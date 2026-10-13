@@ -51,6 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use dot_agent_deck::daemon_attach::{DAEMON_START_POLL_TIMEOUT, DAEMON_START_TIMEOUT_ENV};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 /// Decision 21: tunable harness constant for `wait_until_quiescent`.
@@ -148,51 +149,17 @@ pub enum ClaudePromptShown {
     PastePlaceholder,
 }
 
-/// Issue #709: the 1-minute load average per CPU, or `None` where this platform
-/// does not publish one cheaply.
+/// Issue #709's measurement behind [`load_scaled`]: the 1-minute load average
+/// per CPU, or `None` where this platform does not publish one cheaply (every
+/// target but Linux and macOS). [`load_factor`] says why an unmeasurable load
+/// is not treated as a maximal one.
 ///
-/// Linux reads `/proc/loadavg` and macOS calls `getloadavg(3)`. Elsewhere the
-/// answer is `None`, and [`load_scaled`] then applies NO multiplier at all —
-/// see [`load_factor`] for why an unmeasurable load is not treated as a maximal
-/// one.
-///
-/// **macOS used to be `None` as well, and that was a flake.** This comment said
-/// `getloadavg` was not exposed by the `libc` crate for Apple targets. It is:
-/// `libc` declares it in `unix/bsd/mod.rs`, which `apple` sits under. So
-/// `build-macos` — a 3-core runner under a full `cargo nextest run` — got the
-/// flat [`CHILD_BOOT_BASE`] with no scaling, and `idle_worker_010` failed there
-/// at 8.248 s against that 8 s ceiling with "the pane never entered the closing
-/// state" (PR #1238, run 35747708815): #709's starvation shape, on the one
-/// platform #709 could not scale. [`load_factor`]'s clamp bounds a macOS
-/// reading exactly as it bounds a Linux one.
-pub fn machine_load_per_cpu() -> Option<f64> {
-    let one_minute = one_minute_load_average()?;
-    let cpus = std::thread::available_parallelism().ok()?.get() as f64;
-    if !one_minute.is_finite() || cpus <= 0.0 {
-        return None;
-    }
-    Some(one_minute / cpus)
-}
-
-#[cfg(target_os = "linux")]
-fn one_minute_load_average() -> Option<f64> {
-    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
-    raw.split_whitespace().next()?.parse().ok()
-}
-
-#[cfg(target_os = "macos")]
-fn one_minute_load_average() -> Option<f64> {
-    let mut sample = [0.0_f64; 1];
-    // SAFETY: `getloadavg` writes at most `nelem` (1) doubles into a buffer we
-    // own and have sized to 1, and returns how many it wrote, or -1 on failure.
-    let written = unsafe { libc::getloadavg(sample.as_mut_ptr(), 1) };
-    (written == 1).then_some(sample[0])
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn one_minute_load_average() -> Option<f64> {
-    None
-}
+/// PRD #1258 M2: this is the crate's own implementation, re-exported, not a
+/// copy of it — `src/host_metrics.rs` carries the doc, including why macOS
+/// joined (issue #1244). `load_context` reads `one_minute_load_average` from
+/// the same place.
+pub use dot_agent_deck::host_metrics::machine_load_per_cpu;
+use dot_agent_deck::host_metrics::one_minute_load_average;
 
 /// Issue #709: the largest factor [`load_scaled`] will multiply a base ceiling
 /// by, and therefore the ceiling on how long a starved child is waited for.
@@ -399,24 +366,24 @@ pub fn daemon_task_start_budget() -> Duration {
     load_scaled(DAEMON_TASK_START_BASE)
 }
 
-/// The base ceiling on an out-of-process `dot-agent-deck daemon serve`
-/// ([`DaemonProc`]) binding its attach socket, before [`load_scaled`] widens it.
-///
-/// A third quantity beside [`CHILD_BOOT_BASE`] and [`DAEMON_TASK_START_BASE`],
-/// for the reason the second's doc gives for not sharing a constant: this is a
-/// `fork` + `execve` of the full deck binary, its runtime coming up, and the
-/// daemon's startup up to the attach listener's `bind` — which is past the hook
-/// socket, a state write and a schedules load. 10 s is the flat ceiling this
-/// replaced, so a quiet box reports a daemon that never binds exactly as soon
-/// as it did. What changed is that a starved box now stretches it: six tests
-/// failed against the flat 10 s in PRD #1631's broad e2e run with `io full` at
-/// 52-72%, and `dispatch_009` failed against it alone at 92.8%.
-pub const DAEMON_PROCESS_BOOT_BASE: Duration = Duration::from_secs(10);
+/// PRD #1258: the most [`daemon_start_timeout_for_launch`] hands the deck. It
+/// sits under [`WAIT_TIMEOUT`], the fixed ceiling on the first wait every
+/// launching test makes, so a daemon that never binds still has its deck print
+/// `daemon failed to start within …` onto the screen before that wait expires;
+/// a bound past it would trade that message for an empty grid and buy nothing,
+/// because the test's wait has already given up.
+pub(crate) const DAEMON_START_HARNESS_CEILING: Duration =
+    WAIT_TIMEOUT.saturating_sub(Duration::from_secs(5));
 
-/// [`load_scaled`] applied to [`DAEMON_PROCESS_BOOT_BASE`].
-#[allow(dead_code)]
-pub fn daemon_process_boot_budget() -> Duration {
-    load_scaled(DAEMON_PROCESS_BOOT_BASE)
+/// PRD #1258: the lazy-spawn start bound a launched deck is given through
+/// [`DAEMON_START_TIMEOUT_ENV`] — the binary's own default
+/// ([`DAEMON_START_POLL_TIMEOUT`], 15 s) widened by [`load_scaled`], up to
+/// [`DAEMON_START_HARNESS_CEILING`]. Measured cause: `dashboard/host-metrics/004`
+/// went red on a starved box (io stalled ~70% of the window) with the deck's
+/// fixed 15 s expiring while its debug daemon was still starting. Only an `e2e`
+/// build of the deck reads the variable, and it never goes below the default.
+pub fn daemon_start_timeout_for_launch() -> Duration {
+    load_scaled(DAEMON_START_POLL_TIMEOUT).min(DAEMON_START_HARNESS_CEILING)
 }
 
 /// Issue #709: how long after a child stops being live its output is still
@@ -818,6 +785,12 @@ pub struct TuiDeck {
     /// [`TuiDeck::dump_recordings`] a failing test deleted the one line that says
     /// why. `None` when a test's `with_env` removed the state-dir pin.
     daemon_log_path: Option<PathBuf>,
+    /// The deck's tracing log (`DOT_AGENT_DECK_LOG`), which the TUI and its
+    /// lazy-spawned daemon both append to (PRD #1258). The harness points it at
+    /// `deck.log` in the test's own temp root so a red says where the time went;
+    /// dumped beside `daemon.log`. `None` when a test's `with_env` gave it a
+    /// value that is not an absolute path (`1`, a relative name).
+    deck_log_path: Option<PathBuf>,
 }
 
 /// Observable terminal-cell styling from the outer vt100 screen driven by the
@@ -1368,16 +1341,22 @@ impl TuiDeck {
         for (k, v) in pinned {
             final_env.insert((*k).into(), (*v).into());
         }
-        // PRD #1631: the deck lazy-spawns its daemon and waits a fixed 15 s for
-        // it to bind (`DAEMON_START_POLL_TIMEOUT`). That wait is a boot, so it
-        // gets the load scaling `DaemonProc`'s own boot wait already has:
-        // `question_live_005` failed at `io full` 70.7% with "daemon failed to
-        // start within 15000ms". Measured when this deck launches, and pinned
-        // before the `with_env` layer so a test can still set its own.
+        // PRD #1258: the deck's lazy-spawn start bound, load-scaled (see
+        // `daemon_start_timeout_for_launch`), and a tracing log for the deck and
+        // its daemon in the test's own temp root. The log sits in `work`, not in
+        // the state dir: the daemon creates that directory, and the TUI opens the
+        // log before any daemon exists — a missing parent would fail the open and
+        // print a warning into the very PTY the test reads. Both are layered
+        // under `with_env`, so a test that sets its own log keeps it.
         final_env.insert(
-            dot_agent_deck::daemon_attach::DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS.into(),
-            load_scaled(dot_agent_deck::daemon_attach::DAEMON_START_POLL_TIMEOUT)
-                .as_millis()
+            DAEMON_START_TIMEOUT_ENV.into(),
+            daemon_start_timeout_for_launch().as_millis().to_string(),
+        );
+        final_env.insert(
+            "DOT_AGENT_DECK_LOG".into(),
+            work.join("deck.log")
+                .to_str()
+                .expect("deck log path is UTF-8")
                 .to_string(),
         );
         // PRD #1487: `env_clear` above drops the test runner's own signal, so
@@ -1421,6 +1400,10 @@ impl TuiDeck {
         let daemon_log_path = final_env
             .get("DOT_AGENT_DECK_STATE_DIR")
             .map(|dir| PathBuf::from(dir).join("daemon.log"));
+        let deck_log_path = final_env
+            .get("DOT_AGENT_DECK_LOG")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
         for (k, v) in final_env {
             cmd.env(k, v);
         }
@@ -1533,6 +1516,7 @@ impl TuiDeck {
             record_on_success,
             recording_redactions,
             daemon_log_path,
+            deck_log_path,
         })
     }
 
@@ -2793,16 +2777,21 @@ const DAEMON_LOG_TAIL_LINES: usize = 40;
 /// front of whoever reads a red `e2e-deterministic` run. Bounded, because a
 /// chatty daemon must not bury the assertion that failed.
 fn eprint_daemon_log_tail(redacted: &[u8], where_the_rest_is: &str) {
+    eprint_log_tail("daemon.log", redacted, where_the_rest_is);
+}
+
+/// [`eprint_daemon_log_tail`] for any dumped log, labelled `name`.
+fn eprint_log_tail(name: &str, redacted: &[u8], where_the_rest_is: &str) {
     let text = String::from_utf8_lossy(redacted);
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(DAEMON_LOG_TAIL_LINES);
     eprintln!(
-        "[tui-harness] daemon.log (last {} of {} lines; {where_the_rest_is}):",
+        "[tui-harness] {name} (last {} of {} lines; {where_the_rest_is}):",
         lines.len() - start,
         lines.len(),
     );
     for line in &lines[start..] {
-        eprintln!("[daemon.log] {line}");
+        eprintln!("[{name}] {line}");
     }
 }
 
@@ -2934,6 +2923,30 @@ impl TuiDeck {
                     if outcome == RecordingOutcome::Failed {
                         let copy = dir.join("daemon.log");
                         eprint_daemon_log_tail(
+                            &redacted,
+                            &format!("full copy at {}", copy.display()),
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        // deck.log — PRD #1258. The TUI's and the daemon's tracing log, which
+        // `daemon.log` (stdout and stderr only) does not carry: it is where the
+        // daemon's pre-bind timing lands, so a start that timed out says whether
+        // the login-shell capture or the installers took the time. Redacted like
+        // the rest; its tail goes to stderr on a failure for the same reason.
+        if let Some(src) = self.deck_log_path.as_deref() {
+            match std::fs::read(src) {
+                Ok(bytes) => {
+                    let redacted = redact_known_credentials_bytes(&bytes, &redactions);
+                    atomic_write(&dir.join("deck.log"), &redacted)?;
+                    if outcome == RecordingOutcome::Failed {
+                        let copy = dir.join("deck.log");
+                        eprint_log_tail(
+                            "deck.log",
                             &redacted,
                             &format!("full copy at {}", copy.display()),
                         );
@@ -4903,13 +4916,14 @@ pub fn current_test_recordings_dir() -> PathBuf {
 /// will publish the cast, so removing it before the cast means a discard that
 /// panics partway has already made whatever survives unpublishable. The dump
 /// writes it LAST for the mirror-image reason.
-const RECORDING_ARTIFACTS: [&str; 6] = [
+const RECORDING_ARTIFACTS: [&str; 7] = [
     "provenance.json",
     "final-grid.txt",
     "final-grid.svg",
     "full-stream.cast",
     "fixture.toml",
     "daemon.log",
+    "deck.log",
 ];
 
 /// Schema version of the `provenance.json` sidecar (issue #808).
@@ -9837,9 +9851,18 @@ pub fn spawn_daemon_serve_with_env(
 impl DaemonProc {
     /// Block until the attach socket file exists (the daemon finished
     /// binding), failing at once if the daemon exits first and otherwise after
-    /// [`daemon_process_boot_budget`].
+    /// `load_scaled(DAEMON_START_POLL_TIMEOUT)`.
+    ///
+    /// PRD #1258: the bound is the binary's own lazy-spawn bound
+    /// ([`DAEMON_START_POLL_TIMEOUT`], which covers the daemon's pre-bind work)
+    /// widened by [`load_scaled`]. It was a fixed 10 s, shorter than the time
+    /// the deck itself gives a daemon to bind, and a STARVED lane-1 run lost
+    /// seven tests to it — `deck.log` from the same run showed one daemon's
+    /// pre-bind work alone taking 5.7 s. PRD #1631 met the same flat 10 s
+    /// failing six tests at `io full` 52-72%, which `load_scaled`'s stall
+    /// share now widens for.
     fn wait_for_attach_socket(&mut self) {
-        let budget = daemon_process_boot_budget();
+        let budget = load_scaled(DAEMON_START_POLL_TIMEOUT);
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if self.attach_socket.exists() {
@@ -11770,7 +11793,11 @@ impl Drop for InProcDaemon {
 /// the window and a 1-minute load of 41 on 16 CPUs, and all four passed when
 /// rerun alone. Between the hook bind and the attach bind the daemon writes
 /// its state and loads schedules synchronously, which is disk work that
-/// starvation stretches.
+/// starvation stretches. PRD #1258 met the same overrun on the hook wait:
+/// `agent_event_007`/`008` went red at a 1-minute load of 143 on 16 CPUs (cpu
+/// PSI 98%) and passed once the box recovered. It is a flat ceiling rather than
+/// a `load_scaled(5 s)` one because 30 s is already the largest value that
+/// scaling could reach (`MAX_LOAD_FACTOR` is 6).
 #[cfg(unix)]
 #[allow(dead_code)]
 pub const INPROC_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);

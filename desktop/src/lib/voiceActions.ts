@@ -329,6 +329,29 @@ export type VoiceActionContext = {
    */
   openNewAgent: (deckId?: string) => void;
   /**
+   * PR #1672 — open one daemon's Host figures: the popover its **Host** button
+   * beside the daemon's name opens (PRD #1258). `deckId` is the daemon a
+   * row's `deck_ref` resolved to, or the button's own; without one, the one
+   * daemon on the dashboard that shows a Host button. Answers `undefined` when
+   * it opened, or the sentence saying why not: no daemon named and several
+   * shown, a named daemon that is not connected, or none to show.
+   *
+   * **Served by the OVERVIEW**, which renders the buttons and holds which
+   * popover is open; see {@link VoiceOverviewContext}.
+   */
+  showHostMetrics: (deckId?: string) => string | undefined;
+  /**
+   * PR #1672 — close the open Host popover: what its X (`Close host`), Escape
+   * and a press outside it do.
+   *
+   * **Published by the overview only while a popover is OPEN**, for
+   * {@link dismissVoiceOverlay}'s reason: *"a Host popover is open"* is a
+   * `useState` in the overview (`hostOpen`), not a `DeckView`, so
+   * {@link closeTopmost} reads it as this member's presence. Opening one is
+   * {@link showHostMetrics}, the `show_host_metrics` row.
+   */
+  closeHostMetrics: () => void;
+  /**
    * PRD #1223 — the New agent dialog's directory browser, by voice: go into
    * the child a `dir_ref` resolved to (`target.directoryPath`), go up to `..`,
    * or choose the directory on screen. Each calls the function the browser's
@@ -619,9 +642,24 @@ export const VOICE_ACTIONS = {
      * looking at, so `close` takes the pane first and Settings on the next
      * utterance. Before Settings moved to the shell it was not in this order
      * at all, and `close` with it open answered "nothing to close".
+     *
+     * **The Host popover is checked after Settings, last of all** (PR #1672).
+     * It hangs from a daemon's Host button IN the dashboard (z-index 30 in
+     * the dashboard's own region), so it is under every other layer here, and
+     * each of them can be open over it: a click closes it, but a spoken
+     * "show commands", "new agent" or "open settings", `Ctrl+N`, or a spoken
+     * agent row leaves it open beneath the list (z 96), the New agent dialog
+     * (100), the agent's pane (90) or the Settings sheet (80). Nothing opens
+     * over the dashboard UNDER it, so with any of those up `close` takes that
+     * one first, and the popover on the utterance after — and with none of
+     * them up it is what the user is looking at, so `close` takes it rather
+     * than answering "nothing to close". The overview publishes
+     * `closeHostMetrics` only while one is open, as it does `closeNewAgent`,
+     * and the shell withholds it while a stop or upgrade confirmation is
+     * open, which is modal over the dashboard too and not in this chain.
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings" | "closeHostMetrics">>,
       target: VoiceDispatchTarget,
     ) => {
       if (context.dismissVoiceOverlay) return context.dismissVoiceOverlay();
@@ -632,6 +670,7 @@ export const VOICE_ACTIONS = {
       }
       if (target.agentViewOpen) return context.closeAgentView();
       if (context.closeSettings) return context.closeSettings();
+      if (context.closeHostMetrics) return context.closeHostMetrics();
       context.reportNothingToClose();
     },
   },
@@ -901,6 +940,22 @@ export const VOICE_ACTIONS = {
      * (the `open_new_agent` row's `deck_ref`). An empty id preselects nothing.
      */
     run: (context: Pick<VoiceActionContext, "openNewAgent">, target?: { preselectDeckId?: string }) => context.openNewAgent(target?.preselectDeckId || undefined),
+  },
+
+  /* PR #1672 — a daemon's Host button and the `show_host_metrics` row. It
+     opens a read-only popover and starts, stops and changes nothing. A spoken
+     daemon arrives as the row's optional `deck_ref`, which `App.tsx` carries
+     in as `preselectDeckId`; the button passes its own. `reportRefused` is
+     read through `?.` for `switchDeck`'s reason: the button serves no voice
+     surface, and offers only a daemon that has figures to show. */
+  showHostMetrics: {
+    label: "Show a daemon's Host figures",
+    voice: true,
+    needs: ["showHostMetrics"],
+    run: (context: Pick<VoiceActionContext, "showHostMetrics"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { preselectDeckId?: string }) => {
+      const refused = context.showHostMetrics(target?.preselectDeckId || undefined);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
   },
 
   /* PRD #1223 — the three `requires`-gated rows: the New agent dialog's
@@ -1352,7 +1407,7 @@ export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "swit
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics">;
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

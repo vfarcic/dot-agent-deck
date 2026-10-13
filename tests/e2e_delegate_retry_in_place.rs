@@ -161,7 +161,7 @@ fn delegate_042_retries_lost_pointer_in_the_same_worker_process() {
     );
 
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     deck.send_bytes(b"2");
     let proof_visible = deck.wait_for_grid_string_within(PROOF, Duration::from_secs(45));
     let accepted_pid = std::fs::read_to_string(work.join("worker-accepted-pid.log"))
@@ -329,7 +329,7 @@ fn delegate_042_default_timings_recover_pointer_lost_to_a_loaded_opencode_boot()
     );
 
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     deck.send_bytes(b"2");
     let proof_visible = deck
         .wait_for_grid_string_within("DELEGATE_RETRY_LOADED_BOOT_1381", Duration::from_secs(75));
@@ -741,7 +741,7 @@ fn delegate_044_visible_composer_retries_submit_only() {
         deck.snapshot_grid()
     );
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     deck.send_bytes(b"2");
     assert!(
         deck.wait_for_grid_string_within("COMPOSER_SUBMITTED_1383", Duration::from_secs(5)),
@@ -813,7 +813,7 @@ fn ready_composer_lost_submit(agent: &str) {
         deck.snapshot_grid()
     );
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     deck.send_bytes(b"2");
     assert!(
         deck.wait_for_grid_string_within("READY_COMPOSER_SUBMITTED_1383", Duration::from_secs(5)),

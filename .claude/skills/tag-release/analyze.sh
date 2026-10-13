@@ -122,9 +122,11 @@ fi
 # release workflow makes its own check immediately before tagging, which is the
 # only moment at which the answer is binding — and a wider one, covering the
 # `skip-checks: true` commit trailer as well as the bracket markers below. It is still printed because it tells a maintainer, up front, whether
-# the workflow is going to insert an empty preparation commit — the usual cause
-# being `docs-publish.yml`, which ends every release by committing
-# `chore: update docs chart to <tag> [skip ci]` to `main`.
+# the workflow is going to insert an empty preparation commit. Until #514 the
+# usual cause was `docs-publish.yml`, which ended every release by committing
+# `chore: update docs chart to <tag> [skip ci]` to `main`; nothing on the
+# release path writes a marker now, so a `true` here comes from a hand-written
+# commit message.
 head_message=$(git log -1 --format="%B" HEAD 2>/dev/null || echo "")
 skip_ci=false
 if echo "$head_message" | grep -qiE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]'; then

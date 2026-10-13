@@ -38,6 +38,7 @@ import type { HandoffEdge,
   DesktopFeatures,
   DisconnectedReason,
   EvidenceItem,
+  HostMetricsReport,
   NewAgentOptions,
   NewAgentOrchestrations,
   PromptKeys,
@@ -217,6 +218,14 @@ export interface DesktopSnapshotDto {
    * `false`.
    */
   allDecks?: boolean;
+  /**
+   * PRD #1258 M4 — this deck's host as its daemon reports it: disk per watched
+   * role, load per core, memory and the sample's age. The crate asks the deck;
+   * nothing here is measured on this machine. Absent when the deck is not
+   * connected or the request failed, in which case the last answer for a
+   * connected deck is kept.
+   */
+  hostMetrics?: HostMetricsReport;
 }
 
 /** One configured-but-unaddressed deck (PRD #742 M12). */
@@ -2519,6 +2528,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
   */
   const daemonId = dto.connection.deckId;
   const agents = dto.agents.map((agent, index) => agentFromDto(agent, index, daemonId));
+  const hostMetrics = dto.connection.status === "connected" ? dto.hostMetrics ?? previous?.hostMetrics : undefined;
   // Three tiers since PRD #819 M6, not four. The daemon-reported agent cwd
   // leads, as it always did; the removed tier was the desktop's own guess at a
   // project directory, which is the read this PRD moved daemon-side.
@@ -2551,6 +2561,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     scheduleRevision: dto.scheduleRevision,
     // #1083: see `DesktopSnapshotDto.allDecks`.
     allDecks: dto.allDecks === true,
+    // PRD #1258 M4: a connected deck keeps its last host answer through a
+    // snapshot that carries none; a deck that is not connected shows none.
+    ...(hostMetrics === undefined ? {} : { hostMetrics }),
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
       deckId: dto.connection.deckId,

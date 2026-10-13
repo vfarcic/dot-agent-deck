@@ -30,5 +30,5 @@ expression: unzoomed
                                   ┃                                                                ┃
                                   ┃                                                                ┃
  2 active  │  2 idle  │  0 tools  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
- COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?]   
-[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]
+ COMMAND  [Back to Pane d/Ctrl+D] [New Agent n/Ctrl+N] [Close w/Ctrl+W] [Toggle Layout t/Ctrl+T]    
+[Help ?] [Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

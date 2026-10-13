@@ -53,6 +53,20 @@ desktopScenario("dashboard-filter", async (page) => {
   await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
 });
 
+// PRD #1258 — the same fixed host the TUI `host-metrics` image shows
+// (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`), on the `docs` deck.
+// The host button beside the deck's name, opened: its popover is what the
+// image shows, with the temp root's warning and its X (PR #1672 round 10).
+desktopScenario("host-metrics", async (page) => {
+  await overview(page, "docs");
+  await expect(page.getByTestId("host-metrics-button")).toHaveAttribute("data-level", "warn");
+  await page.getByTestId("host-metrics-button").click();
+  await expect(page.getByTestId("host-metrics")).toContainText("0.42 across 16 cores");
+  await expect(page.getByTestId("host-metrics")).toContainText("6 GiB free of 64 GiB total (warning)");
+  await expect(page.getByTestId("host-metrics")).toContainText("Memory available43.5 GiB");
+  await expect(page.getByTestId("host-metrics-popover").getByRole("button", { name: "Close host" })).toBeVisible();
+});
+
 /** Select the fixture project's directory in the shared New agent form. */
 async function projectInNewAgent(page: Page): Promise<void> {
   await overview(page, "docs");

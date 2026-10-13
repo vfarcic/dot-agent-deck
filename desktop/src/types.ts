@@ -964,6 +964,48 @@ export interface AgentProfile {
   savedToProject: boolean;
 }
 
+/**
+ * PRD #1258 M4 — one watched role's filesystem on a deck's host, as its daemon
+ * reports it. A figure the daemon could not read is absent, never zero.
+ */
+export interface HostDiskUsage {
+  role: string;
+  freeBytes?: number;
+  totalBytes?: number;
+  /** PRD #1258 — the daemon's level for this filesystem's free space. */
+  level?: HostLevel;
+}
+
+/**
+ * PRD #1258 — how healthy one host reading is, as the deck's daemon judged it
+ * against its own thresholds. The app colours from it and never recomputes it;
+ * a reading without one (an older daemon, or an absent number) is shown
+ * uncoloured, not as `ok`.
+ */
+export type HostLevel = "ok" | "warn" | "critical";
+
+/** PRD #1258 M4 — a deck's host sample; every reading but the age may be absent. */
+export interface HostMetrics {
+  disks: HostDiskUsage[];
+  loadPerCpu?: number;
+  cpuCount?: number;
+  memoryUsedBytes?: number;
+  memoryAvailableBytes?: number;
+  /** PRD #1258 — the daemon's level for {@link loadPerCpu}. */
+  loadLevel?: HostLevel;
+  /** PRD #1258 — the daemon's level for available memory as a share of the total. */
+  memoryLevel?: HostLevel;
+  sampledAtMs: number;
+  sampleAgeMs: number;
+}
+
+/**
+ * PRD #1258 M4 — what a deck says about its host: its sample, or that its
+ * daemon does not report one (an older build), which the card states as "not
+ * available from this deck" rather than as zeros.
+ */
+export type HostMetricsReport = { status: "available"; metrics: HostMetrics } | { status: "not-available" };
+
 export interface DeckSnapshot {
   runId: string;
   repo: string;
@@ -1001,6 +1043,12 @@ export interface DeckSnapshot {
    * to show "Select a deck" instead. Absent in fixture mode.
    */
   allDecks?: boolean;
+  /**
+   * PRD #1258 M4 — this deck's host, from its own daemon. Absent until the
+   * deck has answered, and for a deck that is not connected. Absent in fixture
+   * mode.
+   */
+  hostMetrics?: HostMetricsReport;
   stages: WorkflowStage[];
   agents: AgentSession[];
   evidence: EvidenceItem[];

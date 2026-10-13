@@ -707,6 +707,7 @@ pub(crate) mod tests {
                 "open_deck".to_string(),
                 "close".to_string(),
                 "open_settings".to_string(),
+                "show_host_metrics".to_string(),
                 "switch_deck".to_string(),
                 "voice_off".to_string(),
                 "list_commands".to_string(),

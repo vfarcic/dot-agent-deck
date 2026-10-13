@@ -723,6 +723,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "show_host_metrics",
                 "switch_deck",
                 "voice_off",
                 "list_commands",
