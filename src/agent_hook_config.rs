@@ -4016,8 +4016,23 @@ mod tests {
         assert!(lock_config(&dest).is_err());
     }
 
+    /// The stall window the busy-holder tests wait with: the waiter looks once
+    /// per window, so a window reads as stuck only if no publish at all lands
+    /// in it. At 500 ms both busy-holder tests failed on a dev box at load
+    /// average ~30 (2026-10-13), in isolation too, and passed once the load
+    /// fell; four times that leaves room for a loaded box to schedule the
+    /// holder.
+    const BUSY_HOLDER_STALL: std::time::Duration = std::time::Duration::from_secs(2);
+
     /// Hold the config's lock on a thread that publishes `dest` every `every`
     /// until `stop` is set, then release it. Returns once the lock is held.
+    ///
+    /// It publishes the way [`write_atomic`] does, a fresh file renamed over
+    /// `dest`, which is the change [`PublishMark`] sees, but without the
+    /// fsync: these tests are about the waiter, and on a box busy writing
+    /// elsewhere one fsync blocked for seconds, which the waiter rightly read
+    /// as a stuck holder (the same 2026-10-13 runs, where a 6 s test took
+    /// 14.6 s and failed at a 2 s window).
     fn hold_and_keep_publishing(
         dest: &Path,
         every: std::time::Duration,
@@ -4035,7 +4050,9 @@ mod tests {
                 published += 1;
                 // A different length each time, so the change shows even where
                 // the modification time is coarse.
-                write_atomic(dir, &dest, "x".repeat(published).as_bytes()).expect("publish");
+                let next = dir.join("config.next");
+                std::fs::write(&next, "x".repeat(published)).expect("write the next copy");
+                std::fs::rename(&next, &dest).expect("publish");
             }
             published
         });
@@ -4053,7 +4070,7 @@ mod tests {
         let dir = crate::test_temp::tempdir().expect("lock tempdir");
         let dest = dir.path().join("config.toml");
         std::fs::write(&dest, b"").expect("seed destination");
-        let stall = std::time::Duration::from_millis(500);
+        let stall = BUSY_HOLDER_STALL;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let holder =
             hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
@@ -4127,9 +4144,9 @@ mod tests {
         let holder =
             hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
 
-        let ceiling = std::time::Duration::from_millis(1200);
+        let ceiling = BUSY_HOLDER_STALL * 12 / 5;
         let started = std::time::Instant::now();
-        let waited = lock_config_waiting(&dest, std::time::Duration::from_millis(500), ceiling);
+        let waited = lock_config_waiting(&dest, BUSY_HOLDER_STALL, ceiling);
         let elapsed = started.elapsed();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         holder.join().expect("holder thread");

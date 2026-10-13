@@ -5293,6 +5293,8 @@ pub(super) fn spoken_names(agent: &DesktopAgent) -> Vec<String> {
         names.push(cli_name.clone());
     }
     names.push(agent.id.clone());
+    // Its label, for an orchestration member (`display_label`'s invariant).
+    names.extend(run_member_name(agent));
     names
 }
 
@@ -5448,7 +5450,9 @@ pub(super) fn role_name(agent: &DesktopAgent) -> Option<String> {
 ///
 /// `bridge.ts`'s `agentFromDto` is `agent.displayName || role`, with
 /// `Agent <n>` when neither is there — the position in the snapshot, the same
-/// number the webview uses.
+/// number the webview uses. An orchestration member's carries its run's title
+/// in front ([`run_member_name`], issue #1668), as voice lists and Reading
+/// name it, so a choice between two runs' coders offers two different names.
 ///
 /// # Invariant: every label this returns is a name [`spoken_names`] answers to
 ///
@@ -5458,9 +5462,9 @@ pub(super) fn role_name(agent: &DesktopAgent) -> Option<String> {
 /// was told into a [`VoiceOutcome::ParamUnresolved`] refusal, which is the
 /// worst shape of bug available here: correct behaviour punished.
 ///
-/// The first two branches hold it by construction — a display name and a role
-/// are both in [`spoken_names`]. The positional fallback does **not**, and it is
-/// unreachable only because `crate::dto::map_agent` floors `agent_type` at
+/// The first two branches hold it by construction — a run member's name, a
+/// display name and a role are all in [`spoken_names`]. The positional
+/// fallback does **not**, and it is unreachable only because `crate::dto::map_agent` floors `agent_type` at
 /// `"none"`, which makes [`role_name`] `Some` for every agent the app actually
 /// produces. `voice_outcome_every_label_is_a_name_the_agent_answers_to` asserts
 /// the invariant over those shapes, so a change that lets `agent_type` be
@@ -5472,21 +5476,58 @@ pub(super) fn role_name(agent: &DesktopAgent) -> Option<String> {
 /// behaviour than the refusal it would replace. The invariant is pinned
 /// instead.
 pub(super) fn display_label(agent: &DesktopAgent, agents: &[DesktopAgent]) -> String {
-    if let Some(display_name) = agent
-        .display_name
-        .as_ref()
-        .filter(|name| !name.trim().is_empty())
-    {
-        return display_name.trim().to_string();
+    if let Some(name) = run_member_name(agent) {
+        return name;
     }
-    if let Some(role) = role_name(agent) {
-        return role;
+    if let Some(name) = own_name(agent) {
+        return name;
     }
     let index = agents
         .iter()
         .position(|candidate| candidate.id == agent.id)
         .unwrap_or(0);
     format!("Agent {}", index + 1)
+}
+
+/// What the agent itself is called: its display name, else its role.
+fn own_name(agent: &DesktopAgent) -> Option<String> {
+    agent
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| role_name(agent))
+}
+
+/// The title an orchestration's card is headed with: the run's title, else
+/// the orchestration's config name — `orchestrationTitle` in
+/// `desktop/src/lib/agentNames.ts`.
+fn run_title(agent: &DesktopAgent) -> Option<String> {
+    let DesktopTab::Orchestration {
+        name,
+        display_title,
+        ..
+    } = &agent.tab
+    else {
+        return None;
+    };
+    let title = display_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(name)
+        .trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+/// An orchestration member's name: its run's title and its own name ("prd-1401
+/// Coder", issue #1668), the rule `agentSpokenName` in
+/// `desktop/src/lib/agentNames.ts` gives the overview heading and Reading.
+/// Every run of one orchestration names its roles alike, so the role alone
+/// cannot tell two runs' coders apart. `None` for an agent outside one.
+fn run_member_name(agent: &DesktopAgent) -> Option<String> {
+    Some(format!("{} {}", run_title(agent)?, own_name(agent)?))
 }
 
 /// Whether two names are the same name to a speaker.
@@ -7134,7 +7175,7 @@ mod tests {
                 .iter()
                 .map(|c| (c.value.as_str(), c.label.as_str()))
                 .collect::<Vec<_>>(),
-            [("atlas-a", "Atlas"), ("atlas-b", "Atlas")]
+            [("atlas-a", "build Atlas"), ("atlas-b", "build Atlas")]
         );
 
         let DeckRefMatch::Ambiguous(deck_candidates) = resolve_deck_ref("build", &decks()) else {
@@ -9965,7 +10006,7 @@ mod tests {
         assert_eq!(params[0].value, "1");
         assert_eq!(
             sentence,
-            "Confirm stopping tester — nothing has been stopped yet."
+            "Confirm stopping build tester — nothing has been stopped yet."
         );
 
         let deck = run_agents(&resolver, Screen::Deck, &fleet(), "stop the tester").await;
@@ -10009,7 +10050,7 @@ mod tests {
             assert_eq!(params.len(), 1, "{params:?}");
             assert_eq!(params[0].kind, ParamKind::AgentRef);
             assert_eq!(params[0].value, "1");
-            assert_eq!(sentence, "Opening the pull request. Agent: tester.");
+            assert_eq!(sentence, "Opening the pull request. Agent: build tester.");
 
             let ghost = run_agents(&resolver, screen, &fleet(), "open the PR for the ghost").await;
             assert!(
@@ -10037,7 +10078,7 @@ mod tests {
         assert!(
             matches!(&only, VoiceOutcome::Dispatch { params, sentence, .. }
                 if params.len() == 1 && params[0].value == "1"
-                && sentence == "Opening the pull request. Agent: tester."),
+                && sentence == "Opening the pull request. Agent: build tester."),
             "{only:?}"
         );
         // …and several are asked about, each one offered as a choice.
@@ -10060,7 +10101,7 @@ mod tests {
         );
         assert_eq!(
             which.sentence(),
-            "Heard: \u{201c}open the PR\u{201d} — say which agent's pull request to open: tester, orchestrator."
+            "Heard: \u{201c}open the PR\u{201d} — say which agent's pull request to open: build tester, build orchestrator."
         );
 
         // Over the browser itself it is not here, as before.
@@ -10353,8 +10394,8 @@ mod tests {
         assert_eq!(params[0].kind, ParamKind::AgentRef);
         assert_eq!(params[0].spoken, "tester");
         assert_eq!(params[0].value, "1");
-        assert_eq!(params[0].label, "tester");
-        assert_eq!(sentence, "Opening tester.");
+        assert_eq!(params[0].label, "build tester");
+        assert_eq!(sentence, "Opening build tester.");
         assert!(outcome.is_dispatch());
     }
 
@@ -10757,9 +10798,15 @@ mod tests {
         assert_eq!(
             resolve_agent_ref_on("the newest agent", &agents, &decks()).ambiguous_labels(),
             Some(
-                ["Mercury", "Juno", "Vega", "reviewer", "reviewer"]
-                    .map(str::to_string)
-                    .to_vec()
+                [
+                    "Mercury",
+                    "Juno",
+                    "Vega",
+                    "prd-1487 reviewer",
+                    "docs-1502 reviewer"
+                ]
+                .map(str::to_string)
+                .to_vec()
             )
         );
     }
@@ -10786,7 +10833,7 @@ mod tests {
         }
         assert_eq!(
             resolve_agent_ref_on("the agent", &agents, &decks()).ambiguous_labels(),
-            Some(vec!["tester".to_string(), "Orion".to_string()])
+            Some(vec!["build tester".to_string(), "Orion".to_string()])
         );
         assert!(matches!(
             resolve_agent_ref_on("the agent", &agents[..1], &decks()),
@@ -10814,7 +10861,7 @@ mod tests {
         let outcome = run(&resolver, Screen::Overview, &agents, said).await;
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { params, sentence, .. }
-                if params[0].value == "agent-review-1487" && sentence == "Opening reviewer."),
+                if params[0].value == "agent-review-1487" && sentence == "Opening prd-1487 reviewer."),
             "{outcome:?}"
         );
         let said = "show the reviewer";
@@ -10970,7 +11017,7 @@ mod tests {
             IntentAnswer::new("open_agent").with_param("agent", "tester"),
         );
         let outcome = run(&resolver, Screen::Deck, &agents, "open the tester").await;
-        assert_eq!(outcome.sentence(), "Opening Release Tester.");
+        assert_eq!(outcome.sentence(), "Opening build Release Tester.");
     }
 
     // -- no match and the escape -------------------------------------------
@@ -11186,11 +11233,14 @@ mod tests {
         assert_eq!(spoken, "tester");
         assert_eq!(
             matches,
-            &vec!["tester one".to_string(), "tester two".to_string()]
+            &vec![
+                "build tester one".to_string(),
+                "build tester two".to_string()
+            ]
         );
         assert_eq!(
             outcome.sentence(),
-            "Heard: \u{201c}open the tester\u{201d} — \u{201c}tester\u{201d} matches more than one agent: tester one, tester two."
+            "Heard: \u{201c}open the tester\u{201d} — \u{201c}tester\u{201d} matches more than one agent: build tester one, build tester two."
         );
     }
 
@@ -11237,7 +11287,7 @@ mod tests {
         assert!(
             outcome
                 .sentence()
-                .ends_with("tester 1, tester 2, tester 3 and 2 more."),
+                .ends_with("build tester 1, build tester 2, build tester 3 and 2 more."),
             "got {}",
             outcome.sentence()
         );
@@ -11340,6 +11390,51 @@ mod tests {
         );
     }
 
+    /// Scenario (issue #1668): two runs of one orchestration definition,
+    /// `mixed`, titled prd-1401 and prd-1500, each have a coder. Each is
+    /// labelled by its run's title and its role — an untitled run by the
+    /// definition's name, a standalone agent by its own name as before — and
+    /// is reached by saying that; the bare role is a choice between the two
+    /// labels rather than a guess, and with one run it is that run's coder.
+    #[test]
+    fn voice_outcome_names_a_run_member_by_its_run_title_and_role() {
+        let runs = vec![
+            in_titled_orchestration(role_agent("1", "coder"), "o1", "mixed", "prd-1401"),
+            in_titled_orchestration(role_agent("2", "coder"), "o2", "mixed", "prd-1500"),
+        ];
+        assert_eq!(display_label(&runs[0], &runs), "prd-1401 coder");
+        assert_eq!(display_label(&runs[1], &runs), "prd-1500 coder");
+        let untitled = vec![role_agent("3", "coder")];
+        assert_eq!(display_label(&untitled[0], &untitled), "build coder");
+        let solo = vec![agent("4", Some("Deploy watcher"), "claude_code")];
+        assert_eq!(display_label(&solo[0], &solo), "Deploy watcher");
+
+        for said in ["prd-1500 coder", "the prd 1500 coder", "coder in prd-1500"] {
+            assert_eq!(
+                resolve_agent_ref(said, &runs),
+                AgentRefMatch::One {
+                    id: "2".to_string(),
+                    label: "prd-1500 coder".to_string(),
+                },
+                "{said}"
+            );
+        }
+        assert_eq!(
+            resolve_agent_ref("coder", &runs),
+            AgentRefMatch::Ambiguous(vec![
+                Candidate::new("1", "prd-1401 coder"),
+                Candidate::new("2", "prd-1500 coder"),
+            ])
+        );
+        assert_eq!(
+            resolve_agent_ref("coder", &runs[..1]),
+            AgentRefMatch::One {
+                id: "1".to_string(),
+                label: "prd-1401 coder".to_string(),
+            }
+        );
+    }
+
     /// Every [`display_label`] output is a name [`spoken_names`] answers to.
     ///
     /// The model is told to answer a by-state reference with the agent's
@@ -11357,6 +11452,10 @@ mod tests {
             ("a bare agent type", agent("2", None, "claude_code")),
             ("the map_agent floor", agent("3", None, "none")),
             ("an orchestration role", role_agent("4", "orchestrator")),
+            (
+                "a titled run's role",
+                in_titled_orchestration(role_agent("5", "coder"), "o1", "mixed", "prd-1401"),
+            ),
         ];
         for (what, shaped) in shapes {
             let fleet = vec![shaped.clone()];
@@ -11531,7 +11630,7 @@ mod tests {
             assert!(outcome.is_dispatch(), "spelling {spelling:?}: {outcome:?}");
             assert_eq!(
                 outcome.sentence(),
-                "Opening tester.",
+                "Opening build tester.",
                 "spelling {spelling:?}"
             );
         }
@@ -11674,7 +11773,7 @@ mod tests {
             resolve_agent_ref("tester", &agents),
             AgentRefMatch::One {
                 id: "1".to_string(),
-                label: "tester".to_string()
+                label: "build tester".to_string()
             }
         );
     }
@@ -11721,7 +11820,10 @@ mod tests {
         let agents = vec![role_agent("1", "tester one"), role_agent("2", "tester two")];
         assert_eq!(
             resolve_agent_ref("tester", &agents).ambiguous_labels(),
-            Some(vec!["tester one".to_string(), "tester two".to_string()])
+            Some(vec![
+                "build tester one".to_string(),
+                "build tester two".to_string()
+            ])
         );
     }
 
@@ -11734,7 +11836,7 @@ mod tests {
             resolve_agent_ref("tester", &agents),
             AgentRefMatch::One {
                 id: "1".to_string(),
-                label: "tester".to_string()
+                label: "build tester".to_string()
             }
         );
     }
