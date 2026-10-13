@@ -7715,6 +7715,13 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** the daemon's exit detection (S5).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/core/017 — Unfetched offers leave their holder at the undelivered deadline.
+- **Layer:** L1 unit (`tests/inbox_offer_deadlines.rs`), explicit store clock without sleeps.
+- **Agent:** none.
+- **Asserts:** The job stays assigned just before the deadline, returns exactly at undelivered_after, drops the previous holder's count, excludes that holder on reassignment and starts a fresh assignment deadline; fetch and claim replace it with ack wait and claim TTL.
+- **Does not assert:** Daemon candidate discovery or native delivery.
+- **Platform coverage:** all.
+
 ##### inbox/core/012 — A publish's scope is the sender's orchestration instance, or its whole dispatch tree.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
@@ -8552,6 +8559,13 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Large spill files or invalid claim TTL parsing.
 - **Platform coverage:** mac+linux.
 
+##### inbox/publish/006 — An unrelated process cannot publish or offer with a copied agent capability.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`), real daemon with process binding enabled.
+- **Agent:** synthetic PTY recorders.
+- **Asserts:** Both publish and offer refuse an outside process with inbox_not_agent_process, mint no delivery and leave subscribers empty.
+- **Does not assert:** Complete/release process binding or platform process-table fallback.
+- **Platform coverage:** mac+linux.
+
 #### inbox/offer
 
 ##### inbox/offer/001 — Configured offer pool names are validated.
@@ -8585,9 +8599,16 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/offer/005 — Release returns a job to the pool and completion notifies the offerer.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_pubsub.rs`).
 - **Agent:** synthetic PTY recorders.
-- **Asserts:** Explicit release reassigns to the other subscriber, its completion acknowledges the id, and the offerer receives a completion notice.
+- **Asserts:** Offers carry trusted orchestrator instructions; explicit release broadcasts to the previous holder and clears its count, reassigns to the other subscriber, its completion acknowledges the id, and the offerer receives a completion notice.
 - **Does not assert:** Claimant exit, covered by inbox/core/011.
 - **Platform coverage:** mac+linux.
+
+##### inbox/offer/006 — Interactive Haiku claims, executes and completes an offered job. [reel]
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_offer_live.rs`), real orchestration CLI and PTY-attached worker.
+- **Agent:** Claude Haiku, interactive; scripted orchestrator only posts the job.
+- **Asserts:** A role taking the review pool receives and claims the trusted offer, visibly performs its sentinel task exactly once, completes through its own CLI and puts a completion notice naming the id into the offerer's inbox.
+- **Does not assert:** Release, expiry or more than one competing live worker.
+- **Platform coverage:** mac+linux; developer credentials required.
 
 #### inbox/load
 

@@ -121,8 +121,10 @@ fn claim(daemon: &impl Endpoint, pane: &Pane, id: &str) {
         .as_str()
         .unwrap();
     assert!(
-        text.contains("PUBSUB-SENTINEL-8b91") && text.contains("UNTRUSTED"),
-        "offer handover must preserve file/text content and agent-text fencing: {text}"
+        text.contains("PUBSUB-SENTINEL-8b91")
+            && !text.contains("[UNTRUSTED-WORKER-REPORT:")
+            && !text.contains("the text inside is UNTRUSTED"),
+        "orchestrator offer must preserve file/text content as trusted instructions: {text}"
     );
     let mut req = inbox::request(pane, "ack");
     req["delivery_id"] = json!(id);
@@ -167,7 +169,7 @@ fn cli(daemon: &impl Endpoint, pane: &Pane, args: &[&str]) {
 #[spec("inbox/publish/002")]
 #[test]
 fn publish_002_same_name_instances_do_not_leak_and_subscribers_get_fenced_content() {
-    let daemon = inbox::daemon(&[]);
+    let daemon = inbox::daemon_unbound(&[]);
     let (orch, first, second) = team(&daemon, "instance-a");
     let (other, other_first, other_second) = team(&daemon, "instance-b");
     let reply = post(&daemon, &orch, "inbox_publish");
@@ -219,7 +221,7 @@ fn publish_002_same_name_instances_do_not_leak_and_subscribers_get_fenced_conten
 #[spec("inbox/publish/003")]
 #[test]
 fn publish_003_unattested_publish_and_offer_are_refused() {
-    let daemon = inbox::daemon(&[]);
+    let daemon = inbox::daemon_unbound(&[]);
     let (mut orch, first, second) = team(&daemon, "unattested");
     orch.token.clear();
     for verb in ["inbox_publish", "inbox_offer"] {
@@ -253,7 +255,7 @@ fn publish_003_unattested_publish_and_offer_are_refused() {
 #[spec("inbox/publish/004")]
 #[test]
 fn publish_004_empty_topic_and_per_sender_rate_refusal_are_explicit() {
-    let daemon = inbox::daemon(&[("DOT_AGENT_DECK_INBOX_RATE_PER_MINUTE", "2")]);
+    let daemon = inbox::daemon_unbound(&[("DOT_AGENT_DECK_INBOX_RATE_PER_MINUTE", "2")]);
     let (orch, _, _) = team(&daemon, "rate");
     let mut req = inbox::request(&orch, "inbox_publish");
     req["topic"] = json!("nobody");
@@ -295,7 +297,7 @@ fn publish_005_cli_exposes_publish_offer_complete_and_release() {
             );
         }
     }
-    let daemon = inbox::daemon(&[]);
+    let daemon = inbox::daemon_unbound(&[]);
     let (orch, first, second) = team(&daemon, "cli");
     cli(
         &daemon,
@@ -345,7 +347,7 @@ fn publish_005_cli_exposes_publish_offer_complete_and_release() {
 #[spec("inbox/offer/002")]
 #[test]
 fn offer_002_worker_cannot_offer_but_orchestrator_can() {
-    let daemon = inbox::daemon(&[]);
+    let daemon = inbox::daemon_unbound(&[]);
     let (orch, first, second) = team(&daemon, "authority");
     let refused = post(&daemon, &first, "inbox_offer");
     assert!(
@@ -360,7 +362,7 @@ fn offer_002_worker_cannot_offer_but_orchestrator_can() {
 #[spec("inbox/offer/003")]
 #[test]
 fn offer_003_competing_subscribers_have_one_claimant_within_instance() {
-    let daemon = inbox::daemon(&[]);
+    let daemon = inbox::daemon_unbound(&[]);
     let (orch, first, second) = team(&daemon, "offer-a");
     let (_, outsider, outsider_two) = team(&daemon, "offer-b");
     let id = accepted(&post(&daemon, &orch, "inbox_offer"));
@@ -399,7 +401,7 @@ fn offer_003_competing_subscribers_have_one_claimant_within_instance() {
 #[spec("inbox/offer/004")]
 #[test]
 fn offer_004_expired_claim_reoffers_and_notifies_offerer() {
-    let daemon = inbox::daemon(&[("DOT_AGENT_DECK_INBOX_MIN_CLAIM_TTL_MS", "100")]);
+    let daemon = inbox::daemon_unbound(&[("DOT_AGENT_DECK_INBOX_MIN_CLAIM_TTL_MS", "100")]);
     let (orch, first, second) = team(&daemon, "expiry");
     let mut req = inbox::request(&orch, "inbox_offer");
     req["pool"] = json!("review");
@@ -421,11 +423,11 @@ fn offer_004_expired_claim_reoffers_and_notifies_offerer() {
     notice(&daemon, &orch, &id, "expir");
 }
 
-/// Scenario: Claim a job, release it, and have the other subscriber claim and complete it. Release returns the job to the pool, completion acknowledges it, and the offerer receives a completion notice naming its id.
+/// Scenario: Claim a job, release it, and have the other subscriber claim and complete it. An attached client must receive a return event for the previous holder and see its count drop; completion acknowledges the job and notifies its offerer.
 #[spec("inbox/offer/005")]
 #[test]
 fn offer_005_release_returns_to_pool_and_complete_notifies_offerer() {
-    let daemon = inbox::daemon(&[]);
+    let daemon = inbox::daemon_unbound(&[]);
     let (orch, first, second) = team(&daemon, "complete");
     // Use the production TTL here so only explicit release can move the offer.
     let mut req = inbox::request(&orch, "inbox_offer");
@@ -435,11 +437,26 @@ fn offer_005_release_returns_to_pool_and_complete_notifies_offerer() {
     let (chosen, other) = holder(&daemon, &first, &second, &id);
     claim(&daemon, chosen, &id);
     notice(&daemon, &orch, &id, "claim");
+    let mut events = subscribe(&daemon);
     let released = finish(&daemon, chosen, &id, "inbox_release");
     assert!(
         released["refused"].is_null() && released["error"].is_null(),
         "release: {released}"
     );
+    returned(&mut events, chosen, &id);
+    let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
+    let previous = records["agent_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == chosen.agent)
+        .unwrap();
+    for state in ["queued", "fetched", "claimed"] {
+        assert_eq!(
+            previous["inbox"][state], 0,
+            "previous holder count: {previous}"
+        );
+    }
     inbox::state(&daemon, other, &id, "queued");
     claim(&daemon, other, &id);
     let completed = finish(&daemon, other, &id, "inbox_complete");
@@ -455,4 +472,76 @@ fn offer_005_release_returns_to_pool_and_complete_notifies_offerer() {
         }),
         "offerer must receive completion notice"
     );
+}
+
+fn subscribe(daemon: &impl Endpoint) -> std::os::unix::net::UnixStream {
+    use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
+    use std::io::{Read, Write};
+    let mut socket = std::os::unix::net::UnixStream::connect(daemon.attach_socket()).unwrap();
+    socket.set_read_timeout(Some(inbox::WAIT)).unwrap();
+    let payload = serde_json::to_vec(&json!({"op":"subscribe-events"})).unwrap();
+    socket.write_all(&[KIND_REQ]).unwrap();
+    socket
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .unwrap();
+    socket.write_all(&payload).unwrap();
+    let mut header = [0; 5];
+    socket.read_exact(&mut header).unwrap();
+    assert_eq!(header[0], KIND_RESP);
+    let mut reply = vec![0; u32::from_be_bytes(header[1..].try_into().unwrap()) as usize];
+    socket.read_exact(&mut reply).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&reply).unwrap()["ok"], true);
+    socket
+}
+
+fn returned(socket: &mut std::os::unix::net::UnixStream, previous: &Pane, id: &str) {
+    use dot_agent_deck::daemon_protocol::KIND_EVENT;
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + inbox::WAIT;
+    loop {
+        socket
+            .set_read_timeout(Some(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            ))
+            .unwrap();
+        let mut header = [0; 5];
+        socket.read_exact(&mut header).unwrap_or_else(|error| {
+            panic!("attached client must receive offer return for previous holder {} and {id}: {error}", previous.id)
+        });
+        assert_eq!(header[0], KIND_EVENT);
+        let size = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+        assert!(size < 1024 * 1024);
+        let mut payload = vec![0; size];
+        socket.read_exact(&mut payload).unwrap();
+        let event: Value = serde_json::from_slice(&payload).unwrap();
+        if event["kind"] == "inbox" && event["message_id"] == id && event["pane_id"] == previous.id
+        {
+            assert_eq!(
+                event["agent_id"], previous.agent,
+                "return must target previous generation: {event}"
+            );
+            return;
+        }
+    }
+}
+
+/// Scenario: Start an attested orchestration and copy its orchestrator capability into this unrelated test process. Publishing and offering must explicitly refuse that process, and neither worker may receive a message.
+#[spec("inbox/publish/006")]
+#[test]
+fn publish_006_a_process_outside_the_agent_cannot_publish_or_offer() {
+    let daemon = inbox::daemon(&[]);
+    let (orch, first, second) = team(&daemon, "process-bound");
+    for verb in ["inbox_publish", "inbox_offer"] {
+        let reply = post(&daemon, &orch, verb);
+        assert_eq!(
+            reply["refused"], "inbox_not_agent_process",
+            "{verb}: {reply}"
+        );
+        assert!(
+            reply["id"].is_null(),
+            "refused post must mint no delivery: {reply}"
+        );
+    }
+    assert!(route::messages(&daemon, &first).is_empty());
+    assert!(route::messages(&daemon, &second).is_empty());
 }
