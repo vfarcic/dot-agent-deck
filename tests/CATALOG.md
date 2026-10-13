@@ -18,6 +18,45 @@ Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `
 
 Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> — <headline>` line opts that test into the PRD #180 demo reel (`.claude/skills/demo-reel-adapter`). Eligibility is **opt-in** — the default (no marker) is *not* eligible even for a PTY-attached test that records a cast. Mark a test only if it validates the feature **as a user actually runs and sees it** — a real agent genuinely spinning up (spawn → agent → work) — never a synthetic/stand-in test (`cat`, scripted echo, recorder stubs, terminal-probe, or synthesized hook events). The adapter includes a marked test in the reel only when it *also* has a cast and its source changed on the branch.
 
+### Session pull requests
+
+#### session/pr
+
+##### session/pr/001 — The daemon resolves the exact branch PR and serves its state and review.
+- **Layer:** L2 headless, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, strict offline gh stub).
+- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly. The stub requires explicit repository, all states and all required JSON fields.
+- **Does not assert:** periodic refresh (`session/pr/003`) or TUI rendering.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/002 — Missing PR data leaves the daemon healthy and the agent without a badge.
+- **Layer:** L2 headless, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, offline gh stub).
+- **Asserts:** default branch, failed gh query, empty response, detached HEAD, non-GitHub origin and non-git directory keep a live agent served with no PR; two completed default-branch probes precede the no-gh assertion. Switching from a resolved PR branch to the default branch, detached HEAD or a new branch whose query fails clears the old PR; a same-key transient failure preserves it.
+- **Does not assert:** missing gh executable, real authentication or network failures.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/003 — PR polling updates an already-attached client without reconnecting.
+- **Layer:** L2 headless, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, mutable offline gh stub).
+- **Asserts:** with DOT_AGENT_DECK_PR_REFRESH_SECS=1, switching an open PR to merged/approved updates ListAgents and sends the full PR to one continuously held event subscription even during continuous non-trigger tool traffic.
+- **Does not assert:** the particular event variant or metadata key used, browser invocation or real GitHub latency.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/004 — A dashboard card shows the PR and o opens its URL.
+- **Layer:** L2 PTY-attached, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, offline gh stub and BROWSER recorder).
+- **Asserts:** the real TUI displays `#1234 ⊙ ◐`; o on the selected card invokes BROWSER with the exact PR URL; the same key on a default-branch card spawns no opener and leaves Help usable.
+- **Does not assert:** a real browser opening, real-agent execution or reel eligibility.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/005 — An interactive Haiku agent visibly works beside its pull request badge. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (real agent).
+- **Agent:** Claude Code (interactive Haiku; strict offline gh stub).
+- **Asserts:** a genuine agent on a fixture PR branch lists the files and reveals a uniquely named sentinel omitted from its prompt; the attached TUI displays that filename together with `#1234 ⊙ ◐`.
+- **Does not assert:** real GitHub authentication or network access, a browser opening, or live PR polling transitions.
+- **Platform coverage:** mac+linux.
+
 ### Dashboard panes
 
 #### dashboard/pane
@@ -126,6 +165,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (a `SessionState` fixture rendered through `ui::render_card_to_buffer` with a CJK display name, an ASCII control, and a name of VS16 emoji).
 - **Asserts:** a card whose display name is `项目目录管理` — 6 scalars, 12 display columns — rendered 40 columns wide leaves 26 cells for the title, and the title is cut to fit with a trailing `…` inside that budget, the two characters past it dropped, the ` ● Thinking ` badge still whole beside it, and the top border exactly one card wide. Before the fix `ui::truncate_styled_segments` counted `char`s, so the 23-character title measured as fitting the 26-cell budget and was returned whole at 29 columns; ratatui then clipped the overhang at the right edge and the card read `· 项 目 目 录 管  ● Thinking` with no `…` and no border fill. The same card with the ASCII name `abcdef` renders untouched, which is the property that keeps every committed card snapshot from churning. And the same card named with eight `❤️` (U+2764 + VARIATION SELECTOR-16, one column per `char` but a two-cell grapheme cluster as ratatui draws it) is also cut with a `…` and keeps its badge: a per-`char` width budget measured those at 8 columns against 16 drawn, passed the title whole, and the badge was drawn over its tail — the same symptom, on input the char count had handled correctly.
 - **Does not assert:** the eight `ui::truncate_styled_segments` unit tests beside the function, which own the emoji, combining-mark, keycap, halfwidth-dakuten, ZWJ, control-character, mid-wide-glyph, zero-budget and per-segment-style cases, measured against ratatui's own `Line::width` and `Buffer::set_line`; the `Dir:` / `Prmt:` lines, converted by PRD #339 to a per-`char` width sum and covered by `dashboard/pane/006`.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/016 — A card shows its pull request number with state and review glyphs at roomy and narrow widths.
+- **Layer:** L1 (ratatui TestBackend + insta).
+- **Agent:** none (synthetic SessionState).
+- **Asserts:** an open, review-required PR shows `#1234` at 80 and 30 columns; snapshots pin both sides of the review/state/stats/omission width boundaries and all lifecycle/review combinations, including Unknown (`?`) and absent review.
+- **Does not assert:** daemon resolution or browser invocation (`session/pr/*`).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/stats
@@ -547,6 +593,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Agent:** none.
 - **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`; the dashboard shortcuts advertise the `m` host-metrics overlay, and the plain-letter commands list their `Ctrl` form after the letter (`m / Ctrl+m`, PR #1672).
 - **Does not assert:** dynamic content (none today).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/help/003 — Dashboard help advertises the shortcut to open the selected pull request.
+- **Layer:** L1 (ratatui TestBackend).
+- **Agent:** none.
+- **Asserts:** one rendered help row names the `o` key and opening a pull request.
+- **Does not assert:** browser invocation, covered by `session/pr/004`.
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/host-metrics
@@ -8839,3 +8892,16 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 | `dot-agent-deck hooks install` / `uninstall` CLI commands ([docs/troubleshooting.md#hooks](../docs/troubleshooting.md)) | Auto-install path is catalogued as `hooks/install/001`–`003`; the explicit subcommand variants share the same install/uninstall code. A targeted L2 test will be added only if a divergence appears. |
 | Ghostty-specific Shift+Enter terminal config ([docs/troubleshooting.md#shiftenter-or-ctrlenter-sends-the-message](../docs/troubleshooting.md)) | **No longer a skip** — PRD #227 showed the break was deck-side (`keyevent_to_bytes` collapsed `Enter + SHIFT` to a bare CR), so there IS a deck-side surface: it is now covered by `embed/key-forwarding/001`. Only the outer-terminal *configuration* itself (what a user types into `ghostty/config`) remains untestable here. |
 | `--continue` "dashboard-first landing" detail ([docs/session-management.md#resuming-sessions](../docs/session-management.md)) | Implicit consequence of `session/restore/001`; not separately worth a catalog ID. Reconsider if the landing-tab logic ever has its own surface. |
+
+## Desktop native network scenarios
+
+These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner. They use the native driver harness, and network scenarios are explicitly opted into locally rather than included in the deterministic desktop CI run.
+
+##### desktop/pull-request/001 — A real GitHub PR renders and closes from the agent screen and the overview row.
+
+- **Test:** `desktop/driver/pull-request.live.test.ts`, `pull_request_001`.
+- **Layer:** native Tauri/WebKitGTK driver with real GitHub network access; local opt-in using `DAD_DRIVER_REAL_GITHUB=1`, skipped by default.
+- **Agent:** a shell plus a synthetic session-start hook, matching `session/pr/001`'s session setup; real `gh` lookup on PR #1601's branch and the real native child webview. No LLM is started.
+- **Asserts:** the native child has nonzero dimensions matching the overlay frame; OCR of the composed X display inside that frame finds the real PR title; Back, Open in browser and Close are visible and usable; Close and Escape from both the toolbar and focused GitHub page remove the overlay and native view; the system-browser handoff receives the real PR URL. The same checks run from the agent pane and the overview row as a control.
+- **Does not assert:** macOS WKWebView or Windows WebView2 placement; GitHub login or cookie persistence; real-agent work. The system browser is replaced by a URL recorder, while the embedded GitHub page is real.
+- **Platform coverage:** Verified on Linux WebKitGTK only, under Xvfb at 96 DPI; macOS WKWebView is not covered and the reported macOS blank/unclosable page was not reproduced here. In addition to the driver tier's prerequisites, this local scenario needs authenticated `gh`, network access to GitHub and PR #1601, Tesseract (`DAD_DRIVER_TESSERACT` or PATH), `/usr/bin/python3` with PyGObject/Gdk 3, and `xdotool` (`DAD_DRIVER_XDOTOOL` or PATH). Nix WebKitGTK also needs its `glib-networking` modules supplied in `GIO_EXTRA_MODULES` for HTTPS. From the repository root, run `DAD_DRIVER_REAL_GITHUB=1 bash desktop/scripts/driver-test.sh` to build and run the driver suite including this scenario; use `--no-build` only with an existing driver-seam-enabled embedded bundle. Evidence, including passing runs, is saved under the gitignored `desktop/driver-results/pull-request-live-<pid>/`.

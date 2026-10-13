@@ -27,6 +27,7 @@
  */
 import { useState } from "react";
 import { FileCog, X } from "lucide-react";
+import { useOverlaySheet } from "../hooks/useInertBackground";
 import type { DesktopSettingsDto } from "../lib/bridge";
 import type { SettingsPanelProps, SettingsSection } from "../lib/settingsContract";
 import { SETTINGS_SECTIONS } from "../lib/settingsRegistry";
@@ -59,6 +60,7 @@ interface SettingsSheetProps {
 
 export function SettingsSheet({ open, onClose, settings, onSave, saveError, path, problem, loaded, mode, sections = SETTINGS_SECTIONS }: SettingsSheetProps) {
   const [activeId, setActiveId] = useState(sections[0]?.id ?? "");
+  const sheet = useOverlaySheet<HTMLElement>(open, onClose);
   if (!open) return null;
 
   const active = sections.find((section) => section.id === activeId) ?? sections[0];
@@ -68,8 +70,10 @@ export function SettingsSheet({ open, onClose, settings, onSave, saveError, path
   const withColumn = sections.length > 1;
 
   return (
-    <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
+    <div className={sheet.raised ? "sheet-backdrop is-raised" : "sheet-backdrop"} role="presentation" onMouseDown={onClose}>
       <section
+        ref={sheet.ref}
+        tabIndex={-1}
         className="config-sheet settings-sheet"
         role="dialog"
         aria-modal="true"

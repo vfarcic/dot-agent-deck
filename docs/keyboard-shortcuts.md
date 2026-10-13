@@ -60,7 +60,7 @@ In command mode you can drop the `Ctrl`: the letter alone does the same thing as
 
 A letter works only while its action is on its default `Ctrl+` key and no other action uses that letter. If you [remap](#customizing-keybindings) `new_pane`, `n` no longer starts an agent, and if you bind `d` to another action, `d` does that action instead. The help overlay (`?`) lists `d`, `n`, `w`, `t` and `z` beside their chords, for example `n / Ctrl+n`, and the bottom bar shows `d`, `n`, `w` and `t`; each drops a letter that a remap has taken away. `e` is listed in neither. The bar's `n/Ctrl+N` stays on **New Agent** even while the selected card shows **Needs Input**, where `n` denies instead.
 
-It works the other way round too: in command mode, the commands whose key is a plain letter also answer to `Ctrl` with that letter.
+It works the other way round too: in command mode, these commands, whose key is a plain letter, also answer to `Ctrl` with that letter.
 
 | Chord | Same as | Note |
 |---|---|---|
@@ -70,7 +70,7 @@ It works the other way round too: in command mode, the commands whose key is a p
 | `Ctrl+U` | `u` | Upgrade |
 | `Ctrl+R` | `r` | Rename the selected agent |
 
-These are command mode only. While you are typing in a pane, `Ctrl+R`, `Ctrl+U`, `Ctrl+S`, `Ctrl+G` and `Ctrl+M` go to the program as before, so reverse search, clearing the line and your agent's own shortcuts keep working. Moving around (`j`, `k`, `h`, `l`), the digits, `?`, `/`, `y`, `n`, `Enter` and `Esc` have no `Ctrl` form.
+These are command mode only. While you are typing in a pane, `Ctrl+R`, `Ctrl+U`, `Ctrl+S`, `Ctrl+G` and `Ctrl+M` go to the program as before, so reverse search, clearing the line and your agent's own shortcuts keep working. Moving around (`j`, `k`, `h`, `l`), the digits, `?`, `/`, `y`, `n`, `o`, `Enter` and `Esc` have no `Ctrl` form.
 
 A chord works only while its command is on its default letter and no other command uses that chord: after `scroll_pane_up = "Ctrl+u"`, `Ctrl+U` scrolls the pane and no longer opens the upgrade dialog, and if you remap `rename`, `Ctrl+R` no longer renames. The help overlay lists each one after its letter, for example `m / Ctrl+m`.
 
@@ -123,6 +123,7 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 | `r` | Rename the selected agent |
 | `g` | Ask the selected agent to generate `.dot-agent-deck.toml` for its directory |
 | `s` or `S` | Open the **Schedules** manager (see [Schedules](scheduled-tasks.md)) |
+| `o` | Open the selected agent's pull request in your system browser (uses `$BROWSER` when set; a `$BROWSER` that puts the address into a shell command, such as `sh -c %s`, is refused); when no browser can be opened, for example in a TUI on a remote host, the status line shows the pull request's address so you can copy it. On a card with no [pull request badge](session-management.md#pull-request-badge) it says the agent has none. The desktop app has no `o`: click the badge or say "open the PR", and it opens inside the app ([Dashboard → Pull requests](desktop/dashboard.md#pull-requests)) |
 | `m` | Open the **Host of this deck** overlay: disk, load and memory of the machine the deck runs on (see [Session Management](session-management.md#check-the-machine-a-deck-runs-on)); `Esc` closes it |
 | `u` | Open the upgrade dialog while the footer shows an update notice (see [Upgrade from the TUI](installation.md#upgrade-from-the-tui)) |
 | `y` / `n` | Approve / deny a pending permission request; only when the selected card shows **Needs Input**. Otherwise `n` starts a new agent (see [Plain letters in command mode](#plain-letters-in-command-mode)). |
@@ -290,6 +291,7 @@ Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Ent
 | `deny_permission` | `n` | Deny a pending permission request |
 | `generate_config` | `g` | Generate `.dot-agent-deck.toml` |
 | `open_scheduled_tasks` | `s` | Open the Schedules manager |
+| `open_pull_request` | `o` | Open the selected agent's pull request in the system browser |
 | `open_upgrade` | `u` | Open the upgrade dialog |
 | `scroll_pane_up` | `PageUp` | Scroll the focused pane back |
 | `scroll_pane_down` | `PageDown` | Scroll the focused pane forward |

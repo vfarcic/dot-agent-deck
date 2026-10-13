@@ -44,6 +44,7 @@ expression: buf
    │  y / n              approve / deny permission                                                       │    
    │  s / ctrl+s         schedules manager                                                               │    
    │  m / ctrl+m         host of this deck                                                               │    
+   │  o                  open pull request                                                               │    
    │  u / ctrl+u         upgrade (update badge)                                                          │    
    │  pageup / pagedown  scroll focused pane                                                             │    
    │  ?                  toggle this help                                                                │    

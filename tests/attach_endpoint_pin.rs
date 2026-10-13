@@ -62,11 +62,14 @@ async fn spawn_daemon() -> DaemonHandle {
     let handle = tokio::spawn(async move {
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // The budget `common::spawn_inprocess_daemon` gives the same wait: a flat
+    // 5 s here went red at `io full` 79% (PRD #1631's merge of #1680).
+    let budget = common::daemon_task_start_budget().max(common::INPROC_DAEMON_READY_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + budget;
     while !(attach_path.exists() && UnixStream::connect(&attach_path).await.is_ok()) {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "attach socket was not accepting connections within 5s"
+            "attach socket was not accepting connections within {budget:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

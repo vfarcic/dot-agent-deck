@@ -560,6 +560,59 @@ mod tests {
         assert_eq!(view.fetch_count(), 1, "only the install fetched");
     }
 
+    /// Scenario: install one working agent, then fold the daemon's PRD #1401
+    /// pull request report for it, and later the report that it has none. The
+    /// rendered record carries the pull request and then drops it, with no
+    /// fetch falling due and no change to the status.
+    #[test]
+    fn a_pull_request_report_is_served_from_the_fold_and_costs_no_fetch() {
+        use dot_agent_deck::pull_request_info::{
+            PullRequestInfo, PullRequestReview, PullRequestState,
+        };
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        view.apply(&BroadcastMsg::Event(tool_start("pane-7", "7", "Bash")));
+        let info = PullRequestInfo {
+            number: 1234,
+            url: "https://github.com/o/r/pull/1234".into(),
+            state: PullRequestState::Open,
+            review: Some(PullRequestReview::ReviewRequired),
+        };
+        let mut report = event("pane-7", "7", EventType::PullRequest);
+        report.metadata.insert(
+            dot_agent_deck::event::PULL_REQUEST_METADATA_KEY.into(),
+            serde_json::to_string(&info).unwrap(),
+        );
+        view.apply(&BroadcastMsg::Event(report));
+
+        let pull_request_of = |view: &AgentView| {
+            view.records()
+                .into_iter()
+                .find(|record| record.id == "7")
+                .and_then(|record| record.live)
+                .and_then(|live| live.pull_request)
+        };
+        assert_eq!(pull_request_of(&view), Some(info));
+        assert_eq!(
+            status_of(&view.records(), "7"),
+            Some(SessionStatus::Working)
+        );
+        assert_eq!(view.needs_fetch(now), None);
+
+        view.apply(&BroadcastMsg::Event(event(
+            "pane-7",
+            "7",
+            EventType::PullRequest,
+        )));
+        assert_eq!(
+            pull_request_of(&view),
+            None,
+            "a report of none drops the badge"
+        );
+        assert_eq!(view.fetch_count(), 1, "only the install fetched");
+    }
+
     /// Scenario: fold a burst of twenty tool events for one agent. Every one is
     /// applied and none of them makes a fetch fall due, which is the "burst of N
     /// events" figure the milestone reports.
@@ -714,6 +767,8 @@ mod tests {
             blocked: None,
             hook_generation: None,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
             background: None,
             background_revision: None,
         });
@@ -760,6 +815,8 @@ mod tests {
             blocked: None,
             hook_generation: None,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
             background: None,
             background_revision: None,
         });
@@ -803,6 +860,8 @@ mod tests {
             blocked: None,
             hook_generation: None,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
             background: None,
             background_revision: None,
         });
@@ -993,6 +1052,8 @@ mod tests {
             blocked: None,
             hook_generation: None,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
             background: (!work.is_empty()).then_some(work),
             background_revision: Some(revision),
         });

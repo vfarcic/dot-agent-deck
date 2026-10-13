@@ -2620,6 +2620,11 @@ struct UiState {
     /// `Ctrl+n` form's pre-fill. `None` without a daemon-backed controller
     /// (tests), and the form then seeds from [`Self::last_command`] as before.
     last_command_reader: Option<crate::embedded_pane::LastCommandReader>,
+    /// PRD #1401: the number of the latest pull request launch from `o`. A
+    /// launch's outcome reaches the status line only while it is still the
+    /// latest, so a slow earlier launch never overwrites a later one's
+    /// ([`drain_pull_request_launch`]).
+    pull_request_launch: u64,
     /// PRD #1258 M3 — what the host overlay shows: the attached daemon's last
     /// answer, or that one is on its way.
     host_metrics: HostMetricsView,
@@ -2797,6 +2802,7 @@ impl UiState {
             last_command: None,
             pending_last_command: None,
             last_command_reader: None,
+            pull_request_launch: 0,
             host_metrics: HostMetricsView::Loading,
             host_metrics_received_at: None,
             host_metrics_reader: None,
@@ -7105,6 +7111,9 @@ pub enum Action {
     /// (PRD #80 parity), so both funnel through one dispatch path that loads the
     /// schedules and switches into [`UiMode::ScheduledTasks`].
     OpenScheduledTasks,
+    /// PRD #1401: open the selected card's pull request in the system browser
+    /// (dashboard `o`). No pull request, nothing opened.
+    OpenPullRequest,
     /// PRD #1258 M3: open the "Host of this deck" overlay and ask the attached
     /// daemon for its host sample. Reached from the dashboard `host_metrics`
     /// binding (default `m`).
@@ -8247,6 +8256,22 @@ fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
     ));
 }
 
+/// PRD #1401: put how the latest `o` launch settled on the status line. The
+/// browser is watched off the UI thread, so its outcome is queued in the
+/// shared state and drained here, the way [`drain_worktree_kept`] drains its
+/// report. An outcome for an earlier launch is dropped.
+fn drain_pull_request_launch(state: &SharedState, ui: &mut UiState) {
+    if state.blocking_read().pending_pull_request_launch.is_none() {
+        return;
+    }
+    let Some((launch, message)) = state.blocking_write().take_pull_request_launch() else {
+        return;
+    };
+    if launch == ui.pull_request_launch {
+        ui.status_message = Some((message, std::time::Instant::now()));
+    }
+}
+
 /// Issue #717: what the dialog (and, after the close, the status line) says
 /// about a worktree that will be kept. Two sentences, because the probe has two
 /// honest outcomes — see [`KeptWorktree::confirmed_dirty`].
@@ -8776,6 +8801,107 @@ fn truncate_with_ellipsis(input: &str, max_width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// PRD #1401: the glyph a card's pull request badge shows for `state`, and
+/// its colour — GitHub's own colour roles (green open, grey draft, purple
+/// merged, red closed) in the palette's terms.
+fn pull_request_state_glyph(
+    state: crate::pull_request_info::PullRequestState,
+) -> (&'static str, Color) {
+    use crate::pull_request_info::PullRequestState;
+    match state {
+        PullRequestState::Open => ("⊙", palette::STATUS_WORKING),
+        PullRequestState::Draft => ("◌", palette::STATUS_IDLE),
+        PullRequestState::Merged => ("◆", palette::STATUS_WAITING),
+        PullRequestState::Closed => ("⊘", palette::STATUS_ERROR),
+        PullRequestState::Unknown => ("?", palette::STATUS_IDLE),
+    }
+}
+
+/// PRD #1401: the glyph a card's pull request badge shows for `review`, and
+/// its colour.
+fn pull_request_review_glyph(
+    review: crate::pull_request_info::PullRequestReview,
+) -> (&'static str, Color) {
+    use crate::pull_request_info::PullRequestReview;
+    match review {
+        PullRequestReview::Approved => ("✓", palette::STATUS_WORKING),
+        PullRequestReview::ChangesRequested => ("✗", palette::STATUS_ERROR),
+        PullRequestReview::ReviewRequired => ("◐", palette::STATUS_THINKING),
+        PullRequestReview::Unknown => ("?", palette::STATUS_IDLE),
+    }
+}
+
+/// PRD #1401: a card's pull request badge in its forms, widest first —
+/// `#<n>` with the state and review glyphs, then without the review glyph,
+/// then the number alone. A PR with no review decision has no first form.
+fn pull_request_badge_forms(
+    pr: &crate::pull_request_info::PullRequestInfo,
+) -> Vec<Vec<Span<'static>>> {
+    let number = Span::styled(
+        format!("#{}", pr.number),
+        text_primary().add_modifier(Modifier::BOLD),
+    );
+    let (state_glyph, state_color) = pull_request_state_glyph(pr.state);
+    let state = Span::styled(state_glyph, Style::default().fg(state_color));
+    let mut forms = Vec::new();
+    if let Some(review) = pr.review {
+        let (review_glyph, review_color) = pull_request_review_glyph(review);
+        forms.push(vec![
+            Span::raw(" "),
+            number.clone(),
+            Span::raw(" "),
+            state.clone(),
+            Span::raw(" "),
+            Span::styled(review_glyph, Style::default().fg(review_color)),
+            Span::raw(" "),
+        ]);
+    }
+    forms.push(vec![
+        Span::raw(" "),
+        number.clone(),
+        Span::raw(" "),
+        state,
+        Span::raw(" "),
+    ]);
+    forms.push(vec![Span::raw(" "), number, Span::raw(" ")]);
+    forms
+}
+
+/// PRD #1401: the bottom border's two labels — the pull request badge on the
+/// left and the `Last`/`Tools` stats on the right — fitted into
+/// `usable_width` cells together. The stats shorten first (their own forms),
+/// then the badge drops its glyphs; if no badge form fits beside any stats
+/// form, the badge wins and the stats go, and a badge that fits nowhere is
+/// dropped. With no pull request this is [`card_stats_border_label`] alone.
+#[doc(hidden)]
+pub fn card_bottom_border_labels(
+    usable_width: u16,
+    pull_request: Option<&crate::pull_request_info::PullRequestInfo>,
+    last: &str,
+    tools: usize,
+) -> (Option<Vec<Span<'static>>>, Option<String>) {
+    use unicode_width::UnicodeWidthStr;
+    let Some(pr) = pull_request else {
+        return (None, card_stats_border_label(usable_width, last, tools));
+    };
+    let width = |form: &[Span<'_>]| form.iter().map(|s| s.content.width()).sum::<usize>();
+    let forms = pull_request_badge_forms(pr);
+    for form in &forms {
+        let remaining = (usable_width as usize).saturating_sub(width(form));
+        let remaining = u16::try_from(remaining).unwrap_or(u16::MAX);
+        if let Some(stats) = card_stats_border_label(remaining, last, tools) {
+            return (Some(form.clone()), Some(stats));
+        }
+    }
+    let badge = forms
+        .into_iter()
+        .find(|form| width(form) <= usable_width as usize);
+    match badge {
+        Some(badge) => (Some(badge), None),
+        None => (None, card_stats_border_label(usable_width, last, tools)),
+    }
 }
 
 /// Pick the widest `Last`/`Tools` form that fits a card's bottom border, or
@@ -9652,6 +9778,11 @@ fn handle_normal_key(
     // so existing muscle memory keeps working while lowercase `s` is added.
     if pressed(KbAction::OpenScheduledTasks) || key.code == KeyCode::Char('S') {
         return Action::OpenScheduledTasks;
+    }
+    // PRD #1401: open the selected card's pull request (default `o`). The
+    // dispatcher resolves the card and does nothing when it has none.
+    if kb.matches(KbAction::OpenPullRequest, &key) && total > 0 {
+        return Action::OpenPullRequest;
     }
     // PRD #1258 M3: the host-of-this-deck overlay (default `m`). Needs no card,
     // so it opens on an empty dashboard too.
@@ -11986,6 +12117,37 @@ fn dispatch_action(
                     "No active agent to send prompt to.".to_string(),
                     std::time::Instant::now(),
                 ));
+            }
+        }
+        Action::OpenPullRequest => {
+            let url = selected_id
+                .and_then(|sid| snapshot.sessions.get(sid))
+                .and_then(|session| session.pull_request.as_ref())
+                .map(|pr| pr.url.clone());
+            match url {
+                Some(url) => {
+                    // The browser is watched off this thread; its outcome comes
+                    // back through `drain_pull_request_launch`.
+                    ui.pull_request_launch += 1;
+                    let launch = ui.pull_request_launch;
+                    let settled = state.clone();
+                    let message = crate::system_browser::open_pull_request(
+                        &url,
+                        &crate::system_browser::BrowserEnv::from_process(),
+                        move |message| {
+                            settled
+                                .blocking_write()
+                                .queue_pull_request_launch(launch, message);
+                        },
+                    );
+                    ui.status_message = Some((message, std::time::Instant::now()));
+                }
+                None => {
+                    ui.status_message = Some((
+                        "This agent has no pull request.".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
             }
         }
         Action::SendPermissionResponse(approve) => {
@@ -14717,6 +14879,9 @@ pub fn run_tui(
         // on disk. Queued by the event subscriber, drained here because the
         // status line is `UiState`.
         drain_worktree_kept(&state, &mut ui);
+        // PRD #1401: how the latest `o` launch settled, from the thread that
+        // watches the browser.
+        drain_pull_request_launch(&state, &mut ui);
 
         let snapshot = state.blocking_read().clone();
 
@@ -20150,6 +20315,9 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         ),
         help_key_line(&lettered(KbAction::OpenScheduledTasks), "Schedules manager"),
         help_key_line(&lettered(KbAction::HostMetrics), "Host of this deck"),
+        // PRD #1401: the terminal has no in-app browser, so this hands the PR
+        // to the system browser.
+        help_key_line(&n(KbAction::OpenPullRequest), "Open pull request"),
         // Issue #1635: opens the upgrade dialog while the footer's update
         // badge shows.
         help_key_line(&lettered(KbAction::OpenUpgrade), "Upgrade (update badge)"),
@@ -21910,8 +22078,12 @@ fn render_session_card(
     // The border reads `Last: 2m`, not `Last: 2m ago` — four columns of suffix
     // are expensive there, and the `Last:` label already says "time since".
     let elapsed = format_elapsed(session.last_activity, now);
-    let stats_title = card_stats_border_label(
+    // PRD #1401: the pull request badge takes the bottom-LEFT border, which
+    // was empty, so it costs no row at any density. The two share the row: the
+    // stats shorten first, then the badge drops its glyphs, then the stats go.
+    let (pr_badge, stats_title) = card_bottom_border_labels(
         area.width.saturating_sub(2),
+        session.pull_request.as_ref(),
         &elapsed,
         session.tool_count as usize,
     );
@@ -21926,6 +22098,9 @@ fn render_session_card(
             Line::from(Span::styled(status_text, status_style))
                 .alignment(ratatui::layout::Alignment::Right),
         );
+    if let Some(badge) = pr_badge {
+        block = block.title_bottom(Line::from(badge).alignment(ratatui::layout::Alignment::Left));
+    }
     // Omitted entirely when even the shortest form would overrun the corners.
     if let Some(stats) = stats_title {
         block = block.title_bottom(
@@ -23321,6 +23496,8 @@ pub fn render_orchestration_frame_to_buffer(
                 prompt_reports_declared: false,
                 output_set_status: false,
                 pending_question: None,
+                pull_request: None,
+                pull_request_revision: 0,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -24117,6 +24294,8 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 prompt_reports_declared: false,
                 output_set_status: false,
                 pending_question: None,
+                pull_request: None,
+                pull_request_revision: 0,
             },
         );
     }
@@ -25427,6 +25606,56 @@ mod tests {
         UiState::default()
     }
 
+    /// PRD #1401: the `o` key's browser is watched off the UI thread, and its
+    /// outcome reaches the status line through the render loop's drain — but
+    /// only for the latest launch, so a slow earlier one never overwrites it.
+    #[test]
+    fn a_pull_request_launch_outcome_reaches_the_status_line_only_while_latest() {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let mut ui = default_ui();
+        ui.pull_request_launch = 2;
+        ui.status_message = Some(("Opening B".into(), std::time::Instant::now()));
+
+        state
+            .blocking_write()
+            .queue_pull_request_launch(1, "Pull request: A (could not open)".into());
+        drain_pull_request_launch(&state, &mut ui);
+        assert_eq!(ui.status_message.as_ref().unwrap().0, "Opening B");
+        assert!(state.blocking_read().pending_pull_request_launch.is_none());
+
+        state
+            .blocking_write()
+            .queue_pull_request_launch(2, "Pull request: B (could not open)".into());
+        drain_pull_request_launch(&state, &mut ui);
+        assert_eq!(
+            ui.status_message.as_ref().unwrap().0,
+            "Pull request: B (could not open)"
+        );
+    }
+
+    /// PRD #1401: an earlier launch settling AFTER a later one queued its
+    /// outcome must not replace that outcome in the one-slot queue, or the
+    /// render loop drops the earlier one as stale and the later one is lost.
+    #[test]
+    fn an_older_pull_request_launch_cannot_overwrite_a_newer_queued_one() {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let mut ui = default_ui();
+        ui.pull_request_launch = 2;
+        ui.status_message = Some(("Opening B".into(), std::time::Instant::now()));
+
+        state
+            .blocking_write()
+            .queue_pull_request_launch(2, "Pull request: B (could not open)".into());
+        state
+            .blocking_write()
+            .queue_pull_request_launch(1, "Pull request: A (could not open)".into());
+        drain_pull_request_launch(&state, &mut ui);
+        assert_eq!(
+            ui.status_message.as_ref().unwrap().0,
+            "Pull request: B (could not open)"
+        );
+    }
+
     /// Scenario: Open the schedule manager with no configured entries and
     /// inspect its rendered title. The dialog must call the collection
     /// "Schedules" even when the list is empty.
@@ -26487,6 +26716,8 @@ mod tests {
                 prompt_reports_declared: false,
                 output_set_status: false,
                 pending_question: None,
+                pull_request: None,
+                pull_request_revision: 0,
             },
         );
         state
@@ -30025,6 +30256,8 @@ mod tests {
             prompt_reports_declared: false,
             output_set_status: false,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -32949,6 +33182,8 @@ mod tests {
             prompt_reports_declared: false,
             output_set_status: false,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -33744,6 +33979,8 @@ mod tests {
             prompt_reports_declared: false,
             output_set_status: false,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         }
     }
 
@@ -34181,6 +34418,8 @@ mod tests {
             prompt_reports_declared: false,
             output_set_status: false,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
 
         // Spacious: get all 3
@@ -34223,6 +34462,8 @@ mod tests {
             prompt_reports_declared: false,
             output_set_status: false,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -34256,6 +34497,8 @@ mod tests {
             prompt_reports_declared: false,
             output_set_status: false,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
 
         let prompts = collect_recent_prompts(&session, 3);

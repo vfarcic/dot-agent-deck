@@ -40,7 +40,10 @@ pub fn path() -> String {
 
 pub fn agent_id(deck: &TuiDeck) -> String {
     assert!(
-        common::wait_until(Duration::from_secs(30), || {
+        // Load-scaled: the deck's daemon has to finish its pre-bind work
+        // first, which took 17 s at `io full` 58% and left a flat 30 s too
+        // little for the spawn after it.
+        common::wait_until(common::load_scaled(Duration::from_secs(30)), || {
             common::agent_records_on(deck.attach_socket_path()).len() == 1
         }),
         "expected one live pane:\n{}",

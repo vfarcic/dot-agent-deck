@@ -1182,6 +1182,32 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // PRD #1401: unconditional — every agent on a branch with a pull request
+    // gets a badge, and this is the only place that answer comes from. It runs
+    // `gh` only for a live session on a non-default branch of a GitHub
+    // repository; the `git` probes that find each session's branch still run
+    // for every live session with a working directory, once an interval and
+    // sooner after a turn ends.
+    let pull_request_handle = {
+        let registry = pty_registry.clone();
+        let monitor_state = state.clone();
+        let monitor_event_tx = event_tx.clone();
+        let interval = crate::pull_request::refresh_interval_from(
+            std::env::var(crate::pull_request::DOT_AGENT_DECK_PR_REFRESH_SECS_ENV)
+                .ok()
+                .as_deref(),
+        );
+        tokio::spawn(async move {
+            crate::pull_request::run_pull_request_monitor(
+                registry,
+                monitor_state,
+                monitor_event_tx,
+                interval,
+            )
+            .await;
+        })
+    };
+
     let result = run_hook_loop(
         listener,
         state,
@@ -1211,6 +1237,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     shell_activity_handle.abort();
     codex_rollout_handle.abort();
+    pull_request_handle.abort();
     scheduler_handle.abort();
     if let Some(h) = orphan_handle {
         h.abort();
@@ -2965,6 +2992,9 @@ fn notify_orchestrator_of_quota_block(
 ///   scrubbed ([`normalize_quota_blocked_metadata`]);
 /// * every other event type loses every `quota_blocked_*` key, so a reason can
 ///   only ever travel with the status it explains;
+/// * `pull_request` (PRD #1401), the daemon's report of a card's pull request,
+///   is stripped from every producer frame, and the hook loop drops a
+///   producer's `pull_request` event outright;
 /// * `quota_blocked_source` and `quota_blocked_lifted`, the daemon's own
 ///   markers (its Codex-rollout block, and the lift after a pane restart), are
 ///   stripped from every producer frame;
@@ -3008,6 +3038,13 @@ fn admit_producer_event(event: &mut AgentEvent) {
             }
         }
     }
+    // PRD #1401: the pull request a card's badge opens is the daemon's alone.
+    event
+        .metadata
+        .remove(crate::event::PULL_REQUEST_METADATA_KEY);
+    event
+        .metadata
+        .remove(crate::event::PULL_REQUEST_REVISION_METADATA_KEY);
     // Issue #1678: the background aggregate is the daemon's alone; a producer's
     // copy would otherwise reach every attached client's card.
     event.background = None;
@@ -5884,6 +5921,21 @@ async fn run_hook_loop_with_limits(
                             // Issue #714: normalise the quota-block keys, and hand
                             // a Codex event's rollout and turn to the tailer.
                             admit_producer_event(&mut event);
+                            // PRD #1401: a pull request report is the
+                            // daemon's alone — its URL is what a card's badge
+                            // opens — so a producer's copy goes no further.
+                            if event.event_type == crate::event::EventType::PullRequest {
+                                warn!(
+                                    verb = "agent_event",
+                                    claimed_pane = %escape_id_for_log(
+                                        event.pane_id.as_deref().unwrap_or("<none>")
+                                    ),
+                                    reason = "daemon_authored_event_type",
+                                    "hook socket: dropped a producer's pull_request event; \
+                                     only the daemon reports an agent's pull request"
+                                );
+                                continue;
+                            }
                             // An outside agent's rollout is not this daemon's to
                             // tail; the arm is for panes it spawned.
                             if !unproven {

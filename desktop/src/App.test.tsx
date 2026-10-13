@@ -2080,8 +2080,8 @@ describe("ControlDeck", () => {
     // states stay pinned with stub sections in
     // `components/SettingsSheet.test.tsx`, so this does not become their only
     // coverage. PRD #741's Daemons row took it to three and PRD #802 M4's Voice
-    // row to four.
-    expect(SETTINGS_SECTIONS).toHaveLength(4);
+    // row to four, and PRD #1401's GitHub row to five.
+    expect(SETTINGS_SECTIONS).toHaveLength(5);
     expect(screen.getByTestId("settings-layout")).not.toHaveClass("is-single");
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
 

@@ -37,6 +37,20 @@ pub enum EventType {
     /// and strips from every other event type. An older reader decodes it as
     /// [`EventType::Unknown`], a no-op.
     QuotaBlocked,
+    /// PRD #1401: the DAEMON's report of the pull request a session's branch
+    /// has — or, with no [`PULL_REQUEST_METADATA_KEY`], that it has none any
+    /// more. Synthesized only by [`crate::pull_request`]'s monitor and
+    /// broadcast straight onto the fan-out; the hook socket drops a producer's
+    /// copy (`daemon::admit_producer_event`), so the URL a client opens is
+    /// always one the daemon resolved.
+    ///
+    /// Status-neutral: it sets [`crate::state::SessionState::pull_request`] on
+    /// the card it names and nothing else ([`crate::state::AppState::apply_event`]).
+    /// An older reader decodes it as [`EventType::Unknown`], the `QuotaBlocked`
+    /// precedent, so no `PROTOCOL_VERSION` bump; the daemon stamps it at the
+    /// session's current `last_activity`, so even that reader's activity clock
+    /// does not move.
+    PullRequest,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
@@ -543,6 +557,23 @@ pub const ORCHESTRATION_ORPHANED_METADATA_VALUE: &str = "1";
 /// same placeholder it removes (today's stale card, unchanged), and the desktop
 /// reads any `SessionEnd` as "refetch the agent list now".
 pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
+
+/// `AgentEvent.metadata` key carrying the JSON of the
+/// [`crate::pull_request_info::PullRequestInfo`] an [`EventType::PullRequest`]
+/// reports (PRD #1401). Absent on that event means "no pull request".
+///
+/// **Daemon-authoritative**, like [`DAEMON_PANE_CLOSED_METADATA_KEY`]: the hook
+/// socket removes it from every producer frame and drops a producer's
+/// `pull_request` event outright, so a producer on the unauthenticated same-uid
+/// socket cannot put a URL of its choosing behind a card's badge.
+pub const PULL_REQUEST_METADATA_KEY: &str = "pull_request";
+
+/// `AgentEvent.metadata` key carrying, in decimal, the revision of the pull
+/// request an [`EventType::PullRequest`] reports — present on a report of none
+/// too (PRD #1401). It orders the report against a `ListAgents` reply, see
+/// [`crate::state::SessionState::pull_request_revision`]. Daemon-authoritative
+/// like [`PULL_REQUEST_METADATA_KEY`], and removed from producer frames with it.
+pub const PULL_REQUEST_REVISION_METADATA_KEY: &str = "pull_request_revision";
 
 /// The [`DAEMON_PANE_CLOSED_METADATA_KEY`] value meaning "yes". Fixed for the
 /// same reason as [`ORCHESTRATION_ORPHANED_METADATA_VALUE`].
@@ -1331,6 +1362,33 @@ impl AgentEvent {
                 .is_some_and(|v| v == DAEMON_PANE_CLOSED_METADATA_VALUE)
     }
 
+    /// PRD #1401: the pull request an [`EventType::PullRequest`] reports —
+    /// `Some(None)` when it reports none, `None` when this is not such an
+    /// event. A value that does not decode reads as "none": the badge is
+    /// dropped rather than left showing something the daemon no longer says.
+    pub fn pull_request_report(&self) -> Option<Option<crate::pull_request_info::PullRequestInfo>> {
+        if self.event_type != EventType::PullRequest {
+            return None;
+        }
+        Some(
+            self.metadata
+                .get(PULL_REQUEST_METADATA_KEY)
+                .and_then(|json| serde_json::from_str(json).ok()),
+        )
+    }
+
+    /// PRD #1401: the revision an [`EventType::PullRequest`] carries under
+    /// [`PULL_REQUEST_REVISION_METADATA_KEY`], or `None` when it carries none
+    /// that decodes — a daemon that sends none, or a different event.
+    pub fn pull_request_revision(&self) -> Option<u64> {
+        if self.event_type != EventType::PullRequest {
+            return None;
+        }
+        self.metadata
+            .get(PULL_REQUEST_REVISION_METADATA_KEY)
+            .and_then(|revision| revision.parse().ok())
+    }
+
     /// Issue #1678: is this the daemon's report that the named spawn's
     /// background work is over (see [`BACKGROUND_RETIRED_METADATA_KEY`])?
     /// Requires the shell event type and both identities, so a malformed frame
@@ -1569,8 +1627,10 @@ impl AgentEvent {
     /// authentication marker (auditor) — a forged raw `Error` without it marks a
     /// card exactly as it did before.
     pub fn is_daemon_synthetic(&self) -> bool {
-        matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
-            || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+        matches!(
+            self.event_type,
+            EventType::ShellBusy | EventType::ShellIdle | EventType::PullRequest
+        ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
             || self
                 .metadata
                 .contains_key(crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY)

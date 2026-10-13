@@ -180,6 +180,11 @@ pub(crate) const MAX_LOAD_FACTOR: f64 = 6.0;
 /// the base is returned unscaled rather than at the maximum multiplier. [`load_factor`]
 /// carries that reasoning and the measurement behind it.
 ///
+/// **Contention is the load average OR an I/O / memory stall, whichever is
+/// worse** — see [`stall_factor`]. The load average alone missed the starvation
+/// that failed `delegate_012` with an empty snapshot: 15 on 16 CPUs is a factor
+/// of 1.0, while `/proc/pressure/io` reported `full` for 68% of the window.
+///
 /// Apply this ONLY to a ceiling on something that must HAPPEN, never to a
 /// negative window in which something must NOT happen: the waits it feeds return
 /// the moment their condition holds, so a wider ceiling is free on the happy
@@ -187,11 +192,7 @@ pub(crate) const MAX_LOAD_FACTOR: f64 = 6.0;
 /// window is the opposite — it is always paid in full, and its length is part of
 /// what the test asserts.
 ///
-/// **Contention is the larger of two readings, not the load average alone.**
-/// The second is [`stall_factor`] over [`machine_stall_share`]: the share of
-/// recent time in which every non-idle task was stalled on IO or memory. The
-/// load average under-reads that starvation badly, and the waits this feeds
-/// failed on it: during PRD #1631's broad `cargo test-e2e` run thirteen tests
+/// PRD #1631's broad `cargo test-e2e` run met the same gap: thirteen tests
 /// failed with `io full` at 52-79% of their windows, and a reading on the same
 /// box afterwards showed a 1-minute load of 16.8 on 16 CPUs (a factor of 1.05)
 /// beside `io full avg10=60.5` (a factor of 2.5). `version_001`'s isolated rerun
@@ -200,91 +201,34 @@ pub(crate) const MAX_LOAD_FACTOR: f64 = 6.0;
 pub fn load_scaled(base: Duration) -> Duration {
     base.mul_f64(contention_factor(
         machine_load_per_cpu(),
-        machine_stall_share(),
+        load_context::full_stall_share(),
     ))
 }
 
 /// The factor [`load_scaled`] applies: the larger of [`load_factor`] and
-/// [`stall_factor`], so either kind of contention widens the ceiling and
-/// neither can narrow what the other widened. Both are already clamped to
-/// `1.0..=MAX_LOAD_FACTOR`, so the result is too.
+/// [`stall_factor`], so each source can only widen a ceiling the other left
+/// alone and the cap binds on both.
 pub(crate) fn contention_factor(load_per_cpu: Option<f64>, stall_share: Option<f64>) -> f64 {
     load_factor(load_per_cpu).max(stall_factor(stall_share))
 }
 
-/// How much slower than an idle box work progresses when every non-idle task
-/// is stalled for `stall_share` of the time (a fraction in `0.0..=1.0`): only
-/// the remaining `1 - stall_share` makes progress, so the same work takes
-/// `1 / (1 - stall_share)` as long. Clamped to `1.0..=MAX_LOAD_FACTOR`, so a
-/// box stalled 92.8% of the time — what `dispatch_009` measured when it failed
-/// alone — widens a ceiling 6x rather than 14x.
+/// The factor an I/O or memory stall widens a ceiling by: `1 / (1 - share)`,
+/// clamped to `1.0..=`[`MAX_LOAD_FACTOR`].
 ///
-/// An unmeasurable or non-finite share yields 1.0, for [`load_factor`]'s
-/// reason: the absence of a measurement is not evidence of a loaded machine.
+/// `share` is the fraction of recent time during which NOTHING runnable made
+/// progress (PSI `full`), so a child that needs a fixed amount of progress gets
+/// it at roughly `1 - share` of the idle rate, and needs `1 / (1 - share)` of
+/// the idle time. At `delegate_012`'s measured 68% that is ~3.1, turning the
+/// 8 s [`CHILD_BOOT_BASE`] that expired into ~25 s; at 83% or more the cap
+/// binds. Unmeasurable (`None`, non-finite) is 1.0 for [`load_factor`]'s reason.
 pub(crate) fn stall_factor(stall_share: Option<f64>) -> f64 {
     match stall_share {
         Some(share) if share.is_finite() => {
-            let progress = 1.0 - share.clamp(0.0, 1.0);
-            if progress <= 1.0 / MAX_LOAD_FACTOR {
-                MAX_LOAD_FACTOR
-            } else {
-                (1.0 / progress).clamp(1.0, MAX_LOAD_FACTOR)
-            }
+            let progress = (1.0 - share.clamp(0.0, 1.0)).max(1.0 / MAX_LOAD_FACTOR);
+            (1.0 / progress).clamp(1.0, MAX_LOAD_FACTOR)
         }
         _ => 1.0,
     }
-}
-
-/// The larger of the IO and memory `full` stall shares from Pressure Stall
-/// Information, as a fraction, or `None` where neither file can be read (any
-/// host but Linux, a kernel without `CONFIG_PSI`, a container hiding
-/// `/proc/pressure`).
-///
-/// Each file contributes the larger of its `avg10` and `avg60`: `avg10` sees a
-/// stall that began seconds before the wait did, and `avg60` keeps a lull of a
-/// few seconds inside a starved minute from reading as a quiet box. `full`
-/// rather than `some`, and IO and memory rather than CPU, for the reason
-/// [`load_context`]'s STARVED verdict uses the same three: `full` is the share
-/// during which nothing runnable made progress, and CPU contention is what the
-/// load average already measures.
-pub fn machine_stall_share() -> Option<f64> {
-    #[cfg(target_os = "linux")]
-    {
-        let read = |file: &str| {
-            std::fs::read_to_string(format!("/proc/pressure/{file}"))
-                .ok()
-                .and_then(|text| parse_psi_full_share(&text))
-        };
-        match (read("io"), read("memory")) {
-            (Some(io), Some(memory)) => Some(io.max(memory)),
-            (one, other) => one.or(other),
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
-/// The larger of the `avg10` and `avg60` fields on the `full` line of a PSI
-/// file, as a fraction rather than the percentage the kernel prints.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn parse_psi_full_share(text: &str) -> Option<f64> {
-    let line = text
-        .lines()
-        .find(|line| line.split_whitespace().next() == Some("full"))?;
-    let field = |name: &str| -> Option<f64> {
-        line.split_whitespace()
-            .find_map(|f| f.strip_prefix(name))?
-            .parse::<f64>()
-            .ok()
-            .filter(|v| v.is_finite())
-    };
-    let percent = match (field("avg10="), field("avg60=")) {
-        (Some(a), Some(b)) => a.max(b),
-        (one, other) => one.or(other)?,
-    };
-    Some(percent / 100.0)
 }
 
 /// The factor [`load_scaled`] multiplies its base by, split out from it so the
@@ -413,6 +357,15 @@ const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
 ///   generous ceiling might otherwise have slowed — a stand-in that DIED rather
 ///   than printed — still fails about as fast as it did against 2 s.
 ///
+/// **The ceiling is re-read while waiting, and can only move later.** Sizing it
+/// once at the start missed a stall that began mid-wait, and the load average
+/// missed an I/O stall altogether: `delegate_012` reported an empty snapshot
+/// after the flat 8 s at load 15 on 16 CPUs, with `io full` at 68% of its
+/// window. Each poll re-takes [`child_boot_budget`] from the wait's start and
+/// keeps the later deadline, so a stall that develops extends it while one that
+/// clears never shortens it, and it stays bounded by [`CHILD_BOOT_BASE`] x
+/// [`MAX_LOAD_FACTOR`].
+///
 /// Use it only for the boot leg. A wait on a BEHAVIOUR the daemon must perform
 /// belongs on that behaviour's own budget, and a negative window in which
 /// something must not happen must not be widened at all — its length is part of
@@ -423,13 +376,15 @@ pub async fn wait_for_child_first_output(
     agent_id: &str,
     needle: &[u8],
 ) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + child_boot_budget();
+    let started = tokio::time::Instant::now();
+    let mut deadline = started + child_boot_budget();
     let mut drain_deadline: Option<tokio::time::Instant> = None;
     loop {
         let snapshot = registry.snapshot(agent_id).unwrap_or_default();
         if snapshot.windows(needle.len()).any(|w| w == needle) {
             return snapshot;
         }
+        deadline = deadline.max(started + child_boot_budget());
         let now = tokio::time::Instant::now();
         if now >= deadline || drain_deadline.is_some_and(|drained| now >= drained) {
             return snapshot;
@@ -11802,14 +11757,6 @@ impl Drop for InProcDaemon {
 #[allow(dead_code)]
 pub const INPROC_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The wait [`spawn_inprocess_daemon`] gives each socket: the load-scaled
-/// [`daemon_task_start_budget`], floored at [`INPROC_DAEMON_READY_TIMEOUT`].
-#[cfg(unix)]
-#[allow(dead_code)]
-fn inproc_daemon_ready_budget() -> Duration {
-    daemon_task_start_budget().max(INPROC_DAEMON_READY_TIMEOUT)
-}
-
 /// Bring up an in-process daemon and block until its hook and attach sockets accept
 /// connections (so an agent's first CLI call can't race startup). Mirrors
 /// `e2e_delegate_work_done_chain.rs::spawn_daemon`, centralized so the readiness
@@ -11860,12 +11807,17 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
 
-    // A newly spawned daemon task must get a turn and finish synchronous
-    // startup before its sockets can accept. Each endpoint gets the harness's
-    // load-scaled task-start budget, but never less than
-    // [`INPROC_DAEMON_READY_TIMEOUT`].
-    let hook_budget = inproc_daemon_ready_budget();
-    let deadline = tokio::time::Instant::now() + hook_budget;
+    // A daemon task getting going, not a behaviour: both readiness waits below
+    // take the larger of `daemon_task_start_budget` (load-scaled) and
+    // `INPROC_DAEMON_READY_TIMEOUT` (a flat floor). They were flat 5 s
+    // ceilings, and all nine `pane_restart` tests failed together at the attach
+    // one in a `test-fast` run under `/proc/pressure/io full` 89% — the attach
+    // listener binds behind a synchronous `LoadedSchedules::load()`, so an I/O
+    // stall lands squarely in the gap between the two sockets. Each wait
+    // returns the instant its socket accepts, so an idle box pays nothing for
+    // the headroom.
+    let budget = daemon_task_start_budget().max(INPROC_DAEMON_READY_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + budget;
     let mut ready = false;
     while tokio::time::Instant::now() < deadline {
         if hook_path.exists() && tokio::net::UnixStream::connect(&hook_path).await.is_ok() {
@@ -11876,7 +11828,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         ready,
-        "in-process daemon hook socket {} was not accepting connections within {hook_budget:?}",
+        "in-process daemon hook socket {} was not accepting connections within {budget:?}",
         hook_path.display()
     );
 
@@ -11897,8 +11849,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     // harness-sized version of that bug being written next. `daemon_status.rs`
     // had already hand-rolled this wait for its own calls; the other consumer,
     // `delegate_respawn_recovery.rs`, had not, and nothing said it had to.
-    let attach_budget = inproc_daemon_ready_budget();
-    let attach_deadline = tokio::time::Instant::now() + attach_budget;
+    let attach_deadline = tokio::time::Instant::now() + budget;
     let mut attach_ready = false;
     while tokio::time::Instant::now() < attach_deadline {
         if tokio::net::UnixStream::connect(&attach_path).await.is_ok() {
@@ -11909,7 +11860,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         attach_ready,
-        "in-process daemon attach socket {} was not accepting connections within {attach_budget:?}",
+        "in-process daemon attach socket {} was not accepting connections within {budget:?}",
         attach_path.display()
     );
 

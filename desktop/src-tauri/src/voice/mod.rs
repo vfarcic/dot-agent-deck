@@ -671,6 +671,7 @@ pub mod test_support {
             authoring_kind: None,
             pending_question: None,
             tab: DesktopTab::Dashboard,
+            pull_request: None,
         }
     }
 

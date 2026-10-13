@@ -1209,6 +1209,24 @@ pub struct SessionSnapshot {
     /// [`AppState::seed_hydrated_session`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<crate::question::PendingQuestion>,
+    /// PRD #1401: the pull request this session's work produced, when the
+    /// daemon knows of one ([`SessionState::pull_request`]). Additive optional,
+    /// the `last_activity_ms` precedent: an older daemon omits the key and a
+    /// newer client reads its absence as no PR, an older client ignores it, so
+    /// no `PROTOCOL_VERSION` bump. The enums inside tolerate values a newer
+    /// daemon may add, so an unknown one never fails the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<crate::pull_request_info::PullRequestInfo>,
+    /// PRD #1401: the revision of [`Self::pull_request`]
+    /// ([`SessionState::pull_request_revision`]). A daemon that reports pull
+    /// requests always sends it, `Some(0)` for a session it has never reported
+    /// one for, so a client can refuse a reply older than a report it already
+    /// applied ([`AppState::seed_hydrated_session`]). Additive optional, like
+    /// the field it orders: an older daemon omits it and the client takes the
+    /// reply's value as before, and an older client ignores it, so no
+    /// `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_revision: Option<u64>,
     /// Issue #1678: the background work the agent left running after its turn
     /// ended, as the daemon counts it — `None` when there is nothing to show.
     /// Additive optional, the `blocked` precedent: an older reader ignores the
@@ -1347,6 +1365,19 @@ pub struct SessionState {
     /// question rules — or by the daemon when it answers the question or its
     /// held channel closes ([`AppState::clear_pending_question`]).
     pub pending_question: Option<crate::question::PendingQuestion>,
+    /// PRD #1401: the pull request this session's work produced, when the
+    /// daemon knows of one. Carried to clients by
+    /// [`SessionSnapshot::pull_request`].
+    pub pull_request: Option<crate::pull_request_info::PullRequestInfo>,
+    /// PRD #1401: which daemon report [`Self::pull_request`] came from. On the
+    /// daemon, the [`crate::pull_request::next_revision`] stamped when it last
+    /// changed, `0` before the first change; on a client, the revision of the
+    /// value it holds — from a report or a reply, the last resync's reply
+    /// taken outright, or `0` after a value that carried none. Carried by
+    /// [`SessionSnapshot::pull_request_revision`] and by the report's
+    /// [`crate::event::PULL_REQUEST_REVISION_METADATA_KEY`]. Not an activity
+    /// clock: it orders the pull request alone and moves nothing else.
+    pub pull_request_revision: u64,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -1530,6 +1561,8 @@ impl SessionState {
             // A pane property: `AppState::live_session_for` fills it.
             hook_generation: None,
             pending_question: self.pending_question.clone(),
+            pull_request: self.pull_request.clone(),
+            pull_request_revision: Some(self.pull_request_revision),
             background: held.and_then(|(background, _)| background.filter(|b| !b.is_empty())),
             background_revision: held.map(|(_, revision)| revision),
         }
@@ -2234,6 +2267,14 @@ pub struct AppState {
     /// holding a queue of them would invite the unbounded growth
     /// `pending_orchestration_surfaces` needs a cap for.
     pub pending_worktree_kept: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// PRD #1401: how a pull request launch from the `o` key settled — the
+    /// launch's number and the status-line message for it — waiting for the
+    /// render loop. Filled by the thread that watches the browser
+    /// ([`crate::system_browser::open_pull_request`]), which has no `UiState`,
+    /// and drained by the render loop, which shows it only while that launch
+    /// is still the latest. One outcome is kept, the most recent launch's
+    /// ([`Self::queue_pull_request_launch`]), as for `pending_worktree_kept`.
+    pub pending_pull_request_launch: Option<(u64, String)>,
     /// PRD #1223: panes the daemon announced as stopped, waiting for the render
     /// loop to drop them from the `TabManager`, the pane controller and the
     /// `UiState` maps — none of which the event subscriber can reach. The
@@ -5852,9 +5893,12 @@ pub(crate) fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
         // construction, matching `SessionStatus::Unknown`'s neutral rendering.
         // Issue #714: `QuotaBlocked` says the provider refused the agent, which
         // is the opposite of a turn.
+        // PRD #1401: `PullRequest` is the daemon's report about the branch,
+        // never the agent's.
         EventType::ShellBusy
         | EventType::ShellIdle
         | EventType::QuotaBlocked
+        | EventType::PullRequest
         | EventType::Unknown => false,
         // A turn is underway: a submitted prompt, a tool, a subagent, a
         // compaction, or a permission request raised by a tool the agent chose.
@@ -11174,6 +11218,11 @@ fn overlay_snapshot_onto_kept_card(
     snap: &SessionSnapshot,
     observed: Option<DateTime<Utc>>,
 ) {
+    // PRD #1401: the pull request is the daemon's alone and its report moves
+    // no `last_activity`, so the activity clock below cannot order it. Its own
+    // revision does, whatever the snapshot's stamp: see
+    // `adopt_snapshot_pull_request`.
+    adopt_snapshot_pull_request(session, snap);
     if let Some(observed) = observed
         && observed > session.last_activity
         && observed <= Utc::now()
@@ -11208,6 +11257,66 @@ fn overlay_snapshot_onto_kept_card(
     // snapshot whose activity stamp is equal or older (and an older one is
     // refused whatever its stamp).
     merge_snapshot_background(session, snap);
+}
+
+/// PRD #1401: take a hydration snapshot's pull request onto `session` unless
+/// the card already holds a newer one.
+///
+/// The daemon sets a session's value and broadcasts its report under one write
+/// lock, which orders the daemon's own state, not a client's two streams: a
+/// reply built before a report can arrive after that report's event did. Each
+/// change carries a daemon-assigned revision on both the snapshot and the
+/// event, so a snapshot whose revision is lower than the one the card last
+/// applied is the older answer and is ignored; a clear carries a revision like
+/// any other value. See [`apply_pull_request_revision`] for a snapshot with no
+/// revision.
+///
+/// Revisions order one daemon's answers only, so this comparison is sound
+/// only where the card's revision and the snapshot come from the same daemon:
+/// hydration, where the events applied before it came over the same
+/// connection. The resync after an event-stream gap, which is where a
+/// replacement daemon's first answer arrives, takes the snapshot outright
+/// instead ([`take_snapshot_pull_request`]).
+fn adopt_snapshot_pull_request(session: &mut SessionState, snap: &SessionSnapshot) {
+    apply_pull_request_revision(
+        session,
+        snap.pull_request.clone(),
+        snap.pull_request_revision,
+    );
+}
+
+/// PRD #1401: put `pull_request`, reported at `revision`, on `session` unless
+/// the card already holds a higher revision. A value with no revision comes
+/// from a daemon that sends none: it is applied as it always was, by arrival,
+/// and it resets the card's revision to `0`, so a revision kept from some
+/// earlier daemon cannot outlive the value it described and refuse a later
+/// daemon's reports.
+fn apply_pull_request_revision(
+    session: &mut SessionState,
+    pull_request: Option<crate::pull_request_info::PullRequestInfo>,
+    revision: Option<u64>,
+) {
+    match revision {
+        Some(revision) if revision < session.pull_request_revision => {}
+        revision => {
+            session.pull_request = pull_request;
+            session.pull_request_revision = revision.unwrap_or(0);
+        }
+    }
+}
+
+/// PRD #1401: take `snap`'s pull request and revision onto `session`
+/// outright, whatever revision the card held. For
+/// [`AppState::resync_after_event_gap`] only: its reply was built after
+/// everything the state holds (see that function), so it is the newer answer
+/// by construction, and it is the first answer from whichever daemon now
+/// serves the connection, possibly a replacement whose revisions are not
+/// comparable with the old one's. Adopting its revision as the card's new
+/// watermark is what lets that daemon's later reports land: they are stamped
+/// after the reply, by the same daemon, so none is lower than it.
+fn take_snapshot_pull_request(session: &mut SessionState, snap: &SessionSnapshot) {
+    session.pull_request = snap.pull_request.clone();
+    session.pull_request_revision = snap.pull_request_revision.unwrap_or(0);
 }
 
 /// The snapshot fields [`AppState::seed_hydrated_session`] copies onto a card:
@@ -11254,6 +11363,8 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
         .clone()
         .and_then(crate::question::PendingQuestion::sanitized);
     session.tool_count = snap.tool_count;
+    // PRD #1401: the pull request is not taken here. Each caller decides how
+    // (`adopt_snapshot_pull_request` or `take_snapshot_pull_request`).
     session.first_prompts = snap.first_prompts.clone();
     session.last_user_prompt = snap.last_user_prompt.clone();
     // PRD #20 blocker-4: restore the durable live-target so a history-only /
@@ -12499,6 +12610,27 @@ impl AppState {
         self.pending_worktree_kept = Some(kept);
     }
 
+    /// PRD #1401: record how pull request launch `launch` settled, for the
+    /// render loop to put on the status line. Launches settle in any order, so
+    /// an outcome for an earlier launch than the one already waiting is
+    /// dropped rather than put in its place: the render loop would drop it as
+    /// stale anyway, and the later launch's outcome would be lost with it.
+    pub fn queue_pull_request_launch(&mut self, launch: u64, message: String) {
+        if self
+            .pending_pull_request_launch
+            .as_ref()
+            .is_some_and(|(waiting, _)| *waiting > launch)
+        {
+            return;
+        }
+        self.pending_pull_request_launch = Some((launch, message));
+    }
+
+    /// PRD #1401: take the pending pull request launch outcome, if any.
+    pub fn take_pull_request_launch(&mut self) -> Option<(u64, String)> {
+        self.pending_pull_request_launch.take()
+    }
+
     /// PRD #1223: apply the daemon's pane-closed announcement
     /// ([`crate::event::DAEMON_PANE_CLOSED_METADATA_KEY`]) — the removal a TUI
     /// performs for its own close, for a stop some OTHER client asked for.
@@ -12523,6 +12655,60 @@ impl AppState {
     /// half then finds no tab and no attachment either. A session tagged with a
     /// DIFFERENT agent id is a successor's and is kept, and so is the pane's
     /// registration while any session remains on it.
+    /// PRD #1401: put the pull request an [`EventType::PullRequest`] reports on
+    /// the card it names — by session id, or by pane and agent for a card a
+    /// client filed under a placeholder key (the reuse guard's mapping). No
+    /// card is ever created for one: a report about a card the client does not
+    /// hold has nothing to land on, and the next `ListAgents` carries the
+    /// field anyway.
+    ///
+    /// A report carrying a revision lower than the one the card holds is older
+    /// than a reply the card already took, and is ignored; one with no revision
+    /// comes from a daemon that sends none, is applied as it always was and
+    /// resets the card's revision ([`apply_pull_request_revision`]). See
+    /// [`SessionState::pull_request_revision`].
+    fn apply_pull_request_report(
+        &mut self,
+        event: &AgentEvent,
+        pull_request: Option<crate::pull_request_info::PullRequestInfo>,
+    ) {
+        let revision = event.pull_request_revision();
+        for (id, session) in self.sessions.iter_mut() {
+            let same_card = *id == event.session_id
+                || (event.pane_id.is_some()
+                    && session.pane_id == event.pane_id
+                    && session.agent_id == event.agent_id);
+            if !same_card {
+                continue;
+            }
+            apply_pull_request_revision(session, pull_request.clone(), revision);
+        }
+    }
+
+    /// PRD #1401: the daemon side of [`Self::apply_pull_request_report`] —
+    /// set `pull_request` on every live session `want` maps, and return one
+    /// [`EventType::PullRequest`] per session whose value changed, for the
+    /// caller to broadcast while it still holds the lock it called this under.
+    ///
+    /// `want` maps a session id to the pull request its branch has now
+    /// (`None`: no badge). Sessions it does not name are left as they are.
+    pub fn set_pull_requests(
+        &mut self,
+        want: &HashMap<String, Option<crate::pull_request_info::PullRequestInfo>>,
+    ) -> Vec<AgentEvent> {
+        let mut changed = Vec::new();
+        for (id, session) in self.sessions.iter_mut() {
+            let Some(next) = want.get(id) else { continue };
+            if session.pull_request == *next {
+                continue;
+            }
+            session.pull_request = next.clone();
+            session.pull_request_revision = crate::pull_request::next_revision();
+            changed.push(crate::pull_request::report_event(session));
+        }
+        changed
+    }
+
     pub fn apply_daemon_pane_closed(&mut self, pane_id: &str, agent_id: Option<&str>) {
         let doomed: Vec<String> = self
             .sessions
@@ -12678,6 +12864,8 @@ impl AppState {
                 prompt_reports_declared: false,
                 output_set_status: false,
                 pending_question: None,
+                pull_request: None,
+                pull_request_revision: 0,
             },
         );
         if let Some((background, revision)) = held
@@ -12857,6 +13045,7 @@ impl AppState {
         };
         if minted {
             overlay_snapshot_fields(session, snap);
+            adopt_snapshot_pull_request(session, snap);
             // Issue #804: newer-only, per the doc comment. Deliberately
             // AFTER the carrier `overlay_snapshot_fields` pushed, which keeps
             // its minted stamp: the carrier's timestamp feeds the pane's event
@@ -13063,6 +13252,7 @@ impl AppState {
                     card.last_activity = observed;
                 }
                 overlay_snapshot_fields(card, snap);
+                take_snapshot_pull_request(card, snap);
                 // Qodo, PR #1559: the overlay can push a live-target carrier
                 // outside the accounted path; see `forget_unproven_journal_count`.
                 if let Some(entry) = self.unproven_sessions.get_mut(&card.session_id) {
@@ -16145,6 +16335,14 @@ impl AppState {
             }
             return AppliedEvent::StatusAsserted;
         }
+        // PRD #1401: the daemon's pull request report is a statement ABOUT a
+        // card's branch, not anything its agent did, so none of the machinery
+        // below (admission, activity, journal, status) applies to it. It only
+        // ever lands on a card that already exists.
+        if let Some(pull_request) = event.pull_request_report() {
+            self.apply_pull_request_report(&event, pull_request);
+            return AppliedEvent::Rejected;
+        }
         // Issue #697: the daemon evicted an outside agent's card to stay within
         // `MAX_UNPROVEN_SESSIONS`. Like the pane-closed announcement it is a
         // statement about a card, not a conversation ending, and it must not
@@ -17551,6 +17749,8 @@ impl AppState {
                 prompt_reports_declared: false,
                 output_set_status: false,
                 pending_question: None,
+                pull_request: None,
+                pull_request_revision: 0,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -18190,6 +18390,8 @@ impl AppState {
                 // which rely on exactly this: no status change.
                 false
             }
+            // PRD #1401: returned early at the top of `apply_event_unsettled`.
+            EventType::PullRequest => false,
             EventType::SessionEnd => unreachable!(),
         };
         // Issue #714: the reason exists only beside the status it explains.
@@ -26213,6 +26415,8 @@ while True:
                 prompt_reports_declared: false,
                 output_set_status: false,
                 pending_question: None,
+                pull_request: None,
+                pull_request_revision: 0,
             },
         );
 
@@ -28505,6 +28709,8 @@ while True:
             }),
             hook_generation: None,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
             background: None,
             background_revision: None,
         };
@@ -28573,6 +28779,8 @@ while True:
             }),
             hook_generation: None,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
             background: None,
             background_revision: None,
         };

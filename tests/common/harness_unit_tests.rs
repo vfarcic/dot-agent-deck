@@ -5068,80 +5068,43 @@ fn measured_load_still_widens_between_one_and_the_cap() {
         MAX_LOAD_FACTOR,
         "a runaway load average must clamp at the cap"
     );
+    assert!(
+        load_scaled(Duration::from_secs(8))
+            >= Duration::from_secs(8).mul_f64(load_factor(machine_load_per_cpu())),
+        "load_scaled must never scale by less than the measured load factor"
+    );
 }
 
-/// Scenario: Map a PSI `full` stall share to a slowdown factor: none or a
-/// non-finite share leaves a ceiling alone, a box stalled half the time
-/// doubles it, and a nearly fully stalled box hits the cap instead of
-/// multiplying a wait without bound.
+/// Scenario: An I/O or memory stall widens a ceiling by `1 / (1 - share)` — 1.0
+/// on a stall-free box, ~3.1 at the 68% `io full` that failed `delegate_012` at
+/// a load factor of 1.0, and the cap past it — while an unmeasurable or
+/// non-finite share leaves the base alone exactly as an unmeasurable load does.
 #[test]
-fn stall_share_widens_by_the_progress_it_leaves() {
-    assert_eq!(
-        stall_factor(None),
-        1.0,
-        "an unmeasured stall must not widen"
-    );
+fn an_io_stall_widens_the_ceiling_the_load_average_left_alone() {
+    assert_eq!(stall_factor(None), 1.0);
+    assert_eq!(stall_factor(Some(0.0)), 1.0);
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         assert_eq!(stall_factor(Some(bad)), 1.0, "{bad} is not a stall share");
     }
-    assert_eq!(stall_factor(Some(0.0)), 1.0, "a quiet box keeps its base");
-    assert_eq!(
-        stall_factor(Some(0.5)),
-        2.0,
-        "half the time stalled is half speed"
-    );
-    assert_eq!(
-        stall_factor(Some(0.928)),
-        MAX_LOAD_FACTOR,
-        "dispatch_009's isolated 92.8% must clamp at the cap"
-    );
+    assert_eq!(stall_factor(Some(0.5)), 2.0);
     assert_eq!(stall_factor(Some(1.0)), MAX_LOAD_FACTOR);
     assert_eq!(
-        stall_factor(Some(-0.3)),
+        stall_factor(Some(-0.5)),
         1.0,
-        "a share below zero never shrinks"
+        "a negative share never shrinks"
     );
-}
 
-/// Scenario: Combine the load average with the stall share and take the
-/// larger, so the IO-starved, low-load box PRD #1631 measured still widens
-/// its ceilings, and the result is what `load_scaled` applies.
-#[test]
-fn contention_is_the_larger_of_load_and_stall() {
-    // The reading behind this change: load 16.8 on 16 CPUs beside io full 60.5%.
-    let factor = contention_factor(Some(16.8 / 16.0), Some(0.605));
+    // `delegate_012`'s failing run: load 15.07 on 16 CPUs, `io full` 68.4%.
+    let starved = contention_factor(Some(15.07 / 16.0), Some(0.684));
     assert!(
-        (factor - 1.0 / (1.0 - 0.605)).abs() < 1e-9,
-        "an IO-starved box at a near-1.0 load must scale by its stall, got {factor}"
+        Duration::from_secs(8).mul_f64(starved) > Duration::from_secs(24),
+        "the measured starvation must widen the 8 s boot ceiling well past the \
+         ~10 s it took to fail, got factor {starved}"
     );
-    assert_eq!(
-        contention_factor(Some(44.0 / 16.0), Some(0.0)),
-        2.75,
-        "a CPU-loaded box with no IO stall keeps #709's load scaling"
-    );
-    assert_eq!(contention_factor(None, None), 1.0);
+    // Either source alone can widen; neither can push past the cap.
+    assert_eq!(contention_factor(Some(44.0 / 16.0), Some(0.0)), 2.75);
     assert_eq!(contention_factor(Some(1000.0), Some(1.0)), MAX_LOAD_FACTOR);
-    let base = Duration::from_secs(8);
-    let scaled = load_scaled(base);
-    assert!(
-        scaled >= base && scaled <= base.mul_f64(MAX_LOAD_FACTOR),
-        "load_scaled must stay between its base and the cap, got {scaled:?}"
-    );
-}
-
-/// Scenario: Read the `full` line of real `/proc/pressure/io` captures as a
-/// fraction, taking the larger of `avg10` and `avg60`, and get `None` for a
-/// file with no usable `full` line.
-#[test]
-fn psi_full_share_takes_the_larger_recent_average() {
-    let io = "some avg10=71.28 avg60=52.51 avg300=58.16 total=285448512127\n\
-              full avg10=60.50 avg60=47.42 avg300=52.35 total=240720008324\n";
-    assert_eq!(parse_psi_full_share(io), Some(0.605));
-    let lull = "full avg10=3.00 avg60=72.00 avg300=50.00 total=1\n";
-    assert_eq!(parse_psi_full_share(lull), Some(0.72));
-    assert_eq!(parse_psi_full_share("some avg10=9.00 avg60=9.00\n"), None);
-    assert_eq!(parse_psi_full_share("full avg10=x avg60=y\n"), None);
-    assert_eq!(parse_psi_full_share(""), None);
+    assert_eq!(contention_factor(None, None), 1.0);
 }
 
 // -----------------------------------------------------------------------
@@ -5175,6 +5138,41 @@ mod load_context_tests {
         assert_eq!(parse_psi_total("some avg10=1.00\n", "some"), None);
         assert_eq!(parse_psi_total("some total=abc\n", "some"), None);
         assert_eq!(parse_psi_total("", "full"), None);
+    }
+
+    /// Scenario: Read the `avg10=` field of a PSI line as a fraction — 7.21% is
+    /// 0.0721 — from the named line only, and get `None` for an absent line, a
+    /// missing field or a value that is not a non-negative number.
+    #[test]
+    fn psi_avg10_is_read_as_a_fraction_from_the_named_line_only() {
+        let io = "some avg10=70.00 avg60=1.00 avg300=1.00 total=1\n\
+                  full avg10=68.40 avg60=1.00 avg300=1.00 total=1\n";
+        let close = |got: Option<f64>, want: f64| got.is_some_and(|g| (g - want).abs() < 1e-9);
+        assert!(close(parse_psi_avg10(io, "full"), 0.684));
+        assert!(close(parse_psi_avg10(io, "some"), 0.70));
+        assert_eq!(parse_psi_avg10(PSI_CPU, "full"), Some(0.0));
+        assert_eq!(parse_psi_avg10("some total=1\n", "some"), None);
+        assert_eq!(parse_psi_avg10("full avg10=abc\n", "full"), None);
+        assert_eq!(parse_psi_avg10("full avg10=-1.00\n", "full"), None);
+        assert_eq!(parse_psi_avg10("", "full"), None);
+    }
+
+    /// Scenario: Read the `full` line of real `/proc/pressure/io` captures as a
+    /// fraction, taking the larger of `avg10` and `avg60`, and get `None` for a
+    /// file with no usable `full` line.
+    #[test]
+    fn psi_full_share_takes_the_larger_recent_average() {
+        let io = "some avg10=71.28 avg60=52.51 avg300=58.16 total=285448512127\n\
+                  full avg10=60.50 avg60=47.42 avg300=52.35 total=240720008324\n";
+        assert_eq!(parse_psi_recent_full_share(io), Some(0.605));
+        let lull = "full avg10=3.00 avg60=72.00 avg300=50.00 total=1\n";
+        assert_eq!(parse_psi_recent_full_share(lull), Some(0.72));
+        assert_eq!(
+            parse_psi_recent_full_share("some avg10=9.00 avg60=9.00\n"),
+            None
+        );
+        assert_eq!(parse_psi_recent_full_share("full avg10=x avg60=y\n"), None);
+        assert_eq!(parse_psi_recent_full_share(""), None);
     }
 
     /// Scenario: Two readings ten seconds apart whose stall counters grew by

@@ -135,6 +135,8 @@ fn card(orphaned: bool) -> SessionState {
         prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
     }
 }
 

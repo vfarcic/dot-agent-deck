@@ -222,6 +222,9 @@ describe("VOICE_ACTIONS", () => {
       "scrollToBottom",
       // PR #1451 round 4, D8: the New agent form's Command field.
       "setNewAgentCommand",
+      // PRD #1401: an agent's pull request in the app's own browser.
+      "openPullRequest",
+      "openPullRequestInBrowser",
     ];
 
     expect(Array.isArray(VOICE_ACTIONS)).toBe(false);
@@ -791,6 +794,103 @@ describe("VOICE_ACTIONS", () => {
     expect(screen.queryByTestId("orchestration-editor")).not.toBeInTheDocument();
     expect(screen.getByTestId("toast")).toHaveTextContent("That project is no longer one this daemon knows");
     expectOneRegistryDispatch("openProjects");
+  });
+});
+
+/**
+ * PRD #1401 — the pull request browser's entries, driven through the one
+ * dispatch seam voice uses.
+ */
+describe("the pull request browser by voice (PRD #1401)", () => {
+  const target = { deckId: "deck-a", agentId: "7", from: "overview" as const };
+  const base = () => ({
+    navigate: vi.fn(),
+    closeAgentView: vi.fn(),
+    reportNothingToClose: vi.fn(),
+    reportRefused: vi.fn(),
+  });
+
+  /** Scenario: "close" with the browser on top closes the browser, not the pane under it nor the voice overlay. */
+  it("puts the browser at the top of close's order", async () => {
+    const { dispatchVoiceAction } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    const context = { ...base(), closePullRequest: vi.fn(async () => undefined), dismissVoiceOverlay: vi.fn(), closeSettings: vi.fn() };
+
+    expect(dispatchVoiceAction("closeTopmost", context, { ...target, agentViewOpen: true })).toBe(true);
+    expect(context.closePullRequest).toHaveBeenCalledTimes(1);
+    expect(context.dismissVoiceOverlay).not.toHaveBeenCalled();
+    expect(context.closeAgentView).not.toHaveBeenCalled();
+    expect(context.closeSettings).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: PR #1680 review — Settings, or an overlay with no member of its
+   * own (the command menu, a configuration sheet), published because it is on
+   * top, closes before the pane under it.
+   */
+  it.each(["closeSettings", "closeOverlay"] as const)("closes %s's overlay before the pane", async (member) => {
+    const { dispatchVoiceAction } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    const close = vi.fn();
+    const context = { ...base(), [member]: close };
+
+    dispatchVoiceAction("closeTopmost", context, { ...target, agentViewOpen: true });
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(context.closeAgentView).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: "close" on the browser is reported once the page has closed, not when it was asked for. */
+  it("reports the browser's close once it has happened", async () => {
+    const { dispatchVoiceAction, PULL_REQUEST_CLOSED, PULL_REQUEST_CLOSING } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    const work = Promise.resolve("The pull request page did not close: refused");
+    const context = { ...base(), reportPending: vi.fn(), closePullRequest: vi.fn(() => work) };
+
+    dispatchVoiceAction("closeTopmost", context, { ...target, agentViewOpen: true });
+    expect(context.reportPending).toHaveBeenCalledWith(PULL_REQUEST_CLOSING, work, PULL_REQUEST_CLOSED);
+    expect(context.closeAgentView).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: with the browser not published (closed, or covered), close falls through as before. */
+  it("leaves close's order alone without the browser", async () => {
+    const { dispatchVoiceAction } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    const context = { ...base(), dismissVoiceOverlay: vi.fn() };
+
+    dispatchVoiceAction("closeTopmost", context, { ...target, agentViewOpen: true });
+    expect(context.dismissVoiceOverlay).toHaveBeenCalledTimes(1);
+    expect(context.closeAgentView).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: "open the PR" on an agent with none is refused in the app's own sentence. */
+  it("opens the pane's agent's pull request, or says why not", async () => {
+    const { dispatchVoiceAction } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    const opened = { ...base(), openPullRequest: vi.fn(() => undefined) };
+    expect(dispatchVoiceAction("openPullRequest", opened, target)).toBe(true);
+    expect(opened.openPullRequest).toHaveBeenCalledWith({ deckId: "deck-a", agentId: "7" });
+    expect(opened.reportRefused).not.toHaveBeenCalled();
+
+    const refused = { ...base(), openPullRequest: vi.fn(() => "Coder has no pull request.") };
+    dispatchVoiceAction("openPullRequest", refused, target);
+    expect(refused.reportRefused).toHaveBeenCalledWith("Coder has no pull request.");
+  });
+
+  /** Scenario: "open it in the browser" hands the page off and reports it once it has happened, or says no pull request is open. */
+  it("hands the open pull request to the system browser, or says none is open", async () => {
+    const { dispatchVoiceAction, PULL_REQUEST_HANDED_OFF, PULL_REQUEST_HANDING_OFF } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    const work = Promise.resolve(undefined);
+    const handed = { ...base(), reportPending: vi.fn(), openPullRequestInBrowser: vi.fn(() => work) };
+    expect(dispatchVoiceAction("openPullRequestInBrowser", handed, target)).toBe(true);
+    expect(handed.openPullRequestInBrowser).toHaveBeenCalledTimes(1);
+    expect(handed.reportPending).toHaveBeenCalledWith(PULL_REQUEST_HANDING_OFF, work, PULL_REQUEST_HANDED_OFF);
+    expect(handed.reportRefused).not.toHaveBeenCalled();
+
+    const none = { ...base(), openPullRequestInBrowser: vi.fn(() => "No pull request is open.") };
+    dispatchVoiceAction("openPullRequestInBrowser", none, target);
+    expect(none.reportRefused).toHaveBeenCalledWith("No pull request is open.");
+  });
+
+  /** A host that does not serve the browser refuses the row rather than throwing. */
+  it("refuses the browser's rows where nothing serves them", async () => {
+    const { dispatchVoiceAction } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    expect(dispatchVoiceAction("openPullRequest", base(), target)).toBe(false);
+    expect(dispatchVoiceAction("openPullRequestInBrowser", base(), target)).toBe(false);
   });
 });
 

@@ -104,6 +104,9 @@ pub mod project_config;
 // selected over the attach socket.
 pub mod project_resolve;
 pub mod prompt_delivery;
+// PRD #1401: the pull request an agent's work produced, on the session wire.
+pub mod pull_request;
+pub mod pull_request_info;
 pub mod question;
 pub mod quota_block;
 pub mod quota_signals;
@@ -119,6 +122,8 @@ pub mod self_upgrade;
 pub mod spawn;
 pub mod state;
 pub mod submit_echo;
+// PRD #1401: the TUI's `o` key, which hands a wire URL to the system browser.
+pub mod system_browser;
 pub mod tab;
 pub mod tab_layout;
 pub mod terminal_hangup;

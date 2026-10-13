@@ -257,6 +257,8 @@ mod tests {
             blocked: None,
             hook_generation: None,
             pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
             background: None,
             background_revision: None,
         }

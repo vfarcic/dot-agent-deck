@@ -179,8 +179,9 @@ fn delegate_into_booting_worker_drawn(timings: &[(&str, &str)], draw: &str) -> (
 
     let launches = work.join("worker-launches.log");
     assert!(
-        common::wait_until(Duration::from_secs(10), || !launch_pids(&launches)
-            .is_empty()),
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            !launch_pids(&launches).is_empty()
+        }),
         "worker did not launch; grid:\n{}",
         deck.snapshot_grid()
     );
@@ -233,7 +234,9 @@ fn delegate_052_clear_false_pointer_waits_for_a_booting_codex_worker() {
         ("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", "1500,1500"),
     ]);
     assert!(
-        common::wait_until(Duration::from_secs(20), || !submissions(&work).is_empty()),
+        common::wait_until(common::load_scaled(Duration::from_secs(20)), || {
+            !submissions(&work).is_empty()
+        }),
         "the worker never submitted anything; raw={:?}; grid:\n{}",
         String::from_utf8_lossy(&std::fs::read(work.join("worker-raw.log")).unwrap_or_default()),
         deck.snapshot_grid()
@@ -288,9 +291,11 @@ fn cut_short_pointer_is_sent_again(draw: &str) {
         draw,
     );
     assert!(
-        common::wait_until(Duration::from_secs(25), || submissions(&work)
-            .iter()
-            .any(|submission| is_whole_pointer(submission))),
+        common::wait_until(common::load_scaled(Duration::from_secs(25)), || {
+            submissions(&work)
+                .iter()
+                .any(|submission| is_whole_pointer(submission))
+        }),
         "the worker never received the whole task pointer; submissions={:?}; daemon log:\n{}\ngrid:\n{}",
         submissions(&work),
         std::fs::read_to_string(work.join("booting-worker.log")).unwrap_or_default(),

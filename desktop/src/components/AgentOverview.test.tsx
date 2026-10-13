@@ -43,6 +43,7 @@ import logoUrl from "../assets/logo.svg";
 import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, overviewFilterFacts, toOverviewAgent } from "./AgentOverview";
 import { filterDashboardAgents } from "../lib/dashboardFilter";
 import { DeckSelector } from "./DeckSelector";
+import { OpenPullRequest } from "../lib/prBrowser";
 
 // Existing overview/deck navigation cases exercise the experimental surface.
 // Each shipped-default case below removes this query parameter explicitly.
@@ -1812,6 +1813,57 @@ describe("AgentOverview", () => {
       expect(onNavigate).toHaveBeenCalledOnce();
       expect(onNavigate).toHaveBeenCalledWith({ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "overview" });
     }
+  });
+
+  /**
+   * Scenario: an agent whose daemon reported a pull request shows the same
+   * badge on its overview row as on its tile — the number, with the state and
+   * review in its accessible name — and an agent without one shows nothing new.
+   */
+  it("shows an agent's pull request badge on its row, and nothing for an agent without one (PRD #1401)", () => {
+    const snapshot = createFixtureSnapshot("connected");
+    const [withPr, withoutPr] = snapshot.agents;
+    expect(withoutPr).toBeDefined();
+    const agents = [{ ...withPr, pullRequest: { number: 12345, url: "https://github.com/o/r/pull/12345", state: "open" as const, review: "review_required" as const } }, { ...withoutPr, pullRequest: undefined }];
+    render(<AgentOverview runtime={runtime({ snapshot: { ...snapshot, agents } })} onNavigate={vi.fn()} />);
+
+    const row = screen.getByTestId(`overview-agent-${agentDomKey(withPr)}`);
+    const badge = within(row).getByTestId("overview-pr-badge");
+    expect(badge).toHaveTextContent("#12345");
+    expect(badge).toHaveAttribute("aria-label", "Pull request #12345: open, review required");
+    expect(badge).toHaveAttribute("data-pr-state", "open");
+    expect(badge).toHaveAttribute("data-pr-review", "review_required");
+    expect(within(screen.getByTestId(`overview-agent-${agentDomKey(withoutPr)}`)).queryByTestId("overview-pr-badge")).toBeNull();
+  });
+
+  /**
+   * Scenario: click the badge on an overview row. The pull request opens in
+   * the in-app browser for that agent on its own deck, and the agent's pane
+   * does not also open; without an in-app browser the badge is plain text.
+   */
+  it("opens the pull request in the app from the row's badge, without opening the pane (PRD #1401)", () => {
+    const onNavigate = vi.fn();
+    const openPullRequest = vi.fn();
+    const snapshot = createFixtureSnapshot("connected");
+    const [first] = snapshot.agents;
+    const agent = { ...first, pullRequest: { number: 77, url: "https://github.com/o/r/pull/77", state: "merged" as const, review: "approved" as const } };
+    const { unmount } = render(
+      <OpenPullRequest.Provider value={openPullRequest}>
+        <AgentOverview runtime={runtime({ snapshot: { ...snapshot, agents: [agent] } })} onNavigate={onNavigate} />
+      </OpenPullRequest.Provider>,
+    );
+    const badge = within(screen.getByTestId(`overview-agent-${agentDomKey(agent)}`)).getByRole("button", { name: "Pull request #77: merged, approved" });
+    fireEvent.click(badge);
+    expect(openPullRequest).toHaveBeenCalledOnce();
+    expect(openPullRequest).toHaveBeenCalledWith({ deckId: agent.daemonId, agentId: agent.id });
+    expect(onNavigate).not.toHaveBeenCalled();
+    unmount();
+
+    // No shell to open it in: the badge still says what it is, and is no button.
+    render(<AgentOverview runtime={runtime({ snapshot: { ...snapshot, agents: [agent] } })} onNavigate={onNavigate} />);
+    const plain = within(screen.getByTestId(`overview-agent-${agentDomKey(agent)}`)).getByTestId("overview-pr-badge");
+    expect(plain.tagName).toBe("SPAN");
+    expect(plain).toHaveAttribute("role", "img");
   });
 
   /**

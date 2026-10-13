@@ -767,6 +767,13 @@ pub struct DesktopAgent {
     /// the agent waits on nothing, and from a daemon that predates the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<DesktopPendingQuestion>,
+    /// PRD #1401: the pull request this agent's work produced, copied through
+    /// from `SessionSnapshot.pull_request`. Its fields are single words and its
+    /// enum values snake_case, so the core type is the webview's shape as is.
+    /// Absent when the record carries no `live` snapshot, the daemon knows of
+    /// no PR, or the daemon predates the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<dot_agent_deck::pull_request_info::PullRequestInfo>,
     pub tab: DesktopTab,
 }
 
@@ -2120,6 +2127,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         .and_then(|snapshot| snapshot.live_target.as_ref())
         .map(|target| write_lease_name(&target.writable));
     let last_activity_ms = live.and_then(|snapshot| snapshot.last_activity_ms);
+    let pull_request = live.and_then(|snapshot| snapshot.pull_request.clone());
     // Issue #714: only beside the status it explains.
     let blocked = live
         .filter(|snapshot| snapshot.status == SessionStatus::Blocked)
@@ -2180,6 +2188,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         prompt_keys,
         authoring_kind: record.authoring_kind,
         pending_question,
+        pull_request,
         tab,
     }
 }
@@ -3904,6 +3913,8 @@ mod tests {
                 blocked: None,
                 hook_generation: None,
                 pending_question: None,
+                pull_request: None,
+                pull_request_revision: None,
                 background: None,
                 background_revision: None,
             }),

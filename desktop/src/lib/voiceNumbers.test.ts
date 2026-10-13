@@ -75,6 +75,21 @@ describe("answerNumberLocally", () => {
     expect(answerNumberLocally("open agent 1", agents("Plan", "Docs", "agent-1"), 7)).toEqual({ kind: "ambiguous", choices: [{ section: "agent", number: 1 }, { section: "agent", number: 3 }] });
   });
 
+  /* PRD #1401 — `voice::numbers`' test of the same name: an agent's pull request by the number beside it. */
+  it("answers a pull request asked for by an agent's number", () => {
+    const heard = agents("Plan", "Desktop", "Contract", "Docs");
+    const pullRequest = (of: unknown) => ({ kind: "pull_request", of });
+    for (const said of ["open the PR for agent 3", "open agent 3's pull request", "Show the pull request for agent three.", "open agent 3's P.R.", "open the pull request of the agent 3", "agent 3's PR", "show me agent 3's PR"]) {
+      expect(answerNumberLocally(said, heard, 7), said).toEqual(pullRequest({ kind: "selected", section: "agent", number: 3 }));
+    }
+    expect(answerNumberLocally("open the PR for agent 9", heard, 7)).toEqual(pullRequest({ kind: "out_of_range", section: "agent", number: 9, elsewhere: [] }));
+    expect(answerNumberLocally("open the PR for agent 3", heard, 8)).toEqual(pullRequest({ kind: "stale" }));
+    expect(answerNumberLocally("open the PR for agent 1", agents("Plan", "agent-1"), 7)).toEqual(pullRequest({ kind: "ambiguous", choices: [{ section: "agent", number: 1 }, { section: "agent", number: 2 }] }));
+    for (const said of ["open the PR", "open the PR for the tester", "open coder two's PR", "open the PR for directory 3", "open the PR for agent", "close the PR for agent 3", "open the PR 3"]) {
+      expect(answerNumberLocally(said, heard, 7), said).toEqual({ kind: "not_number" });
+    }
+  });
+
   /* Qodo on PR #1451: a name ending in a number said in two words is that whole number. */
   it("collides a name ending in a compound number with that number only", () => {
     const labels = Array.from({ length: 30 }, (_, at) => `Task ${at + 1}`);

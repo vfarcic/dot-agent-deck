@@ -36,6 +36,7 @@ expression: text
         │  y / n              Approve / deny permission                                                       │         
         │  s / Ctrl+s         Schedules manager                                                               │         
         │  m / Ctrl+m         Host of this deck                                                               │         
+        │  o                  Open pull request                                                               │         
         │  u / Ctrl+u         Upgrade (update badge)                                                          │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  F1                 Toggle this help                                                                │         

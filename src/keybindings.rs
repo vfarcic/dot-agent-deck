@@ -92,6 +92,8 @@ pub enum Action {
     DenyPermission,
     GenerateConfig,
     OpenScheduledTasks,
+    /// PRD #1401: open the selected card's pull request in the system browser.
+    OpenPullRequest,
     /// Issue #1635: open the upgrade dialog the footer's update badge names.
     OpenUpgrade,
     ScrollPaneUp,
@@ -338,6 +340,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         default: "s",
         description: "Schedules manager",
     },
+    // PRD #1401: open the selected card's pull request in the system browser.
+    // Default `o`; a card without a pull request opens nothing.
+    ActionSpec {
+        action: Action::OpenPullRequest,
+        section: Section::Dashboard,
+        name: "open_pull_request",
+        default: "o",
+        description: "Open pull request",
+    },
     // Issue #1635: open the upgrade dialog the footer's update badge names.
     // Default `u`, free in command mode; the badge and the help overlay read
     // the active binding, so a rebind shows there too.
@@ -451,6 +462,8 @@ pub const PLAIN_LETTER_ALIASES: [Action; 6] = [
 ///
 /// Left out on purpose: navigation (`j k h l`), the digits, `?`, `/`, `y`,
 /// `n`, `Enter` and `Esc`, which have no command a `Ctrl` form would name.
+/// `o` (open the pull request, PRD #1401) is a plain letter with no `Ctrl`
+/// form either.
 ///
 /// `Ctrl+M` is the same byte as `Enter` in a terminal that does not
 /// disambiguate escape codes, so there it arrives as `Enter` and focuses the
