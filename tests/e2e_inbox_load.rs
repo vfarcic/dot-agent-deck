@@ -155,6 +155,25 @@ fn delivered(
     if doorbell_only {
         codex_cli_listing(deck, pane, work, ids);
     }
+    let acknowledged = ids
+        .iter()
+        .filter(|(id, _, _)| message(deck, pane, id).is_some_and(|m| m["state"] == "acknowledged"))
+        .count();
+    let acted = ids
+        .iter()
+        .filter(|(_, phase, n)| {
+            std::fs::read_to_string(work.join(format!("inbox-load-{phase}-{n}-49ab.txt")))
+                .is_ok_and(|text| text == format!("INBOX-LOAD-ACTION-{phase}-{n}"))
+        })
+        .count();
+    eprintln!(
+        "inbox load: phase={} total={} acknowledged={acknowledged} acted={acted} remaining_budget={:?}",
+        ids.first()
+            .map(|(_, phase, _)| phase.as_str())
+            .unwrap_or("empty"),
+        ids.len(),
+        remaining(deadline)
+    );
 }
 
 fn idle(deck: &TuiDeck, pane: &Pane, deadline: Instant) {
@@ -294,7 +313,22 @@ fn exercise(deck: &TuiDeck, pane: &Pane, work: &Path, kind: &str, doorbell_only:
             NATIVE_DEADLINE
         };
     seeds(deck, work, kind, deadline, doorbell_only);
-    idle(deck, pane, deadline);
+    if kind == "opencode" {
+        // An untouched home screen has no completed session turn from which
+        // OpenCode could emit Idle. Its visible composer and armed native
+        // watcher are the precondition for the first batch; after that batch
+        // we still require the genuine session Idle status below.
+        assert!(
+            common::wait_until(remaining(deadline), || {
+                inbox::screen(deck, pane).contains("Ask anything")
+                    && inbox::listing(deck, pane)["armed"].as_u64().unwrap_or(0) > 0
+            }),
+            "untouched OpenCode home must be visible and armed: {}",
+            deck.snapshot_grid()
+        );
+    } else {
+        idle(deck, pane, deadline);
+    }
     let idle_ids = batch(deck, pane, work, "idle", 5);
     delivered(deck, pane, work, &idle_ids, deadline, doorbell_only);
     idle(deck, pane, deadline);
