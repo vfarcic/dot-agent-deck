@@ -1451,7 +1451,7 @@ pub struct AppState {
     /// [`Self::apply_event`]'s `SessionEnd` branch for the ownership check.
     ///
     /// **An entry is PERMANENT, and that is the policy rather than a missing
-    /// cleanup.** [`Self::agent_generation_ended`] is a `contains_key`, so from
+    /// cleanup.** Any count above zero is a witnessed end, so from
     /// the first end onward every unnamed automatic delivery bound to that agent
     /// is refused *for as long as the pane it targets has no current
     /// generation* — which is precisely the state the guard exists to refuse,
@@ -5894,27 +5894,6 @@ impl AppState {
             .get(agent_id)
             .copied()
             .unwrap_or(0)
-    }
-
-    /// Issue #915 (finding 4): has `agent_id` ever had a hook generation END?
-    ///
-    /// The daemon's write guard reads this to tell a genuinely sessionless agent
-    /// (never any generation → accept, the carve-out) from one whose
-    /// conversation has closed and whose successor generation has not announced
-    /// itself (→ refuse). `false` for an agent this daemon has recorded no
-    /// confirmed `SessionEnd` for, which includes every producer that named no
-    /// agent id and every event whose named agent did not hold the named pane —
-    /// see the type's docs for those two fail-open limits.
-    ///
-    /// **"Ever" is literal: this latches, and no path clears it as cleanup.**
-    /// The refusal it drives is nonetheless conditional, because the guard reads
-    /// it only after finding the pane has NO current generation — so a successor
-    /// that announces itself takes the decision away from this witness
-    /// entirely. See
-    /// [`Self::agent_generation_closures`] for why permanence is the policy and
-    /// what it costs.
-    pub fn agent_generation_ended(&self, agent_id: &str) -> bool {
-        self.agent_generation_closures.contains_key(agent_id)
     }
 
     /// PRD #20 Greptile finding #3: the write-semantics of the newest live
@@ -12228,7 +12207,6 @@ mod tests {
         state.register_pane("pane".to_string());
 
         // Nothing has ended yet: the guard's carve-out applies to every agent.
-        assert!(!state.agent_generation_ended("agent-1"));
         assert_eq!(state.agent_generation_closures("agent-1"), 0);
 
         // A conversation runs and ends on `agent-1`. The pane's generation is
@@ -12242,24 +12220,23 @@ mod tests {
             "the ended generation must leave `pane_hook_session` empty — the ambiguity this \
              witness exists to resolve"
         );
-        assert!(state.agent_generation_ended("agent-1"));
         assert_eq!(state.agent_generation_closures("agent-1"), 1);
 
         // The pane changes hands. `agent-2` has never had a generation, so it
         // must NOT inherit its predecessor's witness — a pane-keyed witness
         // would refuse it here, and every later occupant of this pane id too.
-        assert!(
-            !state.agent_generation_ended("agent-2"),
+        assert_eq!(
+            state.agent_generation_closures("agent-2"),
+            0,
             "a successor on the same pane id must not inherit the departed agent's witness"
         );
-        assert_eq!(state.agent_generation_closures("agent-2"), 0);
 
         // A second rollover on `agent-1` (a `/clear`) counts again, and does not
         // touch the successor.
         state.apply_event(start("gen-b", "pane", "agent-1", 3));
         state.apply_event(end("gen-b", "pane", Some("agent-1"), 4));
         assert_eq!(state.agent_generation_closures("agent-1"), 2);
-        assert!(!state.agent_generation_ended("agent-2"));
+        assert_eq!(state.agent_generation_closures("agent-2"), 0);
 
         // A producer that named NO agent id records nothing. The guard then
         // behaves exactly as it did before this change for that producer — the
@@ -12273,8 +12250,9 @@ mod tests {
             state.pane_hook_session_id("external").is_none(),
             "the anonymous end must still clear the pane's generation"
         );
-        assert!(
-            !state.agent_generation_ended("agent-3"),
+        assert_eq!(
+            state.agent_generation_closures("agent-3"),
+            0,
             "an event that names no agent id witnesses nothing — fail-open by design"
         );
         assert_eq!(
@@ -18439,7 +18417,7 @@ mod tests {
             .find(|(map, _)| *map == "agent_generation_closures")
             .map(|(_, size)| *size);
         assert_eq!(closures, Some(0), "{sizes:?}");
-        assert!(!client.agent_generation_ended(AUDIT_SURVIVOR));
+        assert_eq!(client.agent_generation_closures(AUDIT_SURVIVOR), 0);
     }
 
     /// An outside agent's start on `pane`, as the daemon relays it.

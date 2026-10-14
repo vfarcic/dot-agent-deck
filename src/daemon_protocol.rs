@@ -8404,8 +8404,9 @@ mod tests {
                 "an outside pane left with no card keeps no per-pane state, so a pane-local \
                  poison does not stay on it either"
             );
-            assert!(
-                !guard.agent_generation_ended(&victim),
+            assert_eq!(
+                guard.agent_generation_closures(&victim),
+                0,
                 "a SessionEnd for a pane the named agent does not hold must witness NOTHING \
                  against that agent"
             );
