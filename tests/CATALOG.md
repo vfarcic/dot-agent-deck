@@ -7416,7 +7416,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Layer:** L1 unit (`src/doorbell.rs`).
 - **Agent:** none.
 - **Asserts:** the recorded unsubmitted line survives an outstanding ring and an owed cleanup, and is cleared by the cleanup CR and by a new ring.
-- **Does not assert:** the daemon's doorbell task recording the line after a write, or a flush-only ring leaving none (`inbox/codex/014`, `inbox/codex/015`).
+- **Does not assert:** the daemon's doorbell task recording the line after a write, or a flush-only ring keeping the earlier line recorded (`inbox/codex/014`, `inbox/codex/017`).
 - **Platform coverage:** mac+linux+windows.
 
 #### inbox/status
@@ -7812,11 +7812,25 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** that screen text proves who wrote it — a process drawing the deck's exact line still earns the CR (`docs/develop/agent-messaging.md`, "Doorbell guards").
 - **Cost:** none.
 
-##### inbox/codex/015 — A line the deck already flushed gets no second flush.
+##### inbox/codex/015 — No flush goes once the message has left `queued`.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
 - **Agent:** the `inbox/codex/013` stand-in, its screen repainted by the test.
-- **Asserts:** after the deck's flush submitted its stranded line, a composer showing that same line again receives no byte across two due rings while the message stays `queued`; an empty composer then takes the next ring.
-- **Does not assert:** how the line got back into a real Codex composer; the repaint stands in for retained or retyped text.
+- **Asserts:** after the deck's flush submitted its stranded line and the composer shows that line again, fetching the message brings exactly its one cleanup CR and then no byte while the line stays painted; a second message queued under that line, which the deck has no record of, gets no byte until an empty composer takes its ring.
+- **Does not assert:** how the line got back into a real Codex composer; the repaint stands in for retained or retyped text. Repeated flushes while the message is still `queued` are allowed, one per ring (`inbox/codex/017`).
+- **Cost:** none.
+
+##### inbox/codex/016 — A doorbell line whose Enter became a newline in Codex's composer is submitted by the next ring.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** wrapped Codex-composer stand-in that takes the first Enter after text as a newline in its composer, leaving the line on the prompt row and its cursor on the empty row below at the composer indent, as Codex 0.160.0 did under CPU pressure (live `inbox/load/004`, 2026-10-14).
+- **Asserts:** the next ring sends one bare CR (no second line typed on top), and that CR submits the line itself.
+- **Does not assert:** why a real Codex took the Enter as a newline; the fixture recreates the measured end-state.
+- **Cost:** none.
+
+##### inbox/codex/017 — A swallowed flush is retried by the next ring.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** the `inbox/codex/016` stand-in, which also ignores the first flushing CR.
+- **Asserts:** after the first flush CR is swallowed, the following ring sends another lone CR, which submits the still-stranded line.
+- **Does not assert:** that a real Codex swallows a flush; this pins the liveness bound, one lone CR per ring while the deck's own line stays stranded.
 - **Cost:** none.
 
 #### inbox/opencode

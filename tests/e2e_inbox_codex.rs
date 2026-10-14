@@ -60,21 +60,34 @@ while True:
         if prompts:
             last = prompts[-1]
             while last + 1 < len(rows) and rows[last + 1].strip(): last += 1
-            os.write(1, f'\x1b[{last + 1};{len(rows[last].rstrip()) + 1}H'.encode())
+            if draft.endswith(b'\n'):
+                # Its Enter taken as a newline: the cursor is on the empty
+                # composer row below the line, at the composer indent.
+                os.write(1, f'\x1b[{last + 2};3H'.encode())
+            else:
+                os.write(1, f'\x1b[{last + 1};{len(rows[last].rstrip()) + 1}H'.encode())
         previous = screen
     if select.select([0],[],[],0.025)[0]:
         chunk = os.read(0,4096)
         if not chunk: break
         capture.write(chunk)
-        strand = os.path.exists(base + '.strand')
+        newline = os.path.exists(base + '.newline')
+        strand = newline or os.path.exists(base + '.strand')
         if strand or os.path.exists(base + '.keep'):
             for c in chunk:
                 if c == 21: draft.clear()
                 elif c == 13:
                     # Codex's paste-burst Enter keeps the draft. A stranding
-                    # Codex drops only the first Enter after text, then submits.
-                    if strand and (not draft or os.path.exists(base + '.dropped')):
-                        with open(base + '.submitted', 'ab') as f: f.write(bytes(draft) + b'\n')
+                    # Codex drops only the first Enter after text, then submits;
+                    # a newline one (Codex 0.160 under load) takes that Enter as
+                    # a newline in the composer instead, and with `.swallow`
+                    # present ignores the next Enter too.
+                    if newline and draft and not draft.endswith(b'\n'):
+                        draft.append(10)
+                    elif newline and draft and os.path.exists(base + '.swallow'):
+                        os.remove(base + '.swallow')
+                    elif strand and (not draft or newline or os.path.exists(base + '.dropped')):
+                        with open(base + '.submitted', 'ab') as f: f.write(bytes(draft).rstrip(b'\n') + b'\n')
                         draft.clear()
                     elif strand: open(base + '.dropped', 'w').close()
                 else: draft.append(c)
@@ -433,13 +446,13 @@ fn codex_014_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
     );
 }
 
-/// Scenario: Start wrapped synthetic Codex that drops the first Enter after text, queue a task, and let the next ring flush the stranded line. Then repaint the composer holding that same line again, as if typed back in, with the message still queued: the deck already flushed its line, so the composer must receive zero bytes until it is empty again, when the ring resumes.
+/// Scenario: Start wrapped synthetic Codex that drops the first Enter after text, queue a task, and let the next ring flush the stranded line. Then repaint the composer holding that same line and fetch the message so it leaves `queued`: the owed cleanup is the one carriage return that goes, and after it the still-painted line gets zero bytes. A second message queued under that line, which the deck never typed there, gets nothing either until the composer is empty again.
 #[spec("inbox/codex/015")]
 #[test]
-fn codex_015_a_line_the_deck_already_flushed_gets_no_second_flush() {
+fn codex_015_no_flush_once_the_message_has_left_queued() {
     let codex = Codex::new_with(
         COMPOSER,
-        &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400,2000")],
+        &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400,60000")],
     );
     let strand = codex.pane.capture.with_extension("strand");
     std::fs::write(strand.with_extension("empty"), COMPOSER).unwrap();
@@ -459,25 +472,142 @@ fn codex_015_a_line_the_deck_already_flushed_gets_no_second_flush() {
     assert!(
         common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
             .contains(&format!("›  {}", line.trim_start()))),
-        "the repainted line must be on screen before the next ring is due: {}",
+        "the repainted line must be on screen before the message leaves queued: {}",
+        screen(&codex.daemon, &codex.pane)
+    );
+    fetch(&codex.daemon, &codex.pane, true);
+    let cleaned = format!("{flushed}\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane) == cleaned.as_bytes()),
+        "the message leaving queued is owed its one cleanup CR: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+    // The stand-in repaints its empty composer after that CR; paint the line
+    // back only once it has, so its repaint cannot land on top.
+    assert!(
+        common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
+            .contains("› Ask Codex to do anything")),
+        "the stand-in must repaint after the cleanup CR: {}",
+        screen(&codex.daemon, &codex.pane)
+    );
+    std::fs::write(codex.pane.capture.with_extension("screen"), holding(&line)).unwrap();
+    assert!(
+        common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
+            .contains(&format!("›  {}", line.trim_start()))),
+        "the line must be painted back: {}",
         screen(&codex.daemon, &codex.pane)
     );
     assert!(
         !common::wait_until(Duration::from_millis(4500), || bytes(&codex.pane).len()
-            > flushed.len()),
-        "a line the deck already flushed must get no second CR: {:?}\nPane:\n{}",
+            > cleaned.len()),
+        "once the message has left queued its line gets no further CR: {:?}\nPane:\n{}",
         String::from_utf8_lossy(&bytes(&codex.pane)),
         screen(&codex.daemon, &codex.pane)
     );
-    state(&codex.daemon, &codex.pane, &id, "queued");
+    let next = codex.queued(BODY);
+    assert!(
+        !common::wait_until(Duration::from_millis(4500), || bytes(&codex.pane).len()
+            > cleaned.len()),
+        "a line the deck has no record of gets nothing, not even for a due ring: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+    state(&codex.daemon, &codex.pane, &next, "queued");
     // Control: once the composer is empty the doorbell rings again.
     std::fs::write(codex.pane.capture.with_extension("screen"), COMPOSER).unwrap();
-    let rung_again = format!("{flushed}\r{line}\r");
+    let rung_again = format!("{cleaned}{}\r", fixed_line(&next));
     assert!(
         common::wait_until(WAIT, || bytes(&codex.pane)
             .starts_with(rung_again.as_bytes())),
         "an empty composer must take the next ring: {:?}",
         String::from_utf8_lossy(&bytes(&codex.pane))
+    );
+}
+
+/// Scenario: Start wrapped synthetic Codex that, as real Codex 0.160.0 did under CPU pressure, takes the doorbell's Enter as a newline in its composer, leaving the line there with the cursor on the empty row below it at the composer indent, and queue a task. The next ring must submit the line with one bare carriage return instead of waiting forever, and type no second line on top of it.
+#[spec("inbox/codex/016")]
+#[test]
+fn codex_016_a_line_whose_enter_became_a_newline_is_submitted_by_the_next_ring() {
+    let codex = Codex::new_with(COMPOSER, &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400")]);
+    let newline = codex.pane.capture.with_extension("newline");
+    std::fs::write(newline.with_extension("empty"), COMPOSER).unwrap();
+    std::fs::write(&newline, "").unwrap();
+    let id = codex.queued(BODY);
+    let line = fixed_line(&id);
+    let rung = format!("{line}\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane).starts_with(rung.as_bytes())
+            && screen(&codex.daemon, &codex.pane)
+                .contains(&format!("›  {}", line.trim_start()))),
+        "the stand-in must leave the rung line in its composer: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+    let flushed = format!("{rung}\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane).starts_with(flushed.as_bytes())),
+        "the next ring must submit the line with a bare CR: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+    let submitted = newline.with_extension("submitted");
+    assert!(
+        common::wait_until(WAIT, || std::fs::read_to_string(&submitted)
+            .unwrap_or_default()
+            .lines()
+            .next()
+            == Some(line.as_str())),
+        "the flush must submit the line itself: {:?}",
+        std::fs::read_to_string(&submitted)
+    );
+    // The stand-in keeps the message queued, so the doorbell rings again:
+    // that ring starts with its own pre-ring CR, never a line on top.
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane).len() > flushed.len()),
+        "the doorbell must ring again while the message stays queued"
+    );
+    assert_eq!(
+        bytes(&codex.pane)[flushed.len()],
+        b'\r',
+        "no second line may be typed on top of the flush: {:?}",
+        String::from_utf8_lossy(&bytes(&codex.pane))
+    );
+}
+
+/// Scenario: Start wrapped synthetic Codex that takes the doorbell's Enter as a newline in its composer and then also ignores the first flushing carriage return, and queue a task. The line is still the deck's own and still stranded, so the following ring must send another lone carriage return, which submits it: one swallowed flush must not strand the worker.
+#[spec("inbox/codex/017")]
+#[test]
+fn codex_017_a_swallowed_flush_is_retried_by_the_next_ring() {
+    let codex = Codex::new_with(COMPOSER, &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400")]);
+    let newline = codex.pane.capture.with_extension("newline");
+    std::fs::write(newline.with_extension("empty"), COMPOSER).unwrap();
+    std::fs::write(newline.with_extension("swallow"), "").unwrap();
+    std::fs::write(&newline, "").unwrap();
+    let id = codex.queued(BODY);
+    let line = fixed_line(&id);
+    let swallowed = format!("{line}\r\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane)
+            .starts_with(swallowed.as_bytes())
+            && !newline.with_extension("swallow").exists()),
+        "the stand-in must swallow the first flushing CR: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+    let submitted = newline.with_extension("submitted");
+    let retried = format!("{swallowed}\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane).starts_with(retried.as_bytes())
+            && std::fs::read_to_string(&submitted)
+                .unwrap_or_default()
+                .lines()
+                .next()
+                == Some(line.as_str())),
+        "the next ring's lone CR must submit the still-stranded line: {:?} submitted {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        std::fs::read_to_string(&submitted),
+        screen(&codex.daemon, &codex.pane)
     );
 }
 

@@ -170,3 +170,44 @@ fn codex_stranded_line_is_bound_to_the_decks_own_line_and_the_edit_cursor() {
         "a lone doorbell row at the bottom of the screen is not the composer"
     );
 }
+
+/// Codex 0.160.0's last frame in live `load_004` (PRD #1666), transcribed
+/// from the pane's PTY bytes with the scratch path substituted: under CPU
+/// pressure it took the ring's CR as a newline in the composer, so the line
+/// stays on the prompt row and the visible cursor sits on the empty row below
+/// it, at the composer indent (0-based row 36, column 2), above a second blank
+/// row, the model line and the warning footer. The pane was 40 x 140.
+const LINE_THEN_NEWLINE_FRAME: &str = concat!(
+    "\x1b[?1049h\x1b[2J\x1b[H",
+    "\x1b[39;3H\x1b[38;2;246;226;183;49mGPT-5.6-Luna low\x1b[39;20H\x1b[39;49m·",
+    "\x1b[39;22H\x1b[38;2;171;223;167;49m/scratch/project",
+    "\x1b[40;116H\x1b[39;49m⚠\x1b[40;118H\x1b[38;2;196;167;103;49m1 warning",
+    "\x1b[40;128H\x1b[39;49m·\x1b[40;130H\x1b[1mf2\x1b[40;133H\x1b[22mto\x1b[40;136Hview\x1b[39m\x1b[49m",
+    "\x1b[?2026h\x1b[?25l\x1b[37;2H\x1b[0m\x1b[49m\x1b[K\x1b[36;1H\x1b[1m›",
+    "\x1b[36;4H\x1b[22mdot-agent-deck:\x1b[36;20Hmessage\x1b[36;28Hm-bztvmdjd-905c176602c7c2cd",
+    "\x1b[36;56Hwaiting,\x1b[36;65Hrun:\x1b[36;70Hdot-agent-deck\x1b[36;85Hinbox\x1b[36;91Hfetch",
+    "\x1b[37;1H \x1b[39m\x1b[49m\x1b[0m\x1b[37;3H\x1b[?25h\x1b[?2026l",
+);
+
+/// Scenario: Replay Codex 0.160.0's measured frame in which the doorbell's Enter became a newline in the composer: the line on the prompt row, the cursor on the blank row directly below it at the composer indent. The deck's own line must be recognised there so the next ring can flush it, and the same frame must still hold for a line naming another message.
+#[test]
+fn codex_line_then_newline_state_from_the_live_frame_is_recognised() {
+    let ours = " dot-agent-deck: message m-bztvmdjd-905c176602c7c2cd waiting, run: dot-agent-deck inbox fetch";
+    let (rows, row, through) = dot_agent_deck::pane_screen_text::visible_rows_and_cursor(
+        LINE_THEN_NEWLINE_FRAME.as_bytes(),
+        40,
+        140,
+    )
+    .expect("the frame parses");
+    assert_eq!(rows[35], format!("›  {}", ours.trim_start()), "{rows:#?}");
+    assert_eq!(row, 36, "the cursor sits on the row below the line");
+    assert!(
+        codex_composer_holds_doorbell_line(&rows, (row, through), ours),
+        "the deck's own line with Codex's Enter taken as a newline must be recognised: {rows:#?}"
+    );
+    let other = " dot-agent-deck: message m-bztvmdjd-905c176602c7c2ce waiting, run: dot-agent-deck inbox fetch";
+    assert!(
+        !codex_composer_holds_doorbell_line(&rows, (row, through), other),
+        "a line naming another message must still hold"
+    );
+}
