@@ -978,6 +978,55 @@ const inboxCovered = (users, pending, assistant) => {
     return !!user && user.sessionID === sessionID && user.seq <= parent.seq;
   });
 };
+// PRD #1666 long-turn delivery. A deck prompt OpenCode queues behind a turn
+// in progress stays unanswered for as long as that turn runs, which can be
+// longer than the deck waits for an ack, so the deck hands it over again. A
+// plugin that remembers the session it prompted (`holds.sessions`) answers
+// such a redelivery with `hold` instead of prompting a second time, for as
+// long as that session has stayed busy since. The session going idle with the
+// prompt unanswered means OpenCode dropped it (the person aborted the turn),
+// and OpenCode removing the prompt's user message means it was reverted:
+// either way the next redelivery prompts it again. With no busy status seen
+// for the session, a redelivery prompts again, as it always did.
+const inboxHolds = () => ({ sessions: new Map(), busy: new Set(), lost: new Set() });
+// Whether a redelivery of `id` is still queued in OpenCode: answer `hold`.
+const inboxHeld = (holds, delivered, id) =>
+  delivered.has(id) && !holds.lost.has(id) && holds.busy.has(holds.sessions.get(id));
+// `id` was prompted into `sessionID`.
+const inboxPrompted = (holds, id, sessionID) => {
+  holds.lost.delete(id);
+  inboxRemember(holds.sessions, id, sessionID);
+};
+// `id` was acknowledged, or will not be: forget it.
+const inboxForget = (holds, id) => {
+  holds.sessions.delete(id);
+  holds.lost.delete(id);
+};
+const inboxObserveBusy = (holds, event) => {
+  const properties = event?.properties;
+  const sessionID = properties?.sessionID;
+  if (!sessionID) return;
+  const status =
+    event?.type === "session.idle" ? "idle" : event?.type === "session.status" ? properties?.status?.type : undefined;
+  if (status === "busy" || status === "retry") {
+    holds.busy.add(sessionID);
+  } else if (status === "idle") {
+    holds.busy.delete(sessionID);
+    for (const [id, session] of holds.sessions) {
+      if (session === sessionID) holds.lost.add(id);
+    }
+  }
+};
+// The user message `event` removes: the deck ids it carried (`pending`) are
+// no longer in the session, so their redelivery prompts again.
+const inboxObserveRemoved = (holds, delivered, pending, event) => {
+  const messageID = event?.type === "message.removed" ? event?.properties?.messageID : undefined;
+  if (!messageID) return;
+  for (const id of pending.get(messageID) ?? []) {
+    delivered.delete(id);
+    inboxForget(holds, id);
+  }
+};
 // The deck message ids whose opener `text` carries.
 const inboxIdsIn = (text) =>
   typeof text === "string" ? [...new Set([...text.matchAll(INBOX_OPENER)].map((m) => m[1]))] : [];
@@ -1114,6 +1163,7 @@ const INBOX_ANNOUNCED = "__dotAgentDeckAnnounced";
 let miniTarget = undefined;
 const miniDelivered = new Set();
 const miniPending = new Map();
+const miniHolds = inboxHolds();
 const miniTurns = new Set();
 let miniQueue = Promise.resolve();
 // Every mode: doorbell prompts whose content this plugin swapped in, by
@@ -1127,6 +1177,10 @@ const isMini = () =>
   isMainThread && process.argv.slice(2).includes("--mini") && !INBOX_SUBCOMMANDS.has(process.argv[2]);
 
 const miniDeliver = async (client, message, generation) => {
+  if (inboxHeld(miniHolds, miniDelivered, message.id)) {
+    inboxWrite(globalThis[INBOX_WATCHER], { hold: [message.id] });
+    return;
+  }
   try {
     while (!miniTarget) {
       if (generation !== inboxGeneration()) return;
@@ -1151,10 +1205,12 @@ const miniDeliver = async (client, message, generation) => {
     if (selection.model) body.model = selection.model;
     if (selection.agent) body.agent = selection.agent;
     miniDelivered.add(message.id);
+    inboxPrompted(miniHolds, message.id, sessionID);
     const result = await client.session.promptAsync({ path: { id: sessionID }, body });
     if (result?.error) throw new Error("promptAsync refused");
   } catch (_) {
     miniDelivered.delete(message.id);
+    inboxForget(miniHolds, message.id);
     inboxWrite(globalThis[INBOX_WATCHER], { nack: [message.id] });
   }
 };
@@ -1224,6 +1280,9 @@ const inboxAck = (assistant) => {
     ids.push(...miniPending.get(key).filter((id) => miniDelivered.delete(id)));
     miniPending.delete(key);
   }
+  for (const id of ids) {
+    inboxForget(miniHolds, id);
+  }
   if (ids.length) {
     if (assistant.sessionID) miniTurns.add(assistant.sessionID);
     inboxWrite(globalThis[INBOX_WATCHER], { ack: ids, repaint: true });
@@ -1232,6 +1291,8 @@ const inboxAck = (assistant) => {
 
 const observeInbox = (event) => {
   try {
+    inboxObserveRemoved(miniHolds, miniDelivered, miniPending, event);
+    inboxObserveBusy(miniHolds, event);
     inboxObserveUsers(inboxUsers, event, intercepted, miniPending);
     const type = event?.type;
     const properties = event?.properties;
@@ -1348,6 +1409,7 @@ const tui = async (api) => {
     const delivered = new Set();
     const pending = new Map();
     const users = new Map();
+    const holds = inboxHolds();
 
     const sessionOf = (id) => {
       try {
@@ -1418,6 +1480,10 @@ const tui = async (api) => {
       return sessionID;
     };
     const deliver = async (message) => {
+      if (inboxHeld(holds, delivered, message.id)) {
+        inboxWrite(watcher, { hold: [message.id] });
+        return;
+      }
       try {
         stillActive();
         const sessionID = await target();
@@ -1433,10 +1499,12 @@ const tui = async (api) => {
         const now = shownSession();
         if (now !== undefined && rootOf(now) !== sessionID) throw new Error("the session changed");
         delivered.add(message.id);
+        inboxPrompted(holds, message.id, sessionID);
         const result = await api.client.session.promptAsync(request);
         if (result?.error) throw new Error("promptAsync refused");
       } catch (error) {
         delivered.delete(message.id);
+        inboxForget(holds, message.id);
         if (!(error instanceof Retired)) inboxWrite(watcher, { nack: [message.id] });
       }
     };
@@ -1455,14 +1523,23 @@ const tui = async (api) => {
           ids.push(...pending.get(key).filter((id) => delivered.delete(id)));
           pending.delete(key);
         }
+        for (const id of ids) inboxForget(holds, id);
         if (ids.length) inboxWrite(watcher, { ack: ids });
       } catch (_) {}
     });
     api.event.on("message.removed", (event) => {
       try {
+        inboxObserveRemoved(holds, delivered, pending, event);
         inboxObserveUsers(users, event, pending);
       } catch (_) {}
     });
+    for (const type of ["session.status", "session.idle"]) {
+      api.event.on(type, (event) => {
+        try {
+          inboxObserveBusy(holds, event);
+        } catch (_) {}
+      });
+    }
     api.event.on("message.part.updated", (event) => {
       try {
         const part = event?.properties?.part;

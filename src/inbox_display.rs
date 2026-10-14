@@ -24,6 +24,11 @@ pub const WORK_DONE: &str = "work-done";
 /// ([`crate::agent_pty::DeliveryNotice::detail`]).
 pub const NOTICE_MAX_DELIVER: &str =
     "not delivered: a deck message was handed to this agent repeatedly and never acknowledged";
+/// PRD #1666 long-turn delivery: the detail of the card notice that lifts
+/// [`NOTICE_MAX_DELIVER`] once the message was acknowledged after all. Logged,
+/// not shown: the card returns to the agent's own status.
+pub const NOTICE_DELIVERED_LATE: &str =
+    "delivered after all: a deck message reported not delivered reached this agent";
 /// The card notice for a message whose agent exited while it was still owed.
 pub const NOTICE_AGENT_EXITED: &str =
     "not delivered: this agent exited before a deck message reached it";

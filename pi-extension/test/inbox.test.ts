@@ -326,7 +326,8 @@ function admission(f: ReturnType<typeof fixture>) {
 
 const idsN = (n: number) => Array.from({ length: n }, (_, i) => `m-k3xzq2ab-${String(i).repeat(8)}54b742c9`);
 const line = (id: string) => JSON.stringify(delivery(BLOCK.replaceAll(ID, id), id));
-const acksOf = (child: Watcher) => child.writes.flatMap(s => JSON.parse(s).ack as string[]);
+const acksOf = (child: Watcher) => child.writes.flatMap(s => (JSON.parse(s).ack ?? []) as string[]);
+const holdsOf = (child: Watcher) => child.writes.flatMap(s => (JSON.parse(s).hold ?? []) as string[]);
 const commitsOf = (committed: string[], id: string) => committed.filter(text => text.includes(`[dot-agent-deck message ${id} `)).length;
 
 /// Scenario: Five inbox messages reach an idle Pi in one burst, the way a loaded deck delivers its seed messages. Pi refuses a second prompt that arrives before the first one starts, and reports that refusal itself; the extension must still get every message committed exactly once, in order, and acknowledge each one only after its commit.
@@ -581,4 +582,69 @@ test("pi_inbox_020_an_input_hook_run_inside_send_user_message_lets_the_hand_over
 	assert.equal(result?.action, "transform", "the hand-over goes on, not consumed");
 	assert.ok(result?.text?.includes(BLOCK) && !result.text.includes("hand-over"), "without the line naming it");
 	await f.emit("session_shutdown");
+});
+
+/// Scenario: While Pi is busy with a long turn an inbox message waits in Pi's follow-up queue, and the deck hands the still-unacknowledged message over again, twice. The extension does not hand it over again and answers each redelivery with hold, so the deck does not count it towards its hand-over limit; Pi runs the message once when the turn ends and it is acknowledged then.
+test("pi_inbox_021_a_redelivery_queued_behind_a_long_turn_answers_hold", async () => {
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [id] = idsN(1);
+	await pi.foreign("a long turn the user started");
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	assert.deepEqual(holdsOf(child), [], "a first hand-over is not a hold");
+	for (let n = 1; n <= 2; n++) {
+		child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+		await pi.quiesce();
+		assert.deepEqual(holdsOf(child), Array(n).fill(id), `redelivery ${n} answers hold`);
+	}
+	assert.equal(f.sent.length, 1, "a hand-over waiting in Pi's queue is not handed over again");
+	await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1);
+	assert.deepEqual(acksOf(child), [id]);
+	pi.shutdown();
+});
+
+/// Scenario: Two inbox messages reach an idle Pi together; the second waits in the extension until the first one's hand-over settles, and the deck hands the second over again meanwhile. The extension answers that redelivery with hold and hands the second message to Pi once, after the first.
+test("pi_inbox_022_a_redelivery_held_behind_an_admission_answers_hold", async () => {
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [first, second] = idsN(2);
+	const gate = pi.holdAfterInput();
+	child.stdout.emit("data", Buffer.from(line(first) + "\n" + line(second) + "\n"));
+	await pi.quiesce();
+	assert.equal(f.sent.length, 1, "the second waits for the first hand-over to settle");
+	child.stdout.emit("data", Buffer.from(line(second) + "\n"));
+	await pi.quiesce();
+	assert.deepEqual(holdsOf(child), [second]);
+	gate.releaseAll();
+	for (let round = 0; round < 10 && acksOf(child).length < 2; round++) {
+		await pi.quiesce();
+		if (pi.running) await pi.settle();
+	}
+	assert.equal(commitsOf(pi.committed, first), 1);
+	assert.equal(commitsOf(pi.committed, second), 1);
+	assert.deepEqual(acksOf(child), [first, second]);
+	pi.shutdown();
+});
+
+/// Scenario: Pi loses a hand-over after its input hook with nothing queued, and the deck hands the message over again. That redelivery replaces the lost hand-over, as before, and is not answered with hold: the deck's count of hand-overs stands, because the first one did not reach the agent.
+test("pi_inbox_023_a_redelivery_that_replaces_a_lost_hand_over_is_not_held", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [id] = idsN(1);
+	pi.dropAfterInput(1);
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	assert.equal(f.sent.length, 2, "the redelivery replaces the lost hand-over");
+	assert.deepEqual(holdsOf(child), [], "a replacing redelivery is not a hold");
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1);
+	assert.deepEqual(acksOf(child), [id]);
+	pi.shutdown();
 });

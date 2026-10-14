@@ -348,15 +348,20 @@ function createPiInbox(pi: ExtensionAPI) {
 
 	/**
 	 * Give `messages` to Pi, once each. A message already held, or carried by
-	 * a hand-over that may still commit, is not handed over again. One the deck
-	 * hands over again while its hand-over is past the `input` hook and Pi has
-	 * nothing queued replaces that hand-over. False only when Pi threw at once.
+	 * a hand-over that may still commit, is not handed over again, and the
+	 * deck is told it is held (`hold`), so a turn longer than the deck's
+	 * hand-over limit does not use that limit up. One the deck hands over again
+	 * while its hand-over is past the `input` hook and Pi has nothing queued
+	 * replaces that hand-over, and is not a hold: the hand-over it replaces did
+	 * not reach the agent. False only when Pi threw at once.
 	 */
 	const deliver = (messages: InboxMessage[]): boolean => {
 		const fresh: InboxMessage[] = [];
 		const stale = new Set<HandOver>();
+		const holding: string[] = [];
 		for (const m of messages) {
 			if (isHeld(m.id)) {
+				holding.push(m.id);
 				continue;
 			}
 			const handed = carrying(m.id);
@@ -364,6 +369,15 @@ function createPiInbox(pi: ExtensionAPI) {
 				fresh.push(m);
 			} else if (handed.stage !== "handed" && askQueued() === false) {
 				stale.add(handed);
+			} else {
+				holding.push(m.id);
+			}
+		}
+		if (holding.length > 0 && writable(watcher)) {
+			try {
+				watcher.stdin!.write(`${JSON.stringify({ hold: holding })}\n`);
+			} catch {
+				// The deck counts the redelivery, as it does without a hold.
 			}
 		}
 		replace([...stale]);

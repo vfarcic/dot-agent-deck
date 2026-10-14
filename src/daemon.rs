@@ -2134,6 +2134,10 @@ fn admit_producer_event(event: &mut AgentEvent) {
     };
     event.metadata.remove(QUOTA_BLOCKED_SOURCE_METADATA_KEY);
     event.metadata.remove(QUOTA_BLOCKED_LIFTED_METADATA_KEY);
+    // PRD #1666 long-turn delivery: only the daemon lifts its own notice.
+    event
+        .metadata
+        .remove(crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY);
     if event.event_type == crate::event::EventType::QuotaBlocked {
         normalize_quota_blocked_metadata(
             &mut event.metadata,
@@ -2682,20 +2686,55 @@ fn install_delivery_notice_sink(
                     );
                     notice.pane_id.clone()
                 });
+            // PRD #1666 long-turn delivery: lift only a card that still shows
+            // the deck's not-delivered notice, as far as the daemon's own copy
+            // says. A client that predates the lift reads the event as a plain
+            // Thinking, so it is sent only where Thinking is what the card
+            // should now show. A card only attached clients hold (#424 F5) is
+            // not the daemon's to check, and gets it; current clients apply
+            // the same rule themselves.
+            if notice.cleared
+                && guard
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.delivery_notice().is_none())
+            {
+                tracing::debug!(
+                    pane_id = %notice.pane_id,
+                    delivery_id = %notice.delivery_id,
+                    "delivery cleared: the card no longer shows the deck's notice"
+                );
+                return;
+            }
             let mut metadata = std::collections::HashMap::new();
-            metadata.insert(
-                crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
-                notice.detail.to_string(),
-            );
+            // PRD #1666 long-turn delivery: a notice that a reported message
+            // reached the agent after all lifts the card's not-delivered
+            // Error (`AppState::apply_status_transition` moves only that one).
+            let (event_type, tool_detail) = if notice.cleared {
+                metadata.insert(
+                    crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY.to_string(),
+                    crate::event::DELIVERY_NOTICE_CLEARED_METADATA_VALUE.to_string(),
+                );
+                (crate::event::EventType::Thinking, None)
+            } else {
+                metadata.insert(
+                    crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+                    notice.detail.to_string(),
+                );
+                (
+                    crate::event::EventType::Error,
+                    Some(notice.detail.to_string()),
+                )
+            };
             let event = AgentEvent {
                 session_id,
                 // The daemon is not the agent, and must not claim to be one:
                 // `apply_event` only fills a session's type when it is still
                 // unknown, so `None` cannot overwrite a real agent type.
                 agent_type: crate::event::AgentType::None,
-                event_type: crate::event::EventType::Error,
+                event_type,
                 tool_name: None,
-                tool_detail: Some(notice.detail.to_string()),
+                tool_detail,
                 cwd: None,
                 timestamp: chrono::Utc::now(),
                 user_prompt: None,
@@ -6562,6 +6601,7 @@ mod hook_ingestion_tests {
             delivery_id: "cap-exhausted-257".to_string(),
             session_id: None,
             detail: "a spawn-time prompt was written into this pane but the daemon is already watching its maximum number of unconfirmed deliveries, so this one is NOT being confirmed or retried; check whether the pane acted on its task",
+            cleared: false,
         });
         let report = tokio::time::timeout(Duration::from_millis(300), async {
             loop {
@@ -6587,6 +6627,107 @@ mod hook_ingestion_tests {
                     && session.status == crate::state::SessionStatus::Error
             }),
             "the attached TUI's broadcast-only card must visibly become Error"
+        );
+    }
+
+    /// PRD #1666 long-turn delivery: through the production sink, a "delivered
+    /// after all" notice lifts the daemon's card from the deck's not-delivered
+    /// Error to Thinking and broadcasts the lift; once the card no longer shows
+    /// that notice, a second lift is not broadcast at all, so a client that
+    /// predates the lift never reads it as a stray Thinking.
+    #[tokio::test]
+    async fn a_delivered_after_all_notice_lifts_only_a_card_showing_the_decks_notice() {
+        const PANE_ID: &str = "late-ack-card";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the recipient pane");
+        let daemon_state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        {
+            let mut state = daemon_state.write().await;
+            state.register_pane(PANE_ID.to_string());
+            state.apply_event(AgentEvent {
+                session_id: "gen-late".to_string(),
+                agent_type: AgentType::Pi,
+                event_type: crate::event::EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: std::collections::HashMap::new(),
+                pane_id: Some(PANE_ID.to_string()),
+                agent_id: Some(agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+        }
+        let (event_tx, mut attached_rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        install_delivery_notice_sink(&registry, daemon_state.clone(), event_tx.clone());
+        let notice = |cleared| DeliveryNotice {
+            pane_id: PANE_ID.to_string(),
+            agent_id: agent_id.clone(),
+            delivery_id: "m-k3xzq2ab-0123456789abcdef".to_string(),
+            session_id: None,
+            detail: if cleared {
+                crate::inbox_display::NOTICE_DELIVERED_LATE
+            } else {
+                crate::inbox_display::NOTICE_MAX_DELIVER
+            },
+            cleared,
+        };
+        let next_event = |rx: &mut broadcast::Receiver<BroadcastMsg>| {
+            let rx = rx.resubscribe();
+            async move {
+                let mut rx = rx;
+                tokio::time::timeout(Duration::from_millis(500), async {
+                    loop {
+                        if let Ok(BroadcastMsg::Event(event)) = rx.recv().await
+                            && event.pane_id.as_deref() == Some(PANE_ID)
+                        {
+                            break event;
+                        }
+                    }
+                })
+                .await
+                .ok()
+            }
+        };
+        let status = |state: &crate::state::AppState| state.sessions["gen-late"].status.clone();
+
+        let reported = next_event(&mut attached_rx);
+        registry.publish_delivery_notice(notice(false));
+        let reported = reported
+            .await
+            .expect("the not-delivered report is broadcast");
+        assert_eq!(reported.event_type, crate::event::EventType::Error);
+        assert_eq!(
+            status(&*daemon_state.read().await),
+            crate::state::SessionStatus::Error
+        );
+
+        let lifted = next_event(&mut attached_rx);
+        registry.publish_delivery_notice(notice(true));
+        let lifted = lifted.await.expect("the lift is broadcast");
+        assert!(lifted.is_delivery_notice_cleared(), "{lifted:?}");
+        assert_eq!(
+            status(&*daemon_state.read().await),
+            crate::state::SessionStatus::Thinking
+        );
+
+        let again = next_event(&mut attached_rx);
+        registry.publish_delivery_notice(notice(true));
+        let again = again.await;
+        registry.shutdown_all();
+        assert!(
+            again.is_none(),
+            "a card that no longer shows the notice gets no lift: {again:?}"
         );
     }
 

@@ -442,6 +442,19 @@ pub const SURFACED_AGENT_ID_METADATA_KEY: &str = "surfaced_agent_id";
 /// notice this replaced, kept because the text still reaches a human.
 pub const DELIVERY_NOTICE_METADATA_KEY: &str = "delivery_notice";
 
+/// `AgentEvent.metadata` key marking the `Thinking` event the DAEMON authors
+/// when a message it reported not delivered ([`DELIVERY_NOTICE_METADATA_KEY`])
+/// was acknowledged after all (PRD #1666 long-turn delivery). It lifts the
+/// card's not-delivered `Error` to `Thinking` — the agent has just taken the
+/// message into its context — and moves no other status
+/// ([`AgentEvent::is_delivery_notice_cleared`]). Daemon-owned: the hook loop
+/// strips it from every producer frame, and [`AgentEvent::is_daemon_synthetic`]
+/// keys on it.
+pub const DELIVERY_NOTICE_CLEARED_METADATA_KEY: &str = "delivery_notice_cleared";
+
+/// The one [`DELIVERY_NOTICE_CLEARED_METADATA_KEY`] value.
+pub const DELIVERY_NOTICE_CLEARED_METADATA_VALUE: &str = "1";
+
 /// `AgentEvent.metadata` key carrying a DAEMON-AUTHORED report that the pane
 /// this event came from is an ORPHANED orchestration role pane (issue #770) —
 /// a role pane the daemon spawned in a previous life, whose agent survived the
@@ -1235,6 +1248,16 @@ impl AgentEvent {
     /// agent a pane restart replaced
     /// ([`crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY`])? The hook loop
     /// strips the key from every producer frame, so only the daemon sends it.
+    /// PRD #1666 long-turn delivery: is this the daemon's "delivered after
+    /// all" event ([`DELIVERY_NOTICE_CLEARED_METADATA_KEY`])?
+    pub fn is_delivery_notice_cleared(&self) -> bool {
+        self.event_type == EventType::Thinking
+            && self
+                .metadata
+                .get(DELIVERY_NOTICE_CLEARED_METADATA_KEY)
+                .is_some_and(|v| v == DELIVERY_NOTICE_CLEARED_METADATA_VALUE)
+    }
+
     pub fn is_quota_block_lift(&self) -> bool {
         self.event_type == EventType::Idle
             && self
@@ -1295,6 +1318,9 @@ impl AgentEvent {
     pub fn is_daemon_synthetic(&self) -> bool {
         matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
             || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(DELIVERY_NOTICE_CLEARED_METADATA_KEY)
             || self
                 .metadata
                 .contains_key(crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY)
@@ -3223,6 +3249,14 @@ pub struct InboxStreamControl {
     /// reads the line as an empty ack and ignores it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub repaint: bool,
+    /// PRD #1666 long-turn delivery: ids the deck handed over again that the
+    /// component still holds — queued in the agent behind the turn in
+    /// progress — and did not hand over again. The deck refunds each such
+    /// redelivery ([`crate::inbox::Inbox::hold`]) so a long turn does not use
+    /// up `max_deliver`. A daemon that predates it reads the line as an empty
+    /// ack and counts the redelivery, as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hold: Vec<String>,
 }
 
 /// The answer to [`DaemonMessage::InboxList`].

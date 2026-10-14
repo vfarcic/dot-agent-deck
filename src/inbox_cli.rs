@@ -114,10 +114,11 @@ pub const STREAM_NOT_IN_DECK_EXIT: u8 = 3;
 /// global hook never disturbs a session the deck does not manage.
 ///
 /// **Stream** (the OpenCode plugin, the Pi extension): prints each handed-over
-/// message as one JSON line on stdout and forwards `{"ack":[…]}` /
-/// `{"nack":[…]}` lines from stdin to the deck, until either side closes. Run
-/// outside a deck pane, or without a capability token, it exits
-/// [`STREAM_NOT_IN_DECK_EXIT`] so the caller knows a respawn cannot succeed.
+/// message as one JSON line on stdout and forwards `{"ack":[…]}`,
+/// `{"nack":[…]}` and `{"hold":[…]}` lines from stdin to the deck, until either
+/// side closes. Run outside a deck pane, or without a capability token, it
+/// exits [`STREAM_NOT_IN_DECK_EXIT`] so the caller knows a respawn cannot
+/// succeed.
 pub fn wait(agent: &str, stream: bool) -> ExitCode {
     let not_in_deck = if stream {
         ExitCode::from(STREAM_NOT_IN_DECK_EXIT)
@@ -277,7 +278,7 @@ fn wait_stream(json: &str) -> ExitCode {
     {
         return ExitCode::SUCCESS;
     }
-    // Acks and nacks from the component, forwarded as they come. The
+    // Acks, nacks and holds from the component, forwarded as they come. The
     // component closing our stdin is how it says it is done (PRD #1666 S8:
     // OpenCode's plugin on dispose), so the watcher then exits, and the deck
     // takes back whatever it handed over and was not acknowledged.

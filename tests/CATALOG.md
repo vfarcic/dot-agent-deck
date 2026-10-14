@@ -7157,6 +7157,20 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** NATS subject compatibility beyond the character set (#1264).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/core/018 — A streaming consumer's hold refunds a redelivery until the hold bound.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** a stream that answers each redelivery with `hold` keeps the message alive through ten ack-waits with `max_deliver` 2 (the count never drops below one); a hold from another consumer or agent, or for a queued message, refunds nothing; past `hold_bound` from the first fetch a hold refunds nothing and the message becomes undeliverable at `max_deliver`; the default bound is one hour.
+- **Does not assert:** the stream wire (inbox/route/009) or the consumers that answer hold (inbox/opencode/024, inbox/opencode/026, the Pi extension's node tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/core/019 — A late ack after max_deliver is recorded.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** an ack from the bound agent for a message undeliverable for `max_deliver` answers acknowledged, moves it to acknowledged with one event, and a repeat answers already acknowledged; another agent's ack is refused; a message undeliverable because its agent exited still answers undeliverable; an offer that ran out of hand-overs is not acknowledged.
+- **Does not assert:** the corrections the daemon posts (inbox/route/010 and the `inbox_hub` unit tests).
+- **Platform coverage:** mac+linux+windows.
+
 #### Protocol and waiter lifecycle
 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.
@@ -7580,6 +7594,20 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the private unresolved-worker dispatch branch or commission expiry arithmetic; the ledger unit tests retain those arithmetic checks.
 - **Platform coverage:** mac+linux.
 
+##### inbox/route/009 — A task held through a long turn raises no false notice.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 300 ms, `max_deliver` 2 and the undelivered notice at 900 ms.
+- **Agent:** scripted stand-ins; a stream component (`pi_extension`) armed from the test process answers each redelivery with `hold`.
+- **Asserts:** over ten ack-waits the delegated task is never undeliverable and the orchestrator receives no notice; the component's ack makes it acknowledged and the orchestrator still receives nothing.
+- **Does not assert:** that a real consumer withholds the duplicate hand-over (inbox/opencode/024, inbox/opencode/026, the Pi extension's node tests).
+- **Platform coverage:** mac+linux.
+
+##### inbox/route/010 — A late ack after max_deliver corrects the orchestrator.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 300 ms and `max_deliver` 2.
+- **Agent:** scripted stand-ins; a stream component (`pi_extension`) armed from the test process that never answers the redeliveries.
+- **Asserts:** the task becomes undeliverable and the orchestrator is told so; the component's later ack makes it acknowledged and the orchestrator receives a correction naming the task and the worker's role.
+- **Does not assert:** the recipient card's cleared notice (the `inbox_hub` and `state` unit tests).
+- **Platform coverage:** mac+linux.
+
 #### inbox/codex
 
 ##### inbox/codex/001 — The update-now startup dialog receives zero input bytes.
@@ -7791,6 +7819,27 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Agent:** fake API withholding assistant-child events.
 - **Asserts:** redelivery after ack-wait, no premature ack, then plugin-confirmed ack for the matching assistant.
 - **Does not assert:** real agent cancellation behavior.
+- **Cost:** none.
+
+##### inbox/opencode/024 — A prompt queued behind a long turn is held, not prompted again.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), daemon with `max_deliver` 2 and ack-wait 1.5 s.
+- **Agent:** fake OpenCode API running the generated full TUI plugin and the real inbox watcher CLI.
+- **Asserts:** with the shown session reporting busy, each redelivery over four ack-waits is answered with `hold`; there is one prompt and the message is never undeliverable; the matching assistant turn acknowledges it.
+- **Does not assert:** real OpenCode's queueing of a prompt behind a turn.
+- **Cost:** none.
+
+##### inbox/opencode/025 — An aborted or removed queued prompt is prompted again.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Agent:** fake OpenCode API running the generated full TUI plugin.
+- **Asserts:** a prompt queued behind a busy session whose session then goes idle unanswered is prompted again on redelivery; a prompt whose user message OpenCode removes is prompted again on redelivery while the session stays busy; each is acknowledged once answered.
+- **Does not assert:** real cancellation behaviour.
+- **Cost:** none.
+
+##### inbox/opencode/026 — Mini holds a queued prompt and prompts an aborted one again.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), daemon with `max_deliver` 2.
+- **Agent:** fake OpenCode API running the generated server plugin under `--mini`.
+- **Asserts:** with mini's session busy, redeliveries over four ack-waits are answered with `hold`, with one prompt and no undeliverable message; a second prompt whose session goes idle unanswered is prompted again; both are acknowledged once answered.
+- **Does not assert:** real mini rendering.
 - **Cost:** none.
 
 ##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.

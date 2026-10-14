@@ -100,6 +100,15 @@ pub const DEFAULT_UNDELIVERED_NOTICE_AFTER: Duration = Duration::from_secs(300);
 pub const ENV_UNDELIVERED_NOTICE_AFTER_MS: &str =
     "DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS";
 
+/// PRD #1666 long-turn delivery: how many messages that ran out of
+/// hand-overs the hub remembers, so a late ack can correct whoever was told
+/// ([`InboxHub::ack`]). The oldest is forgotten first.
+pub const LATE_ACK_MAX_RECORDS: usize = 256;
+/// PRD #1666 long-turn delivery: how long a message that ran out of
+/// hand-overs is remembered for a late ack; the same span as
+/// [`crate::inbox::DEFAULT_HOLD_BOUND`].
+pub const LATE_ACK_MEMORY: Duration = crate::inbox::DEFAULT_HOLD_BOUND;
+
 /// The sender `reason` of a notice the deck itself writes to an agent; its
 /// label is "dot-agent-deck (daemon notice)".
 pub const NOTICE_REASON: &str = "notice";
@@ -368,6 +377,24 @@ struct HubState {
     /// Card notices a state change owes, published with the other owed notices
     /// once the lock is released ([`InboxHub::post_owed_notices`]).
     owed_card_notices: Vec<crate::agent_pty::DeliveryNotice>,
+    /// PRD #1666 long-turn delivery: messages that ran out of hand-overs, by
+    /// message id and recipient pane, with whoever was told — bounded by
+    /// [`LATE_ACK_MAX_RECORDS`] and [`LATE_ACK_MEMORY`]. A late ack takes its
+    /// record and corrects them ([`settle_late_ack`]).
+    late_acks: HashMap<(String, String), LateAck>,
+}
+
+/// PRD #1666 long-turn delivery: who was told that a message ran out of
+/// hand-overs, so a late ack can tell them it arrived after all.
+struct LateAck {
+    /// The agent the message was bound to.
+    recipient: Recipient,
+    /// For a delegated task: the orchestrator generation told it was
+    /// undeliverable, and the worker's role.
+    orchestrator: Option<(Recipient, String)>,
+    /// The recipient's card was told it was not delivered.
+    card_told: bool,
+    at: Instant,
 }
 
 /// The daemon's inbox and the components armed on it. See the module docs.
@@ -481,6 +508,7 @@ impl InboxHub {
                 received_since_done: std::collections::HashSet::new(),
                 card_notice_sink: None,
                 owed_card_notices: Vec::new(),
+                late_acks: HashMap::new(),
             }),
             changed: Arc::new(Notify::new()),
             keepalive,
@@ -1426,6 +1454,32 @@ impl InboxHub {
         outcome
     }
 
+    /// PRD #1666 long-turn delivery: `consumer`, a stream, still holds message
+    /// `id` — queued in the agent behind the turn in progress — and answered
+    /// its redelivery with `hold` instead of handing it over again. The
+    /// redelivery is refunded ([`Inbox::hold`]), and while it is, a delegated
+    /// task's "has not reached the worker" notice waits a full
+    /// [`ENV_UNDELIVERED_NOTICE_AFTER_MS`] past the hold. Returns whether it
+    /// was refunded.
+    pub fn hold(&self, id: &str, pane_id: &str, agent_id: &str, consumer: &Consumer) -> bool {
+        let refunded = {
+            let mut st = self.lock();
+            let now = Instant::now();
+            let refunded = st.inbox.hold(now, id, pane_id, agent_id, consumer);
+            if refunded
+                && let Some(watch) = st.delegates.get_mut(id)
+                && !watch.notified
+            {
+                watch.due = watch.due.max(now + self.undelivered_after);
+            }
+            refunded
+        };
+        if refunded {
+            self.changed.notify_one();
+        }
+        refunded
+    }
+
     /// A component handing message `id` back unread: it is queued again and
     /// offered to the agent's newest waiter.
     pub fn nack(&self, id: &str, pane_id: &str, agent_id: &str) -> bool {
@@ -1691,7 +1745,9 @@ fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBud
 /// An offer back in its pool has no pane to show it on, so it is only logged.
 fn drain_events(st: &mut HubState) {
     for event in st.inbox.drain_events() {
+        settle_late_ack(st, &event);
         settle_delegate(st, &event);
+        remember_max_deliver(st, &event);
         settle_offer(st, &event);
         debug!(
             message_id = %event.message_id,
@@ -1736,6 +1792,10 @@ fn drain_events(st: &mut HubState) {
 
 /// The subject of a notice that a delegated task did not reach its worker.
 const UNDELIVERED_SUBJECT: &str = "task not delivered";
+
+/// PRD #1666 long-turn delivery: the subject of the correction an orchestrator
+/// gets when a task it was told was undeliverable reached its worker after all.
+pub const LATE_ACK_SUBJECT: &str = "task delivered after all";
 
 /// PRD #1666 S11: owe an offer's offerer the notice its state change calls
 /// for — claimed, completed, claim expired, or not taken — wake the assigner
@@ -1852,6 +1912,7 @@ fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
         delivery_id: event.message_id.to_string(),
         session_id: None,
         detail,
+        cleared: false,
     });
 }
 
@@ -1884,8 +1945,115 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
     }
     if let Some(to) = watch.orchestrator {
         let body = compose_undeliverable_notice(id, &watch.role, reason);
+        if reason == UndeliverableReason::MaxDeliver {
+            remember_late_ack(
+                st,
+                event,
+                Some((to.clone(), watch.role.clone())),
+                Instant::now(),
+            );
+        }
         st.owed_notices.push((to, UNDELIVERED_SUBJECT, body));
     }
+}
+
+/// PRD #1666 long-turn delivery: remember a message that just ran out of
+/// hand-overs, so a late ack can correct whoever [`settle_delegate`] and
+/// [`owe_card_notice`] tell. An offer is not remembered: it went back to its
+/// pool, and its offerer was told it was not taken.
+fn remember_max_deliver(st: &mut HubState, event: &InboxEvent) {
+    if event.state == StateName::Undeliverable
+        && event.undeliverable_reason == Some(UndeliverableReason::MaxDeliver)
+        && event.kind != "offer"
+    {
+        remember_late_ack(st, event, None, Instant::now());
+    }
+}
+
+/// Record (or complete) `event`'s [`LateAck`]; `orchestrator` is kept from
+/// whichever call names one. Forgets records past [`LATE_ACK_MEMORY`] and,
+/// past [`LATE_ACK_MAX_RECORDS`], the oldest.
+fn remember_late_ack(
+    st: &mut HubState,
+    event: &InboxEvent,
+    orchestrator: Option<(Recipient, String)>,
+    now: Instant,
+) {
+    let Some(recipient) = event.recipient.clone() else {
+        return;
+    };
+    st.late_acks
+        .retain(|_, record| now.saturating_duration_since(record.at) < LATE_ACK_MEMORY);
+    let card_told = st.card_notice_sink.is_some() && recipient.agent_id.is_some();
+    let key = (event.message_id.to_string(), recipient.pane_id.clone());
+    let record = st.late_acks.entry(key).or_insert(LateAck {
+        recipient,
+        orchestrator: None,
+        card_told,
+        at: now,
+    });
+    if orchestrator.is_some() {
+        record.orchestrator = orchestrator;
+    }
+    while st.late_acks.len() > LATE_ACK_MAX_RECORDS {
+        let Some(oldest) = st
+            .late_acks
+            .iter()
+            .min_by_key(|(_, record)| record.at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        st.late_acks.remove(&oldest);
+    }
+}
+
+/// PRD #1666 long-turn delivery: a message reported undeliverable after
+/// `max_deliver` hand-overs was acknowledged after all ([`Inbox::ack`] records
+/// the late ack). The orchestrator told it was undeliverable gets a
+/// correction, the worker counts as having received a task
+/// (`received_since_done`), and the recipient's card is cleared once no other
+/// message it was told about is still owed a correction.
+fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
+    if event.state != StateName::Acknowledged {
+        return;
+    }
+    let Some(recipient) = event.recipient.as_ref() else {
+        return;
+    };
+    let key = (event.message_id.to_string(), recipient.pane_id.clone());
+    let Some(record) = st.late_acks.remove(&key) else {
+        return;
+    };
+    info!(
+        message_id = %event.message_id,
+        pane_id = %recipient.pane_id,
+        "inbox: a message reported undeliverable was acknowledged after all"
+    );
+    if let Some((to, role)) = record.orchestrator {
+        st.received_since_done
+            .insert(record.recipient.pane_id.clone());
+        let body = compose_late_ack_notice(event.message_id.as_str(), &role);
+        st.owed_notices.push((to, LATE_ACK_SUBJECT, body));
+    }
+    let still_owed = st
+        .late_acks
+        .values()
+        .any(|other| other.card_told && other.recipient == record.recipient);
+    if !record.card_told || still_owed || st.card_notice_sink.is_none() {
+        return;
+    }
+    let Some(agent_id) = record.recipient.agent_id.clone() else {
+        return;
+    };
+    st.owed_card_notices.push(crate::agent_pty::DeliveryNotice {
+        pane_id: record.recipient.pane_id,
+        agent_id,
+        delivery_id: event.message_id.to_string(),
+        session_id: None,
+        detail: crate::inbox_display::NOTICE_DELIVERED_LATE,
+        cleared: true,
+    });
 }
 
 /// PRD #1666 S5: the notice an orchestrator gets when a task it delegated is
@@ -1942,6 +2110,19 @@ pub fn compose_undeliverable_notice(
     )
 }
 
+/// PRD #1666 long-turn delivery: the correction an orchestrator gets when a
+/// task it was told was undeliverable is acknowledged by its worker after all.
+pub fn compose_late_ack_notice(message_id: &str, role: &str) -> String {
+    format!(
+        "Correction: task {message_id} to the worker in role {} reached the worker after all - \
+         it acknowledged the task after the deck reported it undeliverable, so disregard that \
+         report. The worker is working on it and its work-done can arrive. If you already \
+         re-delegated or reassigned the task, it may now be done twice: check the worker's \
+         pane and decide whether to stop one of them, or notify the user.",
+        crate::state::quote_untrusted_role(role),
+    )
+}
+
 /// PRD #1666 hardening H4: the smallest hand-over any agent's component gets
 /// once its framing heads it — Codex's byte budget less [`AGENT_FRAMING`]. A
 /// message that renders within it reaches every agent whole.
@@ -1971,6 +2152,7 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
         created_at: Instant::now(),
         state: MessageState::Queued,
         deliveries: 0,
+        first_fetched_at: None,
         history: Vec::new(),
         excluded: Vec::new(),
         assign_deadline: None,
@@ -2444,6 +2626,10 @@ pub async fn serve_waiter<R, W, P>(
                             for id in &control.nack {
                                 let requeued = hub.nack(id, &pane_id, &agent_id);
                                 debug!(conn_id, %id, requeued, "inbox: stream nack");
+                            }
+                            for id in &control.hold {
+                                let refunded = hub.hold(id, &pane_id, &agent_id, &consumer);
+                                debug!(conn_id, %id, refunded, "inbox: stream hold");
                             }
                             if control.repaint {
                                 if component == InboxComponent::OpenCodeMini {
@@ -3555,5 +3741,124 @@ mod tests {
             hub.list("o").is_empty(),
             "a task the worker answered is not reported"
         );
+    }
+
+    /// PRD #1666 long-turn delivery: a stream that answers each redelivery of
+    /// a delegated task with `hold` keeps the task alive past ack-wait ×
+    /// `max_deliver`, and keeps the "has not reached the worker" notice from
+    /// being posted while it holds; its ack then ends the watch with no notice.
+    #[tokio::test]
+    async fn a_held_delegate_is_neither_undeliverable_nor_reported() {
+        let limits = InboxLimits {
+            ack_wait: Duration::ZERO,
+            max_deliver: 2,
+            ..InboxLimits::default()
+        };
+        let mut hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        hub.undelivered_after = Duration::from_millis(150);
+        let id = delegate(&hub, "LONG-TURN-TASK");
+        let stream = Consumer::Stream { conn_id: 41 };
+        for round in 0..8 {
+            assert_eq!(
+                hub.fetch("w", "wa", stream.clone(), None, None).len(),
+                1,
+                "round {round}"
+            );
+            assert!(hub.hold(id.as_str(), "w", "wa", &stream), "round {round}");
+            std::thread::sleep(Duration::from_millis(50));
+            hub.tick();
+            assert_eq!(state_in(&hub, "w", &id), StateName::Queued, "round {round}");
+        }
+        assert!(
+            hub.list("o").is_empty(),
+            "a task its worker holds is not reported as undelivered"
+        );
+        hub.fetch("w", "wa", stream.clone(), None, None);
+        assert_eq!(
+            hub.ack(id.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
+            AckOutcome::Acknowledged
+        );
+        hub.undelivered_after = Duration::ZERO;
+        hub.tick();
+        assert!(hub.list("o").is_empty());
+    }
+
+    /// PRD #1666 long-turn delivery: an ack that arrives after a message ran
+    /// out of hand-overs is recorded, the orchestrator told it was
+    /// undeliverable gets a correction naming it, and the recipient's card is
+    /// cleared — once no other message it was told about is still owed a
+    /// correction. A message that was not a delegated task corrects the card
+    /// alone.
+    #[tokio::test]
+    async fn a_late_ack_corrects_the_orchestrator_and_the_card() {
+        let limits = InboxLimits {
+            max_deliver: 1,
+            ..InboxLimits::default()
+        };
+        let mut hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        hub.undelivered_after = Duration::from_secs(3600);
+        let told: Arc<Mutex<Vec<(String, bool)>>> = Arc::default();
+        let sink = Arc::clone(&told);
+        hub.set_card_notice_sink(Arc::new(move |notice| {
+            sink.lock()
+                .unwrap()
+                .push((notice.delivery_id.clone(), notice.cleared));
+        }));
+        let task = delegate(&hub, "TASK-A");
+        let report = hub
+            .post_direct(Recipient::bound("w", "wa"), content("REPORT-B"))
+            .unwrap();
+        assert_eq!(
+            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
+            2
+        );
+        assert!(hub.nack(task.as_str(), "w", "wa"));
+        assert!(hub.nack(report.as_str(), "w", "wa"));
+        let notices = hub.list("o");
+        assert_eq!(notices.len(), 1, "the orchestrator is told: {notices:?}");
+        assert_eq!(
+            *told.lock().unwrap(),
+            [(task.to_string(), false), (report.to_string(), false)]
+        );
+
+        assert_eq!(
+            hub.ack(task.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
+            AckOutcome::Acknowledged
+        );
+        assert_eq!(state_in(&hub, "w", &task), StateName::Acknowledged);
+        let notices = hub.list_with_bodies(Some("o"));
+        assert_eq!(notices.len(), 2, "one correction: {notices:?}");
+        let correction = notices.last().unwrap();
+        assert_eq!(correction.subject, LATE_ACK_SUBJECT);
+        let body = correction.text.as_deref().unwrap_or_default();
+        assert!(
+            body.contains(task.as_str()) && body.contains("coder"),
+            "the correction names the task and the role: {body}"
+        );
+        assert_eq!(
+            told.lock().unwrap().len(),
+            2,
+            "the card still shows the report it was told about"
+        );
+
+        assert_eq!(
+            hub.ack(report.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
+            AckOutcome::Acknowledged
+        );
+        assert_eq!(
+            hub.list("o").len(),
+            2,
+            "no orchestrator was told of the report"
+        );
+        assert_eq!(
+            told.lock().unwrap().last().cloned(),
+            Some((report.to_string(), true)),
+            "with nothing left uncorrected, the card is cleared"
+        );
+        assert_eq!(
+            hub.ack(report.as_str(), "w", "wa", AckHow::Explicit),
+            AckOutcome::AlreadyAcknowledged
+        );
+        assert_eq!(told.lock().unwrap().len(), 3, "corrected once");
     }
 }

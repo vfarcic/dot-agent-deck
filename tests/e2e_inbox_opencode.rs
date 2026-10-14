@@ -47,6 +47,10 @@ impl OpenCode {
                 config["ackWaitMs"].as_str().unwrap_or("1500"),
             ),
             ("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", "3500"),
+            (
+                "DOT_AGENT_DECK_INBOX_MAX_DELIVER",
+                config["maxDeliver"].as_str().unwrap_or("5"),
+            ),
         ]);
         let installed = daemon.home.join(".local/bin/dot-agent-deck");
         std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
@@ -164,6 +168,54 @@ impl OpenCode {
             .map(|event| event["sessionID"].clone())
             .unwrap_or(json!("shown"));
         self.control(json!({"event":"message.updated","properties":{"info":{"id":format!("assistant-{parent}"),"role":"assistant","parentID":parent,"sessionID":session}}}));
+    }
+    /// The `hold` lines the plugin's watcher wrote for `id`.
+    fn holds(&self, id: &str) -> usize {
+        self.events()
+            .iter()
+            .filter(|e| e["kind"] == "stdin")
+            .filter_map(|e| serde_json::from_str::<Value>(e["text"].as_str()?.trim()).ok())
+            .filter(|line| {
+                line["hold"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|held| held == id))
+            })
+            .count()
+    }
+    /// The session `sessionID` reports `status` (`busy` or `idle`), once the
+    /// plugin host has emitted it.
+    fn session_status(&self, session: &str, status: &str) {
+        let before = self.emitted("session.status");
+        self.control(json!({"event":"session.status","properties":{"sessionID":session,"status":{"type":status}}}));
+        assert!(
+            common::wait_until(WAIT, || self.emitted("session.status") > before),
+            "the host must emit session.status {status}"
+        );
+    }
+    fn emitted(&self, kind: &str) -> usize {
+        self.events()
+            .iter()
+            .filter(|e| e["kind"] == "emitted" && e["type"] == kind)
+            .count()
+    }
+    fn message_state(&self, id: &str) -> Value {
+        listing(&self.daemon, &self.pane)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .map(|m| m["state"].clone())
+            .unwrap_or(Value::Null)
+    }
+    /// Over `span`, the message is never undeliverable and never prompted a
+    /// second time.
+    fn held_through(&self, id: &str, span: Duration) {
+        assert!(
+            !common::wait_until(span, || self.message_state(id) == "undeliverable"
+                || self.prompts().len() != 1),
+            "a held message must outlive ack-wait × max_deliver with one prompt: {:?}",
+            self.events()
+        );
     }
     fn acknowledge(&self, id: &str) {
         self.wait_kind("user-message");
@@ -957,4 +1009,103 @@ fn opencode_014_server_announces_before_idle_and_delayed_tui_arms() {
         bytes(&op.pane).is_empty(),
         "spawn-time native wake must never type a doorbell"
     );
+}
+
+/// Scenario: The shown OpenCode session is busy with a long turn when a deck task arrives, so the TUI plugin's prompt waits in OpenCode's queue. For four ack-waits — twice the deck's hand-over limit — every redelivery is answered with hold: no second prompt, and the task is never reported undeliverable. When OpenCode answers the queued prompt the task is acknowledged.
+#[spec("inbox/opencode/024")]
+#[test]
+fn opencode_024_a_prompt_queued_behind_a_long_turn_is_held_not_reinjected() {
+    let op = OpenCode::new("session", json!({"maxDeliver":"2"}));
+    armed(&op.daemon, &op.pane, 1);
+    op.session_status("shown", "busy");
+    let id = op.post();
+    op.wait_kind("prompt");
+    op.held_through(&id, Duration::from_millis(6000));
+    assert!(
+        op.holds(&id) >= 2,
+        "each redelivery answers hold: {:?}",
+        op.events()
+    );
+    op.acknowledge(&id);
+    assert_eq!(op.prompts().len(), 1);
+}
+
+/// Scenario: A deck task waits behind a busy OpenCode session, then the person aborts: the session goes idle without answering it. The deck's next redelivery prompts it again. A second task waits behind another long turn and the person reverts its prompt (OpenCode removes the message); its redelivery is prompted again too. Each is acknowledged once answered.
+#[spec("inbox/opencode/025")]
+#[test]
+fn opencode_025_an_aborted_or_removed_queued_prompt_is_reinjected() {
+    let op = OpenCode::new("session", json!({}));
+    armed(&op.daemon, &op.pane, 1);
+    op.session_status("shown", "busy");
+    let aborted = op.post();
+    op.wait_kind("user-message");
+    op.session_status("shown", "idle");
+    assert!(
+        common::wait_until(WAIT, || op.prompts().len() >= 2),
+        "an aborted queued prompt must be prompted again: {:?}",
+        op.events()
+    );
+    op.acknowledge(&aborted);
+
+    op.session_status("shown", "busy");
+    let removed = op.post();
+    let prompts = op.prompts().len();
+    assert!(common::wait_until(WAIT, || op.prompts().len() > prompts));
+    assert!(common::wait_until(WAIT, || op
+        .events()
+        .iter()
+        .filter(|e| e["kind"] == "user-message")
+        .count()
+        >= op.prompts().len()));
+    let user = op
+        .events()
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "user-message")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    op.control(
+        json!({"event":"message.removed","properties":{"sessionID":"shown","messageID":user}}),
+    );
+    let after = op.prompts().len();
+    assert!(
+        common::wait_until(WAIT, || op.prompts().len() > after),
+        "a removed queued prompt must be prompted again: {:?}",
+        op.events()
+    );
+    op.acknowledge(&removed);
+}
+
+/// Scenario: Under `opencode --mini` the server plugin starts a deck task in a session busy with a long turn. Each redelivery over four ack-waits is answered with hold, with no second prompt and no undeliverable task, and the task is acknowledged once answered. A second task queued behind another long turn is prompted again once the session goes idle without answering it.
+#[spec("inbox/opencode/026")]
+#[test]
+fn opencode_026_mini_holds_a_queued_prompt_and_reinjects_an_aborted_one() {
+    let op = OpenCode::new(
+        "session",
+        json!({"server":true,"argv":["--mini"],"maxDeliver":"2"}),
+    );
+    armed(&op.daemon, &op.pane, 1);
+    op.session_status("shown", "busy");
+    let held = op.post();
+    op.wait_kind("prompt");
+    op.held_through(&held, Duration::from_millis(6000));
+    assert!(
+        op.holds(&held) >= 2,
+        "each redelivery answers hold: {:?}",
+        op.events()
+    );
+    op.acknowledge(&held);
+
+    op.session_status("shown", "busy");
+    let aborted = op.post();
+    assert!(common::wait_until(WAIT, || op.prompts().len() >= 2));
+    op.session_status("shown", "idle");
+    assert!(
+        common::wait_until(WAIT, || op.prompts().len() >= 3),
+        "an aborted queued prompt must be prompted again: {:?}",
+        op.events()
+    );
+    op.acknowledge(&aborted);
 }

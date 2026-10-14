@@ -5969,6 +5969,11 @@ pub struct DeliveryNotice {
     /// controls may be interpolated here — that rule outlives the transport,
     /// because the text still reaches a human-readable surface.
     pub detail: &'static str,
+    /// PRD #1666 long-turn delivery: not a failure but the end of one — the
+    /// inbox message an earlier notice reported not delivered was acknowledged
+    /// after all, so the card's not-delivered `Error` is lifted
+    /// ([`crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY`]).
+    pub cleared: bool,
 }
 
 /// Issue #424: the daemon's sink for [`DeliveryNotice`]s, installed via

@@ -11546,9 +11546,11 @@ impl AppState {
         // stale `Blocked` behind; an arm that does assert overwrites it below.
         let quota_blocked = event.event_type == EventType::QuotaBlocked;
         let quota_lift = event.is_quota_block_lift();
+        let delivery_cleared = event.is_delivery_notice_cleared();
         if session.status == SessionStatus::Blocked
             && !quota_blocked
             && !quota_lift
+            && !delivery_cleared
             && crate::quota_block::is_work_evidence(event)
         {
             session.status = SessionStatus::Thinking;
@@ -11561,6 +11563,18 @@ impl AppState {
             // Issue #714: still blocked and this frame proves no work — it is
             // journalled below like any other, but asserts no status.
             _ if blocked_hold => false,
+            // PRD #1666 long-turn delivery: the daemon saying a message it
+            // reported not delivered reached the agent after all. Only the
+            // card's not-delivered Error moves, to `Thinking`: the agent has
+            // just taken the message in. Anywhere else it asserts nothing.
+            _ if delivery_cleared => {
+                let asserted = session.delivery_notice().is_some();
+                if asserted {
+                    session.status = SessionStatus::Thinking;
+                    session.active_tool = None;
+                }
+                asserted
+            }
             // Issue #714: the daemon lifting a block whose agent a pane restart
             // replaced (`AppState::lift_replaced_quota_blocks`). Only a Blocked
             // card moves, to `Idle`; anywhere else it asserts nothing.
@@ -16809,6 +16823,52 @@ mod tests {
         let card = &state.sessions["gen-q"];
         assert_eq!(card.delivery_notice(), None);
         assert_eq!(card.live_snapshot().delivery_notice, None);
+    }
+
+    /// PRD #1666 long-turn delivery: the daemon's "delivered after all" event
+    /// lifts the card's not-delivered Error to Thinking, and only that Error:
+    /// an Error the agent reported, or a card in any other status, keeps its
+    /// status.
+    #[test]
+    fn a_delivery_cleared_event_lifts_only_the_decks_not_delivered_error() {
+        let notice = crate::inbox_display::NOTICE_MAX_DELIVER;
+        let cleared = |secs| {
+            let mut event = quota_event(EventType::Thinking, secs);
+            event.agent_type = AgentType::None;
+            event.tool_name = None;
+            event.metadata.insert(
+                crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY.to_string(),
+                crate::event::DELIVERY_NOTICE_CLEARED_METADATA_VALUE.to_string(),
+            );
+            event
+        };
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::SessionStart, 1));
+        let mut report = quota_event(EventType::Error, 2);
+        report.agent_type = AgentType::None;
+        report.tool_name = None;
+        report.tool_detail = Some(notice.to_string());
+        report.metadata.insert(
+            crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+            notice.to_string(),
+        );
+        state.apply_daemon_report_event(report);
+        assert_eq!(state.sessions["gen-q"].delivery_notice(), Some(notice));
+        assert!(cleared(3).is_daemon_synthetic());
+        state.apply_daemon_report_event(cleared(3));
+        let card = &state.sessions["gen-q"];
+        assert_eq!(card.status, SessionStatus::Thinking);
+        assert_eq!(card.delivery_notice(), None);
+
+        // The agent's own Error is not the deck's to lift.
+        state.apply_event(quota_event(EventType::Error, 4));
+        state.apply_daemon_report_event(cleared(5));
+        assert_eq!(state.sessions["gen-q"].status, SessionStatus::Error);
+        // Nor is any other status.
+        state.apply_event(quota_event(EventType::Idle, 6));
+        state.apply_daemon_report_event(cleared(7));
+        assert_eq!(state.sessions["gen-q"].status, SessionStatus::Idle);
     }
 
     fn quota_blocked_event(kind: BlockedKind, detail: &str, secs: i64) -> AgentEvent {
