@@ -11,7 +11,7 @@ mod child_lifetime_bound;
 use dot_agent_deck::agent_pty::AgentPtyRegistry;
 use dot_agent_deck::event::{
     AgentEvent, AgentType, BroadcastMsg, EventType, QUESTION_RESOLVED_METADATA_KEY,
-    SUBAGENT_ID_METADATA_KEY,
+    SUBAGENT_ID_METADATA_KEY, TOOL_INPUT_DIGEST_METADATA_KEY, tool_input_digest,
 };
 use dot_agent_deck::question::{
     AnswerChannel, OptionRole, PendingQuestion, Question, QuestionKind, QuestionOption,
@@ -410,4 +410,161 @@ fn question_state_007_a_resync_after_an_event_gap_carries_the_question() {
         None,
         "the resync must drop a question answered during the gap"
     );
+}
+
+/// A `PreToolUse` as the Claude-shaped hook reports it: the call's id and the
+/// fingerprint of its input.
+fn tool_start(tool: &str, use_id: &str, input: serde_json::Value) -> AgentEvent {
+    let mut e = event(EventType::ToolStart);
+    e.tool_name = Some(tool.to_string());
+    e.metadata
+        .insert("tool_use_id".to_string(), use_id.to_string());
+    e.metadata.insert(
+        TOOL_INPUT_DIGEST_METADATA_KEY.to_string(),
+        tool_input_digest(&input),
+    );
+    e
+}
+
+/// A Claude Code `PermissionRequest` raising `q` for a call with `input`: no
+/// `tool_use_id` (Claude Code 2.1.296 sends none), the input's fingerprint.
+fn asking_for(q: &PendingQuestion, input: &serde_json::Value) -> AgentEvent {
+    let mut e = asking(EventType::PermissionRequest, q);
+    e.tool_name = q.tool.as_ref().map(|t| t.name.clone());
+    e.metadata.insert(
+        TOOL_INPUT_DIGEST_METADATA_KEY.to_string(),
+        tool_input_digest(input),
+    );
+    e
+}
+
+fn pending_call(state: &AppState) -> Option<String> {
+    state.sessions[SESSION]
+        .pending_question
+        .as_ref()
+        .and_then(|q| q.tool.as_ref())
+        .and_then(|t| t.use_id.clone())
+}
+
+/// Scenario: Claude runs two Bash calls in parallel; call A waits on a
+/// permission prompt while call B, a different command, finishes — and fails,
+/// in a second run. Neither of B's ends clears A's question, so the card still
+/// reads Needs Input; A's own end clears it.
+#[spec("question/state/008")]
+#[test]
+fn question_state_008_a_parallel_call_of_the_same_tool_ending_does_not_clear() {
+    let a = serde_json::json!({"command": "rm -rf build", "description": "Clean"});
+    let b = serde_json::json!({"command": "ls", "description": "List"});
+    for b_ends_as in [EventType::ToolEnd, EventType::Error] {
+        let mut state = fresh();
+        state.apply_event(tool_start("Bash", "toolu_A", a.clone()));
+        state.apply_event(tool_start("Bash", "toolu_B", b.clone()));
+        state.apply_event(asking_for(&question("q-a", Some(("Bash", None))), &a));
+        assert_eq!(pending(&state).as_deref(), Some("q-a"));
+
+        let mut b_end = tool_end("Bash", Some("toolu_B"));
+        b_end.event_type = b_ends_as.clone();
+        state.apply_event(b_end);
+        assert_eq!(
+            pending(&state).as_deref(),
+            Some("q-a"),
+            "call B ending as {b_ends_as:?} must not clear call A's question"
+        );
+        assert_eq!(
+            state.sessions[SESSION].status,
+            SessionStatus::WaitingForInput
+        );
+
+        state.apply_event(tool_end("Bash", Some("toolu_A")));
+        assert_eq!(pending(&state), None, "call A's own end clears it");
+    }
+}
+
+/// Scenario: Where the deck cannot tell which call a question belongs to, the
+/// question still clears when its tool ends, so Needs Input never sticks: two
+/// calls with the same input, a call whose `PreToolUse` never reached the deck,
+/// and a tool end that names no call at all. A call that already ended is not
+/// mistaken for the asking one, and a question tied to its call clears on that
+/// call's end even when the call ran with an input its answer rewrote.
+#[spec("question/state/009")]
+#[test]
+fn question_state_009_a_question_that_cannot_be_told_apart_still_clears() {
+    let input = serde_json::json!({"command": "npm test"});
+
+    // One call fits: the question is tied to it.
+    let mut state = fresh();
+    state.apply_event(tool_start("Bash", "toolu_A", input.clone()));
+    state.apply_event(tool_start(
+        "Bash",
+        "toolu_B",
+        serde_json::json!({"command": "ls"}),
+    ));
+    state.apply_event(asking_for(&question("q-a", Some(("Bash", None))), &input));
+    assert_eq!(pending_call(&state).as_deref(), Some("toolu_A"));
+
+    // Two calls with the same input: untied, the first end clears (residual).
+    let mut state = fresh();
+    state.apply_event(tool_start("Bash", "toolu_A", input.clone()));
+    state.apply_event(tool_start("Bash", "toolu_A2", input.clone()));
+    state.apply_event(asking_for(&question("q-a", Some(("Bash", None))), &input));
+    assert_eq!(pending_call(&state), None, "two calls fit: none is chosen");
+    state.apply_event(tool_end("Bash", Some("toolu_A2")));
+    assert_eq!(pending(&state), None);
+
+    // No `PreToolUse` seen (an older hook stamps no fingerprint): by name.
+    let mut state = fresh();
+    state.apply_event(asking(
+        EventType::PermissionRequest,
+        &question("q-a", Some(("Bash", None))),
+    ));
+    state.apply_event(tool_end("Bash", Some("toolu_A")));
+    assert_eq!(pending(&state), None);
+
+    // A tool end that names no call (OpenCode's plugin before this change)
+    // clears a question tied to a call by name.
+    let mut state = fresh();
+    state.apply_event(asking(
+        EventType::PermissionRequest,
+        &question("per_1", Some(("bash", Some("call_A")))),
+    ));
+    state.apply_event(tool_end("bash", None));
+    assert_eq!(pending(&state), None);
+
+    // An earlier call with the same input that already ended is not a
+    // candidate: the question ties to the call still running.
+    let mut state = fresh();
+    state.apply_event(tool_start("Bash", "toolu_X", input.clone()));
+    state.apply_event(tool_end("Bash", Some("toolu_X")));
+    state.apply_event(tool_start("Bash", "toolu_A", input.clone()));
+    state.apply_event(asking_for(&question("q-a", Some(("Bash", None))), &input));
+    assert_eq!(pending_call(&state).as_deref(), Some("toolu_A"));
+
+    // A subagent's call with the same input is another thread's.
+    let mut state = fresh();
+    let mut sub = tool_start("Bash", "toolu_S", input.clone());
+    sub.metadata
+        .insert(SUBAGENT_ID_METADATA_KEY.to_string(), "sub-1".to_string());
+    state.apply_event(sub);
+    state.apply_event(tool_start("Bash", "toolu_A", input.clone()));
+    state.apply_event(asking_for(&question("q-a", Some(("Bash", None))), &input));
+    assert_eq!(pending_call(&state).as_deref(), Some("toolu_A"));
+
+    // An `AskUserQuestion` answered on screen runs with the answers added to
+    // its input; tied by its `PreToolUse`, its own end still clears it.
+    let form = serde_json::json!({"questions": [{"question": "Which?", "options": []}]});
+    let mut state = fresh();
+    state.apply_event(tool_start("AskUserQuestion", "toolu_Q", form.clone()));
+    state.apply_event(asking_for(
+        &question("q-form", Some(("AskUserQuestion", None))),
+        &form,
+    ));
+    let mut end = tool_end("AskUserQuestion", Some("toolu_Q"));
+    let mut answered = form.clone();
+    answered["answers"] = serde_json::json!({"Which?": "That"});
+    end.metadata.insert(
+        TOOL_INPUT_DIGEST_METADATA_KEY.to_string(),
+        tool_input_digest(&answered),
+    );
+    state.apply_event(end);
+    assert_eq!(pending(&state), None);
 }

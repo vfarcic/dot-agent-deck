@@ -106,6 +106,11 @@ pub(crate) struct OpenCodeHookInput {
     // on that child's tool calls (`crate::opencode_manage`).
     #[serde(default, deserialize_with = "lenient_string")]
     subagent_id: Option<String>,
+    // PR #1698 review: OpenCode's `callID` for a `tool.execute.before` /
+    // `tool.execute.after`, which its `permission.asked` names as
+    // `tool.callID`, so a permission question clears on its own call's end.
+    #[serde(default, deserialize_with = "lenient_string")]
+    call_id: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
@@ -1124,6 +1129,19 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     if let Some(tool_use_id) = tool_use_id {
         metadata.insert("tool_use_id".to_string(), tool_use_id);
     }
+    // PR #1698 review: a `PermissionRequest` names no call, so the state ties
+    // its question to the `PreToolUse` with the same input
+    // ([`crate::event::TOOL_INPUT_DIGEST_METADATA_KEY`]).
+    if matches!(
+        event_type,
+        EventType::ToolStart | EventType::PermissionRequest
+    ) && let Some(input) = &tool_input
+    {
+        metadata.insert(
+            crate::event::TOOL_INPUT_DIGEST_METADATA_KEY.to_string(),
+            crate::event::tool_input_digest(input),
+        );
+    }
     if let Some(subagent_id) = subagent_id {
         metadata.insert(
             crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
@@ -1600,6 +1618,17 @@ pub(crate) fn build_opencode_event_with_question(
             crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
             subagent_id,
         );
+    }
+
+    // PR #1698 review: the call a tool event is about, so a permission question
+    // tied to it ([`crate::question::opencode_permission_asked`]) clears on
+    // that call's end and not on a parallel one's.
+    if matches!(
+        input.event.as_str(),
+        "tool.execute.before" | "tool.execute.after"
+    ) && let Some(call_id) = input.call_id
+    {
+        metadata.insert("tool_use_id".to_string(), call_id);
     }
 
     // Store the full bash command (tool_detail truncates).
@@ -6111,6 +6140,106 @@ mod question_tests {
             plain.is_none(),
             "a question the daemon held is already on the card: {plain:?}"
         );
+    }
+
+    /// Scenario: Claude Code's captured Bash `PermissionRequest` names no call,
+    /// but the `PreToolUse` that call ran first carries its `tool_use_id` and
+    /// the same input. The deck ties the question to that call, so a parallel
+    /// Bash call with another command ending leaves it pending and Needs Input,
+    /// and the call's own end clears it. OpenCode's captured `permission.asked`
+    /// names its call (`tool.callID`), its `tool.execute.after` carries that
+    /// id, and the same holds there.
+    #[spec("question/detect/020")]
+    #[test]
+    fn question_detect_020_a_permission_question_is_tied_to_its_own_call() {
+        use crate::state::{AppState, SessionStatus};
+        let digest = crate::event::TOOL_INPUT_DIGEST_METADATA_KEY;
+
+        // Claude Code: the call's id comes from its `PreToolUse`.
+        let asked = fixture("claude-permission-bash.json");
+        let pre_tool_use = |use_id: &str, input: &Value| {
+            let mut payload = asked.clone();
+            payload["hook_event_name"] = Value::from("PreToolUse");
+            payload["tool_use_id"] = Value::from(use_id);
+            payload["tool_input"] = input.clone();
+            event_for(AgentType::ClaudeCode, &payload)
+        };
+        let post_tool_use = |use_id: &str| {
+            let mut payload = asked.clone();
+            payload["hook_event_name"] = Value::from("PostToolUse");
+            payload["tool_use_id"] = Value::from(use_id);
+            payload["tool_response"] = serde_json::json!({"stdout": "", "stderr": ""});
+            event_for(AgentType::ClaudeCode, &payload)
+        };
+        let ask = event_for(AgentType::ClaudeCode, &asked);
+        assert_eq!(
+            ask.metadata.get("tool_use_id"),
+            None,
+            "the payload names no call"
+        );
+        let start_a = pre_tool_use("toolu_A", &asked["tool_input"]);
+        let start_b = pre_tool_use("toolu_B", &serde_json::json!({"command": "ls"}));
+        assert_eq!(start_a.metadata.get(digest), ask.metadata.get(digest));
+        assert_ne!(start_b.metadata.get(digest), ask.metadata.get(digest));
+
+        let session = ask.session_id.clone();
+        let mut state = AppState::default();
+        for e in [start_a, start_b, ask] {
+            state.apply_event(e);
+        }
+        let tied = |state: &AppState| {
+            state.sessions[&session]
+                .pending_question
+                .as_ref()
+                .map(|q| q.tool.as_ref().and_then(|t| t.use_id.clone()))
+        };
+        assert_eq!(tied(&state), Some(Some("toolu_A".to_string())));
+        state.apply_event(post_tool_use("toolu_B"));
+        assert_eq!(tied(&state), Some(Some("toolu_A".to_string())));
+        assert_eq!(
+            state.sessions[&session].status,
+            SessionStatus::WaitingForInput
+        );
+        state.apply_event(post_tool_use("toolu_A"));
+        assert_eq!(tied(&state), None);
+
+        // OpenCode: the call's id is in the question and the tool's end.
+        let props = fixture("opencode-permission-asked.json");
+        let call = props["tool"]["callID"].as_str().unwrap().to_string();
+        let q = crate::question::opencode_permission_asked(&props, 1).unwrap();
+        assert_eq!(
+            q.tool.as_ref().unwrap().use_id.as_deref(),
+            Some(call.as_str())
+        );
+        let opencode = |event: &str, call_id: Option<&str>, properties: Option<Value>| {
+            build_opencode_event(OpenCodeHookInput {
+                session_id: "oc-1".into(),
+                event: event.into(),
+                tool_name: Some("bash".into()),
+                call_id: call_id.map(str::to_string),
+                properties,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let end_other = opencode("tool.execute.after", Some("call_other"), None);
+        assert_eq!(
+            end_other.metadata.get("tool_use_id").map(String::as_str),
+            Some("call_other")
+        );
+        let mut state = AppState::default();
+        state.apply_event(opencode("permission.asked", None, Some(props.clone())));
+        let pending = |state: &AppState| {
+            state
+                .sessions
+                .values()
+                .find_map(|s| s.pending_question.as_ref().map(|q| q.id.clone()))
+        };
+        assert_eq!(pending(&state).as_deref(), props["id"].as_str());
+        state.apply_event(end_other);
+        assert_eq!(pending(&state).as_deref(), props["id"].as_str());
+        state.apply_event(opencode("tool.execute.after", Some(&call), None));
+        assert_eq!(pending(&state), None);
     }
 }
 

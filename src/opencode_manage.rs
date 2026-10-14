@@ -1323,6 +1323,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
             event: "tool.execute.before",
             tool_name: input?.tool,
             tool_input: output?.args,
+            call_id: input?.callID,
           }})
         );
         return;
@@ -1337,6 +1338,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         event: "tool.execute.before",
         tool_name: input?.tool,
         tool_input: output?.args,
+        call_id: input?.callID,
         cwd: directory,
       }});
     }},
@@ -1347,6 +1349,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
             event: "tool.execute.after",
             tool_name: input?.tool,
             tool_input: input?.args,
+            call_id: input?.callID,
           }})
         );
         return;
@@ -1361,6 +1364,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         event: "tool.execute.after",
         tool_name: input?.tool,
         tool_input: input?.args,
+        call_id: input?.callID,
         cwd: directory,
       }});
     }},
@@ -2199,6 +2203,9 @@ pub(crate) mod tests {
         assert!(content.contains("eventType === \"message.updated\""));
         assert!(content.contains("const permissionPayload"));
         assert!(content.contains("\"permission.asked\""));
+        // PR #1698 review: both tool hooks, root and child session, forward the
+        // call's id, which a `permission.asked` names as `tool.callID`.
+        assert_eq!(content.matches("call_id: input?.callID,").count(), 4);
     }
 
     /// The installer intentionally fans out to every existing OpenCode config

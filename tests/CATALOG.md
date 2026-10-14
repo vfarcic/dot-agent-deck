@@ -8452,6 +8452,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Asserts:** a Claude Code Bash `PermissionRequest` in the `default` mode, with and without an `addDirectories` suggestion, marks "Yes, and switch to auto mode" `maybe_hidden` and no other option; in `plan` mode nothing is marked; Claude Code's Write, plan and `AskUserQuestion` questions and Codex's approval and form mark nothing; across every agent's option tables in `agent_registry::ALL`, the auto-mode entry is the only marked one.
 - **Does not assert:** whether Claude draws the option (nothing in the payload says); the desktop's handling of the mark (`question/desktop/031`).
 - **Platform coverage:** mac+linux.
+
+##### question/detect/020 — A permission question is tied to its own call, from real payloads.
+- **Layer:** L1/fast unit (`src/hook.rs`, the captured `claude-permission-bash.json` and `opencode-permission-asked.json`).
+- **Agent:** none.
+- **Asserts:** Claude Code's `PermissionRequest` names no call and fingerprints its input like the call's `PreToolUse`, and unlike another command's; applied to state, the question ties to that call, survives the other call's `PostToolUse` on Needs Input, and clears on its own. OpenCode's `permission.asked` puts `tool.callID` in `tool.use_id`, a `tool.execute.after` carries its `call_id` as `tool_use_id`, and only the matching call's end clears it.
+- **Does not assert:** live agents running parallel calls; Codex's `PreToolUse` and `PermissionRequest` inputs agreeing.
+- **Platform coverage:** mac+linux.
 #### question/state
 
 ##### question/state/001 — A question event sets the pending question and Needs Input.
@@ -8501,6 +8508,20 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Agent:** none.
 - **Asserts:** a question (with its revision) raised on the daemon while the client was not listening reaches the client's card through the resync, and the card reads Needs Input; a question resolved on the daemon during a later gap is gone from the card after the next resync.
 - **Does not assert:** the subscriber's reconnect loop itself (`event_subscriber`'s own tests, issue #1520); the desktop, which reads `ListAgents` snapshots directly.
+- **Platform coverage:** mac+linux.
+
+##### question/state/008 — A parallel call of the same tool ending does not clear the question.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`).
+- **Agent:** none.
+- **Asserts:** with two Bash calls in flight, a Claude-shaped question raised for call A (no `tool_use_id`, A's input fingerprint) stays pending and the card stays on Needs Input when call B, a different command, ends — as a `ToolEnd` or as a promoted failure `Error`; call A's own end clears it.
+- **Does not assert:** the hook stamping the fingerprint from real payloads (`question/detect/020`).
+- **Platform coverage:** mac+linux.
+
+##### question/state/009 — A question that cannot be tied to one call still clears when its tool ends.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`).
+- **Agent:** none.
+- **Asserts:** one fitting call ties the question to it; two calls with the same input leave it untied and the first end clears it; no `ToolStart` seen, and a tool end naming no call, fall back to the tool-name match; an earlier call that already ended and a subagent's call with the same input are not candidates; an `AskUserQuestion` tied to its call clears on its own end even when its input was rewritten.
+- **Does not assert:** a `ToolStart` applied after its `PermissionRequest` (untied, falls back by name).
 - **Platform coverage:** mac+linux.
 
 #### question/answer

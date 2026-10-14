@@ -115,8 +115,11 @@ pub struct QuestionTool {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// The producer's `tool_use_id` when it had one, so the tool's own
-    /// `ToolEnd` clears exactly this question.
+    /// The `tool_use_id` of the call the question is about, so that call's
+    /// own `ToolEnd` clears exactly this question: the producer's when it had
+    /// one (Codex's `request_user_input`, OpenCode's `callID`), else the one
+    /// the state tied the question to from the call's `ToolStart`
+    /// ([`crate::state`]'s `question_call`, PR #1698 review).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_id: Option<String>,
 }
@@ -587,12 +590,18 @@ impl PendingQuestion {
     /// PRD #1631 (audit A4): whether `other` is this same question raised
     /// again — every field equal except when it was raised, how the deck would
     /// answer it, and its revision, none of which a repeat of one prompt
-    /// changes.
+    /// changes. Nor is the call it is tied to ([`QuestionTool::use_id`]): the
+    /// pending copy may carry the one the state tied it to, which the
+    /// producer's repeat does not name (PR #1698 review).
     pub fn same_content(&self, other: &Self) -> bool {
         let bare = |q: &Self| Self {
             raised_at_ms: 0,
             channel: AnswerChannel::Unknown,
             revision: None,
+            tool: q.tool.clone().map(|tool| QuestionTool {
+                use_id: None,
+                ..tool
+            }),
             ..q.clone()
         };
         bare(self) == bare(other)
@@ -1502,7 +1511,12 @@ pub fn devin_permission_request(
 
 /// PRD #1631: OpenCode's `permission.asked` properties → a held
 /// [`QuestionKind::Permission`] with OpenCode's three fixed replies. The id is
-/// OpenCode's own request id, so its `permission.replied` names it.
+/// OpenCode's own request id, so its `permission.replied` names it. The call it
+/// asks about is `tool.callID`, the `callID` that call's `tool.execute.after`
+/// carries [read from 1.18.35's bundle: a tool's `ctx.ask` adds
+/// `tool: {messageID, callID: toolCallId}`], so that call's end clears it and a
+/// parallel call's does not (PR #1698 review). An ask made outside a tool call
+/// has no `tool`.
 pub fn opencode_permission_asked(props: &Value, raised_at_ms: i64) -> Option<PendingQuestion> {
     let id = str_field(props, "id")?.to_string();
     let permission = str_field(props, "permission").unwrap_or("permission");
@@ -1546,7 +1560,10 @@ pub fn opencode_permission_asked(props: &Value, raised_at_ms: i64) -> Option<Pen
         tool: Some(QuestionTool {
             name: permission.to_string(),
             detail,
-            use_id: None,
+            use_id: props
+                .get("tool")
+                .and_then(|tool| str_field(tool, "callID"))
+                .map(str::to_string),
         }),
         channel: AnswerChannel::Held,
         subagent_id: None,

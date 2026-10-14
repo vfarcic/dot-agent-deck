@@ -18070,12 +18070,39 @@ impl AppState {
             .pending_question
             .as_ref()
             .is_some_and(|q| question_cleared_by(q, event));
+        // PR #1698 review: a question this frame leaves pending keeps the card
+        // on Needs Input when the frame only ends ANOTHER call — a parallel
+        // call's end is not the agent moving past the prompt it still shows.
+        let question_stays =
+            !clears_question && session.pending_question.is_some() && ends_a_call(event);
         let raised_question = event.question().map(|mut q| {
             if q.subagent_id.is_none() {
                 q.subagent_id = event
                     .metadata
                     .get(crate::event::SUBAGENT_ID_METADATA_KEY)
                     .cloned();
+            }
+            // PR #1698 review: tie a question its producer could not name a
+            // call for to the one call in flight it was raised for, so a
+            // parallel call of the same tool ending does not clear it.
+            let call = match &q.tool {
+                Some(tool) if tool.use_id.is_none() => session
+                    .pending_question
+                    .as_ref()
+                    .filter(|current| current.id == q.id)
+                    .and_then(|current| current.tool.as_ref()?.use_id.clone())
+                    .or_else(|| {
+                        question_call(
+                            &session.recent_events,
+                            event,
+                            &tool.name,
+                            q.subagent_id.as_ref(),
+                        )
+                    }),
+                _ => None,
+            };
+            if let (Some(tool), Some(call)) = (q.tool.as_mut(), call) {
+                tool.use_id = Some(call);
             }
             q
         });
@@ -18263,7 +18290,7 @@ impl AppState {
             EventType::ToolEnd => {
                 session.active_tool = None;
                 session.tool_count += 1;
-                let asserted = session.status == SessionStatus::WaitingForInput;
+                let asserted = session.status == SessionStatus::WaitingForInput && !question_stays;
                 if asserted {
                     session.status = SessionStatus::Thinking;
                 }
@@ -18349,6 +18376,9 @@ impl AppState {
                 // Informational — recorded in recent_events but no status change
                 false
             }
+            // PR #1698 review: another call's failure while a question is
+            // still pending is journalled, and the card stays on Needs Input.
+            EventType::Error if question_stays => false,
             EventType::Error => {
                 session.status = SessionStatus::Error;
                 true
@@ -18556,12 +18586,13 @@ impl AppState {
 /// PRD #1631: whether `event` proves the agent moved past `question`, so the
 /// pending question must go. The rules, in the design's terms:
 ///
-/// 1. the tool's own `ToolEnd` — matched by `tool_use_id` where the question
-///    has one, else by tool name from the same thread (a `ToolEnd` for another
-///    tool does not clear: tools run in parallel);
+/// 1. the end of the call the question is about ([`call_ended`]) — a `ToolEnd`,
+///    or the `Error` the hook promotes a failed call's `PostToolUse` to — and
+///    not the end of another call: tools run in parallel, including two calls
+///    of the same tool (PR #1698 review);
 /// 2. a new turn (`Thinking` carrying a prompt), `Idle` (a `Stop`, or Codex's
-///    `Interrupt`), `SessionStart`, `Error` or `QuotaBlocked` — on the main
-///    thread;
+///    `Interrupt`), `SessionStart`, an `Error` that is not a call's, or
+///    `QuotaBlocked` — on the main thread;
 /// 3. the agent reporting this very question answered
 ///    ([`crate::event::QUESTION_RESOLVED_METADATA_KEY`]);
 /// 4. the `SubagentStop` of the subagent that asked.
@@ -18575,18 +18606,7 @@ fn question_cleared_by(question: &crate::question::PendingQuestion, event: &Agen
     }
     let event_subagent = event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY);
     match event.event_type {
-        EventType::ToolEnd => {
-            let Some(tool) = &question.tool else {
-                return false;
-            };
-            match &tool.use_id {
-                Some(use_id) => event.metadata.get("tool_use_id") == Some(use_id),
-                None => {
-                    event.tool_name.as_deref() == Some(tool.name.as_str())
-                        && event_subagent == question.subagent_id.as_ref()
-                }
-            }
-        }
+        _ if ends_a_call(event) => call_ended(question, event),
         EventType::Thinking => event.user_prompt.is_some() && event_subagent.is_none(),
         EventType::Idle | EventType::SessionStart | EventType::Error | EventType::QuotaBlocked => {
             event_subagent.is_none()
@@ -18596,6 +18616,96 @@ fn question_cleared_by(question: &crate::question::PendingQuestion, event: &Agen
         }
         _ => false,
     }
+}
+
+/// PR #1698 review: whether `event` reports one tool call ending — a
+/// `ToolEnd`, or an `Error` naming its call, which is how the hook reports a
+/// failed call's `PostToolUse` (`tool_response_is_failure` in
+/// [`crate::hook`]). Such an `Error` ends that call, not the turn.
+fn ends_a_call(event: &AgentEvent) -> bool {
+    match event.event_type {
+        EventType::ToolEnd => true,
+        EventType::Error => event.metadata.contains_key("tool_use_id"),
+        _ => false,
+    }
+}
+
+/// PR #1698 review: whether the call that `event` ends ([`ends_a_call`]) is
+/// the one `question` is about. By `tool_use_id` when both name a call — the
+/// producer's id, or the one [`question_call`] tied the question to. When
+/// either does not, the deck cannot tell the calls apart and matches by tool
+/// name from the same thread, so a question whose call really ended still
+/// clears; the cost is that a parallel call of the same tool ending clears it
+/// too.
+fn call_ended(question: &crate::question::PendingQuestion, event: &AgentEvent) -> bool {
+    let Some(tool) = &question.tool else {
+        return false;
+    };
+    match (&tool.use_id, event.metadata.get("tool_use_id")) {
+        (Some(use_id), Some(ended)) => ended == use_id,
+        _ => {
+            event.tool_name.as_deref() == Some(tool.name.as_str())
+                && event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                    == question.subagent_id.as_ref()
+        }
+    }
+}
+
+/// PR #1698 review: the `tool_use_id` of the call a question raised by
+/// `event` is about, when exactly one call fits.
+///
+/// Claude Code's `PermissionRequest` payload carries no `tool_use_id` — its
+/// hook input is the session fields, `tool_name`, `tool_input`,
+/// `permission_suggestions` and an MCP server [read from 2.1.296's bundle] —
+/// and neither does Codex's (`permission-request.command.input` in 0.160.0).
+/// But both agents run `PreToolUse` before they ask, and its payload carries
+/// the call's `tool_use_id` and the same `tool_input`. So the call is the one
+/// in this turn's journal whose `ToolStart` names the same tool, from the same
+/// thread, with the same input fingerprint
+/// ([`crate::event::TOOL_INPUT_DIGEST_METADATA_KEY`]), and that has not ended.
+///
+/// `None` — the question then clears by tool name ([`call_ended`]) — when the
+/// question's event or the `ToolStart` carries no fingerprint (an older hook,
+/// another agent), when no such call is in the journal, and when two are: two
+/// calls of one tool with the same input cannot be told apart.
+fn question_call(
+    journal: &VecDeque<AgentEvent>,
+    event: &AgentEvent,
+    tool_name: &str,
+    subagent_id: Option<&String>,
+) -> Option<String> {
+    let digest = event
+        .metadata
+        .get(crate::event::TOOL_INPUT_DIGEST_METADATA_KEY)?;
+    let mut ended = HashSet::new();
+    let mut found = None;
+    for earlier in journal.iter().rev() {
+        if earlier.event_type == EventType::Thinking && earlier.user_prompt.is_some() {
+            break;
+        }
+        let Some(call) = earlier.metadata.get("tool_use_id") else {
+            continue;
+        };
+        if ends_a_call(earlier) {
+            ended.insert(call);
+            continue;
+        }
+        if earlier.event_type == EventType::ToolStart
+            && !ended.contains(call)
+            && earlier.tool_name.as_deref() == Some(tool_name)
+            && earlier.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY) == subagent_id
+            && earlier
+                .metadata
+                .get(crate::event::TOOL_INPUT_DIGEST_METADATA_KEY)
+                == Some(digest)
+        {
+            if found.as_ref().is_some_and(|f| f != call) {
+                return None;
+            }
+            found = Some(call.clone());
+        }
+    }
+    found
 }
 
 #[cfg(test)]

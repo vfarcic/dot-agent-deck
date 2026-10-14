@@ -1064,6 +1064,27 @@ pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
 /// rewrites it sanitized, or drops it, on arrival.
 pub const QUESTION_METADATA_KEY: &str = "pending_question";
 
+/// PRD #1631 (PR #1698 review): a fingerprint of a tool call's `tool_input`
+/// ([`tool_input_digest`]), stamped by the Claude-shaped hook on a `PreToolUse`
+/// (`ToolStart`) and a `PermissionRequest`. Claude Code's and Codex's
+/// `PermissionRequest` payloads carry no `tool_use_id`, but the call's own
+/// `PreToolUse` does, and carries the same input, so the state ties a question
+/// to the one call in flight whose input it was raised for
+/// ([`crate::state`]'s `question_call`). Additive like
+/// [`SUBAGENT_ID_METADATA_KEY`]: an older daemon ignores it, an older hook
+/// never sets it, and a question left untied clears by tool name as before.
+pub const TOOL_INPUT_DIGEST_METADATA_KEY: &str = "tool_input_digest";
+
+/// PRD #1631 (PR #1698 review): the [`TOOL_INPUT_DIGEST_METADATA_KEY`] value
+/// for `input` — SHA-256, in hex, of its JSON. `serde_json` keeps an object's
+/// keys sorted in this build (no `preserve_order`), so the same input digests
+/// alike whatever order the producer wrote its keys in.
+pub fn tool_input_digest(input: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.to_string().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// PRD #1631: the id of a question the AGENT reports answered — OpenCode's
 /// `permission.replied` / `question.replied` / `question.rejected` name their
 /// request id here. An event carrying it clears that question if it is the
