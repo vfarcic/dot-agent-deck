@@ -240,6 +240,65 @@ pub const LEGACY_MODES_VALIDATE_MESSAGE: &str =
 
 /// Validate a project config and return a list of issues.
 /// Errors should block the config from being used; warnings are informational.
+/// PRD #1666: every `subscribe` and `take_offers` entry is a topic or pool
+/// name the inbox accepts. A name it would refuse is an error rather than a
+/// warning: the subscription would never match anything, and nothing else
+/// would ever say why.
+fn validate_subscriptions(config: &ProjectConfig, issues: &mut Vec<ValidationIssue>) {
+    let mut check = |scope: &str, owner: &str, key: &str, names: &[String]| {
+        if names.len() > crate::inbox::MAX_SUBSCRIPTIONS {
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                scope: scope.to_string(),
+                message: format!(
+                    "{owner}`{key}` names {} entries; at most {} are allowed",
+                    names.len(),
+                    crate::inbox::MAX_SUBSCRIPTIONS
+                ),
+            });
+        }
+        for name in names {
+            if !crate::inbox::is_valid_label(name) {
+                issues.push(ValidationIssue {
+                    severity: Severity::Error,
+                    scope: scope.to_string(),
+                    message: format!(
+                        "{owner}`{key}` entry \"{}\" is not a valid name: use 1 to {} lowercase \
+                         letters, digits and hyphens, starting with a letter or digit",
+                        bound_chars(name, MAX_QUOTED_VALUE_CHARS),
+                        crate::inbox::MAX_LABEL_LEN
+                    ),
+                });
+            }
+        }
+    };
+    check("[dispatch]", "", "subscribe", &config.inbox.dispatch);
+    for (orchestration, subs) in config
+        .orchestrations
+        .iter()
+        .zip(&config.inbox.orchestrations)
+    {
+        check(&orchestration.name, "", "subscribe", &subs.subscribe);
+        let mut roles: Vec<_> = subs.roles.iter().collect();
+        roles.sort_by(|a, b| a.0.cmp(b.0));
+        for (role, role_subs) in roles {
+            let owner = format!("role '{}': ", bound_chars(role, MAX_QUOTED_VALUE_CHARS));
+            check(
+                &orchestration.name,
+                &owner,
+                "subscribe",
+                &role_subs.subscribe,
+            );
+            check(
+                &orchestration.name,
+                &owner,
+                "take_offers",
+                &role_subs.take_offers,
+            );
+        }
+    }
+}
+
 pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
 
@@ -256,6 +315,8 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             message: LEGACY_MODES_VALIDATE_MESSAGE.to_string(),
         });
     }
+
+    validate_subscriptions(config, &mut issues);
 
     // Check for duplicate orchestration names.
     let mut seen_orch_names = HashSet::new();
@@ -566,6 +627,8 @@ mod tests {
             orchestrations,
             worker_response_timeout_minutes:
                 crate::project_config::DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES,
+
+            inbox: Default::default(),
         }
     }
 

@@ -145,6 +145,24 @@ impl From<MessageId> for String {
     }
 }
 
+/// The longest topic or pool name.
+pub const MAX_LABEL_LEN: usize = 64;
+/// The most topics or pools one `subscribe` or `take_offers` list may name.
+pub const MAX_SUBSCRIPTIONS: usize = 64;
+
+/// A topic or offer-pool name: `[a-z0-9][a-z0-9-]{0,63}`. Inert wherever it is
+/// carried — in an address, a subject, a log line — so the wire and the config
+/// refuse anything else rather than escaping it.
+pub fn is_valid_label(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_LABEL_LEN
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
 /// `m-[a-z2-7]{8}-[0-9a-f]{16}`. Replaces `delegate_retry::is_valid_delivery_id`;
 /// an old `d-…` delivery id is not a message id.
 pub fn is_valid_message_id(text: &str) -> bool {
