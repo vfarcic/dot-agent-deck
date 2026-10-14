@@ -139,6 +139,9 @@ async fn codex_worker_inner(launch: WorkerLaunch) {
                     daemon.hook_path.display().to_string(),
                 ),
                 ("PATH".to_string(), path_with_binary_dir()),
+                // This fixture owns a PTY even when the test runner's parent
+                // uses pipes and advertises TERM=dumb.
+                ("TERM".to_string(), "xterm-256color".to_string()),
                 (
                     "HOME".to_string(),
                     codex_home
@@ -192,7 +195,7 @@ async fn codex_worker_inner(launch: WorkerLaunch) {
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: format!(
-            "First create {SENTINEL_NAME} in the current working directory with the exact contents {SENTINEL_CONTENT} and no trailing newline. Then run the dot-agent-deck work-done command from the completion instructions below. Do not stop before both steps are complete."
+            "First create {SENTINEL_NAME} in the current working directory containing exactly {SENTINEL_CONTENT}. Then run the dot-agent-deck work-done command from the completion instructions below. Do not stop before both steps are complete."
         ),
         to: vec![WORKER_ROLE.to_string()],
         supersede: false,
@@ -209,6 +212,9 @@ async fn codex_worker_inner(launch: WorkerLaunch) {
     let sentinel = cwd.path().join(SENTINEL_NAME);
     // Poll the CONTENT, not existence: a shell redirect creates the file before
     // the write lands, so an existence wait can read it empty (issue #244).
+    // Compared trimmed, which is why the task does not ask for "no trailing
+    // newline": asked that, the cheap model reached for `truncate` and twice
+    // wrote a padded or cut sentinel, or stopped before work-done (2026-10-14).
     // `codex/worker/002` runs inside nextest's 180 s terminate-after, so its
     // wait ends early enough for the panic below to show the pane.
     let sentinel_wait = match launch {
