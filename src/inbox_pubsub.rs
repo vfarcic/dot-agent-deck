@@ -32,7 +32,7 @@ use crate::inbox::{
     RoleFacts, ScopeMember, Sender, is_valid_label, is_valid_message_id, offer_candidates,
     publish_recipients, resolve_scope,
 };
-use crate::inbox_hub::{MintedSpill, PostRefusal, Stale};
+use crate::inbox_hub::{MintedSpill, PooledOffer, PostRefusal, Stale};
 use crate::state::{ProjectConfigs, SharedState};
 
 /// How many times a publish or offer reads its scope again when an agent in
@@ -633,22 +633,39 @@ pub fn spawn_offer_assigner(
             }
             let view = ScopeView::gather(&state, &registry).await;
             for offer in offers {
-                let Some(offerer_agent) = offer.offerer.agent_id.as_deref() else {
-                    continue;
-                };
-                // The scope is the offerer's while it lives; once it is gone
-                // its jobs wait in their pool.
-                if !is_live(&registry, &offer.offerer.pane_id, offerer_agent) {
-                    continue;
-                }
-                let Some(scope) = view.scope_of(&offer.offerer.pane_id) else {
-                    continue;
-                };
-                let takers = view.takers(&scope, &offer.pool, &offer.offerer.pane_id);
-                registry.inbox().assign_offer(&offer.id, &takers);
+                assign_pooled(&registry, &view, &offer);
             }
         }
     })
+}
+
+/// Hand pooled `offer` to the next taker of its pool in its offerer's scope,
+/// as `view` read it.
+fn assign_pooled(
+    registry: &AgentPtyRegistry,
+    view: &ScopeView,
+    offer: &PooledOffer,
+) -> Option<Recipient> {
+    let offerer_agent = offer.offerer.agent_id.as_deref()?;
+    // The scope is the offerer's while it lives; once it is gone its jobs
+    // wait in their pool.
+    if !is_live(registry, &offer.offerer.pane_id, offerer_agent) {
+        return None;
+    }
+    let scope = view.scope_of(&offer.offerer.pane_id)?;
+    let takers = view.takers(&scope, &offer.pool, &offer.offerer.pane_id);
+    hand_out(registry, offer, &takers)
+}
+
+/// The hand-over [`assign_pooled`] ends with, once it has read the takers.
+fn hand_out(
+    registry: &AgentPtyRegistry,
+    offer: &PooledOffer,
+    takers: &[(Recipient, String)],
+) -> Option<Recipient> {
+    registry
+        .inbox()
+        .assign_offer(&offer.id, takers, &|| registry.live_pane_agents())
 }
 
 #[cfg(test)]
@@ -993,6 +1010,159 @@ mod tests {
         assert!(
             matches!(attempt, Attempt::Stale),
             "the scope changed under the publish: it is read again"
+        );
+        registry.shutdown_all();
+    }
+
+    /// A team in `dir`: an orchestrator in pane `{prefix}-o` and two takers of
+    /// pool `jobs`, `{prefix}-t1` and `{prefix}-t2`, in one orchestration.
+    fn offer_team(
+        registry: &Arc<AgentPtyRegistry>,
+        dir: &std::path::Path,
+        prefix: &str,
+    ) -> (SharedState, [(String, String); 3]) {
+        std::fs::write(
+            dir.join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = 'pool'\n[[orchestrations.roles]]\nname = 'orchestrator'\n\
+             command = 'cat'\nstart = true\n[[orchestrations.roles]]\nname = 'taker'\n\
+             command = 'cat'\ntake_offers = ['jobs']\n",
+        )
+        .unwrap();
+        let cwd = dir.to_str().unwrap();
+        let mut state = AppState::default();
+        let panes = ["o", "t1", "t2"].map(|suffix| {
+            let pane = format!("{prefix}-{suffix}");
+            let agent = spawn_in(registry, &pane, Some(cwd));
+            state.pane_orchestration_map.insert(
+                pane.clone(),
+                crate::state::OrchestrationIdentity {
+                    id: format!("{prefix}-token"),
+                    name: "pool".to_string(),
+                },
+            );
+            let role = if suffix == "o" {
+                "orchestrator"
+            } else {
+                "taker"
+            };
+            state.pane_role_map.insert(pane.clone(), role.to_string());
+            state.pane_cwd_map.insert(pane.clone(), cwd.to_string());
+            (pane, agent)
+        });
+        state.orchestrator_pane_ids.insert(panes[0].0.clone());
+        (Arc::new(tokio::sync::RwLock::new(state)), panes)
+    }
+
+    /// Offer a job from `o` and put it back in its pool: the first taker
+    /// fetches it and hands it back, so it is now never offered to that taker.
+    async fn pooled_offer(
+        registry: &Arc<AgentPtyRegistry>,
+        state: &SharedState,
+        o: &(String, String),
+        t1: &(String, String),
+    ) -> PooledOffer {
+        let reply = handle_offer(registry, state, &offer_from(&o.0, &o.1), &o.1).await;
+        assert!(reply.refused.is_none(), "{reply:?}");
+        let fetched =
+            registry
+                .inbox()
+                .fetch(&t1.0, &t1.1, crate::inbox::Consumer::FetchCli, None, None);
+        assert_eq!(fetched.len(), 1, "the first taker holds the job");
+        assert!(registry.inbox().nack(&fetched[0].id, &t1.0, &t1.1));
+        let pooled = registry.inbox().pooled_offers();
+        assert_eq!(pooled.len(), 1, "the job is back in its pool");
+        pooled.into_iter().next().unwrap()
+    }
+
+    /// Respawn `pane`'s agent and wait until the inbox has swept the departed
+    /// one: a message bound to it is undeliverable.
+    async fn respawn_and_sweep(
+        registry: &Arc<AgentPtyRegistry>,
+        pane: &(String, String),
+    ) -> String {
+        let probe = registry
+            .inbox()
+            .post_direct(
+                Recipient::bound(pane.0.clone(), pane.1.clone()),
+                Content::from_deck("seed", "probe", "probe"),
+            )
+            .unwrap();
+        let successor = registry
+            .respawn_agent_for_pane(&pane.0, "cat")
+            .await
+            .expect("respawn");
+        assert_ne!(successor, pane.1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !registry
+            .inbox()
+            .list(&pane.0)
+            .iter()
+            .any(|m| m.id == probe && m.state == crate::inbox::StateName::Undeliverable)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the departed agent was never swept"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        successor
+    }
+
+    fn holder_of(registry: &AgentPtyRegistry, id: &MessageId) -> Option<Recipient> {
+        registry
+            .inbox()
+            .list_all()
+            .into_iter()
+            .find(|m| &m.id == id)
+            .and_then(|m| m.recipient)
+    }
+
+    /// Audit D2: a pooled job whose takers were read before a taker's agent
+    /// was replaced — and the departed agent already swept from the inbox — is
+    /// not handed to the departed agent. The next read of the scope hands it
+    /// to the successor.
+    #[tokio::test]
+    async fn a_pooled_offer_is_not_handed_to_a_taker_that_left_after_the_scope_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (state, [o, t1, t2]) = offer_team(&registry, dir.path(), "d2a");
+        let offer = pooled_offer(&registry, &state, &o, &t1).await;
+
+        let view = ScopeView::gather(&state, &registry).await;
+        let successor = respawn_and_sweep(&registry, &t2).await;
+        assert_eq!(assign_pooled(&registry, &view, &offer), None);
+        assert!(
+            holder_of(&registry, &offer.id).is_none_or(|r| r.agent_id.as_deref() != Some(&t2.1)),
+            "the job was handed to the taker's departed agent"
+        );
+
+        let view = ScopeView::gather(&state, &registry).await;
+        let chosen = assign_pooled(&registry, &view, &offer).expect("handed out again");
+        assert_eq!(chosen.agent_id.as_deref(), Some(successor.as_str()));
+        registry.shutdown_all();
+    }
+
+    /// Audit D2: a pooled job is not handed out when its offerer was replaced
+    /// after the assigner's liveness check; it waits in its pool.
+    #[tokio::test]
+    async fn a_pooled_offer_is_not_handed_out_once_its_offerer_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (state, [o, t1, t2]) = offer_team(&registry, dir.path(), "d2b");
+        let offer = pooled_offer(&registry, &state, &o, &t1).await;
+
+        let view = ScopeView::gather(&state, &registry).await;
+        assert!(is_live(&registry, &o.0, &o.1));
+        let scope = view.scope_of(&o.0).expect("the offerer's scope");
+        let takers = view.takers(&scope, "jobs", &o.0);
+        assert!(takers.iter().any(|(r, _)| r.pane_id == t2.0), "{takers:?}");
+        respawn_and_sweep(&registry, &o).await;
+        assert_eq!(hand_out(&registry, &offer, &takers), None);
+        assert!(holder_of(&registry, &offer.id).is_none());
+        assert_eq!(
+            registry.inbox().pooled_offers().len(),
+            1,
+            "the job waits in its pool"
         );
         registry.shutdown_all();
     }

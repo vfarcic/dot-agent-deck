@@ -901,23 +901,51 @@ impl InboxHub {
 
     /// PRD #1666 S11: hand pooled offer `id` to the first of `candidates`
     /// (recipient and role) that has not held it before.
+    ///
+    /// Audit D2: `live` — each pane and the agent holding it — is read under
+    /// this hub's lock, as [`Self::publish`]'s `revalidate` is. The offer is
+    /// handed out only while its offerer still holds its pane, and only to a
+    /// candidate whose agent still holds its pane: an agent's exit sweeps its
+    /// messages under the same lock, after the registry stops naming it, so a
+    /// candidate that left after `candidates` were read is skipped rather than
+    /// handed a job no exit sweep will return. When one was skipped and no one
+    /// took the offer, the assigner is woken to read the scope again.
     pub fn assign_offer(
         &self,
         id: &MessageId,
         candidates: &[(Recipient, String)],
+        live: &dyn Fn() -> Vec<(String, String)>,
     ) -> Option<Recipient> {
-        let recipients: Vec<Recipient> = candidates.iter().map(|(r, _)| r.clone()).collect();
         let chosen = {
             let mut st = self.lock();
+            let live: std::collections::HashSet<(String, String)> = live().into_iter().collect();
+            let holds = |r: &Recipient| {
+                r.agent_id
+                    .as_ref()
+                    .is_none_or(|agent| live.contains(&(r.pane_id.clone(), agent.clone())))
+            };
+            if st
+                .offers
+                .get(id.as_str())
+                .is_some_and(|context| !holds(&context.offerer))
+            {
+                return None;
+            }
+            let fresh: Vec<&(Recipient, String)> =
+                candidates.iter().filter(|(r, _)| holds(r)).collect();
             if let Some(context) = st.offers.get_mut(id.as_str()) {
                 context.roles.extend(
-                    candidates
+                    fresh
                         .iter()
                         .map(|(r, role)| (r.pane_id.clone(), role.clone())),
                 );
             }
+            let recipients: Vec<Recipient> = fresh.iter().map(|(r, _)| r.clone()).collect();
             let chosen = st.inbox.assign_offer(Instant::now(), id, &recipients);
             drain_events(&mut st);
+            if chosen.is_none() && fresh.len() < candidates.len() {
+                st.pooled.notify_one();
+            }
             chosen
         };
         if let Some(Recipient {
