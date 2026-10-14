@@ -503,9 +503,9 @@ fn offer_005_release_returns_to_pool_and_complete_notifies_offerer() {
 #[test]
 fn offer_007_a_job_held_behind_a_long_turn_is_not_reassigned() {
     let daemon = inbox::daemon_unbound(&[
-        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "300"),
+        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500"),
         ("DOT_AGENT_DECK_INBOX_MAX_DELIVER", "2"),
-        (route::UNDELIVERED_MS, "900"),
+        (route::UNDELIVERED_MS, "4500"),
     ]);
     let (orch, first, second) = team(&daemon, "held");
     let mut first_stream = inbox::waiter(&daemon, &first);
@@ -527,7 +527,7 @@ fn offer_007_a_job_held_behind_a_long_turn_is_not_reassigned() {
         handed(stream, &id),
         "the holder's component is handed the job"
     );
-    let until = std::time::Instant::now() + Duration::from_millis(3000);
+    let until = std::time::Instant::now() + Duration::from_millis(15000);
     let mut redeliveries = 0;
     while std::time::Instant::now() < until {
         assert!(

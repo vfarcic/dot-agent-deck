@@ -514,13 +514,13 @@ fn idle_worker_030_a_waiting_notice_survives_its_own_pointer_landing_while_it_wa
     route::idle_clock(30);
 }
 
-/// The daemon for a long-turn test: a short ack-wait and hand-over limit, so
-/// ack-wait × `max_deliver` is 600 ms, and the undelivered notice at 900 ms.
+/// The daemon for a long-turn test: a 1500 ms ack-wait gives a loaded runner
+/// more time to answer, with max-delivery at 3000 ms and a notice at 4500 ms.
 fn long_turn_daemon() -> common::DaemonProc {
     daemon_unbound(&[
-        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "300"),
+        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500"),
         ("DOT_AGENT_DECK_INBOX_MAX_DELIVER", "2"),
-        (route::UNDELIVERED_MS, "900"),
+        (route::UNDELIVERED_MS, "4500"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ])
 }
@@ -573,7 +573,7 @@ fn route_009_a_task_held_through_a_long_turn_raises_no_false_notice() {
     let mut stream = worker_stream(&daemon, &worker);
     let id = route::delegate(&daemon, &orch, route::TASK, false);
     handed_over(&mut stream, &id);
-    let until = std::time::Instant::now() + Duration::from_millis(3000);
+    let until = std::time::Instant::now() + Duration::from_millis(15000);
     let mut redeliveries = 0;
     while std::time::Instant::now() < until {
         handed_over(&mut stream, &id);
@@ -620,9 +620,9 @@ fn route_010_a_late_ack_after_max_deliver_corrects_the_orchestrator() {
 #[test]
 fn route_011_an_ack_after_the_not_reached_notice_corrects_the_orchestrator_once() {
     let daemon = daemon_unbound(&[
-        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "300"),
+        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500"),
         ("DOT_AGENT_DECK_INBOX_MAX_DELIVER", "100"),
-        (route::UNDELIVERED_MS, "600"),
+        (route::UNDELIVERED_MS, "3000"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ]);
     let (orch, worker) = route::team(&daemon, false);

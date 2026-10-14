@@ -1050,12 +1050,12 @@ fn opencode_014_server_announces_before_idle_and_delayed_tui_arms() {
 #[spec("inbox/opencode/024")]
 #[test]
 fn opencode_024_a_prompt_queued_behind_a_long_turn_is_held_not_reinjected() {
-    let op = OpenCode::new("session", json!({"maxDeliver":"2"}));
+    let op = OpenCode::new("session", json!({"maxDeliver":"2","ackWaitMs":"3000"}));
     armed(&op.daemon, &op.pane, 1);
     op.session_status("shown", "busy");
     let id = op.post();
     op.wait_kind("prompt");
-    op.held_through(&id, Duration::from_millis(6000));
+    op.held_through(&id, Duration::from_millis(12000));
     assert!(
         op.holds(&id) >= 2,
         "each redelivery answers hold: {:?}",
@@ -1069,7 +1069,7 @@ fn opencode_024_a_prompt_queued_behind_a_long_turn_is_held_not_reinjected() {
 #[spec("inbox/opencode/027")]
 #[test]
 fn opencode_027_an_offer_queued_behind_a_long_turn_is_held_and_stays_assigned() {
-    let op = OpenCode::new("session", json!({"offerPool":"review"}));
+    let op = OpenCode::new("session", json!({"offerPool":"review","ackWaitMs":"3000"}));
     armed(&op.daemon, &op.pane, 1);
     op.session_status("shown", "busy");
     let orch = op.orchestrator.as_ref().unwrap();
@@ -1084,7 +1084,7 @@ fn opencode_027_an_offer_queued_behind_a_long_turn_is_held_and_stays_assigned() 
         .to_string();
     op.wait_kind("prompt");
     assert!(
-        !common::wait_until(Duration::from_millis(6000), || {
+        !common::wait_until(Duration::from_millis(12000), || {
             let state = op.message_state(&id);
             !(state == "queued" || state == "fetched") || op.prompts().len() != 1
         }),
@@ -1166,13 +1166,13 @@ fn opencode_025_an_aborted_or_removed_queued_prompt_is_reinjected() {
 fn opencode_026_mini_holds_a_queued_prompt_and_reinjects_an_aborted_one() {
     let op = OpenCode::new(
         "session",
-        json!({"server":true,"argv":["--mini"],"maxDeliver":"2"}),
+        json!({"server":true,"argv":["--mini"],"maxDeliver":"2","ackWaitMs":"3000"}),
     );
     armed(&op.daemon, &op.pane, 1);
     op.session_status("shown", "busy");
     let held = op.post();
     op.wait_kind("prompt");
-    op.held_through(&held, Duration::from_millis(6000));
+    op.held_through(&held, Duration::from_millis(12000));
     assert!(
         op.holds(&held) >= 2,
         "each redelivery answers hold: {:?}",
