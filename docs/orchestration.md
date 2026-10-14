@@ -462,6 +462,12 @@ Tasks, worker reports, dispatch results, scheduled prompts and deck notices wait
 
 Both clients show `✉N queued` while messages await acknowledgement and `✉ delivered` after receipt when nothing remains pending. A narrow TUI card shortens the badge to `✉N`. If a message cannot be delivered, the recipient shows **Error** (desktop **error**) and a `not delivered: …` notice. Delivered means the agent received the message; read its `work-done` report to judge the result.
 
+Long turns affect delivery the same way in the TUI and the desktop app:
+
+- When OpenCode or Pi keeps a message queued behind a busy turn, the message waits for that turn to end. The deck does not report it as not delivered during this wait, and OpenCode does not receive another copy. Claude Code has no way to confirm this wait: a message waiting behind a turn longer than about five minutes can be reported not delivered before it arrives; the orchestrator is then told it arrived.
+- If the deck reported a task as not delivered and the agent takes it after all, the orchestrator is told that the task arrived, and the agent's TUI card or desktop tile leaves its delivery error state once no other delivery error remains.
+- After a message has been held for an hour, the usual delivery limit and not-delivered notices apply again.
+
 **TUI:**
 
 ![Planner and builder working in demo-loop, each with one queued inbox message beside its role card](/img/agent-messaging-tui.png)
@@ -484,7 +490,7 @@ The delivery behavior is the same whether you watch the pane in the TUI or the d
 
 | Agent | What happens when a message arrives | Fallback or limitation |
 |---|---|---|
-| Claude Code | Native wake is enabled from version 2.1.296 after installing the integration. | Older or unrecognised versions get the doorbell line without a native-wake delay. Upgrade Claude Code and re-run `hooks install`, then restart Claude Code to enable native wake. |
+| Claude Code | Native wake is enabled from version 2.1.296 after installing the integration. | A message waiting behind a long turn can be reported not delivered before it arrives; the orchestrator is then told it arrived. Claude Code cannot confirm that it is keeping a queued message during the turn. Older or unrecognised versions get the doorbell line without a native-wake delay. Upgrade Claude Code and re-run `hooks install`, then restart Claude Code to enable native wake. |
 | Codex | The doorbell wakes an idle agent; hooks hand messages over at turn end when it is busy. | With untrusted hooks, the model runs `inbox fetch` itself and needs `network_access = true`. If a future Codex UI is not recognised, the idle doorbell waits; send the first prompt yourself so turn-end hand-over can take over. |
 | OpenCode | The full TUI receives messages through its TUI plugin. `--mini` receives messages natively and gets a redraw so they become visible; a partial frame can remain briefly. | If the deck cannot update `tui.json`, it uses the doorbell; add the plugin entry by hand as described below. A `/models` choice before the first prompt is not readable by the integration; launch with `--model` to choose that first message's model. `attach`, `acp`, `web`, `pr` and `github` have not been measured for this delivery path; expect the doorbell. |
 | Pi | Native delivery works while idle and queues follow-ups while busy. | The extension stops trying to connect when Pi runs outside a deck pane. Restart Pi inside the deck to receive deck messages. |

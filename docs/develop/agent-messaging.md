@@ -68,6 +68,22 @@ Pi kills its watcher on `session_shutdown` and starts a new one on session start
 
 Pi tags each native hand-over attempt and removes the tag in its `input` handler, consuming superseded attempts and messages already committed. An idle recheck retries an attempt the handler has not seen; after `input`, a retry needs the refusal witness described in [Pi extension](pi-extension.md#native-inbox-delivery). Without that witness the message waits for inbox ack-wait redelivery, which replaces the attempt when Pi has nothing queued. Unanswerable status queries do not trigger a retry. This guard cannot recall an attempt already past `input`; receipt and retry retain the inbox's at-least-once semantics.
 
+### Long turns: hold and the late ack
+
+A stream component may answer a redelivery with `{"hold":[id]}` when it still holds that message, queued in the agent behind the turn in progress, and did not hand it over again. The deck refunds that redelivery's hand-over, and the count never drops below one. The refund applies while the message is fetched by that stream, is not an offer, and was first fetched less than one hour ago (`DEFAULT_HOLD_BOUND` in `src/inbox.rs`). Past that bound, `max_deliver` applies as it does to every consumer. A refunded hold also moves a delegated task's undelivered-notice deadline a full `DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS` past the hold. A daemon that predates `hold` reads the line as an empty ack.
+
+Pi answers `hold` for a redelivered id that it is holding behind an admission, or that a hand-over still carries and that may still commit. A redelivery that replaces a hand-over lost after `input` is not a hold: the replaced hand-over did not reach the agent.
+
+The OpenCode TUI and `--mini` plugins remember the session each deck prompt went to, and they follow `session.status` and `session.idle`. A redelivery of a prompt that is still pending, in a session that has stayed busy since, is answered with `hold` and is not prompted again. If the session goes idle with the prompt unanswered (an abort), or `message.removed` removes its user message (a revert), the next redelivery prompts it again. With no busy status seen for the session, a redelivery prompts again, as before.
+
+An ack from the bound agent for a message that became undeliverable after `max_deliver` hand-overs is recorded: the message becomes acknowledged and the ack answers `acknowledged`. An offer is not changed, and a message undeliverable for any other reason still answers `undeliverable`. The daemon remembers up to 256 such messages for one hour (`LATE_ACK_MAX_RECORDS` and `LATE_ACK_MEMORY` in `src/inbox_hub.rs`).
+
+When a delegated task is acknowledged late, the orchestrator generation that was told it was not delivered gets a correction with the subject `task delivered after all`. The worker then counts as having received a task for work-done retirement.
+
+The recipient's card is lifted from its not-delivered Error to Thinking by a daemon-authored event carrying the `delivery_notice_cleared` metadata key. This happens once no other message the card was told about is still owed a correction, and only while the daemon's copy of the card still shows the deck's notice. Both the TUI and the desktop app consume this event.
+
+Claude Code's once waiter has no channel to answer `hold`, so a message waiting behind a long Claude turn can still be redelivered and reported not delivered before it arrives. The orchestrator is then told it arrived.
+
 ## Claude version gate and framing
 
 `CLAUDE_ASYNC_REWAKE_MIN` in `src/hooks_manage.rs` is 2.1.296, the measured release, not a claim that older Claude versions lack asyncRewake. Unknown or lower versions get no waiter. SessionStart announces native wake only when the installed Claude settings contain the deck's SessionStart waiter; without it, including an installation below the version gate, no native announcement delays the doorbell. The waiter timeout is 86,400 seconds; `/clear` may leave several waiters, so inbox hand-over is claim-once. Once waiters poll their agent ancestry for orphan exit; stream watchers exit when their owning integration closes stdin.

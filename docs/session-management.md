@@ -56,6 +56,12 @@ Both the TUI card and desktop tile show `✉N queued` for messages awaiting ackn
 
 The `Prmt:` line on a TUI card shows `✉ <subject>` for a deck message. Its `Sent by:` line is visible in the agent's pane in both clients. Delivery means receipt, not that the task has finished. See [Orchestration → Delivery](orchestration.md#delivery-in-the-tui-and-desktop-app) for agent support and the inbox commands.
 
+Long turns affect delivery in both clients:
+
+- OpenCode and Pi can keep a message queued behind a busy turn without a not-delivered error during that wait; OpenCode does not receive another copy. Claude Code cannot confirm this wait, so a message waiting behind a turn longer than about five minutes can be reported not delivered before it arrives; the orchestrator is then told it arrived.
+- If a task reported as not delivered arrives after all, the orchestrator is told, and the TUI card or desktop tile leaves its delivery error state once no other delivery error remains.
+- After a message has been held for an hour, the usual delivery limit and not-delivered notices apply again.
+
 ## What a TUI card shows
 
 *This section is about the TUI. The desktop app's rows and columns are described on [Desktop app → Dashboard](desktop/dashboard.md#rows-and-columns).*
