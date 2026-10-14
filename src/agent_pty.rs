@@ -2285,6 +2285,10 @@ pub(crate) enum ExitedNotice {
 pub enum DoorbellWrite {
     /// Every byte went in.
     Written,
+    /// Only the pre-ring CR went in: it submitted the doorbell's own earlier
+    /// line, found unsubmitted in a gated composer, and the new line was not
+    /// typed on top of it.
+    Flushed,
     /// The user has an unsent draft in the pane; nothing was written.
     DraftPending,
     /// The pane is gone or now belongs to another agent; nothing was written.
@@ -8949,9 +8953,14 @@ impl AgentPtyRegistry {
     ///   written to only while the recogniser finds that composer EMPTY on the
     ///   pane's screen, before and after the agent's first own hook (PRD #1666
     ///   S7, decision A; decision 2 for a draft the agent kept after an Enter).
-    ///   The exception is a composer holding the doorbell's own earlier line,
-    ///   unsubmitted: a write that starts with a CR sends that CR alone, which
-    ///   submits the line, and types nothing after it.
+    ///   The exception is a composer showing `stranded` — the line the
+    ///   doorbell typed into this pane earlier and has not flushed since —
+    ///   unsubmitted at the agent's edit cursor: a write that starts with a CR
+    ///   sends that CR alone, which submits the line, and types nothing after
+    ///   it ([`DoorbellWrite::Flushed`]). With `stranded` `None` there is no
+    ///   exception. The match reads the screen, which proves neither where its
+    ///   text came from nor who owns the input: see
+    ///   [`crate::agent_registry::codex_composer_holds_doorbell_line`].
     ///
     /// No echo wait and no retry: whether the message arrived is the inbox's
     /// to say, not the screen's. The screen is read only for the composer gate,
@@ -8961,6 +8970,7 @@ impl AgentPtyRegistry {
         pane_id: &str,
         expected_agent_id: &str,
         pre_cr: bool,
+        stranded: Option<&str>,
         line: Option<&str>,
         still_admitted: F,
     ) -> DoorbellWrite
@@ -9009,21 +9019,28 @@ impl AgentPtyRegistry {
         // believes was submitted (decision 2). So every write waits for the
         // empty composer, read under the writer.
         //
-        // The one non-empty composer a write may go to is one holding the
-        // doorbell's own earlier line, left there when its Enter was not taken
-        // (live Codex 0.160.0, `codex/worker/001`): the flushing CR is what
-        // submits it, so it goes alone, and no second line is typed on top.
+        // The one non-empty composer a write may go to is one showing the
+        // exact line the doorbell typed here and has not flushed, left there
+        // when its Enter was not taken (live Codex 0.160.0,
+        // `codex/worker/001`), with the cursor right after it: the flushing CR
+        // is what submits it, so it goes alone, and no second line is typed on
+        // top.
         let mut flush_only = false;
-        if let Some((empty, stranded)) = self.doorbell_composer_gate(expected_agent_id) {
-            let rows = self.screen_rows(expected_agent_id).await;
-            match rows {
-                Some(rows) if empty(&rows) => {}
-                Some(rows) if pre_cr && stranded.is_some_and(|stranded| stranded(&rows)) => {
+        if let Some((empty, recognise)) = self.doorbell_composer_gate(expected_agent_id) {
+            match self.screen_rows(expected_agent_id).await {
+                Some((rows, _)) if empty(&rows) => {}
+                Some((rows, cursor))
+                    if pre_cr
+                        && stranded
+                            .zip(recognise)
+                            .is_some_and(|(typed, recognise)| recognise(&rows, cursor, typed)) =>
+                {
                     flush_only = true;
                 }
                 _ => return DoorbellWrite::NoComposer,
             }
         }
+        let withheld = flush_only && payload.is_some();
         let mut steps: Vec<&[u8]> = Vec::with_capacity(3);
         if pre_cr {
             steps.push(b"\r");
@@ -9062,7 +9079,11 @@ impl AgentPtyRegistry {
             }
             let _ = sink.flush_tracked().await;
         }
-        DoorbellWrite::Written
+        if withheld {
+            DoorbellWrite::Flushed
+        } else {
+            DoorbellWrite::Written
+        }
     }
 
     /// Stop an agent: SIGKILL the child, reap it, drop its handles. Any
@@ -10707,16 +10728,20 @@ impl AgentPtyRegistry {
     fn doorbell_composer_gate(
         &self,
         agent_id: &str,
-    ) -> Option<(fn(&[String]) -> bool, Option<fn(&[String]) -> bool>)> {
+    ) -> Option<(
+        fn(&[String]) -> bool,
+        Option<crate::agent_registry::StrandedLineRecogniser>,
+    )> {
         let inner = self.inner.lock().unwrap();
         let agent = inner.agents.get(agent_id)?;
         let spec = crate::agent_registry::spec(agent.spawn_agent_type.as_ref()?);
         Some((spec.doorbell_composer?, spec.doorbell_stranded_line))
     }
 
-    /// The screen `agent_id`'s pane shows, one trimmed row each, or `None`
-    /// when it cannot be read.
-    async fn screen_rows(&self, agent_id: &str) -> Option<Vec<String>> {
+    /// The screen `agent_id`'s pane shows, one trimmed row each, with its
+    /// cursor as (row, row length through the cursor), or `None` when it
+    /// cannot be read ([`crate::pane_screen_text::visible_rows_and_cursor`]).
+    async fn screen_rows(&self, agent_id: &str) -> Option<(Vec<String>, (usize, usize))> {
         let (bus, rows, cols) = {
             let inner = self.inner.lock().unwrap();
             let agent = inner.agents.get(agent_id)?;
@@ -10724,7 +10749,7 @@ impl AgentPtyRegistry {
         };
         tokio::task::spawn_blocking(move || {
             crate::pane_screen_text::visible_rows_and_cursor(&bus.snapshot(), rows, cols)
-                .map(|(rows, _, _)| rows)
+                .map(|(rows, row, column)| (rows, (row, column)))
         })
         .await
         .ok()

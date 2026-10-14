@@ -7412,6 +7412,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** reading the real process environment.
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/doorbell/017 — The doorbell remembers the line it typed only while a flush is owed.
+- **Layer:** L1 unit (`src/doorbell.rs`).
+- **Agent:** none.
+- **Asserts:** the recorded unsubmitted line survives an outstanding ring and an owed cleanup, and is cleared by the cleanup CR and by a new ring.
+- **Does not assert:** the daemon's doorbell task recording the line after a write, or a flush-only ring leaving none (`inbox/codex/014`, `inbox/codex/015`).
+- **Platform coverage:** mac+linux+windows.
+
 #### inbox/status
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.

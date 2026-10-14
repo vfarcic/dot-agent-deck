@@ -289,13 +289,20 @@ pub struct AgentSpec {
     /// the agent's status comes only from its own hooks, so it reads Unknown,
     /// and is never rung, until they report.
     pub doorbell_composer: Option<fn(&[String]) -> bool>,
-    /// Recognises the doorbell's own line left unsubmitted in the composer
-    /// [`Self::doorbell_composer`] guards (its Enter was not taken). Such a
-    /// screen is not empty, so without this the bare CR that flushes the line
-    /// would wait for an empty composer forever. `Some` exactly where
-    /// `doorbell_composer` is.
-    pub doorbell_stranded_line: Option<fn(&[String]) -> bool>,
+    /// Recognises, in the composer [`Self::doorbell_composer`] guards, the
+    /// one line the doorbell typed into this pane and has not flushed since,
+    /// left unsubmitted because its Enter was not taken. Such a screen is not
+    /// empty, so without this the bare CR that flushes the line would wait
+    /// for an empty composer forever. Called with the screen rows, the
+    /// cursor (row, and the row's length through the cursor, as
+    /// [`crate::pane_screen_text::visible_rows_and_cursor`] reports them)
+    /// and that exact line. `Some` exactly where `doorbell_composer` is.
+    pub doorbell_stranded_line: Option<StrandedLineRecogniser>,
 }
+
+/// [`AgentSpec::doorbell_stranded_line`]: screen rows, cursor
+/// `(row, length through the cursor)`, the line the doorbell left.
+pub type StrandedLineRecogniser = fn(&[String], (usize, usize), &str) -> bool;
 
 // PRD #20 finding #15: per-agent adapters that normalize each incumbent
 // module's signature to the spec's handler shape. Keeping them here (as the
@@ -661,12 +668,15 @@ pub fn codex_composer_on_screen(rows: &[String]) -> bool {
     empty && rows.get(prompt + 1).is_some_and(String::is_empty)
 }
 
-/// PRD #1666: do `rows` show Codex's composer holding exactly one doorbell
-/// line ([`crate::doorbell::doorbell_line`]) that its Enter did not submit, as
-/// measured on Codex 0.160.0:
+/// PRD #1666: do `rows` show Codex's composer holding `line` — the doorbell
+/// line ([`crate::doorbell::doorbell_line`]) the deck typed into this pane on
+/// an earlier ring and has not flushed since — unsubmitted, with Codex's edit
+/// cursor right after it, as measured on Codex 0.160.0 (live
+/// `codex/worker/001`: the cursor, marked `▏`, on the prompt row at column
+/// 95, just past the text):
 ///
 /// ```text
-/// ›  dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch
+/// ›  dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch▏
 ///
 ///   GPT-5.6-Luna low · /path/to/project
 ///                                                    ⚠ 1 warning · f2 to view
@@ -676,9 +686,27 @@ pub fn codex_composer_on_screen(rows: &[String]) -> bool {
 /// composer is found from the bottom instead: the lowest `›` row that is not a
 /// numbered choice, at most [`CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM`] rows
 /// above the last row with text. Its text, with any wrapped rows below it
-/// joined up to the first blank row, must be the doorbell line and nothing
-/// else; a human draft, a dialog or a line the human edited does not match.
-pub fn codex_composer_holds_doorbell_line(rows: &[String]) -> bool {
+/// joined up to the first blank row, must be `line` exactly, message id
+/// included; a row with text must follow that blank row (Codex's model line);
+/// and the cursor must sit at the end of the composer's last text row, where
+/// Codex 0.160.0 was measured to keep it. A human draft, an edited line, a
+/// doorbell-shaped line naming another message and a dialog do not match,
+/// and neither does `line` itself with the cursor anywhere else. `line` comes
+/// from the doorbell's record of what it typed, so with no ring of its own
+/// left unflushed the doorbell does not ask.
+///
+/// **This narrows the match; it does not authenticate the screen.** Text
+/// on a screen carries no record of who wrote it: a process that controls
+/// what this pane renders can draw this exact frame, line and cursor, and a
+/// human can type the same line by hand. Either earns the one bare CR the
+/// flush sends, which goes to whatever then owns the pane's input. The
+/// writer's other guards — the pane's agent identity, no unsent draft, and
+/// the doorbell's admission re-checked before the byte — still apply.
+pub fn codex_composer_holds_doorbell_line(
+    rows: &[String],
+    (cursor_row, cursor_column): (usize, usize),
+    line: &str,
+) -> bool {
     let Some(bottom) = rows.iter().rposition(|row| !row.is_empty()) else {
         return false;
     };
@@ -697,20 +725,16 @@ pub fn codex_composer_holds_doorbell_line(rows: &[String]) -> bool {
         .unwrap_or_default()
         .trim()
         .to_string();
+    let mut last = prompt;
     for row in rows[prompt + 1..].iter().take_while(|row| !row.is_empty()) {
         text.push(' ');
         text.push_str(row.trim());
+        last += 1;
     }
-    is_doorbell_line(&text)
-}
-
-/// `text`, trimmed, is one doorbell line naming one message id.
-fn is_doorbell_line(text: &str) -> bool {
-    text.strip_prefix(crate::doorbell::LINE_PREFIX.trim_start())
-        .and_then(|rest| rest.strip_suffix(crate::doorbell::LINE_SUFFIX))
-        .is_some_and(|id| {
-            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        })
+    text == line.trim()
+        && last < bottom
+        && cursor_row == last
+        && cursor_column == rows[last].chars().count()
 }
 
 /// How far above the last row with text [`codex_composer_holds_doorbell_line`]'s

@@ -3926,7 +3926,9 @@ mod tests {
         // proves the successor's PTY has drained past the point where a leaked
         // prompt would have landed.
         let barrier = registry
-            .write_doorbell(PANE, &successor, false, Some(BARRIER), || async { true })
+            .write_doorbell(PANE, &successor, false, None, Some(BARRIER), || async {
+                true
+            })
             .await;
         assert_eq!(barrier, crate::agent_pty::DoorbellWrite::Written);
         crate::test_pty_wait::wait_for_echo_bytes(&registry, &successor, BARRIER.as_bytes()).await;

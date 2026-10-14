@@ -782,6 +782,7 @@ fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() 
                 ORCH_PANE,
                 &successor,
                 false,
+                None,
                 Some(SUCCESSOR_BARRIER),
                 || async { true },
             )
@@ -921,7 +922,9 @@ async fn barrier_dispatch_return_observer(
     barrier: &str,
 ) -> String {
     let outcome = registry
-        .write_doorbell(pane_id, agent_id, false, Some(barrier), || async { true })
+        .write_doorbell(pane_id, agent_id, false, None, Some(barrier), || async {
+            true
+        })
         .await;
     assert_eq!(
         outcome,

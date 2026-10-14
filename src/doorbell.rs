@@ -41,8 +41,13 @@
 //! the next ring is preceded by a bare CR, and once a covered message leaves
 //! `queued` by any route, one bare CR is sent under the same guards. Both are
 //! keyed on inbox state, never on the screen. For an agent whose composer is
-//! gated (Codex), that CR is the one write the gate lets into a composer
-//! holding the doorbell's own unsubmitted line, and it then goes alone.
+//! gated (Codex), that CR is the one write the gate lets into a non-empty
+//! composer, and only one showing the exact line this doorbell typed into the
+//! pane and has not flushed since ([`Bell::unsubmitted`]), at the agent's edit
+//! cursor; it then goes alone. That is a match on what the screen shows, not
+//! proof of where it came from: anything that can draw the pane can draw that
+//! line and earn the CR
+//! ([`crate::agent_registry::codex_composer_holds_doorbell_line`]).
 //!
 //! [`decide`] is the pure policy; [`spawn`] runs it against the daemon.
 
@@ -187,6 +192,11 @@ pub struct Bell {
     /// A covered message left `queued` while its ring was outstanding, so one
     /// bare CR is owed.
     pub cleanup_owed: bool,
+    /// The line the last ring typed, while a CR that may submit it is still
+    /// owed (an outstanding ring or a cleanup); `None` once that CR went, and
+    /// after a ring that only flushed. A gated composer showing anything else
+    /// gets no byte ([`AgentPtyRegistry::write_doorbell`]).
+    pub unsubmitted: Option<String>,
 }
 
 /// What the doorbell should do for one agent generation now.
@@ -223,16 +233,20 @@ impl Bell {
     }
 
     /// Record a ring that covered `queued`.
+    /// Record a ring that covered `queued`. What it left in the box is the
+    /// caller's to record in [`Self::unsubmitted`].
     pub fn rang(&mut self, now: Instant, queued: &[String]) {
         self.rings = self.rings.saturating_add(1);
         self.last_ring = Some(now);
         self.outstanding = queued.to_vec();
         self.cleanup_owed = false;
+        self.unsubmitted = None;
     }
 
     /// Record the cleanup CR.
     pub fn cleaned(&mut self) {
         self.cleanup_owed = false;
+        self.unsubmitted = None;
     }
 
     /// Nothing left to remember: no ring outstanding or owed and no schedule
@@ -342,7 +356,7 @@ async fn run_tick(
             idle: admission.is_some(),
             draft: registry.draft_pending(&pane),
         };
-        let action = {
+        let (action, stranded) = {
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
             let slot = slots.entry((pane.clone(), agent.clone())).or_default();
             if slot.busy {
@@ -357,7 +371,7 @@ async fn run_tick(
                 continue;
             }
             slot.busy = true;
-            action
+            (action, slot.bell.unsubmitted.clone())
         };
         let registry = Arc::clone(registry);
         let slots = Arc::clone(slots);
@@ -383,7 +397,14 @@ async fn run_tick(
                 }
             };
             let outcome = registry
-                .write_doorbell(&pane, &agent, pre_cr, line.as_deref(), still_admitted)
+                .write_doorbell(
+                    &pane,
+                    &agent,
+                    pre_cr,
+                    stranded.as_deref(),
+                    line.as_deref(),
+                    still_admitted,
+                )
                 .await;
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
             let Some(slot) = slots.get_mut(&(pane.clone(), agent.clone())) else {
@@ -392,9 +413,17 @@ async fn run_tick(
             slot.busy = false;
             match (outcome, &action) {
                 // A ring that failed part-way may still sit in the box, so it
-                // is treated as rung: the next one flushes it first.
-                (DoorbellWrite::Written | DoorbellWrite::Failed, Action::Ring { id, .. }) => {
+                // is treated as rung: the next one flushes it first. A ring
+                // that only flushed typed no line, so it left none to flush.
+                // One that failed is recorded as having left its own line; if
+                // it failed before typing it, an earlier line still in the box
+                // no longer matches, and the composer gate holds.
+                (
+                    DoorbellWrite::Written | DoorbellWrite::Flushed | DoorbellWrite::Failed,
+                    Action::Ring { id, .. },
+                ) => {
                     slot.bell.rang(Instant::now(), &queued);
+                    slot.bell.unsubmitted = line.filter(|_| outcome != DoorbellWrite::Flushed);
                     registry.inbox().note_ring(&pane, &agent);
                     info!(
                         pane_id = %pane,
@@ -547,6 +576,35 @@ mod tests {
         let mut armed = facts(&[]);
         armed.inbox.armed = 1;
         assert_eq!(decide(&bell, &armed, &config, now), Action::Cleanup);
+    }
+
+    /// Scenario: Record a ring that left its line, then fold in a fetch, send
+    /// the cleanup CR, and ring again. The line stays recorded while a CR
+    /// that may submit it is owed, and is forgotten once that CR went or a
+    /// new ring replaced the record.
+    #[spec("inbox/doorbell/017")]
+    #[test]
+    fn doorbell_017_remembers_its_line_only_while_a_flush_is_owed() {
+        let now = Instant::now();
+        let line = doorbell_line("m1");
+        let mut bell = Bell::default();
+        bell.rang(now, &["m1".to_string()]);
+        assert_eq!(bell.unsubmitted, None, "what a ring left is the caller's");
+        bell.unsubmitted = Some(line.clone());
+        bell.observe(&facts(&["m1"]));
+        assert_eq!(bell.unsubmitted.as_deref(), Some(line.as_str()));
+        bell.observe(&facts(&[]));
+        assert!(bell.cleanup_owed);
+        assert_eq!(
+            bell.unsubmitted.as_deref(),
+            Some(line.as_str()),
+            "the owed cleanup CR may still be the one that submits it"
+        );
+        bell.cleaned();
+        assert_eq!(bell.unsubmitted, None, "the cleanup CR went");
+        bell.unsubmitted = Some(line);
+        bell.rang(now, &["m2".to_string()]);
+        assert_eq!(bell.unsubmitted, None, "a new ring replaces the record");
     }
 
     /// Scenario: Parse the doorbell's environment overrides, including bad
