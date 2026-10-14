@@ -9,7 +9,7 @@ mod route;
 use inbox::{Endpoint, Pane};
 use serde_json::{Value, json};
 use spec::spec;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::process::Command;
 use std::time::Duration;
 
@@ -217,7 +217,7 @@ fn publish_002_same_name_instances_do_not_leak_and_subscribers_get_fenced_conten
     }
 }
 
-/// Scenario: Send publish and offer requests from a live pane without its attested capability. Both verbs explicitly refuse the caller and neither subscriber gains a message.
+/// Scenario: Send publish and offer requests from a live pane with an empty capability, then from a legacy status sender with no token key. Both verbs distinguish malformed tokens from missing attestation and neither subscriber gains a message.
 #[spec("inbox/publish/003")]
 #[test]
 fn publish_003_unattested_publish_and_offer_are_refused() {
@@ -226,6 +226,10 @@ fn publish_003_unattested_publish_and_offer_are_refused() {
     orch.token.clear();
     for verb in ["inbox_publish", "inbox_offer"] {
         let reply = post(&daemon, &orch, verb);
+        assert_eq!(
+            reply["refused"], "malformed_token",
+            "an empty token must not count as absent for {verb}: {reply}"
+        );
         assert!(
             reply["refused"].is_string() && !reply["error"].is_null(),
             "unattested {verb} needs an explicit refusal: {reply}"
@@ -239,9 +243,29 @@ fn publish_003_unattested_publish_and_offer_are_refused() {
         capture: std::path::PathBuf::new(),
         attach_socket: daemon.attach_socket().into(),
     };
-    inbox::status(&daemon, &legacy, "session_start", "claude_code");
+    let event = json!({"session_id":"legacy-pubsub-session", "pane_id":legacy.id,
+        "agent_id":legacy.agent, "agent_type":"claude_code", "event_type":"session_start",
+        "timestamp":chrono::Utc::now(), "cwd":daemon.cwd()});
+    let mut socket = inbox::connect(&daemon, &event).into_inner();
+    socket.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut barrier = Vec::new();
+    socket
+        .read_to_end(&mut barrier)
+        .expect("legacy status ingestion barrier");
     for verb in ["inbox_publish", "inbox_offer"] {
-        let reply = post(&daemon, &legacy, verb);
+        let mut req = inbox::request(&legacy, verb);
+        req.as_object_mut().unwrap().remove("token");
+        req[if verb == "inbox_publish" {
+            "topic"
+        } else {
+            "pool"
+        }] = json!(if verb == "inbox_publish" {
+            "updates"
+        } else {
+            "review"
+        });
+        req["body"] = json!(BODY);
+        let reply = hook(&daemon, req);
         assert_eq!(
             reply["refused"], "unattested",
             "legacy status admission must not authorize {verb}: {reply}"
