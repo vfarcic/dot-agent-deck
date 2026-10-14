@@ -64,6 +64,49 @@ fn delegate_003_work_done_posts_one_untrusted_report() {
     assert_eq!(route::count(&daemon, &orch, 1).len(), 1);
 }
 
+/// Scenario: Complete one task and require an identical follow-up to be
+/// fetchable by the same worker. In a second run, supersede an acknowledged
+/// task and report only that older task done; the newer queued task must still
+/// produce its own undelivered notice and remain available to fetch.
+#[spec("orchestration/delegate/021")]
+#[test]
+fn delegate_021_work_done_releases_only_its_own_delivery_state() {
+    {
+        let daemon = daemon(&[]);
+        let (orch, worker) = route::team(&daemon, false);
+        let first = route::delegate(&daemon, &orch, route::TASK, false);
+        route::fetched(&daemon, &worker, &first, route::TASK, "the orchestrator");
+        route::done(&daemon, &worker, route::REPORT, false);
+        route::count(&daemon, &orch, 1);
+        let second = route::delegate(&daemon, &orch, route::TASK, false);
+        assert_ne!(first, second, "identical follow-up needs a fresh inbox id");
+        route::fetched(&daemon, &worker, &second, route::TASK, "the orchestrator");
+    }
+    let daemon = daemon(&[
+        (route::UNDELIVERED_MS, "700"),
+        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
+    ]);
+    let (orch, worker) = route::team(&daemon, false);
+    let first = route::delegate(&daemon, &orch, route::TASK, false);
+    // Acknowledge without enabling the fixture's automatic fetch: the newer
+    // message below must stay queued while the older commission completes.
+    fetch(&daemon, &worker, true);
+    state(&daemon, &worker, &first, "acknowledged");
+    let second = route::delegate(&daemon, &orch, "NEWER-TASK-STILL-OWED", true);
+    state(&daemon, &worker, &second, "queued");
+    route::done(&daemon, &worker, "OLDER-TASK-COMPLETED-LATE", false);
+    let notice = route::notice(&daemon, &orch, &second).to_string();
+    assert!(notice.contains("has not reached the worker"), "{notice}");
+    state(&daemon, &worker, &second, "queued");
+    route::fetched(
+        &daemon,
+        &worker,
+        &second,
+        "NEWER-TASK-STILL-OWED",
+        "the orchestrator",
+    );
+}
+
 /// Scenario: Fill a worker's single-message inbox, then delegate to it and
 /// require an explicit refusal notice without a task being delivered. Its next
 /// work-done must be labelled unsolicited, and after draining the inbox a

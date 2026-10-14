@@ -3282,6 +3282,13 @@ without depending on the config struct API.
 - **Does not assert:** a real agent following the generated command (`delegate_work_done_chain_claude`, lane 2); the orchestrator context's `delegate` examples or the dispatch prompt's `work-done --done` line, which take the same word from the same `binary_name()` (`/016`, and the `dispatch` unit test `a_single_dispatch_prompt_tells_the_unit_to_report_when_it_finishes`); a replacement of the deck's own file between composing the line and running it, which no command word can prevent.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS; `spawn_inprocess_daemon` is `#[cfg(unix)]`).
 
+##### orchestration/delegate/021 — Completing an older task releases only its own inbox delivery and commission.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon and in-pane CLI fetches.
+- **Agent:** scripted stand-ins; no credential.
+- **Asserts:** completion permits an identical follow-up with a fresh id; after an acknowledged older task is superseded, its delayed completion leaves the newer task queued, its undelivered notice armed, and its framed task fetchable.
+- **Does not assert:** native adapter behavior, preservation of an editor draft, or real-model completion.
+- **Platform coverage:** mac+linux.
+
 ##### orchestration/delegate/022 — A `clear = true` delegate that lands while the worker's pane is mid-close brings the role back instead of killing it for the session (issue #606).
 - **Layer:** fast integration (the daemon's real `StopAgent` handler over its attach socket, the real `handle_delegate_with_state`, and daemon-owned PTYs; no LLM and no `e2e` feature gate).
 - **Agent:** none — a worker stand-in that IGNORES SIGTERM (`trap '' TERM; exec cat`), so `close_agent` spends its full 3 s `AGENT_TERMINATE_GRACE` and the close is genuinely still in flight 200 ms later. A plain `cat` dies on the first signal and the whole close is over well inside that window, so it cannot reproduce the race at all — the stand-in's stubbornness is the fixture's entire point. The replacement's readiness signal is injected over the hook socket, as the rest of the fast delegate suite does for a stand-in.
