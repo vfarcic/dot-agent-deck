@@ -1171,29 +1171,6 @@ impl TuiDeck {
             // within 300s instead of leaking to PID 1 for hours/days. Idle
             // shutdown stays disabled (above) for determinism.
             ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "300"),
-            // PRD #249 M3: the daemon reports a delegated worker that emits no
-            // event within a window (30s by default) as "possibly not
-            // delivered", writing a notice into the ORCHESTRATOR's pane. Most
-            // e2e delegate tests drive stand-in workers (`cat`, recorder
-            // scripts) that legitimately emit nothing, so the report would fire
-            // on every one of them and dirty panes that tests assert stay clean
-            // (`orchestration/delegate/001`). Pinned off here rather than via
-            // `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS=0`, which would also
-            // disable PRD #126's idle-worker detection that other tests
-            // exercise. A test that wants the report overrides it via
-            // `with_env`.
-            ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0"),
-            // PRD #249 M1: ordinary e2e scenarios do not pay the production
-            // post-respawn buffer. The two real readiness scenarios opt back in
-            // explicitly after this pin.
-            ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "0"),
-            // Issue #1383: the daemon re-sends a delegate's task pointer into the
-            // same worker while nothing proves it arrived. Stand-in workers
-            // declared as a real agent emit no event, and several tests count
-            // pointer occurrences, so the production schedule would type
-            // duplicate pointers into them. Pinned off here; a test that wants
-            // the retry overrides it via `with_env`.
-            ("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", "0"),
         ];
         // PATH is required for the deck to spawn its own daemon
         // subcommand (it shells out via `current_exe`, but lookups like
@@ -9392,34 +9369,6 @@ pub fn spawn_daemon_serve_with_env(
     for (k, v) in config_containment_env() {
         env.push((k.into(), v));
     }
-    // PRD #127: the scheduler spawn primitive gates a fresh fire's prompt
-    // delivery on the spawned agent's `SessionStart` (readiness), falling back
-    // after a timeout for commands that emit no hook (bare `cat`, the recorder
-    // scripts these tests use). Shrink that fallback from the production 10s so
-    // the no-hook delivery tests don't race their ~10s observation windows;
-    // 5000ms stays comfortably above spawn/005's 2s "not yet delivered" window
-    // and below every 10s delivery window. A test may override via `extra_env`.
-    env.push(("DOT_AGENT_DECK_SESSION_START_WAIT_MS".into(), "5000".into()));
-    // PRD #249 M3: same pin as the TuiDeck harness above — the silent-worker
-    // report would fire on every stand-in worker that emits no events and write
-    // a notice into an orchestrator pane. Off by default here; a test that wants
-    // the report sets it in `extra_env`, which is layered after this.
-    env.push((
-        "DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS".into(),
-        "0".into(),
-    ));
-    // PRD #249 M1: same zero pin as `TuiDeck`; targeted scenarios layer a
-    // non-zero value through `extra_env` after this baseline.
-    env.push((
-        "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS".into(),
-        "0".into(),
-    ));
-    // Issue #1383: same pin as `TuiDeck` — the in-place delegate retry is off
-    // by default here; a test that wants it sets it in `extra_env`.
-    env.push((
-        "DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS".into(),
-        "0".into(),
-    ));
     for (k, v) in extra_env {
         match *k {
             "DOT_AGENT_DECK_SOCKET" => hook_socket = PathBuf::from(v),
@@ -10173,30 +10122,36 @@ pub fn attach_request_on(
     attach_json_request_on(socket, &payload)
 }
 
-/// Send a guarded `WriteAndSubmit` request over a daemon attach socket.
-///
-/// The identity fields are additive JSON keys rather than fields on
-/// `AttachRequest`, so E2E clients use this helper when they need to model the
-/// production seed/orchestrator prompt-delivery RPC.
+/// Post `body` to the inbox of the agent `expected_agent_id` in `pane_id`, the
+/// way the deck hands an agent a task (PRD #1666): the agent's inbox component
+/// takes it, or the doorbell rings for it. Answers the message id, or the
+/// daemon's refusal as an error.
 #[cfg(unix)]
 #[allow(dead_code)]
-pub fn write_and_submit_with_identity_on(
+pub fn post_message_on(
     socket: &Path,
     pane_id: &str,
-    text: &str,
     expected_agent_id: &str,
-    expected_session_id: Option<&str>,
-) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
-    let mut request = serde_json::json!({
-        "op": "write-and-submit",
-        "pane_id": pane_id,
-        "text": text,
-        "expected_agent_id": expected_agent_id,
-    });
-    if let Some(session_id) = expected_session_id {
-        request["expected_session_id"] = serde_json::Value::String(session_id.to_string());
+    body: &str,
+) -> std::io::Result<String> {
+    let resp = attach_request_on(
+        socket,
+        &dot_agent_deck::daemon_protocol::AttachRequest::PostMessage {
+            pane_id: pane_id.to_string(),
+            expected_agent_id: Some(expected_agent_id.to_string()),
+            subject: "task".to_string(),
+            body: body.to_string(),
+            spill_path: None,
+            origin: dot_agent_deck::inbox_hub::PostOrigin::Seed,
+        },
+    )?;
+    match (resp.ok, resp.id) {
+        (true, Some(id)) => Ok(id),
+        _ => Err(std::io::Error::other(format!(
+            "the daemon refused the post: {:?}",
+            resp.error
+        ))),
     }
-    attach_json_request_on(socket, &request)
 }
 
 /// Send one JSON request over a daemon attach socket and read its response.

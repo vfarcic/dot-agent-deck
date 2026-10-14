@@ -369,51 +369,6 @@ pub struct LiveTarget {
     pub writable: Writable,
 }
 
-/// PRD #20 M3: the honest outcome of delivering input to a session, returned
-/// instead of a fire-and-forget `Result<(), _>`. Serializes kebab-case; every
-/// variant keeps a distinct public wire value so a caller can tell accepted
-/// input apart from a stale, wrong, or unwritable target.
-///
-/// Rides the daemon wire on [`crate::daemon_protocol::AttachResponse::send_result`]
-/// as an additive, optional field (a missing value decodes to `None`), so it is
-/// forward-compatible and needs no `PROTOCOL_VERSION` bump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SendResult {
-    /// Delivered to the live target.
-    Applied,
-    /// Accepted, not yet confirmed applied.
-    Queued,
-    /// Target moved on / our view was behind.
-    Stale,
-    /// The handle no longer maps to the session we meant.
-    WrongSession,
-    /// No live target — only history resume is possible.
-    HistoryOnly,
-    /// Nothing to write to.
-    NoLiveTarget,
-    /// PRD #20 R20-004 (finding #3): a write STARTED reaching the target but the
-    /// full payload+submit sequence did not complete (a partial write followed
-    /// by a writer error). Some bytes MAY already have been delivered, so this is
-    /// neither a clean success nor a safely-retryable failure: the daemon caches
-    /// it against the `delivery_id` so a retry REPLAYS this (does not blind-submit
-    /// again, which could duplicate the partial input), and the UI surfaces it as
-    /// a terminal non-delivery rather than looping a retry. Older clients decode
-    /// the unknown `"ambiguous"` value to [`SendResult::Unknown`] (also treated as
-    /// a non-delivered, conservative outcome), so it stays forward-compatible.
-    Ambiguous,
-    /// PRD #20 R20-011: forward-compat catch-all. A future daemon may report an
-    /// honest outcome this build does not know; a pre-`serde(other)` reader would
-    /// reject the whole [`crate::daemon_protocol::AttachResponse`] as malformed
-    /// (`unknown variant`) rather than degrade gracefully. Deserializing an
-    /// unknown value here — the SAFE, non-delivered outcome — keeps the response
-    /// decodable and forces every UI match to treat it conservatively (never as a
-    /// delivered success). Deserialize-only in practice: this build never
-    /// constructs `Unknown`, so it is never sent on the wire.
-    #[serde(other)]
-    Unknown,
-}
-
 /// PRD #201 M1.2 (test-plan row 3): map a lifecycle **state** string an agent's
 /// extension reports via `dot-agent-deck agent-event --type <state>` to the
 /// [`EventType`] that drives the target pane's card status. This is the single
@@ -718,8 +673,7 @@ pub const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 /// was emitted by `dot-agent-deck wrap` right after `fork`/`exec`, purely to
 /// surface the dashboard card for a slow-booting agent" (PRD #225 M3). It does
 /// NOT mean the wrapped agent can accept input yet — for Codex the real TUI is
-/// still seconds away — so readiness gates
-/// ([`crate::state::wait_for_session_start`]) must not treat it as proof of
+/// still seconds away — so a reader must not treat it as proof of
 /// interactivity for an agent that will emit a genuine native `SessionStart`
 /// later.
 pub const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
@@ -909,58 +863,18 @@ pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE: &str = "1";
 /// browser (`crate::wrap`'s `codex_spawn_prep`). That step is best-effort,
 /// and it fails on an ordinary launcher configuration — `codex` reachable only
 /// inside `devbox run codex-big`, so the wrapper's own `codex app-server` is
-/// `NotFound`. The pane's only producer is then the wrapper, whose events still
-/// declare `AgentType::Codex`, and a type-derived capability answer arms
-/// re-submission against a channel that can never confirm: a prompt that WAS
-/// delivered is typed in again.
+/// `NotFound`. Nothing will then announce a turn, so the deck reads the
+/// wrapper's classified output as the pane's status (issue #1493).
 ///
-/// Read by [`AgentEvent::reports_submitted_prompt`] and by
-/// [`crate::state::SessionState::prompt_reports_unavailable`], and it can only
-/// REMOVE standing. Any value counts, so a forged or garbled key makes an event
-/// count for less, never for more — the worst a forgery does is make a pane
-/// write its automatic prompt once instead of retrying it. It is not, and must
-/// not be treated as, an authentication marker: its ABSENCE proves nothing, and
-/// an event without it is answered from its type exactly as before.
+/// Read by [`AgentEvent::declares_prompt_reports_unavailable`]. Any value
+/// counts. It is not, and must not be treated as, an authentication marker: its
+/// ABSENCE proves nothing.
 pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY: &str =
     "wrapper_prompt_reports_unavailable";
 
 /// The [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`] value the wrapper
 /// writes. Readers accept any value; see the key's docs.
 pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE: &str = "1";
-
-/// Issue #1567: the [`AgentEvent::metadata`] key on which a producer DECLARES
-/// that it reports every prompt it submits (value
-/// [`PROMPT_REPORTS_DECLARED_METADATA_VALUE`]).
-///
-/// The bundled Pi extension sends it on every report from issue #1567 on, via
-/// `dot-agent-deck agent-event --reports-prompts`. Pi's prompt reports come
-/// from an extension the deck ships, and an extension from an older deck does
-/// not report every prompt Pi submits — none before issue #622, and from #622
-/// none that was submitted while Pi was busy. A Pi process keeps the extension
-/// it loaded at start, so the deck meets older ones whenever it outlives an
-/// upgrade. This declaration is what tells the two apart.
-///
-/// Unlike [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`] it GRANTS standing
-/// — and only to an agent type whose prompt reporting is
-/// [`crate::prompt_delivery::PromptReporting::WhenDeclared`] (Pi); on any other
-/// type it is inert. Because it grants, it is read only from a frame the
-/// daemon's hook-provenance gate ATTESTED ([`crate::hook_provenance`]): one
-/// carrying [`ATTESTED_OWNER_METADATA_KEY`], which the daemon sets only for a
-/// frame whose per-spawn capability token resolved to the pane and agent it
-/// names, and never with [`UNPROVEN_METADATA_KEY`]. Both are daemon-authoritative
-/// — `ingest_event` strips a producer's copy — so an outside agent's frame, a
-/// token-less one, or one relayed by a daemon older than issue #318 declares
-/// nothing, whatever this key says. What the attestation does not reach is the
-/// same-uid residual `crate::hook_provenance` names: a process that reads a
-/// deck agent's own token can speak for that pane in this as in everything else.
-///
-/// Read by [`AgentEvent::declares_prompt_reports`] and by
-/// [`crate::state::SessionState::prompt_reports_declared`].
-pub const PROMPT_REPORTS_DECLARED_METADATA_KEY: &str = "prompt_reports_declared";
-
-/// The [`PROMPT_REPORTS_DECLARED_METADATA_KEY`] value a declaring producer
-/// writes, and the only one that counts.
-pub const PROMPT_REPORTS_DECLARED_METADATA_VALUE: &str = "1";
 
 /// Issue #1354: the [`AgentEvent::metadata`] key naming the SUBAGENT an event
 /// came from, when the agent's hook payload says it came from one.
@@ -1340,45 +1254,10 @@ impl AgentEvent {
     /// Issue #559: did this event's producer declare that no submitted-prompt
     /// report will come from it (see
     /// [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`])? Presence of the
-    /// key, whatever its value, because the answer can only withdraw standing.
+    /// key, whatever its value.
     pub fn declares_prompt_reports_unavailable(&self) -> bool {
         self.metadata
             .contains_key(WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY)
-    }
-
-    /// Issue #1567: did this event's producer declare that it reports every
-    /// prompt it submits (see [`PROMPT_REPORTS_DECLARED_METADATA_KEY`]), on a
-    /// frame the daemon ATTESTED? Only the exact value counts, and only on a
-    /// frame carrying the daemon's attested-owner stamp and not its unproven
-    /// one, because this answer GRANTS standing.
-    pub fn declares_prompt_reports(&self) -> bool {
-        self.attested_owner().is_some()
-            && !self.is_unproven()
-            && self
-                .metadata
-                .get(PROMPT_REPORTS_DECLARED_METADATA_KEY)
-                .is_some_and(|v| v == PROMPT_REPORTS_DECLARED_METADATA_VALUE)
-    }
-
-    /// Issue #559: can the producer of THIS event report a submitted prompt —
-    /// [`crate::prompt_delivery::producer_reports_submitted_prompt`] for its
-    /// declared type and what the event itself declares: that it reports
-    /// ([`Self::declares_prompt_reports`], issue #1567, which is what a Pi
-    /// producer needs) or that it cannot
-    /// ([`Self::declares_prompt_reports_unavailable`]).
-    ///
-    /// Every daemon-side capability read goes through this rather than through
-    /// the type, because the type is what a wrapper declares on behalf of the
-    /// agent it hosts and says nothing about whether that agent's reporting
-    /// channel exists.
-    pub fn reports_submitted_prompt(&self) -> bool {
-        crate::prompt_delivery::producer_reports_submitted_prompt(
-            crate::prompt_delivery::ConfirmationProducer {
-                agent_type: &self.agent_type,
-                prompt_reports_declared: self.declares_prompt_reports(),
-                prompt_reports_unavailable: self.declares_prompt_reports_unavailable(),
-            },
-        )
     }
 
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than
@@ -1650,8 +1529,8 @@ impl DaemonMessage {
             | DaemonMessage::InboxPublish(_)
             | DaemonMessage::InboxOffer(_)
             | DaemonMessage::InboxComplete(_)
-            | DaemonMessage::InboxRelease(_) => true,
-            DaemonMessage::Ack(s) => s.delivery_id.starts_with("m-"),
+            | DaemonMessage::InboxRelease(_)
+            | DaemonMessage::Ack(_) => true,
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
             | DaemonMessage::GetSeed(_)
@@ -1902,8 +1781,8 @@ pub struct SignalAck {
     /// remedy where there is one. `None` on an admission.
     #[serde(default)]
     pub error: Option<String>,
-    /// Issue #1383 / PR #1414 review: on an admitted `ack`, whether its delivery
-    /// id matched the pane's current delivery. `None` on every other verb, on a
+    /// Issue #1383 / PR #1414 review: on an admitted `ack`, what the daemon did
+    /// with the message it names. `None` on every other verb, on a
     /// refusal, and from a daemon that wrote the admission before looking the id
     /// up. Additive and optional, so a CLI that predates it still parses the
     /// line (see `an_ack_with_unknown_fields_still_reads_as_an_acceptance`).
@@ -1911,19 +1790,15 @@ pub struct SignalAck {
     pub delivery: Option<AckDelivery>,
 }
 
-/// What an admitted `ack` did with its delivery id. The wire form of
-/// [`crate::delegate_retry::AckOutcome`], which it mirrors variant for variant.
+/// What an admitted `ack` did with its message id. The wire form of
+/// [`crate::inbox::AckOutcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AckDelivery {
-    /// It matched the pane's pending delivery, whose retry is now stopped.
-    Stopped,
-    /// The pane's last acknowledged delivery, acknowledged again.
+    /// The message was already acknowledged.
     AlreadyAcknowledged,
-    /// The pane's current delivery, with no retry pending to stop.
-    NotPending,
-    /// Not the pane's current delivery: mistyped, stale, or another agent's.
-    /// For a PRD #1666 message id: no such message (an old `d-…` id included).
+    /// No such message — mistyped, or an id the deck does not hold (a `d-…`
+    /// delivery id from before PRD #1666 included).
     Unknown,
     /// PRD #1666: the inbox message is now acknowledged — delivered.
     Acknowledged,
@@ -1934,8 +1809,9 @@ pub enum AckDelivery {
     WrongAgent,
     /// PRD #1666: too late — the message is already undeliverable.
     Undeliverable,
-    /// A value a later daemon added. Never written by this build; read so a
-    /// new outcome does not make the whole ack unparseable.
+    /// A value this build does not know — one a later daemon added, or one an
+    /// earlier daemon wrote for its delivery ids (`stopped`, `not_pending`).
+    /// Never written by this build; read so the ack still parses.
     #[serde(other)]
     Unrecognised,
 }
@@ -1944,11 +1820,9 @@ impl AckDelivery {
     /// Whether the worker may be told its acknowledgement was recorded.
     pub fn recorded(self) -> bool {
         match self {
-            AckDelivery::Stopped
-            | AckDelivery::AlreadyAcknowledged
-            | AckDelivery::NotPending
-            | AckDelivery::Acknowledged
-            | AckDelivery::Claimed => true,
+            AckDelivery::AlreadyAcknowledged | AckDelivery::Acknowledged | AckDelivery::Claimed => {
+                true
+            }
             AckDelivery::Unknown
             | AckDelivery::WrongAgent
             | AckDelivery::Undeliverable
@@ -1966,18 +1840,6 @@ impl From<crate::inbox::AckOutcome> for AckDelivery {
             AckOutcome::AlreadyAcknowledged => AckDelivery::AlreadyAcknowledged,
             AckOutcome::WrongAgent => AckDelivery::WrongAgent,
             AckOutcome::Undeliverable => AckDelivery::Undeliverable,
-            AckOutcome::Unknown => AckDelivery::Unknown,
-        }
-    }
-}
-
-impl From<crate::delegate_retry::AckOutcome> for AckDelivery {
-    fn from(outcome: crate::delegate_retry::AckOutcome) -> Self {
-        use crate::delegate_retry::AckOutcome;
-        match outcome {
-            AckOutcome::Stopped { .. } => AckDelivery::Stopped,
-            AckOutcome::AlreadyAcknowledged => AckDelivery::AlreadyAcknowledged,
-            AckOutcome::NotPending { .. } => AckDelivery::NotPending,
             AckOutcome::Unknown => AckDelivery::Unknown,
         }
     }
@@ -2934,10 +2796,10 @@ pub enum DispatchShape {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AckSignal {
     pub pane_id: String,
-    /// The delivery id from the task file, `^d-[0-9a-f]{8}$`
-    /// ([`crate::delegate_retry::is_valid_delivery_id`]), or since PRD #1666 an
-    /// inbox message id (`m-…`, [`crate::inbox::is_valid_message_id`]).
-    /// Validated by the daemon before any lookup or log line.
+    /// The inbox message id (`m-…`, [`crate::inbox::is_valid_message_id`]).
+    /// Validated by the daemon before any lookup or log line. Named
+    /// `delivery_id` on the wire since issue #1383's delivery ids, which PRD
+    /// #1666 retired.
     pub delivery_id: String,
     /// The sender's `DOT_AGENT_DECK_AGENT_ID`, so an older generation's ack cannot
     /// stop a newer generation's retry.
@@ -4344,9 +4206,8 @@ mod tests {
         let refused = serde_json::to_string(&SignalAck::refused("missing_token", "m")).unwrap();
         assert!(!refused.contains("delivery"), "{refused}");
         for (delivery, wire) in [
-            (AckDelivery::Stopped, "stopped"),
+            (AckDelivery::Acknowledged, "acknowledged"),
             (AckDelivery::AlreadyAcknowledged, "already_acknowledged"),
-            (AckDelivery::NotPending, "not_pending"),
             (AckDelivery::Unknown, "unknown"),
         ] {
             let line = serde_json::to_string(&SignalAck::acknowledged(delivery)).unwrap();
@@ -4361,6 +4222,11 @@ mod tests {
         )
         .expect("a later outcome must not make the ack unparseable");
         assert_eq!(later.delivery, Some(AckDelivery::Unrecognised));
+        // PRD #1666: an older daemon's delivery-id outcomes read the same way.
+        let earlier: SignalAck =
+            serde_json::from_str(r#"{"kind":"signal_ack","accepted":true,"delivery":"stopped"}"#)
+                .expect("an earlier outcome must not make the ack unparseable");
+        assert_eq!(earlier.delivery, Some(AckDelivery::Unrecognised));
         assert!(!AckDelivery::Unrecognised.recorded());
     }
 
@@ -4427,11 +4293,11 @@ mod tests {
             "an admitted ack is answered by its handler; a gate line would be a second one"
         );
         let accepted: SignalAck = serde_json::from_str(
-            &serde_json::to_string(&SignalAck::acknowledged(AckDelivery::Stopped)).unwrap(),
+            &serde_json::to_string(&SignalAck::acknowledged(AckDelivery::Acknowledged)).unwrap(),
         )
         .unwrap();
         assert!(accepted.is_signal_ack() && accepted.accepted);
-        assert_eq!(accepted.delivery, Some(AckDelivery::Stopped));
+        assert_eq!(accepted.delivery, Some(AckDelivery::Acknowledged));
         let refused: SignalAck = serde_json::from_str(
             &msg.provenance_refusal_reply("missing_token", "no token")
                 .expect("a refusal is answered"),

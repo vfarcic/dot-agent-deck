@@ -75,14 +75,12 @@ impl Drop for Pane {
 }
 
 // New S4 overrides. Schedule values are successive delays; the final delay
-// repeats. ACK_WAIT is already specified by S1. The legacy cap deliberately
-// remains tiny: any path retaining its force-submit behavior fails our tests.
+// repeats. ACK_WAIT is already specified by S1.
 pub fn daemon(extra: &[(&str, &str)]) -> DaemonProc {
     let mut env = vec![
         ("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25"),
         ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000"),
         ("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", "750"),
-        ("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "100"),
     ];
     env.extend_from_slice(extra);
     common::spawn_daemon_serve_with_env(None, "0", &env)

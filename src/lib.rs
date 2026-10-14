@@ -28,7 +28,6 @@ pub mod daemon_upgrade;
 pub mod deck_list;
 // PRD #1666: the deck's persistent id, carried in inbox addresses and message ids.
 pub mod deck_identity;
-pub mod delegate_retry;
 pub mod devin_hooks_manage;
 // PRD #1223 M1: the daemon's one-level, bounded directory listing that backs
 // the desktop's new-agent directory step.
@@ -90,7 +89,6 @@ pub mod orchestrator_context;
 pub mod orchestrator_ext;
 pub mod palette;
 pub mod pane;
-pub mod pane_delivery_queue;
 pub mod pane_input;
 pub mod pane_screen_text;
 pub mod platform;
@@ -103,7 +101,6 @@ pub mod project_config;
 // there is for files this process wrote, and this one is for a path a caller
 // selected over the attach socket.
 pub mod project_resolve;
-pub mod prompt_delivery;
 pub mod quota_block;
 pub mod quota_signals;
 pub mod remote;
@@ -117,7 +114,6 @@ pub mod scheduler;
 pub mod self_upgrade;
 pub mod spawn;
 pub mod state;
-pub mod submit_echo;
 pub mod submitted_prompt;
 pub mod tab;
 pub mod tab_layout;

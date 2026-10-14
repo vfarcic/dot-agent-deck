@@ -399,8 +399,6 @@ fn make_session(
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     }
 }
@@ -3257,8 +3255,6 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     };
     let (buffer, _) =
@@ -3375,8 +3371,6 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     };
 

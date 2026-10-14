@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::event::{
-    AGENT_EVENT_SCHEMA_VERSION, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
+    AGENT_EVENT_SCHEMA_VERSION, AgentType, EventType, LiveTarget, TargetKind, Writable,
 };
 use spec::spec;
 
@@ -65,8 +65,8 @@ fn path_with_binary_dir() -> String {
 /// ends its turn through Codex's native `Stop` hook, as real Codex does.
 /// Subscribe to the real daemon event stream and detach to the dashboard;
 /// events must carry the Codex identity and schema version while the visible
-/// card moves Thinking → Idle and reads `Codex`. Send identity-bound input and
-/// require it to reach the wrapped child exactly once.
+/// card moves Thinking → Idle and reads `Codex`. Type input into the pane the
+/// way a client does and require it to reach the wrapped child exactly once.
 #[spec("codex/wrap/001")]
 #[test]
 fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
@@ -107,19 +107,9 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
         .agent_id
         .as_deref()
         .expect("managed wrapper event carries its agent id");
-    let response = common::write_and_submit_with_identity_on(
-        deck.attach_socket_path(),
-        pane_id,
-        "MANAGED-WRAPPER-WRITE",
-        agent_id,
-        Some(&working.session_id),
-    )
-    .expect("write through managed wrapper pane");
-    assert_eq!(
-        response.send_result,
-        Some(SendResult::Applied),
-        "dashboard writes to a managed wrapped Codex pane must be applied to its live PTY"
-    );
+    let mut input = common::AttachInput::attach(deck.attach_socket_path(), agent_id);
+    input.write("MANAGED-WRAPPER-WRITE\r");
+    drop(input);
     assert!(
         common::wait_for_file_substr_count(
             &deck.workdir().join("managed-wrapper-input.log"),

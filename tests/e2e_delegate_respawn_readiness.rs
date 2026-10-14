@@ -2,9 +2,7 @@
 
 //! PTY-attached real-agent coverage for PRD #249's `clear = true` delegate path.
 //!
-//! The deterministic slow-readiness stand-in in `orchestration/delegate/012`
-//! pins the race itself. These tests cover the user-visible happy path that a
-//! stand-in cannot: the real deck opens an orchestration tab, a real interactive
+//! These tests cover the user-visible happy path that a stand-in cannot: the real deck opens an orchestration tab, a real interactive
 //! worker boots in its role pane, the production delegate CLI respawns it, its
 //! native hook reports submission and real status, and the worker acts on the
 //! delegated task.
@@ -26,7 +24,6 @@ use std::time::Duration;
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
 use dot_agent_deck::event::{AgentType, EventType};
-use dot_agent_deck::state::DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS;
 use spec::spec;
 
 const ORCH_NAME: &str = "delegate-respawn";
@@ -343,7 +340,6 @@ fn delegate_014_real_claude_worker_acts_on_clear_true_delegate() {
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("PATH", path_with_binary_dir())
-        .with_env(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, "1000")
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
         .launch_with_fixture("minimal");

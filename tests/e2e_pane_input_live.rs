@@ -68,9 +68,7 @@ fn prompt_pane_input_042_live_claude_draft_defers_delegate() {
         .with_pty_size(160, 45)
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
-        .with_env("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "60000")
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active agents");
     let config = deck.workdir().join(".dot-agent-deck.toml");

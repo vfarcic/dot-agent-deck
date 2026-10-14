@@ -690,7 +690,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// * the [`crate::submitted_prompt::USER_PROMPT_MAX_LEN`] budget below is spent
 ///   on the prompt rather than partly on a wrapper.
 ///
-/// **This does not replace [`crate::prompt_delivery`]'s envelope shape and must
+/// **This does not replace [`crate::submitted_prompt`]'s envelope shape and must
 /// not be read as making it unreachable.** The `dot-agent-deck` invoked inside
 /// a pane comes from the agent's own hook configuration and can be OLDER than
 /// the daemon it reports to — `crate::hook_provenance`'s `missing_token`
@@ -1197,10 +1197,6 @@ pub struct AgentEventDetail {
     pub prompt: Option<String>,
     pub tool_name: Option<String>,
     pub tool_detail: Option<String>,
-    /// Issue #1567: the reporter declares that it reports every prompt the
-    /// agent submits (`--reports-prompts`), stamped on the event as
-    /// [`crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY`].
-    pub reports_prompts: bool,
 }
 
 /// Build the raw [`AgentEvent`] `dot-agent-deck agent-event` sends for a pane
@@ -1217,10 +1213,6 @@ pub struct AgentEventDetail {
 /// the tool detail keeps only its first line, cut to the same 120 bytes as
 /// [`extract_tool_detail`]'s shell arms. The daemon scrubs both tool strings on
 /// ingest regardless.
-///
-/// [`AgentEventDetail::reports_prompts`] becomes the declaration marker on the
-/// event's metadata (issue #1567), on every `--type`: the deck reads it from
-/// whichever report it sees first, the session-start one included.
 pub fn build_agent_event_cli(
     pane_id: String,
     agent_id: Option<String>,
@@ -1231,13 +1223,7 @@ pub fn build_agent_event_cli(
     let tool_detail = non_blank(detail.tool_detail)
         .map(|d| truncate(d.lines().next().unwrap_or(&d), 120))
         .filter(|d| !d.trim().is_empty());
-    let mut metadata = std::collections::HashMap::new();
-    if detail.reports_prompts {
-        metadata.insert(
-            crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY.to_string(),
-            crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE.to_string(),
-        );
-    }
+    let metadata = std::collections::HashMap::new();
     let prompt = non_blank(detail.prompt);
     let mut event = AgentEvent {
         session_id: format!("{pane_id}-session"),
@@ -1439,36 +1425,15 @@ pub fn send_and_await_reply(json: &str) -> SocketReply {
 /// daemon is still carrying out.
 /// `handle_restart_role_with_state` blocks on
 /// [`crate::agent_pty::AgentPtyRegistry::pane_dispatch_lock`] *before* it
-/// respawns, and `dispatch_one_owned` takes that same per-pane lock as its
-/// first statement and holds it across `wait_for_session_start`
-/// (`SESSION_START_WAIT_TIMEOUT`, 30s) plus one readiness buffer. So a
-/// `pane restart <role>` issued while a `clear = true` delegate to that same
-/// role is mid-flight waits behind the lock, blows this 14s budget, and
-/// surfaces to the caller as [`SocketReply::NoReply`] — a reported failure
-/// for a restart the daemon is still holding and will carry out (or refuse,
-/// per the post-lock crash recheck) once the lock frees.
-///
-/// Issue #544 (PR #1398 review): the delegate's own wait for the worker's
-/// unsent draft — up to the draft-deferral cap — is NOT in that list. The
-/// pointer write sets the dispatch lock down while it waits
-/// ([`crate::agent_pty::PaneDispatchHold`]), so a restart landing then
-/// proceeds at once and the parked pointer is refused.
-///
-/// **Sizing the constant to cover that was considered and rejected**, because
-/// no compile-time constant can honestly bound it. The buffer term is not a
-/// fixed 1s: `dispatch_one_owned` pays one of `DELEGATE_READINESS_BUFFER`
-/// (1s), `WRAPPER_INTERFACE_READINESS_BUFFER` (5s) or
-/// `NO_SIGNAL_READINESS_BUFFER` (8s) depending on the readiness path — the
-/// 8s one is a SKIP of the wait rather than a release from it, and the 1s
-/// one also covers the timeout fallback and an unresolved agent. An
-/// operator can override the buffer via
-/// `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` up to
-/// `MAX_DELEGATE_READINESS_BUFFER` (30s) — a runtime value nothing here can
-/// see. The lock also has no cap on queue depth, so queued same-pane
-/// delegates compound. A derivation ending in
-/// `+ DELEGATE_READINESS_BUFFER` would therefore reproduce exactly the
-/// over-claim this paragraph exists to correct, while making a genuinely
-/// failing `pane restart` take ~45s to say so.
+/// respawns, and `dispatch_one_owned` holds that same per-pane lock while it
+/// hands a delegated task over — including a `clear = true` respawn of the
+/// worker. So a `pane restart <role>` issued while such a delegate to that same
+/// role is mid-flight waits behind the lock, can blow this 14s budget, and
+/// surfaces to the caller as [`SocketReply::NoReply`] — a reported failure for
+/// a restart the daemon is still holding and will carry out (or refuse, per the
+/// post-lock crash recheck) once the lock frees. The lock has no cap on queue
+/// depth, so queued same-pane delegates compound, which is why no compile-time
+/// constant here can honestly bound it.
 ///
 /// The mitigation is the caller-facing text instead: this verb's `NoReply`
 /// arm in `main.rs` is deliberately cause-agnostic — it tells the operator
@@ -2302,7 +2267,6 @@ mod tests {
                 prompt: None,
                 tool_name: Some("bash".into()),
                 tool_detail: Some("touch a.txt\necho second line".into()),
-                reports_prompts: false,
             },
         );
         assert_eq!(event.session_id, "pane-7-session");
@@ -2340,7 +2304,6 @@ mod tests {
                     prompt: Some(prompt.clone()),
                     tool_name: None,
                     tool_detail: None,
-                    reports_prompts: true,
                 },
             );
             assert_eq!(event.user_prompt, None, "{event:?}");
@@ -2358,7 +2321,6 @@ mod tests {
                 prompt: Some("please fix the build".into()),
                 tool_name: None,
                 tool_detail: None,
-                reports_prompts: true,
             },
         );
         assert_eq!(
@@ -2402,7 +2364,6 @@ mod tests {
                 prompt: Some("".into()),
                 tool_name: Some("\t".into()),
                 tool_detail: Some("\nsecond".into()),
-                reports_prompts: false,
             },
         );
         assert!(event.cwd.is_none());
@@ -2422,43 +2383,6 @@ mod tests {
         );
         assert_eq!(long.tool_name, Some(truncate(&"t".repeat(300), 80)));
         assert_eq!(long.tool_detail, Some(truncate(&"d".repeat(300), 120)));
-    }
-
-    /// Issue #1567: `--reports-prompts` becomes the declaration marker on any
-    /// report; without it the frame declares nothing, as every report from an
-    /// older extension. The marker the CLI stamps is not yet standing: only
-    /// once the daemon's hook-provenance gate attests the frame
-    /// (`ATTESTED_OWNER_METADATA_KEY`) does a Pi pane count as confirming.
-    #[test]
-    fn agent_event_cli_declares_prompt_reports_only_when_asked() {
-        for reports_prompts in [false, true] {
-            let mut event = build_agent_event_cli(
-                "pane-7".into(),
-                Some("agent-7".into()),
-                EventType::Idle,
-                AgentEventDetail {
-                    reports_prompts,
-                    ..Default::default()
-                },
-            );
-            assert_eq!(
-                event
-                    .metadata
-                    .get(crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY)
-                    .map(String::as_str),
-                reports_prompts.then_some(crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE)
-            );
-            assert!(
-                !event.declares_prompt_reports() && !event.reports_submitted_prompt(),
-                "reports_prompts={reports_prompts}: an unattested frame declares nothing"
-            );
-            event.metadata.insert(
-                crate::event::ATTESTED_OWNER_METADATA_KEY.to_string(),
-                "agent-7".to_string(),
-            );
-            assert_eq!(event.declares_prompt_reports(), reports_prompts);
-            assert_eq!(event.reports_submitted_prompt(), reports_prompts);
-        }
     }
 
     /// PRD #1497: `agent-event --turn-reply-stdin` reads the reply whole when

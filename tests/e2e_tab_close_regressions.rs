@@ -159,9 +159,7 @@ async fn handle_connection(
     match request {
         AttachRequest::Hello { .. } => {
             let summary = RunningAgentsSummary::from_records(&records.lock().unwrap());
-            let response = AttachResponse::hello(PROTOCOL_VERSION)
-                .with_running_agents(summary)
-                .with_guarded_send();
+            let response = AttachResponse::hello(PROTOCOL_VERSION).with_running_agents(summary);
             write_resp(&mut stream, &response)
                 .await
                 .expect("reply to Hello");

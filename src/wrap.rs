@@ -328,9 +328,9 @@ impl Emitter {
     /// `cmd.spawn()` returns. Its ONLY job is to surface the dashboard card so a
     /// slow-booting agent isn't invisible — the child is typically just the
     /// launcher (`devbox`, a shell) at this point, seconds away from the real
-    /// agent TUI. Stamping [`SESSION_START_ORIGIN_METADATA_KEY`] lets readiness
-    /// gates tell this apart from a genuine "the session is up and accepting
-    /// input" signal; see [`crate::state::wait_for_session_start`].
+    /// agent TUI. Stamping [`SESSION_START_ORIGIN_METADATA_KEY`] lets a reader
+    /// tell this apart from a genuine "the session is up and accepting input"
+    /// signal.
     fn emit_fork_session_start(&self) {
         let mut metadata = HashMap::new();
         metadata.insert(

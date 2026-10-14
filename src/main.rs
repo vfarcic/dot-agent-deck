@@ -203,13 +203,11 @@ enum Commands {
         #[arg(long)]
         done: bool,
     },
-    /// Acknowledge a message the deck delivered to you (`m-…`), or that a
-    /// delegated task reached you (`d-…`, the id your task file names). Exits
-    /// non-zero only when the deck says it holds no such message for you; any
-    /// other failure to acknowledge is harmless, and the task goes on.
+    /// Acknowledge a message the deck delivered to you (`m-…`). Exits non-zero
+    /// only when the deck says it holds no such message for you; any other
+    /// failure to acknowledge is harmless, and the task goes on.
     Ack {
-        /// The message id (`m-…`) or the delivery id from the task file
-        /// (`d-…`).
+        /// The message id (`m-…`).
         delivery_id: String,
     },
     /// Read and manage this agent's dot-agent-deck inbox.
@@ -238,14 +236,11 @@ enum Commands {
         /// A short description of the tool call, e.g. its command or path.
         #[arg(long = "tool-detail", allow_hyphen_values = true)]
         tool_detail: Option<String>,
-        /// Declare that the reporter reports every prompt the agent submits,
-        /// so the deck may re-submit a delivered prompt it never reported
-        /// (issue #1567). Hidden: inbox delivery (PRD #1666) re-submits
-        /// nothing and the prompt-confirmation machinery this declaration
-        /// feeds is being removed, but installed Pi extensions still pass it
-        /// on every report, so it stays accepted.
+        /// Accepted and ignored. Pi extensions from before PRD #1666 pass it on
+        /// every report to declare that they report every prompt; nothing reads
+        /// that any more, so the flag does nothing.
         #[arg(long = "reports-prompts", hide = true)]
-        reports_prompts: bool,
+        _reports_prompts: bool,
         /// Read the final reply of the turn that just settled (with `--type
         /// finished`) from stdin, for the deck's reading mode (PRD #1497). Sent
         /// by the bundled Pi extension, which writes the reply to stdin so it
@@ -963,7 +958,7 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
         )
     };
     match reply {
-        AckReply::Malformed => not_confirmed("that is not a delivery id"),
+        AckReply::Malformed => not_confirmed("that is not a message id"),
         AckReply::NoPane => not_confirmed("not running inside a dot-agent-deck managed pane"),
         AckReply::Socket(SocketReply::Unreachable) => not_confirmed("the deck is not reachable"),
         AckReply::Socket(SocketReply::NoReply) => {
@@ -1662,8 +1657,7 @@ fn main() -> ExitCode {
         },
         Some(Commands::Ack { delivery_id }) => {
             let reply = match (
-                dot_agent_deck::delegate_retry::is_valid_delivery_id(&delivery_id)
-                    || dot_agent_deck::inbox::is_valid_message_id(&delivery_id),
+                dot_agent_deck::inbox::is_valid_message_id(&delivery_id),
                 std::env::var(DOT_AGENT_DECK_PANE_ID),
             ) {
                 (false, _) => AckReply::Malformed,
@@ -1702,7 +1696,7 @@ fn main() -> ExitCode {
             prompt,
             tool_name,
             tool_detail,
-            reports_prompts,
+            _reports_prompts,
             turn_reply_stdin,
             turn_reply_failed,
         }) => {
@@ -1762,7 +1756,6 @@ fn main() -> ExitCode {
                     prompt,
                     tool_name,
                     tool_detail,
-                    reports_prompts,
                 },
             );
             // Issue #318: present this pane's hook capability token.
@@ -4592,7 +4585,7 @@ mod tests {
 
     /// Issue #1383: `ack` exits 0 whatever happens, and says on stderr — never
     /// as a failure — when receipt could not be confirmed. Only an accepted ack
-    /// whose id matched the pane's delivery prints "Acknowledged"; an unanswered
+    /// whose id matched a message the deck holds prints "Acknowledged"; an unanswered
     /// one (an older daemon) and a bare admission (PR #1414 review) do not.
     #[test]
     fn ack_report_is_never_a_failure_and_says_what_happened() {
@@ -4605,15 +4598,11 @@ mod tests {
             serde_json::to_string(&SignalAck::refused("missing_token", "no token")).unwrap();
         let cases = [
             (
-                line(SignalAck::acknowledged(AckDelivery::Stopped)),
+                line(SignalAck::acknowledged(AckDelivery::Acknowledged)),
                 AckStream::Stdout,
             ),
             (
                 line(SignalAck::acknowledged(AckDelivery::AlreadyAcknowledged)),
-                AckStream::Stdout,
-            ),
-            (
-                line(SignalAck::acknowledged(AckDelivery::NotPending)),
                 AckStream::Stdout,
             ),
             // Admitted, but the daemon did not say the id matched: an admission

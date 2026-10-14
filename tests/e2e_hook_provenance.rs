@@ -59,7 +59,6 @@ fn provenance_003_outside_status_events_cannot_drive_a_spawned_panes_card() {
         .with_pty_size(160, 40)
         .with_env("DOT_AGENT_DECK_HOOK_PROVENANCE", "enforce")
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .with_env("DAD_TEST_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
         .launch_with_fixture("status-provenance");
     deck.wait_for_string("No active agents");
@@ -283,7 +282,6 @@ fn provenance_001_a_forged_work_done_is_refused_while_the_pane_s_own_still_lands
         // firing into the orchestrator pane would be noise competing with the
         // one thing under assertion.
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .with_env("DAD_TEST_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
         .with_env("DAD_PROVENANCE_SENTINEL_1", ATTESTED_FIRST)
         .with_env("DAD_PROVENANCE_SENTINEL_2", ATTESTED_SECOND)
@@ -437,7 +435,6 @@ fn provenance_002_a_stale_pane_identity_cannot_route_into_another_live_orchestra
         // Both delegation watches off: no notice may compete with the panes
         // under assertion.
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .with_env("DAD_TEST_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
         // Deliberately NOT `impersonating_pane_signals()`: the shipped policy.
         .launch_with_fixture("stale-pane-identity");

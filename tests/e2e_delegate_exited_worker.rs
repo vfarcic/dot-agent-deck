@@ -232,7 +232,6 @@ fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_de
         // Both delegation watches off: neither detector is under test, and a
         // notice firing into the orchestrator would only add noise.
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .with_env("DAD_TEST_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
         .launch_with_fixture("delegate-exited-worker");
     deck.wait_for_string("No active agents");
@@ -315,7 +314,6 @@ fn delegate_051_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
         .impersonating_pane_signals()
         .with_pty_size(160, 40)
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .with_env("DAD_TEST_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
         .launch_with_fixture("delegate-exited-worker");
     deck.wait_for_string("No active agents");

@@ -1109,8 +1109,7 @@ export type DeckAction =
   | { type: "rename_agent"; agentId: string; displayName: string };
 
 /**
- * Whether an agent's pane takes input, in the vocabulary of the Rust
- * `SendResult` (kebab-case on the wire). The terminal reads `history-only` and
+ * Whether an agent's pane takes input. The terminal reads `history-only` and
  * `no-live-target` off the agent's write lease (`lib/terminalInput.ts`).
  */
 export type SendResult =

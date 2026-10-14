@@ -35,7 +35,7 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DoorbellWrite, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::dispatch_return::DispatchCaller;
 use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
@@ -725,18 +725,24 @@ fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() 
             .work_done(&format!("Finished the second delegation. {FRESH_SENTINEL}"))
             .await;
 
-        // A barrier rather than a sleep: an authorized write that has
-        // demonstrably arrived proves the successor's PTY has drained past the
-        // point where leaked feedback would have landed.
+        // A barrier rather than a sleep: an authorized write — the doorbell's,
+        // the one automatic writer the deck keeps — that has demonstrably
+        // arrived proves the successor's PTY has drained past the point where
+        // leaked feedback would have landed.
         let barrier = harness
             .registry
-            .write_and_submit_guarded(ORCH_PANE, SUCCESSOR_BARRIER, &successor, || async { true })
-            .await
-            .expect("the barrier write must reach the registry");
+            .write_doorbell(
+                ORCH_PANE,
+                &successor,
+                false,
+                Some(SUCCESSOR_BARRIER),
+                || async { true },
+            )
+            .await;
         assert_eq!(
             barrier,
-            GuardedSend::Applied,
-            "the successor owns the pane, so a write bound to IT must be applied — otherwise \
+            DoorbellWrite::Written,
+            "the successor owns the pane, so a write bound to IT must go in — otherwise \
              this test proves nothing about the refusal"
         );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -868,13 +874,12 @@ async fn barrier_dispatch_return_observer(
     barrier: &str,
 ) -> String {
     let outcome = registry
-        .write_and_submit_guarded(pane_id, barrier, agent_id, || async { true })
-        .await
-        .expect("the barrier write must reach the registry");
+        .write_doorbell(pane_id, agent_id, false, Some(barrier), || async { true })
+        .await;
     assert_eq!(
         outcome,
-        GuardedSend::Applied,
-        "the observer owns the pane, so its barrier write must be applied"
+        DoorbellWrite::Written,
+        "the observer owns the pane, so its barrier write must go in"
     );
     let snapshot = wait_for_dispatch_return_snapshot(registry, agent_id, barrier).await;
     assert!(

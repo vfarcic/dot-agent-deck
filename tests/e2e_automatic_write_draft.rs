@@ -17,7 +17,6 @@ fn launch() -> (TuiDeck, Pane) {
         .with_pty_size(160, 45)
         .with_env("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")
         .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
-        .with_env("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "100")
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     let pane = pane(&deck, "draft-worker");

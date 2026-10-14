@@ -237,15 +237,11 @@ fn each_single_provider_variant_launches_only_that_provider() {
 /// launcher, means every role DECLARES it with `agent = "…"`.
 ///
 /// `AgentType::from_command` sees `devbox` and nothing behind it, so an
-/// undeclared role is an agent the deck cannot identify, and `delegate` then
-/// keeps its conservative wait for a `SessionStart` (`orchestration/delegate/011`).
-/// Claude posts one of its own regardless, which is why the Claude roles looked
-/// fine. Codex, Pi and OpenCode never do before their first task — they are
-/// covered instead by the wrapper's interface observation, Pi's native seed
-/// hand-off and OpenCode's declared no-signal skip, and every one of those keys
-/// on the RESOLVED type. Measured on one day of this very file: 0 of 17
-/// delegations to the Codex tester, 0 of 6 to the Pi reviewer and 0 of 6 to the
-/// OpenCode auditor saw readiness, each paying the full 30 s fallback.
+/// undeclared role is an agent the deck cannot identify, and what the deck keys
+/// on the RESOLVED type — the wrapper, the inbox component, the card — is lost.
+/// Measured before PRD #1666 on one day of this very file: 0 of 17 delegations
+/// to the Codex tester, 0 of 6 to the Pi reviewer and 0 of 6 to the OpenCode
+/// auditor saw readiness, each paying the full 30 s fallback.
 ///
 /// Compared against what the script launches rather than against a hard-coded
 /// list so that swapping a role's commented-out alternative launcher in — the

@@ -1242,12 +1242,6 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // between now and the end of the successor work must still claim its stop
     // before the plan is decided, and a second one must still force-exit. It is
     // aborted once that work is done, below.
-    // Issue #424 (reviewer finding B9): a spawn-time prompt's confirmation loop
-    // must not outlive the daemon that owns the PTY it re-submits into. The loop
-    // also ends on its own when the broadcast sender drops (`PromptWatch::Closed`),
-    // but that is a race against the next backoff window expiring, and this is
-    // the deterministic half.
-    crate::spawn::cancel_all_prompt_confirmations();
     drop(pty_registry);
 
     // PRD #1487: an accepted `restart-daemon` in `Installed` mode left its
@@ -1922,19 +1916,6 @@ async fn ingest_event_unless(
             }
         } else if crate::quota_block::is_work_evidence(&event) {
             registry.quota_note_work_event(pane_id, generation);
-        }
-        // Issue #1650: remember when a booting agent first announced it is
-        // ready, so a `clear = false` delegate that arrives later can tell a
-        // worker still starting from one that is up. Only for the generation
-        // the event names, like the quota latch above.
-        if let Some(agent_id) = event.agent_id.as_deref()
-            && crate::state::session_start_opens_boot_gate(&event)
-        {
-            registry.note_boot_readiness(
-                pane_id,
-                agent_id,
-                event.is_wrapper_interface_ready_session_start(),
-            );
         }
     }
     // The other half, plus the stamp: is this an orchestration role pane whose
@@ -3367,79 +3348,6 @@ async fn run_shell_activity_monitor_with<S, F>(
     }
 }
 
-/// Issue #617 (finding 3): deliver a dispatch result back to the agent that
-/// asked for it, bound to the registry agent id captured from the caller's
-/// `AgentRecord` *before* the dispatch ran.
-///
-/// The write used to be inline in `run_hook_loop`'s `Dispatch` arm and used the
-/// unguarded `write_to_pane_and_submit(&signal.pane_id, …)`. Between the request
-/// and this delivery sits `handle_dispatch` — a git worktree creation plus an
-/// agent spawn, unbounded and deliberately performed outside any `AppState` lock
-/// — which is one of the widest race windows in the daemon. A pane id is a
-/// recycled handle, so a caller that was closed or respawned during that work had
-/// its dispatch result submitted into whatever process inherited its pane, which
-/// may then act on it with its own tools.
-///
-/// Extracted rather than fixed in place so the delivery has a name and a seam:
-/// the slow half (`handle_dispatch`) was already unit-testable and this half was
-/// not, which is why the only coverage of it was end-to-end.
-///
-/// Every refusal is terminal and none is retried — a retry could only re-target
-/// whichever process now occupies the pane. `Ambiguous` is deliberately NOT
-/// folded in with the refusals: bytes of ours already reached the authorized
-/// caller, so re-sending would duplicate a half-written message rather than
-/// repair it, and the caller is the one place where that distinction is visible.
-pub async fn deliver_dispatch_result(
-    registry: &AgentPtyRegistry,
-    pane_id: &str,
-    expected_agent_id: &str,
-    message: &str,
-) -> crate::agent_pty::GuardedSend {
-    use crate::agent_pty::GuardedSend;
-    match registry
-        .write_and_submit_guarded_first_write(
-            pane_id,
-            message,
-            expected_agent_id,
-            || async { true },
-            std::time::Instant::now(),
-        )
-        .await
-    {
-        Ok(GuardedSend::Applied) => GuardedSend::Applied,
-        Ok(GuardedSend::Ambiguous) => {
-            warn!(
-                pane_id = %pane_id,
-                agent_id = %expected_agent_id,
-                "dispatch: result delivery was ambiguous (partial write); not retried"
-            );
-            GuardedSend::Ambiguous
-        }
-        Ok(refused) => {
-            warn!(
-                pane_id = %pane_id,
-                agent_id = %expected_agent_id,
-                outcome = ?refused,
-                "dispatch: identity gate refused the result (the caller pane no longer belongs \
-                 to the agent that requested the dispatch); nothing written"
-            );
-            refused
-        }
-        Err(e) => {
-            warn!(
-                pane_id = %pane_id,
-                agent_id = %expected_agent_id,
-                error = %e,
-                "dispatch: failed to write result into caller pane"
-            );
-            // A transport error, not a refusal: no identity decision was
-            // reached. Reported as `Stale` so callers have one vocabulary, with
-            // the real cause on the `warn!` above.
-            GuardedSend::Stale
-        }
-    }
-}
-
 /// Issue #319: how many hook-socket connections the daemon serves at once.
 ///
 /// **Where the number comes from.** A hook connection is short-lived by
@@ -3765,71 +3673,6 @@ fn mask_capability_runs(text: &str) -> Option<String> {
         }
     }
     changed.then_some(out)
-}
-
-/// Issue #1383: act on a worker's `ack` for a delegated task's delivery id.
-///
-/// Stops the pane's in-place retry when the id is the pane's pending delivery,
-/// and cancels the silent-worker watch armed for the pane's current delivery,
-/// retry or no retry — an ack is
-/// not an [`crate::event::AgentEvent`], so that watch cannot see it, and a
-/// hookless worker that acknowledged must not later be reported as never having
-/// got its task. The cancel is seq-conditional, not
-/// [`AgentPtyRegistry::retire_silence_watch`], whose oldest-first accounting
-/// belongs to `work-done`.
-///
-/// Returns what the caller is told (PR #1414 review): the hook loop writes it
-/// back as [`crate::event::SignalAck::acknowledged`], so the `ack` CLI says
-/// "Acknowledged" only for an id that named the pane's current delivery. The
-/// id is producer-supplied, so a malformed one is logged only as a length,
-/// looks nothing up, and answers [`crate::event::AckDelivery::Unknown`].
-///
-/// `attested_agent_id` is the agent the hook-token provenance gate resolved
-/// from the token (Qodo, #1414), and it outranks the payload's own
-/// `agent_id`, which the sender chooses: an older generation still holding a
-/// valid token for the same pane is identified as itself and cannot stop a
-/// newer generation's retry by leaving `agent_id` out. The payload's id is
-/// consulted only for an ack the gate admitted without attesting it (a pane
-/// never issued a token, or `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`), and an ack
-/// with neither matches nothing.
-pub(crate) fn handle_delivery_ack(
-    registry: &AgentPtyRegistry,
-    signal: &crate::event::AckSignal,
-    attested_agent_id: Option<&str>,
-) -> crate::event::AckDelivery {
-    if !crate::delegate_retry::is_valid_delivery_id(&signal.delivery_id) {
-        warn!(
-            pane_id = %escape_id_for_log(&signal.pane_id),
-            delivery_id_len = signal.delivery_id.len(),
-            "Received an ack whose delivery id is not shaped like one this daemon mints; ignored"
-        );
-        return crate::event::AckDelivery::Unknown;
-    }
-    let outcome = registry.pending_deliveries().acknowledge(
-        &signal.pane_id,
-        &signal.delivery_id,
-        attested_agent_id.or(signal.agent_id.as_deref()),
-    );
-    // A matching ack with no retry pending cancels too (Qodo, PR #1414): with
-    // the retry off no record is ever armed, and the watch would otherwise
-    // report a worker that acknowledged as never having got its task.
-    let silence_cancelled = match outcome {
-        crate::delegate_retry::AckOutcome::Stopped {
-            silence_seq: Some(seq),
-        }
-        | crate::delegate_retry::AckOutcome::NotPending {
-            silence_seq: Some(seq),
-        } => registry.cancel_silence_watch_if(&signal.pane_id, seq),
-        _ => false,
-    };
-    info!(
-        pane_id = %escape_id_for_log(&signal.pane_id),
-        delivery_id = %signal.delivery_id,
-        outcome = ?outcome,
-        silence_cancelled,
-        "Received ack"
-    );
-    outcome.into()
 }
 
 /// PRD #1666: the refusal code for an inbox request no token attests.
@@ -4926,20 +4769,13 @@ async fn run_hook_loop_with_idle_timeout(
                                         } => Some(agent_id.as_str()),
                                         _ => None,
                                     };
-                                    // PRD #1666: a message id is the inbox's; a
-                                    // `d-` delivery id still belongs to the typed
-                                    // delivery's retry loop until that is retired.
+                                    // PRD #1666: every id is an inbox message's,
+                                    // acknowledged for the agent the token attests.
                                     let delivery = match attested_agent_id {
-                                        Some(agent_id)
-                                            if signal.delivery_id.starts_with("m-") =>
-                                        {
+                                        Some(agent_id) => {
                                             handle_inbox_ack(&pty_registry, &signal, agent_id)
                                         }
-                                        _ => handle_delivery_ack(
-                                            &pty_registry,
-                                            &signal,
-                                            attested_agent_id,
-                                        ),
+                                        None => crate::event::AckDelivery::Unknown,
                                     };
                                     if let Ok(json) = serde_json::to_string(
                                         &crate::event::SignalAck::acknowledged(delivery),
@@ -4950,54 +4786,27 @@ async fn run_hook_loop_with_idle_timeout(
                                     }
                                 }
                                 DaemonMessage::GetSeed(req) => {
-                                    // PRD #201 native prompt delivery: hand the
-                                    // pane's pending seed to the caller (the
-                                    // extension's `get-seed`) and CLEAR it, so
-                                    // the daemon's PTY-injection safety net
-                                    // won't also deliver it. `take_..._native`
-                                    // marks the delivery as native for the
-                                    // real-pi e2e proof. `None` → `{"seed":null}`.
+                                    // PRD #1666 S5 (the design's S9 alias): a
+                                    // seed is the pane's first inbox message, so
+                                    // `get-seed` hands over the agent's oldest
+                                    // queued message, rendered, and acknowledges
+                                    // it — what a Pi extension that predates the
+                                    // inbox needs to keep receiving its seed.
+                                    // `None` → `{"seed":null}`.
                                     //
-                                    // Issue #916: the pane id is CALLER-SUPPLIED
-                                    // and this socket authenticates nobody, so
-                                    // the take is scoped by the caller's own
-                                    // agent id when it presents one and skips
-                                    // exited records either way — the filtering
-                                    // every other registry lookup applies and
-                                    // this one did not. `req.agent_id` is
-                                    // `None` for a caller the daemon injected no
-                                    // id into, which falls back to the pane's
-                                    // live occupant; the reasoning for that
-                                    // choice is on `take_pending_seed_native_for`.
-                                    // PRD #1666 S5 (the design's S9 alias, pulled
-                                    // forward): a seed is now the pane's first
-                                    // inbox message, so `get-seed` hands over the
-                                    // agent's oldest queued message, rendered, and
-                                    // acknowledges it — what an extension that
-                                    // predates the inbox needs to keep receiving
-                                    // its seed. A seed stashed the old way is
-                                    // still taken first.
-                                    //
-                                    // Hardening H2: the inbox half acts only
-                                    // for the agent the token attests, never
-                                    // for an id the caller names or the pane's
-                                    // occupant ([`get_seed_inbox_alias`]).
-                                    let seed = pty_registry
-                                        .take_pending_seed_native_for(
-                                            &req.pane_id,
-                                            req.agent_id.as_deref(),
-                                        )
-                                        .or_else(|| {
-                                            get_seed_inbox_alias(
-                                                pty_registry.inbox(),
-                                                &req.pane_id,
-                                                req.agent_id.as_deref(),
-                                                attested_agent.as_deref(),
-                                                pty_registry
-                                                    .pane_current_agent_id(&req.pane_id)
-                                                    .as_deref(),
-                                            )
-                                        });
+                                    // Hardening H2: it acts only for the agent
+                                    // the token attests, never for an id the
+                                    // caller names or the pane's occupant
+                                    // ([`get_seed_inbox_alias`]).
+                                    let seed = get_seed_inbox_alias(
+                                        pty_registry.inbox(),
+                                        &req.pane_id,
+                                        req.agent_id.as_deref(),
+                                        attested_agent.as_deref(),
+                                        pty_registry
+                                            .pane_current_agent_id(&req.pane_id)
+                                            .as_deref(),
+                                    );
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
                                         agent_id = ?req.agent_id,
@@ -6463,69 +6272,6 @@ mod hook_ingestion_tests {
         fx.registry.shutdown_all();
     }
 
-    /// Issue #714 (audit F-A2): block 1 claims the blocked-worker notice and
-    /// waits on the orchestrator's writer, which is held busy. A work hook lifts
-    /// block 1 and the worker reports block 2 of the SAME delegation while the
-    /// writer is still busy, so block 2 finds the notice claimed and skips it.
-    /// When the writer frees, block 1's write is refused and released — and the
-    /// notice is then delivered for block 2, exactly once. A third block of the
-    /// delegation reports nothing more.
-    #[tokio::test]
-    #[ignore = "quarantined: vfarcic, #1666"]
-    async fn quota_refused_notice_hands_the_claim_to_a_newer_block() {
-        let fx = QuotaNoticeFixture::new("quota-handoff-worker", "quota-handoff-orch").await;
-        let writer = fx
-            .registry
-            .agent_writer(&fx.orch_id)
-            .expect("the orchestrator's writer");
-        let mut held = Some(writer.lock().await);
-
-        let first = bounded_while_holding(&mut held, "latching block 1", fx.latch_block()).await;
-        let notice = fx
-            .registry
-            .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
-            .expect("block 1 claims the notice");
-        let delivery = {
-            let registry = Arc::clone(&fx.registry);
-            let (pane, agent) = (fx.worker_pane.to_string(), fx.worker_id.clone());
-            tokio::spawn(async move {
-                registry
-                    .deliver_worker_blocked_notice(&pane, &agent, first, notice)
-                    .await;
-            })
-        };
-        // Let block 1's write reach the busy writer.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !delivery.is_finished(),
-            "precondition: the write waits on the writer"
-        );
-
-        bounded_while_holding(&mut held, "the work hook", fx.work_hook()).await;
-        let second = bounded_while_holding(&mut held, "reporting block 2", fx.report_block()).await;
-        assert_ne!(second, first);
-        assert_eq!(fx.blocked_cards().await, 1, "precondition: block 2 applied");
-
-        drop(held.take());
-        tokio::time::timeout(Duration::from_secs(30), delivery)
-            .await
-            .expect("block 1's refused write never returned once the writer freed")
-            .expect("the delivery task");
-        let delivered = fx.settled_notices().await;
-        assert_eq!(delivered, 2, "expected exactly one notice (echo + output)");
-        assert!(
-            fx.registry
-                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
-                .is_none(),
-            "block 2's delivered notice was not claimed"
-        );
-
-        fx.work_hook().await;
-        fx.report_block().await;
-        assert_eq!(fx.notices().await, delivered, "the delegation re-notified");
-        fx.registry.shutdown_all();
-    }
-
     /// Issue #714 (review): every pane's hooks pass through `ingest_event`, so
     /// ingesting a worker's block must not wait on the orchestrator's pane
     /// writer. Hold that writer and ingest the worker's `quota_blocked`: it
@@ -6553,95 +6299,6 @@ mod hook_ingestion_tests {
             "the delivered notice keeps its claim"
         );
         drop(held.take());
-        fx.registry.shutdown_all();
-    }
-
-    /// Scenario: hold an orchestrator's writer and repeatedly supersede a
-    /// delegation to a blocked worker. Release the writer and wait for the
-    /// terminal echo and stand-in output, proving only the current notice lands
-    /// (issue #714, review).
-    #[tokio::test]
-    #[ignore = "quarantined: vfarcic, #1666"]
-    async fn superseded_blocked_notices_do_not_queue_on_a_stalled_orchestrator_writer() {
-        let fx = QuotaNoticeFixture::new("quota-stall-worker", "quota-stall-orch").await;
-        let writer = fx
-            .registry
-            .agent_writer(&fx.orch_id)
-            .expect("the orchestrator's writer");
-        let mut held = Some(writer.lock().await);
-
-        bounded_while_holding(&mut held, "ingesting the block", fx.report_block()).await;
-        assert_eq!(
-            fx.blocked_cards().await,
-            1,
-            "precondition: the block applied"
-        );
-
-        let mut tasks = Vec::new();
-        for _ in 0..8 {
-            let armed = fx
-                .registry
-                .arm_outstanding_delegation(
-                    fx.worker_pane,
-                    "coder",
-                    fx.orch_pane,
-                    &fx.orch_id,
-                    None,
-                )
-                .expect("arm the delegation");
-            fx.registry
-                .bind_delegation_worker_agent_id(fx.worker_pane, armed.seq, &fx.worker_id);
-            tasks.push(
-                fx.registry
-                    .report_published_block_to_new_delegation(
-                        fx.worker_pane,
-                        armed.seq,
-                        &fx.worker_id,
-                    )
-                    .expect("each new delegation is reported"),
-            );
-        }
-
-        // A failure bound only: an abort lands on the task's next poll.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let pending = tasks.iter().filter(|t| !t.is_finished()).count();
-            if pending <= 1 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{pending} notice tasks still queued on the stalled writer"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let last = tasks.pop().expect("the current delegation's task");
-        assert!(
-            tasks.iter().all(|t| t.is_finished()),
-            "a superseded delegation's notice task is still waiting"
-        );
-        assert!(
-            !last.is_finished(),
-            "the current delegation's notice must still be waiting on the writer"
-        );
-        assert_eq!(fx.notices().await, 0, "precondition: nothing written yet");
-
-        drop(held.take());
-        tokio::time::timeout(Duration::from_secs(30), last)
-            .await
-            .expect("the current notice was delivered once the writer freed")
-            .expect("the notice task");
-        assert_eq!(
-            fx.settled_notices().await,
-            2,
-            "expected exactly one notice, the current delegation's (echo + output)"
-        );
-        assert!(
-            fx.registry
-                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
-                .is_none(),
-            "the current delegation keeps the claim its delivered notice took"
-        );
         fx.registry.shutdown_all();
     }
 
@@ -8957,163 +8614,6 @@ mod hook_ingestion_tests {
         assert!(seed.contains("the successor's task"));
     }
 
-    /// Scenario: PRD #201 native prompt delivery over the hook socket. Spawn a
-    /// shell agent tagged with a pane id, stash a seed for it via
-    /// `set_pending_seed`, run the real `run_hook_loop`, then send a `get_seed`
-    /// request line and read the reply. The daemon must reply with the exact
-    /// seed, mark it delivered-native, and clear it — a second request replies
-    /// `{"seed":null}`. This is the request/response path the pi extension's
-    /// `get-seed` verb rides (the one hook-socket message that reads a reply).
-    ///
-    /// Issue #916 added the identity arms, over the real socket rather than
-    /// against the registry method: a request naming an agent that does not hold
-    /// the pane gets `null` and consumes nothing, a request naming the pane's own
-    /// agent is answered, and a request naming NO agent — the pre-#916 client, and
-    /// any producer the daemon injected no id into — is still answered rather than
-    /// refused.
-    #[tokio::test]
-    async fn run_hook_loop_answers_get_seed_and_clears_it() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let agent_gs = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-gs".to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn shell agent");
-        let token_gs = registry
-            .hook_token_of(&agent_gs)
-            .expect("a spawned agent carries a hook capability token");
-        registry.set_pending_seed(
-            "pane-gs",
-            "Acknowledge your role and wait for instructions.",
-        );
-
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("chmod tempdir");
-        let sock = dir.path().join("hook.sock");
-        let listener =
-            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
-        let state: SharedState =
-            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
-        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn({
-            let registry = registry.clone();
-            let wtr = crate::issue_dispatch_run::new_worktree_registry();
-            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
-        });
-
-        // Helper: send one get_seed request line and read the single reply line.
-        // `agent_id` is what the real CLI reads out of `DOT_AGENT_DECK_AGENT_ID`
-        // (issue #916); `None` is the pre-#916 client, and the shape a producer
-        // the daemon injected no id into still sends.
-        async fn ask_get_seed_as(
-            sock: &std::path::Path,
-            pane_id: &str,
-            agent_id: Option<&str>,
-            token: &str,
-        ) -> String {
-            let req = crate::event::DaemonMessage::GetSeed(crate::event::GetSeedRequest {
-                pane_id: pane_id.to_string(),
-                agent_id: agent_id.map(|a| a.to_string()),
-                // Issue #1077: the pane's own hook capability token, which the
-                // real `get-seed` CLI reads out of `DOT_AGENT_DECK_PANE_CAPABILITY`.
-                // Supplied on every arm below so each one still tests the
-                // identity question #916 is about rather than being refused one
-                // layer earlier for want of provenance.
-                token: Some(token.to_string()),
-            });
-            let line = format!("{}\n", serde_json::to_string(&req).unwrap());
-            let mut stream = UnixStream::connect(sock).await.expect("connect");
-            stream.write_all(line.as_bytes()).await.unwrap();
-            stream.flush().await.unwrap();
-            stream.shutdown().await.unwrap();
-            let mut buf = String::new();
-            stream.read_to_string(&mut buf).await.unwrap();
-            buf
-        }
-
-        // Issue #916: a pull that NAMES an agent which does not hold this pane
-        // is refused, and refused without consuming anything — the seed is still
-        // there for its owner two blocks down. Asserted first for that reason:
-        // after a successful pull there is nothing left to prove it did not eat.
-        let stranger = ask_get_seed_as(&sock, "pane-gs", Some("agent-999"), &token_gs).await;
-        let stranger_resp: crate::event::GetSeedResponse =
-            serde_json::from_str(stranger.trim()).expect("parse stranger get-seed reply");
-        assert!(
-            stranger_resp.seed.is_none(),
-            "a pull naming an agent that does not hold this pane must get nothing"
-        );
-        assert!(
-            !registry.seed_delivered_native("pane-gs"),
-            "…and must not have consumed the seed on its way to being refused"
-        );
-
-        // First pull: the daemon returns the seed…
-        let reply = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs), &token_gs).await;
-        let resp: crate::event::GetSeedResponse =
-            serde_json::from_str(reply.trim()).expect("parse get-seed reply");
-        assert_eq!(
-            resp.seed.as_deref(),
-            Some("Acknowledge your role and wait for instructions.")
-        );
-        // …marks it delivered-native and clears it.
-        assert!(
-            registry.seed_delivered_native("pane-gs"),
-            "answering get-seed must mark the delivery native"
-        );
-
-        // Second pull: nothing left — the seed was delivered exactly once.
-        let reply2 = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs), &token_gs).await;
-        let resp2: crate::event::GetSeedResponse =
-            serde_json::from_str(reply2.trim()).expect("parse second get-seed reply");
-        assert!(
-            resp2.seed.is_none(),
-            "seed must be cleared after the first pull"
-        );
-
-        // Issue #916: the pre-#916 / id-less client still works. It presents no
-        // agent id, and the take falls back to the pane's LIVE occupant rather
-        // than refusing — the decision recorded on `take_pending_seed_native_for`.
-        registry.set_pending_seed("pane-gs", "a second opening task");
-        let legacy = ask_get_seed_as(&sock, "pane-gs", None, &token_gs).await;
-        let legacy_resp: crate::event::GetSeedResponse =
-            serde_json::from_str(legacy.trim()).expect("parse id-less get-seed reply");
-        assert_eq!(
-            legacy_resp.seed.as_deref(),
-            Some("a second opening task"),
-            "a caller the daemon injected no agent id into must not lose its seed"
-        );
-
-        // Unknown pane → null, harmless, whether or not an id is presented.
-        //
-        // Issue #1077 made these hold for a STRONGER reason than they used to:
-        // the token presented here was minted for `pane-gs`, so naming any other
-        // pane is refused at the boundary (`Refusal::WrongPane`) before the
-        // registry is consulted at all, and a refused `get-seed` answers exactly
-        // as "no seed pending" does. The assertions are unchanged because the
-        // observable answer is unchanged.
-        let reply3 = ask_get_seed_as(&sock, "pane-unknown", None, &token_gs).await;
-        let resp3: crate::event::GetSeedResponse =
-            serde_json::from_str(reply3.trim()).expect("parse unknown-pane get-seed reply");
-        assert!(resp3.seed.is_none());
-        let reply4 = ask_get_seed_as(&sock, "pane-unknown", Some(&agent_gs), &token_gs).await;
-        let resp4: crate::event::GetSeedResponse =
-            serde_json::from_str(reply4.trim()).expect("parse cross-pane get-seed reply");
-        assert!(
-            resp4.seed.is_none(),
-            "an agent naming a pane it does not hold must get nothing"
-        );
-
-        handle.abort();
-        let _ = handle.await;
-        registry.shutdown_all();
-    }
-
     // ---------------------------------------------------------------------
     // Issue #1077: the hook-socket provenance gate, driven through the REAL
     // `run_hook_loop` over a REAL socket against REAL spawned agents.
@@ -9363,48 +8863,6 @@ mod hook_ingestion_tests {
                 serde_json::from_str(buf.trim()).unwrap_or_else(|e| {
                     panic!("work_done reply was not a SignalAck ({e}): {buf:?}")
                 }),
-            )
-        }
-
-        /// Issue #1383: send one `ack` line claiming `claimed_pane` and read the
-        /// daemon's acknowledgement, the way [`Self::work_done`] does.
-        async fn ack(
-            &self,
-            claimed_pane: &str,
-            token: Option<&str>,
-            delivery_id: &str,
-        ) -> Option<crate::event::SignalAck> {
-            self.ack_as(claimed_pane, token, delivery_id, None).await
-        }
-
-        /// [`Self::ack`] with the payload's own, sender-chosen `agent_id`.
-        async fn ack_as(
-            &self,
-            claimed_pane: &str,
-            token: Option<&str>,
-            delivery_id: &str,
-            agent_id: Option<&str>,
-        ) -> Option<crate::event::SignalAck> {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let msg = crate::event::DaemonMessage::Ack(crate::event::AckSignal {
-                pane_id: claimed_pane.to_string(),
-                delivery_id: delivery_id.to_string(),
-                agent_id: agent_id.map(str::to_string),
-                token: token.map(str::to_string),
-            });
-            let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
-            let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
-            stream.write_all(line.as_bytes()).await.unwrap();
-            stream.flush().await.unwrap();
-            stream.shutdown().await.unwrap();
-            let mut buf = String::new();
-            stream.read_to_string(&mut buf).await.unwrap();
-            if buf.trim().is_empty() {
-                return None;
-            }
-            Some(
-                serde_json::from_str(buf.trim())
-                    .unwrap_or_else(|e| panic!("ack reply was not a SignalAck ({e}): {buf:?}")),
             )
         }
 
@@ -9827,286 +9285,6 @@ mod hook_ingestion_tests {
             !fx.orchestrator_saw("WORKDONE-FORGED-2b7e", Duration::from_secs(2))
                 .await,
             "the refused work-done still reached the orchestrator's PTY — the caller was told              but the handler ran anyway"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: issue #1383 — a delegate delivery to the worker is pending a
-    /// retry, with a silent-worker watch armed beside it. The worker sends
-    /// `ack` for that delivery id with its own pane's token. The daemon must
-    /// admit it, stop the retry and cancel the watch — an ack is not an agent
-    /// event, so the watch could never have seen it otherwise.
-    #[tokio::test]
-    async fn delivery_ack_from_the_attested_pane_stops_the_retry_and_its_silence_watch() {
-        let fx = ProvenanceFixture::start().await;
-        let silence = fx
-            .registry
-            .arm_silence_watch(PROV_WORKER_PANE, PROV_ORCH_PANE, Some(&fx.worker_agent))
-            .expect("arm silence watch");
-        let mut armed = fx.registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            &fx.worker_agent,
-            Some(silence.seq),
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let token = fx.worker_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abcd")
-            .await
-            .expect("an admitted ack is answered");
-        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
-        assert_eq!(
-            ack.delivery,
-            Some(crate::event::AckDelivery::Stopped),
-            "the reply must say the id matched, not only that the gate admitted it"
-        );
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while fx
-            .registry
-            .pending_deliveries()
-            .is_pending(PROV_WORKER_PANE)
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(
-            !fx.registry
-                .pending_deliveries()
-                .is_pending(PROV_WORKER_PANE),
-            "the ack did not stop the pending delivery"
-        );
-        assert!(
-            armed.cancel.try_recv().is_err(),
-            "the retry loop's cancel must resolve"
-        );
-        assert!(
-            !fx.registry
-                .cancel_silence_watch_if(PROV_WORKER_PANE, silence.seq),
-            "the ack must also cancel the silent-worker watch armed for the same delivery"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: issue #1383 — the orchestrator presents its own token while
-    /// claiming the WORKER's pane, to ack the worker's delivery. The gate must
-    /// refuse it on the connection and leave the pending delivery armed, so one
-    /// pane cannot switch off another pane's retry.
-    #[tokio::test]
-    async fn delivery_ack_claiming_another_pane_is_refused() {
-        let fx = ProvenanceFixture::start().await;
-        let armed = fx.registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            &fx.worker_agent,
-            None,
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let token = fx.orchestrator_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abcd")
-            .await
-            .expect("a refused ack is reported to the caller");
-        assert!(ack.is_signal_ack() && !ack.accepted, "{ack:?}");
-        assert!(
-            fx.registry
-                .pending_deliveries()
-                .is_current(PROV_WORKER_PANE, armed.seq),
-            "a refused ack must not stop the delivery"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: PR #1414 review — an attested ack whose delivery id is shaped
-    /// correctly but is not the pane's delivery (mistyped, or an earlier
-    /// task's) is answered as admitted but UNKNOWN, so the CLI does not print
-    /// "Acknowledged", and the pending delivery stays armed.
-    #[tokio::test]
-    async fn delivery_ack_with_an_unknown_id_is_answered_as_unknown() {
-        let fx = ProvenanceFixture::start().await;
-        let armed = fx.registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            &fx.worker_agent,
-            None,
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let token = fx.worker_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abce")
-            .await
-            .expect("answered");
-        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
-        assert_eq!(ack.delivery, Some(crate::event::AckDelivery::Unknown));
-        assert!(
-            fx.registry
-                .pending_deliveries()
-                .is_current(PROV_WORKER_PANE, armed.seq),
-            "an unknown id must not stop the delivery"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: PR #1414 review (Qodo) — the pane's pending delivery belongs to
-    /// a newer worker generation, and the fixture's worker, still holding a
-    /// valid token for the same pane, acks that delivery id with no `agent_id`
-    /// in the payload. The daemon must identify it by its token, answer
-    /// UNKNOWN, and leave the newer generation's retry running.
-    #[tokio::test]
-    async fn delivery_ack_from_an_older_generation_s_token_without_an_agent_id_does_not_stop_the_retry()
-     {
-        let fx = ProvenanceFixture::start().await;
-        let armed = fx.registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            "agent-newer-generation",
-            None,
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let token = fx.worker_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abcd")
-            .await
-            .expect("answered");
-        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
-        assert_eq!(
-            ack.delivery,
-            Some(crate::event::AckDelivery::Unknown),
-            "another generation's ack must not read as recorded"
-        );
-        assert!(
-            fx.registry
-                .pending_deliveries()
-                .is_current(PROV_WORKER_PANE, armed.seq),
-            "an older generation's ack stopped the newer generation's retry"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: PR #1414 review (Qodo) — the daemon runs with
-    /// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`. The worker pane's current delivery
-    /// has no retry pending (the retry is off) and is bound to the pane's
-    /// current worker and its silent-worker watch. An older generation of that
-    /// pane, which read the overwritten role file, acks the new delivery id
-    /// with no token and a self-chosen `agent_id`. The gate admits it, and the
-    /// daemon must answer UNKNOWN — not "Acknowledged" — and leave the watch
-    /// armed for the worker's own ack, which is then recorded.
-    #[tokio::test]
-    async fn delivery_ack_from_an_older_generation_under_warn_is_unknown_with_nothing_pending() {
-        let _provenance = HOOK_PROVENANCE_ENV_LOCK.lock().await;
-        let _warn = HookProvenanceEnv::set("warn");
-        let fx = ProvenanceFixture::start().await;
-        let silence = fx
-            .registry
-            .arm_silence_watch(PROV_WORKER_PANE, PROV_ORCH_PANE, Some(&fx.worker_agent))
-            .expect("arm silence watch");
-        let deliveries = fx.registry.pending_deliveries();
-        deliveries.note_delivery(PROV_WORKER_PANE, "d-1383abcd");
-        assert!(deliveries.bind_current(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            &fx.worker_agent,
-            Some(silence.seq),
-        ));
-        assert!(!deliveries.is_pending(PROV_WORKER_PANE));
-
-        let ack = fx
-            .ack_as(
-                PROV_WORKER_PANE,
-                None,
-                "d-1383abcd",
-                Some("agent-older-generation"),
-            )
-            .await
-            .expect("an ack admitted under warn is answered");
-        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
-        assert_eq!(
-            ack.delivery,
-            Some(crate::event::AckDelivery::Unknown),
-            "an older generation must not be told its ack of the new delivery was recorded"
-        );
-        assert_eq!(
-            deliveries.current_for_test(PROV_WORKER_PANE),
-            Some(("d-1383abcd".to_string(), Some(silence.seq))),
-            "the older generation's ack must leave the watch bound"
-        );
-
-        let token = fx.worker_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abcd")
-            .await
-            .expect("answered");
-        assert_eq!(ack.delivery, Some(crate::event::AckDelivery::NotPending));
-        assert!(
-            !fx.registry
-                .cancel_silence_watch_if(PROV_WORKER_PANE, silence.seq),
-            "the worker's own ack must cancel the watch"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: PR #1414 review (Qodo) — an ack the gate admitted without
-    /// attesting a sender, carrying the pane's current delivery id and no
-    /// `agent_id`, reaches the handler. Nobody can say which worker sent it, so
-    /// it must answer UNKNOWN and leave the retry running.
-    #[test]
-    fn delivery_ack_with_no_identity_at_all_does_not_stop_the_retry() {
-        let registry = AgentPtyRegistry::new();
-        let armed = registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            "agent-worker",
-            None,
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let signal = crate::event::AckSignal {
-            pane_id: PROV_WORKER_PANE.to_string(),
-            delivery_id: "d-1383abcd".to_string(),
-            agent_id: None,
-            token: None,
-        };
-        assert_eq!(
-            handle_delivery_ack(&registry, &signal, None),
-            crate::event::AckDelivery::Unknown
-        );
-        assert!(
-            registry
-                .pending_deliveries()
-                .is_current(PROV_WORKER_PANE, armed.seq)
-        );
-        // The same ack from the worker it was armed for does stop it.
-        assert_eq!(
-            handle_delivery_ack(&registry, &signal, Some("agent-worker")),
-            crate::event::AckDelivery::Stopped
-        );
-        assert!(!registry.pending_deliveries().is_pending(PROV_WORKER_PANE));
-    }
-
-    /// Scenario: issue #1383 — an attested ack whose delivery id is not shaped
-    /// like one the daemon mints is answered (the gate admitted it) and then
-    /// ignored: nothing is looked up, and the pending delivery stays armed.
-    #[tokio::test]
-    async fn delivery_ack_with_a_malformed_id_is_ignored() {
-        let fx = ProvenanceFixture::start().await;
-        let armed = fx.registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            &fx.worker_agent,
-            None,
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let token = fx.worker_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383ABCD\n")
-            .await
-            .expect("answered");
-        assert!(ack.accepted, "{ack:?}");
-        assert_eq!(ack.delivery, Some(crate::event::AckDelivery::Unknown));
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            fx.registry
-                .pending_deliveries()
-                .is_current(PROV_WORKER_PANE, armed.seq)
         );
         fx.stop().await;
     }

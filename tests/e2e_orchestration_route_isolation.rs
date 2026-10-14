@@ -61,7 +61,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
-use dot_agent_deck::event::SendResult;
+
 use spec::spec;
 
 /// The fixture's `[[orchestrations]] name` — the label BOTH tabs render with in
@@ -137,7 +137,7 @@ fn path_with_binary_dir() -> String {
 struct RolePane {
     /// Daemon registry id — the handle `AttachRequest::Snapshot` takes.
     agent_id: String,
-    /// `DOT_AGENT_DECK_PANE_ID` — the handle `AttachRequest::WriteAndSubmit`
+    /// `DOT_AGENT_DECK_PANE_ID` — the handle `AttachRequest::PostMessage`
     /// takes, and the key the daemon's orchestration maps are built on.
     pane_id: String,
 }
@@ -264,39 +264,22 @@ fn open_orchestration_tab(deck: &TuiDeck, expect_same_cwd_warning: bool) {
     deck.send_keys(b"\r"); // submit (Command is hidden for an orchestration)
 }
 
-/// Ask a real orchestrator pane to delegate `task` to `role`, by writing the
-/// directive into its PTY through the daemon's production prompt-delivery RPC —
-/// the same guarded write-and-submit the deck uses for a seed or orchestrator
-/// prompt. What the orchestrator does with it (shell `dot-agent-deck delegate`)
+/// Ask a real orchestrator pane to delegate `task` to `role`, by posting the
+/// directive to its inbox — the way the deck hands an agent a seed or an
+/// orchestrator prompt. What the orchestrator does with it (shell `dot-agent-deck delegate`)
 /// is the agent's own doing.
-fn ask_orchestrator_to_delegate(
-    deck: &TuiDeck,
-    orchestrator: &RolePane,
-    session_id: &str,
-    role: &str,
-    task: &str,
-) {
+fn ask_orchestrator_to_delegate(deck: &TuiDeck, orchestrator: &RolePane, role: &str, task: &str) {
     let directive = format!(
         "Use the Bash tool to run exactly this one command, then stop and say nothing else: \
          dot-agent-deck delegate --to {role} --task \"{task}\""
     );
-    let resp = common::write_and_submit_with_identity_on(
+    common::post_message_on(
         deck.attach_socket_path(),
         &orchestrator.pane_id,
-        &directive,
         &orchestrator.agent_id,
-        Some(session_id),
+        &directive,
     )
-    .expect("WriteAndSubmit to the orchestrator pane over the attach socket");
-    assert_eq!(
-        resp.send_result,
-        Some(SendResult::Applied),
-        "the daemon refused to deliver the directive to orchestrator pane {}: error={:?}, \
-         send_result={:?}",
-        orchestrator.pane_id,
-        resp.error,
-        resp.send_result
-    );
+    .expect("post the directive to the orchestrator's inbox");
 }
 
 /// Scenario: Launch the real deck against a fixture whose `route-iso`
@@ -410,12 +393,12 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
         // diagnosable.
         eprintln!("warning: not every role pane settled within 180s; proceeding anyway");
     }
-    let orch_a_session_id = events.wait_for_session_start_on_pane(
+    events.wait_for_session_start_on_pane(
         &orch_a.pane_id,
         &orch_a.agent_id,
         Duration::from_secs(10),
     );
-    let orch_b_session_id = events.wait_for_session_start_on_pane(
+    events.wait_for_session_start_on_pane(
         &orch_b.pane_id,
         &orch_b.agent_id,
         Duration::from_secs(10),
@@ -432,7 +415,6 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
     ask_orchestrator_to_delegate(
         &deck,
         &orch_a,
-        &orch_a_session_id,
         "coder",
         &format!(
             "Create a file named {SENTINEL_A} in the current directory with the exact \
@@ -442,7 +424,6 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
     ask_orchestrator_to_delegate(
         &deck,
         &orch_b,
-        &orch_b_session_id,
         "reviewer",
         &format!(
             "Create a file named {SENTINEL_B} in the current directory with the exact \

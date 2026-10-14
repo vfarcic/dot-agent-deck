@@ -10,12 +10,10 @@
 /// The byte length `crate::hook` truncates a reported `user_prompt` to before it
 /// ever reaches [`crate::event::AgentEvent`].
 ///
-/// **This is the silent-failure trap of the whole confirmation design.** A seed
-/// prompt longer than this is reported back in truncated form, so comparing a
+/// A prompt longer than this is reported back in truncated form, so comparing a
 /// locally-known prompt to a reported one with plain `==` matches for short
-/// prompts, never matches for long ones, and fails by *retrying until the
-/// deadline abandons the prompt* — i.e. it looks exactly like the bug being
-/// fixed. Always compare through [`prompt_submission_matches`], never directly.
+/// prompts and never for long ones. Always compare through
+/// [`prompt_submission_matches`], never directly.
 pub const USER_PROMPT_MAX_LEN: usize = 200;
 
 /// How many accumulated copies of one prompt the repetition shapes below build
@@ -27,7 +25,7 @@ pub const USER_PROMPT_MAX_LEN: usize = 200;
 /// 50 or 500 copies is indistinguishable from the 16 this builds — see
 /// [`prompt_submission_matches`]'s residual section, which withdraws the claim
 /// that accepted submissions are at most this many copies. The retry schedule
-/// cannot produce more than single digits inside [`crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`],
+/// cannot produce more than single digits inside the typed delivery's 60 s deadline (removed by PRD #1666),
 /// so the number is margin, not a tuning knob.
 pub(crate) const MAX_REPEATED_SUBMISSION_COPIES: u32 = 16;
 
@@ -95,7 +93,7 @@ pub(crate) fn normalize_for_match(s: &str) -> &str {
 ///    — does not come back as the text we wrote: Claude Code reports it wrapped
 ///    in `<pasted_content id="…">`. So the first three shapes structurally
 ///    cannot match a multi-line delivery to such a producer, and every one of
-///    them was retried to [`crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`] and abandoned on work
+///    them was retried to the typed delivery's 60 s deadline (removed by PRD #1666) and abandoned on work
 ///    the agent had received and acted on. The envelope is a DELIMITED region,
 ///    which is what keeps this from meaning "the report contains our prompt
 ///    somewhere": the payload is compared as a whole, only blank lines may
@@ -168,7 +166,7 @@ pub fn prompt_submission_matches(expected: &str, reported: &str) -> bool {
 /// identically, so the question cannot be answered from it in either direction —
 /// and a line claiming a duplicate that may not have happened is worse than the
 /// silence this issue is about. That is why the second is a weaker line at a
-/// quieter level rather than the same warning; see [`crate::prompt_delivery::log_prompt_confirmed`].
+/// quieter level rather than the same warning; see the typed delivery's confirmation log (removed by PRD #1666).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmedSubmission {
     /// The report is the prompt verbatim: complete text, one copy. The only
@@ -279,7 +277,7 @@ impl ConfirmedSubmission {
 /// ```
 ///
 /// so the plain comparisons above can never match it, and the delivery retries
-/// until [`crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`] abandons it — the exact silent-failure
+/// until the typed delivery's 60 s deadline (removed by PRD #1666) abandons it — the exact silent-failure
 /// shape [`USER_PROMPT_MAX_LEN`]'s doc warns about, arrived at from a different
 /// direction. That is not hypothetical scope: PRD #220 Phase 2 (#1081) appends
 /// the `work-done` completion instruction to EVERY `--single` dispatch prompt,
@@ -305,7 +303,7 @@ impl ConfirmedSubmission {
 /// # Accepted residual: two pastes in one turn
 ///
 /// A turn carrying our payload TWICE — the accumulation
-/// [`crate::prompt_delivery::prompt_submission_accumulated`] is the safety net for, produced when the
+/// the typed delivery's accumulation detector (removed by PRD #1666) was the safety net for, produced when the
 /// bounded replacement write lands before the agent has submitted the first
 /// payload — arrives as two envelopes, and this shape does not read it as a
 /// confirmation. It is not widened to N of them: no report carrying two was
@@ -339,7 +337,7 @@ const MAX_PASTE_ENVELOPE_ID_LEN: usize = 16;
 /// an agent TUI that is not yet in submit-aware mode lands as a newline in the
 /// input box (PRD #128), so a turn submitted later carries one per probe ahead
 /// of the payload. `dispatch/015` measured exactly two. The retry schedule
-/// cannot produce more than single digits inside [`crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`]
+/// cannot produce more than single digits inside the typed delivery's 60 s deadline (removed by PRD #1666)
 /// — the same fact [`MAX_REPEATED_SUBMISSION_COPIES`] rests on — so this is
 /// margin over that, not a tuning knob.
 ///
@@ -831,5 +829,145 @@ mod tests {
         let cut = truncate_on_char_boundary(&s, USER_PROMPT_MAX_LEN);
         assert_eq!(cut, format!("{}…", "a".repeat(199)));
         assert!(prompt_submission_matches(&s, &cut));
+    }
+
+    /// Issue #685: the same 2x2 fixture set the issue's table was measured with
+    /// — both repetition shapes, at 2 and 3 copies, for a prompt under
+    /// [`USER_PROMPT_MAX_LEN`] and one over it, each put through the hook's
+    /// truncation — asserted against the CLASSIFICATION rather than the bare
+    /// `bool`.
+    ///
+    /// What the table said before this: the `warn` fired in one of the four
+    /// cells, and in NONE of them for a long prompt. What it says now is in the
+    /// `expected` column below — the three cells that used to be a silent clean
+    /// confirmation are now either a distinct knowable duplicate (the short
+    /// newline-separated shape) or report themselves undecidable (every
+    /// long-prompt shape, whichever separator).
+    ///
+    /// The accept set is untouched, and the row-by-row `prompt_submission_matches`
+    /// cross-check at the bottom of each iteration is what says so: every shape
+    /// that classifies is exactly a shape the `bool` API confirms.
+    #[test]
+    fn confirmation_classification_covers_every_repetition_shape() {
+        // `crate::hook` truncates every reported `user_prompt` through exactly
+        // this function before it can reach an `AgentEvent`, so applying it here
+        // is the hook's own truncation and not a stand-in for it.
+        let through_the_hook = |text: &str| truncate_on_char_boundary(text, USER_PROMPT_MAX_LEN);
+
+        let short = "Use Bash to verify seed-confirm-alpha-7f31.txt exists then print it";
+        assert!(short.len() < USER_PROMPT_MAX_LEN);
+        let long = format!(
+            "Read .dot-agent-deck/worker-task-coder.md and begin. {}",
+            "y".repeat(USER_PROMPT_MAX_LEN)
+        );
+        assert!(long.len() > USER_PROMPT_MAX_LEN);
+
+        let cases: Vec<(&str, &str, Option<ConfirmedSubmission>)> = vec![
+            // The baselines: one copy of each length.
+            ("short/single", short, Some(ConfirmedSubmission::SingleCopy)),
+            (
+                "long/single",
+                &long,
+                Some(ConfirmedSubmission::TruncatedPrefix),
+            ),
+            // Newline-separated — shape 3, the matcher's own repetition
+            // grammar. Short: the repetition is visible in the report, so it is
+            // a KNOWABLE duplicate. Two copies fit under the limit and are
+            // counted exactly; three do not, so the count is withheld while the
+            // repetition itself stays certain — see `RepeatedCopies` for why a
+            // withheld count is the honest answer rather than a floor.
+            (
+                "short/newline/2",
+                short,
+                Some(ConfirmedSubmission::RepeatedCopies { copies: Some(2) }),
+            ),
+            (
+                "short/newline/3",
+                short,
+                Some(ConfirmedSubmission::RepeatedCopies { copies: None }),
+            ),
+            // Long: every repetition collapses onto the same prefix a single
+            // copy produces, so the report cannot answer the question either
+            // way. This is the cell that makes the issue matter — a dispatch
+            // prompt lives here.
+            (
+                "long/newline/2",
+                &long,
+                Some(ConfirmedSubmission::TruncatedPrefix),
+            ),
+            (
+                "long/newline/3",
+                &long,
+                Some(ConfirmedSubmission::TruncatedPrefix),
+            ),
+            // Separator-free — NOT the matcher's business. Short: no
+            // confirmation at all, which is what routes it to
+            // `prompt_submission_accumulated` and its own `warn`. Long: the
+            // doubled text truncates onto the ordinary long-prompt prefix, so
+            // the matcher confirms it and the accumulation detector is never
+            // consulted; undecidable is the honest report.
+            ("short/bare/2", short, None),
+            ("short/bare/3", short, None),
+            (
+                "long/bare/2",
+                &long,
+                Some(ConfirmedSubmission::TruncatedPrefix),
+            ),
+            (
+                "long/bare/3",
+                &long,
+                Some(ConfirmedSubmission::TruncatedPrefix),
+            ),
+        ];
+
+        let reported_for = |name: &str, expected: &str| -> String {
+            let text = match name.rsplit_once('/') {
+                Some((shape, "2")) if shape.ends_with("newline") => {
+                    format!("{expected}\n{expected}")
+                }
+                Some((shape, "3")) if shape.ends_with("newline") => {
+                    format!("{expected}\n{expected}\n{expected}")
+                }
+                Some((shape, "2")) if shape.ends_with("bare") => format!("{expected}{expected}"),
+                Some((shape, "3")) if shape.ends_with("bare") => {
+                    format!("{expected}{expected}{expected}")
+                }
+                _ => expected.to_string(),
+            };
+            through_the_hook(&text)
+        };
+
+        let mut observed = Vec::new();
+        for (name, expected, want) in &cases {
+            let reported = reported_for(name, expected);
+            let got = classify_prompt_submission(expected, &reported);
+            observed.push((*name, got));
+            assert_eq!(
+                got, *want,
+                "{name}: classification must match the shape the issue's table measured"
+            );
+            // The classification never widens or narrows what confirms a
+            // delivery: it is `prompt_submission_matches` with the `true`s
+            // labelled, and this is the assertion that keeps it that way.
+            assert_eq!(
+                got.is_some(),
+                prompt_submission_matches(expected, &reported),
+                "{name}: classification and the bool matcher must accept exactly the same set"
+            );
+        }
+
+        // Eight of the ten cells confirm, and exactly ONE of those eight is a
+        // clean single copy. That ratio is the complaint restated as an
+        // assertion: before this, all eight emitted the same `info` line as
+        // that one clean cell.
+        assert_eq!(observed.iter().filter(|(_, got)| got.is_some()).count(), 8);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(_, got)| *got == Some(ConfirmedSubmission::SingleCopy))
+                .count(),
+            1,
+            "observed={observed:?}"
+        );
     }
 }

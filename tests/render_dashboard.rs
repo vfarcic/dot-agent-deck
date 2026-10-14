@@ -104,8 +104,6 @@ fn pane_004_card_title_row() {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
@@ -155,8 +153,6 @@ fn card_stats_session(cwd: &str) -> SessionState {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     }
 }
@@ -874,8 +870,6 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     };
     let width: u16 = 40;
@@ -1069,8 +1063,6 @@ fn pane_007_pi_card_shows_pi_identity() {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     };
     let width: u16 = 80;
@@ -1136,8 +1128,6 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     };
     let width: u16 = 80;
@@ -1396,8 +1386,6 @@ fn palette_session(status: SessionStatus) -> SessionState {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     }
 }
@@ -2285,8 +2273,6 @@ fn pane_005_highlight_follows_selected_session_id() {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
@@ -2490,8 +2476,6 @@ fn filled_session() -> SessionState {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     }
 }
@@ -3254,8 +3238,6 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     };
     let density = CardDensityKind::Normal;
@@ -3602,8 +3584,6 @@ fn role_session(index: usize, role: &str) -> SessionState {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
     }
 }

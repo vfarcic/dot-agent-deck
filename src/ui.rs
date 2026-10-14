@@ -20046,8 +20046,6 @@ pub fn render_orchestration_frame_to_buffer(
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
                 subagent_wait: None,
-                prompt_reports_unavailable: false,
-                prompt_reports_declared: false,
                 output_set_status: false,
             },
         );
@@ -20841,8 +20839,6 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
                 subagent_wait: None,
-                prompt_reports_unavailable: false,
-                prompt_reports_declared: false,
                 output_set_status: false,
             },
         );
@@ -23099,8 +23095,6 @@ mod tests {
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
                 subagent_wait: None,
-                prompt_reports_unavailable: false,
-                prompt_reports_declared: false,
                 output_set_status: false,
             },
         );
@@ -26627,8 +26621,6 @@ mod tests {
             shell_synthetic_working: false,
             orchestration_orphaned: false,
             subagent_wait: None,
-            prompt_reports_unavailable: false,
-            prompt_reports_declared: false,
             output_set_status: false,
         };
 
@@ -29423,8 +29415,6 @@ mod tests {
             shell_synthetic_working: false,
             orchestration_orphaned: false,
             subagent_wait: None,
-            prompt_reports_unavailable: false,
-            prompt_reports_declared: false,
             output_set_status: false,
         };
         let s0 = make("s0", "p0");
@@ -30217,8 +30207,6 @@ mod tests {
             shell_synthetic_working: false,
             orchestration_orphaned: false,
             subagent_wait: None,
-            prompt_reports_unavailable: false,
-            prompt_reports_declared: false,
             output_set_status: false,
         }
     }
@@ -30651,8 +30639,6 @@ mod tests {
             shell_synthetic_working: false,
             orchestration_orphaned: false,
             subagent_wait: None,
-            prompt_reports_unavailable: false,
-            prompt_reports_declared: false,
             output_set_status: false,
         };
 
@@ -30692,8 +30678,6 @@ mod tests {
             shell_synthetic_working: false,
             orchestration_orphaned: false,
             subagent_wait: None,
-            prompt_reports_unavailable: false,
-            prompt_reports_declared: false,
             output_set_status: false,
         };
 
@@ -30724,8 +30708,6 @@ mod tests {
             shell_synthetic_working: false,
             orchestration_orphaned: false,
             subagent_wait: None,
-            prompt_reports_unavailable: false,
-            prompt_reports_declared: false,
             output_set_status: false,
         };
 

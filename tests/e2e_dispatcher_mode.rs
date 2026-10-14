@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
-use dot_agent_deck::event::SendResult;
-use dot_agent_deck::state::{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, SessionStatus};
+
+use dot_agent_deck::state::SessionStatus;
 use spec::spec;
 
 /// The opening words of `authoring_seeds::DISPATCHER_SEED_PROMPT`.
@@ -1224,7 +1224,6 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         // idle for the full 300s budget, and the test was deterministically red.
         // The other two real `clear = true` scenarios
         // (`orchestration/delegate/014`, `/015`) already opt back in the same way.
-        .with_env(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, "1000")
         // The daemon must outlive this test's OWN budget, or its failure
         // diagnostics lie. The harness's leaked-daemon backstop is 300s and
         // `WORK_WAIT` below is also 300s, so on a red run the daemon self-exited
@@ -1454,8 +1453,8 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         eprintln!("warning: not every role pane settled within 180s; proceeding anyway");
     }
 
-    // Delivered through the daemon's production prompt-delivery RPC — the same
-    // guarded write-and-submit the deck uses for a seed or orchestrator prompt.
+    // Posted to the orchestrator's inbox — the way the deck hands an agent a
+    // seed or an orchestrator prompt.
     // What the orchestrator does with it (shell `dot-agent-deck delegate`) is the
     // AGENT's own doing, which is the point: this is the decision path, not a
     // test-issued CLI call.
@@ -1467,27 +1466,18 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         .remove("orchestrator")
         .expect("the dispatched orchestration has an `orchestrator` role state")
         .agent_id;
-    let orchestrator_session_id = events.wait_for_session_start_on_pane(
+    events.wait_for_session_start_on_pane(
         &orchestrator_pane,
         &orchestrator_agent_id,
         Duration::from_secs(10),
     );
-    let resp = common::write_and_submit_with_identity_on(
+    common::post_message_on(
         deck.attach_socket_path(),
         &orchestrator_pane,
-        &directive,
         &orchestrator_agent_id,
-        Some(&orchestrator_session_id),
+        &directive,
     )
-    .expect("WriteAndSubmit to the dispatched orchestrator pane over the attach socket");
-    assert_eq!(
-        resp.send_result,
-        Some(SendResult::Applied),
-        "the daemon refused to deliver the delegate directive to the dispatched \
-         orchestrator pane {orchestrator_pane}: error={:?}, send_result={:?}",
-        resp.error,
-        resp.send_result
-    );
+    .expect("post the delegate directive to the dispatched orchestrator's inbox");
 
     // Generous: an orchestrator turn, a `clear = true` worker RESPAWN (issue
     // #584 — a fresh Haiku cold boot, its `SessionStart`, and the readiness

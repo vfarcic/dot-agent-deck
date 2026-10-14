@@ -249,7 +249,7 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// shape (an older client would see an unrecognised kind), so per the task's
 /// Rule 12 rule this is a hard bump, not an additive-field change. Finding #6's
 /// guarded-send capability rides ALONGSIDE this as an additive, optional field
-/// on the `Hello` reply ([`AttachResponse::guarded_send`]) — a NEW client checks
+/// on the `Hello` reply (`guarded_send`, removed with that send by PRD #1666) — a NEW client checks
 /// that explicit capability (NOT the version number) before an identity-bearing
 /// send, and fails safe when it is absent, so the two concerns are decoupled: an
 /// old daemon that happens to share a version can never be mistaken for one that
@@ -569,16 +569,6 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// the handshake reports and `daemon hello` prints — and, at the two sites
 /// above, what makes it *refused*.
 pub const PROTOCOL_VERSION: u32 = 11;
-
-/// Issue #1383: the longest the daemon may hold the Enter of one
-/// [`AttachRequest::WriteAndSubmit`] waiting for its payload to render on a
-/// pane that never shows it. The reply comes after that Enter, so a client
-/// timing the RPC must allow longer than this or it can report a failure for a
-/// write that is still going ahead. It is a property of this RPC, which is why
-/// it is published here; the value is
-/// [`crate::submit_echo::SUBMIT_ECHO_BOUND`], and this is an alias of it rather
-/// than a second number to keep in step.
-pub const WRITE_AND_SUBMIT_ECHO_BOUND: Duration = crate::submit_echo::SUBMIT_ECHO_BOUND;
 
 /// The attach-protocol version the daemon's `Hello` handler advertises as
 /// [`AttachResponse::server_version`]. [`PROTOCOL_VERSION`] in every shipped
@@ -1971,24 +1961,6 @@ pub enum AttachRequest {
         #[serde(default)]
         cwd: Option<String>,
     },
-    /// PRD #100: atomic write-and-submit RPC. Routes the client's
-    /// `pane_id` + `text` straight to
-    /// [`crate::agent_pty::AgentPtyRegistry::write_and_submit_guarded`]
-    /// on the daemon side, which holds the per-agent writer mutex across
-    /// the full `payload → SUBMIT_DELAY → CR` sequence (PRD #93 round-8
-    /// atomic contract). Lets a TUI client trigger the same atomic
-    /// byte stream the daemon-initiated orchestration-delegate path
-    /// already produces — without the two-`STREAM_IN`-frames-with-150ms-gap
-    /// pattern, whose mid-sequence mutex release lets a concurrent
-    /// daemon-initiated write interleave and fuse a daemon-side CR onto
-    /// the user's payload, submitting it prematurely. The user's
-    /// trailing CR then lands in an empty input box and is rendered as
-    /// a newline — PRD #100's "Enter inserted a newline instead of
-    /// submitting" symptom.
-    WriteAndSubmit {
-        pane_id: String,
-        text: String,
-    },
     /// PRD #76 M2.17: long-lived subscription to the daemon's
     /// `AgentEvent` broadcast. Server replies with an OK `RESP` then
     /// streams `KIND_EVENT` frames (one per hook event) until either side
@@ -2737,64 +2709,11 @@ fn default_cols() -> u16 {
     80
 }
 
-/// PRD #20 R20-003/R20-004: additive identity + idempotency fields that ride
-/// alongside a [`AttachRequest::WriteAndSubmit`] request as extra JSON keys.
-///
-/// They are deliberately NOT declared on the `WriteAndSubmit` enum variant: its
-/// `{ pane_id, text }` shape is constructed as a 2-field literal at existing
-/// call sites (older tests, the Codex-wrapper path), and widening the variant
-/// would break those literals. Instead the handler re-parses the SAME request
-/// payload into this struct — every field `#[serde(default)]`, so an older
-/// client that omits them still decodes to all-`None`. Unknown keys on the base
-/// variant are ignored by serde, so the two parses of one payload never conflict.
-///
-/// Issue #608: decoding cleanly to all-`None` is no longer the same thing as
-/// being AUTHORIZED. `expected_agent_id` is REQUIRED for delivery on the paned
-/// arm as well as the pane-less one — absent, the daemon answers
-/// `no-live-target` and writes nothing. The wire is untouched; what changed is
-/// that an absent identity now means "refuse", not "authorize by pane id alone".
-#[derive(Debug, Default, Deserialize)]
-struct WriteAndSubmitExtras {
-    /// The registry id of the agent the prompt was queued for. On a mismatch
-    /// with the live target that currently owns the pane, the daemon returns
-    /// `wrong-session` WITHOUT writing (R20-003).
-    ///
-    /// Issue #608: REQUIRED. An absent id is not a licence to authorize by pane
-    /// id alone — it resolves to `Writable::None` → `no-live-target` before any
-    /// write is attempted, on the paned and the pane-less arm alike.
-    #[serde(default)]
-    expected_agent_id: Option<String>,
-    /// The session id the prompt was queued for. If a DIFFERENT live session now
-    /// owns the pane, the daemon returns `stale` WITHOUT writing (R20-003).
-    ///
-    /// Issue #608: absent is allowed, but no longer unconditionally. On a paned
-    /// target that already carries a current hook session — attached or not —
-    /// declining to name that generation IS the mismatch — the daemon knows a
-    /// conversation the caller did not name — and the answer is `stale`. An
-    /// agent that never emits a session generation carries neither side of the
-    /// comparison and still delivers; that carve-out cannot tell such an agent
-    /// apart from a conversation that has just ENDED, which is a known hole
-    /// documented at the arm that implements it.
-    #[serde(default)]
-    expected_session_id: Option<String>,
-    /// A stable idempotency key. The daemon caches the first result for a
-    /// delivery id and replays it on a retry, so a re-sent ambiguous transport
-    /// failure never double-submits (R20-004).
-    ///
-    /// Issue #527: at most [`crate::agent_pty::MAX_DELIVERY_ID_BYTES`] bytes. A
-    /// longer id still DECODES (the wire type is unchanged), but the ledger
-    /// refuses to admit it and the daemon answers with an error and writes
-    /// nothing. The charset stays unrestricted.
-    #[serde(default)]
-    delivery_id: Option<String>,
-}
-
 /// PRD #819 audit follow-up: the detector that keeps the *removed* token-on-
 /// `StartAgent` path from coming back as a silent one.
 ///
 /// M4 landed the preparation token as an additive `prep_token` key alongside
-/// [`AttachRequest::StartAgent`], re-parsed from the same payload the way
-/// [`WriteAndSubmitExtras`] still is. That shape fails open against an older
+/// [`AttachRequest::StartAgent`], re-parsed from the same payload. That shape fails open against an older
 /// peer — see [`AttachRequest::StartPreparedAgent`], which replaced it — and it
 /// never shipped: `PROTOCOL_VERSION` was already 9 and unreleased when it was
 /// removed, so no deployed daemon or client ever spoke it.
@@ -3020,54 +2939,6 @@ pub struct AttachResponse {
     /// daemon omits it (`None`), and `PROTOCOL_VERSION` is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
-    /// PRD #20 M3: the honest outcome of an input-delivery request
-    /// ([`AttachRequest::WriteAndSubmit`]). `applied`/`queued` mean the input
-    /// reached (or was accepted for) a live target; `history-only` /
-    /// `no-live-target` / `stale` / `wrong-session` mean it was deliberately
-    /// NOT delivered and the client should surface feedback rather than assume
-    /// success. Additive + optional (`#[serde(default, skip_serializing_if]`):
-    /// a pre-PRD-20 daemon omits it (decodes to `None`, read as "assume
-    /// applied" by a newer client), and an older client ignores the extra
-    /// field — so it is forward-compatible and needs no `PROTOCOL_VERSION` bump.
-    /// `None` on every non-`WriteAndSubmit` response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub send_result: Option<crate::event::SendResult>,
-    /// Issue #621: on a `stale` refusal of a paned `write-and-submit` that named
-    /// NO session, the hook-session generation the pane carried when the guard
-    /// refused it — the conversation the caller would have to name for the
-    /// write to be accepted. Read by the guard itself, under the target writer
-    /// and the same `AppState` guard as the refusal, so it is the value the
-    /// refusal was decided on rather than a later re-read.
-    ///
-    /// Why it exists: before it, a refused caller's ONLY route to the
-    /// generation was its own event stream, and the TUI's subscriber does not
-    /// replay what it missed across a reconnect. A `SessionStart` dropped there
-    /// left every retry unnamed and every one refused, until the prompt was
-    /// abandoned at `crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`.
-    ///
-    /// `None` on every other response — including a `stale` refusal of a
-    /// request that DID name a session, which is a lost target and not an
-    /// invitation to rebind (a delivery bound to one conversation must never be
-    /// redirected into its successor). Advisory, not an authorization: the
-    /// retry that names it is re-validated by the same guard. Additive +
-    /// optional (`#[serde(default, skip_serializing_if)]`): an older daemon
-    /// omits it, an older client ignores it, and the request/response shape is
-    /// otherwise unchanged, so it needs no `PROTOCOL_VERSION` bump.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_session_id: Option<String>,
-    /// PRD #20 R20-003/004/006 (finding #6): guarded-send capability advertised
-    /// on the `Hello` reply. `Some(true)` means this daemon enforces the
-    /// identity/idempotency guards on `write-and-submit` (exact agent + session
-    /// match, atomic delivery-id dedup). A NEW client checks THIS field — not the
-    /// version number — before an identity-bearing send: when it is absent
-    /// (`None`, an OLD daemon that never sets it), the client FAILS SAFE and does
-    /// NOT submit, preserving pre-PRD-20 fire-once semantics rather than trusting
-    /// an unguarded `ok=true` that could double-submit or mis-deliver on a rebind.
-    /// Additive + optional: a pre-PRD-20 daemon omits it, and the plain
-    /// [`AttachResponse::hello`] constructor leaves it `None` (only the live
-    /// daemon's `Hello` handler sets it via [`AttachResponse::with_guarded_send`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guarded_send: Option<bool>,
     /// Issue #717: the answer to
     /// [`AttachRequest::DispatchWorktreeClosePreview`] — `Some` only when the
     /// close would leave a dispatched worktree on disk holding uncommitted
@@ -3110,18 +2981,14 @@ pub struct AttachResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_prepared: Option<crate::event::PreparedOrchestration>,
     /// PRD #819 M2/M5: explicit capability advertisement on the
-    /// [`AttachRequest::Hello`] reply — the general form of
-    /// [`Self::guarded_send`], which stays exactly as it is and is deliberately
-    /// **not** folded into this list (an older client reads only the boolean,
-    /// and moving it would break that client for no gain).
+    /// [`AttachRequest::Hello`] reply.
     ///
     /// Each entry is a stable string naming one op this build's dispatch
     /// accepts and answers; see [`DAEMON_CAPABILITIES`]. Unknown strings are
     /// ignored by a reader, so the set can grow without a bump.
     ///
     /// **Absence means "this daemon does not tell you", which a client must
-    /// treat as "withhold" — never as "proceed".** That is the
-    /// [`Self::guarded_send`] rule generalised, and it is the only safe reading:
+    /// treat as "withhold" — never as "proceed".** It is the only safe reading:
     /// an older daemon omits the field entirely, and it is indistinguishable
     /// from a newer one that chose to.
     ///
@@ -3402,37 +3269,6 @@ impl AttachResponse {
             ..Default::default()
         }
     }
-    /// PRD #20 M3 / blocker-7: a reply to [`AttachRequest::WriteAndSubmit`] that
-    /// carries the honest [`crate::event::SendResult`]. `ok` MIRRORS delivery —
-    /// `true` only for `applied`/`queued`, `false` for every non-delivery
-    /// (`history-only` / `no-live-target` / `stale` / `wrong-session`). This is
-    /// the cross-version safety choice for Rule 12: an OLD client that ignores
-    /// the unknown `send_result` field reads `ok=false` and correctly treats
-    /// non-delivery as a failure (never a false success), while a NEW client
-    /// reads the typed `send_result` BEFORE converting a non-ok response to an
-    /// error (see [`crate::daemon_client::DaemonClient::write_and_submit`]). The
-    /// request/response wire SHAPE is unchanged (additive optional field), so
-    /// `PROTOCOL_VERSION` is not bumped.
-    pub fn with_send_result(result: crate::event::SendResult) -> Self {
-        let delivered = matches!(
-            result,
-            crate::event::SendResult::Applied | crate::event::SendResult::Queued
-        );
-        Self {
-            ok: delivered,
-            send_result: Some(result),
-            ..Default::default()
-        }
-    }
-    /// Issue #621: [`Self::with_send_result`] for a guarded send's full outcome,
-    /// carrying the generation a `stale` refusal was decided on — see
-    /// [`Self::current_session_id`].
-    fn with_write_and_submit_outcome(outcome: WriteAndSubmitOutcome) -> Self {
-        Self {
-            current_session_id: outcome.current_session_id,
-            ..Self::with_send_result(outcome.result)
-        }
-    }
     /// PRD #76 M2.21: protocol-version handshake reply. `version` is the
     /// daemon's [`PROTOCOL_VERSION`]; the client compares it against its own.
     ///
@@ -3472,17 +3308,6 @@ impl AttachResponse {
     /// no registry (the `daemon hello` CLI) leave `running_agents` as `None`.
     pub fn with_running_agents(mut self, summary: RunningAgentsSummary) -> Self {
         self.running_agents = Some(summary);
-        self
-    }
-
-    /// PRD #20 R20-003/004/006 (finding #6): advertise that this daemon enforces
-    /// the guarded-send identity/idempotency contract. The live daemon's `Hello`
-    /// handler calls this; a client uses the resulting `guarded_send = Some(true)`
-    /// to decide it is SAFE to issue an identity-bearing `write-and-submit`. Its
-    /// ABSENCE (any daemon that never calls this, including every pre-PRD-20
-    /// build) makes a guarded send FAIL SAFE — see [`Self::guarded_send`].
-    pub fn with_guarded_send(mut self) -> Self {
-        self.guarded_send = Some(true);
         self
     }
 
@@ -3766,466 +3591,6 @@ pub async fn run_attach_server_with_counter(
         dummy_worktrees,
     )
     .await
-}
-
-/// PRD #20 M3 / R20-003/006 (findings #3, #4, #7): compute the honest
-/// [`crate::event::SendResult`] for a `write-and-submit` request. Shared by the
-/// idempotent (delivery-id) and legacy paths.
-///
-/// A dashboard-visible session is not necessarily a live, writable target: a
-/// `history-only` / `none` pane is reported WITHOUT writing so the TUI surfaces
-/// feedback. A `Live` pane goes through [`AgentPtyRegistry::write_and_submit_guarded`],
-/// which binds delivery to the EXACT target agent and RE-VALIDATES liveness +
-/// (finding #4) the daemon-authoritative hook-session generation AFTER acquiring
-/// the writer, immediately before the write. `Err` is a clean transport failure
-/// (nothing written); `Ok(Ambiguous)` a partial write.
-///
-/// PRD #20 Greptile P1 class-close (stale pre-lock snapshot): every
-/// authorization input the guard consults — writability, the hook-session
-/// generation, AND live-attachment — is sampled INSIDE the post-lock
-/// re-validation closure, so a state change that lands while the send waits for
-/// the writer lock (a pane becoming attached, a `/clear`, a liveness flip)
-/// cannot be masked by a value snapshotted before the lock. The pre-lock
-/// `pane_writable` read below is routing-only (it picks the HistoryOnly / None /
-/// Live branch) and fails closed; the Live branch never trusts it — the closure
-/// re-checks writability post-lock.
-///
-/// Issue #608 audit (finding 5): "sampled inside the closure" is not "sampled
-/// TOGETHER". Writability and the hook-session generation share ONE `AppState`
-/// read guard in there; live-attachment is read from the registry just before
-/// that guard is awaited, and nothing the guarded send holds prevents a
-/// subscription landing in between — so attachment alone can be one lock
-/// acquisition stale, in the PERMISSIVE direction. The closure documents that
-/// window and what would close it; the issue #608 arm is written so it does not
-/// consult the value at all.
-///
-/// Issue #608: BOTH arms fail closed on an ABSENT identity, where the paned one
-/// used to be permissive. A request that names no agent resolves to
-/// `Writable::None` → [`crate::event::SendResult::NoLiveTarget`] before any
-/// write is attempted, so reaching the `Live` arm implies `expected_agent_id` is
-/// `Some`. The paned re-validation closure additionally refuses a request that
-/// names NO session when the pane already carries a current hook session,
-/// attached or not: the daemon knows a conversation the caller did not name,
-/// which is the state-race / split-view shape, and `Stale` sends the caller back
-/// for a fresh generation. A pane that has no current hook session either (an
-/// agent that never emits one) still delivers with no session named — a
-/// deliberate carve-out that CANNOT distinguish such an agent from a
-/// conversation that has just ended, which is a known hole spelled out at the
-/// arm that implements it.
-#[cfg(test)]
-async fn compute_write_and_submit_outcome(
-    registry: &AgentPtyRegistry,
-    state: &SharedState,
-    pane_id: &str,
-    text: &str,
-    extras: &WriteAndSubmitExtras,
-) -> Result<crate::event::SendResult, String> {
-    compute_write_and_submit_reply(registry, state, pane_id, text, extras)
-        .await
-        .map(|outcome| outcome.result)
-}
-
-/// Issue #621: what a `write-and-submit` decided — the honest
-/// [`crate::event::SendResult`], plus, on a `stale` refusal of a paned request
-/// that named no session, the generation the guard refused it against. See
-/// [`AttachResponse::current_session_id`] for why the second half exists and
-/// what it does not license.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WriteAndSubmitOutcome {
-    result: crate::event::SendResult,
-    current_session_id: Option<String>,
-}
-
-impl From<crate::event::SendResult> for WriteAndSubmitOutcome {
-    fn from(result: crate::event::SendResult) -> Self {
-        Self {
-            result,
-            current_session_id: None,
-        }
-    }
-}
-
-/// [`compute_write_and_submit_outcome`] with the refused generation kept — what
-/// the attach handler answers from. The decision is identical; issue #621 only
-/// stops discarding the one value the refusal was made on.
-async fn compute_write_and_submit_reply(
-    registry: &AgentPtyRegistry,
-    state: &SharedState,
-    pane_id: &str,
-    text: &str,
-    extras: &WriteAndSubmitExtras,
-) -> Result<WriteAndSubmitOutcome, String> {
-    use crate::agent_pty::GuardedSend;
-    use crate::event::{SendResult, Writable};
-    // PRD #20 Greptile (paneless guarded send): a daemon-side agent that carries
-    // no pane maps to the `<no-pane>` sentinel. `pane_writable` filters sessions
-    // by `pane_id` and can never find such a session (it is stored with
-    // `pane_id == None`), so it falls through to the `Live` default — letting a
-    // history-only / view-only paneless target pass the liveness gate. Resolve a
-    // paneless target's writability by AGENT identity instead, mirroring the
-    // attach STREAM_IN input loop. Paned targets keep the pane-keyed resolution.
-    //
-    // Issue #608: a request that carries NO agent identity cannot be routed by
-    // identity on EITHER arm, so it fails closed here — `Writable::None` → no
-    // delivery attempted. The pane-less arm always worked this way; the paned
-    // arm used to hand a possibly-`None` identity to `write_and_submit_guarded`,
-    // which then wrote keyed only by `pane_id` — i.e. into whichever agent holds
-    // that pane right now, which is not necessarily the one the caller meant.
-    // A pane id is a recycled handle, so that is precisely the accidental
-    // mis-delivery this machinery exists to prevent everywhere else.
-    //
-    // Gated HERE, in the routing resolution, rather than inside the post-lock
-    // closure: it makes the invariant STRUCTURAL. Reaching `Writable::Live`
-    // below now implies `expected_agent_id` is `Some` on both arms, so the
-    // guarded call passes a concrete id instead of an `Option` that merely
-    // happens never to be `None`.
-    let is_paneless = pane_id == "<no-pane>";
-    let writable = match extras.expected_agent_id.as_deref() {
-        None => Writable::None,
-        Some(agent_id) => {
-            let guard = state.read().await;
-            if is_paneless {
-                guard.agent_writable(agent_id)
-            } else {
-                guard.pane_writable(pane_id)
-            }
-        }
-    };
-    match writable {
-        Writable::HistoryOnly => Ok(SendResult::HistoryOnly.into()),
-        Writable::None => Ok(SendResult::NoLiveTarget.into()),
-        Writable::Live => {
-            // The re-validation closure runs UNDER the held target writer (inside
-            // `write_and_submit_guarded`), immediately before the write, against
-            // the authoritative session state.
-            let st = state.clone();
-            // Issue #608: `Live` implies `expected_agent_id` is `Some` on BOTH
-            // arms — the resolution block above refuses an identity-less request
-            // outright — so every guarded call below binds to a concrete id
-            // rather than forwarding an `Option`.
-            //
-            // Issue #617 made that a TYPE rather than a local invariant:
-            // `write_and_submit_guarded` takes a `&str`, so this is the only
-            // place the refusal above has to be re-stated, and the calls below
-            // could not forward an `Option` even if this block regressed. The
-            // early refusal is kept as the cheaper, better-reported gate — it
-            // answers `SendResult::NoLiveTarget` without touching the registry —
-            // not because the primitive still needs it.
-            //
-            // Issue #617 (auditor finding 5): this `Option → &str` conversion
-            // is load-bearing, so it REFUSES rather than panicking. It cannot
-            // fire today — `Writable::Live` is producible only from the
-            // `Some(agent_id)` arm above and `extras` is not mutated in between
-            // — but it runs inside a connection-handling task, where the
-            // residual failure mode of an `expect` is an aborted attach
-            // connection rather than a refused write. Failing closed costs
-            // nothing and answers with the same `SendResult::NoLiveTarget` the
-            // resolution block above already gives an identity-less request.
-            let Some(agent_id) = extras.expected_agent_id.clone() else {
-                return Ok(SendResult::NoLiveTarget.into());
-            };
-            // Issue #621: the generation the unnamed-request arm below refuses
-            // against, written by the closure under the writer and read back
-            // only if the send comes back `Stale`. Set by that arm alone, so
-            // every other cause of a `Stale` — the agent exiting, the pane
-            // changing hands, a named generation that no longer matches —
-            // leaves it `None`.
-            let refused_generation = Arc::new(std::sync::Mutex::new(None::<String>));
-            let guarded = if is_paneless {
-                // A paneless target is re-validated by agent identity (mirroring
-                // STREAM_IN). `<no-pane>` has no pane→hook-session mapping, so the
-                // pane-keyed session-generation guard (finding #4) does not apply
-                // — STREAM_IN likewise performs no session check on a paneless
-                // target.
-                let agent_for_check = agent_id.clone();
-                registry
-                    .write_and_submit_guarded(pane_id, text, &agent_id, move || async move {
-                        st.read().await.agent_writable(&agent_for_check) == Writable::Live
-                    })
-                    .await
-            } else {
-                let pane_for_check = pane_id.to_string();
-                let expected_session = extras.expected_session_id.clone();
-                // Issue #915 (finding 4): the ended-generation witness is keyed by
-                // AGENT, so the closure needs the identity it is already bound to.
-                let agent_for_check = agent_id.clone();
-                let refused_generation = Arc::clone(&refused_generation);
-                registry
-                    .write_and_submit_guarded(pane_id, text, &agent_id, move || async move {
-                        // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
-                        // stale-pre-lock-snapshot CLASS close: this closure runs
-                        // UNDER the held target writer, immediately before the
-                        // write, and re-reads its authorization inputs HERE
-                        // rather than trusting values captured before the guarded
-                        // send went looking for the writer.
-                        //
-                        // Issue #915 (finding 5) — ATTACHMENT IS NO LONGER AN
-                        // INPUT, which is what makes the sentence above true of
-                        // everything this closure reads. It used to sample
-                        // `pane_has_live_attach` from the REGISTRY first,
-                        // deliberately before `st.read()` was awaited so no state
-                        // lock was held across the registry `inner` mutex — and
-                        // `AgentPtyRegistry::subscribe` builds its receiver under
-                        // the registry/bus locks WITHOUT ever acquiring the target
-                        // writer, so holding that writer fenced nothing out. A
-                        // pane could therefore become attached between that sample
-                        // and the state guard below, and the closure then
-                        // authorized on a stale `false` — a window as long as a
-                        // concurrent writer holds the `AppState` read lock, and
-                        // one that failed PERMISSIVE.
-                        //
-                        // The remedy taken is to drop attachment from the decision
-                        // rather than to synchronise it: the named-session arm
-                        // below now refuses an absent current generation
-                        // unconditionally, which is a strict superset of the old
-                        // attached-only rule (it can only reject more). Making
-                        // `subscribe` participate in the writer-held barrier was
-                        // assessed and rejected — it is a sync `fn` and the writer
-                        // is a `tokio::sync::Mutex`, so it cannot hold `inner` (a
-                        // `std::sync::Mutex`, guard not `Send`) across that await
-                        // and would split into phases that reintroduce the same
-                        // TOCTOU; `write_guarded` takes writer→inner, so an
-                        // inner→writer `subscribe` is a lock-order inversion; and
-                        // attach would serialize behind in-flight guarded writes,
-                        // regressing a latency the user watches.
-                        //
-                        // `pane_writable` and `pane_hook_session_id` are both read
-                        // below under ONE `AppState` read guard, so they are
-                        // mutually consistent and both post-writer-lock. With
-                        // attachment gone that is now every input, so this closure
-                        // IS the single delivery-time authorization snapshot the
-                        // comment here once claimed it was.
-                        let guard = st.read().await;
-                        if guard.pane_writable(&pane_for_check) != Writable::Live {
-                            return false;
-                        }
-                        // PRD #20 R20-003 (finding #4): when the caller named a
-                        // session, require an EXACT match against the pane's
-                        // CURRENT daemon-authoritative hook-session generation. A
-                        // same-agent `/clear` / thread restart rolls the
-                        // generation over → mismatch → reject (always). A `None`
-                        // current-session (the session ended, or none was
-                        // recorded) is refused too — never a silent accept.
-                        //
-                        // Issue #915 (finding 5): that last refusal used to be
-                        // scoped to an ATTACHED pane, on the reasoning that
-                        // finding #4's threat is a stale prompt surfacing in the
-                        // conversation the user is watching, so a headless
-                        // delivery with a confirmed agent identity could proceed.
-                        // Attachment was the one input this closure could not
-                        // sample under the state guard (see the block above), and
-                        // the sibling arm below had already refused to read it for
-                        // exactly that reason. Refusing regardless of attachment
-                        // makes the two arms agree and is a strict superset of the
-                        // old rule.
-                        //
-                        // What it costs, and it is a real cost: a headless
-                        // (`daemon serve`, no client attached) delivery bound to a
-                        // generation that has since ended is now refused where it
-                        // previously landed. `Stale` is retryable, but neither
-                        // `bind_generation_before_retry` nor `adopt_generation`
-                        // can UN-bind a delivery, so such a caller cannot fall
-                        // back to the unnamed arm and is abandoned at
-                        // `crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`
-                        // (60 s). Attached panes — `EmbeddedPaneController`
-                        // attaches to every pane it drives, so in practice every
-                        // delivery under a running TUI — already produced that
-                        // outcome before this change; what is new is that headless
-                        // deliveries produce it too. It invents no new failure
-                        // mode, and it retires the stale-read race rather than
-                        // synchronising it.
-                        //
-                        // Issue #608: and when the caller named NO session, the
-                        // silent accept is closed on the SAME evidence, which is
-                        // what the paragraph above always claimed and the code
-                        // did not do. A pane that HAS a current hook session is a
-                        // conversation the daemon knows about and the caller did
-                        // not name — the state-race / split-view shape — so the
-                        // write is refused rather than landing in a generation
-                        // nobody bound it to. Every in-tree caller that CAN know
-                        // a generation supplies one
-                        // (`process_pending_seed_prompts` captures the
-                        // snapshot's current generation,
-                        // `deliver_orchestrator_prompt` calls
-                        // `bind_delivery_generation` before its first write, and
-                        // both call `bind_generation_before_retry` before a retry
-                        // enters a late generation), so an absent expectation
-                        // against a known generation is a mismatch, not a caller
-                        // that has nothing to say. `Stale` is the right
-                        // vocabulary — both TUI delivery paths already classify
-                        // it as retryable, so the next snapshot that OBSERVES the
-                        // generation binds it and the retry names it.
-                        //
-                        // Issue #608 audit, finding 6 — HOW FAR THAT RECOVERS.
-                        // In the ordinary race it recovers fully, and this
-                        // comment used to stop there. A session that lands after
-                        // the caller's snapshot costs exactly one safe `Stale`:
-                        // the refusal writes nothing and does not bump
-                        // `attempts`, so `crate::ui`'s `bind_delivery_generation`
-                        // binds the generation on the next render pass that sees
-                        // it (`bind_generation_before_retry` does the same for a
-                        // delivery that already wrote), and the retry names it.
-                        // Binding once rather than every frame is also what keeps
-                        // this from looping.
-                        //
-                        // Issue #621: and it now recovers when the caller's event
-                        // stream DROPPED the generation too. The TUI's event
-                        // subscriber resubscribed after a lagged or errored
-                        // stream WITHOUT replaying what it missed, so a
-                        // `SessionStart` dropped in that window was never applied
-                        // to the client `AppState`: every retry went out unnamed,
-                        // every one was refused here, and at
-                        // `crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`
-                        // (60 s) the prompt was abandoned undelivered. This arm
-                        // therefore records the generation it refuses against,
-                        // and the reply carries it
-                        // (`AttachResponse::current_session_id`), so the caller
-                        // can name it without waiting on an event it will never
-                        // receive. The TUI adopts it only for a delivery that has
-                        // written nothing yet — the same precondition as the
-                        // snapshot bind — so it names the conversation the bytes
-                        // are about to enter and claims nothing retroactively.
-                        // A delivery that already wrote into a pane with no
-                        // generation and then missed the start still cannot
-                        // bind from a refusal: from a point-in-time answer it
-                        // cannot tell the conversation it wrote into from a
-                        // successor whose predecessor ended unseen. Since issue
-                        // #1520 the TUI's subscriber (`crate::event_subscriber`)
-                        // records the gap that dropped the start and
-                        // resynchronizes its state when it reconnects, and such a
-                        // delivery stops when its next retry falls due after the
-                        // gap (`crate::ui`'s `delivery_outlived_event_gap`) rather
-                        // than being retried until the deadline; a retry that
-                        // falls due while the stream is still down waits, bounded
-                        // by that deadline. Stopping writes nothing more, so
-                        // nothing here needs to change for it.
-                        //
-                        // Issue #608 audit, finding 5(b): this arm refuses on the
-                        // SESSION evidence alone, with no `has_live_attach`
-                        // conjunct. Attachment is the one input this closure
-                        // cannot sample under the state guard (see the block
-                        // above), and gating a NEW refusal on the one value that
-                        // can be stale in the permissive direction would import
-                        // that hole straight into it. Refusing regardless of
-                        // attachment is a strict superset — it can only reject
-                        // more — and `Stale` is retryable, so an unattached
-                        // caller whose snapshot HAS the generation names it on
-                        // the next attempt (one whose snapshot never observes it
-                        // can name the generation this refusal reports, issue
-                        // #621 — see finding 6 above). Measured before adopting: across the whole
-                        // fast tier the ONLY paned send that reaches this arm
-                        // against a current generation is an ATTACHED one, which
-                        // both rules refuse identically.
-                        //
-                        // Issue #608 audit, finding 4 — WHAT THE CARVE-OUT
-                        // CANNOT SEE FOR ITSELF. `(expected None, current None)`
-                        // delivers, because an agent that never emits a
-                        // generation legitimately carries neither side of the
-                        // comparison. But a `None` CURRENT generation is not
-                        // proof that that is what this is. A matching, current
-                        // `SessionEnd` REMOVES the pane's `pane_hook_session`
-                        // entry (`AppState::apply_event`) while the registry
-                        // agent and the attached pane stay alive, so a
-                        // conversation that has just ENDED reads here exactly
-                        // like an agent that never had one. During a `/clear` or
-                        // a thread restart the successor's `SessionStart` has not
-                        // landed yet, and a caller that knows the stable agent id
-                        // but names no session could land a write in that gap —
-                        // into a pane that has demonstrably just closed a logical
-                        // conversation.
-                        //
-                        // Issue #915 (finding 4) closes that with the one piece
-                        // of evidence the comparison above lacks:
-                        // `agent_generation_ended`, an AGENT-scoped witness
-                        // written in the same `SessionEnd` branch that removes
-                        // the pane entry. It is read under the SAME `AppState`
-                        // guard as the generation itself, so the two are
-                        // mutually consistent, and it is keyed by the identity
-                        // this send is already bound to.
-                        //
-                        // Keyed by AGENT and not by pane, deliberately.
-                        // `AppState::pane_generation_closures` records the same
-                        // transition per pane but is never cleaned up when a
-                        // pane closes or is recycled, so reading it here would
-                        // refuse every future sessionless agent that inherits
-                        // this pane id for the daemon's remaining lifetime —
-                        // permanently, not in a race window, and precisely the
-                        // sessionless agents the carve-out exists to protect.
-                        // Registry agent ids are monotonic and never recycled
-                        // within a daemon process, and `AppState` dies with that
-                        // process, so the witness map and the id space reset
-                        // together.
-                        //
-                        // It FAILS OPEN where the evidence is absent, twice.
-                        // `AgentEvent::agent_id` is an `Option` and an external
-                        // producer (or one that lost `DOT_AGENT_DECK_AGENT_ID`)
-                        // carries `None`, so no witness is recorded for it and
-                        // this arm accepts exactly as it did before; and an
-                        // ending event whose named agent the registry cannot
-                        // confirm holds the named pane records nothing either
-                        // (round-2 audit finding 1 — otherwise a forged
-                        // `SessionEnd` on an invented pane could refuse a
-                        // third party's deliveries here). Both are degradations
-                        // to the previous behaviour, which is the right
-                        // default, and both are documented limits rather than
-                        // guarantees.
-                        //
-                        // THE WITNESS IS A LATCH, NOT A WINDOW. No path clears
-                        // it as cleanup, so "has ended a generation" is true of
-                        // that agent for the daemon's remaining lifetime. What
-                        // makes the refusal transient in practice is the check
-                        // ABOVE it, not this one: the moment a successor
-                        // generation announces itself the pane has a current
-                        // session again and the first branch refuses instead,
-                        // so the witness only ever decides the case where the
-                        // TARGET PANE has no current generation. The cost that
-                        // leaves is an agent whose successor `SessionStart`
-                        // this daemon never observes — live, in a real
-                        // conversation, and refused on every unnamed automatic
-                        // delivery until it ends. See
-                        // `crate::state::AppState::agent_generation_closures`.
-                        match expected_session.as_deref() {
-                            Some(expected) => match guard.pane_hook_session_id(&pane_for_check) {
-                                Some(current) if current != expected => return false,
-                                Some(_) => {}
-                                None => return false,
-                            },
-                            None => {
-                                // Issue #621: refused, and the refusal now says
-                                // which conversation it was refused against —
-                                // see `AttachResponse::current_session_id`.
-                                if let Some(current) = guard.pane_hook_session_id(&pane_for_check) {
-                                    *refused_generation
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                        Some(current);
-                                    return false;
-                                }
-                                if guard.agent_generation_ended(&agent_for_check) {
-                                    return false;
-                                }
-                            }
-                        }
-                        true
-                    })
-                    .await
-            };
-            match guarded {
-                Ok(GuardedSend::Applied) => Ok(SendResult::Applied.into()),
-                Ok(GuardedSend::WrongSession) => Ok(SendResult::WrongSession.into()),
-                Ok(GuardedSend::Stale) => Ok(WriteAndSubmitOutcome {
-                    result: SendResult::Stale,
-                    current_session_id: refused_generation
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take(),
-                }),
-                Ok(GuardedSend::NoLiveTarget) => Ok(SendResult::NoLiveTarget.into()),
-                Ok(GuardedSend::Ambiguous) => Ok(SendResult::Ambiguous.into()),
-                Err(e) => Err(e.to_string()),
-            }
-        }
-    }
 }
 
 /// The orchestration bits of a `StartAgent`'s `TabMembership`, captured before
@@ -5763,7 +5128,7 @@ async fn handle_connection(
             // first and the pane is closed afterwards. Through the filtered list
             // such a record came back `None`, so `pane_id_env` was `None`, so
             // EVERY cleanup step below was skipped: the delegation sweep,
-            // `cancel_prompt_confirmation`, the role-map removal,
+            // the role-map removal,
             // `unregister_pane` and the dispatched-worktree cleanup. And it was
             // skipped permanently — `close_agent` drops the entry in this same
             // handler, so no later call could repair it.
@@ -5839,13 +5204,6 @@ async fn handle_connection(
                         "StopAgent: dropped outstanding delegations touching the closing pane"
                     );
                 }
-                // Issue #424 (reviewer finding B9): the same treatment for a
-                // spawn-time prompt still being held provisional on this pane.
-                // Its guarded re-submissions would refuse anyway once the agent
-                // is gone, but a deliberate close should not have to wait out a
-                // backoff window to stop being retried into, and the
-                // abandonment notice has nowhere left to go.
-                crate::spawn::cancel_prompt_confirmation(pane_id);
             }
             // PRD #92 F8 followup (auditor #1): `close_agent` runs the
             // synchronous SIGTERM-with-grace loop in
@@ -6129,159 +5487,6 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
-        AttachRequest::WriteAndSubmit { pane_id, text } => {
-            // PRD #20 M3: deliver input honestly. A dashboard-visible session is
-            // not necessarily a live, writable target (a wrapped Codex session
-            // is history-only), so consult the live session state for the pane
-            // and return an honest `SendResult` instead of a fire-and-forget
-            // ok(). Only a `Live` target is actually written; a non-live target
-            // is reported (`history-only` / `no-live-target`) WITHOUT writing,
-            // so the TUI surfaces feedback rather than silently dropping input.
-            //
-            // PRD #20 R20-003/004/006: the request MAY additionally carry the
-            // agent identity + session the prompt was queued for and a stable
-            // delivery id. These ride as extra JSON keys alongside the base
-            // `WriteAndSubmit { pane_id, text }` shape (the enum stays 2-field so
-            // existing literals compile), parsed here from the raw payload. When
-            // present the daemon (a) dedups on `delivery_id` so a retry replays
-            // the first result instead of re-submitting, (b) binds delivery to
-            // the EXACT live registry target and refuses (WrongSession/Stale, no
-            // write) on a rebind, and (c) re-validates liveness AFTER acquiring
-            // the target's writer, closing the TOCTOU where a pane goes
-            // history-only / rebinds while the send waits for the writer.
-            // PRD #20 Greptile finding #1 (fail closed on malformed guards): the
-            // base `WriteAndSubmit { pane_id, text }` shape already decoded, so
-            // the ONLY way this strict re-parse of the SAME payload can fail is a
-            // guarded-send identity key (`expected_agent_id` / `expected_session_id`
-            // / `delivery_id`) that is PRESENT but has the wrong JSON type (every
-            // field is `Option<String>` with `#[serde(default)]`, and unknown keys
-            // are ignored). A present-but-malformed guard must REJECT and write
-            // nothing, rather than silently dropping every identity check via
-            // `unwrap_or_default` and proceeding UNGUARDED (which could reach a
-            // rebound pane or double-submit).
-            //
-            // Issue #608: an ABSENT guard set (a legacy / non-guarded client)
-            // still DECODES cleanly to all-`None` — that half is unchanged — but
-            // it no longer DEGRADES to pane-only authorization. A paned write
-            // that names no agent is now refused with `no-live-target` and
-            // writes nothing; see `compute_write_and_submit_outcome`. This
-            // comment used to call that degrade "the cross-version fail-safe",
-            // which had it backwards: a pane id is a recycled handle, so
-            // "deliver to whoever holds this pane now" is exactly the accidental
-            // mis-delivery the guarded-send machinery prevents in every other
-            // case. The trade is deliberate. What is given up is delivery for an
-            // OLD, identity-less client talking to a NEW daemon — and it is
-            // given up VISIBLY (`no-live-target`, nothing written) rather than
-            // silently into a stranger's conversation. The wire SHAPE is
-            // untouched (every field stays `Option<String>` with
-            // `#[serde(default)]`, no field added or removed, no new frame
-            // kind), so this is a SEMANTIC break behind a stable wire: no
-            // `PROTOCOL_VERSION` bump, but a `changelog.d/608.breaking.md`
-            // fragment (rule 12 / `docs/develop/versioning.md`).
-            let extras: WriteAndSubmitExtras = match serde_json::from_slice(&frame.1) {
-                Ok(extras) => extras,
-                Err(e) => {
-                    write_resp(
-                        &mut stream,
-                        &AttachResponse::err(format!(
-                            "malformed guarded-send identity — refusing unguarded write: {e}"
-                        )),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
-
-            match extras.delivery_id.as_deref() {
-                // No idempotency key (legacy / non-guarded caller): compute once,
-                // no dedup ledger involvement.
-                None => match compute_write_and_submit_reply(
-                    &registry, &state, &pane_id, &text, &extras,
-                )
-                .await
-                {
-                    Ok(outcome) => {
-                        write_resp(
-                            &mut stream,
-                            &AttachResponse::with_write_and_submit_outcome(outcome),
-                        )
-                        .await?
-                    }
-                    Err(e) => write_resp(&mut stream, &AttachResponse::err(e)).await?,
-                },
-                // PRD #20 R20-004 (finding #3): atomic, fingerprint-bound
-                // idempotency. Admit the id BEFORE computing so concurrent
-                // duplicates serialize on the single-flight lock and replay one
-                // result; a retry after a lost response replays the cached
-                // delivered/ambiguous result; and reusing the id with a different
-                // payload/target is a conflict (never a false success replay).
-                Some(did) => {
-                    let fingerprint = crate::agent_pty::AgentPtyRegistry::delivery_fingerprint(
-                        extras.expected_agent_id.as_deref(),
-                        extras.expected_session_id.as_deref(),
-                        &pane_id,
-                        &text,
-                    );
-                    match registry.admit_delivery(did, fingerprint).await {
-                        crate::agent_pty::DeliveryAdmission::Replay(result) => {
-                            write_resp(&mut stream, &AttachResponse::with_send_result(result))
-                                .await?
-                        }
-                        crate::agent_pty::DeliveryAdmission::Conflict => {
-                            write_resp(
-                                &mut stream,
-                                &AttachResponse::err(
-                                    "delivery id reused with a conflicting payload/target",
-                                ),
-                            )
-                            .await?
-                        }
-                        // Issue #527: refused before the ledger stores it and
-                        // before anything is written. The message states the
-                        // limit and not the id, which is the value that failed.
-                        crate::agent_pty::DeliveryAdmission::Oversized => {
-                            write_resp(
-                                &mut stream,
-                                &AttachResponse::err(format!(
-                                    "delivery id exceeds {} bytes — refusing the write",
-                                    crate::agent_pty::MAX_DELIVERY_ID_BYTES
-                                )),
-                            )
-                            .await?
-                        }
-                        crate::agent_pty::DeliveryAdmission::Proceed(permit) => {
-                            match compute_write_and_submit_reply(
-                                &registry, &state, &pane_id, &text, &extras,
-                            )
-                            .await
-                            {
-                                Ok(outcome) => {
-                                    // Cache a DELIVERED (`applied`/`queued`) or
-                                    // AMBIGUOUS outcome; a non-delivery stays
-                                    // retryable (see `record_delivery_outcome`).
-                                    // A `stale` is never cached, so the
-                                    // generation it carries (issue #621) is
-                                    // never replayed stale either.
-                                    registry.record_delivery_outcome(&permit, outcome.result);
-                                    write_resp(
-                                        &mut stream,
-                                        &AttachResponse::with_write_and_submit_outcome(outcome),
-                                    )
-                                    .await?
-                                }
-                                Err(e) => {
-                                    // Clean transport failure (nothing written):
-                                    // forget the in-flight record so a retry
-                                    // re-attempts, then surface the error.
-                                    registry.forget_delivery(&permit);
-                                    write_resp(&mut stream, &AttachResponse::err(e)).await?
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
         AttachRequest::SubscribeEvents => {
             handle_subscribe_events(stream, event_tx).await?;
         }
@@ -6344,10 +5549,6 @@ async fn handle_connection(
                 std::env::var_os("DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS").is_some();
             #[cfg(not(any(test, debug_assertions)))]
             let omit_running_agents = false;
-            // PRD #20 finding #6: advertise the guarded-send capability so a new
-            // client knows this daemon enforces the identity/idempotency guards
-            // and may safely issue an identity-bearing write-and-submit. Its
-            // absence (an older daemon) makes the client fail such a send safe.
             // PRD #819 M2/M5: advertise the project verbs explicitly, so a
             // client asks a stable question ("do you know this op?") instead
             // of string-matching serde's `unknown variant` message. Absence
@@ -6355,7 +5556,6 @@ async fn handle_connection(
             // PRD #1487: and name this process, so an upgrade can tell its
             // successor from it.
             let mut resp = AttachResponse::hello(advertised_protocol_version())
-                .with_guarded_send()
                 .with_capabilities()
                 .with_instance_id();
             // PRD #1666 S3: the deck token every inbox address and message id
@@ -9075,349 +8275,6 @@ mod tests {
         );
     }
 
-    /// Issue #915 (finding 5) — a named generation against an ABSENT current
-    /// generation is refused whatever the pane's attachment does mid-flight.
-    ///
-    /// This test was PRD #20 Greptile P1's attach-after-check barrier. The attach
-    /// flag used to be sampled BEFORE `write_and_submit_guarded` acquired the
-    /// target writer and then consulted in the post-lock re-validation closure,
-    /// and this fixture proved the closure re-read it: a pane that became
-    /// attached while the send waited for the writer was refused rather than
-    /// letting a stale prompt into the freshly-attached conversation. Sampling it
-    /// inside the closure narrowed that window but could not close it —
-    /// `subscribe` never acquires the target writer, so holding the writer fences
-    /// no attach out — so the value is no longer part of the decision at all and
-    /// the refusal is unconditional.
-    ///
-    /// It is kept, retargeted, because the mid-flight attach is still the
-    /// interesting fixture: it pins that the refusal does not depend on which
-    /// reading of attachment the closure would have taken. The pre-lock reading
-    /// is `false` and the post-lock reading is `true`, and the outcome is `Stale`
-    /// either way. `guarded_send_refuses_named_generation_on_unattached_pane` is
-    /// its sibling and covers the arm this change actually widened — a pane that
-    /// is unattached throughout, which the old attached-only rule ACCEPTED.
-    ///
-    /// This mirrors `guarded_send_rejects_agent_removal_after_writer_lock`: it
-    /// holds the EXACT target writer so a guarded send parks AFTER its pre-lock
-    /// checks but BEFORE the write, makes the pane become attached during that
-    /// window, then releases the writer.
-    ///
-    /// PRD #42 build-windows: this test spawns a real PTY running `/bin/sh`,
-    /// which does not exist on Windows, so — like its sibling
-    /// `guarded_send_rejects_agent_removal_after_writer_lock` (whole
-    /// `agent_pty::spawn_tests` module is `#[cfg(all(test, unix))]`) — it is
-    /// gated to Unix. The module here is mixed cross-platform, so the gate is
-    /// on the function itself (already inside `#[cfg(test)]`). No Unix coverage
-    /// is lost: the fast tier still exercises it green on Unix.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn guarded_send_refuses_named_generation_across_a_mid_flight_attach() {
-        let reg = Arc::new(AgentPtyRegistry::new());
-        let pane_id = "pane-attach-after-check-barrier";
-        let id = reg
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn agent");
-
-        // State: the pane is registered but carries NO session, so `pane_writable`
-        // defaults to `Live` (the send enters the guarded path) while
-        // `pane_hook_session_id` is `None` (the named generation is gone). With an
-        // `expected_session_id` supplied, that is the `(named, absent)` pair the
-        // refusal now turns on — and attachment, which this fixture changes
-        // underneath the parked send, is no longer one of its inputs.
-        let state: SharedState =
-            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
-        state.write().await.register_pane(pane_id.to_string());
-
-        // Grab the EXACT writer the guarded send will contend for WITHOUT staying
-        // subscribed: `subscribe` bumps `receiver_count`, so keep only `.writer`
-        // and let the rest of the handle (its receiver) drop — returning the pane
-        // to UNATTACHED for the pre-lock reading.
-        let writer = reg.subscribe(&id).expect("subscribe for writer").writer;
-        assert!(
-            !reg.pane_has_live_attach(pane_id),
-            "precondition: pane must be UNATTACHED before the send parks (pre-lock reading)"
-        );
-        let guard = writer.lock().await;
-
-        let reg_task = reg.clone();
-        let state_task = state.clone();
-        let pane = pane_id.to_string();
-        let extras = WriteAndSubmitExtras {
-            expected_agent_id: Some(id.clone()),
-            expected_session_id: Some("queued-generation".to_string()),
-            ..Default::default()
-        };
-        let mut task = tokio::spawn(async move {
-            compute_write_and_submit_outcome(
-                &reg_task,
-                &state_task,
-                &pane,
-                "printf 'ATTACHED-AFTER-CHECK\\n'",
-                &extras,
-            )
-            .await
-        });
-
-        // Precondition: the send is parked on the held writer — past its pre-lock
-        // checks, not yet written.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), &mut task)
-                .await
-                .is_err(),
-            "precondition: guarded send must block on the held writer"
-        );
-
-        // The pane becomes ATTACHED while the send waits for the writer. Keep the
-        // handle alive so `receiver_count > 0` for the post-lock reading.
-        let _attach = reg.subscribe(&id).expect("attach during writer wait");
-        assert!(
-            reg.pane_has_live_attach(pane_id),
-            "the pane must now read as ATTACHED (post-lock reading differs from pre-lock)"
-        );
-
-        // Release the writer; the guarded send now runs its post-lock closure.
-        drop(guard);
-
-        let result = task.await.expect("join guarded-send task");
-        assert_eq!(
-            result,
-            Ok(crate::event::SendResult::Stale),
-            "a named generation against an absent current generation is refused as Stale, and \
-             the pane flipping from unattached (pre-lock) to attached (post-lock) underneath \
-             the parked send must not change that"
-        );
-
-        drop(_attach);
-        reg.shutdown_all();
-    }
-
-    /// Issue #915 (finding 5) — the arm this change actually widened: a pane
-    /// that is UNATTACHED throughout. A caller naming a generation the pane no
-    /// longer has used to be ACCEPTED here, because the refusal was scoped to
-    /// attached panes on the reasoning that a headless delivery with a confirmed
-    /// agent identity is not the threat finding #4 described. That scoping read
-    /// the one input the post-lock closure could not sample under the state
-    /// guard, and it could be stale in the permissive direction — so the
-    /// refusal is now unconditional and this is the case that changed.
-    ///
-    /// No writer is held and nothing races: the whole point is that a stable
-    /// `false` never raced, so this is not a TOCTOU test. It is the policy pin —
-    /// the send goes out against a pane with no current generation and no
-    /// subscriber, and must come back `Stale` with zero bytes.
-    ///
-    /// Unix-gated for the same reason as its sibling above: it spawns a real PTY
-    /// running `/bin/sh`.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn guarded_send_refuses_named_generation_on_unattached_pane() {
-        let reg = Arc::new(AgentPtyRegistry::new());
-        let pane_id = "pane-headless-named-generation";
-        let id = reg
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn agent");
-
-        // Same shape as the sibling: registered pane, so `pane_writable` defaults
-        // to `Live` and the send enters the guarded path, but no hook session, so
-        // `pane_hook_session_id` is `None` against a named expectation.
-        let state: SharedState =
-            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
-        state.write().await.register_pane(pane_id.to_string());
-
-        // Nobody has ever subscribed to this agent's stream, so the pane is
-        // unattached at every point in the send — the reading the old rule
-        // treated as "headless, let it through".
-        assert!(
-            !reg.pane_has_live_attach(pane_id),
-            "precondition: the pane must be UNATTACHED for the whole send"
-        );
-
-        let extras = WriteAndSubmitExtras {
-            expected_agent_id: Some(id.clone()),
-            expected_session_id: Some("queued-generation".to_string()),
-            ..Default::default()
-        };
-        let result = compute_write_and_submit_outcome(
-            &reg,
-            &state,
-            pane_id,
-            "printf 'HEADLESS-MUST-NOT-LAND\\n'",
-            &extras,
-        )
-        .await;
-
-        assert_eq!(
-            result,
-            Ok(crate::event::SendResult::Stale),
-            "a named generation against a pane with NO current generation must be refused \
-             even with no client attached (before issue #915 this arm was Applied)"
-        );
-        assert!(
-            !reg.pane_has_live_attach(pane_id),
-            "the send must not have attached anything of its own"
-        );
-
-        reg.shutdown_all();
-    }
-
-    /// Issue #915 (finding 4) — a caller that names NO generation is accepted
-    /// against an agent that never had one and refused against an agent whose
-    /// conversation has just ENDED. Both leave `pane_hook_session` empty, which
-    /// is why the closure could not tell them apart before and why the witness
-    /// is keyed by agent.
-    ///
-    /// Three arms, and the negative ones carry the design:
-    ///
-    /// * the sessionless agent is ACCEPTED — the carve-out this must not break;
-    /// * the same agent after a `SessionEnd` is REFUSED, with zero bytes;
-    /// * a SUCCESSOR agent on the SAME pane id is accepted again. A pane-keyed
-    ///   witness would refuse it, permanently, for every later occupant of that
-    ///   pane id — the failure that made agent-scoping non-optional.
-    ///
-    /// Unix-gated: it spawns real PTYs running `/bin/sh`.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn unnamed_send_is_refused_only_for_an_agent_whose_generation_ended() {
-        fn session_frame(
-            pane: &str,
-            agent: &str,
-            event_type: crate::event::EventType,
-            secs: i64,
-        ) -> crate::event::AgentEvent {
-            crate::event::AgentEvent {
-                session_id: format!("{agent}-generation"),
-                agent_type: crate::event::AgentType::ClaudeCode,
-                event_type,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
-                    + chrono::TimeDelta::seconds(secs),
-                user_prompt: None,
-                metadata: Default::default(),
-                pane_id: Some(pane.to_string()),
-                agent_id: Some(agent.to_string()),
-                agent_version: None,
-                schema_version: None,
-                live_target: None,
-            }
-        }
-
-        let reg = Arc::new(AgentPtyRegistry::new());
-        let pane_id = "pane-ended-generation-witness";
-        let state: SharedState =
-            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
-        state.write().await.register_pane(pane_id.to_string());
-
-        let original = reg
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn the agent the generation belongs to");
-        let unnamed = |agent: &str| WriteAndSubmitExtras {
-            expected_agent_id: Some(agent.to_string()),
-            expected_session_id: None,
-            ..Default::default()
-        };
-
-        // Arm 1: no generation has ever been reported for this agent, so the
-        // carve-out applies and the send lands.
-        assert_eq!(
-            compute_write_and_submit_outcome(
-                &reg,
-                &state,
-                pane_id,
-                "printf 'SESSIONLESS-IS-STILL-ALLOWED\\n'",
-                &unnamed(&original),
-            )
-            .await,
-            Ok(crate::event::SendResult::Applied),
-            "a genuinely sessionless agent must still be writable — the carve-out this \
-             witness must not break"
-        );
-
-        // The agent's conversation runs and ends. `pane_hook_session` is empty
-        // again, so the generation comparison alone reads identically to arm 1.
-        {
-            let mut guard = state.write().await;
-            guard.apply_event(session_frame(
-                pane_id,
-                &original,
-                crate::event::EventType::SessionStart,
-                1,
-            ));
-            guard.apply_event(session_frame(
-                pane_id,
-                &original,
-                crate::event::EventType::SessionEnd,
-                2,
-            ));
-            assert!(
-                guard.pane_hook_session_id(pane_id).is_none(),
-                "precondition: the ended generation must leave the pane's entry empty"
-            );
-            assert!(
-                guard.agent_generation_ended(&original),
-                "precondition: the SessionEnd must have witnessed against the agent"
-            );
-        }
-
-        // Arm 2: same pane, same agent, same unnamed request — refused now.
-        assert_eq!(
-            compute_write_and_submit_outcome(
-                &reg,
-                &state,
-                pane_id,
-                "printf 'MUST-NOT-LAND-IN-THE-GAP\\n'",
-                &unnamed(&original),
-            )
-            .await,
-            Ok(crate::event::SendResult::Stale),
-            "an unnamed write into the gap between a SessionEnd and its successor's \
-             SessionStart must be refused (before issue #915 this was Applied)"
-        );
-
-        // Arm 3: the pane changes hands. `close_agent` removes the predecessor's
-        // record, so the successor can claim the same `DOT_AGENT_DECK_PANE_ID`.
-        reg.close_agent(&original).expect("close the predecessor");
-        let successor = reg
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn the agent that inherits the pane id");
-        assert_ne!(
-            original, successor,
-            "the hand-over must produce a NEW registry agent id"
-        );
-        assert_eq!(
-            compute_write_and_submit_outcome(
-                &reg,
-                &state,
-                pane_id,
-                "printf 'SUCCESSOR-IS-NOT-ITS-PREDECESSOR\\n'",
-                &unnamed(&successor),
-            )
-            .await,
-            Ok(crate::event::SendResult::Applied),
-            "the departed agent's witness must not be inherited by whoever takes its pane id \
-             — a pane-keyed witness would refuse this, and every later occupant, for the \
-             daemon's remaining lifetime"
-        );
-
-        reg.shutdown_all();
-    }
-
     /// Issue #915 round-2 audit (finding 1) — a `SessionEnd` a same-uid process
     /// FORGES for a pane it invented cannot witness against a victim agent that
     /// sits on a different pane.
@@ -9442,8 +8299,7 @@ mod tests {
     /// forgery records nothing. The forged
     /// `SessionEnd` is still ADMITTED — narrowing that is `managed_pane_ids`'s
     /// pre-existing bearer-token shape (#601) and out of scope here — which is
-    /// exactly why this asserts on the witness and on the delivery rather than
-    /// on admission.
+    /// exactly why this asserts on the witness rather than on admission.
     ///
     /// Unix-gated: it spawns a real PTY running `/bin/sh`.
     #[cfg(unix)]
@@ -9554,28 +8410,6 @@ mod tests {
                  against that agent"
             );
         }
-
-        // And the effect that would have had: the victim never announced a
-        // generation of its own, so it is exactly the sessionless agent the
-        // carve-out protects, and its unnamed automatic delivery must still land.
-        assert_eq!(
-            compute_write_and_submit_outcome(
-                &reg,
-                &state,
-                victim_pane,
-                "printf 'VICTIM-IS-STILL-DELIVERABLE\\n'",
-                &WriteAndSubmitExtras {
-                    expected_agent_id: Some(victim.clone()),
-                    expected_session_id: None,
-                    ..Default::default()
-                },
-            )
-            .await,
-            Ok(crate::event::SendResult::Applied),
-            "a forged end on somebody else's pane must not cost the victim its unnamed \
-             automatic deliveries — permanently, which is what made this worth fixing rather \
-             than documenting"
-        );
 
         reg.shutdown_all();
     }
@@ -10126,8 +8960,6 @@ mod tests {
             shell_synthetic_working: false,
             orchestration_orphaned: false,
             subagent_wait: None,
-            prompt_reports_unavailable: false,
-            prompt_reports_declared: false,
             output_set_status: false,
         };
         let snap = session.live_snapshot();

@@ -53,16 +53,6 @@ fn codex_worker_001_real_worker_receives_delegate_and_signals_work_done() {
 #[spec("codex/worker/002")]
 #[test]
 fn codex_worker_002_clear_false_delegate_to_a_starting_worker_arrives_whole() {
-    // The pointer's in-place re-send off: this test is about the FIRST write.
-    // With it on, a pointer lost in a starting Codex is pressed in again 20 s
-    // later, and the test would pass whether or not the deck waited for Codex.
-    // SAFETY: a stated residual, not a proof (issue #1516). Set at the top of
-    // the sync entry point, before the availability probe and the tokio
-    // runtime exist, and never written again; nextest runs each test in its
-    // own process, so the change cannot reach another test.
-    unsafe {
-        std::env::set_var("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", "0");
-    }
     skip_unless!(common::check_codex_available());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

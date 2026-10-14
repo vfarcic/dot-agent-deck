@@ -12,7 +12,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use dot_agent_deck::daemon_protocol::AttachRequest;
-use dot_agent_deck::event::{AgentType, SendResult};
+use dot_agent_deck::event::AgentType;
 use spec::spec;
 use upgrade_fixture::{DECK, NEW_BUILD, OLD_BUILD, Remote, pid_file, quoted, script};
 
@@ -32,29 +32,15 @@ fn unique_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn report_file(
-    remote: &Remote,
-    deck: &common::TuiDeck,
-    agent: &str,
-    session: &str,
-    file: &str,
-    expected: &str,
-) {
+fn report_file(remote: &Remote, deck: &common::TuiDeck, agent: &str, file: &str, expected: &str) {
     let prompt = format!(
         "Use the Read tool to read {file} in the current directory and report its exact contents. This is the complete task; do not ask questions or modify files."
     );
     // The expected contents are absent from the submitted prompt. Only actual
     // fixture inspection can put them on the live pane and the recorded grid.
     assert!(!prompt.contains(expected));
-    let sent = common::write_and_submit_with_identity_on(
-        &remote.attach,
-        PANE,
-        &prompt,
-        agent,
-        Some(session),
-    )
-    .expect("submit the fixture-reading task");
-    assert_eq!(sent.send_result, Some(SendResult::Applied));
+    common::post_message_on(&remote.attach, PANE, agent, &prompt)
+        .expect("post the fixture-reading task");
     assert!(
         common::wait_for_pane_text_on(&remote.attach, agent, expected, REPORT_WAIT),
         "interactive Haiku must read {file}; pane: {}",
@@ -134,7 +120,7 @@ fn remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts() {
     remote
         .agents
         .push((agent.clone(), pid_file(&pid_path).unwrap()));
-    let session = events.wait_for_session_start_on_pane(PANE, &agent, AGENT_WAIT);
+    events.wait_for_session_start_on_pane(PANE, &agent, AGENT_WAIT);
 
     // A normal attached TUI watches the old remote daemon's private endpoint.
     // Its build override matches that daemon so this viewer needs no consent.
@@ -172,14 +158,7 @@ fn remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts() {
 
     let first = format!("UPGRADE_BEFORE_{}", unique_token());
     fs::write(workspace.join("upgrade-before-proof.txt"), &first).unwrap();
-    report_file(
-        &remote,
-        &deck,
-        &agent,
-        &session,
-        "upgrade-before-proof.txt",
-        &first,
-    );
+    report_file(&remote, &deck, &agent, "upgrade-before-proof.txt", &first);
 
     let mut keep = remote.tty(&["remote", "upgrade", DECK]);
     keep.wait("Restart now?");
@@ -195,7 +174,6 @@ fn remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts() {
         &remote,
         &deck,
         &agent,
-        &session,
         "upgrade-after-keep-proof.txt",
         &second,
     );
