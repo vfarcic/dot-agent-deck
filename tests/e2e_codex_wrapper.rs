@@ -107,9 +107,10 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
         .agent_id
         .as_deref()
         .expect("managed wrapper event carries its agent id");
+    // Held open until the child has the line: the daemon reads an attach
+    // stream's input only after answering it, so closing at once can drop it.
     let mut input = common::AttachInput::attach(deck.attach_socket_path(), agent_id);
     input.write("MANAGED-WRAPPER-WRITE\r");
-    drop(input);
     assert!(
         common::wait_for_file_substr_count(
             &deck.workdir().join("managed-wrapper-input.log"),
@@ -119,6 +120,7 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
         ),
         "the managed wrapper declared Live but the submitted write never reached its child"
     );
+    drop(input);
     assert!(
         deck.wait_for_stream_string_within("Thinking", Duration::from_secs(10)),
         "the wrapped Codex card never visibly entered Thinking:\n{}",
