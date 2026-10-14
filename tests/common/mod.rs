@@ -2560,21 +2560,25 @@ pub enum FixtureDaemonStop {
     /// Nothing listens at the socket: no file, a stale inode, or a listener
     /// that exited before it could be identified.
     NoDaemon,
-    /// The fixture's daemon exited after `SIGTERM`.
+    /// The listener carrying the fixture's marker exited after `SIGTERM`.
     Stopped { pid: u32 },
     /// It was still running when the grace window ended, and was sent
     /// `SIGKILL`.
     Killed { pid: u32 },
-    /// The listener could not be shown to be this fixture's daemon, so it was
-    /// not signalled.
+    /// The listener did not carry the fixture's marker, or could not be
+    /// checked, so it was not signalled.
     Refused(String),
-    /// The daemon was identified, but stopping it failed.
+    /// The listener carried the marker, but stopping it failed.
     Failed(String),
 }
 
 /// Stop the daemon that a fixture rooted at `fixture_root` launched with
-/// `DOT_AGENT_DECK_ATTACH_SOCKET=<attach_socket>`, and no other process (audit
-/// A2-1).
+/// `DOT_AGENT_DECK_ATTACH_SOCKET=<attach_socket>` (audit A2-1). What it
+/// signals is the listener connected at `attach_socket` when that listener
+/// carries the fixture's marker, that variable set to exactly
+/// `attach_socket` — a check of the marker, not proof that this fixture
+/// launched the process. The platform notes below say where the check is
+/// weaker than that.
 ///
 /// The path only says where to look. A name inside the fixture can still reach
 /// an outside daemon — a symlink or a same-filesystem hard link to another
@@ -2587,16 +2591,31 @@ pub enum FixtureDaemonStop {
 /// fixture does not carry it unless it was given this fixture's environment.
 /// (A process the fixture's daemon spawned inherits the value too, and is the
 /// fixture's own.) A listener that fails the check is refused; there is no
-/// fallback to a pattern, a pidfile or endpoint discovery.
+/// fallback to a pattern, a pidfile or endpoint discovery. The marker is an
+/// environment value, not a launch identity: a same-user process that
+/// knows the fixture's socket path can start a listener carrying it, and the
+/// check accepts that listener. What it separates is the fixture's daemon
+/// from an ordinary daemon started elsewhere, such as the developer's own.
 ///
 /// The stop is the daemon's own graceful path — `SIGTERM`, which stops its
-/// managed agents — then `SIGKILL` after `daemon stop --force`'s windows. On
-/// Linux the process is held by a pidfd from before its environment is read
-/// until the last signal, so a pid reused in between is never signalled. On
-/// macOS the environment is read with `ps -E` and the signals go by pid, the
-/// identity re-checked before each; a reuse between a check and its signal is
-/// not excluded there. Other platforms stop nothing and refuse, leaving the
-/// daemon to its `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap.
+/// managed agents — then `SIGKILL` after `daemon stop --force`'s windows.
+///
+/// * **Linux:** the environment is read from `/proc/<pid>/environ` and the
+///   marker must be one exact entry. The pidfd that both signals go through
+///   is opened from the connection's peer pid and held from before that read,
+///   so a pid reused after the read is not signalled. It is opened after the
+///   peer pid is read, so in that interval the pid can name a new process;
+///   that process is signalled only if it carries the marker.
+/// * **macOS:** `ps -E` prints the arguments and the environment as one
+///   space-separated text, so the marker is accepted as any
+///   whitespace-separated word of it: an environment entry, an argument
+///   spelling the same assignment, or a word inside some other argument or
+///   value. The
+///   signals go by numeric pid with the marker re-checked before each, so a
+///   pid reused between a check and its signal is signalled without that
+///   process being shown to carry the marker.
+/// * **Other platforms** stop nothing and refuse, leaving the daemon to its
+///   `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap.
 pub fn stop_fixture_daemon(fixture_root: &Path, attach_socket: &Path) -> FixtureDaemonStop {
     use std::path::Component;
     let inside = attach_socket.is_absolute()
@@ -2688,8 +2707,8 @@ fn socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u
     Ok(pid as u32)
 }
 
-/// Linux: hold `pid` as a pidfd, then confirm from `/proc/<pid>/environ` that it
-/// was launched with `expected`, then signal it through the pidfd.
+/// Linux: hold `pid` as a pidfd, then check that `/proc/<pid>/environ` holds
+/// `expected` as one exact entry, then signal it through the pidfd.
 #[cfg(target_os = "linux")]
 fn signal_identified_daemon(
     pid: u32,
@@ -2793,8 +2812,9 @@ fn pidfd_exited(pidfd: &std::os::fd::OwnedFd, within: Duration) -> bool {
     }
 }
 
-/// macOS: confirm with `ps -E` that `pid` was launched with `expected`, then
-/// signal it by pid, re-confirming before the escalation.
+/// macOS: check that `pid`'s `ps -E` text — its arguments and environment
+/// together — holds `expected` as a whitespace-separated word, then signal
+/// it by pid, re-checking before the escalation.
 #[cfg(target_os = "macos")]
 fn signal_identified_daemon(
     pid: u32,
@@ -2809,7 +2829,8 @@ fn signal_identified_daemon(
             .stderr(std::process::Stdio::null())
             .output()?;
         // `ps` prints the arguments and then the environment, space-separated,
-        // so an argument spelling the same assignment would also match.
+        // so an argument spelling the same assignment, or the same word inside
+        // any argument or value, would also match.
         Ok(out
             .stdout
             .split(u8::is_ascii_whitespace)
