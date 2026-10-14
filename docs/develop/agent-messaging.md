@@ -18,6 +18,10 @@ The default ack-wait is 60 seconds and `max_deliver` is 5. Retry preserves the i
 
 Publish fans out copies with one id, with state per recipient. Subscription resolution excludes the sender and stays inside the sender's orchestration instance or dispatch tree. Offers go to one eligible subscriber at a time; acknowledging an offer claims it. The default claim is 30 minutes, with a 60-second minimum and 24-hour maximum. Release, expiry and owner exit exclude the former holder from subsequent assignment. Publish and offer share a per-agent budget of 60 per minute; deck-generated messages are exempt.
 
+### Delegated-task retirement
+
+A newer delegation or a pane restart retires the worker's earlier unacknowledged tasks as superseded, and superseded tasks are not reported. A worker's `work-done` names no task, so the deck infers which one it answers. If the worker acknowledged a task since its previous `work-done`, the completion answers that task, and only tasks that have reached the worker since (fetched at least once, not acknowledged) are retired with it. A newer task it never fetched stays queued and watched, so the orchestrator is still told if it does not reach the worker. Otherwise the worker answered a task it took another way, such as its task file, and every unacknowledged task to its pane is retired. A late `work-done` therefore cannot cancel a newer queued task, except in this case: an earlier task was acknowledged and its `work-done` never arrived, and the newer task was then taken from its file without being acknowledged.
+
 ### Publish and offer integration
 
 `src/inbox_pubsub.rs` resolves live pane membership from the registry and the daemon's orchestration, role, working-directory and dispatch-return maps. It reads each member directory's project configuration. `subscribe` on an orchestration or role supplies topics; role `take_offers` supplies job pools; `[dispatch] subscribe` subscribes the caller to its dispatch tree. Omitted keys inherit through `extends`; an explicit list, including an empty one, replaces the inherited list. Names match `[a-z0-9][a-z0-9-]{0,63}`, with at most 64 entries per list.

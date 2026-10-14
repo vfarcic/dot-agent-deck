@@ -502,6 +502,8 @@ Preserve your other plugin entries, then restart OpenCode. The installer prints 
 
 A message that was taken but never acknowledged becomes available again. Its id stays the same so an agent can recognise a repeat. The deck stops retrying after the delivery limit and shows `not delivered`; a delegated task that remains unacknowledged also produces a notice for its orchestrator. Restarting an agent does not move an already bound message to the replacement: delegate the task again when needed.
 
+In both clients, replacing an earlier task with a new delegation or restarting the worker stops delivery notices for the superseded task. A late `work-done` for a task the worker acknowledged leaves a newer task it has not taken queued, and the orchestrator is still told if that newer task does not reach the worker. If the worker takes a task directly from its file, it should acknowledge the message id too: otherwise its completion can stop delivery notices for other tasks waiting in its inbox.
+
 ### A deck prompt waits while you have an unsent draft
 
 Native inbox delivery does not type a task into your input box. When native wake is unavailable, the deck sends a fixed doorbell line only when the agent is idle and your input is clear:
