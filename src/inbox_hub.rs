@@ -689,18 +689,28 @@ impl InboxHub {
     /// PRD #1666 S11: publish `content` to `recipients` (resolved by the
     /// daemon from the sender's scope and the subscriptions), and hand each
     /// copy straight to an armed waiter.
+    ///
+    /// Audit F5: `revalidate` is asked, under this hub's lock, whether the
+    /// agents the post was resolved against still hold their panes; the post
+    /// is inserted only when it says they do. An agent's exit sweeps its
+    /// messages under the same lock, and only after the registry stops naming
+    /// it as its pane's live agent, so a check that passes here is followed by
+    /// that sweep and a recipient gone before it is not posted to.
     pub fn publish(
         &self,
         scope: Scope,
         topic: &str,
         content: Content,
         recipients: &[Recipient],
-    ) -> Result<Published, PostError> {
+        revalidate: &dyn Fn() -> Result<(), Stale>,
+    ) -> Result<Published, PostRefusal> {
         let published = {
             let mut st = self.lock();
+            revalidate().map_err(PostRefusal::Stale)?;
             let published = st
                 .inbox
-                .publish(Instant::now(), scope, topic, content, recipients)?;
+                .publish(Instant::now(), scope, topic, content, recipients)
+                .map_err(PostRefusal::Refused)?;
             drain_events(&mut st);
             published
         };
@@ -721,6 +731,8 @@ impl InboxHub {
     /// PRD #1666 S11: offer a job in `pool` and hand it to the first of
     /// `candidates` (recipient and role) that may take it. `offerer` is told
     /// when it is claimed, completed, its claim expires, or nobody takes it.
+    /// `revalidate` is checked as [`Self::publish`] checks it.
+    #[allow(clippy::too_many_arguments)]
     pub fn offer(
         &self,
         scope: Scope,
@@ -729,13 +741,16 @@ impl InboxHub {
         content: Content,
         offerer: Recipient,
         candidates: &[(Recipient, String)],
-    ) -> Result<Offered, PostError> {
+        revalidate: &dyn Fn() -> Result<(), Stale>,
+    ) -> Result<Offered, PostRefusal> {
         let recipients: Vec<Recipient> = candidates.iter().map(|(r, _)| r.clone()).collect();
         let offered = {
             let mut st = self.lock();
-            let offered =
-                st.inbox
-                    .offer(Instant::now(), scope, pool, claim_ttl, content, &recipients)?;
+            revalidate().map_err(PostRefusal::Stale)?;
+            let offered = st
+                .inbox
+                .offer(Instant::now(), scope, pool, claim_ttl, content, &recipients)
+                .map_err(PostRefusal::Refused)?;
             st.offers.insert(
                 offered.id.to_string(),
                 OfferContext {
@@ -1819,6 +1834,25 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
     budget.measure(&render_within(&message, None).text) <= budget.limit()
 }
 
+/// Audit F5: why a publish or offer resolved from earlier facts was not
+/// inserted — the agents it was resolved against are no longer all there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stale {
+    /// The posting agent no longer holds its pane.
+    Sender,
+    /// Some member of the scope it was resolved in no longer holds its pane.
+    Scope,
+}
+
+/// Why [`InboxHub::publish`] or [`InboxHub::offer`] posted nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostRefusal {
+    /// The inbox refused the post.
+    Refused(PostError),
+    /// The facts it was resolved from changed (audit F5).
+    Stale(Stale),
+}
+
 /// Audit F2: the file [`retain_full_body_minted`] saved for one post, if it
 /// saved one. Dropping it removes the file, so a post the inbox then refuses
 /// leaves nothing behind; [`Self::keep`] leaves it for an accepted post. A
@@ -1829,6 +1863,11 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
 pub struct MintedSpill(Option<std::path::PathBuf>);
 
 impl MintedSpill {
+    /// The file, if one was saved.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.0.as_deref()
+    }
+
     /// The post was accepted: its saved body stays.
     pub fn keep(mut self) {
         self.0 = None;

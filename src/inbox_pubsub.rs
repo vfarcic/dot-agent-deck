@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::{
@@ -32,7 +32,12 @@ use crate::inbox::{
     RoleFacts, ScopeMember, Sender, is_valid_label, is_valid_message_id, offer_candidates,
     publish_recipients, resolve_scope,
 };
+use crate::inbox_hub::{MintedSpill, PostRefusal, Stale};
 use crate::state::{ProjectConfigs, SharedState};
+
+/// How many times a publish or offer reads its scope again when an agent in
+/// it changed between reading it and posting (audit F5).
+const MAX_RESOLVE_ATTEMPTS: usize = 3;
 
 /// How often the assigner looks at pooled offers even when nothing woke it,
 /// so a taker that joined the scope after the offer is found.
@@ -48,7 +53,16 @@ struct ScopeView {
     /// Panes whose live agent dispatched a unit, still live, that owes it a
     /// report.
     dispatch_callers: HashSet<String>,
+    /// Each pane's sender facts, read with the rest.
+    senders: HashMap<String, SenderFacts>,
     configs: ProjectConfigs,
+}
+
+/// A post's sender as the daemon's own records have it, never the request.
+#[derive(Debug, Clone, Default)]
+struct SenderFacts {
+    role: Option<String>,
+    orchestration: Option<String>,
 }
 
 impl ScopeView {
@@ -77,9 +91,10 @@ impl ScopeView {
                 .map(|edge| (edge.unit_pane_id, edge.caller_pane_id))
                 .collect()
         };
-        let (facts, cwd_of, orchestrators) = {
+        let (facts, cwd_of, orchestrators, senders) = {
             let state = state.read().await;
             let mut cwd_of = HashMap::new();
+            let mut senders = HashMap::new();
             let mut facts: Vec<PaneFacts> = live
                 .into_iter()
                 .map(|(pane_id, agent_id)| {
@@ -102,6 +117,16 @@ impl ScopeView {
                     if let Some(cwd) = cwd {
                         cwd_of.insert(pane_id.clone(), cwd);
                     }
+                    senders.insert(
+                        pane_id.clone(),
+                        SenderFacts {
+                            role: state.pane_role_map.get(&pane_id).cloned(),
+                            orchestration: state
+                                .pane_orchestration_map
+                                .get(&pane_id)
+                                .map(|identity| identity.name.clone()),
+                        },
+                    );
                     PaneFacts {
                         dispatch_caller: callers.get(&pane_id).cloned(),
                         pane_id,
@@ -113,7 +138,7 @@ impl ScopeView {
             // A stable order, so "the first free taker" does not depend on a
             // map's iteration order.
             facts.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
-            (facts, cwd_of, state.orchestrator_pane_ids.clone())
+            (facts, cwd_of, state.orchestrator_pane_ids.clone(), senders)
         };
         let mut dirs: Vec<String> = cwd_of.values().cloned().collect();
         dirs.sort();
@@ -124,8 +149,25 @@ impl ScopeView {
             cwd_of,
             orchestrators,
             dispatch_callers: callers.into_values().collect(),
+            senders,
             configs,
         }
+    }
+
+    /// The sender of a post from `agent_id` in `pane_id`, and the label its
+    /// subject names it by, read with the scope it is posted in.
+    fn sender(&self, pane_id: &str, agent_id: &str) -> (Sender, String) {
+        let facts = self.senders.get(pane_id).cloned().unwrap_or_default();
+        let label = facts.role.clone().unwrap_or_else(|| "an agent".to_string());
+        (
+            Sender::Agent {
+                pane_id: pane_id.to_string(),
+                agent_id: agent_id.to_string(),
+                role: facts.role,
+                orchestration: facts.orchestration,
+            },
+            label,
+        )
     }
 
     fn scope_of(&self, sender_pane: &str) -> Option<ResolvedScope> {
@@ -228,27 +270,6 @@ fn is_live(registry: &AgentPtyRegistry, pane_id: &str, agent_id: &str) -> bool {
     registry.pane_current_agent_id(pane_id).as_deref() == Some(agent_id)
 }
 
-/// The sender of a post from `agent_id` in `pane_id`, its role and
-/// orchestration taken from the daemon's own records, never the request.
-async fn sender(state: &SharedState, pane_id: &str, agent_id: &str) -> (Sender, String) {
-    let state = state.read().await;
-    let role = state.pane_role_map.get(pane_id).cloned();
-    let orchestration = state
-        .pane_orchestration_map
-        .get(pane_id)
-        .map(|identity| identity.name.clone());
-    let label = role.clone().unwrap_or_else(|| "an agent".to_string());
-    (
-        Sender::Agent {
-            pane_id: pane_id.to_string(),
-            agent_id: agent_id.to_string(),
-            role,
-            orchestration,
-        },
-        label,
-    )
-}
-
 /// Keep the whole of an over-long body reachable (hardening H4), in the
 /// sender's own directory.
 ///
@@ -272,6 +293,73 @@ fn body_not_saved(error: &str) -> InboxPostReply {
     )
 }
 
+/// Audit F5: the check a post makes as it is inserted, under the inbox's lock
+/// ([`crate::inbox_hub::InboxHub::publish`]): the sender still holds its pane,
+/// and so does every member of the scope it was resolved in. A post read from
+/// facts that changed while the request awaited the state or the project
+/// configs then neither speaks for an agent that has left nor waits for one.
+fn revalidator<'a>(
+    registry: &'a AgentPtyRegistry,
+    sender: &'a Recipient,
+    members: &'a [Recipient],
+) -> impl Fn() -> Result<(), Stale> + 'a {
+    move || {
+        let live: HashMap<String, String> = registry.live_pane_agents().into_iter().collect();
+        let holds = |r: &Recipient| {
+            r.agent_id
+                .as_deref()
+                .is_none_or(|agent| live.get(&r.pane_id).map(String::as_str) == Some(agent))
+        };
+        if !holds(sender) {
+            Err(Stale::Sender)
+        } else if members.iter().all(holds) {
+            Ok(())
+        } else {
+            Err(Stale::Scope)
+        }
+    }
+}
+
+/// [`retain`] once per post: a body an earlier try already saved is named
+/// again rather than saved twice. The refusal to answer when it cannot be.
+fn save_once(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    agent_id: &str,
+    content: &mut Content,
+    saved: &mut Option<MintedSpill>,
+) -> Option<InboxPostReply> {
+    content.spill_path = saved
+        .as_ref()
+        .and_then(MintedSpill::path)
+        .map(std::path::Path::to_path_buf);
+    if content.spill_path.is_some() {
+        return None;
+    }
+    match retain(registry, pane_id, agent_id, content) {
+        Ok(spill) => {
+            if spill.path().is_some() {
+                *saved = Some(spill);
+            }
+            None
+        }
+        Err(error) => Some(body_not_saved(&error)),
+    }
+}
+
+/// One try at a publish or offer, against one [`ScopeView`].
+enum Attempt {
+    /// The answer to give.
+    Done(InboxPostReply),
+    /// Someone in the scope left between reading it and posting: read it again.
+    Stale,
+}
+
+/// The refusal once the scope kept changing under a post.
+const SCOPE_CHANGED: &str = "scope_changed";
+const SCOPE_CHANGED_MESSAGE: &str =
+    "the agents in this scope kept changing while the message was being posted; nothing was posted";
+
 /// `inbox_publish`: announce to every subscriber of the topic in the sender's
 /// scope. The body is another agent's text, so it is fenced as UNTRUSTED.
 pub async fn handle_publish(
@@ -289,15 +377,34 @@ pub async fn handle_publish(
     if !is_live(registry, &req.pane_id, agent_id) {
         return InboxPostReply::refused(NOT_LIVE, NOT_LIVE_MESSAGE);
     }
-    let view = ScopeView::gather(state, registry).await;
+    let mut saved = None;
+    for _ in 0..MAX_RESOLVE_ATTEMPTS {
+        let view = ScopeView::gather(state, registry).await;
+        if let Attempt::Done(reply) = publish_in(registry, req, agent_id, &view, &mut saved) {
+            return reply;
+        }
+        debug!(pane_id = %req.pane_id, "inbox: the scope changed under a publish; reading it again");
+    }
+    InboxPostReply::refused(SCOPE_CHANGED, SCOPE_CHANGED_MESSAGE)
+}
+
+/// One try at `req` against the facts in `view`. `saved` is the body an
+/// earlier try saved, kept once a try is accepted.
+fn publish_in(
+    registry: &AgentPtyRegistry,
+    req: &InboxPublishRequest,
+    agent_id: &str,
+    view: &ScopeView,
+    saved: &mut Option<MintedSpill>,
+) -> Attempt {
     let Some(scope) = view.scope_of(&req.pane_id) else {
-        return InboxPostReply::refused(
+        return Attempt::Done(InboxPostReply::refused(
             "no_scope",
             "this pane is in no orchestration or dispatch tree, so there is no one to publish to",
-        );
+        ));
     };
     let recipients = view.subscribers(&scope, &req.topic, &req.pane_id);
-    let (from, role) = sender(state, &req.pane_id, agent_id).await;
+    let (from, role) = view.sender(&req.pane_id, agent_id);
     let mut content = Content {
         from,
         subject: format!("announcement \"{}\" from {role}", req.topic),
@@ -309,29 +416,50 @@ pub async fn handle_publish(
     };
     if let Err(error) = registry.inbox().admit_publish(&content, &recipients) {
         info!(pane_id = %req.pane_id, %error, "inbox: publish refused");
-        return refused_post(&error);
+        return Attempt::Done(refused_post(&error));
     }
-    let spill = match retain(registry, &req.pane_id, agent_id, &mut content) {
-        Ok(spill) => spill,
-        Err(error) => return body_not_saved(&error),
-    };
-    match registry
-        .inbox()
-        .publish(scope.scope, &req.topic, content, &recipients)
-    {
+    if let Some(refusal) = save_once(registry, &req.pane_id, agent_id, &mut content, saved) {
+        return Attempt::Done(refusal);
+    }
+    let sender = Recipient::bound(req.pane_id.clone(), agent_id.to_string());
+    let members: Vec<Recipient> = scope.members.iter().map(|m| m.recipient.clone()).collect();
+    match registry.inbox().publish(
+        scope.scope,
+        &req.topic,
+        content,
+        &recipients,
+        &revalidator(registry, &sender, &members),
+    ) {
         Ok(published) => {
-            spill.keep();
-            InboxPostReply {
+            if let Some(spill) = saved.take() {
+                spill.keep();
+            }
+            Attempt::Done(InboxPostReply {
                 id: Some(published.id.to_string()),
                 delivered_to: Some(published.delivered_to),
                 refused_full: published.refused_full,
                 ..InboxPostReply::default()
-            }
+            })
         }
-        Err(error) => {
-            info!(pane_id = %req.pane_id, %error, "inbox: publish refused");
-            refused_post(&error)
+        Err(refusal) => settle_refusal(&req.pane_id, "publish", refusal),
+    }
+}
+
+/// The answer to a publish or offer the inbox did not insert.
+fn settle_refusal(pane_id: &str, verb: &str, refusal: PostRefusal) -> Attempt {
+    match refusal {
+        PostRefusal::Refused(error) => {
+            info!(pane_id, verb, %error, "inbox: post refused");
+            Attempt::Done(refused_post(&error))
         }
+        PostRefusal::Stale(Stale::Sender) => {
+            info!(
+                pane_id,
+                verb, "inbox: the poster left its pane before its post was inserted"
+            );
+            Attempt::Done(InboxPostReply::refused(NOT_LIVE, NOT_LIVE_MESSAGE))
+        }
+        PostRefusal::Stale(Stale::Scope) => Attempt::Stale,
     }
 }
 
@@ -364,22 +492,40 @@ pub async fn handle_offer(
     if !is_live(registry, &req.pane_id, agent_id) {
         return InboxPostReply::refused(NOT_LIVE, NOT_LIVE_MESSAGE);
     }
-    let view = ScopeView::gather(state, registry).await;
+    let mut saved = None;
+    for _ in 0..MAX_RESOLVE_ATTEMPTS {
+        let view = ScopeView::gather(state, registry).await;
+        if let Attempt::Done(reply) = offer_in(registry, req, agent_id, &view, &mut saved) {
+            return reply;
+        }
+        debug!(pane_id = %req.pane_id, "inbox: the scope changed under an offer; reading it again");
+    }
+    InboxPostReply::refused(SCOPE_CHANGED, SCOPE_CHANGED_MESSAGE)
+}
+
+/// One try at `req` against the facts in `view`, as [`publish_in`].
+fn offer_in(
+    registry: &AgentPtyRegistry,
+    req: &InboxOfferRequest,
+    agent_id: &str,
+    view: &ScopeView,
+    saved: &mut Option<MintedSpill>,
+) -> Attempt {
     if !view.may_offer(&req.pane_id) {
         warn!(pane_id = %req.pane_id, "inbox: offer from a pane that is not an orchestrator");
-        return InboxPostReply::refused(
+        return Attempt::Done(InboxPostReply::refused(
             "not_orchestrator",
             "only an orchestration's orchestrator, or a pane that dispatched a unit, may offer jobs",
-        );
+        ));
     }
     let Some(scope) = view.scope_of(&req.pane_id) else {
-        return InboxPostReply::refused(
+        return Attempt::Done(InboxPostReply::refused(
             "no_scope",
             "this pane is in no orchestration or dispatch tree, so there is no one to offer to",
-        );
+        ));
     };
     let takers = view.takers(&scope, &req.pool, &req.pane_id);
-    let (from, role) = sender(state, &req.pane_id, agent_id).await;
+    let (from, role) = view.sender(&req.pane_id, agent_id);
     let id = MessageId::generate(&registry.inbox().deck());
     let mut content = Content {
         from,
@@ -396,29 +542,33 @@ pub async fn handle_offer(
         .admit_offer(&scope.scope, claim_ttl, &content)
     {
         info!(pane_id = %req.pane_id, %error, "inbox: offer refused");
-        return refused_post(&error);
+        return Attempt::Done(refused_post(&error));
     }
-    let spill = match retain(registry, &req.pane_id, agent_id, &mut content) {
-        Ok(spill) => spill,
-        Err(error) => return body_not_saved(&error),
-    };
+    if let Some(refusal) = save_once(registry, &req.pane_id, agent_id, &mut content, saved) {
+        return Attempt::Done(refusal);
+    }
     let offerer = Recipient::bound(req.pane_id.clone(), agent_id.to_string());
-    match registry
-        .inbox()
-        .offer(scope.scope, &req.pool, claim_ttl, content, offerer, &takers)
-    {
+    let members: Vec<Recipient> = scope.members.iter().map(|m| m.recipient.clone()).collect();
+    match registry.inbox().offer(
+        scope.scope,
+        &req.pool,
+        claim_ttl,
+        content,
+        offerer.clone(),
+        &takers,
+        &revalidator(registry, &offerer, &members),
+    ) {
         Ok(offered) => {
-            spill.keep();
-            InboxPostReply {
+            if let Some(spill) = saved.take() {
+                spill.keep();
+            }
+            Attempt::Done(InboxPostReply {
                 id: Some(offered.id.to_string()),
                 offered_to: offered.offered_to.map(|r| r.pane_id),
                 ..InboxPostReply::default()
-            }
+            })
         }
-        Err(error) => {
-            info!(pane_id = %req.pane_id, %error, "inbox: offer refused");
-            refused_post(&error)
-        }
+        Err(refusal) => settle_refusal(&req.pane_id, "offer", refusal),
     }
 }
 
@@ -740,6 +890,7 @@ mod tests {
                     Content::from_deck("test", format!("job {n}"), "fill the scope"),
                     Recipient::bound("f2-caller", caller.clone()),
                     &[],
+                    &|| Ok(()),
                 )
                 .expect("fill the scope's open offers");
         }
@@ -754,6 +905,94 @@ mod tests {
             saved_bodies(dir.path()),
             rate,
             "an offer into a full scope is saved"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Audit F5: an offer whose offerer is replaced after its scope was read —
+    /// the reads a request awaits on — is refused when it is posted, and
+    /// nothing is queued. The offerer leaving is not a change to retry.
+    #[tokio::test]
+    async fn an_offer_resolved_before_its_offerer_was_replaced_is_refused() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let caller = spawn_in(&registry, "f5-caller", None);
+        let unit = spawn_in(&registry, "f5-unit", None);
+        dispatched(&registry, ("f5-unit", &unit), ("f5-caller", &caller));
+        let state = shared();
+
+        let view = ScopeView::gather(&state, &registry).await;
+        registry
+            .respawn_agent_for_pane("f5-caller", "cat")
+            .await
+            .expect("respawn the offerer");
+        let attempt = offer_in(
+            &registry,
+            &offer_from("f5-caller", &caller),
+            &caller,
+            &view,
+            &mut None,
+        );
+        let Attempt::Done(reply) = attempt else {
+            panic!("the offerer itself left: that is a refusal, not a scope to read again");
+        };
+        assert_eq!(reply.refused.as_deref(), Some("not_live"), "{reply:?}");
+        assert!(
+            registry.inbox().list_all().is_empty(),
+            "the departed offerer's job was posted"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Audit F5: a publish whose subscriber is replaced after the scope was
+    /// read queues no copy for the subscriber's departed agent; the publish
+    /// reads its scope again instead.
+    #[tokio::test]
+    async fn a_publish_resolved_before_a_subscriber_was_replaced_queues_nothing_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".dot-agent-deck.toml"),
+            "[dispatch]\nsubscribe = [\"news\"]\n",
+        )
+        .unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let caller = spawn_in(&registry, "f5s-caller", Some(dir.path().to_str().unwrap()));
+        let unit = spawn_in(&registry, "f5s-unit", None);
+        dispatched(&registry, ("f5s-unit", &unit), ("f5s-caller", &caller));
+        let state = shared();
+
+        let view = ScopeView::gather(&state, &registry).await;
+        let scope = view
+            .scope_of("f5s-unit")
+            .expect("the unit is in its dispatch tree");
+        assert!(
+            view.subscribers(&scope, "news", "f5s-unit")
+                .iter()
+                .any(|r| r.agent_id.as_deref() == Some(caller.as_str())),
+            "precondition: the dispatcher subscribes to the topic"
+        );
+        registry
+            .respawn_agent_for_pane("f5s-caller", "cat")
+            .await
+            .expect("respawn the subscriber");
+        let publish = InboxPublishRequest {
+            pane_id: "f5s-unit".to_string(),
+            agent_id: Some(unit.clone()),
+            token: None,
+            topic: "news".to_string(),
+            body: "the build is green".to_string(),
+        };
+        let attempt = publish_in(&registry, &publish, &unit, &view, &mut None);
+        assert!(
+            registry
+                .inbox()
+                .list_all()
+                .iter()
+                .all(|m| m.bind_agent.as_deref() != Some(caller.as_str())),
+            "a copy was queued for the subscriber's departed agent"
+        );
+        assert!(
+            matches!(attempt, Attempt::Stale),
+            "the scope changed under the publish: it is read again"
         );
         registry.shutdown_all();
     }
