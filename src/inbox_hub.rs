@@ -653,6 +653,11 @@ impl InboxHub {
     ///
     /// Every older task to the same pane still owed is superseded first: a newer
     /// delegation replaces it.
+    ///
+    /// `worker_holds` is asked, under this hub's lock, whether the worker's
+    /// agent still holds its pane, as [`Self::publish`]'s `revalidate` is: the
+    /// task is posted only when it does, and otherwise refused as
+    /// [`Stale::Scope`] — a worker swept before the post would hold it forever.
     pub fn post_delegate(
         &self,
         worker: Recipient,
@@ -660,7 +665,8 @@ impl InboxHub {
         orchestrator: Option<Recipient>,
         ledger: DelegateLedger,
         content: Content,
-    ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostError> {
+        worker_holds: &dyn Fn() -> bool,
+    ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
         self.supersede_delegates_to(&worker.pane_id);
         let (tx, rx) = oneshot::channel();
         let id = {
@@ -669,7 +675,13 @@ impl InboxHub {
             if let Some(id) = content.id.as_ref() {
                 st.pending_posts.remove(id.as_str());
             }
-            let id = st.inbox.post_direct(now, worker.clone(), content)?;
+            if !worker_holds() {
+                return Err(PostRefusal::Stale(Stale::Scope));
+            }
+            let id = st
+                .inbox
+                .post_direct(now, worker.clone(), content)
+                .map_err(PostRefusal::Refused)?;
             drain_events(&mut st);
             st.delegates.insert(
                 id.to_string(),
@@ -3369,6 +3381,7 @@ mod tests {
             Some(Recipient::bound("o", "oa")),
             DelegateLedger::default(),
             content(task),
+            &|| true,
         )
         .expect("delegated")
         .0
@@ -3415,6 +3428,28 @@ mod tests {
         let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, None);
         assert_eq!(taken.len(), 1);
         assert!(taken[0].text.contains("NEWER-TASK-STILL-OWED"));
+    }
+
+    /// delegate_023: a task whose worker left after the dispatch last saw it
+    /// live — and was swept from the inbox before the post — is not posted to
+    /// the departed agent, where no exit sweep would ever end it.
+    #[tokio::test]
+    async fn a_delegate_to_a_worker_gone_before_the_post_is_refused() {
+        let hub = hub();
+        let refused = hub.post_delegate(
+            Recipient::bound("w", "wa"),
+            "coder",
+            Some(Recipient::bound("o", "oa")),
+            DelegateLedger::default(),
+            content("TASK-FOR-A-DEAD-WORKER"),
+            &|| false,
+        );
+        assert_eq!(refused.err(), Some(PostRefusal::Stale(Stale::Scope)));
+        assert!(
+            hub.list("w").is_empty(),
+            "the task was queued for the departed agent"
+        );
+        assert!(hub.lock().delegates.is_empty(), "a watch was left for it");
     }
 
     /// PRD #1666 S5 (idle-worker/029): a worker that acknowledged no delegated
@@ -3473,6 +3508,7 @@ mod tests {
                 Some(Recipient::bound("o", "oa")),
                 DelegateLedger::default(),
                 content("EARLIER-TASK"),
+                &|| true,
             )
             .unwrap();
             hub.fetch(
@@ -3498,6 +3534,7 @@ mod tests {
                 Some(Recipient::bound("o", "oa")),
                 DelegateLedger::default(),
                 content("REDELIVERED-TASK"),
+                &|| true,
             )
             .unwrap()
             .0;

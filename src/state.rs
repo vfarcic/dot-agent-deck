@@ -5101,7 +5101,7 @@ async fn dispatch_one_owned(
         Some(agent) => (live.as_deref() == Some(agent.as_str())).then_some(agent),
         None => live,
     };
-    let Some(worker_agent_id) = worker_agent_id else {
+    let no_live_worker = |orchestrator: Option<crate::inbox::Recipient>| {
         warn!(
             role = %target_role,
             pane_id = %pane_id,
@@ -5123,10 +5123,13 @@ async fn dispatch_one_owned(
         );
         post_orchestrator_notice(
             &registry,
-            orchestrator.clone(),
+            orchestrator,
             "worker not live",
             compose_respawn_no_live_worker_notice(&pane_id),
         );
+    };
+    let Some(worker_agent_id) = worker_agent_id else {
+        no_live_worker(orchestrator.clone());
         return;
     };
     if let Some(seq) = delegation_seq {
@@ -5171,12 +5174,22 @@ async fn dispatch_one_owned(
         commission_arm_id,
         delegation_seq,
     };
+    // The liveness check above is separated from the post by the awaits in
+    // between, so the post checks again, under the inbox's lock: a worker that
+    // died and was swept meanwhile would otherwise hold the task forever.
+    let still_live = || {
+        registry
+            .live_pane_agents()
+            .iter()
+            .any(|(pane, agent)| *pane == pane_id && *agent == worker_agent_id)
+    };
     match registry.inbox().post_delegate(
         worker,
         &target_role,
         orchestrator.clone(),
         ledger,
         content,
+        &still_live,
     ) {
         Ok((id, ended)) => {
             tracing::info!(
@@ -5208,7 +5221,13 @@ async fn dispatch_one_owned(
                 });
             }
         }
-        Err(error) => {
+        Err(crate::inbox_hub::PostRefusal::Stale(_)) => {
+            if let Some(seq) = delegation_seq {
+                registry.finish_delegation_pointer_write(&pane_id, seq, Default::default());
+            }
+            no_live_worker(orchestrator);
+        }
+        Err(crate::inbox_hub::PostRefusal::Refused(error)) => {
             if let Some(seq) = delegation_seq {
                 registry.finish_delegation_pointer_write(&pane_id, seq, Default::default());
             }
