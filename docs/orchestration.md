@@ -466,7 +466,8 @@ Long turns affect delivery the same way in the TUI and the desktop app:
 
 - When OpenCode or Pi keeps a message queued behind a busy turn, the message waits for that turn to end. The deck does not report it as not delivered during this wait, and OpenCode does not receive another copy. Claude Code has no way to confirm this wait: a message waiting behind a turn longer than about five minutes can be reported not delivered before it arrives; the orchestrator is then told it arrived.
 - If the deck reported a task as not delivered and the agent takes it after all, the orchestrator is told that the task arrived, and the agent's TUI card or desktop tile leaves its delivery error state once no other delivery error remains.
-- After a message has been held for an hour, the usual delivery limit and not-delivered notices apply again.
+- If the orchestrator was told a task has not reached its worker and the worker then picks it up, the orchestrator is told the task arrived after all.
+- After a direct message has been held for an hour, the usual delivery limit and not-delivered notices apply again. An offered job waits for up to its claim time or one hour, whichever is shorter; see [Announcements and pooled jobs](#announcements-and-pooled-jobs).
 
 **TUI:**
 
@@ -490,7 +491,7 @@ The delivery behavior is the same whether you watch the pane in the TUI or the d
 
 | Agent | What happens when a message arrives | Fallback or limitation |
 |---|---|---|
-| Claude Code | Native wake is enabled from version 2.1.296 after installing the integration. | A message waiting behind a long turn can be reported not delivered before it arrives; the orchestrator is then told it arrived. Claude Code cannot confirm that it is keeping a queued message during the turn. Older or unrecognised versions get the doorbell line without a native-wake delay. Upgrade Claude Code and re-run `hooks install`, then restart Claude Code to enable native wake. |
+| Claude Code | Native wake is enabled from version 2.1.296 after installing the integration. | A message waiting behind a long turn can be reported not delivered before it arrives; the orchestrator is then told it arrived. Claude Code cannot confirm that it is keeping a queued message during the turn, so a job not claimed within the deck's wait can go to the next worker while the Claude worker is still busy. Older or unrecognised versions get the doorbell line without a native-wake delay. Upgrade Claude Code and re-run `hooks install`, then restart Claude Code to enable native wake. |
 | Codex | The doorbell wakes an idle agent; hooks hand messages over at turn end when it is busy. | With untrusted hooks, the model runs `inbox fetch` itself and needs `network_access = true`. If a future Codex UI is not recognised, the idle doorbell waits; send the first prompt yourself so turn-end hand-over can take over. |
 | OpenCode | The full TUI receives messages through its TUI plugin. `--mini` receives messages natively and gets a redraw so they become visible; a partial frame can remain briefly. | If the deck cannot update `tui.json`, it uses the doorbell; add the plugin entry by hand as described below. A `/models` choice before the first prompt is not readable by the integration; launch with `--model` to choose that first message's model. `attach`, `acp`, `web`, `pr` and `github` have not been measured for this delivery path; expect the doorbell. |
 | Pi | Native delivery works while idle and queues follow-ups while busy. | The extension stops trying to connect when Pi runs outside a deck pane. Restart Pi inside the deck to receive deck messages. |
@@ -553,6 +554,8 @@ dot-agent-deck inbox release <id>
 ```
 
 The default claim lasts 30 minutes; `--claim-ttl` accepts durations from one minute to 24 hours, such as `90s` or `1h30m`. If the worker releases the job, its claim expires, or it exits, the job returns to the pool for another worker. A worker that never picks up its assigned job also loses that assignment after five minutes by default. The offerer receives notices when a job is claimed, completed, its claim expires or delivery attempts are exhausted without completion.
+
+In both the TUI and the desktop app, if OpenCode or Pi is busy with a long turn when a job arrives, the job waits for that agent and is not offered to another worker during that wait, preventing duplicate work. It can wait for up to the job's claim time or one hour, whichever is shorter. For Claude Code, a job not claimed within the deck's wait still goes to the next worker.
 
 In the TUI and desktop app, a claimed job stays counted as a taken message until completed or handed back. The desktop evidence rail records **Job handed back to its pool** when an assignment returns. The CLI commands work in agent panes in either client. Both `publish` and `offer` accept exactly one of `--text` or `--file`; `--file -` reads standard input, with a 1 MiB body limit.
 

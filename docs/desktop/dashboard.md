@@ -79,6 +79,8 @@ Agent tiles show `✉N queued` while messages await acknowledgement, and `✉ de
 
 The handoff rail tracks worker handoffs with `delegated · queued`, `delivered · working`, `work-done` and `not delivered`. It is a desktop surface; in the TUI, follow the role cards and the orchestrator's pane. A delivered message is a receipt, so read the worker's report before treating its work as complete.
 
+In both the desktop app and the TUI, a job that arrives while OpenCode or Pi is busy waits for that agent for up to the job's claim time or one hour, whichever is shorter, without going to another worker during that wait. A Claude Code worker can lose an unclaimed job to the next worker while busy. If the orchestrator was told a task has not reached its worker and the worker then picks it up, the orchestrator is told the task arrived after all. If the task was reported not delivered, its later receipt also clears the card or tile's delivery error once no other delivery error remains.
+
 See [Orchestration → Delivery](../orchestration.md#delivery-in-the-tui-and-desktop-app) for native wake support, the fallback doorbell and the inbox commands.
 
 ## The agent pane
