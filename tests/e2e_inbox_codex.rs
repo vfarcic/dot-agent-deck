@@ -29,6 +29,10 @@ struct Codex {
 
 impl Codex {
     fn new(screen_text: &str) -> Self {
+        Self::new_with(screen_text, &[])
+    }
+
+    fn new_with(screen_text: &str, extra: &[(&str, &str)]) -> Self {
         let bin = common::harness_tempdir().unwrap();
         let program = bin.path().join("codex");
         std::fs::write(&program, r#"#!/usr/bin/python3
@@ -55,18 +59,29 @@ while True:
         chunk = os.read(0,4096)
         if not chunk: break
         capture.write(chunk)
-        if os.path.exists(base + '.keep'):
+        strand = os.path.exists(base + '.strand')
+        if strand or os.path.exists(base + '.keep'):
             for c in chunk:
                 if c == 21: draft.clear()
-                elif c == 13: pass # Codex's paste-burst Enter keeps the draft.
+                elif c == 13:
+                    # Codex's paste-burst Enter keeps the draft. A stranding
+                    # Codex drops only the first Enter after text, then submits.
+                    if strand and (not draft or os.path.exists(base + '.dropped')):
+                        with open(base + '.submitted', 'ab') as f: f.write(bytes(draft) + b'\n')
+                        draft.clear()
+                    elif strand: open(base + '.dropped', 'w').close()
                 else: draft.append(c)
             with open(base + '.empty') as f: empty = f.read()
             shown = empty.replace('Ask Codex to do anything', draft.decode() if draft else 'Ask Codex to do anything')
+            # Codex 0.160 hides its shortcuts hint while the composer holds text.
+            if strand and draft: shown = shown.replace('? for shortcuts', ' ' * 15)
             with open(base + '.screen', 'w') as f: f.write(shown)
 "#).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:/usr/bin:/bin", bin.path().display());
-        let daemon = daemon(&[("PATH", &path)]);
+        let mut env = vec![("PATH", path.as_str())];
+        env.extend_from_slice(extra);
+        let daemon = daemon(&env);
         let pane = Self::start(&daemon, screen_text, &program);
         Self {
             pane,
@@ -305,6 +320,52 @@ fn codex_012_retained_paste_burst_draft_holds_doorbell() {
             bytes(&codex.pane)
         );
     }
+}
+
+/// Scenario: Start wrapped synthetic Codex at its empty composer, make it drop the first Enter after the doorbell line (as a real Codex 0.160.0 was seen to do), and queue a task. The line stays in the composer with the shortcuts hint hidden; the next ring must submit it with one bare carriage return instead of waiting for an empty composer forever, and must not type a second line on top of it.
+#[spec("inbox/codex/013")]
+#[test]
+fn codex_013_a_stranded_doorbell_line_is_submitted_by_the_next_ring() {
+    let codex = Codex::new_with(COMPOSER, &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400")]);
+    let strand = codex.pane.capture.with_extension("strand");
+    std::fs::write(strand.with_extension("empty"), COMPOSER).unwrap();
+    std::fs::write(&strand, "").unwrap();
+    let id = codex.queued(BODY);
+    let line = fixed_line(&id);
+    assert!(
+        common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
+            .contains(&format!("›  {}", line.trim_start()))),
+        "the stand-in must leave the rung line in its composer: {}",
+        screen(&codex.daemon, &codex.pane)
+    );
+    let flushed = format!("{line}\r\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane).starts_with(flushed.as_bytes())),
+        "the next ring must submit the stranded line with a bare CR: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+    // What follows the flush is the next ring's own pre-ring CR (the stand-in
+    // keeps the message queued), never a line typed on top of the flush.
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane).len() > flushed.len()),
+        "the doorbell must ring again while the message stays queued"
+    );
+    assert_eq!(
+        bytes(&codex.pane)[flushed.len()],
+        b'\r',
+        "no second line may be typed on top of the flush: {:?}",
+        String::from_utf8_lossy(&bytes(&codex.pane))
+    );
+    let submitted = strand.with_extension("submitted");
+    assert_eq!(
+        std::fs::read_to_string(&submitted)
+            .unwrap_or_default()
+            .lines()
+            .next(),
+        Some(line.as_str()),
+        "the flush must submit the stranded line itself"
+    );
 }
 
 /// Scenario: Report Codex's own busy hook, replace its screen with an unfamiliar mid-session screen and queue a task. Its own Idle must still wait for an empty recognised composer; restarting in the same pane on a startup dialog must keep every byte out of that dialog.

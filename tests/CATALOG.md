@@ -7791,6 +7791,13 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Codex's real paste-burst timing; the fixture recreates the measured retained-draft end-state.
 - **Cost:** none.
 
+##### inbox/codex/013 — A doorbell line Codex left unsubmitted is submitted by the next ring.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** wrapped Codex-composer stand-in that drops the first Enter after text and hides its shortcuts hint while the composer holds text, as Codex 0.160.0 does.
+- **Asserts:** the rung line stays in the composer; the next ring sends one bare CR (no second line typed on top), and that CR submits the stranded line itself.
+- **Does not assert:** why a real Codex dropped the Enter; the fixture recreates the measured stranded end-state (live `codex/worker/001`, 2026-10-14).
+- **Cost:** none.
+
 #### inbox/opencode
 
 ##### inbox/opencode/001 — Home delivery creates and navigates once, in stream order.

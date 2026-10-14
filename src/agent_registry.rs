@@ -289,6 +289,12 @@ pub struct AgentSpec {
     /// the agent's status comes only from its own hooks, so it reads Unknown,
     /// and is never rung, until they report.
     pub doorbell_composer: Option<fn(&[String]) -> bool>,
+    /// Recognises the doorbell's own line left unsubmitted in the composer
+    /// [`Self::doorbell_composer`] guards (its Enter was not taken). Such a
+    /// screen is not empty, so without this the bare CR that flushes the line
+    /// would wait for an empty composer forever. `Some` exactly where
+    /// `doorbell_composer` is.
+    pub doorbell_stranded_line: Option<fn(&[String]) -> bool>,
 }
 
 // PRD #20 finding #15: per-agent adapters that normalize each incumbent
@@ -477,6 +483,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
         },
     }),
     doorbell_composer: None,
+    doorbell_stranded_line: None,
 };
 
 /// OpenCode — plugin strategy (shipped).
@@ -513,6 +520,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
         },
     }),
     doorbell_composer: None,
+    doorbell_stranded_line: None,
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -544,6 +552,7 @@ pub static PI: AgentSpec = AgentSpec {
         },
     }),
     doorbell_composer: None,
+    doorbell_stranded_line: None,
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -594,6 +603,7 @@ pub static CODEX: AgentSpec = AgentSpec {
     // PRD #1666 S7: Codex's wrapper reports raw input while its start
     // dialogs are up, so the doorbell needs the composer itself.
     doorbell_composer: Some(codex_composer_on_screen),
+    doorbell_stranded_line: Some(codex_composer_holds_doorbell_line),
 };
 
 /// PRD #1666 S7 (decision A): whether `rows` — a pane's screen, one trimmed
@@ -651,6 +661,63 @@ pub fn codex_composer_on_screen(rows: &[String]) -> bool {
     empty && rows.get(prompt + 1).is_some_and(String::is_empty)
 }
 
+/// PRD #1666: do `rows` show Codex's composer holding exactly one doorbell
+/// line ([`crate::doorbell::doorbell_line`]) that its Enter did not submit, as
+/// measured on Codex 0.160.0:
+///
+/// ```text
+/// ›  dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch
+///
+///   GPT-5.6-Luna low · /path/to/project
+///                                                    ⚠ 1 warning · f2 to view
+/// ```
+///
+/// Codex hides `? for shortcuts` while its composer holds text, so the
+/// composer is found from the bottom instead: the lowest `›` row that is not a
+/// numbered choice, at most [`CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM`] rows
+/// above the last row with text. Its text, with any wrapped rows below it
+/// joined up to the first blank row, must be the doorbell line and nothing
+/// else; a human draft, a dialog or a line the human edited does not match.
+pub fn codex_composer_holds_doorbell_line(rows: &[String]) -> bool {
+    let Some(bottom) = rows.iter().rposition(|row| !row.is_empty()) else {
+        return false;
+    };
+    let first = bottom.saturating_sub(CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM);
+    let Some(prompt) = (first..=bottom).rev().find(|&n| {
+        rows[n].strip_prefix('›').is_some_and(|rest| {
+            let rest = rest.trim_start();
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            !(digits > 0 && rest[digits..].starts_with('.'))
+        })
+    }) else {
+        return false;
+    };
+    let mut text = rows[prompt]
+        .strip_prefix('›')
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    for row in rows[prompt + 1..].iter().take_while(|row| !row.is_empty()) {
+        text.push(' ');
+        text.push_str(row.trim());
+    }
+    is_doorbell_line(&text)
+}
+
+/// `text`, trimmed, is one doorbell line naming one message id.
+fn is_doorbell_line(text: &str) -> bool {
+    text.strip_prefix(crate::doorbell::LINE_PREFIX.trim_start())
+        .and_then(|rest| rest.strip_suffix(crate::doorbell::LINE_SUFFIX))
+        .is_some_and(|id| {
+            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+}
+
+/// How far above the last row with text [`codex_composer_holds_doorbell_line`]'s
+/// prompt row may be: the composer's wrapped rows, a blank row, the model
+/// line and the footer.
+const CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM: usize = 6;
+
 /// The texts Codex 0.160.0 shows in an empty composer: the first at start
 /// and after a turn (measured), the second from the binary's strings
 /// (unmeasured on screen). Anything else on the prompt row is a draft.
@@ -706,6 +773,7 @@ pub static DEVIN: AgentSpec = AgentSpec {
     // the key table was measured on, so none of its keys could be verified.
     prompt_keys: None,
     doorbell_composer: None,
+    doorbell_stranded_line: None,
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -729,6 +797,7 @@ pub static NONE: AgentSpec = AgentSpec {
     // Not an agent: there is nothing to press keys at.
     prompt_keys: None,
     doorbell_composer: None,
+    doorbell_stranded_line: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral

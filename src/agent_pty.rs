@@ -8949,6 +8949,9 @@ impl AgentPtyRegistry {
     ///   written to only while the recogniser finds that composer EMPTY on the
     ///   pane's screen, before and after the agent's first own hook (PRD #1666
     ///   S7, decision A; decision 2 for a draft the agent kept after an Enter).
+    ///   The exception is a composer holding the doorbell's own earlier line,
+    ///   unsubmitted: a write that starts with a CR sends that CR alone, which
+    ///   submits the line, and types nothing after it.
     ///
     /// No echo wait and no retry: whether the message arrived is the inbox's
     /// to say, not the screen's. The screen is read only for the composer gate,
@@ -9005,19 +9008,27 @@ impl AgentPtyRegistry {
         // can answer it, or a composer holding a draft the input tracker
         // believes was submitted (decision 2). So every write waits for the
         // empty composer, read under the writer.
-        if let Some(composer) = self.doorbell_composer_gate(expected_agent_id)
-            && !self
-                .screen_rows(expected_agent_id)
-                .await
-                .is_some_and(|rows| composer(&rows))
-        {
-            return DoorbellWrite::NoComposer;
+        //
+        // The one non-empty composer a write may go to is one holding the
+        // doorbell's own earlier line, left there when its Enter was not taken
+        // (live Codex 0.160.0, `codex/worker/001`): the flushing CR is what
+        // submits it, so it goes alone, and no second line is typed on top.
+        let mut flush_only = false;
+        if let Some((empty, stranded)) = self.doorbell_composer_gate(expected_agent_id) {
+            let rows = self.screen_rows(expected_agent_id).await;
+            match rows {
+                Some(rows) if empty(&rows) => {}
+                Some(rows) if pre_cr && stranded.is_some_and(|stranded| stranded(&rows)) => {
+                    flush_only = true;
+                }
+                _ => return DoorbellWrite::NoComposer,
+            }
         }
         let mut steps: Vec<&[u8]> = Vec::with_capacity(3);
         if pre_cr {
             steps.push(b"\r");
         }
-        if let Some(payload) = payload.as_deref() {
+        if let Some(payload) = payload.as_deref().filter(|_| !flush_only) {
             steps.push(payload);
             steps.push(b"\r");
         }
@@ -10689,10 +10700,18 @@ impl AgentPtyRegistry {
     /// for the agent's whole life, not only until its first own hook: an
     /// agent that has reported can still show a draft it kept, or a screen
     /// the recogniser does not know (decision 2).
-    fn doorbell_composer_gate(&self, agent_id: &str) -> Option<fn(&[String]) -> bool> {
+    /// The agent's empty-composer and stranded-line recognisers
+    /// ([`crate::agent_registry::AgentSpec::doorbell_composer`]), or `None`
+    /// where the doorbell needs no screen to write.
+    #[allow(clippy::type_complexity)]
+    fn doorbell_composer_gate(
+        &self,
+        agent_id: &str,
+    ) -> Option<(fn(&[String]) -> bool, Option<fn(&[String]) -> bool>)> {
         let inner = self.inner.lock().unwrap();
         let agent = inner.agents.get(agent_id)?;
-        crate::agent_registry::spec(agent.spawn_agent_type.as_ref()?).doorbell_composer
+        let spec = crate::agent_registry::spec(agent.spawn_agent_type.as_ref()?);
+        Some((spec.doorbell_composer?, spec.doorbell_stranded_line))
     }
 
     /// The screen `agent_id`'s pane shows, one trimmed row each, or `None`

@@ -40,7 +40,9 @@
 //! *outstanding* — rung, with none of the messages it covered fetched since —
 //! the next ring is preceded by a bare CR, and once a covered message leaves
 //! `queued` by any route, one bare CR is sent under the same guards. Both are
-//! keyed on inbox state, never on the screen.
+//! keyed on inbox state, never on the screen. For an agent whose composer is
+//! gated (Codex), that CR is the one write the gate lets into a composer
+//! holding the doorbell's own unsubmitted line, and it then goes alone.
 //!
 //! [`decide`] is the pure policy; [`spawn`] runs it against the daemon.
 
