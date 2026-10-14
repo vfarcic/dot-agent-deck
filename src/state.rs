@@ -1092,7 +1092,8 @@ pub struct AppState {
     /// doorbell reads of it ([`Self::doorbell_view`]). A doorbell admission is
     /// bound to this count ([`Self::doorbell_admission`]), so any status change
     /// between the doorbell's decision and its write — a dialog, a turn — voids
-    /// it.
+    /// it. Forgotten with the pane, so it does not grow by one entry per pane
+    /// id ever seen.
     pane_event_epochs: HashMap<String, u64>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
@@ -6486,6 +6487,7 @@ impl AppState {
         self.pane_generation_announced.remove(pane_id);
         self.untagged_status_panes.remove(pane_id);
         self.waiting_superseded_sessions.remove(pane_id);
+        self.pane_event_epochs.remove(pane_id);
     }
 
     /// Issue #697: apply the daemon's announcement that it evicted the unproven
@@ -6789,6 +6791,10 @@ impl AppState {
         // reused pane id surfaces with its own.
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
+        // PRD #1666: and its doorbell epoch. A successor restarting the count
+        // at 0 cannot satisfy an admission captured for the previous agent:
+        // the doorbell's writer re-checks the agent that owns the pane.
+        self.pane_event_epochs.remove(pane_id);
         if !self
             .sessions
             .values()
@@ -8201,6 +8207,7 @@ impl AppState {
         self.managed_pane_ids.remove(pane_id);
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
+        self.pane_event_epochs.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
@@ -16066,6 +16073,29 @@ mod tests {
             "the session must carry the agent id `ListAgents` joins on"
         );
         assert_eq!(session.status, SessionStatus::Thinking);
+    }
+
+    /// PRD #1666: a pane's doorbell epoch is forgotten with the pane. An event
+    /// that changes what the doorbell reads moves the epoch; closing the pane
+    /// leaves no entry behind, so the map does not grow by one entry per pane
+    /// id ever seen.
+    #[test]
+    fn a_closed_panes_doorbell_epoch_is_forgotten() {
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        state.apply_event(agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID));
+        assert!(
+            state.pane_event_epochs.contains_key(CLI_PANE),
+            "precondition: the report moved the pane's doorbell epoch"
+        );
+
+        state.apply_daemon_pane_closed(CLI_PANE, Some(CLI_AGENT_ID));
+        assert!(!state.pane_event_epochs.contains_key(CLI_PANE));
+
+        state.apply_event(agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID));
+        state.unregister_pane(CLI_PANE);
+        assert!(!state.pane_event_epochs.contains_key(CLI_PANE));
     }
 
     /// The negative half, and the reason the fix registers panes at the spawn
