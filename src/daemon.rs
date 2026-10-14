@@ -736,12 +736,61 @@ pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), Da
     run_daemon_with(socket_path, Daemon::new(state)).await
 }
 
+/// PRD #1666: the environment settings of the typed delivery the inbox
+/// replaced. Each one used to tune a wait or a retry of a prompt the deck typed
+/// into a pane; the deck types nothing but the doorbell now, so none of them
+/// does anything.
+pub const REMOVED_DELIVERY_SETTINGS: &[&str] = &[
+    "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS",
+    "DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS",
+    "DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS",
+    "DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS",
+    "DOT_AGENT_DECK_SEED_FALLBACK_SECS",
+    "DOT_AGENT_DECK_SESSION_START_WAIT_MS",
+];
+
+/// Log one `warn!` for each [`REMOVED_DELIVERY_SETTINGS`] entry `is_set`
+/// reports, and return their names.
+fn warn_removed_delivery_settings(is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    let set: Vec<&'static str> = REMOVED_DELIVERY_SETTINGS
+        .iter()
+        .copied()
+        .filter(|name| is_set(name))
+        .collect();
+    for name in &set {
+        warn!(
+            setting = %name,
+            "{name} no longer has any effect: messages go through the agent's inbox"
+        );
+    }
+    set
+}
+
+#[cfg(test)]
+mod removed_delivery_settings_tests {
+    use super::*;
+
+    /// PRD #1666 (D-7): a removed delivery setting that is set is named, and
+    /// one that is not set, or any other variable, is not.
+    #[test]
+    fn removed_delivery_settings_that_are_set_are_named() {
+        let named = warn_removed_delivery_settings(|name| {
+            name == "DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS" || name == "DOT_AGENT_DECK_SOCKET"
+        });
+        assert_eq!(named, ["DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS"]);
+        assert!(warn_removed_delivery_settings(|_| false).is_empty());
+    }
+}
+
 /// Same as `run_daemon` but lets callers (and tests) inject a pre-built
 /// `Daemon` so they can hold a clone of the PTY registry alongside it.
 /// If `daemon.attach_socket_path` is set, the M1.2 streaming attach server
 /// is spawned alongside the hook-ingestion loop and aborted when this
 /// function returns.
 pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), DaemonError> {
+    // PRD #1666 (decision D-7): settings of the typed delivery the inbox
+    // replaced do nothing now; say so once rather than ignore them silently.
+    warn_removed_delivery_settings(|name| std::env::var_os(name).is_some());
     // PRD #819 M3: capture this daemon's own working directory ONCE, here, at
     // startup — the first of the four seeds its project enumeration draws on.
     // A process's cwd is not guaranteed stable, so reading it lazily at request
