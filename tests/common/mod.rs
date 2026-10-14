@@ -659,6 +659,9 @@ pub struct TuiDeck {
     home: PathBuf,
     hook_socket: PathBuf,
     attach_socket: PathBuf,
+    /// The final attach override, checked against this fixture at teardown.
+    /// Teardown must never fall back to the developer's default endpoint.
+    teardown_attach_socket: Option<PathBuf>,
     fixture_path: PathBuf,
     test_name: String,
     cols: u16,
@@ -1242,6 +1245,16 @@ impl TuiDeck {
         let daemon_log_path = final_env
             .get("DOT_AGENT_DECK_STATE_DIR")
             .map(|dir| PathBuf::from(dir).join("daemon.log"));
+        let teardown_attach_socket = final_env
+            .get("DOT_AGENT_DECK_ATTACH_SOCKET")
+            .map(PathBuf::from)
+            .map(|socket| {
+                if socket.is_absolute() {
+                    socket
+                } else {
+                    launch_dir.join(socket)
+                }
+            });
         for (k, v) in final_env {
             cmd.env(k, v);
         }
@@ -1347,6 +1360,7 @@ impl TuiDeck {
             home,
             hook_socket,
             attach_socket,
+            teardown_attach_socket,
             fixture_path: work,
             test_name,
             cols: builder.cols,
@@ -2459,9 +2473,8 @@ impl Drop for TuiDeck {
         // makes the spawned deck a session/process-group leader (pgid == pid),
         // so a negative-pid `kill` signals every non-detached descendant in its
         // group (best-effort; ignore errors). Then the normal child kill+wait
-        // as the fallback. (The deck's own lazy-spawned daemon setsid's into a
-        // separate session and escapes this group — its
-        // `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap is the net for that.)
+        // as the fallback. The lazy-spawned daemon has its own session, so it
+        // is stopped separately through this fixture's endpoint below.
         #[cfg(unix)]
         if let Some(pid) = self.child.process_id() {
             // SAFETY: kill(2) with a negative pid signals the process group;
@@ -2472,6 +2485,13 @@ impl Drop for TuiDeck {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+
+        // Stop after the TUI so it cannot lazily respawn a daemon, and before
+        // TempDir deletes the agents' working directories. The product stop
+        // drains the managed agent trees and pins the socket peer before any
+        // PID escalation. Keep the lifetime cap as the backstop for SIGKILL or
+        // a hung stop: Drop cannot run after a killed test process.
+        self.stop_sandbox_daemon();
 
         if let Some(h) = self.reader_handle.take() {
             let _ = h.join();
@@ -2512,6 +2532,66 @@ impl Drop for TuiDeck {
             // demand. `harness/teardown/001` pins this.
             if !panicking {
                 regenerate_paired_doc(&self.test_name);
+            }
+        }
+    }
+}
+
+impl TuiDeck {
+    fn stop_sandbox_daemon(&self) {
+        let Some(socket) = &self.teardown_attach_socket else {
+            return;
+        };
+        // Resolve after launch: an owned nested parent may not have existed
+        // yet, and an alias inside the fixture must not target an outside
+        // daemon. An absent socket needs no stop. Never ask endpoint discovery
+        // to choose another daemon when this check refuses the captured path.
+        if !std::fs::canonicalize(socket).is_ok_and(|socket| {
+            std::fs::canonicalize(self.tempdir.path()).is_ok_and(|root| socket.starts_with(root))
+        }) {
+            return;
+        }
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        command
+            .args(["daemon", "stop", "--force"])
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("DOT_AGENT_DECK_ATTACH_SOCKET", socket)
+            .env("DOT_AGENT_DECK_SOCKET", &self.hook_socket)
+            .current_dir(&self.fixture_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(state) = self.daemon_log_path.as_ref().and_then(|log| log.parent()) {
+            command.env("DOT_AGENT_DECK_STATE_DIR", state);
+        }
+        let mut stop = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("[tui-harness] could not stop sandbox daemon at {socket:?}: {error}");
+                return;
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match stop.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        eprintln!("[tui-harness] sandbox daemon stop at {socket:?}: {status}");
+                    }
+                    return;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => {
+                    eprintln!(
+                        "[tui-harness] sandbox daemon stop at {socket:?} did not finish: {result:?}"
+                    );
+                    let _ = stop.kill();
+                    let _ = stop.wait();
+                    return;
+                }
             }
         }
     }
