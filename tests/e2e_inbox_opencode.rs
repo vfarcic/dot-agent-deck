@@ -3,6 +3,8 @@
 mod common;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
+#[path = "support/inbox_route.rs"]
+mod route;
 use inbox::*;
 use serde_json::{Value, json};
 use spec::spec;
@@ -36,12 +38,15 @@ struct OpenCode {
     pane: Pane,
     daemon: common::DaemonProc,
     base: PathBuf,
+    /// With `{"offerPool": …}`: a stand-in orchestrator whose orchestration
+    /// offers jobs in that pool to the OpenCode pane.
+    orchestrator: Option<Pane>,
 }
 impl OpenCode {
     fn new(route: &str, config: Value) -> Self {
         let path = std::env::var("PATH").unwrap();
-        let daemon = daemon(&[
-            ("PATH", &path),
+        let mut env = vec![
+            ("PATH", path.as_str()),
             (
                 "DOT_AGENT_DECK_INBOX_ACK_WAIT_MS",
                 config["ackWaitMs"].as_str().unwrap_or("1500"),
@@ -51,7 +56,13 @@ impl OpenCode {
                 "DOT_AGENT_DECK_INBOX_MAX_DELIVER",
                 config["maxDeliver"].as_str().unwrap_or("5"),
             ),
-        ]);
+        ];
+        // The stand-in orchestrator's offer is posted from the test process,
+        // outside its pane's agent.
+        if config["offerPool"].is_string() {
+            env.push(("DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS", "1"));
+        }
+        let daemon = daemon(&env);
         let installed = daemon.home.join(".local/bin/dot-agent-deck");
         std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
         if !installed.exists()
@@ -100,12 +111,24 @@ impl OpenCode {
             module.display(),
             base.display()
         ));
-        let reply = attach(
-            &daemon,
-            json!({"op":"start-agent","command":command,"cwd":daemon.home,
+        let membership = |role: &str, index, start| {
+            json!({"kind":"orchestration", "name":"offers", "role_name":role,
+            "role_index":index, "is_start_role":start, "orchestration_id":"offers-fixture",
+            "orchestration_cwd":daemon.cwd()})
+        };
+        let pool = config["offerPool"].as_str();
+        let mut start = json!({"op":"start-agent","command":command,"cwd":daemon.home,
             "agent_type":"opencode","rows":40,"cols":140,
-            "env":[["DOT_AGENT_DECK_PANE_ID","opencode-fixture"],["PATH",path]],"display_name":"opencode fixture"}),
-        );
+            "env":[["DOT_AGENT_DECK_PANE_ID","opencode-fixture"],["PATH",path]],"display_name":"opencode fixture"});
+        if let Some(pool) = pool {
+            std::fs::write(
+                daemon.cwd().join(".dot-agent-deck.toml"),
+                format!("[[orchestrations]]\nname = 'offers'\n[[orchestrations.roles]]\nname = 'orchestrator'\ncommand = 'cat'\nstart = true\n[[orchestrations.roles]]\nname = 'worker'\ncommand = 'cat'\ntake_offers = ['{pool}']\n"),
+            )
+            .unwrap();
+            start["tab_membership"] = membership("worker", 1, false);
+        }
+        let reply = attach(&daemon, start);
         assert_eq!(reply["ok"], true, "plugin host: {reply}");
         let agent = reply["id"].as_str().unwrap().to_string();
         let token = tokio::runtime::Runtime::new()
@@ -120,7 +143,19 @@ impl OpenCode {
             capture: base.with_extension("bytes"),
             attach_socket: daemon.attach_socket.clone(),
         };
-        let result = Self { pane, daemon, base };
+        let orchestrator = pool.map(|_| {
+            route::start(
+                &daemon,
+                "offers-orchestrator",
+                json!({"tab_membership": membership("orchestrator", 0, true)}),
+            )
+        });
+        let result = Self {
+            pane,
+            daemon,
+            base,
+            orchestrator,
+        };
         result.wait_kind("ready");
         result
     }
@@ -1028,6 +1063,53 @@ fn opencode_024_a_prompt_queued_behind_a_long_turn_is_held_not_reinjected() {
     );
     op.acknowledge(&id);
     assert_eq!(op.prompts().len(), 1);
+}
+
+/// Scenario: The OpenCode pane is a worker that takes jobs from a pool, and its shown session is busy with a long turn when the orchestrator offers it a job, so the TUI plugin's prompt waits in OpenCode's queue. For four ack-waits every redelivery of the job is answered with hold: there is no second prompt, and the job stays with this worker instead of going back to its pool. When OpenCode answers the queued prompt, the plugin's acknowledgement claims the job.
+#[spec("inbox/opencode/027")]
+#[test]
+fn opencode_027_an_offer_queued_behind_a_long_turn_is_held_and_stays_assigned() {
+    let op = OpenCode::new("session", json!({"offerPool":"review"}));
+    armed(&op.daemon, &op.pane, 1);
+    op.session_status("shown", "busy");
+    let orch = op.orchestrator.as_ref().unwrap();
+    let mut req = request(orch, "inbox_offer");
+    req["pool"] = json!("review");
+    req["body"] = json!(BODY);
+    req["claim_ttl_ms"] = json!(120_000);
+    let reply = hook(&op.daemon, req);
+    let id = reply["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the offer is accepted: {reply}"))
+        .to_string();
+    op.wait_kind("prompt");
+    assert!(
+        !common::wait_until(Duration::from_millis(6000), || {
+            let state = op.message_state(&id);
+            !(state == "queued" || state == "fetched") || op.prompts().len() != 1
+        }),
+        "a held job stays with its holder with one prompt: state {}, events {:?}",
+        op.message_state(&id),
+        op.events()
+    );
+    assert!(
+        op.holds(&id) >= 2,
+        "each redelivery answers hold: {:?}",
+        op.events()
+    );
+    op.wait_kind("user-message");
+    let events = op.events();
+    let parent = events
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "user-message")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    op.assistant(&parent);
+    state(&op.daemon, &op.pane, &id, "claimed");
+    assert_eq!(op.prompts().len(), 1, "the job ran once");
 }
 
 /// Scenario: A deck task waits behind a busy OpenCode session, then the person aborts: the session goes idle without answering it. The deck's next redelivery prompts it again. A second task waits behind another long turn and the person reverts its prompt (OpenCode removes the message); its redelivery is prompted again too. Each is acknowledged once answered.

@@ -606,6 +606,29 @@ test("pi_inbox_021_a_redelivery_queued_behind_a_long_turn_answers_hold", async (
 	pi.shutdown();
 });
 
+/// Scenario: While Pi is busy with a long turn, a job the orchestrator offered this worker waits in Pi's follow-up queue, and the deck hands the unclaimed offer over again, twice. The extension answers each redelivery with hold, as it does for a direct message, so the deck keeps the job with this worker instead of offering it to another; Pi runs the job once when the turn ends, and its acknowledgement then claims it.
+test("pi_inbox_024_a_redelivered_offer_queued_behind_a_long_turn_answers_hold", async () => {
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [id] = idsN(1);
+	const offer = JSON.stringify({ id, subject: "job offered from pool review", from: "the orchestrator", text: BLOCK.replaceAll(ID, id) });
+	await pi.foreign("a long turn the user started");
+	child.stdout.emit("data", Buffer.from(offer + "\n"));
+	await pi.quiesce();
+	assert.deepEqual(holdsOf(child), [], "a first hand-over is not a hold");
+	for (let n = 1; n <= 2; n++) {
+		child.stdout.emit("data", Buffer.from(offer + "\n"));
+		await pi.quiesce();
+		assert.deepEqual(holdsOf(child), Array(n).fill(id), `redelivery ${n} of the offer answers hold`);
+	}
+	assert.equal(f.sent.length, 1, "an offer waiting in Pi's queue is not handed over again");
+	await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1, "the job runs once");
+	assert.deepEqual(acksOf(child), [id], "and its acknowledgement claims it");
+	pi.shutdown();
+});
+
 /// Scenario: Two inbox messages reach an idle Pi together; the second waits in the extension until the first one's hand-over settles, and the deck hands the second over again meanwhile. The extension answers that redelivery with hold and hands the second message to Pi once, after the first.
 test("pi_inbox_022_a_redelivery_held_behind_an_admission_answers_hold", async () => {
 	const f = fixture(); const pi = admission(f);

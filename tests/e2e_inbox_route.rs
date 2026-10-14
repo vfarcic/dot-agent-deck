@@ -614,3 +614,40 @@ fn route_010_a_late_ack_after_max_deliver_corrects_the_orchestrator() {
         "the correction names the task and the worker's role: {correction}"
     );
 }
+
+/// Scenario: A worker's component holds a delegated task without answering the deck's redeliveries, so the orchestrator is told the task has not reached the worker. The component then acknowledges it before the deck stops trying: the task is recorded as delivered, and the orchestrator gets exactly one correction naming the task and the worker's role, saying it reached the worker after all.
+#[spec("inbox/route/011")]
+#[test]
+fn route_011_an_ack_after_the_not_reached_notice_corrects_the_orchestrator_once() {
+    let daemon = daemon_unbound(&[
+        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "300"),
+        ("DOT_AGENT_DECK_INBOX_MAX_DELIVER", "100"),
+        (route::UNDELIVERED_MS, "600"),
+        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
+    ]);
+    let (orch, worker) = route::team(&daemon, false);
+    let mut stream = worker_stream(&daemon, &worker);
+    let id = route::delegate(&daemon, &orch, route::TASK, false);
+    handed_over(&mut stream, &id);
+    let notice = route::notice(&daemon, &orch, "has not reached the worker").to_string();
+    assert!(notice.contains(&id), "the notice names the task: {notice}");
+    writeln!(stream.get_mut(), "{}", json!({"ack":[id]})).unwrap();
+    state(&daemon, &worker, &id, "acknowledged");
+    let correction = route::notice(&daemon, &orch, "after all").to_string();
+    assert!(
+        correction.contains(&id) && correction.contains("coder"),
+        "the correction names the task and the worker's role: {correction}"
+    );
+    let corrections = || {
+        route::messages(&daemon, &orch)
+            .iter()
+            .filter(|m| m["subject"] == "task delivered after all")
+            .count()
+    };
+    assert!(
+        !common::wait_until(Duration::from_millis(1500), || corrections() > 1),
+        "one correction per task: {:?}",
+        route::messages(&daemon, &orch)
+    );
+    assert_eq!(corrections(), 1);
+}

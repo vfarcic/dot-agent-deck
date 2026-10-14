@@ -7171,6 +7171,13 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** the corrections the daemon posts (inbox/route/010 and the `inbox_hub` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/core/020 — A held offer stays with its holder until the bound.
+- **Layer:** L1 unit (src/inbox.rs).
+- **Agent:** none.
+- **Asserts:** an offer a stream fetched is handed to the same holder again at each ack-wait while the stream answers with `hold`, never reassigned and with its assignment count unchanged, and the holder's ack still claims it; it returns to its pool, excluding the holder, once the claim TTL or the hold bound (whichever is shorter) has passed since the assignment's first fetch, or when a re-hand-over goes unanswered; a once waiter's offer returns at the first ack-wait.
+- **Does not assert:** the stream wire (inbox/offer/007) or the consumers that answer hold (inbox/opencode/027, the Pi extension's node tests).
+- **Platform coverage:** mac+linux+windows.
+
 #### Protocol and waiter lifecycle
 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.
@@ -7608,6 +7615,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the recipient card's cleared notice (the `inbox_hub` and `state` unit tests).
 - **Platform coverage:** mac+linux.
 
+##### inbox/route/011 — An ack after the "has not reached the worker" notice corrects the orchestrator once.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 300 ms, `max_deliver` 100 and the undelivered notice at 600 ms.
+- **Agent:** scripted stand-ins; a stream component (`pi_extension`) armed from the test process that does not answer the redeliveries until it acknowledges.
+- **Asserts:** the orchestrator is told the task has not reached the worker; the component's ack makes it acknowledged and the orchestrator receives one correction naming the task and the worker's role, and no second one.
+- **Does not assert:** the correction after "is undeliverable" (inbox/route/010) or the told-both case (the `inbox_hub` unit tests).
+- **Platform coverage:** mac+linux.
+
 #### inbox/codex
 
 ##### inbox/codex/001 — The update-now startup dialog receives zero input bytes.
@@ -7842,6 +7856,13 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** real mini rendering.
 - **Cost:** none.
 
+##### inbox/opencode/027 — An offer queued behind a long turn is held and stays assigned.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), daemon with ack-wait 1.5 s.
+- **Agent:** fake OpenCode API running the generated full TUI plugin as a worker taking a pool's jobs; a stand-in orchestrator offers the job.
+- **Asserts:** with the shown session busy, each redelivery of the job over four ack-waits is answered with `hold`, with one prompt, and the job stays with the OpenCode worker; the matching assistant turn's acknowledgement claims it.
+- **Does not assert:** real OpenCode's queueing, or mini (whose hold path is the one inbox/opencode/026 covers).
+- **Cost:** none.
+
 ##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
 - **Agent:** generated server plugin under mini, full-TUI, run, serve and attach argv.
@@ -8072,6 +8093,13 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Asserts:** A role taking the review pool receives and claims the trusted offer, visibly performs its sentinel task exactly once, completes through its own CLI and puts a completion notice naming the id into the offerer's inbox.
 - **Does not assert:** Release, expiry or more than one competing live worker.
 - **Platform coverage:** mac+linux; developer credentials required.
+
+##### inbox/offer/007 — A job held behind a long turn is not reassigned.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_pubsub.rs`), real sandbox daemon with ack-wait 300 ms and `max_deliver` 2.
+- **Agent:** synthetic PTY recorders; stream components (`pi_extension`) for both workers armed from the test process.
+- **Asserts:** the holder's component is handed the job again at each ack-wait over ten ack-waits and answers with hold; the other worker never lists it and its component is never handed it; the holder's ack claims it and the offerer is told it was claimed.
+- **Does not assert:** the bound past which a held job returns to its pool (inbox/core/020) or a real consumer (inbox/opencode/027).
+- **Platform coverage:** mac+linux.
 
 #### inbox/load
 

@@ -682,10 +682,12 @@ impl InboxHub {
     /// Every older task to the same pane still owed is superseded first: a newer
     /// delegation replaces it.
     ///
-    /// `worker_holds` is asked, under this hub's lock, whether the worker's
-    /// agent still holds its pane, as [`Self::publish`]'s `revalidate` is: the
-    /// task is posted only when it does, and otherwise refused as
-    /// [`Stale::Scope`] — a worker swept before the post would hold it forever.
+    /// `worker_holds` is asked, under this hub's lock and before anything is
+    /// superseded, whether the worker's agent still holds its pane, as
+    /// [`Self::publish`]'s `revalidate` is: the task is posted only when it
+    /// does, and otherwise refused as [`Stale::Scope`] — a worker swept before
+    /// the post would hold it forever — with the tasks it would have
+    /// superseded left as they were.
     pub fn post_delegate(
         &self,
         worker: Recipient,
@@ -695,9 +697,8 @@ impl InboxHub {
         content: Content,
         worker_holds: &dyn Fn() -> bool,
     ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
-        self.supersede_delegates_to(&worker.pane_id);
         let (tx, rx) = oneshot::channel();
-        let id = {
+        let (id, superseded) = {
             let mut st = self.lock();
             let now = Instant::now();
             if let Some(id) = content.id.as_ref() {
@@ -706,6 +707,7 @@ impl InboxHub {
             if !worker_holds() {
                 return Err(PostRefusal::Stale(Stale::Scope));
             }
+            let superseded = retire_delegates_locked(&mut st, now, &worker.pane_id, |_| true);
             let id = st
                 .inbox
                 .post_direct(now, worker.clone(), content)
@@ -723,8 +725,11 @@ impl InboxHub {
                     ledger,
                 },
             );
-            id
+            (id, superseded)
         };
+        if superseded > 0 {
+            debug!(pane_id = %worker.pane_id, superseded, "inbox: older delegated tasks superseded");
+        }
         info!(message_id = %id, pane_id = %worker.pane_id, role, "inbox: delegated task posted");
         self.changed.notify_one();
         match &worker.agent_id {
@@ -769,36 +774,7 @@ impl InboxHub {
     fn retire_delegates_to(&self, pane_id: &str, retire: impl Fn(&Message) -> bool) -> usize {
         let retired = {
             let mut st = self.lock();
-            let now = Instant::now();
-            let ids: Vec<String> = st
-                .delegates
-                .iter()
-                .filter(|(_, watch)| watch.worker.pane_id == pane_id)
-                .map(|(id, _)| id.clone())
-                .collect();
-            let mut retired = 0;
-            for id in ids {
-                let live = st
-                    .inbox
-                    .get(&id, pane_id)
-                    .filter(|message| !message.state.is_terminal());
-                if live.is_some_and(|message| !retire(message)) {
-                    continue;
-                }
-                if st
-                    .inbox
-                    .retire(now, &id, pane_id, UndeliverableReason::Superseded)
-                {
-                    retired += 1;
-                } else if let Some(mut watch) = st.delegates.remove(&id) {
-                    // Already terminal without an event reaching the watch.
-                    if let Some(end) = watch.end.take() {
-                        let _ = end.send(DelegateEnd::Ended);
-                    }
-                }
-            }
-            drain_events(&mut st);
-            retired
+            retire_delegates_locked(&mut st, Instant::now(), pane_id, retire)
         };
         if retired > 0 {
             debug!(pane_id, retired, "inbox: older delegated tasks superseded");
@@ -1457,10 +1433,10 @@ impl InboxHub {
     /// PRD #1666 long-turn delivery: `consumer`, a stream, still holds message
     /// `id` — queued in the agent behind the turn in progress — and answered
     /// its redelivery with `hold` instead of handing it over again. The
-    /// redelivery is refunded ([`Inbox::hold`]), and while it is, a delegated
-    /// task's "has not reached the worker" notice waits a full
-    /// [`ENV_UNDELIVERED_NOTICE_AFTER_MS`] past the hold. Returns whether it
-    /// was refunded.
+    /// redelivery is refunded, or an offer kept with its holder
+    /// ([`Inbox::hold`]), and while it is, a delegated task's "has not reached
+    /// the worker" notice waits a full [`ENV_UNDELIVERED_NOTICE_AFTER_MS`] past
+    /// the hold. Returns whether the hold was honoured.
     pub fn hold(&self, id: &str, pane_id: &str, agent_id: &str, consumer: &Consumer) -> bool {
         let refunded = {
             let mut st = self.lock();
@@ -1741,6 +1717,44 @@ fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBud
     count
 }
 
+/// [`InboxHub::retire_delegates_to`] under a lock already held.
+fn retire_delegates_locked(
+    st: &mut HubState,
+    now: Instant,
+    pane_id: &str,
+    retire: impl Fn(&Message) -> bool,
+) -> usize {
+    let ids: Vec<String> = st
+        .delegates
+        .iter()
+        .filter(|(_, watch)| watch.worker.pane_id == pane_id)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut retired = 0;
+    for id in ids {
+        let live = st
+            .inbox
+            .get(&id, pane_id)
+            .filter(|message| !message.state.is_terminal());
+        if live.is_some_and(|message| !retire(message)) {
+            continue;
+        }
+        if st
+            .inbox
+            .retire(now, &id, pane_id, UndeliverableReason::Superseded)
+        {
+            retired += 1;
+        } else if let Some(mut watch) = st.delegates.remove(&id) {
+            // Already terminal without an event reaching the watch.
+            if let Some(end) = watch.end.take() {
+                let _ = end.send(DelegateEnd::Ended);
+            }
+        }
+    }
+    drain_events(st);
+    retired
+}
+
 /// Log the inbox's state changes and broadcast each one to attached clients.
 /// An offer back in its pool has no pane to show it on, so it is only logged.
 fn drain_events(st: &mut HubState) {
@@ -1933,6 +1947,21 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
         let _ = tx.send(end);
     }
     if end != DelegateEnd::Ended {
+        // PRD #1666 long-turn delivery: its orchestrator was told the task
+        // has not reached the worker, and it has. A task that ran out of
+        // hand-overs first has no watch left here; its late ack is corrected
+        // by [`settle_late_ack`] instead, so each task is corrected once.
+        if watch.notified
+            && let Some(to) = watch.orchestrator
+        {
+            info!(
+                message_id = %id,
+                pane_id = %watch.worker.pane_id,
+                "inbox: a task reported as not reaching its worker was acknowledged"
+            );
+            let body = compose_late_ack_notice(id, &watch.role, LateAckReport::NotReached);
+            st.owed_notices.push((to, LATE_ACK_SUBJECT, body));
+        }
         st.received_since_done.insert(watch.worker.pane_id);
         return;
     }
@@ -2033,7 +2062,11 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
     if let Some((to, role)) = record.orchestrator {
         st.received_since_done
             .insert(record.recipient.pane_id.clone());
-        let body = compose_late_ack_notice(event.message_id.as_str(), &role);
+        let body = compose_late_ack_notice(
+            event.message_id.as_str(),
+            &role,
+            LateAckReport::Undeliverable,
+        );
         st.owed_notices.push((to, LATE_ACK_SUBJECT, body));
     }
     let still_owed = st
@@ -2110,12 +2143,27 @@ pub fn compose_undeliverable_notice(
     )
 }
 
+/// PRD #1666 long-turn delivery: which report about a delegated task a late
+/// ack corrects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateAckReport {
+    /// "has not reached the worker" ([`compose_undelivered_notice`]).
+    NotReached,
+    /// "is undeliverable" ([`compose_undeliverable_notice`]).
+    Undeliverable,
+}
+
 /// PRD #1666 long-turn delivery: the correction an orchestrator gets when a
-/// task it was told was undeliverable is acknowledged by its worker after all.
-pub fn compose_late_ack_notice(message_id: &str, role: &str) -> String {
+/// task it was told had not reached its worker, or was undeliverable, is
+/// acknowledged by its worker after all.
+pub fn compose_late_ack_notice(message_id: &str, role: &str, report: LateAckReport) -> String {
+    let reported = match report {
+        LateAckReport::NotReached => "it had not reached the worker",
+        LateAckReport::Undeliverable => "it undeliverable",
+    };
     format!(
         "Correction: task {message_id} to the worker in role {} reached the worker after all - \
-         it acknowledged the task after the deck reported it undeliverable, so disregard that \
+         it acknowledged the task after the deck reported {reported}, so disregard that \
          report. The worker is working on it and its work-done can arrive. If you already \
          re-delegated or reassigned the task, it may now be done twice: check the worker's \
          pane and decide whether to stop one of them, or notify the user.",
@@ -2156,6 +2204,7 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
         history: Vec::new(),
         excluded: Vec::new(),
         assign_deadline: None,
+        offer_hold: crate::inbox::OfferHold::NotAsked,
     };
     // Counted with the separator a hand-over puts before each block.
     let budget = tightest_hand_over().less(BLOCK_SEPARATOR);
@@ -3781,6 +3830,108 @@ mod tests {
         hub.undelivered_after = Duration::ZERO;
         hub.tick();
         assert!(hub.list("o").is_empty());
+    }
+
+    /// PRD #1666 long-turn delivery: a delegated task its orchestrator was told
+    /// has not reached the worker, then acknowledged by the worker before the
+    /// deck stops trying, gets one correction naming it. The card was never
+    /// told, so it is not cleared. A task told both "has not reached" and
+    /// "undeliverable" before its late ack is still corrected once.
+    #[tokio::test]
+    async fn an_ack_after_the_not_reached_notice_corrects_the_orchestrator_once() {
+        let limits = InboxLimits {
+            max_deliver: 1,
+            ..InboxLimits::default()
+        };
+        let mut hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        hub.undelivered_after = Duration::ZERO;
+        let told: Arc<Mutex<Vec<(String, bool)>>> = Arc::default();
+        let sink = Arc::clone(&told);
+        hub.set_card_notice_sink(Arc::new(move |notice| {
+            sink.lock()
+                .unwrap()
+                .push((notice.delivery_id.clone(), notice.cleared));
+        }));
+        let corrections = |hub: &InboxHub| {
+            hub.list("o")
+                .iter()
+                .filter(|m| m.subject == LATE_ACK_SUBJECT)
+                .count()
+        };
+
+        let task = delegate(&hub, "TASK-NOT-REACHED");
+        assert_eq!(
+            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
+            1
+        );
+        hub.tick();
+        let notices = hub.list_with_bodies(Some("o"));
+        assert_eq!(notices.len(), 1, "told it has not reached: {notices:?}");
+        assert!(
+            notices[0]
+                .text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("has not reached the worker")
+        );
+        assert_eq!(
+            hub.ack(task.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
+            AckOutcome::Acknowledged
+        );
+        let notices = hub.list_with_bodies(Some("o"));
+        assert_eq!(notices.len(), 2, "one correction: {notices:?}");
+        let correction = notices.last().unwrap();
+        assert_eq!(correction.subject, LATE_ACK_SUBJECT);
+        let body = correction.text.as_deref().unwrap_or_default();
+        assert!(
+            body.contains(task.as_str())
+                && body.contains("coder")
+                && body.contains("had not reached the worker"),
+            "the correction names the task, the role and the report it corrects: {body}"
+        );
+        assert!(told.lock().unwrap().is_empty(), "the card was never told");
+        assert_eq!(
+            hub.ack(task.as_str(), "w", "wa", AckHow::Explicit),
+            AckOutcome::AlreadyAcknowledged
+        );
+        hub.tick();
+        assert_eq!(corrections(&hub), 1);
+
+        // Told both, then acknowledged late: still one correction.
+        let task = delegate(&hub, "TASK-TOLD-TWICE");
+        hub.fetch("w", "wa", Consumer::FetchCli, None, None);
+        hub.tick();
+        assert!(hub.nack(task.as_str(), "w", "wa"));
+        assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
+        assert_eq!(
+            hub.ack(task.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
+            AckOutcome::Acknowledged
+        );
+        hub.tick();
+        assert_eq!(corrections(&hub), 2, "one more correction, for this task");
+    }
+
+    /// Reviewer nit: a delegation refused because the worker's agent no longer
+    /// holds its pane supersedes nothing — the task already owed to the pane
+    /// stays queued and watched.
+    #[tokio::test]
+    async fn a_stale_delegation_supersedes_nothing() {
+        let hub = hub();
+        let older = delegate(&hub, "OLDER-TASK");
+        let refused = hub.post_delegate(
+            Recipient::bound("w", "wa"),
+            "coder",
+            Some(Recipient::bound("o", "oa")),
+            DelegateLedger::default(),
+            content("STALE-TASK"),
+            &|| false,
+        );
+        assert!(matches!(refused, Err(PostRefusal::Stale(Stale::Scope))));
+        assert_eq!(state_in(&hub, "w", &older), StateName::Queued);
+        assert!(hub.lock().delegates.contains_key(older.as_str()));
+        let newer = delegate(&hub, "NEWER-TASK");
+        assert_eq!(state_in(&hub, "w", &newer), StateName::Queued);
+        assert_eq!(state_in(&hub, "w", &older), StateName::Undeliverable);
     }
 
     /// PRD #1666 long-turn delivery: an ack that arrives after a message ran
