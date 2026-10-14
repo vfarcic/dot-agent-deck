@@ -1408,77 +1408,6 @@ pub struct AppState {
     /// keeping the local announcement still converges. Kept in step with the
     /// map at each site that writes it.
     pane_generation_announced: HashSet<String>,
-    /// Issue #915 (finding 4): how many of each AGENT's own hook generations
-    /// have ended, keyed by the registry agent id the `SessionEnd` carried.
-    ///
-    /// The daemon's write guard has a deliberate carve-out for the
-    /// `(caller named no generation, pane has no current generation)` pair,
-    /// because an agent that never emits a generation legitimately carries
-    /// neither side of the comparison. A `None` current generation is not proof
-    /// that that is what it is looking at: [`Self::pane_hook_session`] is
-    /// REMOVED when a matching, non-superseded `SessionEnd` lands, while the
-    /// registry agent and its pane stay alive — so a conversation that has just
-    /// ended reads there exactly like an agent that never had one. During a
-    /// `/clear` or a thread restart the successor's `SessionStart` has not
-    /// landed yet, and a caller that knows the stable agent id but names no
-    /// generation could land a write in that gap. This is the evidence that
-    /// tells the two apart.
-    ///
-    /// **Keyed by AGENT, never by pane, and that is the whole design.**
-    /// [`Self::pane_generation_closures`] records the same transition but keyed
-    /// by pane, and nothing ever removes an entry when a pane closes or is
-    /// recycled (its only `.remove()` calls are the snapshot-and-restore inside
-    /// [`Self::apply_daemon_report_event`], which is not a cleanup path). A
-    /// pane-keyed witness would therefore refuse EVERY future sessionless agent
-    /// that ever inherits that pane id, for the daemon's remaining lifetime —
-    /// permanently, not in a race window — which is exactly the "refuses the
-    /// sessionless agents the carve-out exists to protect" failure this had to
-    /// avoid. Registry agent ids are monotonic and never recycled within a
-    /// daemon process ([`crate::agent_pty::AgentPtyRegistry::spawn_agent`]), and
-    /// `AppState` is in-memory and dies with that process, so the map and the id
-    /// space reset together.
-    ///
-    /// FAILS OPEN when the evidence is absent, in two ways. `AgentEvent::agent_id`
-    /// is an `Option` and events from external agents (or any producer that lost
-    /// `DOT_AGENT_DECK_AGENT_ID` on the way) carry `None`, so no witness is
-    /// recorded and the carve-out accepts the write exactly as it did before;
-    /// and (round-2 audit finding 1) an event whose named agent the registry
-    /// cannot confirm holds the named pane records nothing either. Both are
-    /// degradations to the previous behaviour rather than new holes, and both
-    /// are the right default — the alternative refuses the very agents the
-    /// carve-out exists for, and lets a forged event refuse them on somebody
-    /// else's behalf — but they are documented limits, not guarantees. See
-    /// [`Self::apply_event`]'s `SessionEnd` branch for the ownership check.
-    ///
-    /// **An entry is PERMANENT, and that is the policy rather than a missing
-    /// cleanup.** Any count above zero is a witnessed end, so from
-    /// the first end onward every unnamed automatic delivery bound to that agent
-    /// is refused *for as long as the pane it targets has no current
-    /// generation* — which is precisely the state the guard exists to refuse,
-    /// and which no elapsed time makes safe. Once a successor announces itself
-    /// the witness stops mattering: [`Self::pane_hook_session`] is populated
-    /// again and the guard's unnamed arm refuses on that check first, and if
-    /// that conversation also ends the witness is correct again. The residual
-    /// availability cost is an agent whose successor `SessionStart` the daemon
-    /// never observes: it is live, in a real conversation, and its unnamed
-    /// automatic deliveries stay refused. Eviction
-    /// would not recover that case. The two places a registry record actually
-    /// goes away — `AgentPtyRegistry::close_agent` and the replace-in-place
-    /// inside `respawn_agent_for_pane` — both retire the agent as they remove
-    /// it, so by the time an eviction hooked there could fire, `write_guarded`
-    /// is already refusing that id as `NoLiveTarget` before this is ever read.
-    /// An agent that merely exits keeps its record (flagged `exited`) and so
-    /// would not be evicted by either hook anyway. The one `.remove()` this map
-    /// has is the snapshot-and-restore inside [`Self::apply_daemon_report_event`]
-    /// — not a cleanup path, exactly the shape
-    /// [`Self::pane_generation_closures`] has.
-    ///
-    /// Monotonic per agent, `u64`, in memory only; it grows by one per real
-    /// conversation end. The keys are registry-minted ids this daemon confirmed
-    /// ownership of, so neither the entry count nor the key length is
-    /// caller-steerable; the count is bounded by the conversations ended by
-    /// agents this daemon spawned.
-    agent_generation_closures: HashMap<String, u64>,
     /// Issue #1520: how many times this state's event stream has broken — the
     /// TUI's subscriber lost its `SubscribeEvents` connection (a `KIND_STREAM_END
     /// "lagged"`, a daemon restart, a transport error) and so missed whatever the
@@ -5720,8 +5649,8 @@ impl AppState {
     ///
     /// Rather than reason about which stamping choices happen to be inert, every
     /// piece of state that records a generation transition is snapshotted and
-    /// restored around the apply — the pane's generation entry, its closure
-    /// count, and (issue #915) the agent-keyed ended-generation witness. That
+    /// restored around the apply — the pane's generation entry, whether it was
+    /// announced, and its closure count. That
     /// makes "a delivery report never moves the generation, forward or backward"
     /// a property of this function instead of a property of the caller's timing,
     /// and it holds for the placeholder-only pane the old comment listed as a
@@ -5732,23 +5661,6 @@ impl AppState {
     /// visible exactly like any other event on that card.
     pub fn apply_daemon_report_event(&mut self, event: AgentEvent) {
         let pane_id = event.pane_id.clone();
-        // Issue #915 round-2 audit (finding 3): the AGENT-keyed witness is
-        // snapshotted for the same reason as the two pane-keyed entries below,
-        // and it is the one whose absence would cost the most. The pane-keyed
-        // closure count is a COUNTER compared against a snapshot, so a spurious
-        // bump abandons one delivery; `agent_generation_closures` is a LATCH, so
-        // a spurious bump refuses that agent's every later unnamed automatic
-        // delivery for the daemon's remaining lifetime. Not reachable today —
-        // the only production caller (`install_delivery_notice_sink`) synthesizes
-        // an `EventType::Error`, which never enters the `SessionEnd` branch that
-        // writes this — but "a delivery report never moves the generation" is
-        // meant to be a property of THIS function rather than of what its callers
-        // happen to synthesize, and the third map records the same transition as
-        // the first two.
-        let agent_id = event.agent_id.clone();
-        let agent_closures_before = agent_id
-            .as_ref()
-            .and_then(|agent| self.agent_generation_closures.get(agent).copied());
         let before = pane_id
             .as_ref()
             .and_then(|pane| self.pane_hook_session.get(pane).cloned());
@@ -5783,16 +5695,6 @@ impl AppState {
                 }
                 None => {
                     self.pane_generation_closures.remove(&pane);
-                }
-            }
-        }
-        if let Some(agent) = agent_id {
-            match agent_closures_before {
-                Some(count) => {
-                    self.agent_generation_closures.insert(agent, count);
-                }
-                None => {
-                    self.agent_generation_closures.remove(&agent);
                 }
             }
         }
@@ -5872,26 +5774,6 @@ impl AppState {
     pub fn pane_generation_closures(&self, pane_id: &str) -> u64 {
         self.pane_generation_closures
             .get(pane_id)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Issue #915 (finding 4): record that `agent_id`'s own established
-    /// generation just ended. See [`Self::agent_generation_closures`].
-    fn note_agent_generation_closed(&mut self, agent_id: &str) {
-        let entry = self
-            .agent_generation_closures
-            .entry(agent_id.to_string())
-            .or_insert(0);
-        *entry = entry.saturating_add(1);
-    }
-
-    /// Issue #915 (finding 4): how many conversations of `agent_id`'s own have
-    /// ended over this daemon's lifetime. See
-    /// [`Self::agent_generation_closures`].
-    pub fn agent_generation_closures(&self, agent_id: &str) -> u64 {
-        self.agent_generation_closures
-            .get(agent_id)
             .copied()
             .unwrap_or(0)
     }
@@ -6185,10 +6067,6 @@ impl AppState {
             (
                 "waiting_superseded_sessions",
                 self.waiting_superseded_sessions.len(),
-            ),
-            (
-                "agent_generation_closures",
-                self.agent_generation_closures.len(),
             ),
         ]
     }
@@ -11109,77 +10987,6 @@ impl AppState {
                 // snapshot afterwards that there WAS one. See
                 // [`Self::pane_generation_closures`].
                 self.note_generation_closed(pane_id);
-                // Issue #915 (finding 4): the same transition, recorded against
-                // the AGENT the ending event names rather than against the pane
-                // it was sitting on. The daemon's write guard needs this to tell
-                // a just-ended conversation from an agent that never had one —
-                // both of which leave `pane_hook_session` empty from here on.
-                // Keyed by agent because the pane-keyed counter above is never
-                // cleaned up on pane recycle, so reading THAT one here would
-                // refuse a genuinely sessionless successor forever. See
-                // [`Self::agent_generation_closures`]; a producer that named no
-                // agent id records nothing and the guard keeps its carve-out.
-                //
-                // ROUND-2 AUDIT (finding 1): the named id is not taken at face
-                // value, and that check is the whole difference between a
-                // witness and a weapon. `owns_pane_event` admits an event whose
-                // pane is merely in `managed_pane_ids`, and in a process with no
-                // oracle an entry there is still establishable by posting an
-                // unmarked `SessionStart` for an INVENTED pane id (the TUI's
-                // startup-race branch). In the daemon it no longer is (issue
-                // #601: an outside start is recorded as unproven, never in
-                // `managed_pane_ids`), but the registry check below is what
-                // holds in every process, so it stays. So without
-                // this, any same-uid process holding the hook socket could post
-                // a `SessionEnd` for a pane it invented while naming a VICTIM
-                // agent that sits on a different pane, and the victim's every
-                // later unnamed automatic delivery would be refused for as long
-                // as this daemon runs. Registry ids are sequential decimal
-                // strings from `"1"`, so the whole live id space is one pass —
-                // and future agents can be poisoned before they spawn.
-                //
-                // [`crate::event`]'s own doctrine is the fix: provenance is
-                // established by the DAEMON, at the site that acts on it. The
-                // witness is recorded only where the registry confirms that this
-                // agent holds this pane — the binding `generation_ownership`
-                // already computes and the `registration_admits` fallback
-                // deliberately does not enforce. It costs nothing on the honest
-                // path: a real `SessionEnd` from a real agent on its own pane is
-                // [`Ownership::Owned`].
-                //
-                // [`Ownership::Unclaimed`] and [`Ownership::Unknown`] record
-                // NOTHING. This effect is adverse to the agent it names, so
-                // absence of evidence must not grant it, and withholding the
-                // witness degrades to exactly the fail-open the absent-`agent_id`
-                // case already takes.
-                //
-                // A `None` oracle is a different answer from `Unclaimed` and is
-                // deliberately admitted: it means no oracle was installed AT ALL
-                // — the TUI and every bare-[`AppState`] test — where the
-                // historical pane-set rule stands in full and nothing reads this
-                // map. Both of the daemon's serving paths install it before they
-                // accept anything (`crate::daemon::run_daemon_with` ahead of its
-                // hook loop, `crate::daemon_protocol::serve_attach_with_counter`
-                // ahead of its accept loop, idempotently), so in the daemon this
-                // is an ownership check and not the historical fallback.
-                //
-                // Issue #697: and never for an unproven event. A client with no
-                // oracle reads the `None` arm above, so without this an outside
-                // agent's `SessionEnd` naming any id it liked would grow this
-                // agent-keyed map without bound there. A frame carrying the
-                // daemon's unproven marker is always unproven here: the one
-                // marked frame that reaches a card of this process's own, the
-                // orphan survivor's report, returned above without getting here.
-                if !unproven
-                    && !marked_unproven
-                    && let Some(agent_id) = event.agent_id.as_deref()
-                    && matches!(
-                        self.oracle_ownership(Some(pane_id.as_str()), Some(agent_id)),
-                        None | Some(Ownership::Owned)
-                    )
-                {
-                    self.note_agent_generation_closed(agent_id);
-                }
             }
             // Preserve started_at for the pane so a restarted session keeps its position.
             //
@@ -11405,17 +11212,6 @@ impl AppState {
                 //   closure. That is the launcher case #424 exists for: the first
                 //   genuine announcement after our write is the conversation we
                 //   are still trying to reach, not one we missed.
-                //
-                // Issue #915 round-2 audit (finding 2): this site deliberately
-                // does NOT also call `note_agent_generation_closed`, and the
-                // asymmetry with the `SessionEnd` branch above is not an
-                // omission. The agent-keyed witness exists only to disambiguate
-                // an EMPTY `pane_hook_session`, and a rollover leaves one
-                // populated — the successor generation is inserted immediately
-                // below — so the unnamed arm of the write guard refuses on its
-                // first check (`pane_hook_session_id(...).is_some()`) without
-                // ever consulting the witness. Recording one here would change
-                // no decision.
                 if announces_generation
                     && self
                         .pane_hook_session
@@ -12169,102 +11965,6 @@ impl AppState {
 mod tests {
     use super::*;
     use spec::spec;
-
-    /// Issue #915 (finding 4): the ended-generation witness the daemon's write
-    /// guard reads is recorded against the AGENT that ended, is not inherited by
-    /// a successor on the same pane, and is simply absent for a producer that
-    /// named no agent id.
-    ///
-    /// All three properties are the design, not incidental. Keying by pane would
-    /// have refused every future sessionless agent on that pane id for the
-    /// daemon's lifetime, because the pane-keyed counter next door is never
-    /// cleaned up on recycle; and the absent-evidence case has to keep reading
-    /// as "no witness" so the guard's carve-out for genuinely sessionless agents
-    /// survives.
-    #[test]
-    fn an_ended_generation_is_witnessed_against_its_agent_not_its_pane() {
-        fn end(session: &str, pane: &str, agent: Option<&str>, secs: i64) -> AgentEvent {
-            AgentEvent {
-                session_id: session.to_string(),
-                agent_type: AgentType::ClaudeCode,
-                event_type: EventType::SessionEnd,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
-                user_prompt: None,
-                metadata: Default::default(),
-                pane_id: Some(pane.to_string()),
-                agent_id: agent.map(|a| a.to_string()),
-                agent_version: None,
-                schema_version: None,
-                live_target: None,
-            }
-        }
-        fn start(session: &str, pane: &str, agent: &str, secs: i64) -> AgentEvent {
-            let mut ev = end(session, pane, Some(agent), secs);
-            ev.event_type = EventType::SessionStart;
-            ev
-        }
-
-        let mut state = AppState::default();
-        state.register_pane("pane".to_string());
-
-        // Nothing has ended yet: the guard's carve-out applies to every agent.
-        assert_eq!(state.agent_generation_closures("agent-1"), 0);
-
-        // A conversation runs and ends on `agent-1`. The pane's generation is
-        // gone — which is exactly what makes the pane unable to tell this apart
-        // from an agent that never had one — but the witness remembers.
-        state.apply_event(start("gen-a", "pane", "agent-1", 1));
-        assert_eq!(state.pane_hook_session_id("pane").as_deref(), Some("gen-a"));
-        state.apply_event(end("gen-a", "pane", Some("agent-1"), 2));
-        assert!(
-            state.pane_hook_session_id("pane").is_none(),
-            "the ended generation must leave `pane_hook_session` empty — the ambiguity this \
-             witness exists to resolve"
-        );
-        assert_eq!(state.agent_generation_closures("agent-1"), 1);
-
-        // The pane changes hands. `agent-2` has never had a generation, so it
-        // must NOT inherit its predecessor's witness — a pane-keyed witness
-        // would refuse it here, and every later occupant of this pane id too.
-        assert_eq!(
-            state.agent_generation_closures("agent-2"),
-            0,
-            "a successor on the same pane id must not inherit the departed agent's witness"
-        );
-
-        // A second rollover on `agent-1` (a `/clear`) counts again, and does not
-        // touch the successor.
-        state.apply_event(start("gen-b", "pane", "agent-1", 3));
-        state.apply_event(end("gen-b", "pane", Some("agent-1"), 4));
-        assert_eq!(state.agent_generation_closures("agent-1"), 2);
-        assert_eq!(state.agent_generation_closures("agent-2"), 0);
-
-        // A producer that named NO agent id records nothing. The guard then
-        // behaves exactly as it did before this change for that producer — the
-        // fail-open limit, pinned so it is a decision rather than a surprise.
-        state.register_pane("external".to_string());
-        state.apply_event(start("gen-x", "external", "agent-3", 5));
-        let mut anonymous = end("gen-x", "external", None, 6);
-        anonymous.agent_id = None;
-        state.apply_event(anonymous);
-        assert!(
-            state.pane_hook_session_id("external").is_none(),
-            "the anonymous end must still clear the pane's generation"
-        );
-        assert_eq!(
-            state.agent_generation_closures("agent-3"),
-            0,
-            "an event that names no agent id witnesses nothing — fail-open by design"
-        );
-        assert_eq!(
-            state.pane_generation_closures("external"),
-            1,
-            "the pane-keyed counter still counts it; only the agent-keyed witness needs an id"
-        );
-    }
 
     /// Issue #1395 item 2: an ended orchestration's context file is answered
     /// for deletion only once its last pane is gone, and never while another
@@ -18387,7 +18087,7 @@ mod tests {
     /// pane. Outside reports stamped orphaned for that pane arrive as far more
     /// start/end pairs than the outside-card budget, each naming a fresh
     /// session and a fresh agent id. No map the client keeps may grow with
-    /// them — in particular no agent-keyed closure record may be written.
+    /// them.
     #[test]
     fn hook_provenance_audit_client_orphan_flood_retains_nothing_per_agent() {
         let mut client = hook_provenance_audit_orphan_client();
@@ -18402,13 +18102,6 @@ mod tests {
                 ));
             }
         }
-        // The survivor's own end writes no agent-keyed witness either: the
-        // frame is still an outside report.
-        client.apply_event(hook_provenance_audit_orphan_frame(
-            "survivor-card",
-            Some(AUDIT_SURVIVOR),
-            EventType::SessionEnd,
-        ));
         let sizes = client.retained_map_sizes();
         for (map, size) in &sizes {
             assert!(
@@ -18416,12 +18109,6 @@ mod tests {
                 "`{map}` retains {size} entries after an orphan flood: {sizes:?}"
             );
         }
-        let closures = sizes
-            .iter()
-            .find(|(map, _)| *map == "agent_generation_closures")
-            .map(|(_, size)| *size);
-        assert_eq!(closures, Some(0), "{sizes:?}");
-        assert_eq!(client.agent_generation_closures(AUDIT_SURVIVOR), 0);
     }
 
     /// An outside agent's start on `pane`, as the daemon relays it.
@@ -18686,7 +18373,6 @@ mod tests {
             .remove(crate::event::DAEMON_NO_LIVE_AGENT_METADATA_KEY);
         client.apply_event(unmarked);
         assert_eq!(client.sessions["survivor-card"].status, SessionStatus::Idle);
-        assert_eq!(client.agent_generation_closures.len(), 0);
     }
 
     /// Scenario: A client stayed attached across a daemon restart and still

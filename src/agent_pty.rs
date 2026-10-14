@@ -5625,8 +5625,7 @@ struct RegistryInner {
     /// frame can be (a per-pane cap did exactly that; Qodo on PR #1389). It
     /// grows by one registry-minted id per published spawn that names a pane —
     /// a short decimal string, since `next_id` only ever increments — for the
-    /// life of the daemon, which is the same growth class as
-    /// `AppState::agent_generation_closures`.
+    /// life of the daemon.
     pane_generations: HashMap<String, HashSet<String>>,
     /// Issue #454: spawns that have been ADMITTED but whose `RunningAgent` is
     /// not in `agents` yet — keyed by the pre-allocated agent id, valued by the
