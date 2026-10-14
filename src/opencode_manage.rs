@@ -942,12 +942,17 @@ const inboxInPane = () =>
 // `parentID` names only the last of them, so a turn acknowledges every user
 // message its session had up to that parent. `users` maps each user message
 // to its session and the order this process first saw it (OpenCode's ids are
-// time-ordered too); a message OpenCode removes, as a revert does, leaves it.
+// time-ordered too), at most INBOX_MAX_TRACKED of them; a message OpenCode
+// removes, as a revert does, leaves it and every `pendings` map, so nothing
+// acknowledges it any more.
 let inboxUserSeq = 0;
-const inboxObserveUsers = (users, event) => {
+const inboxObserveUsers = (users, event, ...pendings) => {
   const properties = event?.properties;
   if (event?.type === "message.removed") {
-    if (properties?.messageID) users.delete(properties.messageID);
+    if (properties?.messageID) {
+      users.delete(properties.messageID);
+      for (const pending of pendings) pending.delete(properties.messageID);
+    }
     return;
   }
   const info = properties?.info;
@@ -957,17 +962,20 @@ const inboxObserveUsers = (users, event) => {
   }
 };
 // The keys of `pending` (user message ids) that `assistant`'s turn answered:
-// its parent, and every earlier user message of the same session.
+// its parent, and every earlier user message of the same session. Only a
+// parent this process saw, still there and in the assistant's session,
+// answers anything: one removed or reverted since is no longer answered.
 const inboxCovered = (users, pending, assistant) => {
   const parentID = assistant?.parentID;
   if (!parentID) return [];
   const parent = users.get(parentID);
-  const sessionID = assistant.sessionID ?? parent?.sessionID;
+  if (!parent) return [];
+  const sessionID = assistant.sessionID ?? parent.sessionID;
+  if (parent.sessionID !== sessionID) return [];
   return [...pending.keys()].filter((key) => {
     if (key === parentID) return true;
     const user = users.get(key);
-    return !!parent && !!user && parent.sessionID === sessionID &&
-      user.sessionID === sessionID && user.seq <= parent.seq;
+    return !!user && user.sessionID === sessionID && user.seq <= parent.seq;
   });
 };
 // The deck message ids whose opener `text` carries.
@@ -1224,7 +1232,7 @@ const inboxAck = (assistant) => {
 
 const observeInbox = (event) => {
   try {
-    inboxObserveUsers(inboxUsers, event);
+    inboxObserveUsers(inboxUsers, event, intercepted, miniPending);
     const type = event?.type;
     const properties = event?.properties;
     if (type === "session.created") {
@@ -1452,7 +1460,7 @@ const tui = async (api) => {
     });
     api.event.on("message.removed", (event) => {
       try {
-        inboxObserveUsers(users, event);
+        inboxObserveUsers(users, event, pending);
       } catch (_) {}
     });
     api.event.on("message.part.updated", (event) => {
@@ -3851,6 +3859,71 @@ for (const bad of ["", "0", "1.5", "soon", "3600001"]) {
   process.env[ENV] = bad;
   check(inboxFirstBackoff(), 1000, "unreadable " + bad);
 }
+"#
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .expect("run node");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// PRD #1666 final audit (OpenCode note) and review N-3: a deck prompt
+    /// OpenCode removes — a revert — is no longer waiting for an answer, so
+    /// its acknowledgement is dropped, and a late assistant message naming it
+    /// as parent acknowledges nothing; nor does one whose parent is in another
+    /// session. The record of user messages stays bounded however long the
+    /// session runs.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_removed_or_foreign_parent_acknowledges_nothing() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let script = format!(
+            "{}\n{}",
+            inbox_js(""),
+            r#"
+const check = (actual, expected, what) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    console.error(what + ": " + JSON.stringify(actual) + " != " + JSON.stringify(expected));
+    process.exit(1);
+  }
+};
+const user = (id, sessionID) =>
+  ({ type: "message.updated", properties: { info: { role: "user", id, sessionID } } });
+const removed = (messageID, sessionID) =>
+  ({ type: "message.removed", properties: { sessionID, messageID } });
+const users = new Map();
+const pending = new Map();
+
+inboxObserveUsers(users, user("u1", "s1"));
+pending.set("u1", ["m-1"]);
+inboxObserveUsers(users, removed("u1", "s1"), pending);
+check(pending.has("u1"), false, "a removed prompt still waits to be acknowledged");
+pending.set("u1", ["m-1"]);
+check(inboxCovered(users, pending, { parentID: "u1", sessionID: "s1" }), [],
+  "a late answer to a removed prompt acknowledges it");
+
+inboxObserveUsers(users, user("u2", "s2"));
+pending.set("u2", ["m-2"]);
+check(inboxCovered(users, pending, { parentID: "u2", sessionID: "s1" }), [],
+  "an answer in another session acknowledges the prompt");
+check(inboxCovered(users, pending, { parentID: "u2", sessionID: "s2" }), ["u2"],
+  "the answer to a prompt still acknowledges it");
+
+for (let i = 0; i < 4 * INBOX_MAX_TRACKED; i++) inboxObserveUsers(users, user("x" + i, "s3"));
+check(users.size <= INBOX_MAX_TRACKED, true, "the user-message record grows without bound");
 "#
         );
         let output = std::process::Command::new("node")
