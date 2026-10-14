@@ -8954,10 +8954,11 @@ impl AgentPtyRegistry {
     ///   pane's screen, before and after the agent's first own hook (PRD #1666
     ///   S7, decision A; decision 2 for a draft the agent kept after an Enter).
     ///   The exception is a composer showing `stranded` — the line the
-    ///   doorbell typed into this pane earlier and has not flushed since —
-    ///   unsubmitted at the agent's edit cursor: a write that starts with a CR
-    ///   sends that CR alone, which submits the line, and types nothing after
-    ///   it ([`DoorbellWrite::Flushed`]). With `stranded` `None` there is no
+    ///   doorbell last typed into this pane — unsubmitted, with the agent's
+    ///   cursor where the recogniser expects it after an Enter that was not
+    ///   taken: a write that starts with a CR sends that CR alone, which
+    ///   submits the line, and types nothing after it
+    ///   ([`DoorbellWrite::Flushed`]). With `stranded` `None` there is no
     ///   exception. The match reads the screen, which proves neither where its
     ///   text came from nor who owns the input: see
     ///   [`crate::agent_registry::codex_composer_holds_doorbell_line`].
@@ -9020,11 +9021,12 @@ impl AgentPtyRegistry {
         // empty composer, read under the writer.
         //
         // The one non-empty composer a write may go to is one showing the
-        // exact line the doorbell typed here and has not flushed, left there
-        // when its Enter was not taken (live Codex 0.160.0,
-        // `codex/worker/001`), with the cursor right after it: the flushing CR
-        // is what submits it, so it goes alone, and no second line is typed on
-        // top.
+        // exact line the doorbell last typed here, left there when its Enter
+        // was not taken: dropped, with the cursor right after it (live Codex
+        // 0.160.0, `codex/worker/001`), or turned into a newline, with the
+        // cursor on the empty row below it (`inbox/load/004`). The flushing CR
+        // is what submits it, so it goes alone, and no second line is typed
+        // on top.
         let mut flush_only = false;
         if let Some((empty, recognise)) = self.doorbell_composer_gate(expected_agent_id) {
             match self.screen_rows(expected_agent_id).await {
@@ -10739,9 +10741,12 @@ impl AgentPtyRegistry {
     }
 
     /// The screen `agent_id`'s pane shows, one trimmed row each, with its
-    /// cursor as (row, row length through the cursor), or `None` when it
-    /// cannot be read ([`crate::pane_screen_text::visible_rows_and_cursor`]).
-    async fn screen_rows(&self, agent_id: &str) -> Option<(Vec<String>, (usize, usize))> {
+    /// cursor, or `None` when it cannot be read
+    /// ([`crate::pane_screen_text::visible_rows_and_cursor`]).
+    async fn screen_rows(
+        &self,
+        agent_id: &str,
+    ) -> Option<(Vec<String>, crate::pane_screen_text::ScreenCursor)> {
         let (bus, rows, cols) = {
             let inner = self.inner.lock().unwrap();
             let agent = inner.agents.get(agent_id)?;
@@ -10749,7 +10754,6 @@ impl AgentPtyRegistry {
         };
         tokio::task::spawn_blocking(move || {
             crate::pane_screen_text::visible_rows_and_cursor(&bus.snapshot(), rows, cols)
-                .map(|(rows, row, column)| (rows, (row, column)))
         })
         .await
         .ok()

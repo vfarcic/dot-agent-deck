@@ -290,19 +290,19 @@ pub struct AgentSpec {
     /// and is never rung, until they report.
     pub doorbell_composer: Option<fn(&[String]) -> bool>,
     /// Recognises, in the composer [`Self::doorbell_composer`] guards, the
-    /// one line the doorbell typed into this pane and has not flushed since,
-    /// left unsubmitted because its Enter was not taken. Such a screen is not
-    /// empty, so without this the bare CR that flushes the line would wait
-    /// for an empty composer forever. Called with the screen rows, the
-    /// cursor (row, and the row's length through the cursor, as
+    /// line the doorbell last typed into this pane, left unsubmitted because
+    /// its Enter was not taken. Such a screen is not empty, so without this
+    /// the bare CR that flushes the line would wait for an empty composer
+    /// forever. Called with the screen rows, the cursor (as
     /// [`crate::pane_screen_text::visible_rows_and_cursor`] reports them)
     /// and that exact line. `Some` exactly where `doorbell_composer` is.
     pub doorbell_stranded_line: Option<StrandedLineRecogniser>,
 }
 
-/// [`AgentSpec::doorbell_stranded_line`]: screen rows, cursor
-/// `(row, length through the cursor)`, the line the doorbell left.
-pub type StrandedLineRecogniser = fn(&[String], (usize, usize), &str) -> bool;
+/// [`AgentSpec::doorbell_stranded_line`]: screen rows, cursor, the line the
+/// doorbell left.
+pub type StrandedLineRecogniser =
+    fn(&[String], crate::pane_screen_text::ScreenCursor, &str) -> bool;
 
 // PRD #20 finding #15: per-agent adapters that normalize each incumbent
 // module's signature to the spec's handler shape. Keeping them here (as the
@@ -669,14 +669,28 @@ pub fn codex_composer_on_screen(rows: &[String]) -> bool {
 }
 
 /// PRD #1666: do `rows` show Codex's composer holding `line` — the doorbell
-/// line ([`crate::doorbell::doorbell_line`]) the deck typed into this pane on
-/// an earlier ring and has not flushed since — unsubmitted, with Codex's edit
-/// cursor right after it, as measured on Codex 0.160.0 (live
-/// `codex/worker/001`: the cursor, marked `▏`, on the prompt row at column
-/// 95, just past the text):
+/// line ([`crate::doorbell::doorbell_line`]) the deck last typed into this
+/// pane — unsubmitted, in one of the two states measured on Codex 0.160.0.
+/// The cursor is marked `▏`.
+///
+/// Its Enter was dropped, and the cursor sits right after the text (live
+/// `codex/worker/001`: on the prompt row at column 95):
 ///
 /// ```text
 /// ›  dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch▏
+///
+///   GPT-5.6-Luna low · /path/to/project
+///                                                    ⚠ 1 warning · f2 to view
+/// ```
+///
+/// Or, under CPU pressure, its Enter became a newline in the composer, and
+/// the cursor sits on the empty row directly below the text, at the
+/// composer indent (live `inbox/load/004`: row 36, cell column 2, below the
+/// line on row 35):
+///
+/// ```text
+/// ›  dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch
+///   ▏
 ///
 ///   GPT-5.6-Luna low · /path/to/project
 ///                                                    ⚠ 1 warning · f2 to view
@@ -687,13 +701,14 @@ pub fn codex_composer_on_screen(rows: &[String]) -> bool {
 /// numbered choice, at most [`CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM`] rows
 /// above the last row with text. Its text, with any wrapped rows below it
 /// joined up to the first blank row, must be `line` exactly, message id
-/// included; a row with text must follow that blank row (Codex's model line);
-/// and the cursor must sit at the end of the composer's last text row, where
-/// Codex 0.160.0 was measured to keep it. A human draft, an edited line, a
+/// included; a row with text must follow below the cursor (Codex's model
+/// line); and the cursor must sit at the end of the composer's last text
+/// row, or on the blank row directly below it at
+/// [`CODEX_COMPOSER_INDENT`]. A human draft, an edited line, a
 /// doorbell-shaped line naming another message and a dialog do not match,
 /// and neither does `line` itself with the cursor anywhere else. `line` comes
-/// from the doorbell's record of what it typed, so with no ring of its own
-/// left unflushed the doorbell does not ask.
+/// from the doorbell's record of what it typed, so with no record the
+/// doorbell does not ask.
 ///
 /// **This narrows the match; it does not authenticate the screen.** Text
 /// on a screen carries no record of who wrote it: a process that controls
@@ -704,7 +719,7 @@ pub fn codex_composer_on_screen(rows: &[String]) -> bool {
 /// the doorbell's admission re-checked before the byte — still apply.
 pub fn codex_composer_holds_doorbell_line(
     rows: &[String],
-    (cursor_row, cursor_column): (usize, usize),
+    cursor: crate::pane_screen_text::ScreenCursor,
     line: &str,
 ) -> bool {
     let Some(bottom) = rows.iter().rposition(|row| !row.is_empty()) else {
@@ -731,11 +746,23 @@ pub fn codex_composer_holds_doorbell_line(
         text.push_str(row.trim());
         last += 1;
     }
-    text == line.trim()
-        && last < bottom
-        && cursor_row == last
-        && cursor_column == rows[last].chars().count()
+    if text != line.trim() {
+        return false;
+    }
+    // The Enter was dropped: the cursor right after the text.
+    let after_text =
+        last < bottom && cursor.row == last && cursor.through == rows[last].chars().count();
+    // The Enter became a newline: the cursor on the composer's new, empty
+    // row, which `take_while` above stopped at, so it is blank.
+    let on_new_row =
+        last + 1 < bottom && cursor.row == last + 1 && cursor.cell == CODEX_COMPOSER_INDENT;
+    after_text || on_new_row
 }
+
+/// The cell column where Codex 0.160.0's composer text starts, after `› `,
+/// and where it puts the cursor on an empty composer row (measured: cell
+/// column 2 in live `inbox/load/004`).
+pub const CODEX_COMPOSER_INDENT: usize = 2;
 
 /// How far above the last row with text [`codex_composer_holds_doorbell_line`]'s
 /// prompt row may be: the composer's wrapped rows, a blank row, the model

@@ -1,7 +1,8 @@
 //! Fast pin for the composer recogniser used by the byte-writing guard.
 use dot_agent_deck::agent_registry::{
-    codex_composer_holds_doorbell_line, codex_composer_on_screen,
+    CODEX_COMPOSER_INDENT, codex_composer_holds_doorbell_line, codex_composer_on_screen,
 };
+use dot_agent_deck::pane_screen_text::{ScreenCursor, visible_rows_and_cursor};
 
 fn rows(text: &str) -> Vec<String> {
     text.lines().map(|row| row.trim().to_owned()).collect()
@@ -41,20 +42,38 @@ fn codex_composer_empty_and_placeholder_allow_but_visible_text_holds() {
     }
 }
 
-/// Where Codex 0.160.0 keeps its cursor while the composer holds text: right
-/// after the composer's last text row (live `codex/worker/001`: row 36,
-/// column 95, the length of the stranded row).
-fn cursor_after_composer(rows: &[String]) -> (usize, usize) {
+/// A cursor on `row`, `through` chars into its processed text, in cell
+/// column `cell`.
+fn at(row: usize, through: usize, cell: usize) -> ScreenCursor {
+    ScreenCursor { row, through, cell }
+}
+
+/// The composer's last text row.
+fn composer_last_row(rows: &[String]) -> usize {
     let prompt = rows
         .iter()
         .rposition(|row| row.starts_with('›'))
         .expect("a composer row");
-    let last = prompt
+    prompt
         + rows[prompt + 1..]
             .iter()
             .take_while(|row| !row.is_empty())
-            .count();
-    (last, rows[last].chars().count())
+            .count()
+}
+
+/// Where Codex 0.160.0 keeps its cursor when it dropped the Enter: right
+/// after the composer's last text row (live `codex/worker/001`: row 36,
+/// column 95, the length of the stranded row).
+fn cursor_after_composer(rows: &[String]) -> ScreenCursor {
+    let last = composer_last_row(rows);
+    let length = rows[last].chars().count();
+    at(last, length, length)
+}
+
+/// Where Codex 0.160.0 keeps its cursor when the Enter became a newline: on
+/// the empty row below the composer's text, at the composer indent.
+fn cursor_below_composer(rows: &[String]) -> ScreenCursor {
+    at(composer_last_row(rows) + 1, 0, CODEX_COMPOSER_INDENT)
 }
 
 /// Scenario: Inspect Codex screens whose composer holds the deck's own outstanding doorbell line after Codex dropped its Enter (shortcuts hint hidden, with and without a warning, wrapped), and screens that only look close: a line the human edited, a human draft, a start dialog, and an empty composer below a submitted doorbell in history. Only the deck's line in the composer itself may be flushed.
@@ -69,7 +88,13 @@ fn codex_stranded_doorbell_line_is_recognised_only_in_the_composer() {
     };
     let recognised = |screen: &str| {
         let rows = rows(screen);
-        codex_composer_holds_doorbell_line(&rows, cursor_after_composer(&rows), line)
+        let after = codex_composer_holds_doorbell_line(&rows, cursor_after_composer(&rows), line);
+        let below = codex_composer_holds_doorbell_line(&rows, cursor_below_composer(&rows), line);
+        assert_eq!(
+            after, below,
+            "both measured cursor states must judge a screen alike: {screen}"
+        );
+        after
     };
     for footer in ["⚠ 1 warning · f2 to view", ""] {
         let stranded = holding(line, footer);
@@ -146,15 +171,31 @@ fn codex_stranded_line_is_bound_to_the_decks_own_line_and_the_edit_cursor() {
             "a screen line naming another message than the outstanding ring's must hold: {other:?}"
         );
     }
-    let (row, column) = cursor;
+    assert!(
+        codex_composer_holds_doorbell_line(&stranded, cursor_below_composer(&stranded), ours),
+        "control: the deck's line with the cursor on the empty row below it is recognised"
+    );
+    let ScreenCursor {
+        row,
+        through: column,
+        ..
+    } = cursor;
     let bottom = stranded.iter().rposition(|r| !r.is_empty()).unwrap();
     for elsewhere in [
-        (row, 0),
-        (row, column - 1),
-        (row, column + 1),
-        (row + 2, column),
-        (bottom, stranded[bottom].chars().count()),
-        (0, 0),
+        at(row, 0, 0),
+        at(row, column - 1, column - 1),
+        at(row, column + 1, column + 1),
+        at(row + 2, column, column),
+        at(
+            bottom,
+            stranded[bottom].chars().count(),
+            stranded[bottom].chars().count(),
+        ),
+        at(0, 0, 0),
+        // The row below, but not at the composer indent.
+        at(row + 1, 0, 0),
+        at(row + 1, 0, CODEX_COMPOSER_INDENT + 1),
+        at(row + 1, 0, column),
     ] {
         assert!(
             !codex_composer_holds_doorbell_line(&stranded, elsewhere, ours),
@@ -164,11 +205,12 @@ fn codex_stranded_line_is_bound_to_the_decks_own_line_and_the_edit_cursor() {
     // Nothing below the line: not Codex's composer frame, whose model line
     // always follows it.
     let bare = rows(&format!("  >_ OpenAI Codex (v0.160.0)\n\n›{ours}\n"));
-    let bare_cursor = cursor_after_composer(&bare);
-    assert!(
-        !codex_composer_holds_doorbell_line(&bare, bare_cursor, ours),
-        "a lone doorbell row at the bottom of the screen is not the composer"
-    );
+    for bare_cursor in [cursor_after_composer(&bare), cursor_below_composer(&bare)] {
+        assert!(
+            !codex_composer_holds_doorbell_line(&bare, bare_cursor, ours),
+            "a lone doorbell row at the bottom of the screen is not the composer: {bare_cursor:?}"
+        );
+    }
 }
 
 /// Codex 0.160.0's last frame in live `load_004` (PRD #1666), transcribed
@@ -193,21 +235,21 @@ const LINE_THEN_NEWLINE_FRAME: &str = concat!(
 #[test]
 fn codex_line_then_newline_state_from_the_live_frame_is_recognised() {
     let ours = " dot-agent-deck: message m-bztvmdjd-905c176602c7c2cd waiting, run: dot-agent-deck inbox fetch";
-    let (rows, row, through) = dot_agent_deck::pane_screen_text::visible_rows_and_cursor(
-        LINE_THEN_NEWLINE_FRAME.as_bytes(),
-        40,
-        140,
-    )
-    .expect("the frame parses");
+    let (rows, cursor) = visible_rows_and_cursor(LINE_THEN_NEWLINE_FRAME.as_bytes(), 40, 140)
+        .expect("the frame parses");
     assert_eq!(rows[35], format!("›  {}", ours.trim_start()), "{rows:#?}");
-    assert_eq!(row, 36, "the cursor sits on the row below the line");
+    assert_eq!(
+        (cursor.row, cursor.cell),
+        (36, CODEX_COMPOSER_INDENT),
+        "the cursor sits on the row below the line, at the composer indent"
+    );
     assert!(
-        codex_composer_holds_doorbell_line(&rows, (row, through), ours),
+        codex_composer_holds_doorbell_line(&rows, cursor, ours),
         "the deck's own line with Codex's Enter taken as a newline must be recognised: {rows:#?}"
     );
     let other = " dot-agent-deck: message m-bztvmdjd-905c176602c7c2ce waiting, run: dot-agent-deck inbox fetch";
     assert!(
-        !codex_composer_holds_doorbell_line(&rows, (row, through), other),
+        !codex_composer_holds_doorbell_line(&rows, cursor, other),
         "a line naming another message must still hold"
     );
 }

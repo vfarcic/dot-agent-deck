@@ -42,9 +42,13 @@
 //! `queued` by any route, one bare CR is sent under the same guards. Both are
 //! keyed on inbox state, never on the screen. For an agent whose composer is
 //! gated (Codex), that CR is the one write the gate lets into a non-empty
-//! composer, and only one showing the exact line this doorbell typed into the
-//! pane and has not flushed since ([`Bell::unsubmitted`]), at the agent's edit
-//! cursor; it then goes alone. That is a match on what the screen shows, not
+//! composer, and only one showing the exact line this doorbell last typed
+//! into the pane ([`Bell::unsubmitted`]), with the agent's cursor where an
+//! Enter that was not taken leaves it; it then goes alone. A ring that only
+//! flushed keeps that line recorded, so if the agent swallowed the CR too,
+//! the next ring flushes again: at most one lone CR per due ring while the
+//! deck's own line stays stranded and its message stays `queued`. That is a
+//! match on what the screen shows, not
 //! proof of where it came from: anything that can draw the pane can draw that
 //! line and earn the CR
 //! ([`crate::agent_registry::codex_composer_holds_doorbell_line`]).
@@ -192,10 +196,12 @@ pub struct Bell {
     /// A covered message left `queued` while its ring was outstanding, so one
     /// bare CR is owed.
     pub cleanup_owed: bool,
-    /// The line the last ring typed, while a CR that may submit it is still
-    /// owed (an outstanding ring or a cleanup); `None` once that CR went, and
-    /// after a ring that only flushed. A gated composer showing anything else
-    /// gets no byte ([`AgentPtyRegistry::write_doorbell`]).
+    /// The line the doorbell last typed, while a CR that may submit it is
+    /// still owed (an outstanding ring or a cleanup). A ring that only
+    /// flushed it keeps it, since that CR may have been swallowed too; the
+    /// cleanup CR ([`Self::cleaned`]) and a ring that types a new line
+    /// replace it. A gated composer showing anything else gets no byte
+    /// ([`AgentPtyRegistry::write_doorbell`]).
     pub unsubmitted: Option<String>,
 }
 
@@ -232,7 +238,6 @@ impl Bell {
         }
     }
 
-    /// Record a ring that covered `queued`.
     /// Record a ring that covered `queued`. What it left in the box is the
     /// caller's to record in [`Self::unsubmitted`].
     pub fn rang(&mut self, now: Instant, queued: &[String]) {
@@ -414,16 +419,23 @@ async fn run_tick(
             match (outcome, &action) {
                 // A ring that failed part-way may still sit in the box, so it
                 // is treated as rung: the next one flushes it first. A ring
-                // that only flushed typed no line, so it left none to flush.
-                // One that failed is recorded as having left its own line; if
-                // it failed before typing it, an earlier line still in the box
-                // no longer matches, and the composer gate holds.
+                // that only flushed typed no line of its own and keeps the
+                // earlier one recorded: if its CR was swallowed, the line is
+                // still the deck's and still stranded, and the next ring sends
+                // one more lone CR. One that failed is recorded as having left
+                // its own line; if it failed before typing it, an earlier line
+                // still in the box no longer matches, and the composer gate
+                // holds.
                 (
                     DoorbellWrite::Written | DoorbellWrite::Flushed | DoorbellWrite::Failed,
                     Action::Ring { id, .. },
                 ) => {
                     slot.bell.rang(Instant::now(), &queued);
-                    slot.bell.unsubmitted = line.filter(|_| outcome != DoorbellWrite::Flushed);
+                    slot.bell.unsubmitted = if outcome == DoorbellWrite::Flushed {
+                        stranded
+                    } else {
+                        line
+                    };
                     registry.inbox().note_ring(&pane, &agent);
                     info!(
                         pane_id = %pane,
