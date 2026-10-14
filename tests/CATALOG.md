@@ -252,7 +252,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L1 (in-module `src/ui.rs` test: the daemon's real `spawn::surface_attach_started_agent` broadcast applied through `AppState::apply_event`, then `render_frame` into a ratatui `TestBackend`, inline `insta` snapshot of the card order).
 - **Agent:** none (a hydrated dispatcher, two live-surfaced units that have sent no hook, and a later TUI-created pane).
 - **Asserts:** the cards read dispatcher, unit, unit, TUI pane — the live-surfaced units are placed by the registry id their card-surfacing `SessionStart` names (`SURFACED_AGENT_ID_METADATA_KEY`), while the event's own `agent_id` stays `None`. Control: the same surface without that key, as a daemon predating it sends, falls back after every card that has an id.
-- **Does not assert:** the supersession of the surfaced card by the agent's real `SessionStart` (covered by the `status/supersede/*` and `prompt/pane-input/033` tests); a live-surfaced orchestration tab, whose role order `dashboard/order/003` covers.
+- **Does not assert:** the supersession of the surfaced card by the agent's real `SessionStart` (covered by the `status/supersede/*` tests); a live-surfaced orchestration tab, whose role order `dashboard/order/003` covers.
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/card-stats
@@ -1408,13 +1408,6 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** UI mode exit or card feedback; this pins the authoritative daemon stream-input gate.
 - **Platform coverage:** mac+linux.
 
-##### prompt/pane-input/006 — Seed-prompt delivery is retained safely and abandoned after its deadline (PRD #20 findings #3/#4/#13).
-- **Layer:** L1 (in-process seed-prompt readiness consumer with a controllable `PaneController`).
-- **Agent:** none.
-- **Asserts:** injected transport error and non-applied outcomes retain the seed with feedback and backoff; two fresh TUI states generate distinct IDs; delivery captures its logical session; an expired permanent failure is abandoned without another RPC.
-- **Does not assert:** daemon production of stale/wrong-session or orchestration-role status; those require identity-bearing daemon requests and the orchestration render loop.
-- **Platform coverage:** mac+linux+windows.
-
 ##### prompt/pane-input/007 — Open an orchestration through the real TUI and report its start role history-only. The remit remains Queued without a typed pointer, then the same role becoming live fetches and visibly renders it.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
@@ -1434,7 +1427,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
 - **Agent:** synthetic Codex identities bound sequentially to the same pane.
 - **Asserts:** paned requests with no expected agent return `no-live-target`, and requests with no expected session against either an attached or unattached pane's current hook session return `stale` carrying that session as `current_session_id` (issue #621), and a retry naming it delivers; all refusals write no marker, and a delivered or named-but-lost request carries no `current_session_id`. Requests queued for an original agent, a same-agent pre-`/clear` session, or a session missing on the target also fail closed, while a matching agent/session and an identified agent with no hook session still deliver.
-- **Does not assert:** UI feedback for the returned result (covered by `prompt/pane-input/006`).
+- **Does not assert:** UI feedback for the returned result.
 - **Platform coverage:** mac+linux.
 
 ##### prompt/pane-input/010 — Delivery IDs are atomic and bound to a request fingerprint (PRD #20 finding #3).
@@ -1479,13 +1472,6 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the release-step manual test against the actual previous-release daemon.
 - **Platform coverage:** mac+linux.
 
-##### prompt/pane-input/016 — Orchestrator prompt identity is captured at tab creation (PRD #20 finding #5).
-- **Layer:** L1 orchestration action with a controllable pane-controller rebind.
-- **Agent:** none.
-- **Asserts:** replacing the start pane's agent after tab creation cannot change the queued prompt's captured target identity.
-- **Does not assert:** daemon-side stale rejection, covered by `prompt/pane-input/009`.
-- **Platform coverage:** mac+linux+windows.
-
 ##### prompt/pane-input/017 — Malformed guarded-send identity fails closed (PRD #20 Greptile finding #1).
 - **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
 - **Agent:** synthetic pane targets backed by `/bin/sh`.
@@ -1528,78 +1514,6 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** an LLM response (the safety invariant and native prompt-edit behavior are proven without submitting a model turn).
 - **Platform coverage:** mac+linux.
 
-##### prompt/pane-input/023 — Orchestrator prompt writes remain provisional until the matching submission is observed.
-- **Layer:** L1 (in-process orchestrator prompt consumer with a controllable `PaneController` and hook-derived state snapshot).
-- **Agent:** none.
-- **Asserts:** both `Applied` and `Queued` retain the prompt text, delivery identity, retry backoff, non-Working role, and unprompted tab; a matching `UserPromptSubmit`-derived event for that pane clears all provisional state and alone finalizes the role as Working without another write.
-- **Does not assert:** how confirmation is correlated internally or the daemon's PTY behavior; only the consumer's observable delivery state contract.
-- **Platform coverage:** mac+linux+windows.
-
-##### prompt/pane-input/024 — Seed delivery distinguishes confirmable panes, unconfirmable panes, and both swallowed-CR duplicate shapes.
-- **Layer:** L1 (in-process `process_pending_seed_prompts` consumer with a controllable `PaneController` and hook-derived state snapshot).
-- **Agent:** none.
-- **Asserts:** `Applied`/`Queued` reporting panes remain provisional until matching submission; one Pi status event and a pane with no identity each write exactly once without arming retries; short and >200-byte doubled submissions joined by either a newline or no separator clear retry state before an immediately eligible third write; repetition is bounded to 16 newline-separated copies and is not a wildcard.
-- **Does not assert:** orchestration-role status (covered by `prompt/pane-input/023`) or whether the seed came from dispatch versus a configured mode.
-- **Platform coverage:** mac+linux+windows.
-
-##### prompt/pane-input/025 — Unconfirmed prompts retry to deadline, including a producer identified only after the readiness fallback.
-- **Layer:** L1 (clock-controlled orchestrator prompt consumer and controllable `PaneController`).
-- **Agent:** none.
-- **Asserts:** an `Applied` write with no matching submission stays pending, retries only after its armed backoff, never marks the role Working, and is abandoned without a final write after `AUTOMATIC_PROMPT_DEADLINE`; an unidentified fallback write stays provisional without retyping and arms a real retry when a late reporting `SessionStart` arrives.
-- **Does not assert:** wall-clock scheduling in the render loop or exact tracing-log wording.
-- **Platform coverage:** mac+linux+windows.
-
-##### prompt/pane-input/026 — Only fresh matching prompt evidence carrying the target identity confirms provisional delivery.
-- **Layer:** L1 (in-process seed-prompt consumer with two pane identities and synthetic hook-derived snapshots).
-- **Agent:** none.
-- **Asserts:** matching text with no agent id, matching text from another pane, unrelated target-pane text, and matching text already present before the write all leave delivery identity and retry armed; only fresh matching pane/text/identity evidence finalizes the seed.
-- **Does not assert:** a particular reconciliation key or algorithm beyond rejecting these observable false matches.
-- **Platform coverage:** mac+linux+windows.
-
-##### prompt/pane-input/027 — Attempt-ID rotation crosses a caching delivery ledger without weakening same-attempt idempotency.
-- **Layer:** L1 (in-process seed consumer backed by a faithful per-delivery-id caching controller).
-- **Agent:** none.
-- **Asserts:** a lost response retries the same `#a1` id and replays cached `Applied` without a second physical write; the later unconfirmed retry rotates to `#a2`, reaches the writer physically, and a returned `Ambiguous` terminally clears all delivery state with no further attempt.
-- **Does not assert:** daemon socket framing or the registry's ledger implementation internals; the controller reproduces its observable caching contract.
-- **Platform coverage:** mac+linux+windows.
-
-##### prompt/pane-input/028 — A provisional retry never reaches a replacement agent or a same-agent conversation ended by clear.
-- **Layer:** L1 (in-process seed consumer with an identity-guarding, rebindable `PaneController` and hook-derived generation state).
-- **Agent:** none.
-- **Asserts:** after the first write, a different registry agent appearing on the pane gets zero bytes and terminally disarms the old delivery; a `SessionEnd` for the bound generation likewise prevents any same-agent retry and clears provisional state.
-- **Does not assert:** the detached scheduler/dispatch confirmation task or a real agent's `/clear` command; it pins the same observable identity/generation contract at the TUI controller seam.
-- **Platform coverage:** mac+linux+windows.
-
-##### prompt/pane-input/030 — An unbound launcher delivery may bind a live generation before retry, but cannot follow a generation through its end into a successor, even when the first applied write's response was lost.
-- **Layer:** L1 (in-process seed and orchestrator consumers with a payload/identity-recording `PaneController`, a first-response-loss mode, and hook-derived generation state).
-- **Agent:** none.
-- **Asserts:** the first write into a pane with no announced hook session declares no generation; once the real agent's `SessionStart` arrives and remains current, the next retry binds and retains it and a third attempt uses a distinct submit-only probe; separately, both seed and orchestrator TUI write sites send no bytes into a successor when a generation is observed and then ends, when its complete start/end plus the successor start burst between two render passes, or when that burst follows a physically applied first write whose RPC response was lost.
-- **Does not assert:** the daemon-side confirmation task's own latch (covered by `scheduler/dispatch/016`) or the PTY bytes an empty payload produces (covered by the registry's submit path).
-- **Platform coverage:** mac+linux+windows.
-
-##### prompt/pane-input/031 — Daemon-synthetic events do not prove a usable prompt-reporting channel.
-- **Layer:** L1 (in-process seed consumer with a payload-recording `PaneController` and synthetic hook-derived snapshots).
-- **Agent:** none.
-- **Asserts:** identified daemon-authored shell-activity and delivery-notice events landing after the write, alongside a real but untagged legacy hook frame, leave the delivery held.
-- **Does not assert:** an unauthenticated unmarked producer claim on the TUI path — deliberately not pinned because it is indistinguishable from `prompt/pane-input/025`'s accepted slow-launcher recovery and blocking it would re-open #424 for launchers with no bootstrap event; the detached path is pinned by `scheduler/dispatch/016`. It also does not assert authentication of the delivery-notice metadata key, which grants no privilege.
-- **Platform coverage:** mac+linux+windows.
-
-##### prompt/pane-input/032 — User typing after a TUI automatic payload disarms the next retry.
-- **Layer:** L1 (in-process seed consumer driving the production registry guard and a real `/bin/cat` byte-observation PTY).
-- **Agent:** none.
-- **Asserts:** attempt 1 physically reaches the pane before any automatic-write timestamp exists; an unsent user draft after attempt 1 prevents attempt 2 from appending its replacement payload or submitting the draft, and independently a draft after attempt 2 prevents attempt 3's submit-only probe, each proven by an unchanged PTY byte snapshot.
-- **Does not assert:** the fix's internal clock-comparison location or the detached spawn watcher (covered by `scheduler/dispatch/018`).
-- **Platform coverage:** mac+linux.
-
-##### prompt/pane-input/033 — A start that announces no conversation does not become one a TUI-owned prompt can be lost from.
-- **Layer:** L1 (in-process seed consumer driving `AppState::apply_event` and the production `process_pending_seed_prompts`, over a recording pane controller).
-- **Agent:** none (synthetic ClaudeCode generations).
-- **Asserts:** for BOTH provisional establishing events — the daemon's card-surfacing `SessionStart` (`CARD_SURFACE_SESSION_START_ORIGIN`, whose `session_id` is the pane id) and a wrapper's boot-provenance `SessionStart` — the pane's hook generation stays unestablished; a seed the 10-second launcher fallback writes while that card is all there is survives the agent's genuine `SessionStart`; the retry is delivered naming that genuine generation; and the pane's generation-closure count stays 0, since the closure counter abandons the delivery on its own even when the bound id happens to match.
-- **The door is the FALLBACK, and that changed with issue #1005.** This entry used to say a seed "written while that card is all there is" survives the announcement, without saying how it got written — and on the fast path it no longer can be: the readiness gate now requires an announced conversation, so a card-only pane is not written into at all (`prompt/pane-input/036`). The subject is untouched and still load-bearing — a provisional start is not a conversation a delivery can be LOST from — but the only route that still reaches it is the 10-second `timeout_ready` slow path, i.e. the `devbox run claude …` launcher case issue #424 exists for. The fixture is aged accordingly.
-- **Does not assert:** that `spawn::surface_spawned_pane` stamps the marker (this test replays the event rather than calling it — pinned by `surface_spawned_pane_emits_session_start_for_attached_tuis` in `src/spawn.rs`); that the FAST path refuses a card-only pane (`prompt/pane-input/036`); that a second producer's NON-announcing frames leave an established generation alone (`prompt/pane-input/043`); or the daemon-owned delivery paths, which route through `latch_generation` and were never affected.
-- **Platform coverage:** mac+linux.
-
-
 ##### prompt/pane-input/034 — An armed native-seed PTY-injection fallback is refused, with no bytes written and the seed dropped, when the pane changed hands inside the grace (issue #617, finding 6).
 - **Layer:** fast integration, in `src/agent_pty.rs`'s own `mod spawn_tests` (the real `arm_seed_fallback` against registry-owned PTYs; no daemon, no pi, no extension, no LLM and no `e2e` feature gate).
 - **Agent:** none — a `sh -c 'read _line'` predecessor that leaves by exiting when one unsubmitted line ends its `read`, and a `/bin/cat` successor inheriting its `DOT_AGENT_DECK_PANE_ID`. The grace is passed as a PARAMETER (1500 ms), so the 15 s default and its second-granularity `DOT_AGENT_DECK_SEED_FALLBACK_SECS` env var are both out of the picture; it is an order of magnitude larger than `prompt/pane-input/035`'s because this hand-over waits on a child exiting and its reader thread seeing EOF rather than on a synchronous `close_agent`.
@@ -1617,22 +1531,6 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the native `get-seed` pull's own pane-keyed resolution of a caller-supplied pane id (issue #916); the two production callers that arm the fallback; the `Ambiguous` partial-write branch.
 - **Platform coverage:** mac+linux (the `/bin/cat` byte target is POSIX).
 
-##### prompt/pane-input/036 — A card drawn from the command is not an agent that can read: the seed waits for a producer to announce a conversation, and the 10-second slow path still delivers for one that never will (issue #1005).
-- **Layer:** L1, in `src/ui.rs`'s own test module (the production `process_pending_seed_prompts` driven over a recording pane controller and a real `AppState::apply_event`), so it runs under `cargo test-fast` and therefore in the `build` job.
-- **Agent:** none (a synthetic Claude Code card-surfacing `SessionStart` and a synthetic genuine one).
-- **Asserts:** a pane whose ONLY session is the daemon's card-surfacing `SessionStart` — `session_id` is the pane id, no `agent_id`, `agent_type` resolved from the command by `spawn::surface_spawned_pane` — gets NO write across two passes even with the 500 ms `SPAWN_TIME_READINESS_BUFFER` already elapsed, and the seed is HELD rather than dropped; the agent's own `SessionStart` then releases exactly one write, carrying the seed itself and naming that generation. Separately, and in both the card-surfaced and the no-session-at-all shapes, a seed older than 10 s IS delivered by the `timeout_ready` slow path.
-- **Why the second half is here.** Narrowing the fast path onto `pane_hook_session_id` makes the 10-second slow path the ONLY delivery a producer that announces nothing ever gets — opencode's cold boot (#146), Pi's `NoSignal`, `scheduler/spawn/005`. A change that fixes `claude` and strands those is the stated failure mode to design against, so it is pinned beside the narrowing rather than left for whoever breaks it. It is a REGRESSION GUARD, not a reproduction: today's over-eager gate delivers these too, so this half is green before the fix as well as after.
-- **Does not assert:** that `spawn::surface_spawned_pane` stamps the origin marker (replayed here, pinned by `surface_spawned_pane_emits_session_start_for_attached_tuis` in `src/spawn.rs`); that a provisional start does not ESTABLISH the pane's generation (`prompt/pane-input/033`); the end-to-end ordering through the real binary (`prompt/new-pane/017`); or the daemon-owned delivery paths, which gate on `state::wait_for_session_start` instead.
-- **Platform coverage:** mac+linux+windows.
-
-##### prompt/pane-input/037 — The shared readiness predicate, and the orchestrator remit that reads it, both wait for a conversation (issue #1005, retargeted by #1012).
-- **Layer:** L1, in `src/ui.rs`'s own test module (the production `spawn_time_agent_ready` called directly, and `deliver_orchestrator_prompt` over a recording pane controller).
-- **Agent:** none (a synthetic Claude Code card-surfacing `SessionStart` and a synthetic genuine one).
-- **Asserts:** `spawn_time_agent_ready` is false for a pane with no session at all, and still false once the daemon's card-surfacing `SessionStart` has resolved an agent type off the command (asserted as a precondition, alongside `pane_hook_session_id` being `None`) — only the producer's own announcement opens it. Then, for a start-role pane in that same card-only shape and with the 500 ms `SPAWN_TIME_READINESS_BUFFER` pre-spent, `deliver_orchestrator_prompt` puts no bytes in the pane across two passes and does not consume the remit; the agent's own `SessionStart` releases exactly one write, carrying the remit itself and naming the generation it entered.
-- **Why the predicate is pinned directly, and why this entry changed.** Issue #1005 narrowed the PREDICATE and each delivery site is one of its callers, so the first half used to reach it through a third caller, `process_pending_dispatches`. Issue #1012 removed that caller: no production code had pushed to its queue since PRD #93 round-5 moved delegation dispatch into the daemon, so the `retain` drained an always-empty `Vec` every frame. Asserting `spawn_time_agent_ready` itself is what that half was really about, and unlike a per-caller fixture it keeps standing for a caller added later. The orchestrator site's buffer is pre-spent in the fixture so the only thing under observation there is the readiness gate.
-- **Does not assert:** the seed path (`prompt/pane-input/036`), which is the predicate's other live caller and covers the 10-second `timeout_ready` slow path this predicate never gates; confirmation, retry or deadline behaviour on the orchestrator path (`prompt/pane-input/023`–`/030`); the daemon-owned delegate path, which gates on `state::wait_for_session_start` instead.
-- **Platform coverage:** mac+linux+windows.
-
 ##### prompt/pane-input/038 — An erase burst of exactly one `DEL` per payload character removes the payload from a REAL interactive Claude prompt and leaves the word before it untouched (issue #876).
 - **Layer:** L2 (PTY-attached real binary, runtime-skipped when Claude CLI/credentials are unavailable; flaky-tolerant lane-2 tier).
 - **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, with onboarding/project trust seeded and `--allowedTools Bash Read`; no `-p`.
@@ -1648,20 +1546,6 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Asserts:** a `write-and-submit` whose `delivery_id` is `MAX_DELIVERY_ID_BYTES + 1` bytes is answered with an error and no `SendResult`, and its marker never reaches the pane; the same request with an id of exactly `MAX_DELIVERY_ID_BYTES` bytes is `Applied` and its marker arrives, so the refusal is the cap and not the fixture.
 - **Does not assert:** that the ledger stays empty after the refusal, or that the longest id a client mints fits the cap — both pinned at the unit level by `agent_pty::delivery_ledger_refuses_an_oversized_id_without_storing_it`.
 - **Platform coverage:** mac+linux.
-
-##### prompt/pane-input/040 — The 10-second readiness fallback pays the readiness buffer before it writes, on both spawn-time delivery paths (issue #529).
-- **Layer:** L1, in `src/ui.rs`'s own test module (the production `process_pending_seed_prompts` and `deliver_orchestrator_prompt` driven over a recording pane controller), so it runs under `cargo test-fast` and therefore in the `build` job.
-- **Agent:** none (panes with no session at all, so nothing announces a conversation and `spawn_time_agent_ready` stays false — asserted as a precondition on the seed half).
-- **Asserts:** a seed aged 1 ms past `SPAWN_TIME_READINESS_TIMEOUT` gets NO write and is held rather than dropped; re-aged to `SPAWN_TIME_READINESS_TIMEOUT + SPAWN_TIME_READINESS_BUFFER` it gets exactly one write carrying the seed. The same pair for an orchestration start-role remit, driven with explicit instants against its tab anchor: no write and the remit not consumed at `anchor + 10 s + 1 ms`, exactly one write carrying it at `anchor + 10 s + 500 ms`. The seed fixture carries an already-spent `ready_since`, so a fallback that borrowed that stamp instead of counting from its own 10 s would also go red.
-- **Why it exists:** both paths used to set `buffer_elapsed = true` on the timeout branch, so the one delivery made with no evidence at all that the agent's input handling was up was also the one made with no buffer. Fails on the pre-fix code at each half's first assertion.
-- **Does not assert:** the buffer's size (500 ms, tuned under PRD #128); the fast path's buffer (`should_inject_spawn_time_prompt`'s unit tests); that the fallback still delivers for a producer that announces nothing (`prompt/pane-input/036`); confirmation, retry or deadline behaviour after the write (`prompt/pane-input/023`–`/030`); the daemon-owned delegate path, which pays its own buffer after its timeout in `state.rs`.
-
-##### prompt/pane-input/041 — A TUI-owned retry waits out a genuine Codex confirmation 8.45 s after the write, and a delivery that is never confirmed is still retried (issue #637) — except into a pane whose only producer declared it cannot report (issue #559).
-- **Layer:** L1, in `src/ui.rs`'s own test module (the production `deliver_orchestrator_prompt` driven over an `Applied`-returning pane controller at explicit clock offsets, with a hook-derived `AppState`), so it runs under `cargo test-fast`.
-- **Agent:** none (a synthetic Codex pane — `announced_prompt_snapshot` declares the producer as Codex).
-- **Asserts:** two runs against the same fixture. In the first, a render pass 8.45 s after the write — the genuine Codex confirmation latency #637 reports — makes no second write, and the agent's submission report arriving after it finalizes the prompt and the role (`Working`) on that ONE write. In the second, where no report ever comes, a pass one second past `SLOW_CONFIRMATION_LATENCY` (10 s) DOES re-submit, so the floor delays recovery rather than removing it. Measured RED with the floor taken out of `unconfirmed_retry_delay` (the pre-#637 schedule): the 8.45 s pass wrote a second time. Issue #559 adds a production-shaped pair — an UNTYPED placeholder whose `Codex` comes only from `wrap`'s own events (its fork-time start and one classified line, under the wrapper's `{pane}-session` id): without `wrapper_prompt_reports_unavailable` the pane is re-submitted at the same pass (the control, since a healthy wrapped Codex has only the wrapper as producer until its first submit), and with it the pane gets exactly ONE write and the role finalizes `Working`. RED before #559's fix, which wrote the declared-unavailable pane twice.
-- **Does not assert:** the seed path's own call site (it shares `schedule_unconfirmed_retry` and `delivery_capability` with this one); that the marker reaches the pane from a real wrapper (`codex/trust/005`); the daemon-owned detached path (`scheduler/dispatch/022`); Claude Code's shorter floor, which is unit-tested in `src/prompt_delivery.rs` (`confirmation_latency_floor_takes_the_slowest_reporting_producer`); any real agent's actual confirmation latency — the 8.45 s figure is the downstream measurement #637 quotes, not one taken here.
-- **Platform coverage:** mac+linux+windows.
 
 ##### prompt/pane-input/042 — A real Claude draft survives a delegate until Ctrl+U releases it.
 - **Layer:** L2 real agent, lane 2, PTY-attached (`tests/e2e_pane_input_live.rs`).
@@ -1685,33 +1569,12 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### prompt/pane-input/045 — A seed or orchestrator prompt whose `SessionStart` the TUI's event stream dropped is still delivered, naming the conversation the daemon's `stale` refusal reported (issue #621).
-- **Layer:** L1 (in-process seed and orchestrator consumers driven through the production `begin_guarded_submit` against the production attach handler over a real socket, with a `/bin/cat` target whose PTY buffer is the delivery evidence; the daemon's `AppState` and the TUI's snapshot are separate, so they can disagree).
-- **Agent:** none (a synthetic Codex `SessionStart` applied to the daemon's state only).
-- **Asserts:** with the daemon holding a generation the TUI's snapshot never received, the first unnamed write is refused `stale`, the delivery binds the generation the refusal named, and the prompt reaches the pane on both TUI paths; on the pass after the write the delivery is still held for confirmation rather than abandoned as a changed conversation. Control: when the snapshot observes the start after one `stale`, the seed is delivered and the refusal did not count as an attempt. Reverting the daemon recording the generation, the client recording it, the bind using it, or the target check honouring it each turns the test red.
-- **Does not assert:** a delivery that already WROTE into a pane with no generation and then missed the start, or one whose earlier request's response was lost — neither binds from a refusal by design (`ui::tests::refusal_generation_binds_only_an_unwritten_unbound_delivery`), and after a reconnect both stop at their next due retry unless the agent confirms them first (`prompt/pane-input/047`, issue #1520); event-stream resynchronization after a reconnect (`session/live/018`); the wire field in isolation (`prompt/pane-input/009`); the spawned binary (`prompt/pane-input/044`).
-- **Platform coverage:** mac+linux.
-
 ##### prompt/pane-input/046 — A send into a pane that stopped reading comes back as possibly delivered instead of hanging, and does not hold up other panes (issue #525).
 - **Layer:** L2 (real spawned TUI + daemon in the PTY/vt100 harness; no LLM).
 - **Agent:** none — a `sh` that puts its terminal in raw mode (echo left on, so the send's first bytes show it has reached the PTY) and then `sleep`s without reading, and a plain `cat` started on the same daemon.
 - **Asserts:** an identified `WriteAndSubmit` of a 200 KB line into the stuck pane returns `ambiguous` within 30 s rather than never; a send to the `cat` pane made while that one is pending returns `applied` within 8 s and its text reaches the pane; and the dashboard shows `Error` once the stuck send is reported. Before #525 the stuck send never came back, because its `write(2)` blocked the daemon's runtime worker until the pane read.
 - **Does not assert:** which card carries the `Error` (the grid is searched as a whole); the exact stall bound; a real agent that stops reading (no agent can be made to on demand); the unit-level accounting of a stalled write (`a_stalled_guarded_write_is_ambiguous_and_later_writes_add_nothing_behind_it` and the other issue #525 tests in `src/agent_pty.rs`).
 - **Platform coverage:** linux (the stuck-pane shape needs a kernel that blocks the master's writer on a full raw-mode input queue, which the macOS runner's did not).
-
-##### prompt/pane-input/047 — A seed written before the TUI's event stream broke stops after the reconnect instead of being typed again into a conversation the TUI cannot vouch for (issue #1520).
-- **Layer:** L1 (the production seed consumer `process_pending_seed_prompts` against a recording pane controller; the reconnect is the production `AppState::note_event_stream_gap` and `AppState::resync_after_event_gap` fed a `ListAgents` reply joined from a separate daemon-side `AppState` by `attach_live_sessions`).
-- **Agent:** none (a synthetic Codex `SessionStart`).
-- **Asserts:** a seed written by the readiness fallback while the pane had no generation; the stream breaks and, after the resync, the TUI holds the daemon's newly announced generation; the next pass then writes nothing more, drops the delivery, and says `lost contact with the agent's events`. Control: the same announcement on an unbroken stream retries into it (two writes). A third case has the agent announce itself and report submitting the seed before the stream breaks: the delivery finalizes with one write and no `lost contact` message (Greptile and Qodo on #1553). A fourth has a retry fall due while the stream is still down — the delivery is held, neither rewritten nor stopped — and the confirmation then arrives on the resumed stream and finalizes it. Removing the gap check from the seed path turns the first case red; checking it on every pass instead of at the write turns the fourth red.
-- **Does not assert:** the orchestrator path, which carries the same checks at its own write (`prompt/pane-input/048` covers its outage hold and deadline); the real subscriber reconnecting (`session/live/018`, and on screen `session/live/019`); a delivery that had written nothing before the gap, which binds against the resynchronized state as any unwritten delivery does.
-- **Platform coverage:** mac+linux.
-
-##### prompt/pane-input/048 — An orchestrator prompt written before the TUI's event stream went down is held at its retry, and one the outage holds to the deadline reports itself unconfirmed rather than undelivered (issue #1520).
-- **Layer:** L1 (the production orchestrator consumer `deliver_orchestrator_prompt` against a recording pane controller; the outage is the production `AppState::note_event_stream_gap`).
-- **Agent:** none (a synthetic Codex `SessionStart` announcing the start role).
-- **Asserts:** the role prompt is written; the stream goes down and the retry falls due, and nothing is written again, the prompt is still held and the delivery kept; the deadline then passes during the same outage, and the status line reads `Orchestrator prompt not confirmed (lost contact with the agent's events)`, with no second write. Disabling the orchestrator's outage hold, or restoring the old `not delivered (timed out)` wording for this case, each turns it red.
-- **Does not assert:** the seed path's hold (`ui::tests::a_seed_that_may_have_written_is_held_through_an_event_stream_outage`, and `prompt/pane-input/047`); a request still unanswered at the deadline, whose `not delivered (timed out)` wording predates #1520; the real subscriber (`session/live/018`, `session/live/019`).
-- **Platform coverage:** mac+linux.
 
 #### prompt/voice-keys
 
@@ -4903,14 +4766,14 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Layer:** L1 (the production `event_subscriber::run` loop, as `main.rs` spawns it, against a scripted daemon on a real Unix socket that answers `SubscribeEvents` and `ListAgents`, and, run a second time as a daemon that advertises it (issue #1555), `Hello` and `SubscribeEventsWithSnapshot`; the snapshot is joined from a real daemon-side `AppState` by `attach_live_sessions`, as the real handler joins it; no PTY, no binary, no agent).
 - **Agent:** none (synthetic Claude Code hook events).
 - **Asserts:** the first subscription delivers `gen-a`'s `SessionStart` and ends with `KIND_STREAM_END "lagged"`; the subscriber resubscribes (at least two subscriptions); its state then names `gen-b` as the pane's generation, shows the card `Working` from the daemon's snapshot, and counts one generation closure for `gen-a`, which ended while it was disconnected — against both kinds of daemon. Before the fix it stayed on `(gen-a, Idle, 0)`.
-- **Does not assert:** what a prompt delivery in flight does across the gap (`prompt/pane-input/047`); a daemon restart or a dropped connection rather than `lagged` (all three reach the same `Ok(None)`/`Err` arm); a card for a pane this TUI does not manage, which the resync never mints. Sibling unit tests in the same module cover a conversation that ended during the gap with no successor (cleared and counted when the reply shows the daemon reports generations, left alone when it does not), a snapshot that fails once and is retried on a fresh subscription, a card refreshed from a snapshot with no newer stamp, and (issue #1555, `events_the_snapshot_already_includes_are_not_replayed_over_it`) a conversation that rolls over between the resubscribe and the snapshot: through `SubscribeEventsWithSnapshot` the closure is counted once, and its control shows the older daemon's unordered resync replaying the window. That the real daemon opens the subscription and reads the snapshot under one `AppState` guard is `daemon_protocol::tests::an_ordered_subscription_never_carries_an_event_its_snapshot_includes`.
+- **Does not assert:** a daemon restart or a dropped connection rather than `lagged` (all three reach the same `Ok(None)`/`Err` arm); a card for a pane this TUI does not manage, which the resync never mints. Sibling unit tests in the same module cover a conversation that ended during the gap with no successor (cleared and counted when the reply shows the daemon reports generations, left alone when it does not), a snapshot that fails once and is retried on a fresh subscription, a card refreshed from a snapshot with no newer stamp, and (issue #1555, `events_the_snapshot_already_includes_are_not_replayed_over_it`) a conversation that rolls over between the resubscribe and the snapshot: through `SubscribeEventsWithSnapshot` the closure is counted once, and its control shows the older daemon's unordered resync replaying the window. That the real daemon opens the subscription and reads the snapshot under one `AppState` guard is `daemon_protocol::tests::an_ordered_subscription_never_carries_an_event_its_snapshot_includes`.
 - **Platform coverage:** mac+linux.
 
 ##### session/live/019 — A running TUI whose event stream breaks and reconnects shows the status it missed (issue #1520).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_reconnect_agent_type.rs`, `#![cfg(feature = "e2e")]`): a real `daemon serve` with a real `StartAgent` pane, the real binary attached through the vt100 `TuiDeck` harness, and the real `agent-event` CLI. The break is the `e2e`-build-only seam `e2e_subscriber_breaks` in `main.rs`, set through `DOT_AGENT_DECK_E2E_BREAK_STREAM_ON`: it drops the first matching event and tears the subscription down once, standing in for a lagged stream, which a PTY test cannot provoke on cue.
 - **Agent:** none (a `sh -c 'sleep 600'` pane declared `Pi`; the status comes from the real `agent-event --type running` CLI).
 - **Asserts:** the card, already on screen, shows `Thinking` after the one event that would have told the TUI so was lost with the stream; the daemon applied it, and the reconnect's resync carried it over (through `SubscribeEventsWithSnapshot`, which the same build's daemon advertises, issue #1555).
-- **Does not assert:** a real lag or daemon restart (the seam stands in for both); a prompt delivery across the gap (`prompt/pane-input/047`); the generation and closure count (`session/live/018`).
+- **Does not assert:** a real lag or daemon restart (the seam stands in for both); the generation and closure count (`session/live/018`).
 - **Platform coverage:** mac+linux.
 
 ### Session save (snapshot freshness, PRD #89 Phase 1)
@@ -5536,7 +5399,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L1/fast real-binary subprocess integration: the real `wrap` inside a deck-managed pane (pane id set, so the trust step runs), a pinned Codex home, a seeded durable deck, and a real hook socket collecting every emitted event.
 - **Agent:** a Codex launcher script (a copy of the app-server stand-in that, launched without `app-server`, records its args and exits) — the `devbox run codex-big` shape. Three runs: a `codex` app-server stand-in on the wrapper's `PATH` listing a deck `pre_tool_use` hook and the deck's `user_prompt_submit` hook switched on; a `PATH` of `/usr/bin:/bin` with no `codex` at all; and the stand-in listing the same two entries with the prompt hook switched OFF (`enabled: false`, the user's `/hooks` toggle), so trust is recorded only for a hook that reports no prompt.
 - **Asserts:** the precondition that trust was recorded in the first and third runs (`config.toml` exists) and not in the second; then that no event carries `wrapper_prompt_reports_unavailable` in the first run, and that EVERY event does — the fork-time `SessionStart` included — in the other two. RED before issue #559's fix for the no-`codex` run, whose events carried nothing; RED on the fix's first revision for the disabled-prompt-hook run, which counted any trusted deck hook as proof (Qodo on PR #1390).
-- **Does not assert:** what the deck does with the marker (`prompt/pane-input/041` for the TUI-owned delivery, `scheduler/dispatch/016` for the daemon-owned one); a trust record left by an earlier `hooks install`, which this spawn cannot see and which the marker therefore misreads in the safe direction; a launcher that re-exports `CODEX_HOME`, which the wrapper cannot detect and which stays a residual.
+- **Does not assert:** what the deck does with the marker (`scheduler/dispatch/016`); a trust record left by an earlier `hooks install`, which this spawn cannot see and which the marker therefore misreads in the safe direction; a launcher that re-exports `CODEX_HOME`, which the wrapper cannot detect and which stays a residual.
 - **Platform coverage:** mac+linux (unix-only test file).
 
 ##### codex/trust/006 — Only the deck's own stale trust records are collected (issue #1027 item 1).
@@ -6781,7 +6644,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L1 (in-process detached spawn confirmation task with a real registry-owned byte-observation PTY: `/bin/cat` on Unix, `more.com` on Windows).
 - **Agent:** none.
 - **Asserts:** attempt 1 is applied and physically reaches the pane before any automatic-write timestamp exists; an unsent user draft after attempt 1 prevents attempt 2 from appending its replacement payload or submitting the draft, and independently a draft after attempt 2 prevents attempt 3's submit-only probe, each proven by an unchanged PTY byte snapshot.
-- **Does not assert:** TUI-owned seed delivery (covered by `prompt/pane-input/032`) or the internal location of the clock comparison.
+- **Does not assert:** the internal location of the clock comparison.
 - **Platform coverage:** mac+linux+windows.
 
 ##### scheduler/dispatch/019 — Releasing an attached user's pane writer cannot expose unstamped input to an automatic retry.
@@ -6809,7 +6672,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L1 (in-process detached confirmation loop on paused time, a real byte-observation PTY stamped with a Codex spawn record, and a thread-scoped `tracing` subscriber reading the delivery log).
 - **Agent:** none — a `/bin/cat` byte target (`more.com` on Windows) whose frozen spawn type is Codex, so `confirmation_floor_for` derives the floor exactly as `deliver` does.
 - **Asserts:** after attempt 1, the genuine submission report arriving 8.45 s later on virtual time is accepted as attempt 1's confirmation, and the delivery log carries no `re-submitting` and no `probing submit` line — i.e. no replacement payload and no submit probe went into the pane first. The log is read rather than the scrollback because the watch logs a re-submission BEFORE writing it, so the assertion is not a race against the PTY echo. Measured RED with the floor taken out of `unconfirmed_retry_delay` (the pre-#637 schedule).
-- **Does not assert:** that a never-confirmed delivery is still retried on this path (the TUI half of that is `prompt/pane-input/041`; the daemon schedule itself is unit-tested beside `unconfirmed_retry_delay`); any real agent's confirmation latency.
+- **Does not assert:** that a never-confirmed delivery is still retried on this path (the daemon schedule itself is unit-tested beside `unconfirmed_retry_delay`); any real agent's confirmation latency.
 - **Platform coverage:** mac+linux+windows.
 
 ##### scheduler/dispatch/023 — A human draft holds the fixed inbox doorbell until Enter.

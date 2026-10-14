@@ -38,11 +38,9 @@ const LAUNCHER_LOG: &str = "late-announce.log";
 ///
 /// Issue #1006: the field environment was `devbox run agent` → devbox init hooks
 /// → `claude`, announcing ~4.2 s after spawn, while the harness exec'd `claude`
-/// directly and announced fast enough to win the race. Three seconds is
-/// comfortably past the 500 ms `SPAWN_TIME_READINESS_BUFFER` the broken gate
-/// writes on, and leaves the real agent room to announce inside the 10 s
-/// `timeout_ready` slow path — which would deliver the seed for an unrelated
-/// reason and weaken what a green run proves.
+/// directly and announced fast enough to win the race. Three seconds is long
+/// enough that a seed written into the pane at spawn would be sitting in its
+/// input queue when the launcher hands over, which is what the launcher checks.
 const LAUNCHER_DELAY_SECS: u64 = 3;
 
 /// The absolute path of the REAL `claude`, resolved off the host PATH.

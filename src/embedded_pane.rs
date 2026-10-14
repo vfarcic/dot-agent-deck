@@ -16,8 +16,7 @@ use crate::event::AgentType;
 use crate::focus_report::FocusReporter;
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
 use crate::pane::{
-    AgentSpawnOptions, PaneController, PaneDirection, PaneError, PaneInfo, PendingSubmit,
-    RenameOutcome,
+    AgentSpawnOptions, PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome,
 };
 use crate::terminal_modes::{
     ModeDirective, MouseEncoding, MouseModes, MouseProtocol, PrivateModeScanner,
@@ -517,61 +516,6 @@ fn render_only_runtime() -> tokio::runtime::Handle {
     })
     .handle()
     .clone()
-}
-
-/// Issue #1383 / #621: start a guarded write-and-submit on `runtime` and hand
-/// back a handle the render loop polls — the body of
-/// [`EmbeddedPaneController`]'s `begin_write_and_submit_to_pane_with_identity`,
-/// kept free-standing so a test can drive the TUI's delivery loops through the
-/// same call against an in-process daemon.
-///
-/// The reply keeps the generation a `stale` refusal names
-/// ([`crate::pane::SubmitReply::current_session_id`]), which is how a delivery
-/// whose `SessionStart` the event stream dropped learns the conversation to
-/// name.
-pub(crate) fn begin_guarded_submit(
-    runtime: &tokio::runtime::Handle,
-    client: DaemonClient,
-    pane_id: &str,
-    text: &str,
-    expected_agent_id: Option<&str>,
-    expected_session_id: Option<&str>,
-    delivery_id: Option<&str>,
-) -> PendingSubmit {
-    let (tx, pending) = PendingSubmit::channel();
-    let pane_id = pane_id.to_string();
-    let text = text.to_string();
-    let expected_agent_id = expected_agent_id.map(str::to_string);
-    let expected_session_id = expected_session_id.map(str::to_string);
-    let delivery_id = delivery_id.map(str::to_string);
-    runtime.spawn(async move {
-        let reply = match client
-            .write_and_submit_with_identity_reply(
-                &pane_id,
-                &text,
-                expected_agent_id.as_deref(),
-                expected_session_id.as_deref(),
-                delivery_id.as_deref(),
-            )
-            .await
-        {
-            Ok(reply) => crate::pane::SubmitReply {
-                result: Ok(reply.result),
-                current_session_id: reply.current_session_id,
-                may_have_written: false,
-            },
-            Err(failure) => crate::pane::SubmitReply {
-                result: Err(PaneError::CommandFailed(format!(
-                    "write_and_submit: {}",
-                    failure.error
-                ))),
-                current_session_id: None,
-                may_have_written: failure.may_have_written,
-            },
-        };
-        let _ = tx.send_reply(reply);
-    });
-    pending
 }
 
 /// Embedded terminal pane controller. Spawns agents on the daemon at
@@ -4197,88 +4141,6 @@ impl PaneController for EmbeddedPaneController {
         Ok(())
     }
 
-    /// PRD #100: atomic counterpart of [`Self::write_to_pane`]. Routes
-    /// through the new `WriteAndSubmit` RPC so the daemon holds its
-    /// per-agent writer mutex across `payload → SUBMIT_DELAY → CR`,
-    /// matching the daemon-initiated `write_and_submit_guarded` contract.
-    /// Used at the orchestrator spawn-time role-prompt injection site
-    /// in `ui.rs`, where a concurrent daemon-initiated write (e.g.
-    /// work-done feedback for a sibling worker) could otherwise
-    /// interleave into the legacy two-frame path's mid-sequence gap and
-    /// submit the user's prompt with daemon bytes fused in.
-    fn write_and_submit_to_pane(
-        &self,
-        pane_id: &str,
-        text: &str,
-    ) -> Result<crate::event::SendResult, PaneError> {
-        // Issue #608: the daemon now REFUSES a paned write that names no agent
-        // (`no-live-target`, nothing written) — a pane id is a recycled handle,
-        // so "deliver to whoever holds this pane now" is the accidental
-        // mis-delivery the guarded-send machinery exists to prevent. This
-        // controller is the one non-mock implementor of this identity-less
-        // door, and it already knows which agent occupies the pane, so it names
-        // it instead of sending a shape the daemon declines. The SESSION
-        // generation is daemon-side state this controller does not track; a
-        // caller that knows one calls
-        // [`Self::write_and_submit_to_pane_with_identity`] directly, which both
-        // production UI delivery paths do.
-        //
-        // The daemon client is called directly rather than through the trait
-        // sibling so this can never recurse through `PaneController`'s default
-        // `write_and_submit_to_pane_with_identity` (which forwards back here).
-        let expected_agent_id = self.pane_agent_id(pane_id).filter(|id| !id.is_empty());
-        let client = self.client.clone();
-        let pane_id = pane_id.to_string();
-        let text = text.to_string();
-        self.runtime
-            .block_on(async move {
-                client
-                    .write_and_submit_with_identity(
-                        &pane_id,
-                        &text,
-                        expected_agent_id.as_deref(),
-                        None,
-                        None,
-                    )
-                    .await
-            })
-            .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
-    }
-
-    /// PRD #20 R20-003/R20-004: carry the queued-for agent identity + session and
-    /// a stable delivery id to the daemon's atomic write-and-submit RPC, so a
-    /// respawn/rebind between enqueue and delivery yields `stale`/`wrong-session`
-    /// (no write) and a retry after a lost response replays the first result
-    /// instead of double-submitting.
-    fn write_and_submit_to_pane_with_identity(
-        &self,
-        pane_id: &str,
-        text: &str,
-        expected_agent_id: Option<&str>,
-        expected_session_id: Option<&str>,
-        delivery_id: Option<&str>,
-    ) -> Result<crate::event::SendResult, PaneError> {
-        let client = self.client.clone();
-        let pane_id = pane_id.to_string();
-        let text = text.to_string();
-        let expected_agent_id = expected_agent_id.map(str::to_string);
-        let expected_session_id = expected_session_id.map(str::to_string);
-        let delivery_id = delivery_id.map(str::to_string);
-        self.runtime
-            .block_on(async move {
-                client
-                    .write_and_submit_with_identity(
-                        &pane_id,
-                        &text,
-                        expected_agent_id.as_deref(),
-                        expected_session_id.as_deref(),
-                        delivery_id.as_deref(),
-                    )
-                    .await
-            })
-            .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
-    }
-
     fn post_message(
         &self,
         pane_id: &str,
@@ -4340,35 +4202,6 @@ impl PaneController for EmbeddedPaneController {
                 ),
             }
         });
-    }
-
-    /// Issue #1383: the same RPC as
-    /// [`Self::write_and_submit_to_pane_with_identity`], run on the
-    /// controller's runtime so the render thread does not wait for it. The
-    /// daemon holds the submit's CR until the payload renders — up to
-    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`] on a pane that does not echo
-    /// — and the render loop polls the returned handle each frame instead.
-    ///
-    /// Dropping the handle does not cancel the RPC: the daemon completes the
-    /// write whether or not anyone reads its answer, exactly as it does for a
-    /// response lost in transit.
-    fn begin_write_and_submit_to_pane_with_identity(
-        &self,
-        pane_id: &str,
-        text: &str,
-        expected_agent_id: Option<&str>,
-        expected_session_id: Option<&str>,
-        delivery_id: Option<&str>,
-    ) -> PendingSubmit {
-        begin_guarded_submit(
-            &self.runtime,
-            self.client.clone(),
-            pane_id,
-            text,
-            expected_agent_id,
-            expected_session_id,
-            delivery_id,
-        )
     }
 
     fn name(&self) -> &str {
@@ -6052,86 +5885,6 @@ mod tests {
 
             drop((controller, other));
             registry.shutdown_all();
-        }
-    }
-
-    /// Issue #1383: the TUI's prompt submits are started on the controller's
-    /// runtime and polled, because the daemon holds a submit's CR until the
-    /// payload renders and the render thread must keep drawing meanwhile.
-    #[cfg(unix)]
-    mod started_submits {
-        use super::focus_claims::{bind, runtime};
-        use super::*;
-        use crate::daemon_protocol::{AttachResponse, KIND_REQ, read_frame, write_resp};
-
-        /// Scenario: the TUI starts a prompt submit against a daemon that has
-        /// not answered yet. Starting it must return at once, polling it must
-        /// report it unanswered, and once the daemon answers the poll must
-        /// report that answer.
-        #[test]
-        fn a_started_submit_returns_before_the_daemon_answers() {
-            let runtime = runtime();
-            let (_dir, path, listener) = bind(&runtime, "held-submit");
-            let gate = tokio::sync::watch::Sender::new(false);
-            let mut open = gate.subscribe();
-            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let seen = Arc::clone(&requests);
-            let server = runtime.spawn(async move {
-                while let Ok(mut stream) = listener.accept().await {
-                    let Ok(Some((KIND_REQ, _))) = read_frame(&mut stream).await else {
-                        continue;
-                    };
-                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let _ = open.wait_for(|open| *open).await;
-                    let _ = write_resp(&mut stream, &AttachResponse::err("held daemon")).await;
-                }
-            });
-            let controller = EmbeddedPaneController::new(path, runtime.handle().clone());
-
-            let started = Instant::now();
-            let mut pending = controller.begin_write_and_submit_to_pane_with_identity(
-                "pane-1383",
-                "Read the seed and begin",
-                Some("agent-1383"),
-                None,
-                Some("delivery-1383"),
-            );
-            assert!(
-                started.elapsed() < Duration::from_millis(500),
-                "starting a submit must not wait for the daemon: {:?}",
-                started.elapsed()
-            );
-            let asked = Instant::now() + Duration::from_secs(5);
-            while requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                assert!(
-                    Instant::now() < asked,
-                    "the submit never reached the daemon"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            assert!(
-                pending.poll().is_none(),
-                "a submit the daemon has not answered must poll as unanswered"
-            );
-
-            gate.send_replace(true);
-            let answered = Instant::now() + Duration::from_secs(5);
-            let outcome = loop {
-                if let Some(outcome) = pending.poll() {
-                    break outcome;
-                }
-                assert!(
-                    Instant::now() < answered,
-                    "the daemon's answer never arrived"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            };
-            assert!(
-                outcome.is_err(),
-                "the held daemon refuses, and the poll must report it: {outcome:?}"
-            );
-            assert!(pending.poll().is_none(), "an outcome is taken once");
-            server.abort();
         }
     }
 }

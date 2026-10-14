@@ -7,9 +7,8 @@
 //! compact. This file pins the fix: a `Compacting` event, or a
 //! `/clear`-originated `SessionStart`, on the orchestrator start-role pane
 //! re-delivers the `.dot-agent-deck/orchestrator-context-*.md` pointer, scoped
-//! to the start role only, through the SAME readiness-gating and delivery-
-//! confirmation discipline the spawn-time seed already uses
-//! (`deliver_orchestrator_prompt`, `src/ui.rs`).
+//! to the start role only, by posting it to the start role's inbox the way the
+//! spawn-time seed is (`post_orchestrator_prompt`, `src/ui.rs`).
 //!
 //! Uses the `remit-reassert-orchestration` fixture (`orchestrator` start
 //! role running a synthetic script written by each test into the deck's
@@ -21,13 +20,6 @@
 //! declared liveness live -> history-only -> live on cue from the test
 //! driver (needed only by `orchestration/remit/003`; `001`/`002`/`004`-`007`
 //! simply never trigger that phase).
-//!
-//! `orchestration/remit/003` deliberately asserts only on the RENDERED GRID
-//! feedback string and the delivery-log line count — both pre-existing,
-//! stable observables `deliver_orchestrator_prompt` already produces for a
-//! `HistoryOnly` `SendResult` today — never on an internal Rust symbol or
-//! enum variant, so this file stays correct regardless of internal
-//! refactoring of the delivery-confirmation machinery.
 //!
 //! Gated behind the `e2e` feature so `cargo test-fast` never compiles it.
 
@@ -408,11 +400,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 /// meanwhile the FOREGROUND script body reads and logs every line delivered
 /// to its real stdin, however many arrive, to `orchestrator-prompt.log`, and
 /// reports each one back over the hook socket as a `user_prompt`-carrying
-/// `thinking` event — the evidence `deliver_orchestrator_prompt`'s
-/// submission-confirmation logic accepts as CONFIRMATION that a written
-/// prompt was actually submitted rather than merely landed on the PTY.
-/// Without that confirmation every delivery against this fixture — the
-/// spawn-time seed included — is stuck permanently unconfirmed.
+/// `thinking` event.
 ///
 /// The background/foreground split is load-bearing, not stylistic: a
 /// non-interactive POSIX shell reassigns an ASYNCHRONOUS (`&`) job's stdin to
