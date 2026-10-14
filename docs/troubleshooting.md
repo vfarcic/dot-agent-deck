@@ -206,7 +206,7 @@ The doorbell waits while the agent is busy, a permission or dialog answer is nee
 
 ### An inbox integration is refused with `inbox_not_agent_process`
 
-Run the agent inside its deck pane and restart it after `dot-agent-deck hooks install`. Its inbox integration must run as part of that agent; copying the pane's environment into a separate terminal does not make that terminal its inbox receiver. This applies to agents launched from either the TUI or desktop app. If a launcher moves the integration into a separate background service, keep it with the managed agent instead.
+Run the agent inside its deck pane and restart it after `dot-agent-deck hooks install`. Run its inbox integration as part of that agent, for example through a command the agent executes; a separate terminal with a copy of the pane's environment can be refused. This applies to agents launched from either the TUI or desktop app. If a launcher moves the integration into a separate background service, keep it with the managed agent instead.
 
 ### Codex events not showing
 
