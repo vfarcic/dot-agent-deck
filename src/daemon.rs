@@ -3823,6 +3823,12 @@ fn admit_inbox_component(
 /// agent's native receiver. Answers the instance the receiver is pinned by
 /// ([`receiver_instance`]), and refuses one with an agent of its own kind
 /// between it and the caller ([`nested_between`]).
+///
+/// Audit D1: this bounds registration to the agent's process tree; it does not
+/// tell the visible integration from another process the agent runs. A waiter
+/// started from the agent's own tool shell resolves to the agent, and a nested
+/// agent of another kind naming the outer agent's pid passes the same-kind
+/// check; either is then the same receiver as far as the pin can tell.
 fn admit_receiver_process(
     peer: Option<u32>,
     claimed: Option<u32>,
@@ -8770,15 +8776,16 @@ mod hook_ingestion_tests {
     /// pinned by the agent above the shell, so every hook of one agent names
     /// the same receiver.
     #[test]
-    fn a_nested_agent_cannot_register_as_the_outer_agents_receiver() {
+    fn a_nested_agent_of_the_same_kind_cannot_name_the_outer_agent_as_its_receiver() {
         // 1 ── 10 claude ── 11 bash (a tool) ── 12 claude (nested) ── 13 sh ── 14 CLI
+        //   │            │                 └── 19 CLI (a waiter the tool runs)
         //   │            ├── 15 sh ── 16 CLI (the outer agent's hook)
         //   │            └── 17 sh ── 18 CLI (its next hook, in a new shell)
         //   └── 20 node (npx) ── 21 sh ── 22 node (pi) ── 23 CLI (its watcher)
         let parents = |pid: u32| match pid {
             10 | 20 => Some(1),
             11 | 15 | 17 => Some(10),
-            12 => Some(11),
+            12 | 19 => Some(11),
             13 => Some(12),
             14 => Some(13),
             16 => Some(15),
@@ -8793,7 +8800,7 @@ mod hook_ingestion_tests {
                 10 | 12 => "/opt/claude",
                 11 => "/bin/bash",
                 13 | 15 | 17 | 21 => "/bin/sh",
-                14 | 16 | 18 | 23 => "/opt/dot-agent-deck",
+                14 | 16 | 18 | 19 | 23 => "/opt/dot-agent-deck",
                 20 | 22 => "/usr/bin/node",
                 _ => return None,
             };
@@ -8811,12 +8818,17 @@ mod hook_ingestion_tests {
         assert_eq!(admit(Some(16), Some(10), Some(10)), Ok(Some(10)));
         // Pi's watcher, a direct child of Pi under an npx wrapper that runs node too.
         assert_eq!(admit(Some(23), Some(22), Some(20)), Ok(Some(22)));
-        // The nested agent naming the outer agent as its instance is refused.
+        // The nested agent of the same kind naming the outer agent as its
+        // instance is refused.
         assert!(admit(Some(14), Some(10), Some(10)).is_err());
-        // Naming its own shell, or itself, it is the nested agent's receiver,
-        // which the generation's pinned receiver refuses (`InboxHub::arm`).
+        // Naming its own shell, or itself, it is the nested agent's own
+        // instance, which the pin refuses once the outer agent has armed or
+        // announced (`InboxHub::arm`).
         assert_eq!(admit(Some(14), Some(13), Some(10)), Ok(Some(12)));
         assert_eq!(admit(Some(14), Some(12), Some(10)), Ok(Some(12)));
+        // Audit D1, the boundary: a waiter the agent's tool shell runs resolves
+        // to the agent, the same receiver as its hooks.
+        assert_eq!(admit(Some(19), Some(11), Some(10)), Ok(Some(10)));
         // A walk that cannot say does not refuse, and pins what was named.
         assert_eq!(
             admit_receiver_process(Some(14), Some(10), Some(10), descends, parents, |_| None),

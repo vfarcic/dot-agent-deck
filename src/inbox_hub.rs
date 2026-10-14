@@ -434,11 +434,20 @@ pub fn undelivered_after_from_env() -> Duration {
 impl HubState {
     /// Audit F3: admit component process `instance` as `key`'s native
     /// receiver. The first instance admitted is pinned for the rest of the
-    /// generation, and every other one is refused from then on — not only
-    /// while a stream is live, so a nested agent a tool started, which
-    /// inherits the pane's identity, cannot arm in the gap while the outer
-    /// agent's waiter re-arms. An instance this platform cannot name pins
-    /// nothing, and is refused once one is pinned.
+    /// generation, and every other instance is refused from then on — not
+    /// only while a stream is live, so once one has armed or announced, a
+    /// second component process naming another instance cannot arm in the gap
+    /// while the first one's waiter re-arms. An instance this platform cannot
+    /// name pins nothing, and is refused once one is pinned.
+    ///
+    /// Audit D1: the pin compares instances and nothing more. The receiver is
+    /// bound to the agent's process tree, not authenticated as the visible
+    /// integration: a process the agent itself runs that names, or resolves
+    /// to, the pinned instance — a tool shell, or a nested agent of another
+    /// kind naming the outer agent's pid — is admitted as that receiver. Until
+    /// one is pinned the first arrival wins, and a Claude below the waiter
+    /// gate never announces, so its generation is pinned by whatever arms
+    /// first.
     fn admit_receiver(&mut self, key: &AgentKey, instance: Option<u32>) -> Result<(), ArmError> {
         match (self.receivers.get(key), instance) {
             (Some(pinned), Some(instance)) if *pinned == instance => Ok(()),
@@ -2521,7 +2530,7 @@ mod tests {
     /// Audit F3 (a): the first process to arm or announce for an agent
     /// generation is its native receiver for the rest of that generation.
     /// Any other instance is refused — between arms as much as while a stream
-    /// is live, so a nested agent cannot slip in while the outer one's waiter
+    /// is live, so a second instance cannot arm while the pinned one's waiter
     /// re-arms — while the pinned instance may still supersede its own stream.
     /// The pin goes with the generation.
     #[tokio::test]
