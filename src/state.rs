@@ -9738,10 +9738,14 @@ impl AppState {
         // case it exists to surface. See
         // [`AgentPtyRegistry::retire_silence_watch`] for why the accounting
         // cannot simply borrow the idle detector's generation.
-        // PRD #1666 S5: a worker reporting work-done has its delegated tasks not
-        // yet acknowledged retired as superseded — so no undelivered notice is
-        // posted about a task the worker has answered.
-        registry.inbox().supersede_delegates_to(&signal.pane_id);
+        // PRD #1666 S5: a worker reporting work-done has the delegated tasks it
+        // fetched and has not acknowledged retired as superseded — so no
+        // undelivered notice is posted about a task the worker has answered. A
+        // newer task still queued is not answered by this completion, and stays
+        // owed and watched, for the reason above (delegate_021).
+        registry
+            .inbox()
+            .retire_answered_delegates_to(&signal.pane_id);
         // Issue #617 (finding 7): the orchestrator identity the retired delegation
         // was ISSUED by — `(pane, registry agent id)` — carried down to the
         // feedback write below so the report goes to the conversation that

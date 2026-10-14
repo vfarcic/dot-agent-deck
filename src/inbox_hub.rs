@@ -357,6 +357,10 @@ struct HubState {
     exited_ledgers: Vec<DelegateLedger>,
     /// Ids minted for a delegated task that is not yet posted, nor abandoned.
     pending_posts: std::collections::HashSet<String>,
+    /// PRD #1666 delegate_021: worker panes that acknowledged a delegated task
+    /// and have not reported `work-done` since
+    /// ([`InboxHub::retire_answered_delegates_to`]).
+    received_since_done: std::collections::HashSet<String>,
     /// PRD #1666 §2.8: where a recipient's card is told a message could not
     /// reach it — the daemon's delivery-notice channel, installed by
     /// [`InboxHub::set_card_notice_sink`]. Nothing is owed while it is unset.
@@ -465,6 +469,7 @@ impl InboxHub {
                 rings: HashMap::new(),
                 exited_ledgers: Vec::new(),
                 pending_posts: std::collections::HashSet::new(),
+                received_since_done: std::collections::HashSet::new(),
                 card_notice_sink: None,
                 owed_card_notices: Vec::new(),
             }),
@@ -680,10 +685,39 @@ impl InboxHub {
         Ok((id, rx))
     }
 
+    /// PRD #1666 S5: what a worker's `work-done` retires, as superseded, so no
+    /// undelivered notice is posted about a task the worker has answered. A
+    /// `work-done` names no task, so which one it answers is inferred:
+    ///
+    /// * when the worker acknowledged a delegated task since its last
+    ///   `work-done`, the completion answers that task (delegate_021). Only the
+    ///   tasks that reached the worker since — fetched at least once and not
+    ///   acknowledged — are retired with it; a newer task never fetched stays
+    ///   queued and watched, so its orchestrator is still told if it does not
+    ///   reach the worker.
+    /// * otherwise the worker answered a task it took some other way, such as
+    ///   its task file, without acknowledging the message (idle-worker/029),
+    ///   and every task to the pane not yet acknowledged is retired.
+    pub fn retire_answered_delegates_to(&self, pane_id: &str) -> usize {
+        let received = self.lock().received_since_done.remove(pane_id);
+        if received {
+            self.retire_delegates_to(pane_id, |message| message.deliveries > 0)
+        } else {
+            self.retire_delegates_to(pane_id, |_| true)
+        }
+    }
+
     /// PRD #1666 S5: retire every delegated task to `pane_id` that is not yet
-    /// acknowledged, as superseded — a newer delegation, or the worker's
-    /// `work-done`, has made it moot. Superseded tasks are not reported.
+    /// acknowledged, as superseded — a newer delegation, or the pane's agent
+    /// restarting, has made it moot. Superseded tasks are not reported. A
+    /// worker's `work-done` retires less: [`Self::retire_answered_delegates_to`].
     pub fn supersede_delegates_to(&self, pane_id: &str) -> usize {
+        self.retire_delegates_to(pane_id, |_| true)
+    }
+
+    /// Retire, as superseded, each watched task to `pane_id` whose live message
+    /// `retire` selects, and drop the watch of any already terminal.
+    fn retire_delegates_to(&self, pane_id: &str, retire: impl Fn(&Message) -> bool) -> usize {
         let retired = {
             let mut st = self.lock();
             let now = Instant::now();
@@ -695,6 +729,13 @@ impl InboxHub {
                 .collect();
             let mut retired = 0;
             for id in ids {
+                let live = st
+                    .inbox
+                    .get(&id, pane_id)
+                    .filter(|message| !message.state.is_terminal());
+                if live.is_some_and(|message| !retire(message)) {
+                    continue;
+                }
                 if st
                     .inbox
                     .retire(now, &id, pane_id, UndeliverableReason::Superseded)
@@ -1183,6 +1224,7 @@ impl InboxHub {
         st.announced.remove(&key);
         st.receivers.remove(&key);
         st.rings.remove(&key);
+        st.received_since_done.remove(pane_id);
         drain_events(&mut st);
         let ledgers = std::mem::take(&mut st.exited_ledgers);
         drop(st);
@@ -1781,6 +1823,7 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
         let _ = tx.send(end);
     }
     if end != DelegateEnd::Ended {
+        st.received_since_done.insert(watch.worker.pane_id);
         return;
     }
     let reason = match event.undeliverable_reason {
@@ -3270,5 +3313,173 @@ mod tests {
                 "{tail:?}"
             );
         }
+    }
+
+    fn state_in(hub: &InboxHub, pane: &str, id: &MessageId) -> StateName {
+        hub.list(pane)
+            .into_iter()
+            .find(|m| &m.id == id)
+            .map(|m| m.state)
+            .expect("message listed")
+    }
+
+    /// Delegate `task` to worker pane `w` (agent `wa`) from orchestrator pane
+    /// `o` (agent `oa`), with notices due at once.
+    fn delegate(hub: &InboxHub, task: &str) -> MessageId {
+        hub.post_delegate(
+            Recipient::bound("w", "wa"),
+            "coder",
+            Some(Recipient::bound("o", "oa")),
+            DelegateLedger::default(),
+            content(task),
+        )
+        .expect("delegated")
+        .0
+    }
+
+    /// PRD #1666 delegate_021: a worker's `work-done` answers the task it
+    /// fetched, not a newer one still queued for it. That newer task stays
+    /// queued and watched, so the orchestrator is told it has not reached the
+    /// worker, and the worker can still fetch it.
+    #[tokio::test]
+    async fn work_done_leaves_a_queued_newer_delegate_owed() {
+        let mut hub = hub();
+        hub.undelivered_after = Duration::ZERO;
+        let first = delegate(&hub, "OLDER-TASK");
+        let fetched = hub.fetch(
+            "w",
+            "wa",
+            Consumer::FetchCli,
+            None,
+            Some(AckHow::FetchedByCli),
+        );
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(state_in(&hub, "w", &first), StateName::Acknowledged);
+        let second = delegate(&hub, "NEWER-TASK-STILL-OWED");
+
+        assert_eq!(hub.retire_answered_delegates_to("w"), 0);
+        assert_eq!(state_in(&hub, "w", &second), StateName::Queued);
+
+        hub.tick();
+        let notices: Vec<_> = hub
+            .list("o")
+            .into_iter()
+            .filter(|m| m.subject == UNDELIVERED_SUBJECT)
+            .collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let body = hub
+            .fetch("o", "oa", Consumer::FetchCli, None, None)
+            .into_iter()
+            .map(|d| d.text)
+            .collect::<String>();
+        assert!(body.contains(second.as_str()), "{body}");
+        assert!(body.contains("has not reached the worker"), "{body}");
+
+        let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, None);
+        assert_eq!(taken.len(), 1);
+        assert!(taken[0].text.contains("NEWER-TASK-STILL-OWED"));
+    }
+
+    /// PRD #1666 S5 (idle-worker/029): a worker that acknowledged no delegated
+    /// task since its last `work-done` answered one it took some other way —
+    /// its task file — so its `work-done` retires a task never fetched, and no
+    /// undelivered notice is posted about it.
+    #[tokio::test]
+    async fn work_done_with_no_task_received_retires_an_unfetched_delegate_silently() {
+        let mut hub = hub();
+        hub.undelivered_after = Duration::from_secs(3600);
+        let task = delegate(&hub, "TASK-READ-FROM-ITS-FILE");
+        assert_eq!(hub.retire_answered_delegates_to("w"), 1);
+        assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
+        hub.undelivered_after = Duration::ZERO;
+        hub.tick();
+        assert!(
+            hub.list("o").is_empty(),
+            "a task the worker answered is not reported"
+        );
+
+        // After a work-done answered an acknowledged task, the next one with
+        // nothing acknowledged in between is back to retiring everything.
+        let first = delegate(&hub, "ACKNOWLEDGED");
+        hub.fetch(
+            "w",
+            "wa",
+            Consumer::FetchCli,
+            None,
+            Some(AckHow::FetchedByCli),
+        );
+        let second = delegate(&hub, "QUEUED");
+        assert_eq!(hub.retire_answered_delegates_to("w"), 0);
+        assert_eq!(state_in(&hub, "w", &first), StateName::Acknowledged);
+        assert_eq!(hub.retire_answered_delegates_to("w"), 1);
+        assert_eq!(state_in(&hub, "w", &second), StateName::Undeliverable);
+    }
+
+    /// PRD #1666 delegate_021, the companion: after an acknowledged task, a
+    /// task the worker fetched and has not acknowledged is retired by its
+    /// `work-done` as superseded — fetched once and handed back to the queue by
+    /// the ack-wait counts too — and no undelivered notice is posted about it.
+    #[tokio::test]
+    async fn work_done_retires_a_fetched_unacknowledged_delegate_silently() {
+        let limits = InboxLimits {
+            ack_wait: Duration::ZERO,
+            ..InboxLimits::default()
+        };
+        let mut hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        hub.undelivered_after = Duration::from_secs(3600);
+        // Each worker acknowledged an earlier task, so a work-done may be its
+        // answer and retires only what reached the worker since.
+        for (pane, agent) in [("w", "wa"), ("w2", "wa2")] {
+            hub.post_delegate(
+                Recipient::bound(pane, agent),
+                "coder",
+                Some(Recipient::bound("o", "oa")),
+                DelegateLedger::default(),
+                content("EARLIER-TASK"),
+            )
+            .unwrap();
+            hub.fetch(
+                pane,
+                agent,
+                Consumer::FetchCli,
+                None,
+                Some(AckHow::FetchedByCli),
+            );
+        }
+        let fetched = delegate(&hub, "FETCHED-TASK");
+        assert_eq!(
+            hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
+            1
+        );
+        assert_eq!(state_in(&hub, "w", &fetched), StateName::Fetched);
+        // A second worker's task is fetched and then handed back by the
+        // ack-wait: it reached the worker all the same.
+        let other = hub
+            .post_delegate(
+                Recipient::bound("w2", "wa2"),
+                "coder",
+                Some(Recipient::bound("o", "oa")),
+                DelegateLedger::default(),
+                content("REDELIVERED-TASK"),
+            )
+            .unwrap()
+            .0;
+        assert_eq!(
+            hub.fetch("w2", "wa2", Consumer::FetchCli, None, None).len(),
+            1
+        );
+        hub.tick();
+        assert_eq!(state_in(&hub, "w2", &other), StateName::Queued);
+
+        assert_eq!(hub.retire_answered_delegates_to("w"), 1);
+        assert_eq!(hub.retire_answered_delegates_to("w2"), 1);
+        assert_eq!(state_in(&hub, "w", &fetched), StateName::Undeliverable);
+        assert_eq!(state_in(&hub, "w2", &other), StateName::Undeliverable);
+        hub.undelivered_after = Duration::ZERO;
+        hub.tick();
+        assert!(
+            hub.list("o").is_empty(),
+            "a task the worker answered is not reported"
+        );
     }
 }
