@@ -6686,7 +6686,7 @@ mod hook_ingestion_tests {
             let rx = rx.resubscribe();
             async move {
                 let mut rx = rx;
-                tokio::time::timeout(Duration::from_millis(500), async {
+                tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         if let Ok(BroadcastMsg::Event(event)) = rx.recv().await
                             && event.pane_id.as_deref() == Some(PANE_ID)
@@ -6721,13 +6721,18 @@ mod hook_ingestion_tests {
             crate::state::SessionStatus::Thinking
         );
 
-        let again = next_event(&mut attached_rx);
+        // The sink applies notices one at a time in the order they arrive, so
+        // a second report published after the second lift is the next event
+        // broadcast only if that lift broadcast nothing.
+        let next = next_event(&mut attached_rx);
         registry.publish_delivery_notice(notice(true));
-        let again = again.await;
+        registry.publish_delivery_notice(notice(false));
+        let next = next.await;
         registry.shutdown_all();
+        let next = next.expect("the second report is broadcast");
         assert!(
-            again.is_none(),
-            "a card that no longer shows the notice gets no lift: {again:?}"
+            !next.is_delivery_notice_cleared() && next.event_type == crate::event::EventType::Error,
+            "a card that no longer shows the notice gets no lift: {next:?}"
         );
     }
 

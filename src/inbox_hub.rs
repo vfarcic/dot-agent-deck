@@ -3804,7 +3804,7 @@ mod tests {
             ..InboxLimits::default()
         };
         let mut hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
-        hub.undelivered_after = Duration::from_millis(150);
+        hub.undelivered_after = Duration::from_secs(3600);
         let id = delegate(&hub, "LONG-TURN-TASK");
         let stream = Consumer::Stream { conn_id: 41 };
         for round in 0..8 {
@@ -3813,8 +3813,15 @@ mod tests {
                 1,
                 "round {round}"
             );
+            // The notice deadline has passed by the time the worker holds:
+            // only the hold keeps the next tick from posting the notice.
+            let before = Instant::now();
+            hub.lock().delegates.get_mut(id.as_str()).unwrap().due = before;
             assert!(hub.hold(id.as_str(), "w", "wa", &stream), "round {round}");
-            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                hub.lock().delegates[id.as_str()].due >= before + hub.undelivered_after,
+                "round {round}: the hold moves the notice a full window past it"
+            );
             hub.tick();
             assert_eq!(state_in(&hub, "w", &id), StateName::Queued, "round {round}");
         }
