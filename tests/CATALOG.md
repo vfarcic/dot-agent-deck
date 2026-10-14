@@ -5337,14 +5337,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### chain-smoke/pi/001 — A real Pi orchestrator receives an inbox directive and delegates a sentinel task to real Claude Haiku.
 - **Layer:** L2 lane 2 (`tests/e2e_pi_orchestrator.rs`), in-process daemon and real interactive agent PTYs; headless.
 - **Agent:** Real Pi Haiku orchestrator and Claude Haiku worker, with scratch HOMEs and Pi agent directory.
-- **Asserts:** The inbox directive becomes Acknowledged with ExtensionConfirmed and one delivery; the worker writes the sentinel and reports work-done; Pi reports its status through the extension.
+- **Asserts:** The inbox directive becomes Acknowledged with ExtensionConfirmed and one delivery; the worker writes the sentinel at the exact literal path specified by the Bash directive, then reports work-done; Pi reports its status through the extension. Bounded sentinel/work-done waits print phase and path evidence before the 300s nextest timeout.
 - **Does not assert:** Rendered cards or exact model phrasing.
 - **Platform coverage:** mac+linux.
 
 ##### chain-smoke/pi/002 — A clear=true real Pi worker receives an inbox delegate, writes a sentinel and reports work-done.
 - **Layer:** L2 lane 2 (`tests/e2e_pi_worker.rs`), in-process daemon, synthetic orchestrator signal and real interactive Pi worker; headless.
 - **Agent:** Real Pi Haiku worker with scratch HOME and PI_CODING_AGENT_DIR.
-- **Asserts:** The configured worker respawn receives its native inbox task, creates the sentinel, and reports work-done; the task is Acknowledged with ExtensionConfirmed and one delivery.
+- **Asserts:** The configured worker respawn receives its native inbox task, creates the sentinel at the exact literal path specified by the shell directive, then reports work-done; bounded waits print phase and path evidence before the 300s nextest timeout; the task is Acknowledged with ExtensionConfirmed and one delivery.
 - **Does not assert:** A real orchestrator model or rendered cards.
 - **Platform coverage:** mac+linux.
 

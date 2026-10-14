@@ -664,3 +664,22 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(project_launch_003_a_real_coordinator_reads_the_daemon_published_context)'
 slow-timeout = { period = "60s", terminate-after = 11 }
+
+# The Pi chain-smoke cases must report their own failed phase before nextest
+# kills them. pi/001 has 45s worker settling + 120s sentinel + 60s work-done
+# + 30s status = 255s of sequential waits, plus daemon/setup overhead; pi/002
+# has 120s sentinel + 60s work-done plus delegate/setup. Five 60s periods give
+# both diagnostics time to run. The shortened waits also stay inside the
+# in-process agents' existing 300s lifetime cap; raising nextest alone past that
+# cap would leave a worker reaped before its declared waits finished.
+# These filters track function names; update them together with any rename.
+[[profile.default.overrides]]
+filter = 'test(chain_smoke_pi_001_orchestrator_delegates_to_real_worker) | test(chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Claude already specifies an exact Bash command, but its three 30s TUI
+# readiness waits + 120s turn + 10s proof wait can take 220s, before launch
+# overhead. Keep its failure grid/file evidence ahead of nextest's kill too.
+[[profile.default.overrides]]
+filter = 'test(claude_001_thinking_working_idle)'
+slow-timeout = { period = "60s", terminate-after = 5 }

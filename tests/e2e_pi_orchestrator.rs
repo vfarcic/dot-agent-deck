@@ -190,7 +190,7 @@ fn path_with_binary_dir() -> String {
 // M4.1 — real-pi orchestrator delegate → work-done (test-plan ROW 13)
 // ---------------------------------------------------------------------------
 
-/// Scenario: Start a real Claude Haiku worker and an idle real Pi orchestrator with the bundled extension in a scratch HOME. Post a directive to Pi's inbox; it must acknowledge through the extension, delegate the sentinel task, and receive the worker's work-done report while reporting real Pi status.
+/// Scenario: Start a real Claude Haiku worker and an idle real Pi orchestrator with the bundled extension in a scratch HOME. Post a directive with one exact Bash command writing a literal sentinel path to Pi's inbox; it must acknowledge through the extension, delegate the sentinel task, and receive the worker's work-done report while reporting real Pi status.
 #[spec("chain-smoke/pi/001")]
 #[test]
 fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker() {
@@ -216,6 +216,9 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
         .to_str()
         .expect("orchestration cwd is UTF-8")
         .to_string();
+    let sentinel = cwd.path().join(SENTINEL_NAME);
+    let sentinel_arg = sentinel.to_string_lossy().replace('\'', "'\\''");
+    let sentinel_command = format!("printf '%s' '{SENTINEL_CONTENT}' > '{sentinel_arg}'");
     let path_env = path_with_binary_dir();
 
     // --- WORKER: real Claude Haiku, spawned + ready before the orchestrator
@@ -340,9 +343,10 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     let directive = format!(
         "You are the orchestrator in a dot-agent-deck orchestration. A worker role named \
          \"coder\" is available. Call the delegate tool EXACTLY ONCE with role \"coder\" and \
-         this task text: Create a file named {SENTINEL_NAME} in the current working directory \
-         whose entire contents are exactly the text {SENTINEL_CONTENT}. Use the Bash tool to \
-         create it. Do NOT do the work yourself — only call the delegate tool, then stop."
+         this task text: Use Bash to run exactly this command: `{sentinel_command}`. \
+         Preserve the literal path, including every leading dot. Do not cd, change the command \
+         or substitute the Write tool. Then follow the appended When done instructions to \
+         signal completion. Do NOT do the work yourself — only call the delegate tool, then stop."
     );
     // Pi boots idle and its extension waits for inbox messages.
     let pi_command = format!("pi --provider anthropic --model {PI_MODEL} --approve");
@@ -372,13 +376,13 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     //    called `delegate` → daemon routed → worker ran the real task). Generous
     //    per-step timeout (Design Decision #7): pi boot + model + delegate, then
     //    the worker reads its task file and does the work.
-    let sentinel = cwd.path().join(SENTINEL_NAME);
     // Poll the CONTENT, not existence: a shell redirect creates the file before
     // the write lands, so an existence wait can read it empty (issue #244).
+    eprintln!("chain-smoke: waiting up to 120s for the exact sentinel path {sentinel:?}");
     let sentinel_result = common::wait_for_file_containing_async(
         &sentinel,
         SENTINEL_CONTENT,
-        Duration::from_secs(240),
+        Duration::from_secs(120),
     )
     .await;
 
@@ -403,7 +407,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     if let Err(observed) = sentinel_result {
         panic!(
             "the delegated worker never wrote {SENTINEL_CONTENT:?} into the sentinel \
-             {SENTINEL_NAME:?} within 240s; observed: {observed}. \
+             {sentinel:?} within 120s; observed: {observed}. \
              api_error_in_a_pane={api_errored} (if true, an account/quota is the blocker, not \
              the delegate path).\n=== pi orchestrator pane ===\n{orch_pane}\n\
              === worker pane ===\n{worker_pane}\n=== end ==="
@@ -418,7 +422,10 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
         .path()
         .join(".dot-agent-deck")
         .join(format!("work-done-{WORKER_ROLE}.md"));
-    let work_done_ok = common::wait_for_path_async(&work_done, Duration::from_secs(120)).await;
+    eprintln!(
+        "chain-smoke: exact sentinel verified at {sentinel:?}; waiting up to 60s for {work_done:?}"
+    );
+    let work_done_ok = common::wait_for_path_async(&work_done, Duration::from_secs(60)).await;
     assert!(
         work_done_ok,
         "the worker never signalled work-done (no {work_done:?}). The sentinel was created, so \

@@ -80,7 +80,7 @@ fn path_with_binary_dir() -> String {
 // chain-smoke/pi/002 — real-pi WORKER receives a delegate → work-done
 // ---------------------------------------------------------------------------
 
-/// Scenario: Configure a clear=true Pi worker, then delegate a sentinel task through the real daemon from a synthetic orchestrator. The replacement real Pi worker must receive and acknowledge its inbox message through the extension, create the sentinel, and signal work-done.
+/// Scenario: Configure a clear=true Pi worker, then delegate one exact shell command writing a literal sentinel path through the real daemon from a synthetic orchestrator. The replacement real Pi worker must receive and acknowledge its inbox message through the extension, create the sentinel, and signal work-done.
 #[spec("chain-smoke/pi/002")]
 #[test]
 fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done() {
@@ -105,6 +105,9 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         .to_str()
         .expect("orchestration cwd is UTF-8")
         .to_string();
+    let sentinel = cwd.path().join(SENTINEL_NAME);
+    let sentinel_arg = sentinel.to_string_lossy().replace('\'', "'\\''");
+    let sentinel_command = format!("printf '%s' '{SENTINEL_CONTENT}' > '{sentinel_arg}'");
     let path_env = path_with_binary_dir();
 
     // PRD #201: a `.dot-agent-deck.toml` whose `coder` role runs the REAL `pi`
@@ -248,9 +251,9 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     // A third run composed the exact completion command but only offered to run it; offering to act is not asking a follow-up question, so the no-questions clause did not cover that conversational stall, and the no-offers clause now requires signalling before any reply while explicitly rejecting the "next step" framing and waiting for confirmation.
     // None of these clauses dictates HOW to signal, so the real footer stays under test.
     let task = format!(
-        "Create a file named {SENTINEL_NAME} in the current working directory whose entire \
-         contents are exactly the text {SENTINEL_CONTENT}. Use your shell tool to create it. \
-         That is the only work to do — then follow the \"When done\" instructions below to \
+        "Use your shell tool to run exactly this command: `{sentinel_command}`. \
+         Preserve the literal path, including every leading dot. Do not cd, change the command \
+         or substitute a file-writing tool. That is the only work to do — then follow the \"When done\" instructions below to \
          signal completion. Do not ask any follow-up questions before doing both steps: you \
          have everything you need, so choose any value the instructions leave up to you. Do \
          not stop or reply until you have followed the \"When done\" instructions yourself \
@@ -290,13 +293,13 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
 
     // 1 + 2. The pi worker received the NATIVE task and did it: the sentinel
     //        exists with the expected contents (proves Pi received the inbox task and ran the work).
-    let sentinel = cwd.path().join(SENTINEL_NAME);
     // Poll the CONTENT, not existence: a shell redirect creates the file before
     // the write lands, so an existence wait can read it empty (issue #244).
+    eprintln!("chain-smoke: waiting up to 120s for the exact sentinel path {sentinel:?}");
     let sentinel_result = common::wait_for_file_containing_async(
         &sentinel,
         SENTINEL_CONTENT,
-        Duration::from_secs(240),
+        Duration::from_secs(120),
     )
     .await;
 
@@ -313,8 +316,8 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         .any(|k| worker_lower.contains(k));
     if let Err(observed) = sentinel_result {
         panic!(
-            "the pi WORKER never wrote {SENTINEL_CONTENT:?} into the sentinel {SENTINEL_NAME:?} \
-             within 240s; observed: {observed}. \
+            "the pi WORKER never wrote {SENTINEL_CONTENT:?} into the sentinel {sentinel:?} \
+             within 120s; observed: {observed}. \
              task_reached_pane={task_reached} (if false, the native seed never reached the \
              respawned pi — a delivery failure, NOT the model). \
              api_error_in_pane={api_errored} (if true, an account/quota is the blocker, not the \
@@ -330,7 +333,10 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         .path()
         .join(".dot-agent-deck")
         .join(format!("work-done-{WORKER_ROLE}.md"));
-    let work_done_ok = common::wait_for_path_async(&work_done, Duration::from_secs(120)).await;
+    eprintln!(
+        "chain-smoke: exact sentinel verified at {sentinel:?}; waiting up to 60s for {work_done:?}"
+    );
+    let work_done_ok = common::wait_for_path_async(&work_done, Duration::from_secs(60)).await;
     assert!(
         work_done_ok,
         "the pi worker never signalled work-done (no {work_done:?}). The sentinel was created, so \
