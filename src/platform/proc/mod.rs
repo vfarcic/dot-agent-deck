@@ -149,14 +149,14 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
 
 #[cfg(unix)]
 pub use unix::{
-    AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait,
+    AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,
     force_kill_child_group, force_kill_pid, foreground_pgid, parent_pid_of, pin_process,
     process_table, process_table_async, send_sigterm_to_child_group,
     terminate_child_with_grace_and_wait, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
-    AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait,
+    AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,
     force_kill_child_group, force_kill_pid, foreground_pgid, parent_pid_of, pin_process,
     process_table, process_table_async, send_sigterm_to_child_group,
     terminate_child_with_grace_and_wait, terminate_pid,

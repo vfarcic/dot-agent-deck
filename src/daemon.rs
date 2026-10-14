@@ -3777,12 +3777,25 @@ const INBOX_NOT_AGENT_PROCESS_MESSAGE: &str = "this process is not the pane's ag
 /// synthetic lane-1 tests that drive the inbox wire from the test process do.
 const ENV_TEST_UNBOUND_COMPONENTS: &str = "DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS";
 
-/// [`admit_component_process`] on this platform's process table, unless the
-/// `e2e`-only [`ENV_TEST_UNBOUND_COMPONENTS`] knob is set.
+/// Which inbox verb a component is admitted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentUse {
+    /// A post, or settling a job: the agent's own process tree may use its
+    /// token, tools included.
+    Cli,
+    /// Arming a waiter or announcing a wake: registering the agent's native
+    /// receiver ([`admit_receiver_process`]).
+    Receiver,
+}
+
+/// [`admit_component_process`] — or [`admit_receiver_process`] for a
+/// receiver — on this platform's process table, unless the `e2e`-only
+/// [`ENV_TEST_UNBOUND_COMPONENTS`] knob is set.
 fn admit_inbox_component(
     peer: Option<u32>,
     claimed: Option<u32>,
     root: Option<u32>,
+    used_as: ComponentUse,
 ) -> Result<Option<u32>, &'static str> {
     #[cfg(feature = "e2e")]
     if std::env::var(ENV_TEST_UNBOUND_COMPONENTS)
@@ -3792,7 +3805,70 @@ fn admit_inbox_component(
     }
     #[cfg(not(feature = "e2e"))]
     let _ = ENV_TEST_UNBOUND_COMPONENTS;
-    admit_component_process(peer, claimed, root, crate::platform::proc::descends_from)
+    let descends = crate::platform::proc::descends_from;
+    match used_as {
+        ComponentUse::Cli => admit_component_process(peer, claimed, root, descends),
+        ComponentUse::Receiver => {
+            admit_receiver_process(peer, claimed, root, descends, |peer, claimed| {
+                nested_between(
+                    peer,
+                    claimed,
+                    crate::platform::proc::parent_pid_of,
+                    crate::platform::proc::executable_of,
+                )
+            })
+        }
+    }
+}
+
+/// Audit F3: [`admit_component_process`] for a component registering the
+/// agent's native receiver. `nested` answers whether a process between the
+/// caller and the instance it names runs the same executable as that
+/// instance ([`nested_between`]).
+fn admit_receiver_process(
+    peer: Option<u32>,
+    claimed: Option<u32>,
+    root: Option<u32>,
+    descends: impl Fn(u32, u32) -> Option<bool>,
+    nested: impl Fn(u32, u32) -> Option<bool>,
+) -> Result<Option<u32>, &'static str> {
+    let instance = admit_component_process(peer, claimed, root, descends)?;
+    if let (Some(peer), Some(instance)) = (peer, instance)
+        && nested(peer, instance) == Some(true)
+    {
+        return Err("an agent of the same kind sits between the caller and the component it names");
+    }
+    Ok(instance)
+}
+
+/// Audit F3: whether a process strictly between `peer` and `claimed` — one of
+/// `peer`'s ancestors below `claimed` — runs the same executable as
+/// `claimed`: an agent of the same kind nested inside the one it names, as a
+/// tool can start. `None` when the walk cannot say: a process exited, or this
+/// platform cannot read a parent or an executable.
+fn nested_between(
+    peer: u32,
+    claimed: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    executable_of: impl Fn(u32) -> Option<std::path::PathBuf>,
+) -> Option<bool> {
+    /// Deeper than any real agent's process tree, as `descends_from`'s.
+    const MAX_DEPTH: usize = 128;
+    if peer == claimed {
+        return Some(false);
+    }
+    let kind = executable_of(claimed)?;
+    let mut current = parent_of(peer)?;
+    for _ in 0..MAX_DEPTH {
+        if current == claimed || current <= 1 {
+            return Some(false);
+        }
+        if executable_of(current)? == kind {
+            return Some(true);
+        }
+        current = parent_of(current)?;
+    }
+    Some(false)
 }
 
 /// PRD #1666 hardening M2: bind an inbox component to the pane's managed
@@ -4327,6 +4403,7 @@ async fn run_hook_loop_with_idle_timeout(
                                         peer_pid,
                                         req.pid,
                                         pty_registry.child_pid(&agent_id),
+                                        ComponentUse::Receiver,
                                     ) {
                                         Ok(instance) => instance,
                                         Err(why) => {
@@ -4379,11 +4456,14 @@ async fn run_hook_loop_with_idle_timeout(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
-                                    if let Err(why) = admit_inbox_component(
+                                    let instance = match admit_inbox_component(
                                         peer_pid,
                                         req.pid,
                                         pty_registry.child_pid(&agent_id),
+                                        ComponentUse::Receiver,
                                     ) {
+                                        Ok(instance) => instance,
+                                        Err(why) => {
                                         warn!(
                                             pane_id = %escape_id_for_log(&req.pane_id),
                                             component = ?req.component,
@@ -4403,18 +4483,30 @@ async fn run_hook_loop_with_idle_timeout(
                                         }
                                         continue;
                                     }
-                                    pty_registry
-                                        .inbox()
-                                        .announce(&req.pane_id, &agent_id, req.wake, req.component);
+                                    };
+                                    let announced = pty_registry.inbox().announce(
+                                        &req.pane_id,
+                                        &agent_id,
+                                        req.wake,
+                                        req.component,
+                                        instance,
+                                    );
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
                                         component = ?req.component,
                                         wake = ?req.wake,
+                                        pid = ?req.pid,
+                                        refused = ?announced.err(),
                                         "Received inbox announce"
                                     );
-                                    if let Ok(json) =
-                                        serde_json::to_string(&crate::event::SignalAck::accepted())
-                                    {
+                                    let ack = match announced {
+                                        Ok(()) => crate::event::SignalAck::accepted(),
+                                        Err(error) => crate::event::SignalAck::refused(
+                                            error.code(),
+                                            &error.message(),
+                                        ),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
                                         let _ = write_half.flush().await;
@@ -4467,6 +4559,7 @@ async fn run_hook_loop_with_idle_timeout(
                                         peer_pid,
                                         None,
                                         pty_registry.child_pid(&agent_id),
+                                        ComponentUse::Cli,
                                     ) {
                                         warn!(
                                             verb = msg.verb(),
@@ -8621,6 +8714,103 @@ mod hook_ingestion_tests {
             admit_component_process(Some(21), Some(20), None, descends),
             Ok(Some(20))
         );
+    }
+
+    /// Audit F3 (b): a component registering the agent's native receiver is
+    /// refused when a process between it and the instance it names runs that
+    /// instance's executable — an agent of the same kind, started inside the
+    /// one whose receiver it claims to be. The launch shapes the deck's own
+    /// integrations use (the watcher a direct child of its agent, a hook run
+    /// through a shell, an agent under a wrapper of its own kind) still pass,
+    /// and so does a walk that cannot say.
+    #[test]
+    fn a_nested_agent_cannot_register_as_the_outer_agents_receiver() {
+        // 1 ── 10 claude ── 11 bash (a tool) ── 12 claude (nested) ── 13 sh ── 14 CLI
+        //   │            └── 15 sh ── 16 CLI (the outer agent's hook)
+        //   └── 20 node (npx) ── 21 sh ── 22 node (pi) ── 23 CLI (its watcher)
+        let parents = |pid: u32| match pid {
+            10 | 20 => Some(1),
+            11 | 15 => Some(10),
+            12 => Some(11),
+            13 => Some(12),
+            14 => Some(13),
+            16 => Some(15),
+            21 => Some(20),
+            22 => Some(21),
+            23 => Some(22),
+            _ => None,
+        };
+        let executables = |pid: u32| {
+            let exe = match pid {
+                10 | 12 => "/opt/claude",
+                11 => "/bin/bash",
+                13 | 15 | 21 => "/bin/sh",
+                14 | 16 | 23 => "/opt/dot-agent-deck",
+                20 | 22 => "/usr/bin/node",
+                _ => return None,
+            };
+            Some(std::path::PathBuf::from(exe))
+        };
+        let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        let nested = |peer, claimed| nested_between(peer, claimed, parents, executables);
+        let admit =
+            |peer, claimed, root| admit_receiver_process(peer, claimed, root, descends, nested);
+
+        // The outer agent's hook, through a shell, naming the shell or the agent.
+        assert_eq!(admit(Some(16), Some(15), Some(10)), Ok(Some(15)));
+        assert_eq!(admit(Some(16), Some(10), Some(10)), Ok(Some(10)));
+        // Pi's watcher, a direct child of Pi under an npx wrapper that runs node too.
+        assert_eq!(admit(Some(23), Some(22), Some(20)), Ok(Some(22)));
+        // The nested agent naming the outer agent as its instance is refused.
+        assert!(admit(Some(14), Some(10), Some(10)).is_err());
+        // Naming its own instance passes this check: the generation's pinned
+        // receiver refuses it (`InboxHub::arm`).
+        assert_eq!(admit(Some(14), Some(12), Some(10)), Ok(Some(12)));
+        // A walk that cannot say does not refuse.
+        let blind = |peer, claimed| nested_between(peer, claimed, parents, |_| None);
+        assert_eq!(
+            admit_receiver_process(Some(14), Some(10), Some(10), descends, blind),
+            Ok(Some(10))
+        );
+    }
+
+    /// Audit F3 (b), on this machine's real process table: a shell started
+    /// inside a shell, with a process below it, is seen as nested between that
+    /// process and the outer shell, and not between it and its own parent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_between_reads_the_real_process_table() {
+        use std::io::BufRead;
+        let mut outer = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sh -c 'sleep 30 & echo $!; wait'; :")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the outer shell");
+        let mut line = String::new();
+        std::io::BufReader::new(outer.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let caller: u32 = line
+            .trim()
+            .parse()
+            .expect("the nested shell names its child");
+        let parent = crate::platform::proc::parent_pid_of;
+        let nested = parent(caller).expect("the caller's parent");
+        assert_eq!(parent(nested), Some(outer.id()));
+        let seen = |claimed| {
+            nested_between(
+                caller,
+                claimed,
+                parent,
+                crate::platform::proc::executable_of,
+            )
+        };
+        assert_eq!(seen(outer.id()), Some(true));
+        assert_eq!(seen(nested), Some(false));
+        // SAFETY: `caller` is the `sleep` this test started, still running.
+        unsafe { libc::kill(caller as libc::pid_t, libc::SIGKILL) };
+        let _ = outer.wait();
     }
 
     /// PRD #1666 hardening H2: the inbox half of get-seed hands over only the

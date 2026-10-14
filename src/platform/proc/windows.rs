@@ -678,6 +678,12 @@ pub async fn process_table_async(_roots: &[i32]) -> Option<Vec<super::ProcessInf
 // Orphan watchdog (test-gated, OFF in production).
 // ---------------------------------------------------------------------------
 
+/// Audit F3: the executable process `pid` runs. Not implemented on Windows, so
+/// `None`: the caller falls back to not checking.
+pub fn executable_of(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// PRD #1666 hardening M2: the parent of process `pid`. Not implemented on
 /// Windows, so `None`: the caller falls back to not checking.
 pub fn parent_pid_of(_pid: u32) -> Option<u32> {

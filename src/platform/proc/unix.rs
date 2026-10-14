@@ -630,6 +630,37 @@ pub fn parent_pid_of(_pid: u32) -> Option<u32> {
     None
 }
 
+/// Audit F3: the executable process `pid` runs, or `None` when the process is
+/// gone or this platform cannot say. Linux reads the `/proc/<pid>/exe` link;
+/// macOS asks `proc_pidpath`. Other Unix platforms answer `None`, and the
+/// caller falls back to not checking.
+#[cfg(target_os = "linux")]
+pub fn executable_of(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+/// See the Linux variant.
+#[cfg(target_os = "macos")]
+pub fn executable_of(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is a live, writable buffer of exactly the size passed, and
+    // the kernel writes at most that many bytes into it.
+    let written =
+        unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    let written = usize::try_from(written).ok().filter(|n| *n > 0)?;
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &buf[..written],
+    )))
+}
+
+/// See the Linux variant.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn executable_of(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// The calling process's parent pid. Wraps `getppid(2)` (async-signal-safe,
 /// infallible) so the single `unsafe` lives in one place.
 pub fn current_ppid() -> i32 {

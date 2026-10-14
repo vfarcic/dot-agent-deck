@@ -205,13 +205,16 @@ pub enum ArmError {
     /// The agent already has a live stream from another component instance;
     /// one stream per agent generation.
     StreamAlreadyArmed,
+    /// Audit F3: another component instance is this agent generation's
+    /// native receiver.
+    OtherInstance,
 }
 
 impl ArmError {
     pub fn code(self) -> &'static str {
         match self {
             ArmError::NoSlots => "too_many_waiters",
-            ArmError::StreamAlreadyArmed => "another_component_armed",
+            ArmError::StreamAlreadyArmed | ArmError::OtherInstance => "another_component_armed",
         }
     }
 
@@ -223,6 +226,9 @@ impl ArmError {
             ArmError::StreamAlreadyArmed => {
                 "another inbox component is already streaming for this agent".to_string()
             }
+            ArmError::OtherInstance => "another process is this agent's inbox receiver; this one \
+                                        was not armed"
+                .to_string(),
         }
     }
 }
@@ -327,6 +333,9 @@ struct HubState {
     /// Oldest first, so the newest is `last()`.
     waiters: HashMap<AgentKey, Vec<Waiter>>,
     announced: HashMap<AgentKey, Announcement>,
+    /// Audit F3: each agent generation's native receiver — the component
+    /// process that first armed or announced for it ([`InboxHub::arm`]).
+    receivers: HashMap<AgentKey, u32>,
     next_conn: u64,
     /// Where state changes are broadcast to attached clients, once the daemon
     /// has installed its event channel ([`InboxHub::set_broadcast`]).
@@ -418,6 +427,27 @@ pub fn undelivered_after_from_env() -> Duration {
     }
 }
 
+impl HubState {
+    /// Audit F3: admit component process `instance` as `key`'s native
+    /// receiver. The first instance admitted is pinned for the rest of the
+    /// generation, and every other one is refused from then on — not only
+    /// while a stream is live, so a nested agent a tool started, which
+    /// inherits the pane's identity, cannot arm in the gap while the outer
+    /// agent's waiter re-arms. An instance this platform cannot name pins
+    /// nothing, and is refused once one is pinned.
+    fn admit_receiver(&mut self, key: &AgentKey, instance: Option<u32>) -> Result<(), ArmError> {
+        match (self.receivers.get(key), instance) {
+            (Some(pinned), Some(instance)) if *pinned == instance => Ok(()),
+            (Some(_), _) => Err(ArmError::OtherInstance),
+            (None, Some(instance)) => {
+                self.receivers.insert(key.clone(), instance);
+                Ok(())
+            }
+            (None, None) => Ok(()),
+        }
+    }
+}
+
 impl InboxHub {
     pub fn new(deck: DeckId, limits: InboxLimits, keepalive: Duration) -> Self {
         Self {
@@ -425,6 +455,7 @@ impl InboxHub {
                 inbox: Inbox::new(deck, limits),
                 waiters: HashMap::new(),
                 announced: HashMap::new(),
+                receivers: HashMap::new(),
                 next_conn: 1,
                 broadcast: None,
                 delegates: HashMap::new(),
@@ -959,6 +990,10 @@ impl InboxHub {
     /// same component `instance` as the live stream supersedes it — the old
     /// connection is told so, and what it was handed goes back to the queue
     /// when it ends — while one from any other instance is refused.
+    ///
+    /// Audit F3: the first instance to arm or announce is the generation's
+    /// receiver from then on, whatever is armed at the moment
+    /// ([`HubState::admit_receiver`]).
     pub fn arm(
         &self,
         pane_id: &str,
@@ -974,6 +1009,18 @@ impl InboxHub {
         let conn_id = {
             let mut st = self.lock();
             let key = (pane_id.to_string(), agent_id.to_string());
+            if let Err(error) = st.admit_receiver(&key, instance) {
+                let streaming = mode == InboxWaitMode::Stream
+                    && st
+                        .waiters
+                        .get(&key)
+                        .is_some_and(|list| list.iter().any(|w| w.mode == InboxWaitMode::Stream));
+                return Err(if streaming {
+                    ArmError::StreamAlreadyArmed
+                } else {
+                    error
+                });
+            }
             if mode == InboxWaitMode::Stream
                 && let Some(list) = st.waiters.get_mut(&key)
                 && let Some(at) = list.iter().position(|w| w.mode == InboxWaitMode::Stream)
@@ -1048,22 +1095,28 @@ impl InboxHub {
             .map_or(0, Vec::len)
     }
 
-    /// Record what an agent's component said it can do.
+    /// Record what an agent's component, run by process `instance`, said it
+    /// can do.
     pub fn announce(
         &self,
         pane_id: &str,
         agent_id: &str,
         wake: InboxWake,
         component: InboxComponent,
-    ) {
-        self.lock().announced.insert(
-            (pane_id.to_string(), agent_id.to_string()),
+        instance: Option<u32>,
+    ) -> Result<(), ArmError> {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        st.admit_receiver(&key, instance)?;
+        st.announced.insert(
+            key,
             Announcement {
                 wake,
                 component,
                 at: Instant::now(),
             },
         );
+        Ok(())
     }
 
     /// PRD #1666 S3: `agent_id` in `pane_id`'s inbox counts and how a message
@@ -1128,6 +1181,7 @@ impl InboxHub {
         st.inbox.agent_exited(Instant::now(), pane_id, agent_id);
         let key = (pane_id.to_string(), agent_id.to_string());
         st.announced.remove(&key);
+        st.receivers.remove(&key);
         st.rings.remove(&key);
         drain_events(&mut st);
         let ledgers = std::mem::take(&mut st.exited_ledgers);
@@ -2393,6 +2447,81 @@ mod tests {
         InboxHub::new(deck(), InboxLimits::default(), DEFAULT_KEEPALIVE)
     }
 
+    /// Audit F3 (a): the first process to arm or announce for an agent
+    /// generation is its native receiver for the rest of that generation.
+    /// Any other instance is refused — between arms as much as while a stream
+    /// is live, so a nested agent cannot slip in while the outer one's waiter
+    /// re-arms — while the pinned instance may still supersede its own stream.
+    /// The pin goes with the generation.
+    #[tokio::test]
+    async fn the_first_receiver_instance_is_pinned_for_the_generation() {
+        let hub = hub();
+        hub.announce(
+            "p",
+            "a",
+            InboxWake::TurnEnd,
+            InboxComponent::CodexHooks,
+            Some(100),
+        )
+        .unwrap();
+        let once = |instance| {
+            hub.arm(
+                "p",
+                "a",
+                InboxWaitMode::Once,
+                InboxComponent::ClaudeWaiter,
+                instance,
+            )
+            .err()
+        };
+        let stream = |instance| {
+            hub.arm(
+                "p",
+                "a",
+                InboxWaitMode::Stream,
+                InboxComponent::PiExtension,
+                instance,
+            )
+        };
+        assert_eq!(once(Some(200)), Some(ArmError::OtherInstance));
+        assert_eq!(
+            hub.announce(
+                "p",
+                "a",
+                InboxWake::Native,
+                InboxComponent::ClaudeHooks,
+                Some(200)
+            ),
+            Err(ArmError::OtherInstance)
+        );
+        assert_eq!(
+            hub.announced_wake("p", "a"),
+            Some(InboxWake::TurnEnd),
+            "a refused announcement must not change how the pane is woken"
+        );
+        let first = stream(Some(100)).expect("the pinned instance arms");
+        let second = stream(Some(100)).expect("and supersedes its own stream");
+        assert!(stream(Some(200)).is_err());
+        hub.disarm("p", "a", first.conn_id);
+        hub.disarm("p", "a", second.conn_id);
+        assert_eq!(hub.armed("p", "a"), 0);
+        assert_eq!(stream(Some(200)).err(), Some(ArmError::OtherInstance));
+        assert_eq!(stream(None).err(), Some(ArmError::OtherInstance));
+
+        hub.agent_exited("p", "a");
+        assert!(
+            hub.arm(
+                "p",
+                "b",
+                InboxWaitMode::Once,
+                InboxComponent::ClaudeWaiter,
+                Some(200)
+            )
+            .is_ok(),
+            "a successor generation pins its own receiver"
+        );
+    }
+
     /// PRD #1666 §2.8: a message handed over the most times allowed, none
     /// acknowledged, owes its recipient's card a notice through the installed
     /// sink — once, with the fixed not-delivered text.
@@ -2505,9 +2634,23 @@ mod tests {
         assert!(hub.summary("p", "a").last_acked_at.is_some());
 
         // A Native announcement with nothing armed is still the doorbell.
-        hub.announce("p", "a", InboxWake::Native, InboxComponent::ClaudeWaiter);
+        hub.announce(
+            "p",
+            "a",
+            InboxWake::Native,
+            InboxComponent::ClaudeWaiter,
+            None,
+        )
+        .unwrap();
         assert_eq!(hub.summary("p", "a").wake, WakePath::Doorbell);
-        hub.announce("p", "a", InboxWake::TurnEnd, InboxComponent::CodexHooks);
+        hub.announce(
+            "p",
+            "a",
+            InboxWake::TurnEnd,
+            InboxComponent::CodexHooks,
+            None,
+        )
+        .unwrap();
         let s = hub.summary("p", "a");
         assert_eq!(s.wake, WakePath::TurnEnd);
         assert_eq!(s.component.as_deref(), Some("codex_hooks"));
