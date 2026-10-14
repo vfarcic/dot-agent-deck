@@ -25,7 +25,6 @@ import type {
   EvidenceItem,
   PanelTab,
   RuntimeMode,
-  SendResult,
   TerminalFeed,
 } from "../types";
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
@@ -186,12 +185,6 @@ export interface AgentTileProps {
   terminalFeed?: TerminalFeed;
   evidence: EvidenceItem[];
   /**
-   * Issue #1042 — the last non-delivered verdict the guarded send verb returned
-   * for this agent, if any. The only condition #1042 names that the snapshot
-   * cannot express (`wrong-session`) arrives this way and no other.
-   */
-  inputResult?: SendResult;
-  /**
    * PRD #1105 — set when this pane has no terminal at all, and why.
    *
    * Absent means one is attached, which is every tile on the deck and every
@@ -285,7 +278,6 @@ export function AgentTile({
   tab: storedTab,
   terminalFeed,
   evidence,
-  inputResult,
   noTerminal,
   recordFreshness = "live",
   terminalFocusToken,
@@ -310,7 +302,7 @@ export function AgentTile({
   // Issue #1042: one derivation for the terminal's state, its read-only gate
   // and the sentence beside it, so the three cannot disagree the way the tile's
   // inline status condition and the composer's own copy of it could.
-  const input = terminalInputState(agent, inputResult);
+  const input = terminalInputState(agent);
   const fixture = mode === "fixture";
   const tab = shownPanelTab(storedTab, showDetails);
   /**

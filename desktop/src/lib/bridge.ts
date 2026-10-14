@@ -403,7 +403,6 @@ export interface DesktopTerminalGeometryDto {
  */
 export interface DesktopActionResultDto {
   ok: boolean;
-  sendResult?: import("../types").SendResult;
   message?: string;
   /** The agent the action acted on; for `start_agent`, the id the target deck minted. */
   agentId?: string;
@@ -1630,7 +1629,6 @@ export type DesktopRunActionDto =
   | { type: "rename_agent"; agentId: string; displayName: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
   | { type: "detach_terminal"; sessionId: string }
-  | { type: "submit_text"; agentId: string; text: string }
   | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "allow_build_mismatch"; deckId?: string };
@@ -2739,9 +2737,6 @@ class FixtureDeckBridge implements DeckBridge {
       this.snapshot.stages = this.snapshot.stages.map((stage) => stage.id === action.stageId ? { ...stage, status: "active", attempt: stage.attempt === undefined ? undefined : stage.attempt + 1 } : stage);
     } else if (action.type === "rename_agent") {
       this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, displayName: action.displayName } : agent);
-    } else if (action.type === "submit_text") {
-      this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, transcript: `${agent.transcript}\r\n> ${action.text}\r\n` } : agent);
-      this.terminalListeners.forEach((listener) => listener({ agentId: action.agentId, deckId: this.snapshot.connection.deckId, data: new TextEncoder().encode(`\r\n> ${action.text}\r\n`), stream: "output", operation: "append" }));
     } else if (action.type === "advance_fixture") {
       this.fixtureStep = (this.fixtureStep + 1) % 3;
       if (this.fixtureStep === 1) {
@@ -2760,7 +2755,7 @@ class FixtureDeckBridge implements DeckBridge {
       }
     }
     this.emitSnapshot();
-    return { ok: true, sendResult: action.type === "submit_text" ? "applied" : undefined };
+    return { ok: true };
   }
 
   /**
@@ -4543,7 +4538,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
     const invoke = await this.getInvoke();
-    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "stop_orchestration" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "activate_orchestration" || action.type === "stop_daemon" || action.type === "allow_build_mismatch") {
+    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "stop_orchestration" || action.type === "rename_agent" || action.type === "activate_orchestration" || action.type === "stop_daemon" || action.type === "allow_build_mismatch") {
       // `desktop_run_action` resolves with `ok: false` for a non-delivered
       // send rather than raising, so the result must be returned, not dropped.
       //
@@ -4578,7 +4573,7 @@ export class TauriDeckBridge implements DeckBridge {
       // this dropped it, which left a started agent's id — the one thing the
       // caller needs to open its pane — unreadable (#1041).
       const agentId = typeof result?.agentId === "string" ? result.agentId : undefined;
-      return { ok: result?.ok !== false, sendResult: result?.sendResult, message: result?.message, ...(agentId === undefined ? {} : { agentId }) };
+      return { ok: result?.ok !== false, message: result?.message, ...(agentId === undefined ? {} : { agentId }) };
     }
     if (action.type === "start_daemon") {
       // Issue #1490: one command for every deck, local or remote. It resolves

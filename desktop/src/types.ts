@@ -1106,15 +1106,12 @@ export type DeckAction =
    * named as.
    */
   | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string }[] }
-  | { type: "rename_agent"; agentId: string; displayName: string }
-  | { type: "submit_text"; agentId: string; text: string };
+  | { type: "rename_agent"; agentId: string; displayName: string };
 
 /**
- * The daemon's honest delivery outcome for submitted input, mirroring the Rust
- * `SendResult` (kebab-case on the wire). Only `applied` and `queued` mean the
- * text reached the agent; every other value — including an unrecognised future
- * one decoded as `unknown` — is a non-delivery the UI must not dress up as
- * success.
+ * Whether an agent's pane takes input, in the vocabulary of the Rust
+ * `SendResult` (kebab-case on the wire). The terminal reads `history-only` and
+ * `no-live-target` off the agent's write lease (`lib/terminalInput.ts`).
  */
 export type SendResult =
   | "applied"
@@ -1126,15 +1123,9 @@ export type SendResult =
   | "ambiguous"
   | "unknown";
 
-/**
- * What `desktop_run_action` reports back. The Rust command returns `ok: false`
- * with a non-delivered `sendResult` instead of raising, so a caller that only
- * awaits the promise cannot tell delivery from silent loss — every consumer of
- * `submit_text` must read this.
- */
+/** What `desktop_run_action` reports back. */
 export interface DeckActionResult {
   ok: boolean;
-  sendResult?: SendResult;
   message?: string;
   /**
    * The id of the agent the action acted on — for `start_agent`, the one the
@@ -1143,11 +1134,6 @@ export interface DeckActionResult {
    * consumer keys it as `(deckId, agentId)`, never alone.
    */
   agentId?: string;
-}
-
-/** True only for the two outcomes that actually reached the agent. */
-export function isDelivered(result: DeckActionResult): boolean {
-  return result.ok && (result.sendResult === undefined || result.sendResult === "applied" || result.sendResult === "queued");
 }
 
 /** Operator-facing explanation of a non-delivered outcome. */
@@ -1363,26 +1349,6 @@ export interface DeckRuntimeState {
   upgradeDaemon?: (deckId: string, onEvent: (event: import("./lib/upgrade").UpgradeEvent) => void) => Promise<import("./lib/upgrade").UpgradeOutcome>;
   /** Answer question `questionId` of the upgrade `upgradeId`. */
   decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
-  /**
-   * Issue #1042 — the last NON-DELIVERED `SendResult` the guarded send verb
-   * returned, per agent id. An agent with no entry has nothing unresolved.
-   *
-   * This is the post-hoc half of the terminal's input state. `history-only` and
-   * `no-live-target` are read off `AgentSession.writeLease` and need no send;
-   * `wrong-session` is decided at write time, is carried by no snapshot field,
-   * and after a rollover the pane reads `writeLease === "write"` — it looks
-   * deliverable precisely when a send would fail. So it can only be known by
-   * trying, which makes a returned verdict the only place it can come from.
-   *
-   * Optional, and absence is a real state rather than an oversight: a runtime
-   * through which nothing has ever been submitted has no verdicts to report.
-   *
-   * **Keyed by `agentKey(deckId, agentId)` since PRD #1105's security audit**,
-   * not by the bare id. A verdict recorded for deck A's `planner` would
-   * otherwise disable deck B's pane and render A's rejection notice under B's
-   * heading — the ids collide across decks by construction.
-   */
-  terminalInputResults?: Record<string, SendResult>;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**

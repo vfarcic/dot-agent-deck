@@ -618,7 +618,6 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .terminal-input-status { flex: 0 0 auto; margin: 0; padding: 5px 9px 6px; display: flex; align-items: flex-start; gap: 5px; border-top: 1px solid var(--shell-line); background: var(--shell); font-size: 9px; line-height: 1.35; }
 .terminal-input-status svg { flex: 0 0 auto; margin-top: 1px; }
 .terminal-input-status.is-blocked { color: var(--status-error); }
-.terminal-input-status.is-unconfirmed { color: var(--status-warn); }
 .terminal-viewport[aria-disabled="true"] { opacity: .62; }
 /* PRD #1105 — what stands where the terminal would be when this pane has none,
    which today means an agent on a deck that is not the selected one. It reuses

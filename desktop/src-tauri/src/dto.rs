@@ -11,7 +11,7 @@ use dot_agent_deck::authoring_seeds::AuthoringKind;
 use dot_agent_deck::daemon_client::Endpoint;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{
-    AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, SendResult, Writable,
+    AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, Writable,
 };
 use dot_agent_deck::state::SessionStatus;
 use serde::{Deserialize, Serialize};
@@ -867,10 +867,6 @@ pub enum DesktopAction {
     DetachTerminal {
         session_id: String,
     },
-    SubmitText {
-        agent_id: String,
-        text: String,
-    },
 }
 
 /// One role a [`DesktopAction::StopOrchestration`] stops: the deck's agent id,
@@ -1007,8 +1003,6 @@ pub struct DesktopActionResult {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub send_result: Option<SendResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalAttachResult>,
     #[serde(skip_serializing_if = "Option::is_none")]

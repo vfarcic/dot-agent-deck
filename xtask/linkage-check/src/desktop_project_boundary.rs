@@ -219,7 +219,6 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // `std::env::current_dir` — all zero for it.
     "login_shell",
     "platform",
-    "prompt_delivery",
     // PRD #1497, argued rather than added quietly. Reading mode names ONE item
     // here, `NOTIFICATION_TYPE_METADATA_KEY`: it tells a Claude-shaped
     // permission prompt from the other `WaitingForInput` notifications on the
@@ -289,7 +288,6 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // literal, and contains no `std::env::current_dir` — all zero for it.
     "self_upgrade",
     "state",
-    "ui",
     // PRD #741 M7, argued rather than added quietly.
     // `untrusted_text::strip_control_and_bidi` is the policy the connection
     // footer applies to a settings-supplied endpoint label: `dto::safe_message`

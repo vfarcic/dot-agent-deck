@@ -963,43 +963,6 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
-   * Scenario: submit one guarded message for every delivery verdict the daemon
-   * can return. The live bridge must hand each named state to its caller
-   * unchanged, including delivered, uncertain, stale, and non-live outcomes.
-   */
-  it("preserves every SendResult verdict from the guarded submit verb", async () => {
-    const { TauriDeckBridge } = await import("./bridge");
-    const bridge = new TauriDeckBridge();
-    const verdicts = [
-      "applied",
-      "queued",
-      "stale",
-      "wrong-session",
-      "history-only",
-      "no-live-target",
-      "ambiguous",
-      "unknown",
-    ] satisfies SendResult[];
-    const observed: SendResult[] = [];
-
-    for (const [index, sendResult] of verdicts.entries()) {
-      const ok = sendResult === "applied" || sendResult === "queued";
-      invoke.mockResolvedValueOnce({ ok, sendResult, message: `verdict:${sendResult}` });
-
-      const result = await bridge.runAction({ type: "submit_text", agentId: "agent-1", text: `message-${index}` });
-
-      expect(result).toEqual({ ok, sendResult, message: `verdict:${sendResult}` });
-      expect(invoke).toHaveBeenNthCalledWith(index + 1, "desktop_run_action", {
-        action: { type: "submit_text", agentId: "agent-1", text: `message-${index}` },
-      });
-      observed.push(result.sendResult as SendResult);
-    }
-
-    expect(observed).toEqual(verdicts);
-    expect(new Set(observed).size).toBe(verdicts.length);
-  });
-
-  /**
    * A cross-layer pin, not a table lookup. `DesktopAgentDto["status"]` mirrors
    * the Rust union, and `map_agent` emits `"running"` for an agent whose hook
    * state has not arrived yet — `record_without_hook_state_is_still_running`
