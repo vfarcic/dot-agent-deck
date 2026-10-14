@@ -257,6 +257,18 @@ heard_as    = ["dashboard", "overview", "everything", "all", "fleet", "running",
 # on the Daemons screen) then picked `switch_deck` in 2 of 34 runs, against 0
 # of 20 before. Naming its example as the `daemon` facet and not `switch_deck`
 # took it back to 20 of 20, and the full manifest to 289 of 289 (2026-10-13).
+#
+# "Which agents are running?" is named here as `open_overview` because this
+# row took it: fixture `open-overview-running` (said on the Daemons screen)
+# answered `filter_dashboard` with no status it could use in 8 of 10 runs, and
+# 7 of 10 with this row as it stood before the singular rule, so it was not
+# that change. A sentence calling it a question about the whole fleet that
+# "names no set to narrow to" fixed it, 10 of 10, but sent fixture
+# `dashboard-filter-agents-on-build-box` to `switch_deck` in 4 of 30 runs
+# against 0 of 30. The short form below held `open-overview-running` 20 of 20,
+# `dashboard-filter-agents-on-build-box` 20 of 20,
+# `dashboard-filter-control-see-only-the-tester` 20 of 20 and the full
+# manifest 289 of 289 (2026-10-14).
 [[commands]]
 id          = "filter_dashboard"
 description = """Filter the agent dashboard so it shows only a SET of agents: those of one kind
@@ -272,7 +284,8 @@ and is not `switch_deck`), show only agents waiting for input, or when the user 
 some text. Set only the facets the user named and leave
 the rest out; `kind` is the kind, `status` the status, `agent_type` the type, `daemon` the
 daemon, and `text` the words the user asked to filter by. "show everything" or "clear the filter"
-is `clear_dashboard_filter`.
+is `clear_dashboard_filter`. "Which agents are running?" is `open_overview`: running is not a
+status.
 While the New agent dialog shows a directory listing, "filter" is about its directories:
 `filter_directories`, not this one."""
 invoke      = "filterDashboard"
