@@ -171,14 +171,6 @@ export function buildWorkDoneArgv(summary: string, done = false): string[] {
 }
 
 /**
- * The `agent-event` flag that declares this extension reports every prompt Pi
- * submits (issue #1567). The deck counts a Pi pane as confirming its own
- * prompts only while its reports carry this, so a pane running an extension
- * that does not report them keeps being treated as one that cannot.
- */
-export const DECLARE_PROMPT_REPORTS_FLAG = "--reports-prompts";
-
-/**
  * The `agent-event` flags that announce a settled turn's final reply (PRD
  * #1497): the reply itself comes on the CLI's stdin, and the second flag says
  * the message it came from ended in an error. The deck reads a short summary
@@ -215,25 +207,13 @@ export interface TurnReply {
  * @example buildAgentEventArgv("tool-start", { toolName: "bash", toolDetail: "ls" })
  *   → ["agent-event", "--type", "tool-start", "--tool-name=bash", "--tool-detail=ls"]
  */
-export function buildAgentEventArgv(
-	type: string,
-	detail: AgentEventDetail = {},
-	declarePromptReports = false,
-	reply?: TurnReply,
-): string[] {
+export function buildAgentEventArgv(type: string, detail: AgentEventDetail = {}, reply?: TurnReply): string[] {
 	if (!isAgentEventType(type)) {
 		throw new Error(
 			`dot-agent-deck agent-event: unknown type "${type}". Expected one of: ${AGENT_EVENT_TYPES.join(", ")}.`,
 		);
 	}
 	const argv = ["agent-event", "--type", type];
-	// Issue #1567: FIRST among the flags on purpose. A CLI that predates the
-	// declaration names the first argument it does not know in its usage
-	// error, so it reports this one, and the extension steps down one level
-	// (`REPORT_LEVELS`) instead of dropping straight to lifecycle-only.
-	if (declarePromptReports) {
-		argv.push(DECLARE_PROMPT_REPORTS_FLAG);
-	}
 	const flags: Array<[string, string | undefined]> = [
 		["--cwd", detail.cwd],
 		["--prompt", detail.prompt],
@@ -606,31 +586,29 @@ export function piEventReport(
 }
 
 /**
- * How much an `agent-event` report carries, most first (issue #1567):
+ * How much an `agent-event` report carries, most first:
  *
- *   declared  — the detail plus {@link DECLARE_PROMPT_REPORTS_FLAG};
- *   detail    — the detail alone (a deck from issue #622 up to #1567);
+ *   detail    — the prompt and tool detail (a deck from issue #622 on);
  *   lifecycle — the bare `--type <state>` every deck accepts.
  *
- * The extension starts at `declared` and steps down only when the deck's CLI
- * refused a flag as unknown ({@link isUnsupportedFlagFailure}).
+ * The extension starts at `detail` and steps down only when the deck's CLI
+ * refused a flag as unknown ({@link isUnsupportedFlagFailure}). Since PRD #1666
+ * it no longer declares that it reports every prompt (`--reports-prompts`):
+ * nothing the deck does reads that any more.
  */
-export const REPORT_LEVELS = ["declared", "detail", "lifecycle"] as const;
+export const REPORT_LEVELS = ["detail", "lifecycle"] as const;
 export type ReportLevel = (typeof REPORT_LEVELS)[number];
 
 /**
  * The argv for `report` at `level`, or `null` when that level has nothing to
  * send for it — a detail report at `lifecycle`. The report's reply (PRD
- * #1497) is added only with `withReply`, and only at `declared`: the CLI that
- * takes it is newer than the declaration, so a deck that cannot take the
- * declaration cannot take the reply either.
+ * #1497) is added only with `withReply`, and only at `detail`: a deck whose
+ * CLI cannot take the detail cannot take the reply either.
  */
 export function reportArgvAt(report: AgentEventReport, level: ReportLevel, withReply = false): string[] | null {
 	switch (level) {
-		case "declared":
-			return buildAgentEventArgv(report.type, report.detail, true, withReply ? report.reply : undefined);
 		case "detail":
-			return buildAgentEventArgv(report.type, report.detail);
+			return buildAgentEventArgv(report.type, report.detail, withReply ? report.reply : undefined);
 		case "lifecycle":
 			return isAgentState(report.type) ? buildAgentEventArgv(report.type) : null;
 	}
@@ -659,9 +637,7 @@ export class DeckExecError extends Error {
  *
  * A report refused because the CLI does not know one of its flags is sent
  * again one level down, and the session stays at the level that then got
- * through — so a deck that predates the declaration still gets the prompt and
- * tool detail it understands, and one that predates the detail still gets its
- * status. Any other failure (no daemon, a transient socket error) leaves the
+ * through — so a deck that predates the detail still gets its status. Any other failure (no daemon, a transient socket error) leaves the
  * level alone and retries a lifecycle report once, bare, so the card keeps its
  * status. Every report is best-effort: nothing here throws. `signal` is handed
  * to every `run` for that report.
@@ -682,7 +658,7 @@ export function createReporter(
 	level: () => ReportLevel;
 	replies: () => boolean;
 } {
-	let level: ReportLevel = "declared";
+	let level: ReportLevel = "detail";
 	let replies = true;
 	const send = async (report: AgentEventReport, signal?: AbortSignal): Promise<void> => {
 		let tried: ReportLevel | null = level;
@@ -693,7 +669,7 @@ export function createReporter(
 				return;
 			}
 			// The reply flags are on `argv` exactly when this is defined.
-			const stdin = tried === "declared" && withReply ? turnReplyStdin(report.reply) : undefined;
+			const stdin = tried === "detail" && withReply ? turnReplyStdin(report.reply) : undefined;
 			try {
 				await (stdin === undefined ? run(argv, signal) : run(argv, signal, stdin));
 				level = tried;

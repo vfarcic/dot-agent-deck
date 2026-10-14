@@ -627,11 +627,9 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	// down) must never break the agent loop, so failures are swallowed here —
 	// unlike the tools above, which surface errors to the LLM.
 	//
-	// Every report starts out carrying the detail and the prompt-report
-	// declaration (issue #1567) and steps down only when the deck's CLI refuses
-	// a flag as unknown — an older deck; see `createReporter`. A deck that
-	// predates the declaration still gets the detail, and one that predates the
-	// detail still gets the status.
+	// Every report starts out carrying the detail and steps down only when the
+	// deck's CLI refuses a flag as unknown — an older deck; see
+	// `createReporter`. A deck that predates the detail still gets the status.
 	//
 	// The session directory the last report was sent from, for the one report
 	// spawned outside `pi.exec` (a settled turn's reply on stdin), which runs
