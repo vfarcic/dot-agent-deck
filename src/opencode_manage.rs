@@ -922,8 +922,8 @@ const INBOX_SHARED_JS: &str = r#"// PRD #1666: dot-agent-deck's inbox. The deck 
 // watcher this plugin runs (`dot-agent-deck inbox wait --stream`), one JSON
 // line each; the plugin starts them as prompts with OpenCode's own client and
 // acknowledges each once OpenCode starts answering it — the first assistant
-// message whose parent is the deck's prompt — so a turn aborted before then
-// is handed over again. It never touches what the user is typing.
+// message whose parent is the deck's prompt or a later user message of the
+// same session — so a turn aborted before then is handed over again. It never touches what the user is typing.
 const INBOX_FRAMING = __FRAMING_JSON__;
 const INBOX_ID = "(m-[a-z2-7]{8}-[0-9a-f]{16})";
 const INBOX_OPENER = new RegExp("\\[dot-agent-deck message " + INBOX_ID, "g");
@@ -938,6 +938,38 @@ const inboxRemember = (map, key, value) => {
 };
 const inboxInPane = () =>
   !!process.env.DOT_AGENT_DECK_PANE_ID && !!process.env.DOT_AGENT_DECK_PANE_CAPABILITY;
+// OpenCode answers several queued user messages in ONE assistant turn whose
+// `parentID` names only the last of them, so a turn acknowledges every user
+// message its session had up to that parent. `users` maps each user message
+// to its session and the order this process first saw it (OpenCode's ids are
+// time-ordered too); a message OpenCode removes, as a revert does, leaves it.
+let inboxUserSeq = 0;
+const inboxObserveUsers = (users, event) => {
+  const properties = event?.properties;
+  if (event?.type === "message.removed") {
+    if (properties?.messageID) users.delete(properties.messageID);
+    return;
+  }
+  const info = properties?.info;
+  if (event?.type !== "message.updated" || info?.role !== "user") return;
+  if (info.id && info.sessionID && !users.has(info.id)) {
+    inboxRemember(users, info.id, { sessionID: info.sessionID, seq: ++inboxUserSeq });
+  }
+};
+// The keys of `pending` (user message ids) that `assistant`'s turn answered:
+// its parent, and every earlier user message of the same session.
+const inboxCovered = (users, pending, assistant) => {
+  const parentID = assistant?.parentID;
+  if (!parentID) return [];
+  const parent = users.get(parentID);
+  const sessionID = assistant.sessionID ?? parent?.sessionID;
+  return [...pending.keys()].filter((key) => {
+    if (key === parentID) return true;
+    const user = users.get(key);
+    return !!parent && !!user && parent.sessionID === sessionID &&
+      user.sessionID === sessionID && user.seq <= parent.seq;
+  });
+};
 // The deck message ids whose opener `text` carries.
 const inboxIdsIn = (text) =>
   typeof text === "string" ? [...new Set([...text.matchAll(INBOX_OPENER)].map((m) => m[1]))] : [];
@@ -1079,6 +1111,8 @@ let miniQueue = Promise.resolve();
 // Every mode: doorbell prompts whose content this plugin swapped in, by
 // OpenCode user message id.
 const intercepted = new Map();
+// Every mode: the user messages this process saw (`inboxObserveUsers`).
+const inboxUsers = new Map();
 
 const inboxGeneration = () => globalThis[INBOX_GENERATION] ?? 0;
 const isMini = () =>
@@ -1168,30 +1202,29 @@ const startInbox = (client) => {
 };
 
 const inboxAck = (assistant) => {
-  const parent = assistant?.parentID;
-  if (!parent) return;
-  const fromDoorbell = intercepted.get(parent);
-  if (fromDoorbell) {
-    intercepted.delete(parent);
+  for (const key of inboxCovered(inboxUsers, intercepted, assistant)) {
+    const fromDoorbell = intercepted.get(key);
+    intercepted.delete(key);
     for (const id of fromDoorbell) {
       try {
         execFile(hookBinary(), ["ack", id], { timeout: 5000 }, () => {});
       } catch (_) {}
     }
   }
-  const fromStream = miniPending.get(parent);
-  if (fromStream) {
-    miniPending.delete(parent);
-    const ids = fromStream.filter((id) => miniDelivered.delete(id));
-    if (ids.length) {
-      if (assistant.sessionID) miniTurns.add(assistant.sessionID);
-      inboxWrite(globalThis[INBOX_WATCHER], { ack: ids, repaint: true });
-    }
+  const ids = [];
+  for (const key of inboxCovered(inboxUsers, miniPending, assistant)) {
+    ids.push(...miniPending.get(key).filter((id) => miniDelivered.delete(id)));
+    miniPending.delete(key);
+  }
+  if (ids.length) {
+    if (assistant.sessionID) miniTurns.add(assistant.sessionID);
+    inboxWrite(globalThis[INBOX_WATCHER], { ack: ids, repaint: true });
   }
 };
 
 const observeInbox = (event) => {
   try {
+    inboxObserveUsers(inboxUsers, event);
     const type = event?.type;
     const properties = event?.properties;
     if (type === "session.created") {
@@ -1306,6 +1339,7 @@ const tui = async (api) => {
     let queue = Promise.resolve();
     const delivered = new Set();
     const pending = new Map();
+    const users = new Map();
 
     const sessionOf = (id) => {
       try {
@@ -1404,12 +1438,21 @@ const tui = async (api) => {
         const info = event?.properties?.info;
         if (info?.role === "user") {
           lastSeen = inboxSelectionOf(info) ?? lastSeen;
+          inboxObserveUsers(users, { type: "message.updated", properties: { info } });
           return;
         }
-        if (info?.role !== "assistant" || !info.parentID || !pending.has(info.parentID)) return;
-        const ids = pending.get(info.parentID).filter((id) => delivered.delete(id));
-        pending.delete(info.parentID);
+        if (info?.role !== "assistant") return;
+        const ids = [];
+        for (const key of inboxCovered(users, pending, info)) {
+          ids.push(...pending.get(key).filter((id) => delivered.delete(id)));
+          pending.delete(key);
+        }
         if (ids.length) inboxWrite(watcher, { ack: ids });
+      } catch (_) {}
+    });
+    api.event.on("message.removed", (event) => {
+      try {
+        inboxObserveUsers(users, event);
       } catch (_) {}
     });
     api.event.on("message.part.updated", (event) => {
