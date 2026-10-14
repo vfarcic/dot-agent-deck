@@ -5763,7 +5763,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/form/001 — The new-pane form is mouse-operable (field focus, mode chips, Submit/Cancel).
 - **Layer:** L1 (chip + button render) + L2 (click outcomes).
 - **Agent:** none (the `schedule` chip is selected but no authoring agent is submitted).
-- **Asserts:** the form renders clickable choice chips plus `[Submit]`/`[Cancel]`; clicking a field focuses it, clicking `[schedule]` selects it, `[Submit]` creates a plain pane, and `[Cancel]` discards.
+- **Asserts:** the form renders clickable choice chips plus `[Submit]`/`[Cancel]`; clicking a field focuses it, clicking `[schedule]` selects it, and `[Cancel]` discards; at 120x40 and 200x55, replacing the suggested Name and clearing exactly the configured Command length leaves both edited values visible with Command focus, and one `[Submit]` click closes the form and creates the named shell pane.
 - **Does not assert:** command-field validation.
 - **Platform coverage:** mac+linux (L1 half: +windows).
 

@@ -56,17 +56,58 @@ fn configure(command: &str) -> tempfile::TempDir {
     config
 }
 
-fn open_shell_caller_pane(deck: &TuiDeck) -> String {
+/// Read the visible value, excluding the form's border and padding.
+fn form_field_value(grid: &str, label: &str) -> Option<String> {
+    grid.lines().find_map(|line| {
+        line.split_once(label).map(|(_, value)| {
+            value
+                .split('│')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+    })
+}
+
+/// Wait for both edited values and the visible cursor in the blank Command field.
+fn wait_for_edited_form(deck: &TuiDeck, name: &str) {
+    deck.capture_screen_when("edited Name and blank, focused Command", |screen| {
+        let grid = screen.contents();
+        let (row, line) = grid
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("Command:"))?;
+        let col = line.find("Command:")?;
+        let value_col = line[..col].chars().count() + "Command: ".len();
+        (form_field_value(&grid, "Name:").as_deref() == Some(name)
+            && form_field_value(&grid, "Command:").as_deref() == Some("")
+            && !screen.hide_cursor()
+            && screen.cursor_position() == (row as u16, value_col as u16))
+            .then_some(())
+    });
+}
+
+fn open_shell_caller_pane(deck: &TuiDeck, configured_command: &str) -> String {
     deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
     deck.wait_for_string("┌ New Agent");
+    let initial_name = deck.capture_screen_when("initial Name value", |screen| {
+        form_field_value(&screen.contents(), "Name:")
+    });
     deck.send_keys(b"\t");
+    deck.send_keys(&vec![0x7f; initial_name.chars().count()]);
     deck.send_keys(b"caller");
+    deck.wait_until_grid("Name changed to caller", |grid| {
+        form_field_value(grid, "Name:").as_deref() == Some("caller")
+    });
     deck.send_keys(b"\t");
-    deck.send_keys(&[0x7f; 1024]);
-    let (col, row) = deck.wait_for_in_grid("[Submit]");
-    deck.click(col, row);
-    deck.wait_for_absence("[Submit]");
+    deck.send_keys(&vec![0x7f; configured_command.chars().count()]);
+    wait_for_edited_form(deck, "caller");
+    // Seed delivery needs a caller shell; mouse parity is covered by mouse/form/001.
+    deck.send_keys(b"\r");
+    deck.wait_for_absence("┌ New Agent");
     let found = std::cell::RefCell::new(None);
     assert!(common::wait_until(WAIT, || {
         *found.borrow_mut() = common::agent_records_on(deck.attach_socket_path())
@@ -77,7 +118,11 @@ fn open_shell_caller_pane(deck: &TuiDeck) -> String {
     found.into_inner().unwrap()
 }
 
-fn prepare(deck: &TuiDeck, names: &[&str]) -> (String, SiblingWorktreeGuards) {
+fn prepare(
+    deck: &TuiDeck,
+    names: &[&str],
+    configured_command: &str,
+) -> (String, SiblingWorktreeGuards) {
     common::commit_fixture_repo(deck.workdir());
     let worktrees: Vec<_> = names
         .iter()
@@ -90,7 +135,7 @@ fn prepare(deck: &TuiDeck, names: &[&str]) -> (String, SiblingWorktreeGuards) {
     trust.push(deck.workdir().to_string_lossy().into_owned());
     common::seed_claude_trust_in_home(deck.home_dir(), &trust).unwrap();
     (
-        open_shell_caller_pane(deck),
+        open_shell_caller_pane(deck, configured_command),
         SiblingWorktreeGuards(worktrees),
     )
 }
@@ -209,7 +254,7 @@ while True:
             .map(|name| dispatch_worktree_of(&deck, name))
             .collect(),
     );
-    let caller = open_shell_caller_pane(&deck);
+    let caller = open_shell_caller_pane(&deck, launcher.to_str().unwrap());
     let cases: Vec<_> = names
         .iter()
         .map(|name| (*name, format!("BOOT-QUEUE-{name}-cc17")))
@@ -266,7 +311,7 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     let names = ["real-seed-alpha", "real-seed-beta", "real-seed-gamma"];
-    let (caller, _guards) = prepare(&deck, &names);
+    let (caller, _guards) = prepare(&deck, &names, launcher.to_str().unwrap());
     let cases:Vec<_>=names.iter().map(|name|(*name,format!("Use Bash to run exactly: printf '%s\\n' 'seed-ok-{name}' >> 'native-seed-{name}-7f31.txt'. Then end your turn without running work-done."))).collect();
     dispatch(&deck, &caller, &cases);
     for (name, prompt) in &cases {
@@ -316,7 +361,7 @@ fn dispatch_028_prompts_with_cr_line_breaks_submit_exactly_once_on_real_claude()
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     let name = "line-breaks";
-    let (caller, _guards) = prepare(&deck, &[name]);
+    let (caller, _guards) = prepare(&deck, &[name], REAL_AGENT_COMMAND);
     let staging = common::harness_tempdir().unwrap();
     let task_file = staging.path().join("crlf-task.md");
     let body = "This is a Windows CRLF task.\r\n\r\nUse Bash to run exactly: printf '%s\\n' first-ok >> line-break-first-91f3.txt. Then end your turn without running work-done.\r\n";
