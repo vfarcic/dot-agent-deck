@@ -473,7 +473,7 @@ fn respawn_failed_reports(snapshot: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Scenario: On a project whose `coder` role sets `clear = true`, points at a binary that does not exist, and whose idle detector is switched off, delegate so the respawn kills the live worker and then fails to replace it, then have that same worker pane report `work-done` — the case of a person tasking it directly afterwards. The orchestrator's inbox must receive a respawn-failure daemon notice that names no role, and then the completion labelled as one it never commissioned, never pointing at a summary file. After the user types into the orchestrator, a second delegate must post a second, identical notice.
+/// Scenario: A failed clear-enabled respawn must post a notice, release its commission, label the next work-done unsolicited, and permit a second delegation. Separately, hold an admitted non-clearing dispatch, remove its live worker, then release the dispatch; the unresolved target must get no task and its following report must also remain unsolicited, with no commissioned summary file.
 #[spec("orchestration/work-done/005")]
 #[test]
 fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
@@ -609,7 +609,54 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
              input; inbox = {after_second:?}"
         );
         assert_eq!(reports[0], reports[1], "the two reports are the same text");
+        assert_queued_dispatch_with_an_unresolved_worker_releases_its_commission().await;
     });
+}
+
+async fn assert_queued_dispatch_with_an_unresolved_worker_releases_its_commission() {
+    let harness = WorkDoneHarness::new(Some("worker_response_timeout_minutes = 0\n")).await;
+    let order = harness.registry.pane_dispatch_order_lock(WORKER_PANE);
+    let held = order.lock().await;
+    let response = harness.delegate().await;
+    assert_eq!(
+        response.message_ids.len(),
+        1,
+        "delegate must be admitted before the worker exits"
+    );
+    // A deterministic dispatch-time refusal: queue the real handler while the
+    // worker is live, remove that generation, then let its dispatch proceed.
+    let worker = harness.registry.pane_current_agent_id(WORKER_PANE).unwrap();
+    harness
+        .registry
+        .close_agent(&worker)
+        .expect("close only this worker");
+    drop(held);
+    let notice = harness
+        .wait_for_orchestrator(
+            |text| text.contains("delegated worker never came up"),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        notice.contains("NOT delivered"),
+        "unresolved worker must be reported: {notice}"
+    );
+    assert!(harness.registry.inbox().rendered(WORKER_PANE).is_empty());
+    harness
+        .work_done("UNSOLICITED-AFTER-UNRESOLVED-DISPATCH")
+        .await;
+    let report = harness
+        .wait_for_orchestrator(
+            |text| text.contains("UNSOLICITED-AFTER-UNRESOLVED-DISPATCH"),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        report.contains(UNSOLICITED_NEEDLE),
+        "refused dispatch must release its own commission: {report}"
+    );
+    assert!(!report.contains(POINTER_NEEDLE), "{report}");
+    assert!(!harness.summary_path().exists());
 }
 
 /// A raw, no-echo `cat` successor for the orchestrator pane, carrying the same

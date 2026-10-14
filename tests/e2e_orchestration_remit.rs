@@ -99,17 +99,9 @@ const REASSERTION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// real work rather than a single apply.
 const INJECTED_EVENT_APPLIED_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long the delivery log's pointer count must hold steady before this
-/// file trusts it as the baseline every later assertion counts from. Sized
-/// when the deck's first retry window, `unconfirmed_retry_delay(1)`, was a
-/// flat 500ms, so that it exceeded the window in which an unconfirmed
-/// delivery earns its one automatic replacement payload write. Issue #637
-/// floored that window at the producer's confirmation latency, and this
-/// fixture reports as Codex, so it is now 10s
-/// (`SLOW_CONFIRMATION_LATENCY`, `src/prompt_delivery.rs`) and this window no
-/// longer exceeds it. What it still absorbs is a replacement already SENT when
-/// the settle begins — the pointer line a `python3` fork has yet to append. A
-/// replacement now needs `confirm_submission` to miss 10s rather than 500ms.
+/// How long the synthetic inbox consumer's log must hold steady before later
+/// assertions take their baseline. This waits out fixture subprocess writes;
+/// it is not a production typed-payload retry window.
 const DELIVERY_SETTLE_QUIET_WINDOW: Duration = Duration::from_millis(1500);
 
 /// Ceiling on how long [`settled_pointer_count`] will wait for the count to
@@ -117,23 +109,9 @@ const DELIVERY_SETTLE_QUIET_WINDOW: Duration = Duration::from_millis(1500);
 /// fork on a loaded machine, not an IPC round trip.
 const DELIVERY_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The most [`DELIVERED_POINTER`] lines ONE logical delivery can legitimately
-/// leave in the log, and therefore the ceiling [`settled_pointer_count`]
-/// refuses to settle above.
-///
-/// Three, from `src/prompt_delivery.rs`: `MAX_PAYLOAD_SUBMISSIONS` is 2 — the
-/// write itself plus the one bounded REPLACEMENT payload — and issue #666's
-/// `AgentStartRearm` allows ONE further payload write on positive evidence the
-/// payload was destroyed, which that module documents as a hard cap of three.
-/// Every attempt past that falls back to a submit-only probe, which writes a
-/// bare CR the fixture logs as an empty line rather than as a pointer, so it
-/// cannot inflate this count.
-///
-/// Greptile P2 on PR #837, first half. A settled count with no ceiling accepts
-/// whatever it happens to observe, so a caller that meant "one more delivery"
-/// silently accepts five. Bounding it does NOT on its own pin exactly-once —
-/// a count cannot separate one delivery that retried from two that did not,
-/// which is what [`ContextRewriteWatcher`] exists for.
+/// A loose safety ceiling on lines accepted while settling one inbox delivery.
+/// This bounds a runaway fixture, rather than describing a production retry
+/// budget. The context rewrite watcher independently pins exactly one re-arm.
 const MAX_POINTER_LINES_PER_DELIVERY: usize = 3;
 
 /// The minimum gap [`ContextRewriteWatcher`] requires between two observed
@@ -143,8 +121,7 @@ const MAX_POINTER_LINES_PER_DELIVERY: usize = 3;
 /// `std::fs::write`, which truncates and then writes, so ONE logical rewrite
 /// can bump the mtime twice microseconds apart. Two genuine re-arms cannot be
 /// anywhere near that close: the second cannot start until the first
-/// delivery has actually written its payload (`PromptDelivery::attempts > 0`,
-/// `src/ui.rs`), which puts a whole readiness gate and PTY write between them.
+/// delivery has actually written its payload (the inbox post in `src/ui.rs`), which puts a whole readiness gate and PTY write between them.
 /// Measured against the deliberate double-fire mutation used to verify this
 /// detector: **~680ms** apart, across three runs (679ms, 688ms, 688ms).
 const CONTEXT_REWRITE_DEBOUNCE: Duration = Duration::from_millis(8);
@@ -211,26 +188,8 @@ fn wait_for_remits(log: &RemitLog, n: usize, timeout: Duration) -> bool {
 /// BASELINE every later count assertion in this file measures from, in place
 /// of the literal `2`/`3` they used to hardcode.
 ///
-/// Hardcoding those literals assumed the spawn-time delivery had produced
-/// exactly ONE pointer line, which holds only while the fixture's
-/// `confirm_submission` beats the deck's first retry window
-/// (`unconfirmed_retry_delay(1)`, 500ms when this was written and 10s for this
-/// fixture's Codex producer since issue #637). Under load it did not: the deck then writes its one automatic
-/// REPLACEMENT payload (`MAX_PAYLOAD_SUBMISSIONS` is 2,
-/// `src/prompt_delivery.rs`) and the fixture logs that as a second pointer
-/// line with no re-assertion behind it. So every negative check here ("must
-/// NOT reach a second line") reddens on a payload retry that is designed
-/// behaviour rather than on the leak it exists to catch, and every positive
-/// check greens without a re-assertion having happened. Measured on this
-/// branch under a 64-way CPU load: 8 such failures across 6 module runs,
-/// spread over `_002`, `_003`, `_004`, `_005` and `_006` — a different
-/// failure class from the status clobber issues #818/#832 were, and reachable
-/// at a higher load than the CI runner has so far shown.
-///
-/// Counting from a settled baseline makes each assertion measure what it says
-/// it measures — one more pointer line than the spawn-time delivery left
-/// behind, whatever that delivery cost — instead of asserting a literal that
-/// silently encodes "and the retry did not fire".
+/// Count from the synthetic consumer's settled log, so subprocess scheduling
+/// cannot turn an incomplete baseline into a false re-assertion.
 ///
 /// `ceiling` is the largest count this call will accept as settled, and it is
 /// the answer to Greptile P2's first half on PR #837: without it a caller
@@ -269,9 +228,7 @@ fn settled_pointer_count(deck: &TuiDeck, log: &RemitLog, ceiling: usize) -> usiz
         settled_count <= ceiling,
         "the delivery log settled at {settled_count} `{DELIVERED_POINTER}` line(s), above \
          the {ceiling} one logical delivery can account for \
-         ({MAX_POINTER_LINES_PER_DELIVERY} payload writes at most — \
-         `MAX_PAYLOAD_SUBMISSIONS` plus issue #666's one evidence-based rearm, \
-         `src/prompt_delivery.rs`). More than one delivery therefore ran, so this count \
+         ({MAX_POINTER_LINES_PER_DELIVERY} fixture log lines at most). More than one delivery therefore ran, so this count \
          cannot serve as a baseline for anything.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
@@ -283,22 +240,10 @@ fn settled_pointer_count(deck: &TuiDeck, log: &RemitLog, ceiling: usize) -> usiz
 /// exactly-once detector `orchestration_remit_004` needs and that no pointer
 /// count can provide.
 ///
-/// Greptile P2 on PR #837. Counting pointer lines cannot tell ONE re-assertion
-/// whose delivery earned its replacement payload write (`baseline + 2` lines,
-/// designed behaviour, `MAX_PAYLOAD_SUBMISSIONS` in `src/prompt_delivery.rs`)
-/// from a genuine DOUBLE FIRE whose two deliveries were each confirmed first
-/// time (`baseline + 2` lines, the regression). Both land inside
-/// [`DELIVERY_SETTLE_QUIET_WINDOW`], so a settled baseline absorbs the second
-/// one and the "stays put" check behind it then measures from a baseline that
-/// already contains the defect.
-///
-/// The context FILE separates them, because the two writes have different
-/// authors. A re-arm calls `reassert_orchestrator_prompt` (`src/ui.rs`), which
-/// goes through `prepare_orchestrator_prompt` (`src/orchestrator_context.rs`)
-/// and `std::fs::write`s the whole file. A payload retry re-sends the
-/// ALREADY-PREPARED prompt string and never touches the file at all. So the
-/// number of rewrites IS the number of logical re-assertions, whatever the
-/// pointer count did.
+/// Inbox messages can be delivered again if receipt is not acknowledged, so
+/// a pointer count alone cannot distinguish redelivery from a second re-arm.
+/// `reassert_orchestrator_prompt` publishes a new context file, while inbox
+/// redelivery reuses the prepared body. Count context publications separately.
 ///
 /// **Why a background sampler rather than reading the file at each step.** The
 /// first version of this check stamped a sentinel comment into the file,
@@ -430,23 +375,9 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 /// comment before adding a test here, and reach for [`wait_for_applied`] rather
 /// than a marker file for any new phase this script grows.
 ///
-/// **Timing hazard 2, the second one**: `confirm_submission` completing inside
-/// `unconfirmed_retry_delay(1)` (`src/prompt_delivery.rs`) of the initial write
-/// is not enforced by anything. That window was 500ms when this was measured,
-/// and under load the fixture missed it; since issue #637 it is floored at the
-/// producer's confirmation latency — 10s for this fixture's Codex producer —
-/// so missing it now takes a far heavier load than the one measured below.
-/// `MAX_PAYLOAD_SUBMISSIONS` there is 2, so a delivery still unconfirmed past
-/// that window earns one automatic *replacement* payload write, appending a
-/// second `DELIVERED_POINTER` line to the log with no re-assertion behind it.
-/// The hardcoded counts this file used to assert read that as a false GREEN
-/// wherever they wanted 2, and as a false RED on every "must NOT reach a second
-/// line" check and on `orchestration_remit_004`'s "must not reach a third".
-/// Measured under a 64-way CPU load: 8 such failures across 6 module runs. The
-/// retry itself is designed behaviour and still happens; what changed is that
-/// [`settled_pointer_count`] gives every assertion a settled baseline to count
-/// from, so a replacement write no longer reads as a re-assertion. It is a
-/// different failure class from hazard 1 and it is NOT what #818/#832 were.
+/// The fixture consumes inbox messages and acknowledges them independently
+/// of its asynchronous status reports. A settled log baseline accounts for
+/// that scheduling, while context publications pin the logical re-arm count.
 const ORCHESTRATOR_REMIT_SCRIPT: &str = r#"#!/bin/sh
 emit_target() {
     WRITABLE="$1" python3 - <<'PY'
@@ -994,13 +925,7 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     // (`!wait_for_file_substr_count(..., short bound)`), applied here to the
     // count staying PUT rather than never rising.
     //
-    // Settled first, for the same reason the baseline is: the re-assertion's
-    // OWN delivery earns a replacement payload write if the fixture's
-    // confirmation misses the deck's first retry window (500ms when this
-    // reddened, 10s for this Codex fixture since #637), and counting from an
-    // unsettled figure would read that designed retry as a second
-    // re-assertion. Under a 64-way CPU load this reddened here specifically,
-    // on the literal "must not reach a third line".
+    // Settle the asynchronous consumer log before checking for repetition.
     let settled_after_reassertion =
         settled_pointer_count(&deck, &log, baseline + MAX_POINTER_LINES_PER_DELIVERY);
     let repeated_beyond_one_reassertion = wait_for_remits(
@@ -1017,15 +942,8 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
         deck.snapshot_grid()
     );
 
-    // The half the pointer count cannot do (Greptile P2 on PR #837). Settling
-    // absorbs everything written inside its quiet window, and a count cannot
-    // separate ONE delivery that earned its replacement payload write from TWO
-    // deliveries that were each confirmed first time — both read as
-    // `baseline + 2`, so the check above would take a genuine double fire as
-    // its baseline and then confirm the count stayed put at it. Rewrites of
-    // the context file are not a count of deliveries, they are a count of
-    // RE-ARMS: only `reassert_orchestrator_prompt` writes that file and a
-    // payload retry never does.
+    // A receipt retry reuses the body; only a logical re-arm publishes a
+    // new context file. Count publications independently of consumer log lines.
     //
     // Stopped here rather than earlier so the window covers everything above —
     // the delivery, its settle, and the hold.
@@ -1190,8 +1108,8 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
         .impersonating_pane_signals()
         .launch_with_fixture("remit-reassert-orchestration");
     // `_baseline` unused here alone: this test counts [`CARRY_OUT_TASK_POINTER`],
-    // a needle the spawn-time delivery never writes — so a replacement payload
-    // retry of that delivery cannot inflate it and there is nothing to count
+    // a needle absent from the startup message, so redelivery of that
+    // message cannot inflate it and there is nothing to count
     // from. Every other test in this file counts [`DELIVERED_POINTER`], which
     // the spawn-time delivery does write, and therefore needs the baseline.
     let (socket, pane_id, agent_id, log, _baseline) = open_and_confirm_initial_delivery(&deck);

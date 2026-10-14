@@ -515,8 +515,7 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
     let directive = format!(
         "You are the orchestrator in a dot-agent-deck orchestration. A worker role named \
          {ORCH_WORKER_ROLE} is available. Call the delegate tool EXACTLY ONCE with role \
-         {ORCH_WORKER_ROLE} and this task text: Create a file named {ORCH_SENTINEL_NAME} in the \
-         current working directory whose entire contents are exactly the text \
+         {ORCH_WORKER_ROLE} and this task text: Create the file {project_str}/{ORCH_SENTINEL_NAME} whose entire contents are exactly the text \
          {ORCH_SENTINEL_CONTENT}. Use the Bash tool to create it. Do NOT do the work yourself - \
          only call the delegate tool, then stop."
     );
@@ -597,27 +596,14 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
             .any(|k| lower.contains(k))
     };
 
-    let worker_task = project_dir
-        .join(".dot-agent-deck")
-        .join(format!("worker-task-{ORCH_WORKER_ROLE}.md"));
-
-    // A worker task file proves the restored Pi received its inbox directive and delegated.
-    let delegated = common::wait_for_path(&worker_task, Duration::from_secs(150));
-    if !delegated {
-        let grid = deck.snapshot_grid();
-        let seed_on_grid = grid.contains(ORCH_SENTINEL_NAME)
-            || grid.to_lowercase().contains("delegate")
-            || grid.contains(ORCH_WORKER_ROLE);
-        panic!(
-            "NATIVE-SEED CHECKPOINT FAILED (PRD #201 GAP #1): the daemon never wrote \
-             {worker_task:?} within 150s — the pi orchestrator did not receive its seed \
-             natively through the inbox extension and delegate. seed_visible_on_grid={seed_on_grid} \
-             (if true, the seed reached pi's pane but pi did not delegate). \
-             api_error_on_grid={} (if true, an account/quota is the blocker, not native \
-             delivery).\nFinal grid:\n{grid}",
-            api_errored(&grid)
-        );
-    }
+    // Receipt is observable in the worker pane as the framed task, rather
+    // than the retired fixed worker-task-coder.md file.
+    assert!(
+        deck.wait_for_grid_string_within(ORCH_SENTINEL_NAME, Duration::from_secs(150)),
+        "Pi never delegated its inbox directive to the worker; api_error_on_grid={}. Final grid:\n{}",
+        api_errored(&deck.snapshot_grid()),
+        deck.snapshot_grid()
+    );
 
     // The worker card labels the framed inbox task while its real agent works.
     assert!(
@@ -640,8 +626,7 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
     {
         panic!(
             "the delegated claude worker never created the sentinel {ORCH_SENTINEL_NAME:?} with \
-             {ORCH_SENTINEL_CONTENT:?} within 90s. The delegation reached the worker (task file \
-             written), so the worker ran but did not complete the task. observed: {observed}; \
+             {ORCH_SENTINEL_CONTENT:?} within 90s. The inbox task was visible to the worker, so the worker ran but did not complete the task. observed: {observed}; \
              api_error_on_grid={}.\nFinal grid:\n{}",
             api_errored(&deck.snapshot_grid()),
             deck.snapshot_grid()

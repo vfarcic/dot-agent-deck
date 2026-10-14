@@ -3228,7 +3228,7 @@ without depending on the config struct API.
 ##### orchestration/delegate/013 — In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed.
+- **Asserts:** In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed. A replacement orchestrator must receive no stale notice from its predecessor's still-unacknowledged task, which remains fetchable by the original worker.
 - **Test:** `delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -3423,7 +3423,8 @@ without depending on the config struct API.
 - **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs; `cat` stand-ins).
 - **Agent:** none (raw no-echo `cat` orchestrator observer; the worker's `cat` is live, and the role COMMAND points at a binary that does not exist).
 - **Asserts:** with the `coder` role at `clear = true` and BOTH delegation watches switched off (`worker_response_timeout_minutes = 0`), a role command naming a nonexistent single-word binary makes the respawn dispose of the live worker and then fail deterministically at `spawn_agent`, and the dispatch takes its respawn-error return. In failure order: the orchestrator's inbox receives the respawn-failure report as a daemon notice naming the worker pane and no role, and nothing of it is typed into the orchestrator's pane; the commission is already released when the notice is visible; the worker's following `work-done` is labelled unsolicited, names no filed report, and writes no summary file; and after the user types into the orchestrator a second delegate posts a second, byte-identical notice (PRD #1666 S5).
-- **Does not assert:** the guarded-send refusal arm's release (unit-tested arithmetic plus a manual real-binary run; forcing an undelivered guarded send here would depend on the spawned dispatch task winning a race); the pi-native seed return, which is a DELIVERY path and correctly keeps its commission; the readiness-buffer close return, where `begin_pane_close`'s sweep is the discharge.
+- **Also asserts:** hold the real dispatch order lock after a non-clearing delegate is admitted, close its worker and release the lock; the unresolved worker receives no inbox task, the orchestrator gets a bound non-delivery notice, and the next completion is unsolicited with no saved summary. Inbox-admission refusal is covered by `inbox/route/008`; the ledger's own-arm expiry arithmetic remains in `commission_ledger_releases_an_undelivered_delegations_commission` and `commission_ledger_keeps_the_queued_commission_by_arm_id`.
+- **Does not assert:** native adapter behavior or real-model completion.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
 
@@ -4087,13 +4088,13 @@ without depending on the config struct API.
 #### orchestration/route
 
 ##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]
-- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`, so it is demo-reel-eligible per PRD #180). Both tabs are opened through the PRODUCTION new-pane flow (`Ctrl+N` → picker → Space → Right → Enter → Enter) against the deck's own cwd, so their `(name, cwd)` identities are byte-identical and only the per-tab `orchestration_id` (PRD #140 M1.2, echoed back through `StartAgent` → daemon registry → `ListAgents`) tells them apart. Each delegate is issued by a REAL orchestrator agent that shells `dot-agent-deck delegate` after the production `WriteAndSubmit` RPC types the directive into its pane; each work-done is issued by the REAL worker agent from its task-file footer. Per-pane observation is the daemon's own `AttachRequest::Snapshot`, normalized wrap-insensitively (escape sequences stripped, then everything but `[A-Za-z0-9._/-]` dropped) so a pointer hard-wrapped inside a narrow role card still matches. The freshly-built binary's dir is prepended to the deck → daemon → agents PATH; Claude project-trust for the per-test tempdir cwd is seeded into the deck's HOME after launch (the cwd does not exist before it), so the six panes clear their first-run gates with no keystroke.
+- **Layer:** L2 PTY-attached, lane 2, using the real binary through the vt100 `TuiDeck` harness. Both tabs open through the production new-pane flow against the same cwd; their distinct `orchestration_id`s round-trip through `StartAgent` and `ListAgents`. Each real orchestrator receives an inbox directive and shells `dot-agent-deck delegate`; its real worker consumes the framed task and reports work-done. The directive asks each orchestrator to quote its report's opening message line, whose `from` label names the worker role; `Sent by:` separately describes provenance as another agent. The visible reply therefore exposes the role even when Claude collapses native hook content. Per-pane evidence uses the daemon's `AttachRequest::Snapshot`, normalized across wrapping. The fresh binary is on the agents' PATH and project trust is seeded before the six interactive Claude panes start.
 - **Fixture:** `tests/fixtures/orchestration-route` — one `[[orchestrations]] name = "route-iso"` with THREE roles (`orchestrator` start + `coder` + `reviewer`), all REAL interactive Haiku `claude` (`--allowedTools Bash Read Write`, no `-p`), workers at `clear = false` so their agent ids and scrollback stay stable across the delegate. Three roles rather than two because `.dot-agent-deck/worker-task-{role}.md` / `work-done-{role}.md` are keyed by ROLE within a cwd (PRD #140 keeps that layer explicitly out of scope), so two same-cwd tabs sharing a role name share those files: driving tab A through `coder` and tab B through `reviewer` makes every no-cross-delivery check a presence/absence question about a pane that would otherwise have received NOTHING, and makes the two work-done feedback strings role-qualified and thus distinguishable inside one orchestrator pane — no occurrence-counting in a redrawing agent TUI.
-- **Agent:** REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`) ×6 interactive role panes across the two tabs; four short turns actually run (two orchestrators delegate, two workers create one file each). Flaky-tolerant lane-2 tier (real LLM) — run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when the `claude` CLI/credentials are absent.
-- **Asserts:** the second open of the same orchestration in the same directory renders PRD #140 M4.0's non-blocking same-cwd warning pointing at `/worktree-prd` (the M4.0 surface, live in the real form rather than through the L1 render seam); the daemon reports two orchestration tabs with DISTINCT `orchestration_id`s and three role panes each; then, with a task started in EACH tab CONCURRENTLY (the issue's own repro, and the state in which the pre-#140 `HashSet`-ordered work-done lookup was most non-deterministic), tab A's delegate pointer `worker-task-coder.md` lands in tab A's `coder` pane and NEVER in tab B's identically-named `coder` pane; tab A's coder really does its own task (uniquely-named sentinel `route_alpha_5f3c.txt` plus the daemon-written `.dot-agent-deck/work-done-coder.md`); its work-done feedback (`Worker coder has completed their task`) reaches tab A's orchestrator pane and NEVER tab B's; and symmetrically for tab B → `reviewer` (`worker-task-reviewer.md`, `route_beta_9d21.txt`, `work-done-reviewer.md`, `Worker reviewer has completed their task`), with a final sweep re-checking all four absences after both chains have run.
+- **Agent:** REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`) ×6 interactive role panes across two tabs, with Bash, Read and Write allowed in the isolated fixture. Two orchestrators delegate, two workers create one file each, and each orchestrator quotes its received report's opener. Local lane 2; runtime-skipped when the CLI or credentials are absent unless strict real-e2e enforcement is enabled.
+- **Asserts:** the second opening shows the same-cwd warning and `/worktree-prd` remedy; the two tabs have distinct orchestration ids and three role panes each. Concurrently, tab A delegates its alpha task to its coder and tab B delegates its beta task to its reviewer. Each task appears in its own worker pane and stays absent from the other tab's namesake. The real workers write `route_alpha_5f3c.txt` containing `ALPHA_OK` and `route_beta_9d21.txt` containing `BETA_OK`, then report work-done. The owning orchestrator visibly quotes the opener's `from coder (worker report` or `from reviewer (worker report`; the other orchestrator must not show that role-qualified opener. A final sweep repeats the four cross-delivery absence checks.
 - **Does not assert:** WHICH pane wrote a shared coordination file — `worker-task-{role}.md` / `work-done-{role}.md` are role-and-cwd keyed by design (PRD #140 "Deferred: full same-directory isolation"), so the routing proof is the per-pane delegate/work-done delivery, not the file contents; the hydration round trip of two same-`(name, cwd)` tabs across a detach/reattach (M3.1, covered by the `partition_hydrated_panes` unit tests); the token-less older-client path (retired by issue #463, whose daemon refusal is `orchestration/identity/011`); the exact task text each orchestrator forwards (only the literal sentinel filename has to survive LLM phrasing); the deterministic routing decision itself (mutation-checked unit tests on `delegate_targets` / `orchestrator_for_worker` in `src/state.rs`).
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
-- **Cost note:** four short interactive Haiku turns (two delegates, two one-file tasks) — well under Decision 23's <$0.05/run bound.
+- **Cost note:** short pinned-Haiku turns for two delegates, two one-file tasks and two report-opener quotes, plus orchestration startup.
 
 ##### orchestration/route/002 — Detach/reattach of two same-`(name, cwd)` orchestration tabs rebuilds TWO distinct tabs, each keeping its own routing group (PRD #140 M3.1).
 - **Layer:** L1/synthetic (warm in-process daemon + real attach socket, no PTY-attached binary and no LLM). Drives the production reattach chain end to end: `start_agent` stores `TabMembership` on the daemon's `AgentRecord` → `EmbeddedPaneController::hydrate_from_daemon` reads it back through `ListAgents` + `validate_tab_membership` → `partition_hydrated_panes` buckets by `OrchestrationIdentity` → `resolve_orch_config_for_hydration` / `OrchestrationConfig::synthesize_from_bucket_metadata` → `TabManager::open_orchestration_tab_with_existing_role_panes`. Synthetic is the right tier because the claim is about a hydration round trip, not about agent behaviour; the real-agent two-tab case is `orchestration/route/001`, which never detaches.
@@ -5306,13 +5307,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### chain-smoke/claude
 
-##### chain-smoke/claude/001 — A real Claude Code agent run end-to-end emits hook events that drive the card through Thinking → Working → Idle.
-- **Layer:** L2.
+##### chain-smoke/claude/001 — Interactive Claude consumes an inbox task and drives the live card through Thinking → Working → Idle. [reel]
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_chain_smoke_claude.rs`), attached PTY, imported isolated credentials and pre-seeded project trust.
 - **Agent:** Claude Code (`claude-haiku-4-5-20251001` per Decision 8).
-- **Asserts:** card status traverses Thinking → Working → Idle within the test budget; tool name appears on the card during Working.
+- **Asserts:** the live dashboard paints Thinking → Working with Bash → Idle after the inbox post; real Bash work copies the uniquely named fixture sentinel exactly; the interactive agent remains alive after completion.
 - **Does not assert:** any specific text the agent prints.
 - **Platform coverage:** mac+linux (chain-smoke is local-only per Decision 8).
-- **Cost note:** one Haiku invocation, ≲500 input + 200 output tokens — well under Decision 23's bound.
+- **Cost note:** one short interactive Haiku turn with one Bash call.
 
 #### chain-smoke/opencode
 
@@ -7565,6 +7566,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** macOS process discovery.
 - **Platform coverage:** linux.
 
+##### inbox/route/008 — A refused inbox post releases its delegation commission and permits a fresh task.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon and in-pane CLI fetches.
+- **Agent:** scripted stand-ins; no credential.
+- **Asserts:** a full recipient inbox refuses the attempted delegate with a bound daemon notice and no task bytes; subsequent work-done is unsolicited and saves no commissioned summary; draining the inbox permits a fresh delegate and framed fetch.
+- **Does not assert:** the private unresolved-worker dispatch branch or commission expiry arithmetic; the ledger unit tests retain those arithmetic checks.
+- **Platform coverage:** mac+linux.
+
 #### inbox/codex
 
 ##### inbox/codex/001 — The update-now startup dialog receives zero input bytes.
@@ -7738,8 +7746,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 ##### inbox/opencode/023 — One coalesced assistant turn acknowledges its earlier deck messages.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
-- **Agent:** fake OpenCode API executing the real generated TUI plugin and inbox watcher CLI.
-- **Asserts:** one assistant parent naming the third delivered prompt acknowledges the three deck ids in that session exactly once; an interleaved human does not interrupt acknowledgement; another session stays pending; acknowledged tasks do not redeliver after the deadline or a repeated assistant update.
+- **Agent:** fake OpenCode API executing the real generated full TUI and mini plugins and inbox watcher CLI.
+- **Asserts:** in both full and mini, one assistant parent naming the third delivered prompt acknowledges the three deck ids in that session exactly once; an interleaved human does not interrupt acknowledgement; another session stays pending; acknowledged tasks do not redeliver after the deadline or a repeated assistant update.
 - **Does not assert:** real OpenCode model execution or rendering (covered by the live and load tests).
 - **Cost:** none.
 
@@ -7809,7 +7817,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/opencode/011 — Submitted doorbell is replaced in place and acknowledged when its assistant starts.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
 - **Agent:** generated server plugin's real chat.message hook, loaded in a worker thread as the full TUI loads it, under a fake OpenCode host.
-- **Asserts:** original text-parts array receives framed fetched content; fetch does not ack; abort before assistant start permits redelivery; only the matching assistant parent acknowledges the retry; recalling a handled id leaves newer pending work untouched.
+- **Asserts:** original text-parts array receives framed fetched content; fetch does not ack; abort before assistant start permits redelivery; only the matching assistant parent acknowledges the retry; recalling a handled id leaves newer pending work untouched; one coalesced assistant turn acknowledges both intercepted tasks around a human message without redelivery.
 - **Does not assert:** real OpenCode rendering or cancellation; the interception channel was measured separately in full TUI and mini.
 - **Cost:** none.
 

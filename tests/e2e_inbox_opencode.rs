@@ -263,18 +263,38 @@ fn opencode_001_home_creates_navigates_delivers_serially_and_acks() {
     state(&op.daemon, &op.pane, &second, "acknowledged");
 }
 
-/// Scenario: Deliver a task in another session, then three tasks in the shown session with a human message between them. One assistant naming the third task must acknowledge the three tasks once without acknowledging the human or the other session's task, and the acknowledged tasks must not redeliver.
+/// Scenario: Exercise the full TUI and mini plugins with a pending task in another session, then three tasks in the current session and a human message between them. One assistant naming the third task must acknowledge the three tasks once without acknowledging the human or other session, and the tasks must not redeliver.
 #[spec("inbox/opencode/023")]
 #[test]
 fn opencode_023_coalesced_turn_acks_prior_deck_messages_in_its_session_once() {
-    let op = OpenCode::new("session", json!({"ackWaitMs":"10000"}));
+    for mini in [false, true] {
+        assert_coalesced_turn_acks_once(mini);
+    }
+}
+
+fn assert_coalesced_turn_acks_once(mini: bool) {
+    let config = if mini {
+        json!({"ackWaitMs":"10000", "server":true, "argv":["--mini"]})
+    } else {
+        json!({"ackWaitMs":"10000"})
+    };
+    let op = OpenCode::new("session", config);
     armed(&op.daemon, &op.pane, 1);
     let other = op.post();
     assert!(common::wait_until(WAIT, || op.events().iter().any(
         |e| e["kind"] == "user-message" && e["sessionID"] == "shown"
     )));
-    op.control(json!({"route":{"name":"session","params":{"sessionID":"root"}}}));
-    op.wait_kind("navigate");
+    if mini {
+        op.control(json!({"event":"session.created","properties":{"info":{
+            "id":"root","directory":op.daemon.home
+        }}}));
+        assert!(common::wait_until(WAIT, || op.events().iter().any(
+            |e| e["kind"] == "emitted" && e["properties"]["info"]["id"] == "root"
+        )));
+    } else {
+        op.control(json!({"route":{"name":"session","params":{"sessionID":"root"}}}));
+        op.wait_kind("navigate");
+    }
 
     let mut ids = Vec::new();
     for n in 0..3 {
@@ -749,7 +769,7 @@ fn opencode_010_full_and_mini_unarmed_fall_back_after_grace() {
     }
 }
 
-/// Scenario: Submit the fixed doorbell through the generated server plugin, loaded in a worker thread as the full TUI loads it, and inspect the original text-parts array that OpenCode saves for the model. Fetch without acknowledgement, abort before any assistant starts and require redelivery, then acknowledge only the matching assistant child; recalling a handled doorbell must leave a newer task untouched.
+/// Scenario: Submit fixed doorbells through the generated server plugin in the full TUI's worker thread and inspect the original text-parts array. An aborted delivery must redeliver, recalling a handled doorbell must leave newer work untouched, and one coalesced assistant turn must acknowledge two intercepted tasks around an intervening human message.
 #[spec("inbox/opencode/011")]
 #[test]
 fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
@@ -815,6 +835,40 @@ fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
             .to_string()
             .contains("waiting, run: dot-agent-deck inbox fetch"),
         "a recalled handled doorbell must not ask the model to fetch a newer task"
+    );
+
+    // Hold receipt long enough to make the first task remain fetched while
+    // the second is intercepted; a receipt deadline is not the signal under test.
+    let op = OpenCode::new(
+        "session",
+        json!({"server":true,"worker":true,"ackWaitMs":"10000"}),
+    );
+    let first = op.post();
+    op.control(json!({"doorbell":fixed_line(&first),"userID":"coalesced-first"}));
+    state(&op.daemon, &op.pane, &first, "fetched");
+    op.control(json!({"event":"message.updated","properties":{"info":{
+        "id":"human-between-intercepted","role":"user","sessionID":"shown"
+    }}}));
+    let second = op.post();
+    op.control(json!({"doorbell":fixed_line(&second),"userID":"coalesced-last"}));
+    assert!(common::wait_until(WAIT, || op.events().iter().any(
+        |e| e["kind"] == "user-message" && e["id"] == "coalesced-last"
+    )));
+    state(&op.daemon, &op.pane, &second, "fetched");
+    op.assistant("coalesced-last");
+    state(&op.daemon, &op.pane, &second, "acknowledged");
+    state(&op.daemon, &op.pane, &first, "acknowledged");
+    op.assistant("coalesced-last");
+    assert!(
+        !common::wait_until(Duration::from_secs(11), || {
+            listing(&op.daemon, &op.pane)["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["state"] != "acknowledged" || m["deliveries"] != 1)
+        }),
+        "coalesced intercepted tasks must stay acknowledged without redelivery: {}",
+        listing(&op.daemon, &op.pane)
     );
 }
 

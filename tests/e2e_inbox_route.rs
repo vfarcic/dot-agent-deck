@@ -64,6 +64,78 @@ fn delegate_003_work_done_posts_one_untrusted_report() {
     assert_eq!(route::count(&daemon, &orch, 1).len(), 1);
 }
 
+/// Scenario: Fill a worker's single-message inbox, then delegate to it and
+/// require an explicit refusal notice without a task being delivered. Its next
+/// work-done must be labelled unsolicited, and after draining the inbox a
+/// fresh delegation must be accepted and fetched rather than refused as busy.
+#[spec("inbox/route/008")]
+#[test]
+fn route_008_refused_post_releases_the_commission_for_a_fresh_delegate() {
+    let daemon = daemon(&[
+        ("DOT_AGENT_DECK_INBOX_MAX_PER_RECIPIENT", "1"),
+        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
+    ]);
+    let (orch, worker) = route::team(&daemon, false);
+    let filler = common::post_message_on(
+        daemon.attach_socket(),
+        &worker.id,
+        &worker.agent,
+        "FILL-THE-WORKER-INBOX",
+    )
+    .unwrap();
+    let mut req = request(&orch, "delegate");
+    req["task"] = json!("REFUSED-DELEGATE-TASK");
+    req["to"] = json!(["coder"]);
+    req["timestamp"] = json!(chrono::Utc::now());
+    let refused = hook(&daemon, req);
+    let refused_id = refused["message_ids"][0]
+        .as_str()
+        .expect("dispatch attempt id");
+    let notice = route::notice(&daemon, &orch, "inbox refused");
+    assert!(notice.to_string().contains("NOT delivered"));
+    assert_eq!(route::count(&daemon, &worker, 1)[0]["id"], filler);
+    assert!(
+        !route::messages(&daemon, &worker)
+            .iter()
+            .any(|message| message["id"] == refused_id)
+    );
+    assert!(!String::from_utf8_lossy(&bytes(&worker)).contains("REFUSED-DELEGATE-TASK"));
+    // `notice` fetched without acknowledging. Another fetch cannot take its
+    // existing claim, so acknowledge that exact id before posting a report.
+    let mut ack = request(&orch, "ack");
+    ack["delivery_id"] = notice["messages"][0]["id"].clone();
+    hook(&daemon, ack);
+    state(
+        &daemon,
+        &orch,
+        notice["messages"][0]["id"].as_str().unwrap(),
+        "acknowledged",
+    );
+    route::done(&daemon, &worker, "UNCOMMISSIONED-AFTER-REFUSAL", false);
+    route::count(&daemon, &orch, 2);
+    let report = fetch(&daemon, &orch, true).to_string();
+    assert!(
+        report.contains("UNCOMMISSIONED-AFTER-REFUSAL")
+            && report.contains("no outstanding delegation"),
+        "{report}"
+    );
+    assert!(
+        !daemon
+            .home
+            .join(".dot-agent-deck/work-done-coder.md")
+            .exists()
+    );
+    fetch(&daemon, &worker, true);
+    let accepted = route::delegate(&daemon, &orch, "FRESH-DELEGATE-AFTER-REFUSAL", false);
+    route::fetched(
+        &daemon,
+        &worker,
+        &accepted,
+        "FRESH-DELEGATE-AFTER-REFUSAL",
+        "the orchestrator",
+    );
+}
+
 /// Scenario: Delegate with clear enabled to a live stand-in. The old process is replaced before posting; exactly one task is bound to the new agent and only that generation can fetch it.
 #[spec("inbox/route/001")]
 #[test]
@@ -285,7 +357,12 @@ fn route_007_tui_config_generation_posts_bound_message() {
     route::fetch_enable(&pane);
     status(&deck, &pane, "idle", "codex");
     state(&deck, &pane, id, "acknowledged");
-    let fetched = std::fs::read_to_string(pane.capture.with_extension("fetches")).unwrap();
+    let fetched_path = pane.capture.with_extension("fetches");
+    // The CLI acknowledges before the stand-in records its returned output.
+    // Observe that record itself, rather than racing its creation after ack.
+    common::wait_for_file_containing(&fetched_path, ".dot-agent-deck.toml", WAIT)
+        .expect("the in-pane CLI must record the fetched configuration instructions");
+    let fetched = std::fs::read_to_string(fetched_path).unwrap();
     assert!(
         fetched.contains(".dot-agent-deck.toml"),
         "configuration instructions: {fetched}"
@@ -294,12 +371,54 @@ fn route_007_tui_config_generation_posts_bound_message() {
     route::count(&deck, &pane, 1);
 }
 
-/// Scenario: In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed.
+/// Scenario: In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. The orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed. Replace another task's orchestrator before that deadline and require its successor to receive no stale notice while the worker's original task stays fetchable.
 #[spec("orchestration/delegate/013")]
 #[test]
 fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane() {
     route::undelivered(false);
     route::undelivered(true);
+    assert_undelivered_notice_does_not_reach_successor_orchestrator();
+}
+
+fn assert_undelivered_notice_does_not_reach_successor_orchestrator() {
+    let daemon = daemon(&[
+        (route::UNDELIVERED_MS, "1500"),
+        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
+    ]);
+    let (orch, worker) = route::team(&daemon, false);
+    let record = common::agent_records_on(daemon.attach_socket())
+        .into_iter()
+        .find(|record| record.id == orch.agent)
+        .unwrap();
+    let posted = std::time::Instant::now();
+    let id = route::delegate(&daemon, &orch, route::TASK, false);
+    assert!(route::messages(&daemon, &orch).is_empty());
+    let stopped = attach(&daemon, json!({"op":"stop-agent","id":orch.agent}));
+    assert_eq!(
+        stopped["ok"], true,
+        "stop only the original orchestrator: {stopped}"
+    );
+    let successor = route::start(
+        &daemon,
+        &orch.id,
+        json!({"tab_membership":record.tab_membership}),
+    );
+    assert_ne!(successor.agent, orch.agent);
+    assert!(
+        posted.elapsed() < Duration::from_millis(1500),
+        "successor must be ready before the original notice deadline"
+    );
+    assert!(
+        !common::wait_until(Duration::from_secs(2), || {
+            route::messages(&daemon, &successor).iter().any(|message| {
+                message["bind_agent"] == successor.agent && message.to_string().contains(&id)
+            }) || String::from_utf8_lossy(&bytes(&successor)).contains("has not reached the worker")
+        }),
+        "a stale undelivered notice reached the successor: {:?}",
+        route::messages(&daemon, &successor)
+    );
+    state(&daemon, &worker, &id, "queued");
+    route::fetched(&daemon, &worker, &id, route::TASK, "the orchestrator");
 }
 
 /// Scenario: Supersede an unacknowledged delegate with clear enabled, replacing its worker generation again. Only the successor's message is bound to the current worker and only its id appears in the eventual undelivered notice.
