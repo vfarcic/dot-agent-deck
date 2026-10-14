@@ -115,11 +115,9 @@ fn codex_cli_listing(deck: &TuiDeck, pane: &Pane, work: &Path, ids: &[(String, S
             .iter()
             .find(|m| m["id"] == *id)
             .unwrap_or_else(|| panic!("Codex message {id} absent from inbox list: {listed}"));
-        assert!(
-            ["acknowledged", "queued", "undeliverable"]
-                .iter()
-                .any(|state| m["state"] == *state),
-            "Codex message has no terminal-or-pending explanation: {m}"
+        assert_eq!(
+            m["state"], "acknowledged",
+            "the inbox list CLI must show the Codex message acknowledged: {m}"
         );
     }
 }
@@ -141,13 +139,16 @@ fn delivered(
             let acted =
                 std::fs::read_to_string(work.join(format!("inbox-load-{phase}-{n}-49ab.txt")))
                     .is_ok_and(|text| text == format!("INBOX-LOAD-ACTION-{phase}-{n}"));
-            (acknowledged && acted)
-                || (doorbell_only && (m["state"] == "queued" || m["state"] == "undeliverable"))
+            // Codex too (PRD #1666): its doorbell rings while it is idle and
+            // its Stop hook hands messages over at a turn's end, so a message
+            // left queued is a lost delivery, not an explained one. Accepting
+            // `queued` here let a run with nothing acknowledged pass at once.
+            acknowledged && acted
         })
     });
     assert!(
         passed,
-        "every native message must be acknowledged and acted on; Codex must act or remain explicitly queued/undeliverable, never absent: ids={ids:?}, inbox={}, grid={}\n{}",
+        "every message must be acknowledged and acted on: ids={ids:?}, inbox={}, grid={}\n{}",
         inbox::listing(deck, pane),
         deck.snapshot_grid(),
         common::load_context::failure_report()
@@ -494,7 +495,7 @@ fn load_003_pi_acknowledges_seed_idle_and_busy_under_cpu_pressure() {
     exercise(&pi.deck, &pi.pane, &pi.work, "pi", false);
 }
 
-/// Scenario: Under three busy-loop processes per CPU, run real interactive Codex on DOT_AGENT_DECK_CODEX_TEST_MODEL through spawn seed, idle and a sleep-tool turn. Each of 20 messages must be acknowledged and acted on or explicitly queued/undeliverable in inbox list, never absent; no deck line may remain in the composer.
+/// Scenario: Under three busy-loop processes per CPU, run real interactive Codex on DOT_AGENT_DECK_CODEX_TEST_MODEL through spawn seed, idle and a sleep-tool turn. Each of 20 messages must be acknowledged and acted on, and listed as acknowledged by the inbox list CLI; no deck line may remain in the composer.
 #[spec("inbox/load/004")]
 #[test]
 fn load_004_codex_never_loses_seed_idle_or_busy_messages_under_cpu_pressure() {
