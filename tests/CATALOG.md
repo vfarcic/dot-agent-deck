@@ -7419,6 +7419,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the daemon's doorbell task recording the line after a write, or a flush-only ring keeping the earlier line recorded (`inbox/codex/014`, `inbox/codex/017`).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/doorbell/018 — A ring for other queued work replaces the owed cleanup, so the recorded line can outlive its message.
+- **Layer:** L1 unit (`src/doorbell.rs`, pure `decide` with injected time).
+- **Agent:** none.
+- **Asserts:** with the line naming the first of two messages recorded, fetching that message just as a ring is due brings a ring for the second, with its flushing CR, instead of the cleanup; with the record kept as a flush-only ring keeps it, each later due ring flushes again, exactly one ring per due time; once the second message leaves `queued` the cleanup CR goes and drops the record.
+- **Does not assert:** the daemon's `Flushed` arm keeping the record (the test sets it, as that arm does; `inbox/codex/017`), or what the screen shows.
+- **Platform coverage:** mac+linux+windows.
+
 #### inbox/status
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
@@ -7812,11 +7819,11 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** that screen text proves who wrote it — a process drawing the deck's exact line still earns the CR (`docs/develop/agent-messaging.md`, "Doorbell guards").
 - **Cost:** none.
 
-##### inbox/codex/015 — No flush goes once the message has left `queued`.
+##### inbox/codex/015 — No flush goes once the cleanup CR has dropped the record.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
 - **Agent:** the `inbox/codex/013` stand-in, its screen repainted by the test.
-- **Asserts:** after the deck's flush submitted its stranded line and the composer shows that line again, fetching the message brings exactly its one cleanup CR and then no byte while the line stays painted; a second message queued under that line, which the deck has no record of, gets no byte until an empty composer takes its ring.
-- **Does not assert:** how the line got back into a real Codex composer; the repaint stands in for retained or retyped text. Repeated flushes while the message is still `queued` are allowed, one per ring (`inbox/codex/017`).
+- **Asserts:** after the deck's flush submitted its stranded line and the composer shows that line again, fetching the lone message, with no ring due, brings exactly its one cleanup CR and then no byte while the line stays painted; a second message queued under that line, which the deck has no record of, gets no byte until an empty composer takes its ring.
+- **Does not assert:** how the line got back into a real Codex composer; the repaint stands in for retained or retyped text. That the record ends when its message leaves `queued`: when a ring for other queued work is due then, it goes in place of the cleanup and the record survives it (`inbox/doorbell/018`). Repeated flushes while the record lasts are allowed, one per due ring (`inbox/codex/017`).
 - **Cost:** none.
 
 ##### inbox/codex/016 — A doorbell line whose Enter became a newline in Codex's composer is submitted by the next ring.

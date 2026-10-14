@@ -46,12 +46,22 @@
 //! into the pane ([`Bell::unsubmitted`]), with the agent's cursor where an
 //! Enter that was not taken leaves it; it then goes alone. A ring that only
 //! flushed keeps that line recorded, so if the agent swallowed the CR too,
-//! the next ring flushes again: at most one lone CR per due ring while the
-//! deck's own line stays stranded and its message stays `queued`. That is a
-//! match on what the screen shows, not
+//! the next ring flushes again. The record lasts until the cleanup CR goes or
+//! a ring types a new line, which can be after the message it names has left
+//! `queued`: while other work is queued, a ring due for that work is sent in
+//! place of the owed cleanup, and if it only flushes it keeps the record. So
+//! while a frame matching the recorded line stays on screen and a message
+//! stays `queued`, each due ring the guards admit sends one lone CR, with no
+//! fixed total. That is deliberate: the flushed line runs `inbox fetch`,
+//! which serves whatever is queued, and dropping the record would leave that
+//! work behind a stranded line the deck sends no byte to. A flush that Codex
+//! also takes as a newline leaves the line above two blank composer rows with
+//! the cursor on the second, which the recogniser does not match, so the
+//! flushing stops there; that holds for that rendered layout, not for every
+//! way a renderer might draw it. The match is on what the screen shows, not
 //! proof of where it came from: anything that can draw the pane can draw that
-//! line and earn the CR
-//! ([`crate::agent_registry::codex_composer_holds_doorbell_line`]).
+//! line and earn the CR, each time, and it goes to whatever then owns the
+//! pane's input ([`crate::agent_registry::codex_composer_holds_doorbell_line`]).
 //!
 //! [`decide`] is the pure policy; [`spawn`] runs it against the daemon.
 
@@ -200,7 +210,10 @@ pub struct Bell {
     /// still owed (an outstanding ring or a cleanup). A ring that only
     /// flushed it keeps it, since that CR may have been swallowed too; the
     /// cleanup CR ([`Self::cleaned`]) and a ring that types a new line
-    /// replace it. A gated composer showing anything else gets no byte
+    /// replace it. Its message leaving `queued` does not: a ring due for
+    /// other queued work goes in place of the owed cleanup, and if it only
+    /// flushes, the record outlives that message (`inbox/doorbell/018`). A
+    /// gated composer showing anything else gets no byte
     /// ([`AgentPtyRegistry::write_doorbell`]).
     pub unsubmitted: Option<String>,
 }
@@ -617,6 +630,53 @@ mod tests {
         bell.unsubmitted = Some(line);
         bell.rang(now, &["m2".to_string()]);
         assert_eq!(bell.unsubmitted, None, "a new ring replaces the record");
+    }
+
+    /// Scenario: Ring for two messages and record the line naming the first,
+    /// then fetch the first just as a ring for the second is due. That ring
+    /// goes in place of the owed cleanup, with its flushing CR; a ring that
+    /// only flushed keeps the first line recorded, and each later due ring
+    /// flushes again, one CR per ring, until the second message leaves
+    /// `queued` and the cleanup CR drops the record.
+    #[spec("inbox/doorbell/018")]
+    #[test]
+    fn doorbell_018_a_ring_for_other_queued_work_keeps_the_record_past_its_message() {
+        let config = DoorbellConfig {
+            schedule: vec![Duration::from_secs(1)],
+            ..DoorbellConfig::default()
+        };
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let first = doorbell_line("m1");
+        let mut bell = Bell::default();
+        assert_eq!(
+            step(&mut bell, &facts(&["m1", "m2"]), &config, t0),
+            ring("m1", false)
+        );
+        bell.unsubmitted = Some(first.clone());
+        let rest = facts(&["m2"]);
+        for due in [1000, 2000, 3000] {
+            bell.observe(&rest);
+            assert_eq!(
+                decide(&bell, &rest, &config, at(due)),
+                ring("m2", true),
+                "a due ring for the remaining work flushes first, in place of the cleanup"
+            );
+            // The daemon's `DoorbellWrite::Flushed` arm: a ring that only
+            // flushed keeps the line it found.
+            bell.rang(at(due), &rest.inbox.queued);
+            bell.unsubmitted = Some(first.clone());
+            assert!(!bell.cleanup_owed, "the ring took the cleanup's place");
+            assert_eq!(
+                decide(&bell, &rest, &config, at(due + 1)),
+                Action::Nothing,
+                "one CR per due ring"
+            );
+        }
+        let empty = facts(&[]);
+        assert_eq!(step(&mut bell, &empty, &config, at(3001)), Action::Cleanup);
+        assert_eq!(bell.unsubmitted, None, "the cleanup CR drops the record");
+        assert_eq!(step(&mut bell, &empty, &config, at(9000)), Action::Nothing);
     }
 
     /// Scenario: Parse the doorbell's environment overrides, including bad

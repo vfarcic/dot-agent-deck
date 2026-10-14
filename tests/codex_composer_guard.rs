@@ -253,3 +253,51 @@ fn codex_line_then_newline_state_from_the_live_frame_is_recognised() {
         "a line naming another message must still hold"
     );
 }
+
+/// Scenario: Show the deck's own line after Codex took two Enters as newlines: the line above two blank composer rows with the cursor on the second, at the composer indent, both in Codex's measured live frame and in the composer fixture with or without a warning footer. That screen must not be recognised, so a flush that became a second newline is not followed by another.
+#[test]
+fn codex_line_then_two_newlines_is_not_recognised() {
+    let ours = " dot-agent-deck: message m-bztvmdjd-905c176602c7c2cd waiting, run: dot-agent-deck inbox fetch";
+    let (live, cursor) = visible_rows_and_cursor(LINE_THEN_NEWLINE_FRAME.as_bytes(), 40, 140)
+        .expect("the frame parses");
+    assert!(
+        codex_composer_holds_doorbell_line(&live, cursor, ours),
+        "control: the line-then-newline frame is recognised"
+    );
+    assert!(
+        live[cursor.row + 1].is_empty() && !live[cursor.row + 2].is_empty(),
+        "the measured frame has a second blank row above its model line: {live:#?}"
+    );
+    let second = at(cursor.row + 1, 0, CODEX_COMPOSER_INDENT);
+    assert!(
+        !codex_composer_holds_doorbell_line(&live, second, ours),
+        "the cursor on the second blank composer row must hold: {live:#?}"
+    );
+    let placeholder = include_str!("fixtures/codex-inbox/composer.txt");
+    for footer in ["⚠ 1 warning · f2 to view", ""] {
+        let screen = rows(
+            &placeholder
+                .replace("Ask Codex to do anything", &format!("{ours}\n"))
+                .replace("? for shortcuts", footer),
+        );
+        let last = composer_last_row(&screen);
+        assert!(
+            codex_composer_holds_doorbell_line(&screen, cursor_below_composer(&screen), ours),
+            "control: the cursor on the first blank row is recognised (footer {footer:?})"
+        );
+        assert!(
+            screen[last + 1].is_empty()
+                && screen[last + 2].is_empty()
+                && screen[last + 3..].iter().any(|row| !row.is_empty()),
+            "two blank composer rows, then text below: {screen:#?}"
+        );
+        assert!(
+            !codex_composer_holds_doorbell_line(
+                &screen,
+                at(last + 2, 0, CODEX_COMPOSER_INDENT),
+                ours
+            ),
+            "the line above two blank rows, cursor on the second, must hold (footer {footer:?})"
+        );
+    }
+}

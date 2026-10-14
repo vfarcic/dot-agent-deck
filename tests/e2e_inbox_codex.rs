@@ -446,10 +446,10 @@ fn codex_014_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
     );
 }
 
-/// Scenario: Start wrapped synthetic Codex that drops the first Enter after text, queue a task, and let the next ring flush the stranded line. Then repaint the composer holding that same line and fetch the message so it leaves `queued`: the owed cleanup is the one carriage return that goes, and after it the still-painted line gets zero bytes. A second message queued under that line, which the deck never typed there, gets nothing either until the composer is empty again.
+/// Scenario: Start wrapped synthetic Codex that drops the first Enter after text, queue a task, and let the next ring flush the stranded line. Then repaint the composer holding that same line and fetch the message so it leaves `queued` while no ring is due: the owed cleanup is the one carriage return that goes, and after it the still-painted line gets zero bytes. A second message queued under that line, which the deck never typed there, gets nothing either until the composer is empty again.
 #[spec("inbox/codex/015")]
 #[test]
-fn codex_015_no_flush_once_the_message_has_left_queued() {
+fn codex_015_no_flush_once_the_cleanup_cr_dropped_the_record() {
     let codex = Codex::new_with(
         COMPOSER,
         &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400,60000")],
