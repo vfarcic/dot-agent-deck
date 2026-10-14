@@ -1520,12 +1520,15 @@ fn write_recorder(path: &std::path::Path, log: &std::path::Path) {
         .expect("chmod recorder worker stand-in");
 }
 
-/// The recorder's per-invocation blocks, minus the agent id (which is expected
-/// to differ — it is the whole point of a respawn).
+/// The recorder's completed per-invocation blocks, minus the agent id (which
+/// is expected to differ — it is the whole point of a respawn).
 fn recorded_launches(log: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(log)
         .unwrap_or_default()
-        .split("---\n")
+        .split_inclusive("---\n")
+        // The shell appends each line separately. Until its terminal marker is
+        // visible, the existing wait loops must treat that launch as pending.
+        .filter_map(|block| block.strip_suffix("---\n"))
         .map(str::trim)
         .filter(|block| !block.is_empty())
         .map(str::to_string)
