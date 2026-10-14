@@ -1049,12 +1049,39 @@ export function inboxIdsToAck(message: unknown): string[] {
 export const WATCHER_NOT_IN_DECK_EXIT = 3;
 
 /**
- * How long a deck message handed to Pi may stay uncommitted, while Pi sits idle
- * with nothing queued, before the extension takes it as refused and hands it
- * over again. Pi reports a refused `sendUserMessage` itself, never to the
- * caller, so this is how a refusal with no run after it is noticed.
+ * How long a hand-over of deck messages may go unseen by this extension's
+ * `input` hook, while Pi sits idle with nothing queued, before the extension
+ * takes it as refused and hands the messages over again. Pi reports a refused
+ * `sendUserMessage` itself, never to the caller. A hand-over the hook has seen
+ * is never retried on a timer: see {@link tagHandOver}.
  */
 export const INBOX_ADMISSION_RECHECK_MS = 30000;
+
+/** The opening of the line naming a hand-over (see {@link tagHandOver}). */
+export const HAND_OVER_TAG_PREFIX = "[dot-agent-deck hand-over ";
+
+/**
+ * PRD #1666: `text` with a first line naming hand-over `attempt`, so the
+ * extension's `input` hook can tell its hand-overs apart: it consumes one a
+ * retry replaced before Pi takes it any further, and removes the line from the
+ * one it lets through, so the model never sees it.
+ */
+export function tagHandOver(attempt: string, text: string): string {
+	return `${HAND_OVER_TAG_PREFIX}${attempt}]\n${text}`;
+}
+
+/** The attempt a hand-over's text names and the text without that line, or `undefined` when it names none. */
+export function untagHandOver(text: unknown): { attempt: string; text: string } | undefined {
+	if (typeof text !== "string" || !text.startsWith(HAND_OVER_TAG_PREFIX)) {
+		return undefined;
+	}
+	const end = text.indexOf("]\n", HAND_OVER_TAG_PREFIX.length);
+	const attempt = end < 0 ? "" : text.slice(HAND_OVER_TAG_PREFIX.length, end);
+	if (!/^[0-9a-z]+\.[0-9]+$/.test(attempt)) {
+		return undefined;
+	}
+	return { attempt, text: text.slice(end + 2) };
+}
 
 /** The first respawn delay after a watcher exits unexpectedly, and the longest. */
 export const WATCHER_BACKOFF_MIN_MS = 1000;

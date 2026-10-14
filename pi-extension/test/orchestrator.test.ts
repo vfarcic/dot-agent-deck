@@ -18,6 +18,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { describe, test } from "node:test";
 import {
+	tagHandOver,
+	untagHandOver,
 	watcherBackoffOverride,
 	WATCHER_BACKOFF_ENV,
 	WATCHER_BACKOFF_OVERRIDE_MAX_MS,
@@ -1001,6 +1003,16 @@ describe("watcherBackoffOverride (PRD #1666)", () => {
 		assert.equal(read(String(WATCHER_BACKOFF_OVERRIDE_MAX_MS)), WATCHER_BACKOFF_OVERRIDE_MAX_MS);
 		for (const bad of [undefined, "", "0", "-5", "1.5", "1e3", "soon", String(WATCHER_BACKOFF_OVERRIDE_MAX_MS + 1)]) {
 			assert.equal(read(bad), undefined, `${bad} must leave the default backoff`);
+		}
+	});
+});
+
+describe("hand-over attempt line (PRD #1666)", () => {
+	test("names the attempt on a first line that comes off whole, and nothing else reads as one", () => {
+		const text = "[dot-agent-deck message m-1 from the orchestrator]\nWork.\n[end of dot-agent-deck message m-1]";
+		assert.deepEqual(untagHandOver(tagHandOver("k3x9.12", text)), { attempt: "k3x9.12", text });
+		for (const plain of [text, "[dot-agent-deck hand-over k3x9.12] no newline", "[dot-agent-deck hand-over not an attempt]\nx", "[dot-agent-deck hand-over k3x9]\nx", undefined, 7]) {
+			assert.equal(untagHandOver(plain), undefined, `${String(plain)} names no attempt`);
 		}
 	});
 });

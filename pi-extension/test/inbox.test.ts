@@ -220,23 +220,45 @@ test("pi_inbox_008_watcher_backoff_env_fixes_every_respawn_delay", async (t) => 
 });
 
 /**
- * Pi 0.84.4's prompt admission, as `AgentSession.prompt` runs it: a send checks
- * for a running agent only after the input hooks resolve, a send that finds one
- * waits as a follow-up, and one that finds none runs its remaining preflight
- * before the agent takes it. A second send still in that preflight when another
- * prompt starts is refused by the agent ("Agent is already processing a
- * prompt"), and Pi reports the refusal itself: `sendUserMessage` returns before
- * it, so the caller never sees it.
+ * Pi 0.84.4's prompt admission, as `AgentSession.prompt` runs it for an
+ * extension's `sendUserMessage`: `sendUserMessage` returns before any of it, so
+ * the caller never sees what happens next. The `input` hooks run first; a hook
+ * can consume the prompt (`handled`) or rewrite it (`transform`). A send that
+ * then finds a run going waits as a follow-up; one that finds none runs its
+ * remaining preflight (auth, compaction, the `before_agent_start` hooks) and
+ * hands the prompt to the agent. If another prompt started meanwhile, the agent
+ * refuses it ("Agent is already processing a prompt") and Pi emits
+ * `agent_settled` for the refused send while that other run is still going, so
+ * the context's `signal` is still set; a run that ends settles with none.
+ *
+ * `holdBeforeInput` and `holdAfterInput` stand for a slow stage on either side
+ * of this extension's `input` hook: another extension's hook ordered before
+ * it, or auth and compaction after it. `holdAfterStart` stands for another
+ * extension's `before_agent_start` hook ordered after this one's. `refuse` fails a send before `input`
+ * (compaction already running), and `dropAfterInput` loses one after it with
+ * no run (auth failing, or another extension consuming it).
  */
 function admission(f: ReturnType<typeof fixture>) {
 	let running = false;
+	const run = new AbortController();
 	const followUps: string[] = [];
 	const committed: string[] = [];
 	const rejected: string[] = [];
+	const dropped: string[] = [];
 	let refuseNext = 0;
+	let dropNext = 0;
 	const tick = () => new Promise<void>(resolve => setImmediate(resolve));
-	// Pi does not wait for the extension's card report before carrying on, and
-	// the report's CLI is this file's mocked child, which never exits.
+	// Pi awaits the `input` and `before_agent_start` hooks, and this extension's
+	// hooks await their card report; a report the CLI is spawned for (a turn's
+	// reply on stdin) must therefore finish, as the real CLI does.
+	const spawnChild = childProcess.spawn;
+	mock.method(childProcess, "spawn", (bin: string, argv: string[], options: any) => {
+		const child = (spawnChild as any)(bin, argv, options) as Watcher;
+		if (!(argv.includes("inbox") && argv.includes("wait"))) setImmediate(() => child.emit("close", 0, null));
+		return child;
+	});
+	syncBuiltinESMExports();
+	// The events Pi does not wait on are fired without awaiting the handler.
 	const fire = (name: string, event: any = {}) => { void f.handlers.get(name)?.(event, f.ctx); };
 	const commit = async (text: string) => {
 		committed.push(text);
@@ -244,17 +266,41 @@ function admission(f: ReturnType<typeof fixture>) {
 		await tick();
 	};
 	const start = async (text: string) => { running = true; fire("agent_start"); await commit(text); };
+	/** A slow stage: each send waits at it until the test lets it through, first come first served. */
+	const gate = () => {
+		let open = true;
+		const waiting: (() => void)[] = [];
+		return {
+			pass: () => (open ? Promise.resolve() : new Promise<void>(resolve => waiting.push(resolve))),
+			close: () => { open = false; },
+			releaseOne: () => { waiting.shift()?.(); },
+			releaseAll: () => { open = true; while (waiting.length) waiting.shift()!(); },
+			get waiting() { return waiting.length; },
+		};
+	};
+	const beforeInput = gate();
+	const afterInput = gate();
+	const afterStart = gate();
 	f.ctx.isIdle = () => !running;
 	(f.ctx as any).hasPendingMessages = () => followUps.length > 0;
+	Object.defineProperty(f.ctx, "signal", { configurable: true, get: () => (running ? run.signal : undefined) });
 	f.pi.sendUserMessage = (text: string, options: any) => {
 		f.sent.push({ text, options });
 		void (async () => {
 			await tick();
 			if (refuseNext > 0) { refuseNext--; rejected.push(text); return; }
-			if (running) { followUps.push(text); return; }
+			await beforeInput.pass();
+			const hook = (await f.handlers.get("input")?.({ text, source: "extension", streamingBehavior: running ? options?.deliverAs : undefined }, f.ctx)) as { action?: string; text?: string } | undefined;
+			if (hook?.action === "handled") { dropped.push(text); return; }
+			const prompt = hook?.action === "transform" ? hook.text! : text;
+			if (dropNext > 0) { dropNext--; rejected.push(prompt); return; }
+			if (running) { followUps.push(prompt); return; }
 			await tick();
-			if (running) { rejected.push(text); return; }
-			await start(text);
+			await afterInput.pass();
+			await f.handlers.get("before_agent_start")?.({ prompt }, f.ctx);
+			await afterStart.pass();
+			if (running) { rejected.push(prompt); fire("agent_settled"); await tick(); return; }
+			await start(prompt);
 		})();
 		return undefined;
 	};
@@ -266,10 +312,14 @@ function admission(f: ReturnType<typeof fixture>) {
 	};
 	const quiesce = async () => { for (let i = 0; i < 8; i++) await tick(); };
 	return {
-		committed, rejected, tick, settle, quiesce,
+		committed, rejected, dropped, tick, settle, quiesce,
 		foreign: (text: string) => start(text),
 		shutdown: () => fire("session_shutdown"),
 		refuse: (n: number) => { refuseNext = n; },
+		dropAfterInput: (n: number) => { dropNext = n; },
+		holdBeforeInput: () => { beforeInput.close(); return beforeInput; },
+		holdAfterInput: () => { afterInput.close(); return afterInput; },
+		holdAfterStart: () => { afterStart.close(); return afterStart; },
 		get running() { return running; },
 	};
 }
@@ -339,4 +389,196 @@ test("pi_inbox_011_refused_send_with_no_run_is_retried_after_the_recheck_interva
 	assert.equal(commitsOf(pi.committed, id), 1);
 	assert.deepEqual(acksOf(child), [id]);
 	pi.shutdown();
+});
+
+/// Scenario: Another extension's input hook holds an inbox message for longer than the admission recheck while Pi sits idle, so the extension hands it over again; the first hand-over then gets through, its turn ends, and the second follows. Pi must run the message once: the hand-over the retry replaced is consumed at the extension's input hook.
+test("pi_inbox_012_a_hand_over_slow_before_input_is_replaced_not_run_twice", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [id] = idsN(1);
+	const slow = pi.holdBeforeInput();
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	t.mock.timers.tick(INBOX_ADMISSION_RECHECK_MS);
+	await pi.quiesce();
+	assert.equal(f.sent.length, 2, "a hand-over that never reached input is handed over again at the recheck");
+	slow.releaseOne();
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	slow.releaseAll();
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1, "Pi runs the message once");
+	assert.equal(pi.dropped.length, 1, "the replaced hand-over is consumed at input");
+	assert.deepEqual(acksOf(child), [id]);
+	pi.shutdown();
+});
+
+/// Scenario: An inbox message passes the extension's input hook and then waits in Pi's own preflight (auth, compaction) for longer than the admission recheck while Pi looks idle; its turn then runs and ends. The extension must not hand the message over again on a timer, so Pi runs it once.
+test("pi_inbox_013_a_hand_over_slow_after_input_is_never_retried_on_a_timer", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [id] = idsN(1);
+	const slow = pi.holdAfterInput();
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	t.mock.timers.tick(INBOX_ADMISSION_RECHECK_MS * 3);
+	await pi.quiesce();
+	assert.equal(f.sent.length, 1, "a hand-over Pi's input hook has seen is not handed over again on a timer");
+	slow.releaseOne();
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	slow.releaseAll();
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1, "Pi runs the message once");
+	assert.deepEqual(acksOf(child), [id]);
+	pi.shutdown();
+});
+
+/// Scenario: An inbox message passes the extension's input hook and waits in Pi's preflight while a prompt the user typed runs and finishes. That run settling is not a refusal of the waiting message: it is not handed over again, and Pi runs it once when its preflight ends.
+test("pi_inbox_014_a_run_settling_during_preflight_is_not_taken_as_a_refusal", async () => {
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [id] = idsN(1);
+	const slow = pi.holdAfterInput();
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	await pi.foreign("a prompt the user typed");
+	await pi.quiesce();
+	await pi.settle();
+	await pi.quiesce();
+	slow.releaseOne();
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	slow.releaseAll();
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(f.sent.length, 1, "nothing refused it, so it is handed over once");
+	assert.equal(commitsOf(pi.committed, id), 1, "Pi runs the message once");
+	assert.deepEqual(acksOf(child), [id]);
+	pi.shutdown();
+});
+
+/// Scenario: An inbox message passes the extension's input hook while Pi is idle and is then lost with no run (auth failing, or another extension consuming it). Nothing hands it over again on a timer; when the deck hands the unacknowledged message over again, the extension lets it through and Pi runs it once.
+test("pi_inbox_015_a_hand_over_lost_after_input_waits_for_the_decks_redelivery", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [id] = idsN(1);
+	pi.dropAfterInput(1);
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	assert.equal(pi.rejected.length, 1, "the fixture must lose the hand-over after input");
+	t.mock.timers.tick(INBOX_ADMISSION_RECHECK_MS * 3);
+	await pi.quiesce();
+	assert.equal(f.sent.length, 1, "no timer retry for a hand-over Pi's input hook has seen");
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	assert.equal(f.sent.length, 2, "the deck's redelivery of the unacknowledged message is let through");
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1);
+	assert.deepEqual(acksOf(child), [id]);
+	pi.shutdown();
+});
+
+/// Scenario: While Pi is busy an inbox message waits in Pi's follow-up queue, and the deck hands the still-unacknowledged message over again. The extension keeps the queued hand-over and ignores the redelivery, so Pi runs the message once when the turn ends.
+test("pi_inbox_016_a_redelivery_while_the_hand_over_is_queued_in_pi_is_ignored", async () => {
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [id] = idsN(1);
+	await pi.foreign("a prompt the user typed");
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	assert.equal(f.sent.length, 1, "a hand-over waiting in Pi's queue is not handed over again");
+	await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1);
+	assert.deepEqual(acksOf(child), [id]);
+	pi.shutdown();
+});
+
+/// Scenario: A hand-over whose deck message Pi already committed reaches the extension's input hook again. The hook consumes it, so the model never sees the message twice.
+test("pi_inbox_017_a_hand_over_of_a_committed_message_is_consumed_at_input", async () => {
+	const f = fixture();
+	await f.emit("session_start"); const child = f.watcher();
+	f.deliver(child);
+	assert.equal(f.sent.length, 1);
+	const handed = f.sent[0].text;
+	const first = await f.handlers.get("input")!({ text: handed, source: "extension" }, f.ctx) as { action?: string; text?: string } | undefined;
+	const prompt = first?.action === "transform" ? first.text! : handed;
+	assert.ok(prompt.includes(BLOCK));
+	await f.emit("message_start", { message: { role: "user", content: [{ type: "text", text: prompt }] } });
+	assert.deepEqual(acksOf(child), [ID]);
+	const again = await f.handlers.get("input")!({ text: handed, source: "extension" }, f.ctx) as { action?: string } | undefined;
+	assert.equal(again?.action, "handled", "a hand-over of a committed message must not reach the model");
+	await f.emit("session_shutdown");
+});
+
+/// Scenario: Pi refuses an inbox message before its input hook while the extension cannot ask Pi whether it is idle or has anything queued. An unanswerable Pi is never taken as idle with nothing queued, so the admission recheck does not hand the message over again.
+test("pi_inbox_018_an_unanswerable_pi_never_triggers_the_recheck_retry", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	for (const broken of ["isIdle", "hasPendingMessages"] as const) {
+		const f = fixture(); const pi = admission(f);
+		await f.emit("session_start"); const child = f.watcher();
+		const [id] = idsN(1);
+		pi.refuse(1);
+		child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+		await pi.quiesce();
+		(f.ctx as any)[broken] = () => { throw new Error("This extension ctx is stale"); };
+		t.mock.timers.tick(INBOX_ADMISSION_RECHECK_MS * 3);
+		await pi.quiesce();
+		assert.equal(f.sent.length, 1, `${broken} throwing must not count as an answer`);
+		pi.shutdown();
+	}
+});
+
+/// Scenario: An inbox message passes this extension's before_agent_start hook and then waits in another extension's slow before_agent_start hook while a prompt the user typed runs and finishes. A run ending is not a refusal, so the message is not handed over again, and Pi runs it once.
+test("pi_inbox_019_a_run_ending_after_before_agent_start_is_not_taken_as_a_refusal", async () => {
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const child = f.watcher();
+	const [id] = idsN(1);
+	const slow = pi.holdAfterStart();
+	child.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	await pi.foreign("a prompt the user typed");
+	await pi.quiesce();
+	await pi.settle();
+	await pi.quiesce();
+	slow.releaseAll();
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(f.sent.length, 1, "nothing refused it, so it is handed over once");
+	assert.equal(commitsOf(pi.committed, id), 1, "Pi runs the message once");
+	assert.deepEqual(acksOf(child), [id]);
+	pi.shutdown();
+});
+
+/// Scenario: Pi runs the extension's input hook before sendUserMessage returns, as it does when this extension's hook is the first one Pi calls. The hand-over is already on record, so the hook lets it through without the line naming it rather than consuming it.
+test("pi_inbox_020_an_input_hook_run_inside_send_user_message_lets_the_hand_over_through", async () => {
+	const f = fixture();
+	const results: Promise<unknown>[] = [];
+	f.pi.sendUserMessage = (text: string, options: any) => {
+		f.sent.push({ text, options });
+		results.push(Promise.resolve(f.handlers.get("input")!({ text, source: "extension" }, f.ctx)));
+		return undefined;
+	};
+	await f.emit("session_start"); const child = f.watcher();
+	f.deliver(child);
+	const result = await results[0] as { action?: string; text?: string } | undefined;
+	assert.equal(result?.action, "transform", "the hand-over goes on, not consumed");
+	assert.ok(result?.text?.includes(BLOCK) && !result.text.includes("hand-over"), "without the line naming it");
+	await f.emit("session_shutdown");
 });

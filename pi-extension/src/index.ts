@@ -39,6 +39,7 @@ import {
 	doorbellIdsIn,
 	execFailureMessage,
 	execWithStdin,
+	inboxIdsIn,
 	inboxIdsToAck,
 	INBOX_ADMISSION_RECHECK_MS,
 	type InboxMessage,
@@ -49,6 +50,8 @@ import {
 	piEventReport,
 	resolveDeckBin,
 	spawnFailureMessage,
+	tagHandOver,
+	untagHandOver,
 	WATCHER_BACKOFF_MIN_MS,
 	WATCHER_NOT_IN_DECK_EXIT,
 	watcherBackoffOverride,
@@ -146,6 +149,27 @@ function stopWatcher(child: WatcherChild | undefined): void {
 
 /** How many doorbell-fetched ids an instance remembers until Pi commits them. */
 const MAX_DOORBELL_IDS = 256;
+/** How many committed message ids an instance remembers, to consume a late hand-over of one. */
+const MAX_COMMITTED_IDS = 256;
+
+/** One hand-over of deck messages to Pi, from `sendUserMessage` until Pi commits it or another replaces it. */
+interface HandOver {
+	/** Names this hand-over on the first line of the text Pi's `input` hooks see. */
+	attempt: string;
+	messages: InboxMessage[];
+	/** The text Pi goes on with once this extension's `input` hook removed that line. */
+	text: string;
+	/** Runs Pi had started when it was handed over. */
+	run: number;
+	/**
+	 * How far Pi has taken it, as far as this extension can see: `handed` until
+	 * its `input` hook sees it, `input` after that, and `start` once its
+	 * `before_agent_start` hook has seen it.
+	 */
+	stage: "handed" | "input" | "start";
+	/** At `start`: a run settled while another one was active, the way Pi settles a prompt it refused. */
+	suspect: boolean;
+}
 
 /**
  * One extension instance's inbox: the watcher it runs for its session, the
@@ -165,11 +189,19 @@ const MAX_DOORBELL_IDS = 256;
  *   reporting the refusal itself, never to the caller. So while Pi is idle at
  *   most one hand-over is in flight, and later messages wait until it commits;
  *   while Pi is busy each one waits as a follow-up, which Pi queues safely.
- * - A hand-over that never commits was refused. One sent before the latest run
- *   started is handed over again once that run settles with nothing queued,
- *   and one with no run after it once Pi stays idle with nothing queued for
- *   `INBOX_ADMISSION_RECHECK_MS`. A message is acknowledged only on its commit,
- *   so a refusal never loses it, and only one hand-over of it can commit.
+ * - Each hand-over names its attempt on a first line that this extension's
+ *   `input` hook removes. The hook consumes a hand-over another one replaced,
+ *   and one whose messages Pi already committed, so neither reaches the model.
+ * - A hand-over the `input` hook has not seen can be handed over again safely:
+ *   once Pi starts a run after it and settles with nothing queued, or once Pi
+ *   stays idle with nothing queued for `INBOX_ADMISSION_RECHECK_MS`.
+ * - A hand-over the hook has seen is past that guard, so it is handed over
+ *   again only on a sign that Pi refused it: Pi settles a refused prompt while
+ *   the run that beat it is still active, which a run's own end never does. So
+ *   after `before_agent_start` saw it, a settle during an active run and then
+ *   a settle with no run, with no commit of it between, is that sign. Without
+ *   one it waits for the deck, which hands an unacknowledged message over
+ *   again: that redelivery replaces it once Pi has nothing queued.
  */
 function createPiInbox(pi: ExtensionAPI) {
 	let active = false;
@@ -177,14 +209,18 @@ function createPiInbox(pi: ExtensionAPI) {
 	let watcher: WatcherChild | undefined;
 	let respawn: ReturnType<typeof setTimeout> | undefined;
 	const fromDoorbell = new Set<string>();
+	const committedIds = new Set<string>();
 	/** The latest context Pi handed this instance, to ask whether it is idle. */
 	let context: ExtensionContext | undefined;
 	/** Runs Pi started in this session (`agent_start`), to date each hand-over. */
 	let runs = 0;
-	/** Handed to Pi and not yet committed, in the order they were handed over. */
-	let outstanding: { messages: InboxMessage[]; run: number }[] = [];
-	/** The hand-over made while Pi was idle, until it commits or is taken as refused. */
-	let admitting: { messages: InboxMessage[]; run: number } | undefined;
+	/** Names this instance's hand-overs apart from any other instance's. */
+	const instance = Math.random().toString(36).slice(2, 10) || "0";
+	let attempts = 0;
+	/** Handed to Pi and not yet committed or replaced, in the order they were handed over. */
+	let outstanding: HandOver[] = [];
+	/** The hand-over made while Pi was idle, until it commits or is replaced. */
+	let admitting: HandOver | undefined;
 	/** Waiting for `admitting` to settle, in inbox order. */
 	let held: InboxMessage[][] = [];
 	let recheck: ReturnType<typeof setTimeout> | undefined;
@@ -192,23 +228,34 @@ function createPiInbox(pi: ExtensionAPI) {
 	const current = () => active && generation === inboxShared().generation;
 
 	/** Pi is idle, as far as it can be asked; an unanswerable Pi counts as idle, which only holds messages back. */
-	const piIdle = (): boolean => {
+	const piIdle = (): boolean => askIdle() ?? true;
+	/** Pi's answers, or `undefined` when it cannot be asked: never taken as a reason to hand anything over again. */
+	const askIdle = (): boolean | undefined => {
 		try {
-			return context?.isIdle() ?? true;
+			return context?.isIdle();
 		} catch {
-			return true;
+			return undefined;
 		}
 	};
-	const piHasQueued = (): boolean => {
+	const askQueued = (): boolean | undefined => {
 		try {
-			return context?.hasPendingMessages?.() ?? false;
+			return context?.hasPendingMessages?.();
 		} catch {
-			return false;
+			return undefined;
+		}
+	};
+	/** An agent run is active: Pi's `signal` is set only while one is. */
+	const askRunning = (ctx: ExtensionContext): boolean | undefined => {
+		try {
+			return ctx.signal !== undefined;
+		} catch {
+			return undefined;
 		}
 	};
 
-	const isInFlight = (id: string): boolean =>
-		outstanding.some((o) => o.messages.some((m) => m.id === id)) || held.some((batch) => batch.some((m) => m.id === id));
+	const isHeld = (id: string): boolean => held.some((batch) => batch.some((m) => m.id === id));
+	const carrying = (id: string): HandOver | undefined => outstanding.find((o) => o.messages.some((m) => m.id === id));
+	const unseen = (): HandOver[] => outstanding.filter((o) => o.stage === "handed");
 
 	const clearRecheck = (): void => {
 		if (recheck !== undefined) {
@@ -217,20 +264,20 @@ function createPiInbox(pi: ExtensionAPI) {
 		}
 	};
 
-	/** (Re)start the idle recheck: armed from the latest hand-over while any is uncommitted. */
+	/** (Re)start the idle recheck: armed from the latest hand-over while one the `input` hook has not seen remains. */
 	const armRecheck = (): void => {
 		clearRecheck();
-		if (!current() || outstanding.length === 0) {
+		if (!current() || unseen().length === 0) {
 			return;
 		}
 		recheck = setTimeout(() => {
 			recheck = undefined;
 			try {
-				if (!current() || outstanding.length === 0) {
+				if (!current() || unseen().length === 0) {
 					return;
 				}
-				if (piIdle() && !piHasQueued()) {
-					requeue(outstanding);
+				if (askIdle() === true && askQueued() === false) {
+					replace(unseen());
 				} else {
 					armRecheck();
 				}
@@ -248,14 +295,25 @@ function createPiInbox(pi: ExtensionAPI) {
 	/** Hand `messages` to Pi as one user message. False when Pi threw at once: nothing was handed over. */
 	const send = (messages: InboxMessage[]): boolean => {
 		const idle = piIdle();
+		attempts += 1;
+		const handed: HandOver = {
+			attempt: `${instance}.${attempts}`,
+			messages,
+			text: inboxUserText(messages),
+			run: runs,
+			stage: "handed",
+			suspect: false,
+		};
+		// Pi can run this extension's `input` hook before `sendUserMessage`
+		// returns, so the hand-over is on record first.
+		outstanding.push(handed);
 		try {
-			pi.sendUserMessage(inboxUserText(messages), { deliverAs: "followUp" });
+			pi.sendUserMessage(tagHandOver(handed.attempt, handed.text), { deliverAs: "followUp" });
 		} catch {
+			outstanding = outstanding.filter((o) => o !== handed);
 			return false;
 		}
-		const handed = { messages, run: runs };
-		outstanding.push(handed);
-		if (idle) {
+		if (idle && outstanding.includes(handed)) {
 			admitting = handed;
 		}
 		armRecheck();
@@ -270,26 +328,45 @@ function createPiInbox(pi: ExtensionAPI) {
 		}
 	};
 
-	/** These hand-overs were refused: hand their messages over again, ahead of anything held. */
-	const requeue = (refused: { messages: InboxMessage[]; run: number }[]): void => {
-		if (refused.length === 0) {
+	/**
+	 * These hand-overs will not commit: hand their messages over again, ahead
+	 * of anything held. Each one is forgotten, so its own late arrival at the
+	 * `input` hook is consumed there.
+	 */
+	const replace = (stale: HandOver[]): void => {
+		if (stale.length === 0) {
 			return;
 		}
-		outstanding = outstanding.filter((o) => !refused.includes(o));
-		if (admitting !== undefined && refused.includes(admitting)) {
+		outstanding = outstanding.filter((o) => !stale.includes(o));
+		if (admitting !== undefined && stale.includes(admitting)) {
 			admitting = undefined;
 		}
-		held = [...refused.map((o) => o.messages), ...held];
+		held = [...stale.map((o) => o.messages), ...held];
 		armRecheck();
 		flush();
 	};
 
 	/**
-	 * Give `messages` to Pi, once each: an id already handed over and not yet
-	 * committed is not handed over again. False only when Pi threw at once.
+	 * Give `messages` to Pi, once each. A message already held, or carried by
+	 * a hand-over that may still commit, is not handed over again. One the deck
+	 * hands over again while its hand-over is past the `input` hook and Pi has
+	 * nothing queued replaces that hand-over. False only when Pi threw at once.
 	 */
 	const deliver = (messages: InboxMessage[]): boolean => {
-		const fresh = messages.filter((m) => !isInFlight(m.id));
+		const fresh: InboxMessage[] = [];
+		const stale = new Set<HandOver>();
+		for (const m of messages) {
+			if (isHeld(m.id)) {
+				continue;
+			}
+			const handed = carrying(m.id);
+			if (handed === undefined) {
+				fresh.push(m);
+			} else if (handed.stage !== "handed" && askQueued() === false) {
+				stale.add(handed);
+			}
+		}
+		replace([...stale]);
 		if (fresh.length === 0) {
 			return true;
 		}
@@ -302,6 +379,12 @@ function createPiInbox(pi: ExtensionAPI) {
 
 	/** Pi committed these ids: their hand-overs are done, and a settled admission lets the held ones go. */
 	const settleCommitted = (ids: string[]): void => {
+		for (const id of ids) {
+			committedIds.add(id);
+			while (committedIds.size > MAX_COMMITTED_IDS) {
+				committedIds.delete(committedIds.values().next().value as string);
+			}
+		}
 		for (const o of outstanding) {
 			o.messages = o.messages.filter((m) => !ids.includes(m.id));
 		}
@@ -309,7 +392,7 @@ function createPiInbox(pi: ExtensionAPI) {
 		if (admitting !== undefined && admitting.messages.length === 0) {
 			admitting = undefined;
 		}
-		if (outstanding.length === 0) {
+		if (unseen().length === 0) {
 			clearRecheck();
 		}
 		flush();
@@ -488,17 +571,76 @@ function createPiInbox(pi: ExtensionAPI) {
 		},
 
 		/**
-		 * Pi's run settled. With nothing queued in Pi, a hand-over made before
-		 * the run started that has not committed was refused: hand it over again.
-		 * One made during the run may still be in Pi's preflight, so it is left
-		 * to the idle recheck.
+		 * One of this instance's hand-overs reached Pi's `input` hooks. A
+		 * hand-over that was replaced, or whose messages Pi already committed,
+		 * is consumed; any other one goes on without the line naming it.
+		 * `undefined` for an input that is not a hand-over.
+		 */
+		handOverInput(event: unknown): { action: "handled" } | { action: "transform"; text: string } | undefined {
+			const input = event as { text?: unknown; source?: unknown } | undefined;
+			if (input?.source !== "extension") {
+				return undefined;
+			}
+			const tagged = untagHandOver(input.text);
+			if (!tagged) {
+				return undefined;
+			}
+			const handed = current() ? outstanding.find((o) => o.attempt === tagged.attempt) : undefined;
+			if (handed === undefined) {
+				const ids = inboxIdsIn(tagged.text);
+				if (tagged.attempt.startsWith(`${instance}.`) || (ids.length > 0 && ids.every((id) => committedIds.has(id)))) {
+					return { action: "handled" };
+				}
+				return { action: "transform", text: tagged.text };
+			}
+			if (handed.stage === "handed") {
+				handed.stage = "input";
+				armRecheck();
+			}
+			return { action: "transform", text: tagged.text };
+		},
+
+		/** Pi's `before_agent_start` hooks reached `prompt`: a hand-over carrying it is about to run or be refused. */
+		starting(prompt: unknown): void {
+			if (!current()) {
+				return;
+			}
+			const handed = outstanding.find((o) => o.stage === "input" && o.text === prompt);
+			if (handed !== undefined) {
+				handed.stage = "start";
+				handed.suspect = false;
+			}
+		},
+
+		/**
+		 * Pi settled a run, or a prompt it refused. A refused prompt settles
+		 * while the run that beat it is still active; a run's own end settles
+		 * with none. A hand-over past `before_agent_start` that sees the first
+		 * and then the second without committing was refused. With nothing
+		 * queued, a hand-over the `input` hook never saw and that was made
+		 * before the latest run started is handed over again too.
 		 */
 		settled(ctx: ExtensionContext): void {
 			context = ctx;
-			if (!current() || piHasQueued()) {
+			if (!current()) {
 				return;
 			}
-			requeue(outstanding.filter((o) => o.run < runs));
+			const running = askRunning(ctx);
+			const refused: HandOver[] = [];
+			for (const o of outstanding) {
+				if (o.stage !== "start") {
+					continue;
+				}
+				if (running === true) {
+					o.suspect = true;
+				} else if (running === false && o.suspect) {
+					refused.push(o);
+				}
+			}
+			if (askQueued() === false) {
+				refused.push(...unseen().filter((o) => o.run < runs));
+			}
+			replace(refused);
 		},
 
 		/**
@@ -687,22 +829,33 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	pi.on(
 		"before_agent_start",
 		guarded(async (event, ctx) => {
-			await report("before_agent_start", event, ctx);
+			try {
+				await report("before_agent_start", event, ctx);
+			} finally {
+				// Once its own hook has run, a hand-over goes on to run or be refused.
+				inbox.starting(event.prompt);
+			}
 		}),
 	);
-	// PRD #1666: a submitted doorbell line is consumed here and its content
-	// handed over instead. Issue #1567: otherwise, a prompt submitted while Pi
-	// is busy is queued and never reaches `before_agent_start`;
-	// `piEventReport` reports exactly that `input` and ignores every other.
-	// Returns nothing then, so Pi carries on with the input unchanged.
+	// PRD #1666: the extension's own hand-over is consumed here when another
+	// replaced it, and otherwise goes on without the line naming it; a
+	// submitted doorbell line is consumed and its content handed over instead.
+	// Issue #1567: otherwise, a prompt submitted while Pi is busy is queued and
+	// never reaches `before_agent_start`; `piEventReport` reports exactly that
+	// `input` and ignores every other. Returns nothing then, so Pi carries on
+	// with the input unchanged.
 	pi.on(
 		"input",
 		guarded(async (event, ctx) => {
+			const handOver = inbox.handOverInput(event);
+			if (handOver?.action === "handled") {
+				return handOver;
+			}
 			if (await inbox.interceptDoorbell(event, ctx.signal)) {
 				return { action: "handled" as const };
 			}
-			await report("input", event, ctx);
-			return undefined;
+			await report("input", handOver ? { ...event, text: handOver.text } : event, ctx);
+			return handOver;
 		}),
 	);
 	// PRD #1666: the user message carrying a deck message has been committed
