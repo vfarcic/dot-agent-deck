@@ -3849,7 +3849,8 @@ fn admit_receiver_process(
 /// (measured on 2.1.299: `claude ── sh ── hook`), so its announcement and each
 /// of its waiters name a different shell; the agent above them is the one
 /// receiver. Without `root` there is nothing to bound the walk, so `claimed`
-/// stands, as it does where a process cannot be read.
+/// stands, as it does where a process cannot be read or the shells run deeper
+/// than the walk reads (`MAX_SHELLS`) without reaching one that is not a shell.
 fn receiver_instance(
     claimed: u32,
     root: Option<u32>,
@@ -3871,7 +3872,7 @@ fn receiver_instance(
             _ => return claimed,
         }
     }
-    current
+    claimed
 }
 
 /// Whether `exe` is a POSIX-style shell, by its file name.
@@ -8825,6 +8826,29 @@ mod hook_ingestion_tests {
             admit_receiver_process(Some(16), Some(15), Some(10), descends, parents, |_| None),
             Ok(Some(15))
         );
+    }
+
+    /// Review nit 1: a chain of shells deeper than the walk reads, below the
+    /// agent, pins what was named — as a walk that cannot say does — rather
+    /// than whichever shell the walk stopped on.
+    #[test]
+    fn a_shell_chain_deeper_than_the_walk_pins_the_named_instance() {
+        // 1 ── 10 agent ── 11 sh ── 12 sh ── … ── 30 sh ── 31 CLI
+        let parents = |pid: u32| match pid {
+            10 => Some(1),
+            11..=31 => Some(pid - 1),
+            _ => None,
+        };
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                10 => "/opt/agent",
+                11..=30 => "/bin/sh",
+                31 => "/opt/dot-agent-deck",
+                _ => return None,
+            }))
+        };
+        assert_eq!(receiver_instance(30, Some(10), parents, executables), 30);
+        assert_eq!(receiver_instance(12, Some(10), parents, executables), 10);
     }
 
     /// Audit F3 (b), on this machine's real process table: a shell started
