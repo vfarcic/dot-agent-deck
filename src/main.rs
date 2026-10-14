@@ -1233,6 +1233,18 @@ fn blocked_workers_note(resp: &dot_agent_deck::event::DelegateResponse) -> Optio
     Some(lines.join("\n"))
 }
 
+/// A delegated-task delivery id from before PRD #1666 (`d-` and eight lowercase
+/// hex digits). Still sent, so the deck can answer that it holds no such
+/// message instead of the CLI calling a task file's id malformed.
+fn is_retired_delivery_id(id: &str) -> bool {
+    id.strip_prefix("d-").is_some_and(|hex| {
+        hex.len() == 8
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 fn main() -> ExitCode {
     // PRD #89 M3.4: the `--continue` flag was removed — auto-restore is now the
     // default. Intercept a stale invocation before clap parsing so the user
@@ -1657,7 +1669,8 @@ fn main() -> ExitCode {
         },
         Some(Commands::Ack { delivery_id }) => {
             let reply = match (
-                dot_agent_deck::inbox::is_valid_message_id(&delivery_id),
+                dot_agent_deck::inbox::is_valid_message_id(&delivery_id)
+                    || is_retired_delivery_id(&delivery_id),
                 std::env::var(DOT_AGENT_DECK_PANE_ID),
             ) {
                 (false, _) => AckReply::Malformed,
