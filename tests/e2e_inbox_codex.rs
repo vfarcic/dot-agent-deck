@@ -54,6 +54,13 @@ while True:
     with open(base + '.screen') as f: screen = f.read()
     if screen != previous:
         os.write(1, b'\x1b[2J\x1b[H' + screen.replace('\n','\r\n').encode())
+        # Codex 0.160 keeps its cursor right after the composer's text.
+        rows = screen.split('\n')
+        prompts = [n for n, row in enumerate(rows) if row.startswith('›')]
+        if prompts:
+            last = prompts[-1]
+            while last + 1 < len(rows) and rows[last + 1].strip(): last += 1
+            os.write(1, f'\x1b[{last + 1};{len(rows[last].rstrip()) + 1}H'.encode())
         previous = screen
     if select.select([0],[],[],0.025)[0]:
         chunk = os.read(0,4096)
@@ -365,6 +372,112 @@ fn codex_013_a_stranded_doorbell_line_is_submitted_by_the_next_ring() {
             .next(),
         Some(line.as_str()),
         "the flush must submit the stranded line itself"
+    );
+}
+
+/// The stand-in's composer holding `text`, shortcuts hint hidden as Codex
+/// 0.160 hides it while the composer holds text.
+fn holding(text: &str) -> String {
+    COMPOSER
+        .replace("Ask Codex to do anything", text)
+        .replace("? for shortcuts", "")
+}
+
+/// Scenario: Start wrapped synthetic Codex that drops the first Enter after text, queue a task and let its ring strand in the composer. Then repaint the composer so it holds a doorbell-shaped line naming a different message, cursor after it, while the deck's own ring is still outstanding: it must receive zero bytes. Repainting the deck's own line brings the flushing carriage return.
+#[spec("inbox/codex/014")]
+#[test]
+fn codex_014_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
+    let codex = Codex::new_with(COMPOSER, &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "2000")]);
+    let strand = codex.pane.capture.with_extension("strand");
+    std::fs::write(strand.with_extension("empty"), COMPOSER).unwrap();
+    std::fs::write(&strand, "").unwrap();
+    let id = codex.queued(BODY);
+    let line = fixed_line(&id);
+    let rung = format!("{line}\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane) == rung.as_bytes()
+            && screen(&codex.daemon, &codex.pane)
+                .contains(&format!("›  {}", line.trim_start()))),
+        "the stand-in must leave the rung line in its composer: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+    let crafted = fixed_line("m-crafted0-0000000000000000");
+    std::fs::write(
+        codex.pane.capture.with_extension("screen"),
+        holding(&crafted),
+    )
+    .unwrap();
+    assert!(
+        common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
+            .contains(crafted.trim_start())),
+        "the crafted line must be on screen before the next ring is due: {}",
+        screen(&codex.daemon, &codex.pane)
+    );
+    assert!(
+        !common::wait_until(Duration::from_millis(4500), || bytes(&codex.pane).len()
+            > rung.len()),
+        "a doorbell-shaped line naming another message must get no byte, not even the flushing CR: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+    state(&codex.daemon, &codex.pane, &id, "queued");
+    // Control: the same ring, due all along, flushes the deck's own line.
+    std::fs::write(codex.pane.capture.with_extension("screen"), holding(&line)).unwrap();
+    let flushed = format!("{line}\r\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane).starts_with(flushed.as_bytes())),
+        "the deck's own stranded line must still be flushed: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+}
+
+/// Scenario: Start wrapped synthetic Codex that drops the first Enter after text, queue a task, and let the next ring flush the stranded line. Then repaint the composer holding that same line again, as if typed back in, with the message still queued: the deck already flushed its line, so the composer must receive zero bytes until it is empty again, when the ring resumes.
+#[spec("inbox/codex/015")]
+#[test]
+fn codex_015_a_line_the_deck_already_flushed_gets_no_second_flush() {
+    let codex = Codex::new_with(
+        COMPOSER,
+        &[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "400,2000")],
+    );
+    let strand = codex.pane.capture.with_extension("strand");
+    std::fs::write(strand.with_extension("empty"), COMPOSER).unwrap();
+    std::fs::write(&strand, "").unwrap();
+    let id = codex.queued(BODY);
+    let line = fixed_line(&id);
+    let flushed = format!("{line}\r\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane) == flushed.as_bytes()
+            && screen(&codex.daemon, &codex.pane)
+                .contains("› Ask Codex to do anything")),
+        "the second ring must flush the stranded line and leave the composer empty: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+    std::fs::write(codex.pane.capture.with_extension("screen"), holding(&line)).unwrap();
+    assert!(
+        common::wait_until(WAIT, || screen(&codex.daemon, &codex.pane)
+            .contains(&format!("›  {}", line.trim_start()))),
+        "the repainted line must be on screen before the next ring is due: {}",
+        screen(&codex.daemon, &codex.pane)
+    );
+    assert!(
+        !common::wait_until(Duration::from_millis(4500), || bytes(&codex.pane).len()
+            > flushed.len()),
+        "a line the deck already flushed must get no second CR: {:?}\nPane:\n{}",
+        String::from_utf8_lossy(&bytes(&codex.pane)),
+        screen(&codex.daemon, &codex.pane)
+    );
+    state(&codex.daemon, &codex.pane, &id, "queued");
+    // Control: once the composer is empty the doorbell rings again.
+    std::fs::write(codex.pane.capture.with_extension("screen"), COMPOSER).unwrap();
+    let rung_again = format!("{flushed}\r{line}\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&codex.pane)
+            .starts_with(rung_again.as_bytes())),
+        "an empty composer must take the next ring: {:?}",
+        String::from_utf8_lossy(&bytes(&codex.pane))
     );
 }
 

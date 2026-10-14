@@ -7793,9 +7793,23 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 ##### inbox/codex/013 — A doorbell line Codex left unsubmitted is submitted by the next ring.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
-- **Agent:** wrapped Codex-composer stand-in that drops the first Enter after text and hides its shortcuts hint while the composer holds text, as Codex 0.160.0 does.
+- **Agent:** wrapped Codex-composer stand-in that drops the first Enter after text, hides its shortcuts hint while the composer holds text and keeps its cursor right after the composer's text, as Codex 0.160.0 does.
 - **Asserts:** the rung line stays in the composer; the next ring sends one bare CR (no second line typed on top), and that CR submits the stranded line itself.
 - **Does not assert:** why a real Codex dropped the Enter; the fixture recreates the measured stranded end-state (live `codex/worker/001`, 2026-10-14).
+- **Cost:** none.
+
+##### inbox/codex/014 — A doorbell-shaped line the deck did not type gets no byte.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** the `inbox/codex/013` stand-in, its screen repainted by the test.
+- **Asserts:** while the deck's own ring is outstanding, a composer holding a doorbell-shaped line naming another message, cursor after it, receives no byte across two due rings and the message stays `queued`; repainting the deck's own line brings the flushing CR.
+- **Does not assert:** that screen text proves who wrote it — a process drawing the deck's exact line still earns the CR (`docs/develop/agent-messaging.md`, "Doorbell guards").
+- **Cost:** none.
+
+##### inbox/codex/015 — A line the deck already flushed gets no second flush.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`).
+- **Agent:** the `inbox/codex/013` stand-in, its screen repainted by the test.
+- **Asserts:** after the deck's flush submitted its stranded line, a composer showing that same line again receives no byte across two due rings while the message stays `queued`; an empty composer then takes the next ring.
+- **Does not assert:** how the line got back into a real Codex composer; the repaint stands in for retained or retyped text.
 - **Cost:** none.
 
 #### inbox/opencode
