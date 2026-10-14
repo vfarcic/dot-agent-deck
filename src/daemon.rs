@@ -3808,37 +3808,80 @@ fn admit_inbox_component(
     let descends = crate::platform::proc::descends_from;
     match used_as {
         ComponentUse::Cli => admit_component_process(peer, claimed, root, descends),
-        ComponentUse::Receiver => {
-            admit_receiver_process(peer, claimed, root, descends, |peer, claimed| {
-                nested_between(
-                    peer,
-                    claimed,
-                    crate::platform::proc::parent_pid_of,
-                    crate::platform::proc::executable_of,
-                )
-            })
-        }
+        ComponentUse::Receiver => admit_receiver_process(
+            peer,
+            claimed,
+            root,
+            descends,
+            crate::platform::proc::parent_pid_of,
+            crate::platform::proc::executable_of,
+        ),
     }
 }
 
 /// Audit F3: [`admit_component_process`] for a component registering the
-/// agent's native receiver. `nested` answers whether a process between the
-/// caller and the instance it names runs the same executable as that
-/// instance ([`nested_between`]).
+/// agent's native receiver. Answers the instance the receiver is pinned by
+/// ([`receiver_instance`]), and refuses one with an agent of its own kind
+/// between it and the caller ([`nested_between`]).
 fn admit_receiver_process(
     peer: Option<u32>,
     claimed: Option<u32>,
     root: Option<u32>,
     descends: impl Fn(u32, u32) -> Option<bool>,
-    nested: impl Fn(u32, u32) -> Option<bool>,
+    parent_of: impl Fn(u32) -> Option<u32> + Copy,
+    executable_of: impl Fn(u32) -> Option<std::path::PathBuf> + Copy,
 ) -> Result<Option<u32>, &'static str> {
-    let instance = admit_component_process(peer, claimed, root, descends)?;
+    let instance = admit_component_process(peer, claimed, root, descends)?
+        .map(|claimed| receiver_instance(claimed, root, parent_of, executable_of));
     if let (Some(peer), Some(instance)) = (peer, instance)
-        && nested(peer, instance) == Some(true)
+        && nested_between(peer, instance, parent_of, executable_of) == Some(true)
     {
         return Err("an agent of the same kind sits between the caller and the component it names");
     }
     Ok(instance)
+}
+
+/// Audit F3: the process an agent's receiver is pinned by — `claimed`, or,
+/// when `claimed` is a shell the agent runs a hook through, the nearest
+/// ancestor that is not a shell, never above the agent's own process `root`.
+///
+/// Claude Code runs every hook through a new `sh` that does not `exec` it
+/// (measured on 2.1.299: `claude ── sh ── hook`), so its announcement and each
+/// of its waiters name a different shell; the agent above them is the one
+/// receiver. Without `root` there is nothing to bound the walk, so `claimed`
+/// stands, as it does where a process cannot be read.
+fn receiver_instance(
+    claimed: u32,
+    root: Option<u32>,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    executable_of: impl Fn(u32) -> Option<std::path::PathBuf>,
+) -> u32 {
+    /// More shells than any hook runner stacks.
+    const MAX_SHELLS: usize = 8;
+    let Some(root) = root else {
+        return claimed;
+    };
+    let mut current = claimed;
+    for _ in 0..MAX_SHELLS {
+        if current == root || !executable_of(current).is_some_and(|exe| is_shell(&exe)) {
+            return current;
+        }
+        match parent_of(current) {
+            Some(parent) if parent > 1 => current = parent,
+            _ => return claimed,
+        }
+    }
+    current
+}
+
+/// Whether `exe` is a POSIX-style shell, by its file name.
+fn is_shell(exe: &std::path::Path) -> bool {
+    let name = exe.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+    matches!(
+        name,
+        "sh" | "dash" | "bash" | "zsh" | "ksh" | "mksh" | "ash" | "fish" | "busybox"
+    )
 }
 
 /// Audit F3: whether a process strictly between `peer` and `claimed` — one of
@@ -8722,19 +8765,23 @@ mod hook_ingestion_tests {
     /// one whose receiver it claims to be. The launch shapes the deck's own
     /// integrations use (the watcher a direct child of its agent, a hook run
     /// through a shell, an agent under a wrapper of its own kind) still pass,
-    /// and so does a walk that cannot say.
+    /// and so does a walk that cannot say. A hook run through a shell is
+    /// pinned by the agent above the shell, so every hook of one agent names
+    /// the same receiver.
     #[test]
     fn a_nested_agent_cannot_register_as_the_outer_agents_receiver() {
         // 1 ── 10 claude ── 11 bash (a tool) ── 12 claude (nested) ── 13 sh ── 14 CLI
-        //   │            └── 15 sh ── 16 CLI (the outer agent's hook)
+        //   │            ├── 15 sh ── 16 CLI (the outer agent's hook)
+        //   │            └── 17 sh ── 18 CLI (its next hook, in a new shell)
         //   └── 20 node (npx) ── 21 sh ── 22 node (pi) ── 23 CLI (its watcher)
         let parents = |pid: u32| match pid {
             10 | 20 => Some(1),
-            11 | 15 => Some(10),
+            11 | 15 | 17 => Some(10),
             12 => Some(11),
             13 => Some(12),
             14 => Some(13),
             16 => Some(15),
+            18 => Some(17),
             21 => Some(20),
             22 => Some(21),
             23 => Some(22),
@@ -8744,33 +8791,39 @@ mod hook_ingestion_tests {
             let exe = match pid {
                 10 | 12 => "/opt/claude",
                 11 => "/bin/bash",
-                13 | 15 | 21 => "/bin/sh",
-                14 | 16 | 23 => "/opt/dot-agent-deck",
+                13 | 15 | 17 | 21 => "/bin/sh",
+                14 | 16 | 18 | 23 => "/opt/dot-agent-deck",
                 20 | 22 => "/usr/bin/node",
                 _ => return None,
             };
             Some(std::path::PathBuf::from(exe))
         };
         let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
-        let nested = |peer, claimed| nested_between(peer, claimed, parents, executables);
-        let admit =
-            |peer, claimed, root| admit_receiver_process(peer, claimed, root, descends, nested);
+        let admit = |peer, claimed, root| {
+            admit_receiver_process(peer, claimed, root, descends, parents, executables)
+        };
 
-        // The outer agent's hook, through a shell, naming the shell or the agent.
-        assert_eq!(admit(Some(16), Some(15), Some(10)), Ok(Some(15)));
+        // The outer agent's hooks, each through its own shell, naming the
+        // shell or the agent: all are the agent's one receiver.
+        assert_eq!(admit(Some(16), Some(15), Some(10)), Ok(Some(10)));
+        assert_eq!(admit(Some(18), Some(17), Some(10)), Ok(Some(10)));
         assert_eq!(admit(Some(16), Some(10), Some(10)), Ok(Some(10)));
         // Pi's watcher, a direct child of Pi under an npx wrapper that runs node too.
         assert_eq!(admit(Some(23), Some(22), Some(20)), Ok(Some(22)));
         // The nested agent naming the outer agent as its instance is refused.
         assert!(admit(Some(14), Some(10), Some(10)).is_err());
-        // Naming its own instance passes this check: the generation's pinned
-        // receiver refuses it (`InboxHub::arm`).
+        // Naming its own shell, or itself, it is the nested agent's receiver,
+        // which the generation's pinned receiver refuses (`InboxHub::arm`).
+        assert_eq!(admit(Some(14), Some(13), Some(10)), Ok(Some(12)));
         assert_eq!(admit(Some(14), Some(12), Some(10)), Ok(Some(12)));
-        // A walk that cannot say does not refuse.
-        let blind = |peer, claimed| nested_between(peer, claimed, parents, |_| None);
+        // A walk that cannot say does not refuse, and pins what was named.
         assert_eq!(
-            admit_receiver_process(Some(14), Some(10), Some(10), descends, blind),
+            admit_receiver_process(Some(14), Some(10), Some(10), descends, parents, |_| None),
             Ok(Some(10))
+        );
+        assert_eq!(
+            admit_receiver_process(Some(16), Some(15), Some(10), descends, parents, |_| None),
+            Ok(Some(15))
         );
     }
 
