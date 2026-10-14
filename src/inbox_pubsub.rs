@@ -250,21 +250,26 @@ async fn sender(state: &SharedState, pane_id: &str, agent_id: &str) -> (Sender, 
 }
 
 /// Keep the whole of an over-long body reachable (hardening H4), in the
-/// sender's own directory. The refusal to answer when it cannot be saved.
+/// sender's own directory.
+///
+/// Call it only once the inbox has admitted the post (audit F2), and keep the
+/// answered spill only once the post is in: dropped, it removes the file.
 fn retain(
     registry: &AgentPtyRegistry,
     pane_id: &str,
     agent_id: &str,
     content: &mut Content,
-) -> Option<InboxPostReply> {
+) -> Result<crate::inbox_hub::MintedSpill, String> {
     let dirs = crate::inbox_hub::spill_dirs(registry, pane_id, Some(agent_id));
-    let error =
-        crate::inbox_hub::retain_full_body(&registry.inbox().deck(), pane_id, content, &dirs)
-            .err()?;
-    Some(InboxPostReply::refused(
+    crate::inbox_hub::retain_full_body_minted(&registry.inbox().deck(), pane_id, content, &dirs)
+}
+
+/// The refusal for a long body [`retain`] could not save.
+fn body_not_saved(error: &str) -> InboxPostReply {
+    InboxPostReply::refused(
         "body_not_saved",
         &format!("the message is too long to hand over whole and could not be saved: {error}"),
-    ))
+    )
 }
 
 /// `inbox_publish`: announce to every subscriber of the topic in the sender's
@@ -302,19 +307,27 @@ pub async fn handle_publish(
         id: None,
         preface: None,
     };
-    if let Some(refusal) = retain(registry, &req.pane_id, agent_id, &mut content) {
-        return refusal;
+    if let Err(error) = registry.inbox().admit_publish(&content, &recipients) {
+        info!(pane_id = %req.pane_id, %error, "inbox: publish refused");
+        return refused_post(&error);
     }
+    let spill = match retain(registry, &req.pane_id, agent_id, &mut content) {
+        Ok(spill) => spill,
+        Err(error) => return body_not_saved(&error),
+    };
     match registry
         .inbox()
         .publish(scope.scope, &req.topic, content, &recipients)
     {
-        Ok(published) => InboxPostReply {
-            id: Some(published.id.to_string()),
-            delivered_to: Some(published.delivered_to),
-            refused_full: published.refused_full,
-            ..InboxPostReply::default()
-        },
+        Ok(published) => {
+            spill.keep();
+            InboxPostReply {
+                id: Some(published.id.to_string()),
+                delivered_to: Some(published.delivered_to),
+                refused_full: published.refused_full,
+                ..InboxPostReply::default()
+            }
+        }
         Err(error) => {
             info!(pane_id = %req.pane_id, %error, "inbox: publish refused");
             refused_post(&error)
@@ -377,23 +390,31 @@ pub async fn handle_offer(
         preface: Some(offer_preface(&id, &req.pool)),
         id: Some(id),
     };
-    if let Some(refusal) = retain(registry, &req.pane_id, agent_id, &mut content) {
-        return refusal;
+    let claim_ttl = req.claim_ttl_ms.map(Duration::from_millis);
+    if let Err(error) = registry
+        .inbox()
+        .admit_offer(&scope.scope, claim_ttl, &content)
+    {
+        info!(pane_id = %req.pane_id, %error, "inbox: offer refused");
+        return refused_post(&error);
     }
+    let spill = match retain(registry, &req.pane_id, agent_id, &mut content) {
+        Ok(spill) => spill,
+        Err(error) => return body_not_saved(&error),
+    };
     let offerer = Recipient::bound(req.pane_id.clone(), agent_id.to_string());
-    match registry.inbox().offer(
-        scope.scope,
-        &req.pool,
-        req.claim_ttl_ms.map(Duration::from_millis),
-        content,
-        offerer,
-        &takers,
-    ) {
-        Ok(offered) => InboxPostReply {
-            id: Some(offered.id.to_string()),
-            offered_to: offered.offered_to.map(|r| r.pane_id),
-            ..InboxPostReply::default()
-        },
+    match registry
+        .inbox()
+        .offer(scope.scope, &req.pool, claim_ttl, content, offerer, &takers)
+    {
+        Ok(offered) => {
+            spill.keep();
+            InboxPostReply {
+                id: Some(offered.id.to_string()),
+                offered_to: offered.offered_to.map(|r| r.pane_id),
+                ..InboxPostReply::default()
+            }
+        }
         Err(error) => {
             info!(pane_id = %req.pane_id, %error, "inbox: offer refused");
             refused_post(&error)
@@ -611,6 +632,129 @@ mod tests {
         assert!(!in_scope(&view, "f1b-caller", "f1b-unit"));
         assert!(!in_scope(&view, "f1b-unit", "f1b-caller"));
         assert!(!view.may_offer("f1b-caller"));
+        registry.shutdown_all();
+    }
+
+    /// The long-message files the deck saved in `dir`.
+    fn saved_bodies(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir.join(".dot-agent-deck")).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("inbox-message-")
+                })
+                .count()
+        })
+    }
+
+    /// A body too long for the tightest hand-over, so the deck saves it whole.
+    fn long_body() -> String {
+        "a long body. ".repeat(1_000)
+    }
+
+    /// Audit F2: a publish or offer the inbox refuses — over the body limit as
+    /// sent on the wire, over the sender's rate, with a claim time out of
+    /// range, or into a scope already holding its most open offers — saves
+    /// nothing. Accepted long posts still keep their saved body.
+    #[tokio::test]
+    async fn refused_publishes_and_offers_save_no_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let caller = spawn_in(&registry, "f2-caller", Some(cwd));
+        let unit = spawn_in(&registry, "f2-unit", Some(cwd));
+        dispatched(&registry, ("f2-unit", &unit), ("f2-caller", &caller));
+        let state = shared();
+        let publish = |body: String| InboxPublishRequest {
+            pane_id: "f2-unit".to_string(),
+            agent_id: Some(unit.clone()),
+            token: None,
+            topic: "news".to_string(),
+            body,
+        };
+
+        let over = "x".repeat(crate::inbox::DEFAULT_MAX_BODY_BYTES + 1);
+        let reply = handle_publish(&registry, &state, &publish(over.clone()), &unit).await;
+        assert_eq!(
+            reply.refused.as_deref(),
+            Some("body_too_large"),
+            "{reply:?}"
+        );
+        assert_eq!(
+            saved_bodies(dir.path()),
+            0,
+            "a body over the limit is saved"
+        );
+
+        let rate = crate::inbox::DEFAULT_RATE_PER_MINUTE as usize;
+        for _ in 0..rate {
+            let reply = handle_publish(&registry, &state, &publish(long_body()), &unit).await;
+            assert!(reply.refused.is_none(), "{reply:?}");
+        }
+        assert_eq!(
+            saved_bodies(dir.path()),
+            rate,
+            "each accepted long publish keeps its body"
+        );
+        for _ in 0..3 {
+            let reply = handle_publish(&registry, &state, &publish(long_body()), &unit).await;
+            assert_eq!(reply.refused.as_deref(), Some("rate_limited"), "{reply:?}");
+        }
+        assert_eq!(
+            saved_bodies(dir.path()),
+            rate,
+            "a publish over the rate is saved"
+        );
+
+        let mut offer = offer_from("f2-caller", &caller);
+        offer.body = long_body();
+        offer.claim_ttl_ms = Some(1);
+        let reply = handle_offer(&registry, &state, &offer, &caller).await;
+        assert_eq!(
+            reply.refused.as_deref(),
+            Some("claim_ttl_out_of_range"),
+            "{reply:?}"
+        );
+        offer.claim_ttl_ms = None;
+        offer.body = over;
+        let reply = handle_offer(&registry, &state, &offer, &caller).await;
+        assert_eq!(
+            reply.refused.as_deref(),
+            Some("body_too_large"),
+            "{reply:?}"
+        );
+        assert_eq!(saved_bodies(dir.path()), rate, "a refused offer is saved");
+
+        let scope = crate::inbox::Scope::Dispatch {
+            root_pane: "f2-caller".to_string(),
+        };
+        for n in 0..crate::inbox::DEFAULT_MAX_OFFERS_PER_SCOPE {
+            registry
+                .inbox()
+                .offer(
+                    scope.clone(),
+                    "jobs",
+                    None,
+                    Content::from_deck("test", format!("job {n}"), "fill the scope"),
+                    Recipient::bound("f2-caller", caller.clone()),
+                    &[],
+                )
+                .expect("fill the scope's open offers");
+        }
+        offer.body = long_body();
+        let reply = handle_offer(&registry, &state, &offer, &caller).await;
+        assert_eq!(
+            reply.refused.as_deref(),
+            Some("too_many_offers"),
+            "{reply:?}"
+        );
+        assert_eq!(
+            saved_bodies(dir.path()),
+            rate,
+            "an offer into a full scope is saved"
+        );
         registry.shutdown_all();
     }
 }

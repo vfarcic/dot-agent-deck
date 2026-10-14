@@ -498,6 +498,38 @@ impl InboxHub {
         self.keepalive
     }
 
+    /// Audit F2: the refusal [`Self::post_direct`] would give `content` for
+    /// `to` now. Run before anything is saved for the post.
+    pub fn admit_direct(&self, to: &Recipient, content: &Content) -> Result<(), PostError> {
+        self.lock().inbox.admit_direct(Instant::now(), to, content)
+    }
+
+    /// Audit F2: the refusal [`Self::publish`] would give `content` for
+    /// `recipients` now. Run before anything is saved for the post.
+    pub fn admit_publish(
+        &self,
+        content: &Content,
+        recipients: &[Recipient],
+    ) -> Result<(), PostError> {
+        self.lock()
+            .inbox
+            .admit_publish(Instant::now(), content, recipients)
+    }
+
+    /// Audit F2: the refusal [`Self::offer`] would give `content` in `scope`
+    /// now. Run before anything is saved for the post.
+    pub fn admit_offer(
+        &self,
+        scope: &Scope,
+        claim_ttl: Option<Duration>,
+        content: &Content,
+    ) -> Result<(), PostError> {
+        self.lock()
+            .inbox
+            .admit_offer(Instant::now(), scope, claim_ttl, content)
+            .map(|_| ())
+    }
+
     /// Post one direct message and hand it straight to an armed waiter if the
     /// recipient has one.
     pub fn post_direct(&self, to: Recipient, content: Content) -> Result<MessageId, PostError> {
@@ -1787,6 +1819,43 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
     budget.measure(&render_within(&message, None).text) <= budget.limit()
 }
 
+/// Audit F2: the file [`retain_full_body_minted`] saved for one post, if it
+/// saved one. Dropping it removes the file, so a post the inbox then refuses
+/// leaves nothing behind; [`Self::keep`] leaves it for an accepted post. A
+/// `spill_path` the caller supplied is never held here: the deck removes only
+/// what it wrote itself.
+#[must_use = "a saved body is removed again unless it is kept"]
+#[derive(Debug, Default)]
+pub struct MintedSpill(Option<std::path::PathBuf>);
+
+impl MintedSpill {
+    /// The post was accepted: its saved body stays.
+    pub fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for MintedSpill {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take()
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            warn!(path = %path.display(), %error, "inbox: could not remove the saved body of a refused post");
+        }
+    }
+}
+
+/// [`retain_full_body_minted`] for a post that cannot be refused afterwards:
+/// a body it saves stays.
+pub fn retain_full_body(
+    deck: &DeckId,
+    pane_id: &str,
+    content: &mut Content,
+    dirs: &[std::path::PathBuf],
+) -> Result<(), String> {
+    retain_full_body_minted(deck, pane_id, content, dirs).map(MintedSpill::keep)
+}
+
 /// PRD #1666 hardening H4: make sure the whole of `content` stays reachable
 /// whatever agent it reaches. A body that would not render whole within
 /// [`tightest_hand_over`], and names no file of its own, is saved — framed like
@@ -1796,17 +1865,21 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
 /// where the rest is. When no directory takes it the post is refused: a
 /// message the deck can only deliver in part is not accepted as if it were
 /// whole.
-pub fn retain_full_body(
+///
+/// The file it saves is answered as a [`MintedSpill`], removed unless the post
+/// is accepted (audit F2): check the post's admission before calling this, and
+/// keep the spill only once the post is in.
+pub fn retain_full_body_minted(
     deck: &DeckId,
     pane_id: &str,
     content: &mut Content,
     dirs: &[std::path::PathBuf],
-) -> Result<(), String> {
+) -> Result<MintedSpill, String> {
     /// How many taken names to step past in one directory before the next.
     const MAX_NAME_ATTEMPTS: usize = 8;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if content.spill_path.is_some() || fits_every_hand_over(deck, pane_id, content) {
-        return Ok(());
+        return Ok(MintedSpill::default());
     }
     let text = match content.body_trust {
         BodyTrust::Trusted => content.body.clone(),
@@ -1822,8 +1895,8 @@ pub fn retain_full_body(
             let name = format!("inbox-message-{millis}-{seq}.md");
             match crate::orchestrator_context::write_new_coordination_file(dir, &name, &text) {
                 Ok(path) => {
-                    content.spill_path = Some(path);
-                    return Ok(());
+                    content.spill_path = Some(path.clone());
+                    return Ok(MintedSpill(Some(path)));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
@@ -1878,12 +1951,21 @@ pub fn post_to_live(
         ));
     }
     let mut content = content;
-    let dirs = spill_dirs(registry, &to.pane_id, to.agent_id.as_deref());
-    retain_full_body(&registry.inbox().deck(), &to.pane_id, &mut content, &dirs)?;
+    // Audit F2: refused before the body is saved, and the saved body removed
+    // again if the post is refused after all.
     registry
         .inbox()
+        .admit_direct(&to, &content)
+        .map_err(|error| error.to_string())?;
+    let dirs = spill_dirs(registry, &to.pane_id, to.agent_id.as_deref());
+    let spill =
+        retain_full_body_minted(&registry.inbox().deck(), &to.pane_id, &mut content, &dirs)?;
+    let id = registry
+        .inbox()
         .post_direct(to, content)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    spill.keep();
+    Ok(id)
 }
 
 /// PRD #1666 S5: [`post_to_live`] for a notice from the deck, labelled

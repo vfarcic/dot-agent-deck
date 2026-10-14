@@ -6005,19 +6005,29 @@ fn post_message(
         id: None,
         preface: None,
     };
+    let to = crate::inbox::Recipient::bound(pane_id, live.clone());
+    // Audit F2: a post the inbox would refuse is refused before anything is
+    // saved for it.
+    if let Err(error) = registry.inbox().admit_direct(&to, &content) {
+        return AttachResponse::err(format!("post-message: {error}"));
+    }
     // PRD #1666 hardening H4: a body too long to hand over whole is saved to
     // a file the block names, or the post is refused.
     let dirs = crate::inbox_hub::spill_dirs(registry, pane_id, Some(live.as_str()));
-    if let Err(error) =
-        crate::inbox_hub::retain_full_body(&registry.inbox().deck(), pane_id, &mut content, &dirs)
-    {
-        return AttachResponse::err(format!("post-message: {error}"));
-    }
-    match registry
-        .inbox()
-        .post_direct(crate::inbox::Recipient::bound(pane_id, live), content)
-    {
-        Ok(id) => AttachResponse::with_id(id.to_string()),
+    let spill = match crate::inbox_hub::retain_full_body_minted(
+        &registry.inbox().deck(),
+        pane_id,
+        &mut content,
+        &dirs,
+    ) {
+        Ok(spill) => spill,
+        Err(error) => return AttachResponse::err(format!("post-message: {error}")),
+    };
+    match registry.inbox().post_direct(to, content) {
+        Ok(id) => {
+            spill.keep();
+            AttachResponse::with_id(id.to_string())
+        }
         Err(error) => AttachResponse::err(format!("post-message: {error}")),
     }
 }
@@ -6965,6 +6975,66 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Audit F2: the attach `post-message` verb refuses a body over the inbox's
+    /// limit, or one for a recipient whose inbox is full, before it saves the
+    /// body to a file — and keeps the file of a long post it accepts.
+    #[test]
+    fn post_message_refused_by_the_inbox_saves_no_body() {
+        let saved = |dir: &std::path::Path| {
+            std::fs::read_dir(dir.join(".dot-agent-deck")).map_or(0, |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("inbox-message-")
+                    })
+                    .count()
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let agent = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(dir.path().to_str().unwrap()),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "f2-attach".to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let post = |body: String| {
+            post_message(
+                &reg,
+                "f2-attach",
+                Some(agent.as_str()),
+                "a seed".to_string(),
+                body,
+                None,
+                crate::inbox_hub::PostOrigin::Seed,
+            )
+        };
+        let long = "a long seed. ".repeat(1_000);
+
+        let resp = post("x".repeat(crate::inbox::DEFAULT_MAX_BODY_BYTES + 1));
+        assert!(!resp.ok, "{resp:?}");
+        assert_eq!(saved(dir.path()), 0, "a body over the limit was saved");
+
+        let resp = post(long.clone());
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(saved(dir.path()), 1, "an accepted long post keeps its body");
+
+        for _ in 1..crate::inbox::DEFAULT_MAX_PER_RECIPIENT {
+            assert!(post("short".to_string()).ok);
+        }
+        let resp = post(long);
+        assert!(!resp.ok, "{resp:?}");
+        assert_eq!(saved(dir.path()), 1, "a post to a full inbox was saved");
+        reg.shutdown_all();
+    }
 
     /// Issue #1445 (Qodo on PR #1554): two re-arm reports that reach the
     /// daemon in reverse publication order leave the record on the newer file,

@@ -934,6 +934,28 @@ impl Inbox {
         &self.limits
     }
 
+    /// Audit F2: the refusal [`Self::post_direct`] would give `content` for
+    /// `to` now, without posting it, so a caller can refuse before it saves
+    /// the body to a file.
+    pub fn admit_direct(
+        &mut self,
+        now: Instant,
+        to: &Recipient,
+        content: &Content,
+    ) -> Result<(), PostError> {
+        self.expire_dedup(now);
+        self.check_body(content)?;
+        self.check_id(content.id.as_ref())?;
+        self.check_room(1)?;
+        if !self.has_room_for(&to.pane_id) {
+            return Err(PostError::InboxFull {
+                pane_id: to.pane_id.clone(),
+                limit: self.limits.max_per_recipient,
+            });
+        }
+        Ok(())
+    }
+
     /// Post one direct message to `to`.
     pub fn post_direct(
         &mut self,
@@ -941,16 +963,7 @@ impl Inbox {
         to: Recipient,
         content: Content,
     ) -> Result<MessageId, PostError> {
-        self.expire_dedup(now);
-        self.check_body(&content)?;
-        self.check_id(content.id.as_ref())?;
-        self.check_room(1)?;
-        if self.live_for_pane(&to.pane_id) >= self.limits.max_per_recipient {
-            return Err(PostError::InboxFull {
-                pane_id: to.pane_id,
-                limit: self.limits.max_per_recipient,
-            });
-        }
+        self.admit_direct(now, &to, &content)?;
         let id = self.register_id(now, content.id.clone());
         let address = Address::Direct {
             deck: self.deck.clone(),
@@ -970,6 +983,25 @@ impl Inbox {
         Ok(id)
     }
 
+    /// Audit F2: the refusal [`Self::publish`] would give `content` for
+    /// `recipients` now, without publishing it.
+    pub fn admit_publish(
+        &mut self,
+        now: Instant,
+        content: &Content,
+        recipients: &[Recipient],
+    ) -> Result<(), PostError> {
+        self.expire_dedup(now);
+        self.check_body(content)?;
+        self.check_rate(now, &content.from)?;
+        self.check_id(content.id.as_ref())?;
+        let room = recipients
+            .iter()
+            .filter(|r| self.has_room_for(&r.pane_id))
+            .count();
+        self.check_room(room)
+    }
+
     /// Publish to every recipient in `recipients` (resolved by
     /// [`publish_recipients`]). Each gets its own copy under the one id.
     pub fn publish(
@@ -980,14 +1012,10 @@ impl Inbox {
         content: Content,
         recipients: &[Recipient],
     ) -> Result<Published, PostError> {
-        self.expire_dedup(now);
-        self.check_body(&content)?;
-        self.check_rate(now, &content.from)?;
-        self.check_id(content.id.as_ref())?;
+        self.admit_publish(now, &content, recipients)?;
         let (room, full): (Vec<&Recipient>, Vec<&Recipient>) = recipients
             .iter()
-            .partition(|r| self.live_for_pane(&r.pane_id) < self.limits.max_per_recipient);
-        self.check_room(room.len())?;
+            .partition(|r| self.has_room_for(&r.pane_id));
         let id = self.register_id(now, content.id.clone());
         self.record_rate(now, &content.from);
         let address = Address::Topic {
@@ -1029,28 +1057,7 @@ impl Inbox {
         content: Content,
         candidates: &[Recipient],
     ) -> Result<Offered, PostError> {
-        self.expire_dedup(now);
-        self.check_body(&content)?;
-        let claim_ttl = claim_ttl.unwrap_or(self.limits.default_claim_ttl);
-        if claim_ttl < self.limits.min_claim_ttl || claim_ttl > self.limits.max_claim_ttl {
-            return Err(PostError::ClaimTtlOutOfRange {
-                min_ms: millis(self.limits.min_claim_ttl),
-                max_ms: millis(self.limits.max_claim_ttl),
-            });
-        }
-        self.check_rate(now, &content.from)?;
-        let open = self
-            .messages
-            .iter()
-            .filter(|m| m.is_offer() && !m.state.is_terminal() && m.scope() == Some(&scope))
-            .count();
-        if open >= self.limits.max_offers_per_scope {
-            return Err(PostError::TooManyOffers {
-                limit: self.limits.max_offers_per_scope,
-            });
-        }
-        self.check_id(content.id.as_ref())?;
-        self.check_room(1)?;
+        let claim_ttl = self.admit_offer(now, &scope, claim_ttl, &content)?;
         let id = self.register_id(now, content.id.clone());
         self.record_rate(now, &content.from);
         let address = Address::Offer {
@@ -1073,6 +1080,40 @@ impl Inbox {
         );
         let offered_to = self.assign_offer(now, &id, candidates);
         Ok(Offered { id, offered_to })
+    }
+
+    /// Audit F2: the refusal [`Self::offer`] would give `content` in `scope`
+    /// now, without offering it. Answers the claim time the offer would get.
+    pub fn admit_offer(
+        &mut self,
+        now: Instant,
+        scope: &Scope,
+        claim_ttl: Option<Duration>,
+        content: &Content,
+    ) -> Result<Duration, PostError> {
+        self.expire_dedup(now);
+        self.check_body(content)?;
+        let claim_ttl = claim_ttl.unwrap_or(self.limits.default_claim_ttl);
+        if claim_ttl < self.limits.min_claim_ttl || claim_ttl > self.limits.max_claim_ttl {
+            return Err(PostError::ClaimTtlOutOfRange {
+                min_ms: millis(self.limits.min_claim_ttl),
+                max_ms: millis(self.limits.max_claim_ttl),
+            });
+        }
+        self.check_rate(now, &content.from)?;
+        let open = self
+            .messages
+            .iter()
+            .filter(|m| m.is_offer() && !m.state.is_terminal() && m.scope() == Some(scope))
+            .count();
+        if open >= self.limits.max_offers_per_scope {
+            return Err(PostError::TooManyOffers {
+                limit: self.limits.max_offers_per_scope,
+            });
+        }
+        self.check_id(content.id.as_ref())?;
+        self.check_room(1)?;
+        Ok(claim_ttl)
     }
 
     /// Push an offer that no one holds to the first candidate that has not
@@ -1480,6 +1521,11 @@ impl Inbox {
             });
         }
         Ok(())
+    }
+
+    /// `pane_id`'s inbox is below its per-recipient bound.
+    fn has_room_for(&self, pane_id: &str) -> bool {
+        self.live_for_pane(pane_id) < self.limits.max_per_recipient
     }
 
     fn check_room(&self, needed: usize) -> Result<(), PostError> {
