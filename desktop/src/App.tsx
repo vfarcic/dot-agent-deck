@@ -90,6 +90,7 @@ import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRu
 import { DEFAULT_VOICE_SETTINGS, modeScopedKey } from "./lib/bridge";
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
+import { questionAgentName } from "./lib/voiceQuestion";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
@@ -814,6 +815,12 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* PRD #1541 — the agent's type, turn and the deck's prompt keys, for
          the interrupt / clear / scratch commands. */
       ...voicePaneAgent(paneShownAgent),
+      /* PRD #1631 — the question the agent is waiting on, which voice answers
+         from this pane, and only from this pane (decision 9). */
+      question: paneShownAgent.pendingQuestion,
+      /* Issue #1668 — sentences about that question name the agent as
+         Reading does: an orchestration agent by its run's title too. */
+      questionLabel: questionAgentName(paneShownAgent),
     }
     : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab, prBrowser]);
   /**

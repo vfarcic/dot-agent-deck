@@ -136,7 +136,7 @@ fn plugin_template(binary_path: &str) -> String {
     let binary_path_json =
         serde_json::to_string(binary_path).expect("serializing a &str to a String is infallible");
     format!(
-        r#"import {{ execFileSync }} from "child_process";
+        r#"import {{ execFileSync, spawn }} from "child_process";
 
 // Duplicate-load guard. The installer fans out to EVERY candidate config root
 // that exists (`$XDG_CONFIG_HOME/opencode` and `~/.opencode`) because it cannot
@@ -269,6 +269,191 @@ const sendEvent = (payload) => {{
       stdio: ["pipe", "ignore", "ignore"],
     }});
   }} catch (_) {{}}
+}};
+
+// PRD #1631: questions the deck may answer. For `permission.asked` and
+// `question.asked` the plugin starts `await-answer`, which reports the question
+// to the deck and waits for an answer, and replies through OpenCode's own API
+// when one comes. `heldAnswers` maps OpenCode's request id to that child, so
+// an answer given in OpenCode itself (`*.replied`, `question.rejected`) stops
+// it. Nothing here blocks the event loop: the child is spawned, not exec'd.
+const heldAnswers = new Map();
+
+const stopHeldAnswer = (requestId) => {{
+  const child = heldAnswers.get(requestId);
+  if (child) {{
+    heldAnswers.delete(requestId);
+    try {{
+      child.kill();
+    }} catch (_) {{}}
+  }}
+}};
+
+// Request ids OpenCode reported answered (`*.replied`, `question.rejected`),
+// so a failed reply is not raised again for a prompt that is already gone.
+// Bounded: only the most recent are kept.
+const resolvedRequests = new Set();
+const noteResolved = (requestId) => {{
+  if (typeof requestId !== "string" || !requestId) {{
+    return;
+  }}
+  resolvedRequests.add(requestId);
+  if (resolvedRequests.size > 256) {{
+    resolvedRequests.delete(resolvedRequests.values().next().value);
+  }}
+}};
+
+// `client._client` is the SDK's underlying HTTP client. The plugin's v1 client
+// has no question-reply method, and posting through it is what was measured to
+// dismiss OpenCode's dialog (PRD #1631 follow-up d). An SDK internal, so it is
+// used here and nowhere else. Resolves to what OpenCode made of the reply —
+// `{{ delivered: true }}`, or `{{ delivered: false, detail }}` when there is no
+// client to post through, the post throws, or OpenCode answers with an error
+// (the SDK reports one as `error`, or a response that is not ok, rather than
+// throwing) — which `await-answer --ack` passes to the deck.
+const replyThroughOpenCode = async (client, answer) => {{
+  const refused = (detail) => ({{ delivered: false, detail: String(detail).slice(0, 200) }});
+  const http = client?._client;
+  if (!http || typeof http.post !== "function") {{
+    return refused("the plugin has no OpenCode client to reply through");
+  }}
+  const requestID = answer?.request_id;
+  if (typeof requestID !== "string" || !requestID) {{
+    return refused("the answer names no request");
+  }}
+  const url =
+    answer.kind === "permission"
+      ? "/permission/{{requestID}}/reply"
+      : answer.kind === "question"
+        ? "/question/{{requestID}}/reply"
+        : null;
+  if (!url) {{
+    return refused("the answer is not a permission or a question reply");
+  }}
+  try {{
+    const result = await http.post({{ url, path: {{ requestID }}, body: answer.body }});
+    const status = result?.response?.status;
+    if (result?.error !== undefined && result?.error !== null) {{
+      return refused(status ? `OpenCode answered ${{status}}` : "OpenCode refused the reply");
+    }}
+    if (result?.response && result.response.ok === false) {{
+      return refused(`OpenCode answered ${{status}}`);
+    }}
+    return {{ delivered: true }};
+  }} catch (error) {{
+    return refused(error?.message ?? "the reply could not be posted");
+  }}
+}};
+
+// One `await-answer --ack` child per question: the payload goes in as the
+// first line of its stdin, the reply OpenCode should get comes back as one
+// line of stdout, and what OpenCode made of it goes back as one more stdin
+// line, which the child passes to the deck — so the deck reports the answer
+// sent only once OpenCode took it. When OpenCode did not, the question is
+// raised again, so it is pending in the deck once more and can be answered.
+// `fallback` reports the question plainly, so the card still shows it: it runs
+// once when the question cannot be held — it names no request, or its child
+// cannot be spawned — and once when the child fails before it is done with the
+// question (it cannot be started, exits non-zero, or is killed by anything but
+// this plugin). `await-answer` exits 0 on every outcome it handles, a refusal
+// it reports plainly itself included, so a clean exit adds no second report.
+const awaitAnswer = (client, payload, fallback) => {{
+  const requestId = payload?.properties?.id;
+  if (typeof requestId !== "string" || !requestId) {{
+    fallback?.();
+    return;
+  }}
+  stopHeldAnswer(requestId);
+  resolvedRequests.delete(requestId);
+  let child;
+  try {{
+    child = spawn(hookBinary(), ["await-answer", "--agent", "opencode", "--ack"], {{
+      stdio: ["pipe", "pipe", "ignore"],
+    }});
+  }} catch (_) {{
+    fallback?.();
+    return;
+  }}
+  heldAnswers.set(requestId, child);
+  // A child this plugin stopped (`stopHeldAnswer`, shutdown) or that printed
+  // the deck's answer is no longer in `heldAnswers`, so its end is no failure.
+  let failed = false;
+  const failedEarly = (code, signal) => {{
+    if (failed || shuttingDown || heldAnswers.get(requestId) !== child) {{
+      return;
+    }}
+    if (code === 0 && !signal) {{
+      return;
+    }}
+    failed = true;
+    fallback?.();
+  }};
+  const forget = () => {{
+    if (heldAnswers.get(requestId) === child) {{
+      heldAnswers.delete(requestId);
+    }}
+  }};
+  let out = "";
+  let answered = false;
+  const acknowledge = (ack) => {{
+    try {{
+      child.stdin?.end(JSON.stringify(ack) + "\n");
+    }} catch (_) {{}}
+  }};
+  child.stdout?.on("data", async (chunk) => {{
+    if (answered) {{
+      return;
+    }}
+    out += chunk;
+    const newline = out.indexOf("\n");
+    if (newline < 0) {{
+      return;
+    }}
+    answered = true;
+    // The deck has answered: OpenCode's own `*.replied` for this request must
+    // not stop the child while it waits to pass on the outcome.
+    forget();
+    let answer;
+    try {{
+      answer = JSON.parse(out.slice(0, newline));
+    }} catch (_) {{
+      acknowledge({{ delivered: false, detail: "the deck's answer could not be read" }});
+      return;
+    }}
+    const ack = await replyThroughOpenCode(client, answer);
+    acknowledge(ack);
+    if (!ack.delivered && !shuttingDown && !resolvedRequests.has(requestId)) {{
+      awaitAnswer(client, payload, fallback);
+    }}
+  }});
+  child.on("error", () => {{
+    failedEarly(null, "error");
+    forget();
+  }});
+  child.on("close", (code, signal) => {{
+    failedEarly(code, signal);
+    forget();
+  }});
+  // A child that exits first turns a later write into an EPIPE on the stream,
+  // which must not surface as an unhandled error inside OpenCode.
+  child.stdin?.on("error", () => {{}});
+  try {{
+    child.stdin?.write(JSON.stringify(payload) + "\n");
+  }} catch (_) {{}}
+}};
+
+const questionPayload = (event, directory) => {{
+  const props = event?.properties ?? {{}};
+  const cwd = directory ?? process.cwd();
+  return {{
+    session_id: normalizeSessionId(
+      defaultSessionId(props.sessionID ?? props.sessionId),
+      cwd
+    ),
+    event: event?.type ?? "question.unknown",
+    properties: props,
+    cwd,
+  }};
 }};
 
 const defaultSessionId = (value) => (value ? value : "unknown");
@@ -445,6 +630,8 @@ const permissionPayload = (event, directory) => {{
     event: event?.type ?? "permission.unknown",
     prompt: permissionPrompt(props),
     cwd,
+    // PRD #1631: the request a `*.replied` / `question.rejected` answers.
+    request_id: props.requestID ?? props.id,
   }};
 }};
 
@@ -1038,21 +1225,55 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         recordReplyDelta(event?.properties);
         return;
       }}
-      if (eventType === "permission.asked" || eventType === "permission.replied") {{
+      if (
+        eventType === "permission.asked" ||
+        eventType === "permission.replied" ||
+        eventType === "question.asked" ||
+        eventType === "question.replied" ||
+        eventType === "question.rejected"
+      ) {{
         // Issue #1678: a child session's prompt is its subagent's, filed under
-        // the root with the child's id, like its tool calls.
+        // the root with the child's id, like its tool calls. PRD #1631: and,
+        // like the root's, the ask goes through `await-answer` so the deck can
+        // answer it, and the reply names the request it answers. A question
+        // form is the subagent's in the same way as a permission prompt.
         const props = event?.properties ?? {{}};
         const askingId = props.sessionID ?? props.sessionId;
         if (isChildSession(askingId)) {{
-          sendEvent(
-            subagentPayload(undefined, askingId, directory, {{
-              event: eventType,
-              prompt: permissionPrompt(props),
-            }})
-          );
+          const payload = subagentPayload(undefined, askingId, directory, {{
+            event: eventType,
+            prompt: permissionPrompt(props),
+          }});
+          if (eventType === "permission.asked" || eventType === "question.asked") {{
+            awaitAnswer(ctx?.client, {{ ...payload, properties: props }}, () => sendEvent(payload));
+            return;
+          }}
+          payload.request_id = props.requestID ?? props.id;
+          noteResolved(payload.request_id);
+          stopHeldAnswer(payload.request_id);
+          sendEvent(payload);
           return;
         }}
+      }}
+      if (eventType === "permission.asked" || eventType === "question.asked") {{
+        // PRD #1631: reported through `await-answer`, which also waits for
+        // the deck's answer. A prompt that cannot be held, or whose child
+        // fails before it is done with it, is reported plainly, with no
+        // `properties`, so the card still shows it.
+        const payload = questionPayload(event, directory);
+        ensureSessionRegistered(payload.session_id, payload.cwd);
+        const plain = permissionPayload(event, directory);
+        awaitAnswer(ctx?.client, payload, () => sendEvent(plain));
+        return;
+      }}
+      if (
+        eventType === "permission.replied" ||
+        eventType === "question.replied" ||
+        eventType === "question.rejected"
+      ) {{
         const payload = permissionPayload(event, directory);
+        noteResolved(payload.request_id);
+        stopHeldAnswer(payload.request_id);
         ensureSessionRegistered(payload.session_id, payload.cwd);
         sendEvent(payload);
         return;
@@ -1102,6 +1323,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
             event: "tool.execute.before",
             tool_name: input?.tool,
             tool_input: output?.args,
+            call_id: input?.callID,
           }})
         );
         return;
@@ -1116,6 +1338,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         event: "tool.execute.before",
         tool_name: input?.tool,
         tool_input: output?.args,
+        call_id: input?.callID,
         cwd: directory,
       }});
     }},
@@ -1126,6 +1349,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
             event: "tool.execute.after",
             tool_name: input?.tool,
             tool_input: input?.args,
+            call_id: input?.callID,
           }})
         );
         return;
@@ -1140,6 +1364,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         event: "tool.execute.after",
         tool_name: input?.tool,
         tool_input: input?.args,
+        call_id: input?.callID,
         cwd: directory,
       }});
     }},
@@ -1966,7 +2191,7 @@ pub(crate) mod tests {
     #[test]
     fn plugin_template_uses_exec_file_sync() {
         let content = plugin_template("/usr/local/bin/dot-agent-deck");
-        assert!(content.contains("import { execFileSync } from \"child_process\";"));
+        assert!(content.contains("import { execFileSync, spawn } from \"child_process\";"));
         assert!(!content.contains("execSync("));
         assert!(content.contains(r#"BINARY_PATH = "/usr/local/bin/dot-agent-deck""#));
         assert!(content.contains("const knownSessions = new Map();"));
@@ -1978,6 +2203,9 @@ pub(crate) mod tests {
         assert!(content.contains("eventType === \"message.updated\""));
         assert!(content.contains("const permissionPayload"));
         assert!(content.contains("\"permission.asked\""));
+        // PR #1698 review: both tool hooks, root and child session, forward the
+        // call's id, which a `permission.asked` names as `tool.callID`.
+        assert_eq!(content.matches("call_id: input?.callID,").count(), 4);
     }
 
     /// The installer intentionally fans out to every existing OpenCode config
@@ -3092,6 +3320,19 @@ await send("session.idle", {{ sessionID: "s1" }});
     /// `SKIP:`) when Node is not available. `node_args` go before the driver.
     #[cfg(unix)]
     fn run_plugin_driver(body: &str, node_args: &[&str]) -> Option<Vec<serde_json::Value>> {
+        run_plugin_driver_with_awaits(body, node_args).map(|(payloads, _)| payloads)
+    }
+
+    /// [`run_plugin_driver`], also answering what the plugin handed
+    /// `await-answer` (PRD #1631): its recorder reads that first stdin line,
+    /// keeps it apart from the plain reports and exits without an answer.
+    /// The driver gets `awaited(n)`, which waits until `n` have been handed
+    /// over, so a later event cannot stop a child before it has read.
+    #[cfg(unix)]
+    fn run_plugin_driver_with_awaits(
+        body: &str,
+        node_args: &[&str],
+    ) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
         if std::process::Command::new("node")
             .arg("--version")
             .output()
@@ -3102,13 +3343,14 @@ await send("session.idle", {{ sessionID: "s1" }});
         }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("payloads.jsonl");
+        let awaits = dir.path().join("awaits.jsonl");
         let recorder = dir.path().join("recorder.sh");
         crate::test_isolation::write_script(
             &recorder,
             format!(
-                "#!/bin/sh\ncat >> '{}'\necho >> '{}'\n",
-                out.display(),
-                out.display()
+                "#!/bin/sh\nif [ \"$1\" = \"await-answer\" ]; then\n  IFS= read -r input\n  printf '%s\\n' \"$input\" >> '{awaits}'\n  exit 0\nfi\ncat >> '{out}'\necho >> '{out}'\n",
+                awaits = awaits.display(),
+                out = out.display(),
             ),
         )
         .unwrap();
@@ -3122,8 +3364,9 @@ await send("session.idle", {{ sessionID: "s1" }});
         std::fs::write(
             &driver,
             format!(
-                "import plugin from {};\n{body}",
-                serde_json::to_string(&plugin.display().to_string()).unwrap()
+                "import plugin from {plugin};\nimport {{ existsSync as awaitsExist, readFileSync as readAwaits }} from \"fs\";\nconst awaited = async (n) => {{\n  for (let i = 0; i < 1600; i += 1) {{\n    if (awaitsExist({awaits}) && readAwaits({awaits}, \"utf8\").split(\"\\n\").filter(Boolean).length >= n) return;\n    await new Promise((r) => setTimeout(r, 25));\n  }}\n  throw new Error(\"await-answer was not handed \" + n);\n}};\n{body}",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+                awaits = serde_json::to_string(&awaits.display().to_string()).unwrap(),
             ),
         )
         .unwrap();
@@ -3137,14 +3380,15 @@ await send("session.idle", {{ sessionID: "s1" }});
             "the plugin driver failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        Some(
-            std::fs::read_to_string(&out)
+        let read = |path: &Path| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(path)
                 .unwrap_or_default()
                 .lines()
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| serde_json::from_str(l).expect("every payload is JSON the deck decodes"))
-                .collect(),
-        )
+                .collect()
+        };
+        Some((read(&out), read(&awaits)))
     }
 
     /// The final replies the plugin attached to its idle reports, in order,
@@ -3404,20 +3648,27 @@ await status("grandchild", "idle");
     /// Issue #1678 audit AU-2: a known child's permission prompt and its answer
     /// are filed under the root with the child's id — decoded as that
     /// subagent's `PermissionRequest` and its answered prompt — while the
-    /// root's own prompt stays the main thread's.
+    /// root's own prompt carries no subagent attribution. PRD #1631: both asks
+    /// go to `await-answer`, so the deck can answer either; the child's names
+    /// its subagent and becomes that subagent's question, and the child's
+    /// reply names the request it answers. A child's ask with no request id,
+    /// which the deck could not answer, is still reported, plainly.
     #[cfg(unix)]
     #[test]
     fn opencode_plugin_attributes_a_childs_permission_prompt_to_its_subagent() {
-        let Some(payloads) = run_plugin_driver(
+        let Some((payloads, awaits)) = run_plugin_driver_with_awaits(
             r#"
 const hooks = await plugin({ directory: "/work" });
 const send = (type, properties) => hooks.event({ event: { type, properties } });
 await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
 await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
 await send("session.status", { sessionID: "child", status: { type: "busy" } });
-await send("permission.asked", { sessionID: "child", title: "CHILD_ASK" });
-await send("permission.replied", { sessionID: "child" });
-await send("permission.asked", { sessionID: "root", title: "ROOT_ASK" });
+await send("permission.asked", { sessionID: "child", id: "per_child", permission: "bash", patterns: ["touch c"], title: "CHILD_ASK" });
+await awaited(1);
+await send("permission.replied", { sessionID: "child", requestID: "per_child", reply: "once" });
+await send("permission.asked", { sessionID: "root", id: "per_root", permission: "bash", patterns: ["touch r"], title: "ROOT_ASK" });
+await awaited(2);
+await send("permission.asked", { sessionID: "child", title: "UNHELD_ASK" });
 "#,
             &[],
         ) else {
@@ -3428,9 +3679,8 @@ await send("permission.asked", { sessionID: "root", title: "ROOT_ASK" });
             vec![
                 row("root", "session.created", ""),
                 row("root", "subagent.start", "child"),
-                row("root", "permission.asked", "child"),
                 row("root", "permission.replied", "child"),
-                row("root", "permission.asked", ""),
+                row("root", "permission.asked", "child"),
                 row("root", "subagent.stop", "child"),
                 row("root", "session.deleted", ""),
             ],
@@ -3443,14 +3693,56 @@ await send("permission.asked", { sessionID: "root", title: "ROOT_ASK" });
                     .expect("every payload maps to an event")
             })
             .collect();
-        assert_eq!(payloads[2]["prompt"], "CHILD_ASK");
+        assert!(decoded[2].is_subagent_permission_reply());
+        assert_eq!(decoded[2].resolved_question_id(), Some("per_child"));
+        assert_eq!(payloads[3]["prompt"], "UNHELD_ASK");
+        assert!(payloads[3].get("properties").is_none(), "{:?}", payloads[3]);
         assert_eq!(
-            decoded[2].event_type,
+            decoded[3].event_type,
             crate::event::EventType::PermissionRequest
         );
-        assert!(decoded[2].is_from_subagent());
-        assert!(decoded[3].is_subagent_permission_reply());
-        assert!(!decoded[4].is_from_subagent());
+        assert!(decoded[3].is_from_subagent());
+        assert_eq!(decoded[3].question(), None);
+
+        // What each `await-answer` was handed, in whichever order the two
+        // children read it.
+        let asked = |id: &str| {
+            let payload = awaits
+                .iter()
+                .find(|p| p["properties"]["id"] == id)
+                .unwrap_or_else(|| panic!("{id} was not held: {awaits:#?}"));
+            let (event, question) = crate::hook::build_opencode_event_with_question(
+                serde_json::from_value(payload.clone()).unwrap(),
+            )
+            .expect("an event");
+            (payload.clone(), event, question.expect("a question"))
+        };
+        assert_eq!(awaits.len(), 2, "{awaits:#?}");
+        let (child, child_event, child_question) = asked("per_child");
+        assert_eq!(
+            (
+                &child["session_id"],
+                &child["subagent_id"],
+                &child["prompt"]
+            ),
+            (
+                &serde_json::Value::from("root"),
+                &serde_json::Value::from("child"),
+                &serde_json::Value::from("CHILD_ASK")
+            )
+        );
+        assert_eq!(
+            child_event.event_type,
+            crate::event::EventType::PermissionRequest
+        );
+        assert!(child_event.is_from_subagent());
+        assert_eq!(child_question.id, "per_child");
+        assert_eq!(child_question.subagent_id.as_deref(), Some("child"));
+        let (root, root_event, root_question) = asked("per_root");
+        assert_eq!(root["session_id"], "root");
+        assert!(root.get("subagent_id").is_none(), "{root}");
+        assert!(!root_event.is_from_subagent());
+        assert_eq!(root_question.subagent_id, None);
     }
 
     /// Issue #1678 audit AU-3: a child's user message recorded before its
@@ -4049,6 +4341,428 @@ for (const [s, error] of [["d1", "APIError"], ["d2", "MessageAbortedError"]]) {
                 }))
                 .collect::<Vec<_>>(),
             "{payloads:#?}"
+        );
+    }
+
+    /// Scenario: Load the generated plugin under Node with its binary pinned
+    /// to a recorder and a stand-in OpenCode client, and send it OpenCode's
+    /// captured two-question `question.asked`. The plugin hands the question to
+    /// `await-answer` and posts the answer it prints to
+    /// `/question/{requestID}/reply`. A `permission.asked` whose answer is
+    /// still pending is then answered in OpenCode (`permission.replied`): the
+    /// plugin stops the waiting child, posts nothing for it, and forwards the
+    /// reply with its request id, as it does a `question.rejected`. Each child
+    /// is told what OpenCode made of the reply it printed; a reply OpenCode
+    /// refuses is reported as not taken and the question is raised again, and
+    /// the second reply, which OpenCode takes, is reported as delivered.
+    #[cfg(unix)]
+    #[spec("question/detect/007")]
+    #[test]
+    fn question_detect_007_opencode_plugin_holds_and_replies_through_opencode() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let fixture = |name: &str| {
+            std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/agent-questions")
+                    .join(name),
+            )
+            .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let payloads = dir.path().join("payloads.jsonl");
+        let awaits = dir.path().join("await.jsonl");
+        let posts = dir.path().join("posts.json");
+        let acks = dir.path().join("acks.jsonl");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "await-answer" ]; then
+  IFS= read -r input
+  printf '%s\n' "$*|$input" >> '{awaits}'
+  case "$input" in
+    *per_hold*) sleep 2; echo '{{"kind":"permission","request_id":"per_hold","body":{{"reply":"once"}}}}' ;;
+    *per_fail*) echo '{{"kind":"permission","request_id":"per_fail","body":{{"reply":"once"}}}}' ;;
+    *) echo '{{"kind":"question","request_id":"que_1043ff915001MjL9vryfDO6HZX","body":{{"answers":[["Blue"],["Small","Large"]]}}}}' ;;
+  esac
+  IFS= read -r ack && printf '%s\n' "$ack" >> '{acks}'
+else
+  cat >> '{payloads}'
+  echo >> '{payloads}'
+fi
+"#,
+                awaits = awaits.display(),
+                acks = acks.display(),
+                payloads = payloads.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import plugin from "{plugin}";
+import {{ writeFileSync }} from "fs";
+const posts = [];
+let refuseNext = false;
+const client = {{ _client: {{ post: async (req) => {{
+  posts.push(req);
+  if (refuseNext) {{
+    refuseNext = false;
+    // The SDK reports an error response rather than throwing.
+    return {{ error: {{ name: "NotFoundError" }}, response: {{ ok: false, status: 500 }} }};
+  }}
+  return {{ data: true, response: {{ ok: true, status: 200 }} }};
+}} }} }};
+const hooks = await plugin({{ directory: "/work", client }});
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+await hooks.event({{ event: {{ type: "question.asked", properties: {question} }} }});
+for (let i = 0; i < 100 && posts.length === 0; i++) await wait(50);
+const held = {{ ...{permission}, id: "per_hold" }};
+await hooks.event({{ event: {{ type: "permission.asked", properties: held }} }});
+await wait(300);
+await hooks.event({{ event: {{ type: "permission.replied", properties: {{ sessionID: held.sessionID, requestID: "per_hold", reply: "once" }} }} }});
+await hooks.event({{ event: {{ type: "question.rejected", properties: {{ sessionID: held.sessionID, requestID: "que_rejected" }} }} }});
+refuseNext = true;
+await hooks.event({{ event: {{ type: "permission.asked", properties: {{ ...held, id: "per_fail" }} }} }});
+for (let i = 0; i < 100 && posts.length < 3; i++) await wait(50);
+await wait(2600);
+writeFileSync("{posts}", JSON.stringify(posts));
+"#,
+                plugin = plugin.display(),
+                question = fixture("opencode-question-asked.json"),
+                permission = fixture("opencode-permission-asked.json"),
+                posts = posts.display(),
+            ),
+        )
+        .unwrap();
+        let status = std::process::Command::new("node")
+            .arg(&driver)
+            .status()
+            .expect("run node");
+        assert!(status.success(), "the plugin driver failed");
+
+        let posted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&posts).unwrap()).unwrap();
+        let refused_then_taken = serde_json::json!({
+            "url": "/permission/{requestID}/reply",
+            "path": {"requestID": "per_fail"},
+            "body": {"reply": "once"}
+        });
+        assert_eq!(
+            posted,
+            serde_json::json!([
+                {
+                    "url": "/question/{requestID}/reply",
+                    "path": {"requestID": "que_1043ff915001MjL9vryfDO6HZX"},
+                    "body": {"answers": [["Blue"], ["Small", "Large"]]}
+                },
+                refused_then_taken,
+                refused_then_taken,
+            ]),
+            "the question's answer is posted, nothing for the permission OpenCode \
+             answered itself, and the refused reply is posted again once re-asked"
+        );
+
+        let acked: Vec<serde_json::Value> = std::fs::read_to_string(&acks)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            acked,
+            vec![
+                serde_json::json!({"delivered": true}),
+                serde_json::json!({"delivered": false, "detail": "OpenCode answered 500"}),
+                serde_json::json!({"delivered": true}),
+            ],
+            "each child hears what OpenCode made of its reply"
+        );
+
+        let awaited: Vec<String> = std::fs::read_to_string(&awaits)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(awaited.len(), 4, "{awaited:?}");
+        assert!(awaited[0].starts_with("await-answer --agent opencode --ack|"));
+        assert!(awaited[2].contains("per_fail") && awaited[3].contains("per_fail"));
+        let asked: serde_json::Value =
+            serde_json::from_str(awaited[0].split_once('|').unwrap().1).unwrap();
+        assert_eq!(asked["event"], "question.asked");
+        assert_eq!(asked["properties"]["questions"][1]["multiple"], true);
+        assert_eq!(asked["session_id"], "ses_efbc02f39ffeP3cw5BFH7xv6VM");
+
+        let forwarded: Vec<serde_json::Value> = std::fs::read_to_string(&payloads)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let resolved = |event: &str, id: &str| {
+            let payload = forwarded
+                .iter()
+                .find(|p| p["event"] == event)
+                .unwrap_or_else(|| panic!("no {event} forwarded: {forwarded:?}"));
+            assert_eq!(payload["request_id"], id);
+            let input: crate::hook::OpenCodeHookInput =
+                serde_json::from_value(payload.clone()).unwrap();
+            let event = crate::hook::build_opencode_event(input).unwrap();
+            assert_eq!(event.resolved_question_id(), Some(id));
+        };
+        resolved("permission.replied", "per_hold");
+        resolved("question.rejected", "que_rejected");
+    }
+
+    /// Scenario: Load the generated plugin under Node and have a subagent's
+    /// child session ask a question form, which OpenCode then reports answered,
+    /// and ask a second one, which it reports dismissed. The plugin files each
+    /// under the main session with the child's id, as it does the child's
+    /// permission prompts: the card shows the subagent's question and its wait,
+    /// and the answer ends that subagent's wait and clears its question.
+    #[cfg(unix)]
+    #[spec("question/detect/017")]
+    #[test]
+    fn question_detect_017_an_opencode_subagents_question_is_filed_as_the_subagents() {
+        use crate::event::EventType;
+        use crate::state::{AppState, SessionStatus};
+        let mut asked: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/agent-questions/opencode-question-asked.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        asked["sessionID"] = "child".into();
+        let question_id = asked["id"].as_str().unwrap().to_string();
+        let mut dismissed = asked.clone();
+        dismissed["id"] = "que_dismissed".into();
+        let Some((payloads, awaits)) = run_plugin_driver_with_awaits(
+            &format!(
+                r#"
+const hooks = await plugin({{ directory: "/work" }});
+const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
+await send("session.created", {{ sessionID: "root", info: {{ id: "root", directory: "/work" }} }});
+await send("session.created", {{ sessionID: "child", info: {{ id: "child", parentID: "root", directory: "/work" }} }});
+await send("session.status", {{ sessionID: "child", status: {{ type: "busy" }} }});
+await send("question.asked", {asked});
+await awaited(1);
+await send("question.replied", {{ sessionID: "child", requestID: "{question_id}", answers: [["Blue"]] }});
+await send("question.asked", {dismissed});
+await awaited(2);
+await send("question.rejected", {{ sessionID: "child", requestID: "que_dismissed" }});
+"#
+            ),
+            &[],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            payload_rows(&payloads),
+            vec![
+                row("root", "session.created", ""),
+                row("root", "subagent.start", "child"),
+                row("root", "question.replied", "child"),
+                row("root", "question.rejected", "child"),
+                row("root", "subagent.stop", "child"),
+                row("root", "session.deleted", ""),
+            ],
+            "{payloads:#?}"
+        );
+        assert_eq!(awaits.len(), 2, "{awaits:#?}");
+        let held = awaits
+            .iter()
+            .find(|p| p["properties"]["id"] == question_id.as_str())
+            .unwrap_or_else(|| panic!("the child's question was not held: {awaits:#?}"));
+        assert_eq!(held["session_id"], "root");
+        assert_eq!(held["subagent_id"], "child", "{held}");
+        let (asked_event, question) = crate::hook::build_opencode_event_with_question(
+            serde_json::from_value(held.clone()).unwrap(),
+        )
+        .expect("an event");
+        let question = question.expect("the child's form is a question");
+        assert_eq!(asked_event.event_type, EventType::WaitingForInput);
+        assert!(asked_event.is_from_subagent(), "the ask is the subagent's");
+        assert_eq!(question.subagent_id.as_deref(), Some("child"));
+
+        let decode = |payload: &serde_json::Value| {
+            crate::hook::build_opencode_event(serde_json::from_value(payload.clone()).unwrap())
+                .expect("every payload maps to an event")
+        };
+        let replied = decode(&payloads[2]);
+        assert!(replied.is_subagent_permission_reply(), "{replied:?}");
+        assert_eq!(replied.resolved_question_id(), Some(question_id.as_str()));
+        let rejected = decode(&payloads[3]);
+        assert!(rejected.is_subagent_permission_reply(), "{rejected:?}");
+        assert_eq!(rejected.resolved_question_id(), Some("que_dismissed"));
+
+        // What the card makes of it: the subagent's question and wait, which
+        // its answer ends, returning the card to the main thread's status.
+        let mut state = AppState::default();
+        state.register_pane("pane-oc".into());
+        let on_pane = |mut event: crate::event::AgentEvent| {
+            event.pane_id = Some("pane-oc".into());
+            event.agent_id = Some("7".into());
+            event
+        };
+        state.apply_event(on_pane(decode(&payloads[0])));
+        state.apply_event(on_pane(asked_event));
+        {
+            let card = &state.sessions["root"];
+            assert_eq!(card.status, SessionStatus::WaitingForInput);
+            assert_eq!(
+                card.pending_question
+                    .as_ref()
+                    .and_then(|q| q.subagent_id.as_deref()),
+                Some("child")
+            );
+            assert_eq!(
+                card.subagent_wait.as_ref().map(|w| w.subagent_ids.clone()),
+                Some(vec!["child".to_string()]),
+                "the wait is the subagent's"
+            );
+        }
+        state.apply_event(on_pane(replied));
+        let card = &state.sessions["root"];
+        assert_eq!(card.pending_question, None);
+        assert_ne!(card.status, SessionStatus::WaitingForInput);
+    }
+
+    /// Scenario: Load the generated plugin under Node with its binary pinned
+    /// to a recorder whose `await-answer` dies before it hands the question to
+    /// the deck — exiting with an error, or killed — and send it a permission
+    /// prompt and a question form. Each is then reported as the plain event,
+    /// so the card still shows Needs Input; a child that ends normally, having
+    /// handled its question, adds no second report.
+    #[cfg(unix)]
+    #[spec("question/detect/016")]
+    #[test]
+    fn question_detect_016_an_await_answer_child_that_fails_early_falls_back_to_the_plain_event() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let permission: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/agent-questions/opencode-permission-asked.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let payloads = dir.path().join("payloads.jsonl");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "await-answer" ]; then
+  IFS= read -r input
+  case "$input" in
+    *per_crash*|*que_crash*) exit 3 ;;
+    *per_killed*) kill -9 $$ ;;
+    *) exit 0 ;;
+  esac
+else
+  cat >> '{payloads}'
+  echo >> '{payloads}'
+fi
+"#,
+                payloads = payloads.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import plugin from "{plugin}";
+const hooks = await plugin({{ directory: "/work", client: {{}} }});
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const asked = {permission};
+for (const id of ["per_crash", "per_killed", "per_quiet"]) {{
+  await hooks.event({{ event: {{ type: "permission.asked", properties: {{ ...asked, id }} }} }});
+}}
+await hooks.event({{ event: {{ type: "question.asked", properties: {{ id: "que_crash", sessionID: asked.sessionID, questions: [{{ question: "Pick?", header: "Pick", options: [{{ label: "A" }}] }}] }} }} }});
+await wait(1500);
+"#,
+                plugin = plugin.display(),
+                permission = permission,
+            ),
+        )
+        .unwrap();
+        let status = std::process::Command::new("node")
+            .arg(&driver)
+            .status()
+            .expect("run node");
+        assert!(status.success(), "the plugin driver failed");
+
+        let forwarded: Vec<serde_json::Value> = std::fs::read_to_string(&payloads)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let reported = |event: &str, id: &str| {
+            forwarded
+                .iter()
+                .filter(|p| p["event"] == event && p["request_id"] == id)
+                .count()
+        };
+        assert_eq!(
+            reported("permission.asked", "per_crash"),
+            1,
+            "{forwarded:#?}"
+        );
+        assert_eq!(
+            reported("permission.asked", "per_killed"),
+            1,
+            "{forwarded:#?}"
+        );
+        assert_eq!(reported("question.asked", "que_crash"), 1, "{forwarded:#?}");
+        assert_eq!(
+            reported("permission.asked", "per_quiet"),
+            0,
+            "a child that handled its question adds no report: {forwarded:#?}"
+        );
+        let plain: crate::hook::OpenCodeHookInput = serde_json::from_value(
+            forwarded
+                .iter()
+                .find(|p| p["request_id"] == "que_crash")
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::hook::build_opencode_event(plain).map(|e| e.event_type),
+            Some(crate::event::EventType::WaitingForInput),
+            "the plain question reads as Needs Input"
         );
     }
 }

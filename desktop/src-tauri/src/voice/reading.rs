@@ -128,6 +128,14 @@ pub const FAILURE_COALESCE_WINDOW: Duration = Duration::from_secs(3);
 /// leaves a wide margin while keeping the announcement prompt.
 pub const FAILED_REPLY_HOLD: Duration = Duration::from_secs(1);
 
+/// How long, by event timestamp, an announced permission hook owes [`coalesce`]
+/// the `permission_prompt` notification that describes the same prompt. Claude
+/// Code's notification was measured at 6.0 s after its `PermissionRequest`
+/// hook, in 4 runs of 4; 30 s covers that five times over, while a missing
+/// notification stops silencing the next notification-only prompt half a
+/// minute later.
+pub const PERMISSION_NOTICE_WINDOW: Duration = Duration::from_secs(30);
+
 /// What a reading start answers while the Settings switch is off on disk —
 /// only in a race, since the webview starts sessions only while it shows the
 /// switch on, so it is not spoken.
@@ -155,8 +163,20 @@ pub enum TurnEvent {
     Failed { reply: String },
     /// The agent is asking permission. `wants` is what it is asking to do, in
     /// one line — "run cargo publish", "Bash: cargo publish" — and may be empty
-    /// when the agent did not say.
-    Permission { wants: String },
+    /// when the agent did not say. `options` is how to answer it by voice —
+    /// " Say 1 for Yes, or 3 for No." ([`options_sentence`]) — or empty when
+    /// the event carries no question voice can answer.
+    Permission { wants: String, options: String },
+    /// A notification that the agent is waiting on a permission prompt, with
+    /// no question of its own: Claude Code's `permission_prompt`. Said like a
+    /// [`TurnEvent::Permission`], except when it describes a prompt already
+    /// announced from its permission hook ([`coalesce`]).
+    PermissionNotice { wants: String },
+    /// The deck answered the agent's question itself — by voice — so the
+    /// prompt announced for it is decided and should not be said any more.
+    /// Never spoken: it retracts the agent's permission prompts still waiting
+    /// in the webview's speech queue.
+    PermissionAnswered,
     /// The agent stopped and cannot go on by itself.
     Blocked { cause: BlockCause },
 }
@@ -265,8 +285,8 @@ impl TurnEventSource for DaemonTurnEvents {
                         let BroadcastMsg::Event(event) = message else {
                             continue;
                         };
-                        if let Some(status) = status_turn_event(&event, &agent_id)
-                            && status_tx.send(Incoming::Status(status)).await.is_err()
+                        if let Some(status) = status_incoming(&event, &agent_id)
+                            && status_tx.send(status).await.is_err()
                         {
                             return;
                         }
@@ -297,7 +317,17 @@ impl TurnEventSource for DaemonTurnEvents {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
     Reply(FinalReply),
-    Status(TurnEvent),
+    /// A status and the timestamp of the event it came from, in milliseconds
+    /// since the Unix epoch ([`status_incoming`]), which times a permission
+    /// prompt's notification against its hook ([`PERMISSION_NOTICE_WINDOW`]).
+    StatusAt(TurnEvent, i64),
+}
+
+/// [`status_turn_event`] as what [`coalesce`] merges, stamped with `event`'s
+/// timestamp.
+pub fn status_incoming(event: &AgentEvent, agent_id: &str) -> Option<Incoming> {
+    status_turn_event(event, agent_id)
+        .map(|status| Incoming::StatusAt(status, event.timestamp.timestamp_millis()))
 }
 
 /// The status event `event` means for reading the agent `agent_id`, or `None`.
@@ -305,28 +335,54 @@ pub enum Incoming {
 /// Only events naming that agent, and not an outside agent's unproven report.
 /// A permission prompt is a `PermissionRequest`, or a `WaitingForInput` that is
 /// not some other kind of notification (Claude Code's is installed for
-/// permission prompts only). An error is an `Error` that ends work: not a
-/// failed tool call (an `Error` naming a tool, after which the agent carries
-/// on) and not the deck's own delivery notice about a message it could not
-/// hand the agent. A usage limit is a `QuotaBlocked`.
+/// permission prompts only) — a [`TurnEvent::PermissionNotice`] when it carries
+/// no question, as Claude Code's notification does not. An error is an `Error`
+/// that ends work: not a failed tool call (an `Error` naming a tool, after
+/// which the agent carries on) and not the deck's own delivery notice about a
+/// message it could not hand the agent. A usage limit is a `QuotaBlocked`. The
+/// deck's own answer to the agent's question is a
+/// [`TurnEvent::PermissionAnswered`], whatever status it reports (an allow
+/// reports `Thinking`, a deny `Unknown`).
 pub fn status_turn_event(event: &AgentEvent, agent_id: &str) -> Option<TurnEvent> {
-    use dot_agent_deck::event::{DELIVERY_NOTICE_METADATA_KEY, UNPROVEN_METADATA_KEY};
+    use dot_agent_deck::event::{
+        DELIVERY_NOTICE_METADATA_KEY, QUESTION_ANSWERED_BY_DECK_METADATA_KEY,
+        QUESTION_METADATA_KEY, UNPROVEN_METADATA_KEY,
+    };
     use dot_agent_deck::quota_block::NOTIFICATION_TYPE_METADATA_KEY;
     if event.agent_id.as_deref() != Some(agent_id)
         || event.metadata.contains_key(UNPROVEN_METADATA_KEY)
     {
         return None;
     }
+    if event
+        .metadata
+        .contains_key(QUESTION_ANSWERED_BY_DECK_METADATA_KEY)
+    {
+        return Some(TurnEvent::PermissionAnswered);
+    }
     match event.event_type {
         EventType::PermissionRequest => Some(TurnEvent::Permission {
             wants: permission_wants(event),
+            options: event
+                .question()
+                .map(|question| options_sentence(&question))
+                .unwrap_or_default(),
         }),
         EventType::WaitingForInput => event
             .metadata
             .get(NOTIFICATION_TYPE_METADATA_KEY)
             .is_none_or(|kind| kind == "permission_prompt")
-            .then(|| TurnEvent::Permission {
-                wants: permission_wants(event),
+            .then(|| {
+                let wants = permission_wants(event);
+                if event.metadata.contains_key(QUESTION_METADATA_KEY) {
+                    let options = event
+                        .question()
+                        .map(|question| options_sentence(&question))
+                        .unwrap_or_default();
+                    TurnEvent::Permission { wants, options }
+                } else {
+                    TurnEvent::PermissionNotice { wants }
+                }
             }),
         EventType::Error
             if event.tool_name.is_none()
@@ -379,6 +435,21 @@ fn permission_wants(event: &AgentEvent) -> String {
 /// merged exactly like one with text, so it is announced once, in its turn's
 /// place (audit A2).
 ///
+/// A permission prompt Claude Code reports twice is announced once when its
+/// two reports arrive as Claude Code sends them. It sends its permission hook
+/// (a [`TurnEvent::Permission`]) when the prompt appears, and its
+/// `permission_prompt` notification (a [`TurnEvent::PermissionNotice`]) about
+/// six seconds later, which can be after the deck already answered the prompt
+/// or the turn moved on. So each announced permission hook owes one
+/// notification, and a notification pays the oldest debt it can, unsaid: one
+/// whose hook's event is stamped no later than the notification's and at most
+/// [`PERMISSION_NOTICE_WINDOW`] before it, by the events' timestamps, not by
+/// when they arrive. A debt lapses once an event is stamped past that window.
+/// A notification nothing is owed for — a Claude Code too old for the
+/// permission hook, a prompt whose hook's debt lapsed, or one stamped before
+/// every hook still owed — is announced. Neither an answer nor the turn's
+/// progress pays a debt: the answered prompt's notification still comes.
+///
 /// Everything else passes through in arrival order, a held reply first.
 pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<TurnEvent>) {
     use tokio::time::{Instant, sleep_until};
@@ -386,6 +457,9 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
     let mut held: Option<(String, Instant)> = None;
     // The failure last announced, and until when it absorbs the other half.
     let mut announced: Option<(Announced, Instant)> = None;
+    // The announced permission hooks whose notification has not come, oldest
+    // first, each as its event's timestamp.
+    let mut notices_owed: std::collections::VecDeque<i64> = std::collections::VecDeque::new();
     loop {
         let next = match held.as_ref().map(|(_, until)| *until) {
             Some(until) => tokio::select! {
@@ -402,6 +476,17 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
         let recent = announced
             .filter(|(_, until)| now < *until)
             .map(|(what, _)| what);
+        // Debts lapsed by this status's event time are no longer owed.
+        if let Some(Some(Incoming::StatusAt(_, at))) = &next {
+            notices_owed.retain(|hook| !notice_lapsed(*hook, *at));
+        }
+        // The oldest debt a permission notification pays, if it pays one.
+        let paid = match &next {
+            Some(Some(Incoming::StatusAt(TurnEvent::PermissionNotice { .. }, at))) => {
+                notices_owed.iter().position(|hook| notice_pays(*hook, *at))
+            }
+            _ => None,
+        };
         let mut emit = Vec::new();
         let release_held =
             |held: &mut Option<(String, Instant)>,
@@ -432,7 +517,7 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                 release_held(&mut held, &mut emit, &mut announced);
                 emit.push(TurnEvent::Finished { reply: reply.text });
             }
-            Some(Some(Incoming::Status(TurnEvent::Blocked { cause }))) => {
+            Some(Some(Incoming::StatusAt(TurnEvent::Blocked { cause }, _))) => {
                 match (held.is_some(), cause, recent) {
                     // The usage limit replaces the held failed reply.
                     (true, BlockCause::Quota, _) => {
@@ -463,8 +548,18 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                     }
                 }
             }
-            Some(Some(Incoming::Status(status))) => {
+            // The notification of the oldest prompt already announced that it
+            // can belong to.
+            Some(Some(Incoming::StatusAt(TurnEvent::PermissionNotice { .. }, _)))
+                if let Some(paid) = paid =>
+            {
+                notices_owed.remove(paid);
+            }
+            Some(Some(Incoming::StatusAt(status, at))) => {
                 release_held(&mut held, &mut emit, &mut announced);
+                if let TurnEvent::Permission { .. } = status {
+                    notices_owed.push_back(at);
+                }
                 emit.push(status);
             }
         }
@@ -474,6 +569,21 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
             }
         }
     }
+}
+
+/// Whether a notification at `notice` comes too late to be the one a permission
+/// hook at `hook` owes ([`PERMISSION_NOTICE_WINDOW`]), both in milliseconds
+/// since the Unix epoch. A notification stamped before its hook is not late,
+/// though it cannot pay that hook's debt either ([`notice_pays`]).
+fn notice_lapsed(hook: i64, notice: i64) -> bool {
+    i128::from(notice) - i128::from(hook) > PERMISSION_NOTICE_WINDOW.as_millis() as i128
+}
+
+/// Whether a notification at `notice` can be the one a permission hook at
+/// `hook` owes: stamped no earlier than the hook and within
+/// [`PERMISSION_NOTICE_WINDOW`] of it.
+fn notice_pays(hook: i64, notice: i64) -> bool {
+    notice >= hook && !notice_lapsed(hook, notice)
 }
 
 /// What [`coalesce`] last announced of a failed turn.
@@ -515,6 +625,10 @@ pub enum ReadingSentenceKind {
     Turn,
     /// A permission prompt, announced at once.
     Permission,
+    /// The deck answered the agent's question by voice. Not a sentence to
+    /// queue, and its text is empty: the webview drops this agent's
+    /// permission prompts still waiting to be said, and nothing else.
+    PermissionAnswered,
     /// An error or quota block, announced at once.
     Blocked,
     /// Reading ended on this side because its Settings switch was turned
@@ -729,6 +843,84 @@ pub fn permission_sentence(agent: &str, wants: &str) -> String {
     )
 }
 
+/// The most options [`options_sentence`] reads out; the rest are counted.
+pub const MAX_OPTIONS_READ: usize = 6;
+/// The longest option label [`options_sentence`] reads out.
+const MAX_OPTION_LABEL_CHARS: usize = 120;
+
+/// PR #1698: how to answer a prompt by voice, read after it so the user knows
+/// what to say — " Say 1 for Yes or 3 for No." — with the numbers the agent
+/// draws beside its options. An option whose number on screen is not certain,
+/// because the agent may leave out an option before it, is read by name
+/// alone: " Say 1 for Yes, or say No." Only the options voice can pick are
+/// read, so a number skipped is one to answer by keyboard. On a form, the
+/// first question's: " First, Colour: say 1 for Red; 2 for Green; or 3 for
+/// Blue." Empty when voice can answer none of them.
+pub fn options_sentence(question: &dot_agent_deck::question::PendingQuestion) -> String {
+    use dot_agent_deck::question::AnswerChannel;
+    if !matches!(question.channel, AnswerChannel::Held | AnswerChannel::Keys) {
+        return String::new();
+    }
+    let Some(first) = question.questions.first() else {
+        return String::new();
+    };
+    // Each option voice can pick: its label, and its number where that is
+    // the number on screen whatever the agent draws.
+    let options: Vec<(Option<u32>, String)> = first
+        .options
+        .iter()
+        .filter(|option| option.answerable())
+        .map(|option| {
+            let label = one_line(&option.label, MAX_OPTION_LABEL_CHARS);
+            (
+                first.number_certain(option).then_some(option.index),
+                label.trim_end_matches(['.', ' ']).to_string(),
+            )
+        })
+        .collect();
+    if options.is_empty() {
+        return String::new();
+    }
+    let read = &options[..options.len().min(MAX_OPTIONS_READ)];
+    let more = options.len() - read.len();
+    let numbered: Vec<String> = read
+        .iter()
+        .filter_map(|(number, label)| number.map(|number| format!("{number} for {label}")))
+        .collect();
+    let by_name: Vec<&str> = read
+        .iter()
+        .filter(|(number, _)| number.is_none())
+        .map(|(_, label)| label.as_str())
+        .collect();
+    let mut list = match numbered.as_slice() {
+        _ if more > 0 => numbered.join("; "),
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} or {second}"),
+        [init @ .., last] => format!("{}; or {last}", init.join("; ")),
+    };
+    if !by_name.is_empty() {
+        let names = by_name.join(" or ");
+        list = if list.is_empty() {
+            names
+        } else {
+            format!("{list}, or say {names}")
+        };
+    }
+    if more > 0 {
+        list = format!("{list}, or one of {more} more");
+    }
+    if question.questions.len() > 1 {
+        let name = first.header.as_deref().unwrap_or(&first.prompt);
+        format!(
+            " First, {}: say {list}.",
+            one_line(name, MAX_OPTION_LABEL_CHARS)
+        )
+    } else {
+        format!(" Say {list}.")
+    }
+}
+
 /// [`permission_sentence`] without the agent's name: "Asking for permission:
 /// run cargo publish."
 pub fn bare_permission_sentence(wants: &str) -> String {
@@ -762,11 +954,19 @@ pub fn bare_blocked_sentence(cause: BlockCause) -> String {
 /// The sentence for an alert, both ways.
 fn alert_sentence(agent: &str, event: &TurnEvent) -> Option<ReadingSentence> {
     Some(match event {
-        TurnEvent::Permission { wants } => ReadingSentence {
+        TurnEvent::Permission { wants, options } => ReadingSentence {
+            kind: ReadingSentenceKind::Permission,
+            text: format!("{}{options}", permission_sentence(agent, wants)),
+            bare: format!("{}{options}", bare_permission_sentence(wants)),
+        },
+        TurnEvent::PermissionNotice { wants } => ReadingSentence {
             kind: ReadingSentenceKind::Permission,
             text: permission_sentence(agent, wants),
             bare: bare_permission_sentence(wants),
         },
+        TurnEvent::PermissionAnswered => {
+            ReadingSentence::same(ReadingSentenceKind::PermissionAnswered, String::new())
+        }
         TurnEvent::Blocked { cause } => ReadingSentence {
             kind: ReadingSentenceKind::Blocked,
             text: blocked_sentence(agent, *cause),
@@ -798,7 +998,10 @@ pub async fn announce(
     let (kind, reply) = match event {
         TurnEvent::Finished { reply } => (TurnKind::Finished, reply),
         TurnEvent::Failed { reply } => (TurnKind::Failed, reply),
-        TurnEvent::Permission { .. } | TurnEvent::Blocked { .. } => return None,
+        TurnEvent::Permission { .. }
+        | TurnEvent::PermissionNotice { .. }
+        | TurnEvent::PermissionAnswered
+        | TurnEvent::Blocked { .. } => return None,
     };
     let summary = summariser
         .summarise(TurnSummaryRequest {
@@ -1069,6 +1272,7 @@ mod tests {
             "coder",
             TurnEvent::Permission {
                 wants: "run cargo publish".to_string(),
+                options: String::new(),
             },
             &summariser,
         )
@@ -1135,7 +1339,7 @@ mod tests {
     }
 
     fn blocked(cause: BlockCause) -> Incoming {
-        Incoming::Status(TurnEvent::Blocked { cause })
+        Incoming::StatusAt(TurnEvent::Blocked { cause }, 0)
     }
 
     /// Feed `script` into [`coalesce`], waiting `gap` of (paused) time after
@@ -1364,6 +1568,362 @@ mod tests {
         }
     }
 
+    /// Drive status frames through reading's conversion, coalescing and
+    /// session loop, recording what would reach the webview before it closes.
+    async fn question_reading_script(
+        script: Vec<(AgentEvent, Duration)>,
+    ) -> Vec<serde_json::Value> {
+        let script = script
+            .into_iter()
+            .filter_map(|(event, gap)| status_incoming(&event, "a").map(|turn| (turn, gap)))
+            .collect();
+        let (tx, events) = mpsc::channel(16);
+        for event in coalesced(script).await {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let mut sentences = Vec::new();
+        read_turns("tester", events, &Recording::default(), |sentence| {
+            if sentence.kind != ReadingSentenceKind::Closed {
+                sentences.push(serde_json::to_value(sentence).unwrap());
+            }
+            true
+        })
+        .await;
+        sentences
+    }
+
+    /// Scenario (question/desktop/028, PR #1698): with reading on, Claude Code
+    /// asks to run `git push origin main` and may draw Yes, "Yes, and switch
+    /// to auto mode" and No, or leave the auto-mode option out. The
+    /// announcement ends by saying how to answer by voice: "Say 1 for Yes, or
+    /// say No." — Yes by its number, No by name, since its number depends on
+    /// whether Claude drew the keyboard-only auto-mode option, which is not
+    /// offered. A Codex approval reads
+    /// its three options, an OpenCode form reads its first question's, and a
+    /// question voice cannot answer reads none.
+    #[tokio::test]
+    async fn question_desktop_028_a_prompt_is_announced_with_the_numbers_to_say() {
+        let fixture = |name: &str| -> serde_json::Value {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/agent-questions")
+                .join(name);
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let payload = fixture("claude-permission-bash-auto-mode.json");
+        let claude = dot_agent_deck::question::claude_permission_request(
+            "q-claude".into(),
+            "Bash",
+            payload.get("tool_input"),
+            Some("git push origin main".into()),
+            None,
+            payload["permission_mode"].as_str(),
+            1,
+            None,
+        )
+        .question;
+        let mut event = status("a", EventType::PermissionRequest);
+        event.tool_name = Some("Bash".to_string());
+        event.tool_detail = Some("git push origin main".to_string());
+        event.set_question(&claude);
+        let announced = announce(
+            "coder",
+            status_turn_event(&event, "a").expect("a permission prompt"),
+            &Recording::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            announced.text,
+            "The coder is asking for permission: Bash: git push origin main. Say 1 for Yes, or say No."
+        );
+        assert_eq!(
+            announced.bare,
+            "Asking for permission: Bash: git push origin main. Say 1 for Yes, or say No."
+        );
+
+        let codex = dot_agent_deck::question::codex_permission_request(
+            "q-codex".into(),
+            "Bash",
+            Some("touch x".into()),
+            Some("touch x"),
+            1,
+            None,
+        );
+        assert_eq!(
+            options_sentence(&codex),
+            " Say 1 for Yes, proceed; 2 for Yes, and don't ask again for commands that start with the prefix shown; or 3 for No, and tell Codex what to do differently."
+        );
+        let form = dot_agent_deck::question::opencode_question_asked(
+            &fixture("opencode-question-asked.json"),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            options_sentence(&form),
+            " First, Colour: say 1 for Red; 2 for Green; 3 for Blue; or 4 for Type your own answer."
+        );
+        let mut keyboard = claude.clone();
+        keyboard.channel = dot_agent_deck::question::AnswerChannel::Unsupported;
+        assert_eq!(options_sentence(&keyboard), "");
+        // A notice with no question of its own reads no options.
+        let notice = delayed_permission_notice();
+        assert_eq!(
+            status_turn_event(&notice, "a"),
+            Some(TurnEvent::PermissionNotice {
+                wants: String::new()
+            })
+        );
+    }
+
+    fn delayed_permission_notice() -> AgentEvent {
+        let mut notice = status("a", EventType::WaitingForInput);
+        notice.metadata.insert(
+            dot_agent_deck::quota_block::NOTIFICATION_TYPE_METADATA_KEY.to_string(),
+            "permission_prompt".to_string(),
+        );
+        notice
+    }
+
+    fn held_permission_prompt(id: &str) -> AgentEvent {
+        let mut prompt = status("a", EventType::PermissionRequest);
+        prompt.tool_name = Some("Bash".into());
+        prompt.tool_detail = Some("touch x".into());
+        let question = dot_agent_deck::question::claude_permission_request(
+            id.into(),
+            "Bash",
+            None,
+            Some("touch x".into()),
+            None,
+            None,
+            1,
+            None,
+        )
+        .question;
+        prompt.set_question(&question);
+        prompt
+    }
+
+    fn question_event_at(mut event: AgentEvent, seconds: i64) -> AgentEvent {
+        event.timestamp = chrono::DateTime::from_timestamp(1_700_000_000 + seconds, 0).unwrap();
+        event
+    }
+
+    /// Scenario: Claude's permission hook announces a prompt, then its delayed
+    /// notification describes that same pending prompt six seconds later.
+    /// Reading speaks each prompt once even with two hooks before two notices;
+    /// a Claude with only the notification still speaks.
+    #[tokio::test(start_paused = true)]
+    async fn question_desktop_015_a_permission_hook_and_its_notification_are_announced_once() {
+        let notice_only = question_reading_script(vec![(delayed_permission_notice(), SHORT)]).await;
+        assert_eq!(
+            notice_only.len(),
+            1,
+            "older Claude's notification is still announced"
+        );
+        assert_eq!(notice_only[0]["kind"], "permission");
+
+        let prompt = held_permission_prompt("held-prompt");
+        let sentences = question_reading_script(vec![
+            (question_event_at(prompt, 0), Duration::from_secs(6)),
+            (question_event_at(delayed_permission_notice(), 6), SHORT),
+        ])
+        .await;
+        assert_eq!(
+            sentences
+                .iter()
+                .map(|s| s["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["The tester is asking for permission: Bash: touch x. Say 1 for Yes or 2 for No."],
+            "the delayed permission_prompt must not announce the same pending prompt again"
+        );
+
+        let mut second = held_permission_prompt("q2");
+        second.tool_detail = Some("touch y".into());
+        let sentences = question_reading_script(vec![
+            (
+                question_event_at(held_permission_prompt("q1"), 0),
+                Duration::from_secs(6),
+            ),
+            (question_event_at(second, 6), Duration::from_secs(6)),
+            (
+                question_event_at(delayed_permission_notice(), 12),
+                Duration::from_secs(6),
+            ),
+            (question_event_at(delayed_permission_notice(), 18), SHORT),
+        ])
+        .await;
+        assert_eq!(
+            sentences
+                .iter()
+                .map(|s| s["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "The tester is asking for permission: Bash: touch x. Say 1 for Yes or 2 for No.",
+                "The tester is asking for permission: Bash: touch y. Say 1 for Yes or 2 for No."
+            ],
+            "two announced prompts owe two notices; neither delayed notice may speak"
+        );
+    }
+
+    /// Scenario: After a permission hook at 10 seconds is announced, a notice
+    /// stamped at 5 seconds is announced despite backward clock skew. It leaves
+    /// the hook's debt unpaid, so the later notice at 16 seconds is absorbed.
+    #[tokio::test(start_paused = true)]
+    async fn question_desktop_015_a_notice_before_its_hook_does_not_pay_the_debt() {
+        let mut skewed = delayed_permission_notice();
+        skewed.user_prompt = Some("clock-skewed notice".into());
+        let mut later = delayed_permission_notice();
+        later.user_prompt = Some("later duplicate".into());
+        let sentences = question_reading_script(vec![
+            (
+                question_event_at(held_permission_prompt("q1"), 10),
+                Duration::from_secs(6),
+            ),
+            (question_event_at(skewed, 5), Duration::from_secs(6)),
+            (question_event_at(later, 16), SHORT),
+        ])
+        .await;
+        assert_eq!(
+            sentences
+                .iter()
+                .map(|s| s["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "The tester is asking for permission: Bash: touch x. Say 1 for Yes or 2 for No.",
+                "The tester is asking for permission: clock-skewed notice.",
+            ],
+            "a negative timestamp gap announces the notice without paying the hook's debt"
+        );
+    }
+
+    /// Scenario: A notice stamped six seconds after its announced permission
+    /// hook pays that hook's debt and does not repeat its announcement.
+    #[tokio::test(start_paused = true)]
+    async fn question_desktop_015_a_notice_six_seconds_after_its_hook_is_absorbed() {
+        let sentences = question_reading_script(vec![
+            (
+                question_event_at(held_permission_prompt("q1"), 10),
+                Duration::from_secs(6),
+            ),
+            (question_event_at(delayed_permission_notice(), 16), SHORT),
+        ])
+        .await;
+        assert_eq!(sentences.len(), 1, "the +6 second notice is absorbed");
+        assert_eq!(
+            sentences[0]["text"],
+            "The tester is asking for permission: Bash: touch x. Say 1 for Yes or 2 for No."
+        );
+    }
+
+    /// Scenario: A hook prompt receives no notification before an answer or
+    /// turn progress. Its late notice within 30 seconds is still absorbed,
+    /// but a notification-only prompt after that event-timestamp window speaks.
+    #[tokio::test(start_paused = true)]
+    async fn question_desktop_015_a_missing_notice_does_not_silence_the_next_prompt() {
+        let mut answered = status("a", EventType::Thinking);
+        answered.metadata.insert(
+            dot_agent_deck::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.to_string(),
+            dot_agent_deck::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.to_string(),
+        );
+        let boundaries = [
+            ("PermissionAnswered", vec![answered]),
+            (
+                "ToolEnd then Idle",
+                vec![
+                    status("a", EventType::ToolEnd),
+                    status("a", EventType::Idle),
+                ],
+            ),
+            ("ToolStart", vec![status("a", EventType::ToolStart)]),
+            ("Thinking", vec![status("a", EventType::Thinking)]),
+            ("Idle", vec![status("a", EventType::Idle)]),
+        ];
+        let mut failures = Vec::new();
+        for (label, boundary) in boundaries {
+            for notice_seconds in [6, 29, 31] {
+                let mut script = vec![(
+                    question_event_at(held_permission_prompt("q1"), 0),
+                    Duration::from_secs(6),
+                )];
+                script.extend(boundary.iter().cloned().enumerate().map(|(index, event)| {
+                    (
+                        question_event_at(event, index as i64 + 1),
+                        Duration::from_secs(6),
+                    )
+                }));
+                let mut notice = delayed_permission_notice();
+                notice.user_prompt = Some(
+                    if notice_seconds > 30 {
+                        "new Q2"
+                    } else {
+                        "late Q1"
+                    }
+                    .into(),
+                );
+                script.push((question_event_at(notice, notice_seconds), SHORT));
+                let sentences = question_reading_script(script).await;
+                let spoken = sentences
+                    .iter()
+                    .filter(|s| s["kind"] == "permission")
+                    .map(|s| s["text"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                let mut expected = vec![
+                    "The tester is asking for permission: Bash: touch x. Say 1 for Yes or 2 for No.",
+                ];
+                if notice_seconds > 30 {
+                    expected.push("The tester is asking for permission: new Q2.");
+                }
+                if spoken != expected {
+                    failures.push(format!(
+                        "after {label}, notice at +{notice_seconds}s: expected {expected:?}, got {spoken:?}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "Q1 notice debt must survive turn progress and lapse after 30 event-timestamp seconds: {failures:#?}"
+        );
+    }
+
+    /// Scenario: Reading announces a held Claude prompt and the deck answers
+    /// it by voice. Reading forwards a silent retraction to the speech queue
+    /// and suppresses the answered prompt's delayed notification.
+    #[tokio::test(start_paused = true)]
+    async fn question_desktop_016_answering_a_held_prompt_retracts_its_announcement() {
+        let prompt = held_permission_prompt("held-prompt");
+        let mut answered = status("a", EventType::Thinking);
+        answered.metadata.insert(
+            dot_agent_deck::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.to_string(),
+            dot_agent_deck::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.to_string(),
+        );
+        answered.metadata.insert(
+            dot_agent_deck::event::QUESTION_RESOLVED_METADATA_KEY.to_string(),
+            "held-prompt".to_string(),
+        );
+        let sentences = question_reading_script(vec![
+            (prompt, SHORT),
+            (answered, Duration::from_secs(6)),
+            (delayed_permission_notice(), SHORT),
+            (held_permission_prompt("next-prompt"), SHORT),
+        ])
+        .await;
+        assert_eq!(
+            sentences[0]["kind"], "permission",
+            "the held prompt is announced"
+        );
+        assert_eq!(
+            sentences
+                .iter()
+                .map(|s| s["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["permission", "permission_answered", "permission"],
+            "the voice answer must retract the queued prompt and suppress its delayed notification"
+        );
+        assert_eq!(sentences[1]["text"], "", "a retraction is never spoken");
+    }
+
     #[test]
     fn voice_reading_status_events_are_filtered_to_the_agent_and_to_what_stops_it() {
         let mut permission = status("a", EventType::PermissionRequest);
@@ -1372,7 +1932,8 @@ mod tests {
         assert_eq!(
             status_turn_event(&permission, "a"),
             Some(TurnEvent::Permission {
-                wants: "Bash: cargo publish".to_string()
+                wants: "Bash: cargo publish".to_string(),
+                options: String::new(),
             })
         );
         assert_eq!(status_turn_event(&permission, "b"), None, "another agent's");
@@ -1614,7 +2175,8 @@ mod tests {
                     reply: "All tests pass.".to_string()
                 },
                 TurnEvent::Permission {
-                    wants: "Bash".to_string()
+                    wants: "Bash".to_string(),
+                    options: String::new(),
                 },
             ]
         );
@@ -1750,7 +2312,8 @@ mod tests {
         assert_eq!(
             heard,
             TurnEvent::Permission {
-                wants: "Bash".to_string()
+                wants: "Bash".to_string(),
+                options: String::new(),
             }
         );
         deck.abort();
@@ -1825,6 +2388,7 @@ mod tests {
         .unwrap();
         send.send(TurnEvent::Permission {
             wants: "run cargo publish".to_string(),
+            options: String::new(),
         })
         .await
         .unwrap();
@@ -1859,6 +2423,7 @@ mod tests {
         .unwrap();
         send.send(TurnEvent::Permission {
             wants: "two".to_string(),
+            options: String::new(),
         })
         .await
         .unwrap();
@@ -2199,6 +2764,7 @@ mod tests {
         let (send, events) = mpsc::channel(8);
         send.send(TurnEvent::Permission {
             wants: "run cargo publish".to_string(),
+            options: String::new(),
         })
         .await
         .unwrap();
@@ -2303,6 +2869,7 @@ mod tests {
         for prompt in 0..100 {
             send.send(TurnEvent::Permission {
                 wants: format!("prompt {prompt}"),
+                options: String::new(),
             })
             .await
             .unwrap();

@@ -1201,6 +1201,14 @@ pub struct SessionSnapshot {
     /// ignores the key, so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_generation: Option<HookGeneration>,
+    /// PRD #1631: the question this session's agent is waiting on —
+    /// [`SessionState::pending_question`]. The one model the desktop's voice
+    /// answers and #1497's spoken prompts both read. Additive optional, the
+    /// `blocked` precedent: an older reader ignores the key and a newer one
+    /// tolerates its absence, so no `PROTOCOL_VERSION` bump. Restored by
+    /// [`AppState::seed_hydrated_session`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_question: Option<crate::question::PendingQuestion>,
     /// PRD #1401: the pull request this session's work produced, when the
     /// daemon knows of one ([`SessionState::pull_request`]). Additive optional,
     /// the `last_activity_ms` precedent: an older daemon omits the key and a
@@ -1350,6 +1358,13 @@ pub struct SessionState {
     /// (trust left by an earlier install) still outranks output. Process-local,
     /// like [`Self::prompt_reports_unavailable`].
     pub output_set_status: bool,
+    /// PRD #1631: the question the agent is waiting on, built by its producer
+    /// and sanitized on arrival. Set by an event carrying one
+    /// ([`crate::event::QUESTION_METADATA_KEY`]) and cleared by the first event
+    /// that proves the agent moved on — see [`AppState::apply_event`]'s
+    /// question rules — or by the daemon when it answers the question or its
+    /// held channel closes ([`AppState::clear_pending_question`]).
+    pub pending_question: Option<crate::question::PendingQuestion>,
     /// PRD #1401: the pull request this session's work produced, when the
     /// daemon knows of one. Carried to clients by
     /// [`SessionSnapshot::pull_request`].
@@ -1545,6 +1560,7 @@ impl SessionState {
             subagent_wait: self.subagent_wait.clone(),
             // A pane property: `AppState::live_session_for` fills it.
             hook_generation: None,
+            pending_question: self.pending_question.clone(),
             pull_request: self.pull_request.clone(),
             pull_request_revision: Some(self.pull_request_revision),
             background: held.and_then(|(background, _)| background.filter(|b| !b.is_empty())),
@@ -4892,12 +4908,8 @@ impl AppState {
         // a new session's start whatever its clock says, and a report on a pane
         // with no generation yet.
         let live_agent_id = registry.pane_current_agent_id(&pane_id);
-        let superseded = self
-            .waiting_superseded_sessions
-            .get(&pane_id)
-            .is_some_and(|superseded| {
-                superseded.agent_id == live_agent_id && superseded.contains(&event_session_id)
-            });
+        let superseded =
+            self.is_superseded_session(&pane_id, live_agent_id.as_deref(), &event_session_id);
         let from_current_generation = !superseded
             && match &generation_before {
                 Some((current, current_ts)) if *current == event_session_id => {
@@ -4970,6 +4982,52 @@ impl AppState {
                 "waiting notice: the worker left WaitingForInput; episode closed"
             );
         }
+    }
+
+    /// PRD #1631 (Qodo #1561): drop the question `event` raises when it comes
+    /// from a hook session its pane has moved past — a late OpenCode
+    /// `question.asked` from the conversation before a `/clear`, say. That
+    /// conversation is over: applied, its question would be the newest pending
+    /// one on the pane (its timestamp is fresh) and reconciliation would let
+    /// the live question's holder go. The rest of the event is applied as
+    /// before. The daemon calls this under the `AppState` write lock that
+    /// applies the event, before it is broadcast, so no client sees the
+    /// question either. `pane_id` is the pane the event lands on — the one it
+    /// names, or its session's. Returns whether a question was dropped.
+    pub fn strip_superseded_question(
+        &self,
+        pane_id: Option<&str>,
+        event: &mut AgentEvent,
+        registry: &AgentPtyRegistry,
+    ) -> bool {
+        let Some(pane_id) = pane_id else {
+            return false;
+        };
+        if event.question().is_none() {
+            return false;
+        }
+        let live_agent_id = registry.pane_current_agent_id(pane_id);
+        if !self.is_superseded_session(pane_id, live_agent_id.as_deref(), &event.session_id) {
+            return false;
+        }
+        event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+        true
+    }
+
+    /// Issue #447: whether `session_id` is a hook session `pane_id` has moved
+    /// past while `live_agent_id` owned it — see
+    /// [`Self::waiting_superseded_sessions`].
+    fn is_superseded_session(
+        &self,
+        pane_id: &str,
+        live_agent_id: Option<&str>,
+        session_id: &str,
+    ) -> bool {
+        self.waiting_superseded_sessions
+            .get(pane_id)
+            .is_some_and(|superseded| {
+                superseded.agent_id.as_deref() == live_agent_id && superseded.contains(session_id)
+            })
     }
 
     /// Issue #447: open a waiting episode for `pane_id`, whose status is
@@ -11298,6 +11356,12 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
         None
     };
     session.active_tool = snap.active_tool.clone();
+    // PRD #1631: the pending question, sanitized again — it is agent-derived
+    // text arriving over the wire.
+    session.pending_question = snap
+        .pending_question
+        .clone()
+        .and_then(crate::question::PendingQuestion::sanitized);
     session.tool_count = snap.tool_count;
     // PRD #1401: the pull request is not taken here. Each caller decides how
     // (`adopt_snapshot_pull_request` or `take_snapshot_pull_request`).
@@ -11726,6 +11790,173 @@ impl AppState {
                     });
                 snapshot
             })
+    }
+
+    /// PRD #1631 (audit T2): the pane of the session `session_id`, if it has
+    /// one — where an event that names no pane lands, since such an event is
+    /// applied to its session by id and the session keeps its pane.
+    pub fn session_pane(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .get(session_id)
+            .and_then(|session| session.pane_id.clone())
+    }
+
+    /// PRD #1631: the question pending for `(agent_id, pane_id)` — on the same
+    /// session [`Self::live_session_for`] picks — with that session's id.
+    pub fn pending_question_for(
+        &self,
+        agent_id: &str,
+        pane_id: Option<&str>,
+    ) -> Option<(String, crate::question::PendingQuestion)> {
+        self.sessions
+            .values()
+            .filter(|s| s.agent_id.as_deref() == Some(agent_id) && s.pane_id.as_deref() == pane_id)
+            .max_by(|a, b| {
+                a.last_activity
+                    .cmp(&b.last_activity)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            })
+            .and_then(|s| {
+                s.pending_question
+                    .clone()
+                    .map(|q| (s.session_id.clone(), q))
+            })
+    }
+
+    /// PRD #1631 (Qodo #1561): the session `pane_id` is in now — its newest
+    /// card, ties broken on the (unique) `session_id` as
+    /// [`Self::live_session_for`] breaks them. The pane's pending question is
+    /// this session's or none: a predecessor's question does not outlive the
+    /// session that superseded it, even while its card is still in the map.
+    fn pane_current_session(&self, pane_id: &str) -> Option<&SessionState> {
+        self.sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane_id))
+            .max_by(|a, b| {
+                a.last_activity
+                    .cmp(&b.last_activity)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            })
+    }
+
+    /// PRD #1631: the id of the question pending on `pane_id`'s current
+    /// session ([`Self::pane_current_session`]) — what the daemon's held
+    /// channels for that pane are reconciled against.
+    pub fn pending_question_id_on_pane(&self, pane_id: &str) -> Option<String> {
+        self.pending_question_on_pane(pane_id).map(|q| q.id)
+    }
+
+    /// PRD #1631 (audit A4): the question pending on `pane_id` — the one
+    /// [`Self::pending_question_id_on_pane`] names — whole, revision included.
+    pub fn pending_question_on_pane(
+        &self,
+        pane_id: &str,
+    ) -> Option<crate::question::PendingQuestion> {
+        self.pane_current_session(pane_id)
+            .and_then(|s| s.pending_question.clone())
+    }
+
+    /// PRD #1631: the session on `pane_id` whose pending question is
+    /// `question_id` at `revision` — its id, agent type and agent id — which is
+    /// what the daemon's own event about that question has to name. A
+    /// registration under the same id with another revision is not it (audit
+    /// A5).
+    pub fn pending_question_owner(
+        &self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+    ) -> Option<(String, AgentType, Option<String>)> {
+        self.sessions
+            .values()
+            .filter(|s| {
+                s.pane_id.as_deref() == Some(pane_id)
+                    && s.pending_question
+                        .as_ref()
+                        .is_some_and(|q| q.id == question_id && q.revision == revision)
+            })
+            .max_by_key(|s| s.last_activity)
+            .map(|s| {
+                (
+                    s.session_id.clone(),
+                    s.agent_type.clone(),
+                    s.agent_id.clone(),
+                )
+            })
+    }
+
+    /// PRD #1631: drop the question `question_id` wherever it is pending on
+    /// `pane_id`, leaving the status alone — the next event decides it. The
+    /// daemon's fallback when a held channel closes without an answer (Claude
+    /// Code kills its hook on a keyboard No or Esc [observed]) and its own
+    /// release event did not reach the card, and when an answer finds the
+    /// channel gone. Returns whether a question was dropped.
+    pub fn clear_pending_question(&mut self, pane_id: &str, question_id: &str) -> bool {
+        self.clear_pending_question_where(pane_id, question_id, |_| true)
+    }
+
+    /// PRD #1631 (audit A5): [`Self::clear_pending_question`], only where the
+    /// pending question is still `revision` — a registration that replaced it
+    /// under the same id is left alone. What every daemon path that clears a
+    /// question it validated, held or released uses.
+    pub fn clear_pending_question_revision(
+        &mut self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+    ) -> bool {
+        self.clear_pending_question_where(pane_id, question_id, |q| q.revision == revision)
+    }
+
+    fn clear_pending_question_where(
+        &mut self,
+        pane_id: &str,
+        question_id: &str,
+        also: impl Fn(&crate::question::PendingQuestion) -> bool,
+    ) -> bool {
+        let mut cleared = false;
+        for session in self.sessions.values_mut() {
+            if session.pane_id.as_deref() == Some(pane_id)
+                && session
+                    .pending_question
+                    .as_ref()
+                    .is_some_and(|q| q.id == question_id && also(q))
+            {
+                session.pending_question = None;
+                cleared = true;
+            }
+        }
+        cleared
+    }
+
+    /// PRD #1631 (audit A4): the deck typed part of `question_id`'s answer on
+    /// `pane_id` and could not finish, so the agent's prompt has moved past
+    /// what the stored question describes. It stays pending — the agent is
+    /// still waiting — but its channel becomes `Unsupported`, so every client
+    /// offers it to the keyboard only, and it moves to `new_revision`, so a
+    /// client's answer worked out against the old one is stale. Returns the
+    /// question as marked, `None` when none was.
+    pub fn mark_pending_question_keyboard_only(
+        &mut self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+        new_revision: u64,
+    ) -> Option<crate::question::PendingQuestion> {
+        let mut marked = None;
+        for session in self.sessions.values_mut() {
+            if session.pane_id.as_deref() == Some(pane_id)
+                && let Some(question) = session
+                    .pending_question
+                    .as_mut()
+                    .filter(|q| q.id == question_id && q.revision == revision)
+            {
+                question.channel = crate::question::AnswerChannel::Unsupported;
+                question.revision = Some(new_revision);
+                marked = Some(question.clone());
+            }
+        }
+        marked
     }
 
     /// [`Self::live_session_for`] over a whole `ListAgents` reply, writing each
@@ -12632,6 +12863,7 @@ impl AppState {
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
             },
@@ -17516,6 +17748,7 @@ impl AppState {
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
             });
@@ -17829,7 +18062,52 @@ impl AppState {
         let blocked_hold =
             session.status == SessionStatus::Blocked && !quota_blocked && !quota_lift;
 
-        let asserted_status = match event.event_type {
+        // PRD #1631: what this frame does to the pending question, decided
+        // against the session as it stood BEFORE the frame — see
+        // [`question_cleared_by`]. A question the frame itself raises is set
+        // after the status arms below, so it is never cleared by its own frame.
+        let clears_question = session
+            .pending_question
+            .as_ref()
+            .is_some_and(|q| question_cleared_by(q, event));
+        // PR #1698 review: a question this frame leaves pending keeps the card
+        // on Needs Input when the frame only ends ANOTHER call — a parallel
+        // call's end is not the agent moving past the prompt it still shows.
+        let question_stays =
+            !clears_question && session.pending_question.is_some() && ends_a_call(event);
+        let raised_question = event.question().map(|mut q| {
+            if q.subagent_id.is_none() {
+                q.subagent_id = event
+                    .metadata
+                    .get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                    .cloned();
+            }
+            // PR #1698 review: tie a question its producer could not name a
+            // call for to the one call in flight it was raised for, so a
+            // parallel call of the same tool ending does not clear it.
+            let call = match &q.tool {
+                Some(tool) if tool.use_id.is_none() => session
+                    .pending_question
+                    .as_ref()
+                    .filter(|current| current.id == q.id)
+                    .and_then(|current| current.tool.as_ref()?.use_id.clone())
+                    .or_else(|| {
+                        question_call(
+                            &session.recent_events,
+                            event,
+                            &tool.name,
+                            q.subagent_id.as_ref(),
+                        )
+                    }),
+                _ => None,
+            };
+            if let (Some(tool), Some(call)) = (q.tool.as_mut(), call) {
+                tool.use_id = Some(call);
+            }
+            q
+        });
+
+        let mut asserted_status = match event.event_type {
             // Issue #714: still blocked and this frame proves no work — it is
             // journalled below like any other, but asserts no status.
             _ if blocked_hold => false,
@@ -18012,7 +18290,7 @@ impl AppState {
             EventType::ToolEnd => {
                 session.active_tool = None;
                 session.tool_count += 1;
-                let asserted = session.status == SessionStatus::WaitingForInput;
+                let asserted = session.status == SessionStatus::WaitingForInput && !question_stays;
                 if asserted {
                     session.status = SessionStatus::Thinking;
                 }
@@ -18098,6 +18376,9 @@ impl AppState {
                 // Informational — recorded in recent_events but no status change
                 false
             }
+            // PR #1698 review: another call's failure while a question is
+            // still pending is journalled, and the card stays on Needs Input.
+            EventType::Error if question_stays => false,
             EventType::Error => {
                 session.status = SessionStatus::Error;
                 true
@@ -18132,8 +18413,11 @@ impl AppState {
                 asserted
             }
             EventType::Unknown => {
-                // Forward-compat catch-all — informational at most, never
-                // produced by this build. No status change.
+                // Forward-compat catch-all — informational at most. Its two
+                // emitters in this build are the daemon's question release
+                // (`QUESTION_RELEASED_BY_DECK_METADATA_KEY`) and its answer to
+                // a question with a deny (`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`),
+                // which rely on exactly this: no status change.
                 false
             }
             // PRD #1401: returned early at the top of `apply_event_unsettled`.
@@ -18143,6 +18427,23 @@ impl AppState {
         // Issue #714: the reason exists only beside the status it explains.
         if session.status != SessionStatus::Blocked {
             session.blocked = None;
+        }
+        // PRD #1631: the question rules. A frame that proves the agent moved
+        // on clears the pending question; a frame carrying one sets it, and the
+        // card reads Needs Input — also when the question rides a `ToolStart`
+        // (Codex's `request_user_input`), which on its own would read Working.
+        // A Blocked card keeps its status: it is the stickier truth.
+        if clears_question {
+            session.pending_question = None;
+        }
+        if let Some(question) = raised_question {
+            session.pending_question = Some(question);
+            if session.status != SessionStatus::Blocked {
+                if session.status != SessionStatus::WaitingForInput {
+                    asserted_status = true;
+                }
+                session.status = SessionStatus::WaitingForInput;
+            }
         }
         // Issue #1364: and so does a wait's subagent attribution.
         if session.status != SessionStatus::WaitingForInput {
@@ -18280,6 +18581,131 @@ impl AppState {
             AppliedEvent::StatusKept
         }
     }
+}
+
+/// PRD #1631: whether `event` proves the agent moved past `question`, so the
+/// pending question must go. The rules, in the design's terms:
+///
+/// 1. the end of the call the question is about ([`call_ended`]) — a `ToolEnd`,
+///    or the `Error` the hook promotes a failed call's `PostToolUse` to — and
+///    not the end of another call: tools run in parallel, including two calls
+///    of the same tool (PR #1698 review);
+/// 2. a new turn (`Thinking` carrying a prompt), `Idle` (a `Stop`, or Codex's
+///    `Interrupt`), `SessionStart`, an `Error` that is not a call's, or
+///    `QuotaBlocked` — on the main thread;
+/// 3. the agent reporting this very question answered
+///    ([`crate::event::QUESTION_RESOLVED_METADATA_KEY`]);
+/// 4. the `SubagentStop` of the subagent that asked.
+///
+/// `Notification`, a `PermissionRequest` without a question, `ToolStart` and
+/// the shell-activity pair do not clear. The daemon's own clears — its answer,
+/// and a held channel closing — go through [`AppState::clear_pending_question`].
+fn question_cleared_by(question: &crate::question::PendingQuestion, event: &AgentEvent) -> bool {
+    if event.resolved_question_id() == Some(question.id.as_str()) {
+        return true;
+    }
+    let event_subagent = event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY);
+    match event.event_type {
+        _ if ends_a_call(event) => call_ended(question, event),
+        EventType::Thinking => event.user_prompt.is_some() && event_subagent.is_none(),
+        EventType::Idle | EventType::SessionStart | EventType::Error | EventType::QuotaBlocked => {
+            event_subagent.is_none()
+        }
+        EventType::SubagentStop => {
+            event_subagent.is_some() && event_subagent == question.subagent_id.as_ref()
+        }
+        _ => false,
+    }
+}
+
+/// PR #1698 review: whether `event` reports one tool call ending — a
+/// `ToolEnd`, or an `Error` naming its call, which is how the hook reports a
+/// failed call's `PostToolUse` (`tool_response_is_failure` in
+/// [`crate::hook`]). Such an `Error` ends that call, not the turn.
+fn ends_a_call(event: &AgentEvent) -> bool {
+    match event.event_type {
+        EventType::ToolEnd => true,
+        EventType::Error => event.metadata.contains_key("tool_use_id"),
+        _ => false,
+    }
+}
+
+/// PR #1698 review: whether the call that `event` ends ([`ends_a_call`]) is
+/// the one `question` is about. By `tool_use_id` when both name a call — the
+/// producer's id, or the one [`question_call`] tied the question to. When
+/// either does not, the deck cannot tell the calls apart and matches by tool
+/// name from the same thread, so a question whose call really ended still
+/// clears; the cost is that a parallel call of the same tool ending clears it
+/// too.
+fn call_ended(question: &crate::question::PendingQuestion, event: &AgentEvent) -> bool {
+    let Some(tool) = &question.tool else {
+        return false;
+    };
+    match (&tool.use_id, event.metadata.get("tool_use_id")) {
+        (Some(use_id), Some(ended)) => ended == use_id,
+        _ => {
+            event.tool_name.as_deref() == Some(tool.name.as_str())
+                && event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                    == question.subagent_id.as_ref()
+        }
+    }
+}
+
+/// PR #1698 review: the `tool_use_id` of the call a question raised by
+/// `event` is about, when exactly one call fits.
+///
+/// Claude Code's `PermissionRequest` payload carries no `tool_use_id` — its
+/// hook input is the session fields, `tool_name`, `tool_input`,
+/// `permission_suggestions` and an MCP server [read from 2.1.296's bundle] —
+/// and neither does Codex's (`permission-request.command.input` in 0.160.0).
+/// But both agents run `PreToolUse` before they ask, and its payload carries
+/// the call's `tool_use_id` and the same `tool_input`. So the call is the one
+/// in this turn's journal whose `ToolStart` names the same tool, from the same
+/// thread, with the same input fingerprint
+/// ([`crate::event::TOOL_INPUT_DIGEST_METADATA_KEY`]), and that has not ended.
+///
+/// `None` — the question then clears by tool name ([`call_ended`]) — when the
+/// question's event or the `ToolStart` carries no fingerprint (an older hook,
+/// another agent), when no such call is in the journal, and when two are: two
+/// calls of one tool with the same input cannot be told apart.
+fn question_call(
+    journal: &VecDeque<AgentEvent>,
+    event: &AgentEvent,
+    tool_name: &str,
+    subagent_id: Option<&String>,
+) -> Option<String> {
+    let digest = event
+        .metadata
+        .get(crate::event::TOOL_INPUT_DIGEST_METADATA_KEY)?;
+    let mut ended = HashSet::new();
+    let mut found = None;
+    for earlier in journal.iter().rev() {
+        if earlier.event_type == EventType::Thinking && earlier.user_prompt.is_some() {
+            break;
+        }
+        let Some(call) = earlier.metadata.get("tool_use_id") else {
+            continue;
+        };
+        if ends_a_call(earlier) {
+            ended.insert(call);
+            continue;
+        }
+        if earlier.event_type == EventType::ToolStart
+            && !ended.contains(call)
+            && earlier.tool_name.as_deref() == Some(tool_name)
+            && earlier.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY) == subagent_id
+            && earlier
+                .metadata
+                .get(crate::event::TOOL_INPUT_DIGEST_METADATA_KEY)
+                == Some(digest)
+        {
+            if found.as_ref().is_some_and(|f| f != call) {
+                return None;
+            }
+            found = Some(call.clone());
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -26098,6 +26524,7 @@ while True:
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
             },
@@ -28391,6 +28818,7 @@ while True:
                 resets_at_ms: Some(9_000),
             }),
             hook_generation: None,
+            pending_question: None,
             pull_request: None,
             pull_request_revision: None,
             background: None,
@@ -28460,6 +28888,7 @@ while True:
                 resets_at_ms,
             }),
             hook_generation: None,
+            pending_question: None,
             pull_request: None,
             pull_request_revision: None,
             background: None,

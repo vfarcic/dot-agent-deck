@@ -34,7 +34,7 @@ On every launch the TUI performs a build-version handshake with the daemon (PRD 
 
 ## Hook capability tokens
 
-[`hook-provenance.md`](hook-provenance.md) has the design, the threat it closes (another same-uid process signalling as a pane after reading its id from `daemon status`) and the history of the acknowledgement: `work-done` and `dispatch` read no reply until issue #1129, so a refused report exited 0 and was visible only in the daemon log. The acknowledgement is written at the gate, before the handler runs, so it says the message was admitted, not that the work succeeded. The `DOT_AGENT_DECK_HOOK_PROVENANCE` policy treats anything other than an exact, case-insensitive `warn` as enforce, so a typo fails safe.
+[`hook-provenance.md`](hook-provenance.md) has the design, the threat it closes (another same-uid process signalling as a pane after reading its id from `daemon status`) and the history of the acknowledgement: `work-done` and `dispatch` read no reply until issue #1129, so a refused report exited 0 and was visible only in the daemon log. The acknowledgement says the message was admitted, not that the work succeeded: `dispatch`'s is written at the gate, before the handler runs, and `work-done`'s once its report is queued for delivery, before it is written into the orchestrator's pane. The `DOT_AGENT_DECK_HOOK_PROVENANCE` policy treats anything other than an exact, case-insensitive `warn` as enforce, so a typo fails safe.
 
 ## Orphaned orchestration roles
 

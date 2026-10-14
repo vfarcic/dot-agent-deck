@@ -1554,6 +1554,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
         }

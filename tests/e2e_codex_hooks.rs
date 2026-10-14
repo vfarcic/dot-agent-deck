@@ -33,6 +33,12 @@ const HOOK_SENTINEL_NAME: &str = "codex_hooks_sentinel_f42e71.txt";
 /// runs where the agent had booted fine. Match the part that carries the
 /// meaning; leave the decoration out.
 const CODEX_COMPOSER_READY: &str = "Ask Codex to do anything";
+/// Codex's footer while it holds a submitted prompt until its own startup
+/// finishes (`Waiting for startup  · esc cancel` on codex-cli 0.160.0). Nothing
+/// the deck renders carries it (`grep -rn 'Waiting for startup' src/` is
+/// empty), so a match is Codex's own paint. Quoted without the `· esc cancel`
+/// decoration for the reason [`CODEX_COMPOSER_READY`] gives.
+const CODEX_STARTUP_HOLD: &str = "Waiting for startup";
 const HOOK_SENTINEL_CONTENT: &str = "CODEX_HOOKS_OK";
 const TRUST_BYPASS_FLAG: &str = "--dangerously-bypass-hook-trust";
 const DECK_HOOK_EVENTS: &[(&str, &str)] = &[
@@ -46,6 +52,7 @@ const DECK_HOOK_EVENTS: &[(&str, &str)] = &[
     ("PostCompact", "post_compact"),
     ("SubagentStart", "subagent_start"),
     ("SubagentStop", "subagent_stop"),
+    ("Interrupt", "interrupt"),
 ];
 
 fn path_with_binary_dir() -> String {
@@ -291,12 +298,34 @@ fn codex_hooks_003_non_codex_launcher_gets_startup_integration() {
     );
 }
 
+/// The Codex card's header row, from its left edge to the first top-right
+/// corner on that row: `┏ ▸ 1 Codex · <dir> ━━━ ● Idle ┓`, where the card shows
+/// its status.
+///
+/// Scoped to the card because the dashboard also shows the focused agent's
+/// pane, and that pane is real Codex painting its own words. PRD #1631's
+/// lane-2 run failed `codex_hooks_001` on exactly that: a whole-grid check
+/// found Codex's own `• Working (8s • esc to interrupt) · Running hook` status
+/// line, which Codex paints while its turn-end hook runs, after the card had
+/// already gone Idle on that hook's event. The card read `● Idle` throughout.
+fn codex_card_header(grid: &str) -> Option<&str> {
+    let row = grid.lines().find(|line| line.contains("Codex · "))?;
+    let end = row.find(['┓', '┐']).unwrap_or(row.len());
+    Some(&row[..end])
+}
+
 /// Issue #1493: the dashboard shows the Codex card as Idle, and only Idle, for
 /// six seconds — longer than the wrapper's quiet window and several of the
 /// daemon's shell-activity polls, either of which used to repaint it Working.
+/// Judged on the card's own header ([`codex_card_header`]), never on Codex's
+/// pane beside it.
 fn assert_codex_card_holds_idle(deck: &TuiDeck, moment: &str) {
     const BUSY: [&str; 4] = ["Thinking", "Working", "Needs Input", "Compacting"];
-    let shows_idle = |grid: &str| grid.contains("Idle") && BUSY.iter().all(|b| !grid.contains(b));
+    let shows_idle = |grid: &str| {
+        codex_card_header(grid).is_some_and(|card| {
+            card.contains("Idle") && BUSY.iter().all(|busy| !card.contains(busy))
+        })
+    };
     assert!(
         deck.wait_for_grid_predicate_within(Duration::from_secs(30), shows_idle),
         "{moment}: the Codex card should read Idle:\n{}",
@@ -444,8 +473,8 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
     // the cooked-mode terminal echo of a pane with no agent in it.
     deck.wait_for_string(HOOK_SENTINEL_NAME);
 
-    // Press Enter until Codex VISIBLY takes the composer's contents into a turn,
-    // rather than pressing it once and hoping.
+    // Press Enter, then wait for Codex to VISIBLY take the composer's contents
+    // into a turn.
     //
     // The placeholder comes back only once the composer has been emptied, so its
     // return is this test's proof that the Enter was honoured as a submit — and
@@ -453,69 +482,68 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
     // unsubmitted prompt into a failure that names its own cause instead of a
     // 120 s wait for hook events that cannot arrive.
     //
-    // **Why a retry and not a single press.** A run with the readiness gate above
-    // in place, traced byte for byte, delivered the `\r` to Codex's inner PTY as
-    // its own 1-byte write 150 ms after the last prompt byte — `ui::SUBMIT_DEBOUNCE`
-    // doing exactly its job — and Codex ignored it: the prompt sat in the composer
-    // and the pane emitted nothing at all for the next 28 s. So the deck's input
-    // chain is not implicated; reproduced against a real `codex` 0.149.0 driven
-    // directly on a pty (with a stub model provider, so no credential), the submit
-    // survived every write shape this test can produce — byte-at-a-time and one
-    // bulk write, through `dot-agent-deck wrap` and without it — and across a
-    // sweep of 0/20/50/100/150/500 ms the only gap that lost it was **0 ms**. So
-    // Codex's paste-burst window is under 20 ms, over 7x clear of the deck's
-    // 150 ms, and is not the cause here.
+    // **Codex can hold a submit while its own startup finishes, and says so.**
+    // It paints its composer, and accepts typed text into it, before its
+    // startup work is done. An Enter in that window does not start a turn: it
+    // is accepted and HELD, and Codex's footer reads `Waiting for startup ·
+    // esc cancel` until startup ends, then submits once. Measured in PRD
+    // #1631's lane-2 run, on a box with `io full` at 73%: the composer painted
+    // at 27.1 s of the cast, the first Enter at 34.3 s turned the footer to
+    // `Waiting for startup` within 0.1 s, and the prompt went in at 51.9 s,
+    // 17.5 s later, as exactly one turn. The quick retry this loop used to make
+    // read that hold as "Codex ignored 8 Enters". It was the boundary an earlier
+    // version of this comment said nobody had found. The earlier runs that
+    // reported one ignored Enter are consistent with a hold longer than one
+    // 2 s poll, though none of them was traced.
     //
-    // What that leaves is Codex's own initialisation, and this part is INFERRED
-    // rather than measured: with a real backend it paints its composer (and
-    // accepts typed text into it) while an online models-cache refresh, a
-    // remote-control websocket connect and plugin loading are still in flight,
-    // and a submit arriving in that window is dropped. It is consistent with the
-    // one earlier run that did take a turn, which had a second Enter ~13 s behind
-    // the first.
+    // So no second Enter is sent while Codex shows the hold. The 8 sent during
+    // that run's hold landed on a composer Codex was already submitting, and
+    // the pane shows one user turn, so they did no harm, but they proved
+    // nothing either. An Enter is re-sent only when the pane shows neither the
+    // placeholder nor the hold, the case where the Enter really was dropped.
+    // That stays safe to repeat, the precondition
+    // `send_keys_until_grid_string_within`'s doc names: after a submit, an Enter
+    // lands on an EMPTY composer, where Codex does nothing. The byte-exact
+    // `user_prompt` match below would fail if a re-sent Enter ever put a `\n`
+    // into the prompt.
     //
-    // **And it is systematic, not a flake, which is why this loop is load-bearing
-    // in every run rather than defensive padding.** Across the five consecutive
-    // runs that validated this change, the counter below reported the SAME number
-    // every time: exactly one Enter ignored, submitted on attempt 2, whole test
-    // 13.2-17.7 s. Nobody has found the on-screen marker for that second boundary
-    // — if you do, gate on it and delete this loop; the fixed count is the clue to
-    // start from. Until then this retries on the OUTCOME, the same shape
-    // `prompt_delivery`'s bounded, evidence-gated resubmits take in production.
-    //
-    // Safe to repeat, which `send_keys_until_grid_string_within`'s doc warns is
-    // the precondition for this pattern: an Enter that arrives after the submit
-    // lands on an EMPTY composer, where Codex does nothing. The swallowed Enters
-    // observed were DROPPED rather than converted — the failing grid held the
-    // prompt on two rows because it wraps at the pane width, with no newline
-    // inserted, and every validation run went on to match `user_prompt` byte for
-    // byte below. That byte-exact match is also the guard: a retry that ever did
-    // smuggle a `\n` into the prompt would fail there rather than pass quietly.
-    let submit_deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let mut attempts = 0_usize;
+    // The deadline scales with contention because the hold is Codex's startup,
+    // and that startup is what a starved box slows down.
+    let submit_budget = common::load_scaled(Duration::from_secs(60));
+    let submit_deadline = std::time::Instant::now() + submit_budget;
+    let mut enters = 0_usize;
+    let held_for_startup = std::cell::Cell::new(false);
     let submitted = loop {
-        deck.send_keys(b"\r");
-        attempts += 1;
-        if deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(2)) {
+        if enters == 0 || !deck.snapshot_grid().contains(CODEX_STARTUP_HOLD) {
+            deck.send_keys(b"\r");
+            enters += 1;
+        }
+        if deck.wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+            if grid.contains(CODEX_STARTUP_HOLD) {
+                held_for_startup.set(true);
+            }
+            grid.contains(CODEX_COMPOSER_READY)
+        }) {
             break true;
         }
         if std::time::Instant::now() >= submit_deadline {
             break false;
         }
     };
+    let held_for_startup = held_for_startup.get();
     assert!(
         submitted,
-        "after {attempts} Enter(s) over 60s the prompt is still sitting unsubmitted \
-         in Codex's composer, so no turn started and no hook can fire:\n{}",
+        "after {enters} Enter(s) over {submit_budget:?} the prompt is still sitting \
+         unsubmitted in Codex's composer (Codex showed {CODEX_STARTUP_HOLD:?}: \
+         {held_for_startup}), so no turn started and no hook can fire:\n{}",
         deck.snapshot_grid()
     );
-    if attempts > 1 {
-        // Visible only under `--no-capture`, and worth printing: it is the one
-        // number that says whether the inference above is still live.
+    // Visible only under `--no-capture`: which of the two boundaries above this
+    // run met.
+    if held_for_startup || enters > 1 {
         eprintln!(
-            "codex_hooks_001: Codex ignored {} Enter(s) after painting its composer; \
-             submitted on attempt {attempts}",
-            attempts - 1
+            "codex_hooks_001: submitted after {enters} Enter(s); Codex held the submit \
+             for its startup: {held_for_startup}"
         );
     }
     deck.send_bytes(b"\x04");

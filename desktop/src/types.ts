@@ -891,6 +891,12 @@ export interface AgentSession {
   /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
   blocked?: AgentBlocked;
   /**
+   * HONEST. PRD #1631: the question the agent is waiting on, from the daemon's
+   * snapshot. Every text field is the agent's own words, scrubbed by the
+   * crate; render it through `displayText` like any other free-form string.
+   */
+  pendingQuestion?: import("./lib/voiceQuestion").PendingQuestionDto;
+  /**
    * HONEST. PRD #1401 — the pull request the daemon found for the branch this
    * agent works on (`SessionSnapshot.pull_request`), shown as the tile's badge.
    * Absent when the daemon knows of none, has no `gh` login, or predates the
@@ -1638,6 +1644,16 @@ export interface DeckRuntimeState {
    */
   answerVoiceNumber?: (utterance: string, heard: import("./lib/voiceNumbers").VoiceNumberedListDto, generation: number) => Promise<import("./lib/voiceNumbers").VoiceNumberAnswerDto>;
   /**
+   * PRD #1631 — an utterance said while the agent on screen waits on a
+   * question (`DeckBridge.resolveVoiceQuestion`), and the send of a whole
+   * answered form (`DeckBridge.sendVoiceAnswer`). Optional like the rest: a
+   * panel on a runtime without them treats nothing as an answer.
+   */
+  resolveVoiceQuestion?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, utterance: string, form: import("./lib/voiceQuestion").QuestionSelectionDto[], awaitingText?: import("./lib/voiceQuestion").QuestionTextSlotDto, localOnly?: boolean) => Promise<import("./lib/voiceQuestion").QuestionResultDto>;
+  sendVoiceAnswer?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, form: import("./lib/voiceQuestion").QuestionSelectionDto[], confirmedAlways: boolean, lease: string) => Promise<import("./lib/voiceQuestion").AnswerOutcomeDto>;
+  /** PRD #1631 (audit A8): cancel the lease an answer is being sent under (`DeckBridge.cancelVoiceAnswer`). */
+  cancelVoiceAnswer?: (lease: string) => Promise<void>;
+  /**
    * Every command in the table, annotated for one screen (PRD #802 D7) — what
    * the discovery overlay lists.
    *
@@ -1655,8 +1671,12 @@ export interface DeckRuntimeState {
   ) => Promise<import("./lib/bridge").VoiceCommandDto[]>;
   /** Open the microphone. Rejects with the not-configured sentence when transcription is off. */
   voiceStart?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
-  /** Close the microphone and transcribe what it heard. No audio crosses the boundary. */
-  voiceStop?: () => Promise<import("./lib/bridge").VoiceTranscriptionDto>;
+  /**
+   * Close the microphone and transcribe what it heard. No audio crosses the
+   * boundary. `onSplit` is called once the backend has split the recording,
+   * before it transcribes (PRD #1631).
+   */
+  voiceStop?: (onSplit?: () => void) => Promise<import("./lib/bridge").VoiceTranscriptionDto>;
   /**
    * What the microphone is doing, and whether one is offered at all.
    *

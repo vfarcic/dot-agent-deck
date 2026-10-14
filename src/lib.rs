@@ -107,6 +107,7 @@ pub mod prompt_delivery;
 // PRD #1401: the pull request an agent's work produced, on the session wire.
 pub mod pull_request;
 pub mod pull_request_info;
+pub mod question;
 pub mod quota_block;
 pub mod quota_signals;
 pub mod remote;

@@ -1,0 +1,11 @@
+{
+  "session_id": "11e159a7-9408-43a1-8c85-2f593d8479bf",
+  "prompt_id": "18863ebb-831e-438d-8ba9-6daa55129f09",
+  "permission_mode": "plan",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "ExitPlanMode",
+  "tool_input": {
+    "plan": "# Create Empty Plan Probe File\n\nCreate an empty file named `plan_probe.txt` in the project root using the Write tool.\n",
+    "planFilePath": "/work/.claude/plans/plan-create-an-empty-bubbly-gem.md"
+  }
+}

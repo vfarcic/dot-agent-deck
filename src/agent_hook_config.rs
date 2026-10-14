@@ -430,6 +430,11 @@ fn lock_config_waiting(
     let file = opts.open(&lock_path)?;
     let started = std::time::Instant::now();
     let give_up = started + ceiling;
+    // When the current window began: the wait's start, or the look that last
+    // saw `dest` change. The last window is cut short to end at the ceiling,
+    // so a window running out does not by itself mean `stall` has passed
+    // without a publish, and only a full one reads as a stuck holder.
+    let mut window_start = started;
     let mut stall_deadline = (started + stall).min(give_up);
     // Sampled only when a stall window runs out, not on every poll, so waiters
     // add one `stat` of `dest` per window rather than hundreds per second.
@@ -444,7 +449,7 @@ fn lock_config_waiting(
                 let now = std::time::Instant::now();
                 if now >= stall_deadline {
                     let current = PublishMark::of(dest);
-                    if current == seen {
+                    if current == seen && now >= window_start + stall {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
@@ -467,6 +472,7 @@ fn lock_config_waiting(
                     // Another writer published since the last look: the lock
                     // is changing hands, not stuck. Start a fresh window.
                     seen = current;
+                    window_start = now;
                     stall_deadline = (now + stall).min(give_up);
                 }
                 std::thread::sleep(CONFIG_LOCK_POLL);
@@ -4016,23 +4022,40 @@ mod tests {
         assert!(lock_config(&dest).is_err());
     }
 
-    /// The stall window the busy-holder tests wait with: the waiter looks once
-    /// per window, so a window reads as stuck only if no publish at all lands
-    /// in it. At 500 ms both busy-holder tests failed on a dev box at load
-    /// average ~30 (2026-10-13), in isolation too, and passed once the load
-    /// fell; four times that leaves room for a loaded box to schedule the
-    /// holder.
-    const BUSY_HOLDER_STALL: std::time::Duration = std::time::Duration::from_secs(2);
+    /// Publish `dest` the cheapest way [`PublishMark`] can see: one byte
+    /// appended, so its length grows.
+    ///
+    /// Not [`write_atomic`], and not a rename over `dest` either: both made the
+    /// holder's cadence the disk's. Beside eight `dd conv=fsync` loops,
+    /// `write_atomic`'s `fsync` failed each of the two tests below in 10 of 15
+    /// runs, and with the `fsync` gone a bare rename over `dest` still took up
+    /// to 1.59 s on ext4, which starts writing a file back when it is renamed
+    /// over another. Either way one publish outlasted a whole stall window,
+    /// and the waiter was right to read the holder as stuck. An append took at
+    /// most 452 ms under the same load. What these tests exercise is the
+    /// waiter's reading of publishes, not how fast a disk syncs.
+    fn publish_by_appending(dest: &Path) {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dest)
+            .and_then(|mut file| file.write_all(b"x"))
+            .expect("publish");
+    }
+
+    /// The stall window the busy-holder tests wait with: each window has to
+    /// see one of the holder's publishes, or the holder reads as stuck. It is
+    /// shared so the two tests cannot drift apart, and load-scaled from twice
+    /// the 452 ms the slowest [`publish_by_appending`] took under load. A flat
+    /// 500 ms failed both tests on a 16-CPU dev box at load average ~30
+    /// (2026-10-13); at that load the factor alone brings this window to about
+    /// the 2 s a flat window was raised to.
+    fn busy_holder_stall() -> std::time::Duration {
+        crate::test_budget::load_scaled(std::time::Duration::from_secs(1))
+    }
 
     /// Hold the config's lock on a thread that publishes `dest` every `every`
     /// until `stop` is set, then release it. Returns once the lock is held.
-    ///
-    /// It publishes the way [`write_atomic`] does, a fresh file renamed over
-    /// `dest`, which is the change [`PublishMark`] sees, but without the
-    /// fsync: these tests are about the waiter, and on a box busy writing
-    /// elsewhere one fsync blocked for seconds, which the waiter rightly read
-    /// as a stuck holder (the same 2026-10-13 runs, where a 6 s test took
-    /// 14.6 s and failed at a 2 s window).
     fn hold_and_keep_publishing(
         dest: &Path,
         every: std::time::Duration,
@@ -4043,16 +4066,11 @@ mod tests {
         let holder = std::thread::spawn(move || {
             let _lock = lock_config(&dest).expect("holder takes the lock");
             locked.send(()).expect("signal the lock is held");
-            let dir = dest.parent().expect("dest has a directory");
             let mut published = 0;
             while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                 std::thread::sleep(every);
                 published += 1;
-                // A different length each time, so the change shows even where
-                // the modification time is coarse.
-                let next = dir.join("config.next");
-                std::fs::write(&next, "x".repeat(published)).expect("write the next copy");
-                std::fs::rename(&next, &dest).expect("publish");
+                publish_by_appending(&dest);
             }
             published
         });
@@ -4070,7 +4088,7 @@ mod tests {
         let dir = crate::test_temp::tempdir().expect("lock tempdir");
         let dest = dir.path().join("config.toml");
         std::fs::write(&dest, b"").expect("seed destination");
-        let stall = BUSY_HOLDER_STALL;
+        let stall = busy_holder_stall();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let holder =
             hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
@@ -4144,9 +4162,65 @@ mod tests {
         let holder =
             hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
 
-        let ceiling = BUSY_HOLDER_STALL * 12 / 5;
+        // The stall window is sized as in the test above: a publish has to land
+        // inside each one for the wait to reach the ceiling at all.
+        let stall = busy_holder_stall();
+        let ceiling = stall.mul_f64(2.4);
         let started = std::time::Instant::now();
-        let waited = lock_config_waiting(&dest, BUSY_HOLDER_STALL, ceiling);
+        let waited = lock_config_waiting(&dest, stall, ceiling);
+        let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        holder.join().expect("holder thread");
+
+        let err = waited.err().expect("the ceiling bounds the wait");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("busy"), "unexpected error: {err}");
+        assert!(
+            elapsed >= ceiling,
+            "gave up after {elapsed:?}, before {ceiling:?}"
+        );
+    }
+
+    /// The last window before the ceiling is cut short to end at it. A holder
+    /// that published well inside the stall window before then is busy, not
+    /// stuck, even though that short window saw no publish: the ceiling is
+    /// what ended the wait, and the error says so.
+    #[test]
+    fn the_config_lock_blames_the_ceiling_when_the_last_window_is_cut_short() {
+        let dir = crate::test_temp::tempdir().expect("lock tempdir");
+        let dest = dir.path().join("config.toml");
+        std::fs::write(&dest, b"").expect("seed destination");
+        let stall = crate::test_budget::load_scaled(std::time::Duration::from_millis(400));
+        // Windows end at `stall`, `2 * stall` and, cut short, the ceiling.
+        let ceiling = stall.mul_f64(2.4);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (locked, held) = std::sync::mpsc::channel();
+        let (go, started_at) = std::sync::mpsc::channel::<std::time::Instant>();
+        let holder = {
+            let dest = dest.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let _lock = lock_config(&dest).expect("holder takes the lock");
+                locked.send(()).expect("signal the lock is held");
+                let started = started_at.recv().expect("the wait's start");
+                // One publish in the middle of each of the first two windows,
+                // then none: the last is half a window before the third
+                // starts, and 0.9 of a window before the ceiling.
+                for at in [0.5, 1.5] {
+                    let when = started + stall.mul_f64(at);
+                    std::thread::sleep(when.saturating_duration_since(std::time::Instant::now()));
+                    publish_by_appending(&dest);
+                }
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+        held.recv().expect("the holder took the lock");
+
+        let started = std::time::Instant::now();
+        go.send(started).expect("start the holder's schedule");
+        let waited = lock_config_waiting(&dest, stall, ceiling);
         let elapsed = started.elapsed();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         holder.join().expect("holder thread");
