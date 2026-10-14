@@ -56,11 +56,10 @@ impl Drop for RestorePairedDoc {
     }
 }
 
-/// Scenario: On a thread named after this test, start the deck on the minimal
-/// fixture, wait for the dashboard, and panic with the deck still alive, as a
-/// failing e2e test does. The failure dump is still written (with a `failed`
-/// provenance), but the paired `test.md` is not regenerated, which is the step
-/// that kept a panicked test's process alive for minutes.
+/// Scenario: Start the deck and a sleeping stand-in agent on a named thread,
+/// capture their sandbox daemon and agent pids, then panic as a failing test does.
+/// Teardown must stop both before deleting their working directory, still write
+/// the failed recording, and skip regeneration of the paired test document.
 #[test]
 #[spec("harness/teardown/001")]
 fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
@@ -81,10 +80,45 @@ fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
         .name()
         .expect("libtest names the test thread")
         .to_string();
+    #[cfg(unix)]
+    let (sender, receiver) = std::sync::mpsc::channel();
     let joined = std::thread::Builder::new()
         .name(thread_name)
-        .spawn(|| {
-            let deck = TuiDeck::builder().launch_with_fixture("minimal");
+        .spawn(move || {
+            let builder = TuiDeck::builder();
+            #[cfg(unix)]
+            let builder = builder.with_continue_session(
+                "teardown-standin",
+                "sh -c 'echo $$ > teardown-agent.pid; exec sleep 180'",
+            );
+            let deck = builder.launch_with_fixture("minimal");
+            #[cfg(unix)]
+            {
+                deck.wait_for_string("teardown-standin");
+                let pid_path = deck.workdir().join("teardown-agent.pid");
+                assert!(common::wait_for_path(
+                    &pid_path,
+                    std::time::Duration::from_secs(10)
+                ));
+                let agent_pid: i32 = std::fs::read_to_string(pid_path)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let stream = runtime
+                    .block_on(dot_agent_deck::platform::ipc::IpcStream::connect(
+                        deck.attach_socket_path(),
+                    ))
+                    .expect("connect to this test's daemon");
+                let daemon_pid = dot_agent_deck::platform::peercred::peer_pid(&stream)
+                    .expect("capture sandbox daemon peer pid")
+                    as i32;
+                sender
+                    .send((daemon_pid, agent_pid, deck.workdir().to_owned()))
+                    .unwrap();
+            }
+            #[cfg(not(unix))]
             deck.wait_for_string("No active agents");
             panic!("{DELIBERATE_PANIC}");
         })
@@ -103,6 +137,34 @@ fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
         message, DELIBERATE_PANIC,
         "the deck thread panicked before reaching the deliberate panic"
     );
+
+    #[cfg(unix)]
+    {
+        let (daemon_pid, agent_pid, workdir) = receiver.recv().expect("captured sandbox pids");
+        // Reap only captured processes even when this regression is red, so
+        // proving the leak does not leave another test agent on the host.
+        struct ReapCaptured(i32, i32);
+        impl Drop for ReapCaptured {
+            fn drop(&mut self) {
+                for pid in [self.1, self.0] {
+                    if common::process_running(pid) {
+                        // SAFETY: each pid was captured from this test's sandbox.
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+            }
+        }
+        let _reap = ReapCaptured(daemon_pid, agent_pid);
+        assert!(
+            common::wait_until(std::time::Duration::from_secs(2), || {
+                !common::process_running(daemon_pid) && !common::process_running(agent_pid)
+            }),
+            "panicking TuiDeck teardown left sandbox processes alive after deleting cwd {}: daemon pid {daemon_pid} alive={}, agent pid {agent_pid} alive={}",
+            workdir.display(),
+            common::process_running(daemon_pid),
+            common::process_running(agent_pid)
+        );
+    }
 
     // Control: the drop really ran its failure dump, so the doc's absence below
     // is the regeneration being skipped rather than the dump never happening.
