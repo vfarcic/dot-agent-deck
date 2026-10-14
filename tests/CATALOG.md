@@ -7032,6 +7032,13 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** a wall-clock bound on the drop (the observation is the skipped step, which does not depend on machine load); the record-on-success path (`DOT_AGENT_DECK_RECORD=1`), which still regenerates the doc; the content of any dumped artifact beyond the provenance outcome.
 - **Platform coverage:** mac+linux.
 
+##### harness/teardown/002 — The teardown stop never stops a daemon reached through a fixture socket name that leads to another deck's socket (PRD #1666 audit A2-1).
+- **Layer:** L2 lane 1, headless (two real `dot-agent-deck daemon serve` stand-ins, each in its own temp directory, driven through the harness's `stop_fixture_daemon`, the function `TuiDeck`'s `Drop` stops its sandbox daemon with).
+- **Agent:** none; no real agent or credential, and neither daemon is the developer's.
+- **Asserts:** with the fixture's attach-socket name replaced by a hard link to the other daemon's socket — a name that canonicalising the path leaves inside the fixture — and then by a symlink to it, the stop is refused both times, and the other daemon is still running and still answers `ListAgents`. Control: pointed at the other daemon's own fixture and socket, the same stop reports that daemon's pid as stopped and it exits, so the refusals come from the listener failing the identity check (its environment does not carry the fixture's attach socket), not from an inability to stop.
+- **Does not assert:** a swap racing the stop mid-flight (the stop identifies the listener by its own environment wherever the name leads, so when the name was swapped does not change the outcome); the pid-reuse window on macOS, where the stop signals by pid; that `TuiDeck`'s `Drop` stops its own daemon (`harness/teardown/001`).
+- **Platform coverage:** mac+linux.
+
 ### Agent messaging inbox (PRD #1666)
 
 #### inbox/core

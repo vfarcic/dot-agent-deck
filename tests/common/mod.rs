@@ -659,8 +659,10 @@ pub struct TuiDeck {
     home: PathBuf,
     hook_socket: PathBuf,
     attach_socket: PathBuf,
-    /// The final attach override, checked against this fixture at teardown.
-    /// Teardown must never fall back to the developer's default endpoint.
+    /// The final attach override, exactly as the deck was launched with it.
+    /// Teardown stops the daemon listening there only when that daemon was
+    /// itself launched with this value ([`stop_fixture_daemon`]), and never
+    /// falls back to the developer's default endpoint.
     teardown_attach_socket: Option<PathBuf>,
     fixture_path: PathBuf,
     test_name: String,
@@ -1245,16 +1247,12 @@ impl TuiDeck {
         let daemon_log_path = final_env
             .get("DOT_AGENT_DECK_STATE_DIR")
             .map(|dir| PathBuf::from(dir).join("daemon.log"));
+        // Kept verbatim: teardown matches the daemon's own environment against
+        // this value, and a relative one names no fixture, so teardown leaves
+        // it alone rather than this resolving it.
         let teardown_attach_socket = final_env
             .get("DOT_AGENT_DECK_ATTACH_SOCKET")
-            .map(PathBuf::from)
-            .map(|socket| {
-                if socket.is_absolute() {
-                    socket
-                } else {
-                    launch_dir.join(socket)
-                }
-            });
+            .map(PathBuf::from);
         for (k, v) in final_env {
             cmd.env(k, v);
         }
@@ -2474,7 +2472,7 @@ impl Drop for TuiDeck {
         // so a negative-pid `kill` signals every non-detached descendant in its
         // group (best-effort; ignore errors). Then the normal child kill+wait
         // as the fallback. The lazy-spawned daemon has its own session, so it
-        // is stopped separately through this fixture's endpoint below.
+        // is identified and stopped separately below.
         #[cfg(unix)]
         if let Some(pid) = self.child.process_id() {
             // SAFETY: kill(2) with a negative pid signals the process group;
@@ -2487,10 +2485,10 @@ impl Drop for TuiDeck {
         let _ = self.child.wait();
 
         // Stop after the TUI so it cannot lazily respawn a daemon, and before
-        // TempDir deletes the agents' working directories. The product stop
-        // drains the managed agent trees and pins the socket peer before any
-        // PID escalation. Keep the lifetime cap as the backstop for SIGKILL or
-        // a hung stop: Drop cannot run after a killed test process.
+        // TempDir deletes the agents' working directories. The daemon's
+        // SIGTERM shutdown drains its managed agent trees. Keep the lifetime
+        // cap as the backstop for SIGKILL or a refused or hung stop: Drop
+        // cannot run after a killed test process.
         self.stop_sandbox_daemon();
 
         if let Some(h) = self.reader_handle.take() {
@@ -2542,59 +2540,331 @@ impl TuiDeck {
         let Some(socket) = &self.teardown_attach_socket else {
             return;
         };
-        // Resolve after launch: an owned nested parent may not have existed
-        // yet, and an alias inside the fixture must not target an outside
-        // daemon. An absent socket needs no stop. Never ask endpoint discovery
-        // to choose another daemon when this check refuses the captured path.
-        if !std::fs::canonicalize(socket).is_ok_and(|socket| {
-            std::fs::canonicalize(self.tempdir.path()).is_ok_and(|root| socket.starts_with(root))
-        }) {
-            return;
-        }
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
-        command
-            .args(["daemon", "stop", "--force"])
-            .env_clear()
-            .env("HOME", &self.home)
-            .env("DOT_AGENT_DECK_ATTACH_SOCKET", socket)
-            .env("DOT_AGENT_DECK_SOCKET", &self.hook_socket)
-            .current_dir(&self.fixture_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        if let Some(state) = self.daemon_log_path.as_ref().and_then(|log| log.parent()) {
-            command.env("DOT_AGENT_DECK_STATE_DIR", state);
-        }
-        let mut stop = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                eprintln!("[tui-harness] could not stop sandbox daemon at {socket:?}: {error}");
-                return;
-            }
-        };
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            match stop.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        eprintln!("[tui-harness] sandbox daemon stop at {socket:?}: {status}");
-                    }
-                    return;
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                result => {
-                    eprintln!(
-                        "[tui-harness] sandbox daemon stop at {socket:?} did not finish: {result:?}"
-                    );
-                    let _ = stop.kill();
-                    let _ = stop.wait();
-                    return;
-                }
-            }
+        match stop_fixture_daemon(self.tempdir.path(), socket) {
+            // A test that points the deck at a daemon it spawned elsewhere
+            // (`DaemonProc`) owns that daemon's teardown; nothing to say.
+            FixtureDaemonStop::OutsideFixture
+            | FixtureDaemonStop::NoDaemon
+            | FixtureDaemonStop::Stopped { .. } => {}
+            outcome => eprintln!("[tui-harness] sandbox daemon at {socket:?}: {outcome:?}"),
         }
     }
+}
+
+/// What [`stop_fixture_daemon`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixtureDaemonStop {
+    /// The attach socket is not an absolute path inside the fixture, so no
+    /// daemon there is the fixture's to stop. Nothing was connected to.
+    OutsideFixture,
+    /// Nothing listens at the socket: no file, a stale inode, or a listener
+    /// that exited before it could be identified.
+    NoDaemon,
+    /// The fixture's daemon exited after `SIGTERM`.
+    Stopped { pid: u32 },
+    /// It was still running when the grace window ended, and was sent
+    /// `SIGKILL`.
+    Killed { pid: u32 },
+    /// The listener could not be shown to be this fixture's daemon, so it was
+    /// not signalled.
+    Refused(String),
+    /// The daemon was identified, but stopping it failed.
+    Failed(String),
+}
+
+/// Stop the daemon that a fixture rooted at `fixture_root` launched with
+/// `DOT_AGENT_DECK_ATTACH_SOCKET=<attach_socket>`, and no other process (audit
+/// A2-1).
+///
+/// The path only says where to look. A name inside the fixture can still reach
+/// an outside daemon — a symlink or a same-filesystem hard link to another
+/// deck's socket, put there before or after any check of the path — so the
+/// listener is identified by what it is rather than where it was found: the
+/// peer of a connection to the socket is signalled only when its own
+/// environment carries `DOT_AGENT_DECK_ATTACH_SOCKET` set to exactly
+/// `attach_socket`. That value must be an absolute path lexically inside
+/// `fixture_root`, a fresh temp directory, so a daemon started outside this
+/// fixture does not carry it unless it was given this fixture's environment.
+/// (A process the fixture's daemon spawned inherits the value too, and is the
+/// fixture's own.) A listener that fails the check is refused; there is no
+/// fallback to a pattern, a pidfile or endpoint discovery.
+///
+/// The stop is the daemon's own graceful path — `SIGTERM`, which stops its
+/// managed agents — then `SIGKILL` after `daemon stop --force`'s windows. On
+/// Linux the process is held by a pidfd from before its environment is read
+/// until the last signal, so a pid reused in between is never signalled. On
+/// macOS the environment is read with `ps -E` and the signals go by pid, the
+/// identity re-checked before each; a reuse between a check and its signal is
+/// not excluded there. Other platforms stop nothing and refuse, leaving the
+/// daemon to its `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap.
+pub fn stop_fixture_daemon(fixture_root: &Path, attach_socket: &Path) -> FixtureDaemonStop {
+    use std::path::Component;
+    let inside = attach_socket.is_absolute()
+        && attach_socket != fixture_root
+        && attach_socket.starts_with(fixture_root)
+        && attach_socket
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+    if !inside {
+        return FixtureDaemonStop::OutsideFixture;
+    }
+    stop_identified_daemon(attach_socket)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stop_identified_daemon(attach_socket: &Path) -> FixtureDaemonStop {
+    let stream = match std::os::unix::net::UnixStream::connect(attach_socket) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return FixtureDaemonStop::NoDaemon;
+        }
+        Err(error) => return FixtureDaemonStop::Refused(format!("connect: {error}")),
+    };
+    let pid = match socket_peer_pid(&stream) {
+        Ok(pid) if pid != 0 && pid != std::process::id() => pid,
+        Ok(pid) => return FixtureDaemonStop::Refused(format!("peer pid {pid} is not a daemon")),
+        Err(error) => return FixtureDaemonStop::Refused(format!("peer pid: {error}")),
+    };
+    let mut expected = b"DOT_AGENT_DECK_ATTACH_SOCKET=".to_vec();
+    expected.extend_from_slice(std::os::unix::ffi::OsStrExt::as_bytes(
+        attach_socket.as_os_str(),
+    ));
+    signal_identified_daemon(pid, &expected, stream)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn stop_identified_daemon(_attach_socket: &Path) -> FixtureDaemonStop {
+    FixtureDaemonStop::Refused("this platform cannot identify the socket's listener".into())
+}
+
+/// The pid of the process listening on the other end of `stream`.
+#[cfg(target_os = "linux")]
+fn socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a zeroed `ucred` is a valid out-buffer; `len` is its size, and
+    // `getsockopt` writes at most that many bytes. The fd is borrowed from
+    // `stream` for the duration of the call.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(cred.pid as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` is a stack `pid_t` and `len` its size; `getsockopt` writes
+    // at most that many bytes. The fd is borrowed from `stream`.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pid as u32)
+}
+
+/// Linux: hold `pid` as a pidfd, then confirm from `/proc/<pid>/environ` that it
+/// was launched with `expected`, then signal it through the pidfd.
+#[cfg(target_os = "linux")]
+fn signal_identified_daemon(
+    pid: u32,
+    expected: &[u8],
+    stream: std::os::unix::net::UnixStream,
+) -> FixtureDaemonStop {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let flags: libc::c_uint = 0;
+    // SAFETY: pidfd_open(2) reads its two scalar arguments and returns a new
+    // fd or -1.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, flags) };
+    if raw < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return FixtureDaemonStop::NoDaemon;
+        }
+        return FixtureDaemonStop::Refused(format!("pidfd_open({pid}): {error}"));
+    }
+    // SAFETY: `raw` is a fresh fd that nothing else owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as std::os::fd::RawFd) };
+    // The connection named the pid; from here on the pidfd holds it.
+    drop(stream);
+    let launched_with = std::fs::read(format!("/proc/{pid}/environ"))
+        .map(|environ| environ.split(|b| *b == 0).any(|entry| entry == expected));
+    // A pid is reused only after its process exits, and an exit is permanent
+    // on the pidfd: still running after the read means the read was of the
+    // process the pidfd holds.
+    if pidfd_exited(&pidfd, Duration::ZERO) {
+        return FixtureDaemonStop::NoDaemon;
+    }
+    match launched_with {
+        Ok(true) => {}
+        Ok(false) => {
+            return FixtureDaemonStop::Refused(format!(
+                "pid {pid} was not launched with this fixture's attach socket"
+            ));
+        }
+        Err(error) => {
+            return FixtureDaemonStop::Refused(format!("read pid {pid}'s environment: {error}"));
+        }
+    }
+    if let Err(error) = pidfd_signal(&pidfd, libc::SIGTERM) {
+        return FixtureDaemonStop::Failed(format!("SIGTERM pid {pid}: {error}"));
+    }
+    if pidfd_exited(&pidfd, dot_agent_deck::daemon_stop::STOP_GRACE_TIMEOUT) {
+        return FixtureDaemonStop::Stopped { pid };
+    }
+    if let Err(error) = pidfd_signal(&pidfd, libc::SIGKILL) {
+        return FixtureDaemonStop::Failed(format!("SIGKILL pid {pid}: {error}"));
+    }
+    if pidfd_exited(&pidfd, dot_agent_deck::daemon_stop::STOP_FORCE_KILL_TIMEOUT) {
+        FixtureDaemonStop::Killed { pid }
+    } else {
+        FixtureDaemonStop::Failed(format!("pid {pid} still running after SIGKILL"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_signal(pidfd: &std::os::fd::OwnedFd, signal: libc::c_int) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let flags: libc::c_uint = 0;
+    // SAFETY: pidfd_send_signal(2) with a null `siginfo` and no flags reads
+    // only its scalar arguments; the fd is borrowed for the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            flags,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether the process `pidfd` holds exits within `within` (a pidfd polls
+/// readable once it has).
+#[cfg(target_os = "linux")]
+fn pidfd_exited(pidfd: &std::os::fd::OwnedFd, within: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let deadline = Instant::now() + within;
+    loop {
+        let mut entry = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        let timeout = left.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: one valid `pollfd`, alive for the duration of the call.
+        let rc = unsafe { libc::poll(&mut entry, 1, timeout) };
+        if rc >= 0 {
+            return rc > 0;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
+/// macOS: confirm with `ps -E` that `pid` was launched with `expected`, then
+/// signal it by pid, re-confirming before the escalation.
+#[cfg(target_os = "macos")]
+fn signal_identified_daemon(
+    pid: u32,
+    expected: &[u8],
+    stream: std::os::unix::net::UnixStream,
+) -> FixtureDaemonStop {
+    let launched_with = || -> std::io::Result<bool> {
+        let out = std::process::Command::new("/bin/ps")
+            .args(["-E", "-ww", "-o", "command=", "-p", &pid.to_string()])
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()?;
+        // `ps` prints the arguments and then the environment, space-separated,
+        // so an argument spelling the same assignment would also match.
+        Ok(out
+            .stdout
+            .split(u8::is_ascii_whitespace)
+            .any(|word| word == expected))
+    };
+    let confirmed = launched_with();
+    drop(stream);
+    match confirmed {
+        Ok(true) => {}
+        Ok(false) if !process_running(pid as i32) => return FixtureDaemonStop::NoDaemon,
+        Ok(false) => {
+            return FixtureDaemonStop::Refused(format!(
+                "pid {pid} was not launched with this fixture's attach socket"
+            ));
+        }
+        Err(error) => {
+            return FixtureDaemonStop::Refused(format!("read pid {pid}'s environment: {error}"));
+        }
+    }
+    let wait_gone = |within: Duration| wait_until(within, || !process_running(pid as i32));
+    if let Err(error) = signal_pid(pid, libc::SIGTERM) {
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return FixtureDaemonStop::NoDaemon;
+        }
+        return FixtureDaemonStop::Failed(format!("SIGTERM pid {pid}: {error}"));
+    }
+    if wait_gone(dot_agent_deck::daemon_stop::STOP_GRACE_TIMEOUT) {
+        return FixtureDaemonStop::Stopped { pid };
+    }
+    if !matches!(launched_with(), Ok(true)) {
+        return FixtureDaemonStop::Refused(format!(
+            "pid {pid} no longer matches the fixture's daemon; not sending SIGKILL"
+        ));
+    }
+    if let Err(error) = signal_pid(pid, libc::SIGKILL) {
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return FixtureDaemonStop::Stopped { pid };
+        }
+        return FixtureDaemonStop::Failed(format!("SIGKILL pid {pid}: {error}"));
+    }
+    if wait_gone(dot_agent_deck::daemon_stop::STOP_FORCE_KILL_TIMEOUT) {
+        FixtureDaemonStop::Killed { pid }
+    } else {
+        FixtureDaemonStop::Failed(format!("pid {pid} still running after SIGKILL"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn signal_pid(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: kill(2) reads its two scalar arguments; the caller confirmed
+    // `pid`'s identity immediately before.
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// How much of a failed run's `daemon.log` [`eprint_daemon_log_tail`] echoes.
@@ -9522,6 +9792,11 @@ impl DaemonProc {
     /// Public point-in-time liveness check (the daemon process has not exited).
     pub fn is_alive_public(&mut self) -> bool {
         self.is_alive()
+    }
+
+    /// The daemon's pid.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// Assert the daemon stays alive for the whole `window` — polls

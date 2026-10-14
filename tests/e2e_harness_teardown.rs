@@ -189,3 +189,83 @@ fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
         paired_doc.display()
     );
 }
+
+/// Scenario: Start two stand-in daemons, one for this fixture and one standing
+/// for another deck, then give the fixture's attach-socket name to the other
+/// daemon's socket — first as a hard link, then as a symlink — and run the
+/// harness teardown stop. Both attempts must be refused with the other daemon
+/// still running and answering; pointed at the other daemon's own fixture, the
+/// same stop then stops it.
+#[cfg(unix)]
+#[test]
+#[spec("harness/teardown/002")]
+fn teardown_002_a_swapped_fixture_socket_cannot_stop_another_daemon() {
+    use common::FixtureDaemonStop;
+
+    let mut other = common::spawn_daemon_serve(None, "0");
+    let mut own = common::spawn_daemon_serve(None, "0");
+    let own_root = own.attach_socket.parent().unwrap().to_path_buf();
+    let other_root = other.attach_socket.parent().unwrap().to_path_buf();
+    let own_socket = own.attach_socket.clone();
+
+    fn assert_other_untouched(
+        other: &mut common::DaemonProc,
+        how: &str,
+        outcome: common::FixtureDaemonStop,
+    ) {
+        assert!(
+            matches!(outcome, common::FixtureDaemonStop::Refused(_)),
+            "a fixture socket {how} the other daemon's socket must be refused, got {outcome:?}"
+        );
+        assert!(
+            other.is_alive_public(),
+            "teardown through a fixture socket {how} the other daemon's socket stopped it"
+        );
+        assert!(
+            common::attach_request_on(
+                &other.attach_socket,
+                &dot_agent_deck::daemon_protocol::AttachRequest::ListAgents,
+            )
+            .is_ok_and(|resp| resp.ok),
+            "the other daemon stopped answering after teardown through a socket {how} it"
+        );
+    }
+
+    // A hard link keeps the fixture's own pathname, even canonicalised, while
+    // connecting to it reaches the other daemon's listener.
+    std::fs::remove_file(&own_socket).expect("unlink the fixture's socket name");
+    std::fs::hard_link(&other.attach_socket, &own_socket)
+        .expect("hard-link the other daemon's socket into the fixture");
+    assert_other_untouched(
+        &mut other,
+        "hard-linked to",
+        common::stop_fixture_daemon(&own_root, &own_socket),
+    );
+
+    // A symlink, as a process swapping the name after a path check would leave.
+    std::fs::remove_file(&own_socket).expect("unlink the hard link");
+    std::os::unix::fs::symlink(&other.attach_socket, &own_socket)
+        .expect("symlink the other daemon's socket into the fixture");
+    assert_other_untouched(
+        &mut other,
+        "symlinked to",
+        common::stop_fixture_daemon(&own_root, &own_socket),
+    );
+    assert!(
+        own.is_alive_public(),
+        "the fixture's own daemon stopped, though neither swapped name leads to it"
+    );
+
+    // Control: the refusals above are about identity, not an inability to
+    // stop — the other daemon's own fixture stops it.
+    let pid = other.pid();
+    assert_eq!(
+        common::stop_fixture_daemon(&other_root, &other.attach_socket),
+        FixtureDaemonStop::Stopped { pid },
+        "the daemon launched with that fixture's socket must be stopped by it"
+    );
+    assert!(
+        other.wait_for_exit(std::time::Duration::from_secs(2)),
+        "the stopped daemon is still running"
+    );
+}
