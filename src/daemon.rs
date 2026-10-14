@@ -5615,6 +5615,76 @@ mod quota_admission_tests {
         assert!(subagent.is_from_subagent());
     }
 
+    /// PRD #1666 long-turn delivery: only the daemon says a message it reported
+    /// not delivered reached the agent after all. A producer frame carrying the
+    /// `delivery_notice_cleared` key loses it at the hook ingress, so it cannot
+    /// lift the card's not-delivered Error. The frame is a Codex wrapper's
+    /// output frame, which asserts no status of its own, so the card moves only
+    /// if the key survives.
+    #[test]
+    fn a_producer_frame_cannot_clear_the_decks_delivery_notice() {
+        use crate::event::{
+            DELIVERY_NOTICE_CLEARED_METADATA_KEY, DELIVERY_NOTICE_CLEARED_METADATA_VALUE,
+            DELIVERY_NOTICE_METADATA_KEY, EventType, WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY,
+            WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE,
+        };
+        use crate::state::{AppState, SessionStatus};
+        let notice = crate::inbox_display::NOTICE_MAX_DELIVER;
+        let codex = |event_type| {
+            let mut event = quota_frame(event_type);
+            event.agent_type = AgentType::Codex;
+            event
+        };
+        let noticed = || {
+            let mut state = AppState::default();
+            state.register_pane("pane-1".to_string());
+            state.apply_event(codex(EventType::SessionStart));
+            let mut report = codex(EventType::Error);
+            report.agent_type = AgentType::None;
+            report.tool_detail = Some(notice.to_string());
+            report
+                .metadata
+                .insert(DELIVERY_NOTICE_METADATA_KEY.to_string(), notice.to_string());
+            state.apply_daemon_report_event(report);
+            assert_eq!(state.sessions["s"].delivery_notice(), Some(notice));
+            state
+        };
+        let forged = || {
+            let mut event = codex(EventType::Thinking);
+            event.metadata.insert(
+                WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+                WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+            );
+            event.metadata.insert(
+                DELIVERY_NOTICE_CLEARED_METADATA_KEY.to_string(),
+                DELIVERY_NOTICE_CLEARED_METADATA_VALUE.to_string(),
+            );
+            event
+        };
+
+        // The control: unadmitted, the key would lift the card.
+        let mut unadmitted = noticed();
+        unadmitted.apply_event(forged());
+        assert_eq!(unadmitted.sessions["s"].status, SessionStatus::Thinking);
+
+        let mut admitted = forged();
+        admit_producer_event(&mut admitted);
+        assert!(
+            !admitted
+                .metadata
+                .contains_key(DELIVERY_NOTICE_CLEARED_METADATA_KEY),
+            "{:?}",
+            admitted.metadata
+        );
+        assert!(!admitted.is_delivery_notice_cleared());
+        assert!(!admitted.is_daemon_synthetic());
+        let mut state = noticed();
+        state.apply_event(admitted);
+        let card = &state.sessions["s"];
+        assert_eq!(card.status, SessionStatus::Error);
+        assert_eq!(card.delivery_notice(), Some(notice));
+    }
+
     /// Issue #1359: a failed Codex turn read from the rollout becomes one
     /// event for the card — `QuotaBlocked`, marked as the daemon's own, for a
     /// usage limit, and `Error`, with no quota metadata and no provider text,
