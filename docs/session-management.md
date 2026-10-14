@@ -21,7 +21,7 @@ The daemon sets each agent's status from the events its hooks report (see [Insta
 | **Compacting** | `Compacting` | running | The agent is compressing its context window. | Nothing. |
 | **Needs Input** | `WaitingForInput` | needs input | The agent is waiting for a permission answer or other input. | Answer it in the pane. In the TUI's command mode, `y` / `n` on the selected card sends approve / deny to a pending permission request. |
 | **Idle** | `Idle` | idle | The agent finished its turn and is waiting for a prompt. | Give it the next prompt. |
-| **Error** | `Error` | failed | The agent reported a failure, including a turn its provider rejected for a reason other than a usage limit (an API error, a model the account cannot use). | Read the pane. |
+| **Error** | `Error` | error | The agent reported a failure, or a deck message could not be delivered. Provider failures include an API error or a model the account cannot use. | Read the pane and any `not delivered: …` notice. |
 | **Blocked** | `Blocked` | blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. | Wait for the limit to reset, switch account or provider, or add credit. See [Blocked](#blocked). |
 | **No agent** | — | — | The pane is not running an agent the deck recognises (for example a plain shell), or the agent has not reported yet. | If it is an agent, see [Troubleshooting → Hooks](troubleshooting.md#hooks). |
 
@@ -49,6 +49,12 @@ In the TUI, a line under `Dir:` says which limit was hit and, when the provider 
 When a worker in an [orchestration](orchestration.md) that still owes a `work-done` turns Blocked, the daemon sends its orchestrator a one-time report, so the orchestrator can reassign the task or notify you; see [Idle Workers & Notifications](idle-workers-and-notifications.md).
 
 If Blocked never appears for Claude Code or OpenCode, the hook or plugin that reports it may not be installed. The deck installs them at startup only into configuration directories that already exist (`~/.claude`; `~/.config/opencode`, `$XDG_CONFIG_HOME/opencode` or `~/.opencode`). If the agent had never run on this machine when the deck started, run `dot-agent-deck hooks install` or `dot-agent-deck hooks install --agent opencode`, then restart the agent. On a remote host, run the same commands there.
+
+## Message delivery
+
+Both the TUI card and desktop tile show `✉N queued` for messages awaiting acknowledgement and `✉ delivered` when the agent has received them and none remain pending. Narrow TUI cards shorten the count to `✉N`. A message that cannot be delivered shows **Error** (desktop **error**) and a `not delivered: …` notice. The desktop overview still counts error agents under **FAILED**.
+
+The `Prmt:` line on a TUI card shows `✉ <subject>` for a deck message. Its `Sent by:` line is visible in the agent's pane in both clients. Delivery means receipt, not that the task has finished. See [Orchestration → Delivery](orchestration.md#delivery-in-the-tui-and-desktop-app) for agent support and the inbox commands.
 
 ## What a TUI card shows
 

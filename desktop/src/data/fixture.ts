@@ -766,6 +766,12 @@ const docsAgents: AgentSession[] = [
   crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "needs_input", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
 ];
 
+/** Synthetic pair matching the TUI's agent-messaging capture. */
+const docsMessagingAgents: AgentSession[] = [
+  { ...crowdedAgent({ id: "1", displayName: "planner", role: "Planner", cli: "claude", status: "running", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 30, quietForMinutes: 0, activeTool: "Read", activeToolDetail: "src/checkout/flow.ts", lastUserPrompt: "Plan the checkout retry flow.", tab: orchestrationTab("docs-messaging", "demo-loop", "demo-loop", "planner", 0, true, "/home/dev/demo-project") }), inbox: { queued: 1, fetched: 0, undeliverable: 0, wake: "doorbell" }, transcript: "Planning the checkout retry flow\r\n" },
+  { ...crowdedAgent({ id: "2", displayName: "builder", role: "Builder", cli: "codex", status: "running", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 30, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/checkout/RetryPayment.tsx", lastUserPrompt: "Implement the checkout retry flow.", tab: orchestrationTab("docs-messaging", "demo-loop", "demo-loop", "builder", 1, false, "/home/dev/demo-project") }), inbox: { queued: 1, fetched: 0, undeliverable: 0, wake: "doorbell" }, transcript: "Ready to implement the checkout plan\r\n" },
+];
+
 /** Two answering daemons with synthetic projects and no demo-run paths. */
 function docsFleet(): DeckSnapshot[] {
   const local = createFixtureSnapshot("docs");
@@ -1065,7 +1071,8 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
       ? { status: "error" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, daemonDetected: true, message: "This daemon is older than this app, and the two cannot work together. Update the daemon to this app's version.", detail: "The app speaks protocol 6; the daemon reports protocol 5." }
       : { status: "disconnected" as const, message: "No daemon is listening on the configured socket." };
 
-  const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : agents;
+  const messaging = state === "docs" && typeof window !== "undefined" && new URLSearchParams(window.location.search).get("messaging") === "1";
+  const fleet = messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : agents;
   // The docs scenario carries only what its screenshots show, so nothing from
   // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
   const docs = state === "docs";
@@ -1074,7 +1081,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
     runId: "run_7f24a",
     repo: "dot-agent-deck",
     branch: "codex/visual-control-deck",
-    worktree: docs ? DOCS_CWD : "/dev/active/dot-agent-deck-gui",
+    worktree: messaging ? "/home/dev/demo-project" : docs ? DOCS_CWD : "/dev/active/dot-agent-deck-gui",
     connection,
     health: state === "connected" || state === "crowded" || docs ? "healthy" : state === "error" ? "failed" : "idle",
     elapsed: "16:42",

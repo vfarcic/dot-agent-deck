@@ -89,6 +89,18 @@ desktopScenario("agent-pane", async (page) => {
   await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
 });
 
+desktopScenario("agent-messaging", async (page) => {
+  await page.goto("/?fixture=1&state=docs&messaging=1&experimental=1");
+  await page.getByTestId("open-deck").click();
+  await page.getByRole("button", { name: "Close events drawer" }).click();
+  await expect(page.getByTestId("inbox-badge-1")).toBeVisible();
+  await expect(page.getByTestId("inbox-badge-2")).toBeVisible();
+  await expect(page.getByTestId("inbox-badge-1")).toHaveText("✉1 queued");
+  await expect(page.getByTestId("inbox-badge-2")).toHaveText("✉1 queued");
+  await expect(page.getByTestId("terminal-1").locator(".xterm-screen canvas").first()).toBeVisible();
+  await expect(page.getByTestId("terminal-2").locator(".xterm-screen canvas").first()).toBeVisible();
+});
+
 desktopScenario("settings-daemons", async (page) => {
   await page.addInitScript(() => {
     window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({

@@ -32,6 +32,7 @@ Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produ
 | `dashboard-fleet` | desktop | Agent dashboard with six agents across two connected daemons. |
 | `new-agent` | TUI, desktop | New Agent form with a project directory chosen. |
 | `orchestration` | TUI, desktop | Activated `demo-loop` with planner and builder roles. |
+| `agent-messaging` | TUI, desktop | Planner and builder working with one queued inbox message each. TUI activation queues the planner's remit and the capture posts the builder's task. The dedicated desktop scene is `/?fixture=1&state=docs&messaging=1&experimental=1`, shown on the Daemons view. Both use synthetic agents. |
 | `agent-pane` | desktop | Agent pane over the Dashboard, showing a fixed implementation transcript. |
 | `settings-daemons` | desktop | Daemons settings with one configured remote. The browser fixture cannot produce a successful Test connection result. |
 | `daemon-upgrade` | desktop | The Upgrade dialog on the `upgrade` fixture's `dev@build-box` deck, an older remote release with agents running, stopped at the restart question listing them (PRD #1487). The fixture bridge walks the stages; nothing is installed. |

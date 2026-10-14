@@ -68,10 +68,18 @@ The desktop app shows five statuses. Each covers one or more of the words the TU
 | **RUNNING** | Thinking, Working, Compacting | The agent is busy. An agent that has reported no status at all yet, for example a plain shell or an agent whose hooks are not installed, also shows **RUNNING**. |
 | **NEEDS INPUT** | Needs Input | The agent is waiting for you: a permission answer or other input. Answer it in its pane. |
 | **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
-| **FAILED** | Error | Something went wrong. |
+| **error** (counted under **FAILED**) | Error | Something went wrong, including a message the deck could not deliver. Read the notice and open the pane. |
 | **BLOCKED** | Blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. Open the agent's pane to see which limit, and when it resets if the provider says. |
 
 What each status means, and which agents can report Blocked, is on [Session Management → Session Statuses](../session-management.md#session-statuses). An agent that stays **RUNNING** when it is clearly idle usually has no hooks reporting to the daemon; see [Troubleshooting → Hooks](../troubleshooting.md#hooks).
+
+## Message delivery and handoffs
+
+Agent tiles show `✉N queued` while messages await acknowledgement, and `✉ delivered` when received and nothing remains pending. If delivery fails, the tile reads **error** and shows `not delivered: …`. The TUI cards show the same states, with **Error** as the status and `✉N` on narrow cards.
+
+The handoff rail tracks worker handoffs with `delegated · queued`, `delivered · working`, `work-done` and `not delivered`. It is a desktop surface; in the TUI, follow the role cards and the orchestrator's pane. A delivered message is a receipt, so read the worker's report before treating its work as complete.
+
+See [Orchestration → Delivery](../orchestration.md#delivery-in-the-tui-and-desktop-app) for native wake support, the fallback doorbell and the inbox commands.
 
 ## The agent pane
 
