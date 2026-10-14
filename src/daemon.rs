@@ -877,6 +877,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         state.clone(),
         crate::doorbell::DoorbellConfig::from_env(),
     );
+    // PRD #1666 S11: hands an offered job back in its pool to the next taker.
+    let offer_assigner =
+        crate::inbox_pubsub::spawn_offer_assigner(Arc::clone(&pty_registry), state.clone());
     let restart_control = daemon.restart_control;
     // Issue #454: teach this daemon's `AppState` to resolve "do I own the agent
     // this event names?" against the registry rather than against a set it
@@ -1227,6 +1230,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     codex_rollout_handle.abort();
     scheduler_handle.abort();
     inbox_ticker.abort();
+    offer_assigner.abort();
     doorbell.abort();
     if let Some(h) = orphan_handle {
         h.abort();
@@ -4549,6 +4553,82 @@ async fn run_hook_loop_with_idle_timeout(
                                     {
                                         Ok(reply) => serde_json::to_string(&reply),
                                         Err(refusal) => serde_json::to_string(&refusal),
+                                    };
+                                    if let Ok(json) = json {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::InboxPublish(_)
+                                | DaemonMessage::InboxOffer(_)
+                                | DaemonMessage::InboxComplete(_)
+                                | DaemonMessage::InboxRelease(_) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    // Hardening M2 for the verbs that reach
+                                    // other agents or move a job between them:
+                                    // only the agent's own process tree may
+                                    // use its token.
+                                    if let Err(why) = admit_inbox_component(
+                                        peer_pid,
+                                        None,
+                                        pty_registry.child_pid(&agent_id),
+                                    ) {
+                                        warn!(
+                                            verb = msg.verb(),
+                                            pane_id = %escape_id_for_log(msg.claimed_pane()),
+                                            why,
+                                            "hook socket: refused an inbox post from outside the \
+                                             pane's agent"
+                                        );
+                                        if let Some(json) = msg.provenance_refusal_reply(
+                                            INBOX_NOT_AGENT_PROCESS,
+                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                        ) {
+                                            let line = format!("{json}\n");
+                                            let _ = write_half.write_all(line.as_bytes()).await;
+                                            let _ = write_half.flush().await;
+                                        }
+                                        continue;
+                                    }
+                                    let json = match &msg {
+                                        DaemonMessage::InboxPublish(req) => serde_json::to_string(
+                                            &crate::inbox_pubsub::handle_publish(
+                                                &pty_registry,
+                                                &state,
+                                                req,
+                                                &agent_id,
+                                            )
+                                            .await,
+                                        ),
+                                        DaemonMessage::InboxOffer(req) => serde_json::to_string(
+                                            &crate::inbox_pubsub::handle_offer(
+                                                &pty_registry,
+                                                &state,
+                                                req,
+                                                &agent_id,
+                                            )
+                                            .await,
+                                        ),
+                                        DaemonMessage::InboxComplete(req) => serde_json::to_string(
+                                            &crate::inbox_pubsub::handle_claim(
+                                                &pty_registry,
+                                                req,
+                                                &agent_id,
+                                                true,
+                                            ),
+                                        ),
+                                        DaemonMessage::InboxRelease(req) => serde_json::to_string(
+                                            &crate::inbox_pubsub::handle_claim(
+                                                &pty_registry,
+                                                req,
+                                                &agent_id,
+                                                false,
+                                            ),
+                                        ),
+                                        _ => continue,
                                     };
                                     if let Ok(json) = json {
                                         let line = format!("{json}\n");

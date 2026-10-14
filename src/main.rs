@@ -742,6 +742,50 @@ enum InboxAction {
         #[arg(long)]
         agent: String,
     },
+    /// Announce something to every agent in your orchestration (or dispatch
+    /// tree) subscribed to TOPIC. They see it as another agent's text, to
+    /// use as information.
+    Publish {
+        /// The topic: lowercase letters, digits and hyphens.
+        topic: String,
+        #[command(flatten)]
+        body: InboxBody,
+    },
+    /// From an orchestrator pane: offer a job to the first free worker whose
+    /// role takes jobs from POOL. One worker gets it; you are told when it is
+    /// claimed, completed, or its claim expires.
+    Offer {
+        /// The pool: lowercase letters, digits and hyphens.
+        pool: String,
+        #[command(flatten)]
+        body: InboxBody,
+        /// How long the worker that takes the job may hold it before it is
+        /// offered to another, e.g. `30m`, `1h30m`, `90s`.
+        #[arg(long, value_name = "DURATION")]
+        claim_ttl: Option<String>,
+    },
+    /// Report a job you were offered as done.
+    Complete {
+        /// The job's message id.
+        id: String,
+    },
+    /// Hand a job you were offered back, so another worker can take it.
+    Release {
+        /// The job's message id.
+        id: String,
+    },
+}
+
+/// The text of an `inbox publish` or `inbox offer`.
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct InboxBody {
+    /// The text.
+    #[arg(long)]
+    text: Option<String>,
+    /// Read the text from this file (`-` reads stdin).
+    #[arg(long, value_name = "PATH")]
+    file: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -1605,6 +1649,16 @@ fn main() -> ExitCode {
             InboxAction::List { json, all } => dot_agent_deck::inbox_cli::list(json, all),
             InboxAction::Wait { agent, stream } => dot_agent_deck::inbox_cli::wait(&agent, stream),
             InboxAction::Announce { agent } => dot_agent_deck::inbox_cli::announce(&agent),
+            InboxAction::Publish { topic, body } => {
+                dot_agent_deck::inbox_cli::publish(&topic, body.text, body.file)
+            }
+            InboxAction::Offer {
+                pool,
+                body,
+                claim_ttl,
+            } => dot_agent_deck::inbox_cli::offer(&pool, body.text, body.file, claim_ttl),
+            InboxAction::Complete { id } => dot_agent_deck::inbox_cli::settle(&id, true),
+            InboxAction::Release { id } => dot_agent_deck::inbox_cli::settle(&id, false),
         },
         Some(Commands::Ack { delivery_id }) => {
             let reply = match (

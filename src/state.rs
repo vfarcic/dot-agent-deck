@@ -13223,7 +13223,11 @@ impl AppState {
             pane_id.to_string(),
             PaneInbox {
                 agent_id: Some(agent_id.to_string()),
-                baseline: summary.queued.saturating_add(summary.fetched),
+                // A claimed job is taken and not yet acknowledged, as a fetch is.
+                baseline: summary
+                    .queued
+                    .saturating_add(summary.fetched)
+                    .saturating_add(summary.claimed),
                 seen: HashMap::new(),
                 delivered: summary.last_acked_at.is_some(),
             },
@@ -13251,7 +13255,14 @@ impl AppState {
             (None, Some(named)) => inbox.agent_id = Some(named.clone()),
             _ => {}
         }
-        inbox.apply(&notice.message_id, notice.state);
+        // PRD #1666 S11: an offered job that left this pane is settled here
+        // without having been delivered; `state` is the job's, not the pane's.
+        let state = if notice.returned {
+            crate::inbox::StateName::Undeliverable
+        } else {
+            notice.state
+        };
+        inbox.apply(&notice.message_id, state);
         self.refresh_card_inbox(&notice.pane_id);
     }
 
@@ -27019,6 +27030,7 @@ while True:
             from_label: "the orchestrator".to_string(),
             state,
             reason: None,
+            returned: false,
         }
     }
 
@@ -27046,6 +27058,7 @@ while True:
             &crate::inbox_hub::InboxSummary {
                 queued: 1,
                 fetched: 1,
+                claimed: 0,
                 undeliverable: 0,
                 last_acked_at: None,
                 wake: crate::inbox_hub::WakePath::Doorbell,
@@ -27080,6 +27093,54 @@ while True:
         assert_eq!(
             state.sessions["gen-q"].recent_events.len(),
             MAX_RECENT_EVENTS
+        );
+    }
+
+    /// PRD #1666 S11: a claimed job counts on its holder's card like a taken
+    /// message, and once the job leaves that holder — released, expired — the
+    /// card stops counting it without reading it as delivered, whatever state
+    /// the job is in now.
+    #[test]
+    fn a_job_that_left_its_holder_stops_counting_on_its_card() {
+        use crate::inbox::StateName::{Claimed, Queued};
+        use crate::inbox_display::CardInbox;
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::SessionStart, 1));
+        state.apply_inbox_summary(
+            "pane-q",
+            "agent-q",
+            &crate::inbox_hub::InboxSummary {
+                queued: 0,
+                fetched: 0,
+                claimed: 1,
+                undeliverable: 0,
+                last_acked_at: None,
+                wake: crate::inbox_hub::WakePath::Native,
+                component: None,
+            },
+        );
+        let card = |state: &AppState| state.sessions["gen-q"].card_inbox();
+        let pending = |pending| {
+            Some(CardInbox {
+                pending,
+                delivered: false,
+            })
+        };
+        assert_eq!(
+            card(&state),
+            pending(1),
+            "a claimed job is pending on the card"
+        );
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-job", Claimed));
+        assert_eq!(card(&state), pending(1));
+        let mut left = inbox_notice("pane-q", "m-job", Queued);
+        left.returned = true;
+        state.apply_inbox_notice(&left);
+        assert_eq!(
+            card(&state),
+            None,
+            "the job went back to its pool, not to this card, and was not delivered: no badge"
         );
     }
 

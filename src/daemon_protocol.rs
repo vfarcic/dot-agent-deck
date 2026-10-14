@@ -11160,6 +11160,7 @@ mod tests {
             from_label: "the orchestrator".to_string(),
             state: crate::inbox::StateName::Undeliverable,
             reason: Some(crate::inbox::UndeliverableReason::AgentExited),
+            returned: false,
         });
         let value = serde_json::to_value(&msg).unwrap();
         assert_eq!(

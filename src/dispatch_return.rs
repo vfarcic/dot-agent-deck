@@ -94,6 +94,15 @@ pub struct RetainedReturn {
 }
 
 impl DispatchReturns {
+    /// PRD #1666 S11: every outstanding return as `(unit pane, caller pane)`,
+    /// the edges of the dispatch trees a publish or offer is scoped by.
+    pub fn callers(&self) -> Vec<(String, String)> {
+        self.by_unit_pane
+            .iter()
+            .map(|(unit, retained)| (unit.clone(), retained.caller.pane_id.clone()))
+            .collect()
+    }
+
     /// Retain `caller` as the recipient for the unit whose terminal pane is
     /// `unit_pane_id` and whose registry agent id is `unit_agent_id`. Returns the
     /// entry it displaced, if any — a pane id is a recycled handle, so a stale

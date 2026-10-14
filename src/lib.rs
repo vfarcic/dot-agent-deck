@@ -72,6 +72,7 @@ pub mod inbox_cli;
 pub mod inbox_display;
 pub mod inbox_hub;
 pub mod inbox_prompt;
+pub mod inbox_pubsub;
 pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;

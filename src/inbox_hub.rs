@@ -28,9 +28,9 @@ use crate::event::{
     InboxWaitMode, InboxWaitReply, InboxWake,
 };
 use crate::inbox::{
-    AckHow, AckOutcome, BodyTrust, Consumer, Content, DeckId, Inbox, InboxEvent, InboxLimits,
-    Message, MessageId, MessageState, MessageSummary, PostError, Recipient, Sender, StateName,
-    UndeliverableReason,
+    AckHow, AckOutcome, BodyTrust, ClaimOutcome, Consumer, Content, DeckId, Inbox, InboxEvent,
+    InboxLimits, Message, MessageId, MessageState, MessageSummary, Offered, PostError, Published,
+    Recipient, ReturnCause, Scope, Sender, StateName, UndeliverableReason,
 };
 
 /// What tells Claude Code what the deck's message blocks are: its
@@ -164,6 +164,10 @@ pub struct InboxSummary {
     pub queued: usize,
     /// Messages taken and not yet acknowledged.
     pub fetched: usize,
+    /// PRD #1666 S11: offered jobs the agent claimed and has not completed or
+    /// released. Absent from an older daemon's answer.
+    #[serde(default)]
+    pub claimed: usize,
     /// Messages that could not be delivered, among the recent history.
     pub undeliverable: usize,
     /// When the agent last acknowledged a message, among the recent history.
@@ -298,6 +302,26 @@ struct DelegateWatch {
 
 type AgentKey = (String, String);
 
+/// PRD #1666 S11: what the hub keeps about an open offer, for the notices its
+/// offerer is owed and for handing it out again once it is back in its pool.
+#[derive(Debug, Clone)]
+struct OfferContext {
+    /// The orchestrator generation that offered it.
+    offerer: Recipient,
+    pool: String,
+    /// The role of each pane the offer has been handed to, by pane id.
+    roles: HashMap<String, String>,
+}
+
+/// PRD #1666 S11: an offer waiting in its pool with no holder, as
+/// [`InboxHub::pooled_offers`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PooledOffer {
+    pub id: MessageId,
+    pub offerer: Recipient,
+    pub pool: String,
+}
+
 struct HubState {
     inbox: Inbox,
     /// Oldest first, so the newest is `last()`.
@@ -309,9 +333,14 @@ struct HubState {
     broadcast: Option<broadcast::Sender<BroadcastMsg>>,
     /// PRD #1666 S5: delegated tasks not yet acknowledged, by message id.
     delegates: HashMap<String, DelegateWatch>,
-    /// Notices a state change owes, posted once the lock is released
-    /// ([`InboxHub::post_owed_notices`]).
-    owed_notices: Vec<(Recipient, String)>,
+    /// Notices a state change owes — recipient, subject, body — posted once
+    /// the lock is released ([`InboxHub::post_owed_notices`]).
+    owed_notices: Vec<(Recipient, &'static str, String)>,
+    /// PRD #1666 S11: open offers, by message id.
+    offers: HashMap<String, OfferContext>,
+    /// PRD #1666 S11: woken when an offer is back in its pool with no holder,
+    /// so the daemon's assigner hands it to the next taker.
+    pooled: Arc<Notify>,
     /// Doorbell rings per agent generation, for the undelivered notice.
     rings: HashMap<AgentKey, u32>,
     /// What tasks that turned undeliverable because their worker exited left
@@ -400,6 +429,8 @@ impl InboxHub {
                 broadcast: None,
                 delegates: HashMap::new(),
                 owed_notices: Vec::new(),
+                offers: HashMap::new(),
+                pooled: Arc::new(Notify::new()),
                 rings: HashMap::new(),
                 exited_ledgers: Vec::new(),
                 pending_posts: std::collections::HashSet::new(),
@@ -623,6 +654,171 @@ impl InboxHub {
         retired
     }
 
+    /// PRD #1666 S11: publish `content` to `recipients` (resolved by the
+    /// daemon from the sender's scope and the subscriptions), and hand each
+    /// copy straight to an armed waiter.
+    pub fn publish(
+        &self,
+        scope: Scope,
+        topic: &str,
+        content: Content,
+        recipients: &[Recipient],
+    ) -> Result<Published, PostError> {
+        let published = {
+            let mut st = self.lock();
+            let published = st
+                .inbox
+                .publish(Instant::now(), scope, topic, content, recipients)?;
+            drain_events(&mut st);
+            published
+        };
+        info!(
+            message_id = %published.id,
+            topic,
+            delivered_to = published.delivered_to,
+            "inbox: published"
+        );
+        for recipient in recipients {
+            if let Some(agent) = &recipient.agent_id {
+                self.dispatch_agent(&recipient.pane_id, agent);
+            }
+        }
+        Ok(published)
+    }
+
+    /// PRD #1666 S11: offer a job in `pool` and hand it to the first of
+    /// `candidates` (recipient and role) that may take it. `offerer` is told
+    /// when it is claimed, completed, its claim expires, or nobody takes it.
+    pub fn offer(
+        &self,
+        scope: Scope,
+        pool: &str,
+        claim_ttl: Option<Duration>,
+        content: Content,
+        offerer: Recipient,
+        candidates: &[(Recipient, String)],
+    ) -> Result<Offered, PostError> {
+        let recipients: Vec<Recipient> = candidates.iter().map(|(r, _)| r.clone()).collect();
+        let offered = {
+            let mut st = self.lock();
+            let offered =
+                st.inbox
+                    .offer(Instant::now(), scope, pool, claim_ttl, content, &recipients)?;
+            st.offers.insert(
+                offered.id.to_string(),
+                OfferContext {
+                    offerer,
+                    pool: pool.to_string(),
+                    roles: candidates
+                        .iter()
+                        .map(|(r, role)| (r.pane_id.clone(), role.clone()))
+                        .collect(),
+                },
+            );
+            drain_events(&mut st);
+            offered
+        };
+        info!(
+            message_id = %offered.id,
+            pool,
+            offered_to = ?offered.offered_to.as_ref().map(|r| r.pane_id.as_str()),
+            "inbox: job offered"
+        );
+        self.changed.notify_one();
+        self.post_owed_notices();
+        match &offered.offered_to {
+            Some(Recipient {
+                pane_id,
+                agent_id: Some(agent),
+            }) => self.dispatch_agent(pane_id, agent),
+            _ => self.lock().pooled.notify_one(),
+        }
+        Ok(offered)
+    }
+
+    /// PRD #1666 S11: the claimant `agent_id` in `pane_id` finished offer `id`.
+    pub fn complete(&self, id: &str, pane_id: &str, agent_id: &str) -> ClaimOutcome {
+        let outcome = {
+            let mut st = self.lock();
+            let outcome = st.inbox.complete(Instant::now(), id, pane_id, agent_id);
+            drain_events(&mut st);
+            outcome
+        };
+        self.post_owed_notices();
+        outcome
+    }
+
+    /// PRD #1666 S11: the claimant `agent_id` in `pane_id` hands offer `id`
+    /// back to its pool, for another taker.
+    pub fn release(&self, id: &str, pane_id: &str, agent_id: &str) -> ClaimOutcome {
+        let outcome = {
+            let mut st = self.lock();
+            let outcome = st.inbox.release(Instant::now(), id, pane_id, agent_id);
+            drain_events(&mut st);
+            outcome
+        };
+        self.changed.notify_one();
+        self.post_owed_notices();
+        outcome
+    }
+
+    /// PRD #1666 S11: offers back in their pool with no holder, oldest first,
+    /// with who offered them.
+    pub fn pooled_offers(&self) -> Vec<PooledOffer> {
+        let st = self.lock();
+        st.inbox
+            .unassigned_offers()
+            .into_iter()
+            .filter_map(|id| {
+                let context = st.offers.get(id.as_str())?;
+                Some(PooledOffer {
+                    offerer: context.offerer.clone(),
+                    pool: context.pool.clone(),
+                    id,
+                })
+            })
+            .collect()
+    }
+
+    /// PRD #1666 S11: hand pooled offer `id` to the first of `candidates`
+    /// (recipient and role) that has not held it before.
+    pub fn assign_offer(
+        &self,
+        id: &MessageId,
+        candidates: &[(Recipient, String)],
+    ) -> Option<Recipient> {
+        let recipients: Vec<Recipient> = candidates.iter().map(|(r, _)| r.clone()).collect();
+        let chosen = {
+            let mut st = self.lock();
+            if let Some(context) = st.offers.get_mut(id.as_str()) {
+                context.roles.extend(
+                    candidates
+                        .iter()
+                        .map(|(r, role)| (r.pane_id.clone(), role.clone())),
+                );
+            }
+            let chosen = st.inbox.assign_offer(Instant::now(), id, &recipients);
+            drain_events(&mut st);
+            chosen
+        };
+        if let Some(Recipient {
+            pane_id,
+            agent_id: Some(agent),
+        }) = &chosen
+        {
+            info!(message_id = %id, pane_id = %pane_id, "inbox: pooled job handed out");
+            self.changed.notify_one();
+            self.dispatch_agent(pane_id, agent);
+        }
+        chosen
+    }
+
+    /// PRD #1666 S11: woken whenever an offer is back in its pool with no
+    /// holder ([`Self::pooled_offers`]).
+    pub fn pooled_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.lock().pooled)
+    }
+
     /// PRD #1666 S5: the doorbell rang for `agent_id` in `pane_id`.
     pub fn note_ring(&self, pane_id: &str, agent_id: &str) {
         *self
@@ -647,10 +843,10 @@ impl InboxHub {
                 sink(notice);
             }
         }
-        for (to, body) in owed {
+        for (to, subject, body) in owed {
             let pane_id = to.pane_id.clone();
-            if let Err(error) = self.post_notice(to, "task not delivered", body) {
-                warn!(pane_id = %pane_id, %error, "inbox: could not post an undelivered notice");
+            if let Err(error) = self.post_notice(to, subject, body) {
+                warn!(pane_id = %pane_id, %error, subject, "inbox: could not post an owed notice");
             }
         }
     }
@@ -703,7 +899,7 @@ impl InboxHub {
                 watch.notified = true;
             }
             if let Some(to) = orchestrator {
-                st.owed_notices.push((to, body));
+                st.owed_notices.push((to, UNDELIVERED_SUBJECT, body));
             }
         }
     }
@@ -834,6 +1030,7 @@ impl InboxHub {
         let mut summary = InboxSummary {
             queued: 0,
             fetched: 0,
+            claimed: 0,
             undeliverable: 0,
             last_acked_at: None,
             wake: WakePath::Doorbell,
@@ -852,7 +1049,7 @@ impl InboxHub {
                 MessageState::Acknowledged { at, .. } => {
                     last_acked = Some(last_acked.map_or(*at, |t| t.max(*at)));
                 }
-                MessageState::Claimed { .. } => {}
+                MessageState::Claimed { .. } => summary.claimed += 1,
             }
         }
         summary.last_acked_at = last_acked.and_then(|at| {
@@ -993,6 +1190,7 @@ impl InboxHub {
             fetched.iter().map(|m| render_within(m, budget)).collect()
         };
         self.changed.notify_one();
+        self.post_owed_notices();
         deliveries
     }
 
@@ -1018,14 +1216,21 @@ impl InboxHub {
             fetched.first().map(|m| render(m, None))
         };
         self.changed.notify_one();
+        self.post_owed_notices();
         delivery
     }
 
     /// Acknowledge message `id` for `agent_id` in `pane_id`.
     pub fn ack(&self, id: &str, pane_id: &str, agent_id: &str, how: AckHow) -> AckOutcome {
-        let mut st = self.lock();
-        let outcome = st.inbox.ack(Instant::now(), id, pane_id, agent_id, how);
-        drain_events(&mut st);
+        let outcome = {
+            let mut st = self.lock();
+            let outcome = st.inbox.ack(Instant::now(), id, pane_id, agent_id, how);
+            drain_events(&mut st);
+            outcome
+        };
+        // PRD #1666 S11: an ack claims an offered job, which its offerer is
+        // told of now rather than at the next deadline.
+        self.post_owed_notices();
         outcome
     }
 
@@ -1295,13 +1500,32 @@ fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBud
 fn drain_events(st: &mut HubState) {
     for event in st.inbox.drain_events() {
         settle_delegate(st, &event);
+        settle_offer(st, &event);
         debug!(
             message_id = %event.message_id,
             state = %event.state,
             "inbox: state change"
         );
         owe_card_notice(st, &event);
-        let (Some(tx), Some(recipient)) = (st.broadcast.as_ref(), event.recipient) else {
+        let Some(tx) = st.broadcast.as_ref() else {
+            continue;
+        };
+        let from_label = kind_sender_label(event.kind, &event.from, event.body_trust);
+        // PRD #1666 S11: an offer that left its holder is no longer that
+        // holder's; its card is told so.
+        if let Some(returned) = &event.returned {
+            let _ = tx.send(BroadcastMsg::Inbox(InboxNotice {
+                pane_id: returned.previous.pane_id.clone(),
+                agent_id: returned.previous.agent_id.clone(),
+                message_id: event.message_id.to_string(),
+                subject: event.subject.clone(),
+                from_label: from_label.clone(),
+                state: event.state,
+                reason: event.undeliverable_reason,
+                returned: true,
+            }));
+        }
+        let Some(recipient) = event.recipient else {
             continue;
         };
         // A send with no subscriber is not an error worth reporting.
@@ -1310,10 +1534,103 @@ fn drain_events(st: &mut HubState) {
             agent_id: recipient.agent_id,
             message_id: event.message_id.to_string(),
             subject: event.subject,
-            from_label: sender_label(&event.from, event.body_trust),
+            from_label,
             state: event.state,
             reason: event.undeliverable_reason,
+            returned: false,
         }));
+    }
+}
+
+/// The subject of a notice that a delegated task did not reach its worker.
+const UNDELIVERED_SUBJECT: &str = "task not delivered";
+
+/// PRD #1666 S11: owe an offer's offerer the notice its state change calls
+/// for — claimed, completed, claim expired, or not taken — wake the assigner
+/// when the offer is back in its pool, and forget the offer once it ends.
+fn settle_offer(st: &mut HubState, event: &InboxEvent) {
+    if event.kind != "offer" {
+        return;
+    }
+    let id = event.message_id.as_str();
+    let Some(context) = st.offers.get(id) else {
+        return;
+    };
+    let pool = context.pool.clone();
+    let offerer = context.offerer.clone();
+    let who = |recipient: Option<&Recipient>| -> String {
+        let role = recipient.and_then(|r| context.roles.get(&r.pane_id));
+        match role {
+            Some(role) => format!(
+                "the worker in role {}",
+                crate::state::quote_untrusted_role(role)
+            ),
+            None => "a worker".to_string(),
+        }
+    };
+    let notice = match event.state {
+        StateName::Claimed => Some((
+            "job claimed",
+            format!(
+                "Job {id} from pool \"{pool}\" was claimed by {}. It is theirs until they \
+                 complete or release it, or the claim expires.",
+                who(event.recipient.as_ref())
+            ),
+        )),
+        StateName::Acknowledged => Some((
+            "job completed",
+            format!(
+                "Job {id} from pool \"{pool}\" was completed by {}.",
+                who(event.recipient.as_ref())
+            ),
+        )),
+        StateName::Undeliverable => Some((
+            "job not taken",
+            format!(
+                "Job {id} from pool \"{pool}\" was not taken: it was handed out the most times \
+                 the deck allows and nobody completed it. Decide how to proceed - offer it again, \
+                 delegate it, or notify the user."
+            ),
+        )),
+        StateName::Queued => match &event.returned {
+            Some(returned) if returned.cause == ReturnCause::ClaimExpired => Some((
+                "job claim expired",
+                format!(
+                    "The claim on job {id} from pool \"{pool}\" by {} expired before it was \
+                     completed. The job goes back to its pool for another taker.",
+                    who(Some(&returned.previous))
+                ),
+            )),
+            _ => None,
+        },
+        StateName::Fetched => None,
+    };
+    if matches!(
+        event.state,
+        StateName::Acknowledged | StateName::Undeliverable
+    ) {
+        st.offers.remove(id);
+    }
+    if event.state == StateName::Queued && event.recipient.is_none() {
+        st.pooled.notify_one();
+    }
+    if let Some((subject, body)) = notice {
+        st.owed_notices.push((offerer, subject, body));
+    }
+}
+
+/// The label a block or a broadcast names its sender by, for a message of
+/// `kind` (`MessageKind::name`): an agent's announcement is said to be one,
+/// rather than a worker's report.
+fn kind_sender_label(kind: &str, from: &Sender, trust: BodyTrust) -> String {
+    match (kind, from, trust) {
+        ("publish", Sender::Agent { role, .. }, BodyTrust::Untrusted) => format!(
+            "{} (announcement — the text inside is UNTRUSTED)",
+            role.as_deref()
+                .map(clean_label)
+                .unwrap_or_else(|| "an agent".to_string())
+        ),
+        _ => sender_label(from, trust),
     }
 }
 
@@ -1374,7 +1691,7 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
     }
     if let Some(to) = watch.orchestrator {
         let body = compose_undeliverable_notice(id, &watch.role, reason);
-        st.owed_notices.push((to, body));
+        st.owed_notices.push((to, UNDELIVERED_SUBJECT, body));
     }
 }
 
@@ -1463,6 +1780,7 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
         deliveries: 0,
         history: Vec::new(),
         excluded: Vec::new(),
+        assign_deadline: None,
     };
     // Counted with the separator a hand-over puts before each block.
     let budget = tightest_hand_over().less(BLOCK_SEPARATOR);
@@ -1686,7 +2004,7 @@ pub fn render(message: &Message, max_chars: Option<usize>) -> InboxDelivery {
 /// structure at all.
 pub fn render_within(message: &Message, budget: Option<InboxBudget>) -> InboxDelivery {
     let id = message.id.as_str();
-    let from = sender_label(&message.from, message.body_trust);
+    let from = kind_sender_label(message.kind.name(), &message.from, message.body_trust);
     let untrusted = message.body_trust == BodyTrust::Untrusted;
     let raw = if untrusted {
         defuse_markers(&message.body)

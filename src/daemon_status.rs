@@ -471,6 +471,7 @@ mod tests {
         let summary = |queued, fetched, wake| InboxSummary {
             queued,
             fetched,
+            claimed: 0,
             undeliverable: 3,
             last_acked_at: None,
             wake,

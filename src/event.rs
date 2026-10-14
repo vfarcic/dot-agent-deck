@@ -1570,6 +1570,22 @@ pub enum DaemonMessage {
     /// scope). Answered with an [`InboxListReply`].
     #[serde(rename = "inbox_list")]
     InboxList(InboxListRequest),
+    /// PRD #1666 S11: announce something to every subscriber of a topic in the
+    /// sender's scope. Answered with an [`InboxPostReply`].
+    #[serde(rename = "inbox_publish")]
+    InboxPublish(InboxPublishRequest),
+    /// PRD #1666 S11: offer a job to the first free taker of a pool in the
+    /// orchestrator's scope. Answered with an [`InboxPostReply`].
+    #[serde(rename = "inbox_offer")]
+    InboxOffer(InboxOfferRequest),
+    /// PRD #1666 S11: the claimant of an offered job finished it. Answered
+    /// with an [`InboxClaimReply`].
+    #[serde(rename = "inbox_complete")]
+    InboxComplete(InboxClaimRequest),
+    /// PRD #1666 S11: the claimant of an offered job hands it back to its
+    /// pool. Answered with an [`InboxClaimReply`].
+    #[serde(rename = "inbox_release")]
+    InboxRelease(InboxClaimRequest),
 }
 
 impl DaemonMessage {
@@ -1593,6 +1609,9 @@ impl DaemonMessage {
             DaemonMessage::InboxAnnounce(r) => &r.pane_id,
             DaemonMessage::InboxFetch(r) => &r.pane_id,
             DaemonMessage::InboxList(r) => &r.pane_id,
+            DaemonMessage::InboxPublish(r) => &r.pane_id,
+            DaemonMessage::InboxOffer(r) => &r.pane_id,
+            DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => &r.pane_id,
         }
     }
 
@@ -1612,6 +1631,9 @@ impl DaemonMessage {
             DaemonMessage::InboxAnnounce(r) => r.token.as_deref(),
             DaemonMessage::InboxFetch(r) => r.token.as_deref(),
             DaemonMessage::InboxList(r) => r.token.as_deref(),
+            DaemonMessage::InboxPublish(r) => r.token.as_deref(),
+            DaemonMessage::InboxOffer(r) => r.token.as_deref(),
+            DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => r.token.as_deref(),
         }
     }
 
@@ -1624,7 +1646,11 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
-            | DaemonMessage::InboxList(_) => true,
+            | DaemonMessage::InboxList(_)
+            | DaemonMessage::InboxPublish(_)
+            | DaemonMessage::InboxOffer(_)
+            | DaemonMessage::InboxComplete(_)
+            | DaemonMessage::InboxRelease(_) => true,
             DaemonMessage::Ack(s) => s.delivery_id.starts_with("m-"),
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
@@ -1644,6 +1670,11 @@ impl DaemonMessage {
             DaemonMessage::InboxAnnounce(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxFetch(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxList(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxPublish(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxOffer(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => {
+                r.agent_id.as_deref()
+            }
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
             | DaemonMessage::GetSeed(_)
@@ -1672,6 +1703,10 @@ impl DaemonMessage {
             DaemonMessage::InboxAnnounce(_) => "inbox_announce",
             DaemonMessage::InboxFetch(_) => "inbox_fetch",
             DaemonMessage::InboxList(_) => "inbox_list",
+            DaemonMessage::InboxPublish(_) => "inbox_publish",
+            DaemonMessage::InboxOffer(_) => "inbox_offer",
+            DaemonMessage::InboxComplete(_) => "inbox_complete",
+            DaemonMessage::InboxRelease(_) => "inbox_release",
         }
     }
 
@@ -1732,6 +1767,12 @@ impl DaemonMessage {
             | DaemonMessage::InboxList(_) => {
                 serde_json::to_string(&InboxWaitReply::refused(reason, message))
             }
+            DaemonMessage::InboxPublish(_) | DaemonMessage::InboxOffer(_) => {
+                serde_json::to_string(&InboxPostReply::refused(reason, message))
+            }
+            DaemonMessage::InboxComplete(_) | DaemonMessage::InboxRelease(_) => {
+                serde_json::to_string(&InboxClaimReply::refused(reason, message))
+            }
         };
         json.ok()
     }
@@ -1772,7 +1813,11 @@ impl DaemonMessage {
             | DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
-            | DaemonMessage::InboxList(_) => None,
+            | DaemonMessage::InboxList(_)
+            | DaemonMessage::InboxPublish(_)
+            | DaemonMessage::InboxOffer(_)
+            | DaemonMessage::InboxComplete(_)
+            | DaemonMessage::InboxRelease(_) => None,
         }
     }
 }
@@ -2753,6 +2798,12 @@ pub struct InboxNotice {
     /// Why, when `state` is `undeliverable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<crate::inbox::UndeliverableReason>,
+    /// PRD #1666 S11: an offered job LEFT this pane — released, expired or
+    /// never taken — and `state` is where the job went, not this pane's. A
+    /// client stops counting it for the pane. Additive: a client that does not
+    /// know it reads the job as still queued here, as before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub returned: bool,
 }
 
 /// PRD #120: the structural membership of a daemon-spawned orchestration,
@@ -3118,6 +3169,107 @@ pub struct InboxListRequest {
     /// An orchestrator's whole scope rather than its own inbox.
     #[serde(default)]
     pub all: bool,
+}
+
+/// Payload of [`DaemonMessage::InboxPublish`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxPublishRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The topic, a name [`crate::inbox::is_valid_label`] accepts.
+    pub topic: String,
+    pub body: String,
+}
+
+/// Payload of [`DaemonMessage::InboxOffer`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxOfferRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The offer pool, a name [`crate::inbox::is_valid_label`] accepts.
+    pub pool: String,
+    pub body: String,
+    /// How long a taker may hold the job before it is offered again; the
+    /// deck's default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_ttl_ms: Option<u64>,
+}
+
+/// Payload of [`DaemonMessage::InboxComplete`] and
+/// [`DaemonMessage::InboxRelease`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxClaimRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The offered job's message id.
+    pub id: String,
+}
+
+/// The answer to [`DaemonMessage::InboxPublish`] and
+/// [`DaemonMessage::InboxOffer`]: the new message's id, or a refusal.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxPostReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// A publish: how many subscribers it reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_to: Option<usize>,
+    /// A publish: subscribers whose inbox was full, by pane.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_full: Vec<String>,
+    /// An offer: the pane it was handed to, absent while it waits in its pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offered_to: Option<String>,
+    /// A refusal's stable code (`rate_limited`, `not_orchestrator`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// A refusal's one-sentence explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl InboxPostReply {
+    pub fn refused(reason: &str, message: &str) -> Self {
+        Self {
+            refused: Some(reason.to_string()),
+            error: Some(message.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// The answer to [`DaemonMessage::InboxComplete`] and
+/// [`DaemonMessage::InboxRelease`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxClaimReply {
+    /// `completed` or `released`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// A refusal's stable code (`not_claimant`, `unknown`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// A refusal's one-sentence explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl InboxClaimReply {
+    pub fn refused(reason: &str, message: &str) -> Self {
+        Self {
+            refused: Some(reason.to_string()),
+            error: Some(message.to_string()),
+            ..Self::default()
+        }
+    }
 }
 
 /// One message as handed to an agent: the rendered block plus what a

@@ -672,6 +672,7 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             "inbox": {
                 "queued": 0,
                 "fetched": 0,
+                "claimed": 0,
                 "undeliverable": 0,
                 "last_acked_at": null,
                 "wake": "doorbell",

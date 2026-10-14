@@ -1784,7 +1784,9 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     // daemon's and outside what this crate reaches across (linkage-check rule 12).
     let inbox = record.inbox.as_ref().map(|summary| DesktopInbox {
         queued: summary.queued,
-        fetched: summary.fetched,
+        // PRD #1666 S11: a claimed job is taken and not yet acknowledged, which
+        // is what the card counts as fetched; the TUI counts it the same way.
+        fetched: summary.fetched + summary.claimed,
         undeliverable: summary.undeliverable,
         last_acked_at: summary.last_acked_at.map(|at| at.to_rfc3339()),
         wake: serde_json::to_value(summary.wake)
@@ -3475,6 +3477,7 @@ mod tests {
         record.inbox = Some(dot_agent_deck::inbox_hub::InboxSummary {
             queued: 2,
             fetched: 1,
+            claimed: 0,
             undeliverable: 1,
             last_acked_at: None,
             wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,

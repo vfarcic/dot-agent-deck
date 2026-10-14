@@ -45,6 +45,8 @@ export interface DaemonInboxNotice {
   state?: unknown;
   /** Why, when `state` is `undeliverable` (`agent_exited`, …). */
   reason?: unknown;
+  /** An offered job LEFT this pane; `state` is where the job went, not the pane's. */
+  returned?: unknown;
 }
 
 /** Resolves the deck-side agent behind a hook event, when one is known. */
@@ -156,6 +158,9 @@ const INBOX_TITLES: Record<string, { title: string; verdict: Verdict }> = {
   undeliverable: { title: `Message ${INBOX_WORDS.notDelivered}`, verdict: "ERROR" },
 };
 
+/** PRD #1666: an offered job that left the agent it was given to. */
+const RETURNED_TITLE = { title: "Job handed back to its pool", verdict: "INFO" as Verdict };
+
 /**
  * PRD #1666: one evidence row per inbox state change — what was sent to whom,
  * and what became of it. A state this build does not know is ignored, as an
@@ -163,13 +168,13 @@ const INBOX_TITLES: Record<string, { title: string; verdict: Verdict }> = {
  */
 function mapInboxNotice(notice: DaemonInboxNotice, sequence: number, resolveAgent?: AgentResolver): EvidenceItem | undefined {
   const state = text(notice.state);
-  const shown = state ? INBOX_TITLES[state] : undefined;
+  const shown = notice.returned === true ? RETURNED_TITLE : state ? INBOX_TITLES[state] : undefined;
   if (!state || !shown) return undefined;
   const agentId = text(notice.agent_id);
   const paneId = text(notice.pane_id);
   const agent = resolveAgent?.(agentId, paneId);
   const subject = text(notice.subject) ?? "(no subject)";
-  const reason = state === "undeliverable" ? reasonText(text(notice.reason)) : undefined;
+  const reason = state === "undeliverable" && notice.returned !== true ? reasonText(text(notice.reason)) : undefined;
   return {
     id: `hook-${sequence}`,
     verdict: shown.verdict,

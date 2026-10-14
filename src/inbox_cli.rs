@@ -12,8 +12,10 @@ use std::time::Duration;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
-    DaemonMessage, InboxComponent, InboxFetchConsumer, InboxFetchRequest, InboxListReply,
-    InboxListRequest, InboxWaitMode, InboxWaitReply, InboxWaitRequest, InboxWaitSession, InboxWake,
+    DaemonMessage, InboxClaimReply, InboxClaimRequest, InboxComponent, InboxFetchConsumer,
+    InboxFetchRequest, InboxListReply, InboxListRequest, InboxOfferRequest, InboxPostReply,
+    InboxPublishRequest, InboxWaitMode, InboxWaitReply, InboxWaitRequest, InboxWaitSession,
+    InboxWake,
 };
 use crate::inbox::StateName;
 use crate::inbox_hub::AGENT_FRAMING;
@@ -556,6 +558,220 @@ fn render_list(pane_id: &str, reply: &InboxListReply) -> String {
     out
 }
 
+/// The body of an `inbox publish` or `inbox offer`: `--text` as given, or
+/// `--file` read with the task cap (`-` is stdin).
+fn body_from(text: Option<String>, file: Option<String>) -> Result<String, String> {
+    match (text, file) {
+        (Some(text), None) => Ok(text),
+        (None, Some(path)) => crate::bounded_read::read_task_input(&path, std::io::stdin()),
+        _ => Err("give the text with exactly one of --text or --file".to_string()),
+    }
+}
+
+/// A post's refusal sentence, when `line` is one.
+fn post_refusal(line: &str) -> Option<String> {
+    let reply = serde_json::from_str::<InboxPostReply>(line).ok()?;
+    let code = reply.refused?;
+    Some(match reply.error {
+        Some(error) => format!("{error} ({code})"),
+        None => code,
+    })
+}
+
+/// Send a publish or offer and print what became of it.
+fn post(message: DaemonMessage, what: &str) -> ExitCode {
+    let line = match request(&message) {
+        Ok(line) => line,
+        Err(why) => {
+            eprintln!("Could not {what}: {why}.");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(why) = post_refusal(&line) {
+        eprintln!("The deck refused to {what}: {why}.");
+        return ExitCode::FAILURE;
+    }
+    let Some(reply) = serde_json::from_str::<InboxPostReply>(&line)
+        .ok()
+        .filter(|reply| reply.id.is_some())
+    else {
+        eprintln!("Could not {what}: the deck's answer was not one this build understands.");
+        return ExitCode::FAILURE;
+    };
+    let id = reply.id.unwrap_or_default();
+    let label = crate::untrusted_text::label_line;
+    match (&message, reply.delivered_to, reply.offered_to) {
+        (DaemonMessage::InboxPublish(_), delivered, _) => {
+            let delivered = delivered.unwrap_or(0);
+            println!(
+                "Published {id} to {delivered} subscriber{}.",
+                if delivered == 1 { "" } else { "s" }
+            );
+            for pane in &reply.refused_full {
+                println!(
+                    "Not delivered to pane {}: its inbox is full.",
+                    label(pane, 64)
+                );
+            }
+        }
+        (_, _, Some(pane)) => println!("Offered {id}; handed to pane {}.", label(&pane, 64)),
+        _ => println!("Offered {id}; it waits in its pool until a worker that takes it is free."),
+    }
+    ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck inbox publish <topic>`.
+pub fn publish(topic: &str, text: Option<String>, file: Option<String>) -> ExitCode {
+    let Some(identity) = identity() else {
+        eprintln!("{NOT_IN_PANE}");
+        return ExitCode::FAILURE;
+    };
+    let body = match body_from(text, file) {
+        Ok(body) => body,
+        Err(why) => {
+            eprintln!("Could not publish: {why}.");
+            return ExitCode::FAILURE;
+        }
+    };
+    post(
+        DaemonMessage::InboxPublish(InboxPublishRequest {
+            pane_id: identity.pane_id,
+            agent_id: identity.agent_id,
+            token: identity.token,
+            topic: topic.to_string(),
+            body,
+        }),
+        "publish",
+    )
+}
+
+/// `dot-agent-deck inbox offer <pool>`.
+pub fn offer(
+    pool: &str,
+    text: Option<String>,
+    file: Option<String>,
+    claim_ttl: Option<String>,
+) -> ExitCode {
+    let Some(identity) = identity() else {
+        eprintln!("{NOT_IN_PANE}");
+        return ExitCode::FAILURE;
+    };
+    let claim_ttl_ms = match claim_ttl.as_deref().map(parse_duration_ms).transpose() {
+        Ok(ms) => ms,
+        Err(why) => {
+            eprintln!("Could not offer: --claim-ttl {why}.");
+            return ExitCode::FAILURE;
+        }
+    };
+    let body = match body_from(text, file) {
+        Ok(body) => body,
+        Err(why) => {
+            eprintln!("Could not offer: {why}.");
+            return ExitCode::FAILURE;
+        }
+    };
+    post(
+        DaemonMessage::InboxOffer(InboxOfferRequest {
+            pane_id: identity.pane_id,
+            agent_id: identity.agent_id,
+            token: identity.token,
+            pool: pool.to_string(),
+            body,
+            claim_ttl_ms,
+        }),
+        "offer the job",
+    )
+}
+
+/// `dot-agent-deck inbox complete <id>` (`complete`) or `inbox release <id>`.
+pub fn settle(id: &str, complete: bool) -> ExitCode {
+    let Some(identity) = identity() else {
+        eprintln!("{NOT_IN_PANE}");
+        return ExitCode::FAILURE;
+    };
+    let request_body = InboxClaimRequest {
+        pane_id: identity.pane_id,
+        agent_id: identity.agent_id,
+        token: identity.token,
+        id: id.to_string(),
+    };
+    let (message, what) = if complete {
+        (
+            DaemonMessage::InboxComplete(request_body),
+            "complete the job",
+        )
+    } else {
+        (DaemonMessage::InboxRelease(request_body), "release the job")
+    };
+    let line = match request(&message) {
+        Ok(line) => line,
+        Err(why) => {
+            eprintln!("Could not {what}: {why}.");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Ok(reply) = serde_json::from_str::<InboxClaimReply>(&line) else {
+        eprintln!("Could not {what}: the deck's answer was not one this build understands.");
+        return ExitCode::FAILURE;
+    };
+    if let Some(code) = reply.refused {
+        let why = reply.error.map(|e| format!("{e} ({code})")).unwrap_or(code);
+        eprintln!("The deck refused to {what}: {why}.");
+        return ExitCode::FAILURE;
+    }
+    let id = crate::untrusted_text::label_line(id, 64);
+    match reply.outcome.as_deref() {
+        Some("completed") => println!("Job {id} is complete; its offerer has been told."),
+        Some("released") => println!("Job {id} is back in its pool for another worker."),
+        _ => {
+            eprintln!("Could not {what}: the deck's answer was not one this build understands.");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// A duration such as `30m`, `1h30m`, `90s` or `500ms`, in milliseconds.
+/// Every number needs a unit: `ms`, `s`, `m` or `h`.
+pub fn parse_duration_ms(text: &str) -> Result<u64, String> {
+    let invalid = || {
+        format!(
+            "\"{}\" is not a duration such as 30m, 1h30m or 90s",
+            crate::untrusted_text::label_line(text, 64)
+        )
+    };
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return Err(invalid());
+    }
+    let mut total: u64 = 0;
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return Err(invalid());
+        }
+        let number: u64 = rest[..digits].parse().map_err(|_| invalid())?;
+        rest = &rest[digits..];
+        let (unit_ms, len) = if rest.starts_with("ms") {
+            (1, 2)
+        } else if rest.starts_with('s') {
+            (1_000, 1)
+        } else if rest.starts_with('m') {
+            (60_000, 1)
+        } else if rest.starts_with('h') {
+            (3_600_000, 1)
+        } else {
+            return Err(invalid());
+        };
+        rest = &rest[len..];
+        total = number
+            .checked_mul(unit_ms)
+            .and_then(|ms| total.checked_add(ms))
+            .ok_or_else(invalid)?;
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +825,26 @@ mod tests {
         );
         assert_eq!(out.lines().count(), 3, "{out}");
         assert!(out.lines().all(|line| line.chars().count() <= 400), "{out}");
+    }
+
+    /// PRD #1666 S11: `--claim-ttl` takes a duration with a unit on every
+    /// number, and refuses anything else rather than guessing a unit.
+    #[test]
+    fn claim_ttl_durations_need_units() {
+        assert_eq!(parse_duration_ms("30m"), Ok(1_800_000));
+        assert_eq!(parse_duration_ms("1h30m"), Ok(5_400_000));
+        assert_eq!(parse_duration_ms("90s"), Ok(90_000));
+        assert_eq!(parse_duration_ms("500ms"), Ok(500));
+        for bad in [
+            "",
+            "30",
+            "m",
+            "1x",
+            "1h 30m",
+            "-5m",
+            "99999999999999999999h",
+        ] {
+            assert!(parse_duration_ms(bad).is_err(), "{bad:?} must be refused");
+        }
     }
 }

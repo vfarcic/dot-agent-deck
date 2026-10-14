@@ -9072,6 +9072,12 @@ impl AgentPtyRegistry {
     }
 
     /// How many dispatched units still owe a report. Observability and tests.
+    /// PRD #1666 S11: every outstanding dispatch return as `(unit pane,
+    /// caller pane)`.
+    pub fn dispatch_callers(&self) -> Vec<(String, String)> {
+        self.dispatch_returns.lock().unwrap().callers()
+    }
+
     pub fn outstanding_dispatch_returns(&self) -> usize {
         self.dispatch_returns.lock().unwrap().len()
     }
@@ -11259,6 +11265,18 @@ impl AgentPtyRegistry {
     /// that landed while the frame waited for the writer flips the owner (a
     /// different id) or removes it (`None`), so no bytes reach a stale/removed
     /// target. Mirrors the exited-entry skip of [`Self::writer_target_for_pane`].
+    /// PRD #1666 S11: every pane with a live (non-exited) agent, as `(pane id,
+    /// agent id)`.
+    pub fn live_pane_agents(&self) -> Vec<(String, String)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .iter()
+            .filter(|(_, a)| !a.exited.load(Ordering::SeqCst))
+            .filter_map(|(id, a)| Some((a.pane_id_env.clone()?, id.clone())))
+            .collect()
+    }
+
     pub fn pane_current_agent_id(&self, pane_id: &str) -> Option<String> {
         let inner = self.inner.lock().unwrap();
         inner

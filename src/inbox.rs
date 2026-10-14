@@ -530,6 +530,9 @@ pub struct Message {
     pub history: Vec<(Instant, StateName)>,
     /// Offers only: everyone who has held the offer, never offered it again.
     pub excluded: Vec<Recipient>,
+    /// Offers only: when an offer assigned to a holder that has not fetched
+    /// it goes back to its pool ([`InboxLimits::offer_assign_wait`]).
+    pub assign_deadline: Option<Instant>,
 }
 
 impl Message {
@@ -639,6 +642,31 @@ pub struct InboxEvent {
     pub subject: String,
     pub state: StateName,
     pub undeliverable_reason: Option<UndeliverableReason>,
+    /// An offer that left a holder: who held it and why it left, so that
+    /// holder's card is told and the offerer learns of an expired claim.
+    pub returned: Option<OfferReturn>,
+}
+
+/// An offer leaving the holder it was assigned to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferReturn {
+    pub previous: Recipient,
+    pub cause: ReturnCause,
+}
+
+/// Why an offer left its holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnCause {
+    /// The holder never fetched it within [`InboxLimits::offer_assign_wait`].
+    NotFetched,
+    /// The holder fetched it and did not claim it within the ack wait.
+    AckWaitExpired,
+    /// The claim lasted longer than its TTL without a completion.
+    ClaimExpired,
+    /// The claimant handed it back.
+    Released,
+    /// The holder's agent exited.
+    HolderExited,
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +698,10 @@ pub struct InboxLimits {
     /// Hardening M3: how long a terminal message keeps its body for
     /// diagnostics; its summary stays until it leaves the history.
     pub history_body_ttl: Duration,
+    /// How long an offer may wait with a holder that has not fetched it
+    /// before it returns to its pool for someone else: the same deadline as
+    /// the undelivered notice (`DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS`).
+    pub offer_assign_wait: Duration,
 }
 
 impl Default for InboxLimits {
@@ -691,6 +723,7 @@ impl Default for InboxLimits {
             max_history_messages: DEFAULT_MAX_HISTORY_MESSAGES,
             max_history_bytes: DEFAULT_MAX_HISTORY_BYTES,
             history_body_ttl: DEFAULT_HISTORY_BODY_TTL,
+            offer_assign_wait: crate::inbox_hub::DEFAULT_UNDELIVERED_NOTICE_AFTER,
         }
     }
 }
@@ -737,6 +770,8 @@ impl InboxLimits {
             max_history_messages: d.max_history_messages,
             max_history_bytes: d.max_history_bytes,
             history_body_ttl: d.history_body_ttl,
+            offer_assign_wait: ms(crate::inbox_hub::ENV_UNDELIVERED_NOTICE_AFTER_MS)
+                .unwrap_or(d.offer_assign_wait),
         }
     }
 }
@@ -1062,6 +1097,7 @@ impl Inbox {
             .clone();
         self.messages[index].recipient = Some(chosen.clone());
         self.messages[index].deliveries += 1;
+        self.messages[index].assign_deadline = Some(now + self.limits.offer_assign_wait);
         self.transition(index, now, MessageState::Queued);
         Some(chosen)
     }
@@ -1259,7 +1295,7 @@ impl Inbox {
     ) -> ClaimOutcome {
         match self.claimed_by(id, pane_id, agent_id) {
             Ok(index) => {
-                self.return_offer(index, now);
+                self.return_offer(index, now, ReturnCause::Released);
                 self.trim_history(now);
                 ClaimOutcome::Released
             }
@@ -1286,7 +1322,7 @@ impl Inbox {
                 continue;
             }
             if m.is_offer() {
-                self.return_offer(index, now);
+                self.return_offer(index, now, ReturnCause::HolderExited);
             } else {
                 self.transition(
                     index,
@@ -1324,8 +1360,8 @@ impl Inbox {
 
     /// Apply every deadline that has passed by `now`: unacknowledged fetches
     /// are redelivered (or become undeliverable at `max_deliver`), expired
-    /// claims return their offer to its pool, and the dedup and rate windows
-    /// move on.
+    /// claims and offers their holder never fetched return to their pool, and
+    /// the dedup and rate windows move on.
     pub fn tick(&mut self, now: Instant) {
         let mut index = self.messages.len();
         while index > 0 {
@@ -1335,7 +1371,14 @@ impl Inbox {
                     self.redeliver(index, now);
                 }
                 MessageState::Claimed { expires, .. } if *expires <= now => {
-                    self.return_offer(index, now);
+                    self.return_offer(index, now, ReturnCause::ClaimExpired);
+                }
+                MessageState::Queued
+                    if self.messages[index]
+                        .assign_deadline
+                        .is_some_and(|due| due <= now) =>
+                {
+                    self.return_offer(index, now, ReturnCause::NotFetched);
                 }
                 _ => {}
             }
@@ -1353,14 +1396,16 @@ impl Inbox {
         });
     }
 
-    /// The earliest ack deadline or claim expiry, so the daemon can sleep
-    /// until there is something for [`Inbox::tick`] to do.
+    /// The earliest ack deadline, claim expiry or unfetched offer's
+    /// assignment deadline, so the daemon can sleep until there is something
+    /// for [`Inbox::tick`] to do.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.messages
             .iter()
             .filter_map(|m| match &m.state {
                 MessageState::Fetched { ack_deadline, .. } => Some(*ack_deadline),
                 MessageState::Claimed { expires, .. } => Some(*expires),
+                MessageState::Queued => m.assign_deadline,
                 _ => None,
             })
             .min()
@@ -1561,6 +1606,7 @@ impl Inbox {
             deliveries: 0,
             history: Vec::new(),
             excluded: Vec::new(),
+            assign_deadline: None,
         };
         self.messages.push(message);
         let index = self.messages.len() - 1;
@@ -1606,7 +1652,7 @@ impl Inbox {
     /// An offer goes back to its pool instead, excluding its holder.
     fn redeliver(&mut self, index: usize, now: Instant) {
         if self.messages[index].is_offer() {
-            self.return_offer(index, now);
+            self.return_offer(index, now, ReturnCause::AckWaitExpired);
         } else if self.messages[index].deliveries >= self.limits.max_deliver {
             self.transition(
                 index,
@@ -1623,10 +1669,12 @@ impl Inbox {
 
     /// An offer leaves its holder and returns to its pool, never to be offered
     /// to that holder again — or becomes undeliverable at `max_deliver`.
-    fn return_offer(&mut self, index: usize, now: Instant) {
+    fn return_offer(&mut self, index: usize, now: Instant, cause: ReturnCause) {
         let message = &mut self.messages[index];
-        if let Some(holder) = message.recipient.take() {
-            message.excluded.push(holder);
+        message.assign_deadline = None;
+        let previous = message.recipient.take();
+        if let Some(holder) = &previous {
+            message.excluded.push(holder.clone());
         }
         if message.deliveries >= self.limits.max_deliver {
             self.transition(
@@ -1640,6 +1688,9 @@ impl Inbox {
         } else {
             self.transition(index, now, MessageState::Queued);
         }
+        if let (Some(previous), Some(event)) = (previous, self.events.last_mut()) {
+            event.returned = Some(OfferReturn { previous, cause });
+        }
     }
 
     /// The one place a state changes: records history, the dedup state and an
@@ -1647,6 +1698,9 @@ impl Inbox {
     fn transition(&mut self, index: usize, now: Instant, state: MessageState) {
         let message = &mut self.messages[index];
         message.state = state;
+        if !matches!(message.state, MessageState::Queued) {
+            message.assign_deadline = None;
+        }
         let name = message.state.name();
         message.history.push((now, name));
         if let Some(known) = self.dedup_state.get_mut(&message.id) {
@@ -1664,6 +1718,7 @@ impl Inbox {
                 MessageState::Undeliverable { reason, .. } => Some(*reason),
                 _ => None,
             },
+            returned: None,
         });
     }
 
