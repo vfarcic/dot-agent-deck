@@ -441,7 +441,8 @@ fn the_cap_is_pinned_before_any_test_code_runs() {
     }
 }
 
-/// The cap the SIGKILL probes below arm, in seconds.
+/// The cap the SIGKILL probes below arm on an idle box, before
+/// [`armed_cap_secs`] widens it for contention.
 ///
 /// **3, not the parser's 1 s floor, and the difference is what keeps a starved
 /// box from failing these tests vacuously.** A probe child ignores SIGTERM, so
@@ -453,22 +454,63 @@ fn the_cap_is_pinned_before_any_test_code_runs() {
 /// ended by a wrapper that was never killed, which proves nothing. At 1 s that
 /// window was ~2.5 s; at 3 s it is ~4.5 s, the same headroom
 /// `tests/wrap_io.rs`'s `sigkilled_wrapper_case` takes for the same reason.
-const ARMED_CAP_SECS: &str = "3";
+const ARMED_CAP_BASE: Duration = Duration::from_secs(3);
 
-/// How long a control probe — no cap armed — must survive.
+/// The most [`armed_cap_secs`] will arm: [`ARMED_CAP_BASE`] at
+/// `common::MAX_LOAD_FACTOR`. A literal so linkage-check rule 11 reads it
+/// against the reaper's dead-owner floor like every other cap a test pins.
+const ARMED_PROBE_MAX_LIFETIME_SECS: u64 = 18;
+
+/// The cap the SIGKILL probes arm: [`ARMED_CAP_BASE`] widened by the machine's
+/// contention, read once per test so the armed probes and their control share
+/// it.
 ///
-/// 6 s is the FLOOR plus a margin, not a round number: it has to exceed an armed
-/// probe's own deadline ([`ARMED_CAP_SECS`] + one 250 ms backstop poll + the
-/// 1.5 s `WRAP_TERMINATE_GRACE` ≈ 4.75 s), or a child that merely happened to die
-/// on schedule would look like one nothing could end, and the armed assertion
-/// would pass for a reason other than the cap. Every second of it is spent
-/// proving a negative, which is why the controls run concurrently with the armed
-/// probes rather than in front of them.
-const CONTROL_BUDGET: Duration = Duration::from_secs(6);
+/// **Widened because the window between the arm and the SIGKILL is one the
+/// test must do work inside**: the probe's shell must start and record its
+/// pid, and the test must read the wrapper's fork-time event and kill it, all
+/// before the cap ends the child. That clock starts in the wrapper, so a probe
+/// shell that a starved box takes longer than the cap and its grace to start is
+/// ended by the cap before it can record its pid, and the test reports a pid
+/// that was never recorded however long it waits for one. PRD #1631: both
+/// SIGKILL tests reported a pid never recorded at io full 92.4%, which is
+/// either that or the then-flat 10 s wait for the record running out first;
+/// a probe with a 6 s stall injected before its record was ended by a 3 s cap
+/// before it wrote the pid, and recorded it under a 12 s one. The control's
+/// budget moves with the cap, so proving the negative still outlasts the
+/// armed deadline.
+fn armed_cap_secs() -> u64 {
+    let scaled = common::load_scaled(ARMED_CAP_BASE).as_secs_f64().ceil() as u64;
+    scaled.clamp(ARMED_CAP_BASE.as_secs(), ARMED_PROBE_MAX_LIFETIME_SECS)
+}
 
-/// How long an armed probe's child may take to die once its wrapper is gone.
-/// Loose headroom for a loaded host, not an expected duration — that is ~4.75 s.
-const ARMED_BUDGET: Duration = Duration::from_secs(30);
+/// How long a control probe — no cap armed — must survive, for an armed cap of
+/// `cap_secs`.
+///
+/// The cap plus 3 s is the FLOOR plus a margin, not a round number: it has to
+/// exceed an armed probe's own deadline (the cap + one 250 ms backstop poll +
+/// the 1.5 s `WRAP_TERMINATE_GRACE`), or a child that merely happened to die on
+/// schedule would look like one nothing could end, and the armed assertion
+/// would pass for a reason other than the cap. Every second of it is spent
+/// proving a negative, which is why the controls run concurrently with the
+/// armed probes rather than in front of them.
+fn control_budget(cap_secs: u64) -> Duration {
+    Duration::from_secs(cap_secs + 3)
+}
+
+/// How long an armed probe's child may take to die once its wrapper is gone:
+/// the cap, plus loose headroom for a loaded host that is not an expected
+/// duration — the child is due a cap plus ~1.75 s after the arm, which came
+/// before the kill.
+fn armed_budget(cap_secs: u64) -> Duration {
+    Duration::from_secs(cap_secs) + common::load_scaled(Duration::from_secs(27))
+}
+
+/// How long a probe's shell may take to start and record its pid, and its
+/// wrapper to report the arm: a ceiling on something that must happen, so
+/// load-scaled.
+fn probe_start_budget() -> Duration {
+    common::load_scaled(Duration::from_secs(10))
+}
 
 /// Bind the hook socket a probe's wrapper reports to, so [`ready_to_strand`] can
 /// hear its fork-time `SessionStart`.
@@ -508,14 +550,14 @@ fn is_backstop_armed_signal(event: &AgentEvent) -> bool {
 /// forks that create the reaper have run.
 ///
 /// **The liveness half keeps the wait from turning into a vacuous pass.** If the
-/// test stalls past [`ARMED_CAP_SECS`] + grace after the arm, the cap ends the
+/// test stalls past the armed cap + grace after the arm, the cap ends the
 /// child before the wrapper is ever killed, and the armed assertion would then
 /// pass without a reaper having outlived anything.
 ///
 /// Every failure, the event socket's own included, comes back as `Err` rather
 /// than a panic, so the caller's cleanup still runs before it reports one.
 fn ready_to_strand(listener: &UnixListener, pid: libc::pid_t) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + probe_start_budget();
     let mut events: Vec<AgentEvent> = Vec::new();
     let armed = loop {
         match listener.accept() {
@@ -635,7 +677,7 @@ fn term_and_hup_resistant_child_survives(cap: Option<&str>, budget: Duration) ->
             .ok()
             .and_then(|contents| contents.trim().parse().ok())
     };
-    let recorded = common::wait_until(Duration::from_secs(10), || read_pid(&pid_path).is_some());
+    let recorded = common::wait_until(probe_start_budget(), || read_pid(&pid_path).is_some());
     if !recorded {
         let _ = wrapper.kill();
         let _ = wrapper.wait();
@@ -679,7 +721,7 @@ fn term_and_hup_resistant_child_survives(cap: Option<&str>, budget: Duration) ->
 /// Scenario: Run a wrapped child that ignores SIGTERM and SIGHUP and never reads
 /// its terminal, then SIGKILL the wrapper so no reap loop runs. With no lifetime
 /// cap in the environment it must still be alive after the budget; with a
-/// three-second cap it must be gone inside it.
+/// cap of three seconds (widened on a loaded box) it must be gone inside it.
 ///
 /// Issue #668: this is the test that says out loud why the cap is kept once the
 /// fd fix lands. The fd fix ends a wrapped child by hanging its terminal up, and
@@ -692,11 +734,14 @@ fn term_and_hup_resistant_child_survives(cap: Option<&str>, budget: Duration) ->
 fn a_term_resistant_wrapped_child_is_still_bounded_by_the_cap() {
     // Control: nothing armed, so nothing can end it. Run beside the armed probe
     // rather than in front of it, so proving the negative costs no wall clock of
-    // its own; see `CONTROL_BUDGET` for why it is 6 s.
+    // its own; see `control_budget` for why it is the cap plus 3 s.
+    let cap = armed_cap_secs();
+    let cap_arg = cap.to_string();
     let (control, armed) = std::thread::scope(|scope| {
-        let control = scope.spawn(|| term_and_hup_resistant_child_survives(None, CONTROL_BUDGET));
+        let control =
+            scope.spawn(|| term_and_hup_resistant_child_survives(None, control_budget(cap)));
         let armed = scope
-            .spawn(|| term_and_hup_resistant_child_survives(Some(ARMED_CAP_SECS), ARMED_BUDGET));
+            .spawn(|| term_and_hup_resistant_child_survives(Some(&cap_arg), armed_budget(cap)));
         (control.join(), armed.join())
     });
     let (control, armed) = (
@@ -818,7 +863,7 @@ fn setsid_escapee_survives(cap: Option<&str>, fate: OuterFate, budget: Duration)
     };
 
     let mut wrapper = command.spawn().expect("spawn setsid-escapee probe");
-    let recorded = common::wait_until(Duration::from_secs(10), || {
+    let recorded = common::wait_until(probe_start_budget(), || {
         read_pid(&escapee_pid_path).is_some()
     });
     if !recorded {
@@ -896,9 +941,9 @@ fn session_id_of(pid: libc::pid_t) -> Option<libc::pid_t> {
 /// Scenario: Run a wrapped child that `setsid`s a grandchild into its own
 /// session — the shape Claude Code's Bash tool really has — then SIGKILL the
 /// wrapper so no reap loop runs. With no lifetime cap in the environment the
-/// escapee must still be alive after the budget; with a three-second cap it must
-/// be gone inside it, whether the wrapped child kept running or exited the
-/// moment it had launched the escapee.
+/// escapee must still be alive after the budget; with a cap of three seconds
+/// (widened on a loaded box) it must be gone inside it, whether the wrapped
+/// child kept running or exited the moment it had launched the escapee.
 ///
 /// Issue #861. The child-group reaper #661 forks holds
 /// `killpg(child_pid, …)`, and a `killpg` cannot reach a process that has left
@@ -910,7 +955,7 @@ fn session_id_of(pid: libc::pid_t) -> Option<libc::pid_t> {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_setsid_escapee_is_still_bounded_by_the_cap() {
-    // Control: nothing armed, so nothing can end it — `CONTROL_BUDGET`, for the
+    // Control: nothing armed, so nothing can end it — `control_budget`, for the
     // same reason the group-resident control uses it.
     //
     // Armed: both fates, and every probe runs concurrently, deliberately: the
@@ -920,14 +965,18 @@ fn a_setsid_escapee_is_still_bounded_by_the_cap() {
     // would leave the second's assertion never observed failing, which is no
     // evidence at all. Concurrency is what keeps proving the control's negative
     // from adding its budget to the armed probes'.
+    let cap = armed_cap_secs();
+    let cap_arg = cap.to_string();
     let [control, exit_at_once, persist] = std::thread::scope(|scope| {
         [
-            scope.spawn(|| setsid_escapee_survives(None, OuterFate::ExitAtOnce, CONTROL_BUDGET)),
             scope.spawn(|| {
-                setsid_escapee_survives(Some(ARMED_CAP_SECS), OuterFate::ExitAtOnce, ARMED_BUDGET)
+                setsid_escapee_survives(None, OuterFate::ExitAtOnce, control_budget(cap))
             }),
             scope.spawn(|| {
-                setsid_escapee_survives(Some(ARMED_CAP_SECS), OuterFate::Persist, ARMED_BUDGET)
+                setsid_escapee_survives(Some(&cap_arg), OuterFate::ExitAtOnce, armed_budget(cap))
+            }),
+            scope.spawn(|| {
+                setsid_escapee_survives(Some(&cap_arg), OuterFate::Persist, armed_budget(cap))
             }),
         ]
         .map(|probe| probe.join())

@@ -66,6 +66,9 @@ fn fixture_session() -> SessionState {
         orchestration_orphaned: false,
         subagent_wait: None,
         output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
     }
 }
 

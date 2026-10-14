@@ -166,8 +166,26 @@ async fn delegate_020_inner(bin_dir: &str, inherited_path: &str) {
         .path()
         .join(".dot-agent-deck")
         .join("worker-task-coder.md");
-    let ok = common::wait_for_path_async(&task_file, Duration::from_secs(5)).await;
-    assert!(ok, "worker task file was never written at {task_file:?}");
+    // The task file is created before its body is written and announced only
+    // afterwards (`write_coordination_file` in `src/orchestrator_context.rs`), so
+    // existing is not being complete: a read straight after the path appeared
+    // found it EMPTY in PRD #1631's broad e2e run (`io full` 86%). Wait for the
+    // whole instruction line this test parses, closing quote included.
+    let complete = |body: &str| {
+        body.lines().any(|l| {
+            l.split_once(" work-done --task-file '")
+                .is_some_and(|(_, rest)| rest.contains('\''))
+        })
+    };
+    if let Err(state) = common::wait_for_file_matching_async(
+        &task_file,
+        common::load_scaled(Duration::from_secs(5)),
+        complete,
+    )
+    .await
+    {
+        panic!("worker task file never carried its `work-done --task-file` line: {state}");
+    }
     let body = std::fs::read_to_string(&task_file).expect("read worker task file");
 
     // The primary instruction, exactly as the worker would copy it out of the

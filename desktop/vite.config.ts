@@ -30,6 +30,10 @@ export default defineConfig({
     // them.
     exclude: [...configDefaults.exclude, "e2e/**", "driver/**"],
     setupFiles: ["./src/test/setup.ts"],
+    // Bound concurrent jsdom bootstraps on shared development hosts. Letting
+    // the pool use every available core timed out 15 worker startups while
+    // Rust builds were active, before those files could run any assertions.
+    maxWorkers: 4,
     // A ceiling, not a pace: a passing test waits no longer for it. vitest's
     // default of 5s is an idle machine's budget, and under the parallel load
     // this repo's agents put on one box (load averages of 90 to 130 on 16
@@ -41,6 +45,23 @@ export default defineConfig({
     // timeouts). Testing Library's own wait budget is raised beside this, in
     // `src/test/setup.ts`.
     testTimeout: 30_000,
+    // `vmForks`, not the default `forks`: it starts one worker process per
+    // lane instead of one per file. That is a weaker isolation boundary than
+    // `forks` — the files a worker runs share its process, each in a separate
+    // VM context, so module-level globals are per file but anything held by
+    // the process (native modules, `process` state, leaked timers) is not. The reason is a start timeout this config cannot
+    // raise: vitest 5.0.3 fails a worker that does not report "started"
+    // within a hard-coded 60s (`START_TIMEOUT` in its `PoolRunner`), and
+    // under `forks` that window covers importing jsdom and creating its
+    // window, which was 95% of the measured start time (114s of 120.6s summed
+    // over 59 starts, 2026-10-10). On this repo's loaded box (load 60-90,
+    // swapping, IO pressure ~80%) one jsdom setup averaged 14.5s and a full
+    // run died with 15 "Failed to start forks worker ... Timeout waiting for
+    // worker to respond" errors and no failed assertion. Under `vmForks` the
+    // environment is set up when a file runs, outside that window: measured
+    // 15 starts averaging 0.2s against 59 averaging 1.0-2.0s, with the same
+    // 2021 tests passing and a wall clock no slower in alternating runs.
+    pool: "vmForks",
     css: true,
   },
 });

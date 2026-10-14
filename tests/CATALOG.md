@@ -18,6 +18,45 @@ Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `
 
 Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> — <headline>` line opts that test into the PRD #180 demo reel (`.claude/skills/demo-reel-adapter`). Eligibility is **opt-in** — the default (no marker) is *not* eligible even for a PTY-attached test that records a cast. Mark a test only if it validates the feature **as a user actually runs and sees it** — a real agent genuinely spinning up (spawn → agent → work) — never a synthetic/stand-in test (`cat`, scripted echo, recorder stubs, terminal-probe, or synthesized hook events). The adapter includes a marked test in the reel only when it *also* has a cast and its source changed on the branch.
 
+### Session pull requests
+
+#### session/pr
+
+##### session/pr/001 — The daemon resolves the exact branch PR and serves its state and review.
+- **Layer:** L2 headless, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, strict offline gh stub).
+- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly. The stub requires explicit repository, all states and all required JSON fields.
+- **Does not assert:** periodic refresh (`session/pr/003`) or TUI rendering.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/002 — Missing PR data leaves the daemon healthy and the agent without a badge.
+- **Layer:** L2 headless, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, offline gh stub).
+- **Asserts:** default branch, failed gh query, empty response, detached HEAD, non-GitHub origin and non-git directory keep a live agent served with no PR; two completed default-branch probes precede the no-gh assertion. Switching from a resolved PR branch to the default branch, detached HEAD or a new branch whose query fails clears the old PR; a same-key transient failure preserves it.
+- **Does not assert:** missing gh executable, real authentication or network failures.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/003 — PR polling updates an already-attached client without reconnecting.
+- **Layer:** L2 headless, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, mutable offline gh stub).
+- **Asserts:** with DOT_AGENT_DECK_PR_REFRESH_SECS=1, switching an open PR to merged/approved updates ListAgents and sends the full PR to one continuously held event subscription even during continuous non-trigger tool traffic.
+- **Does not assert:** the particular event variant or metadata key used, browser invocation or real GitHub latency.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/004 — A dashboard card shows the PR and o opens its URL.
+- **Layer:** L2 PTY-attached, lane 1 (deterministic).
+- **Agent:** none (synthetic cat agent, offline gh stub and BROWSER recorder).
+- **Asserts:** the real TUI displays `#1234 ⊙ ◐`; o on the selected card invokes BROWSER with the exact PR URL; the same key on a default-branch card spawns no opener and leaves Help usable.
+- **Does not assert:** a real browser opening, real-agent execution or reel eligibility.
+- **Platform coverage:** mac+linux.
+
+##### session/pr/005 — An interactive Haiku agent visibly works beside its pull request badge. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (real agent).
+- **Agent:** Claude Code (interactive Haiku; strict offline gh stub).
+- **Asserts:** a genuine agent on a fixture PR branch lists the files and reveals a uniquely named sentinel omitted from its prompt; the attached TUI displays that filename together with `#1234 ⊙ ◐`.
+- **Does not assert:** real GitHub authentication or network access, a browser opening, or live PR polling transitions.
+- **Platform coverage:** mac+linux.
+
 ### Dashboard panes
 
 #### dashboard/pane
@@ -126,6 +165,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (a `SessionState` fixture rendered through `ui::render_card_to_buffer` with a CJK display name, an ASCII control, and a name of VS16 emoji).
 - **Asserts:** a card whose display name is `项目目录管理` — 6 scalars, 12 display columns — rendered 40 columns wide leaves 26 cells for the title, and the title is cut to fit with a trailing `…` inside that budget, the two characters past it dropped, the ` ● Thinking ` badge still whole beside it, and the top border exactly one card wide. Before the fix `ui::truncate_styled_segments` counted `char`s, so the 23-character title measured as fitting the 26-cell budget and was returned whole at 29 columns; ratatui then clipped the overhang at the right edge and the card read `· 项 目 目 录 管  ● Thinking` with no `…` and no border fill. The same card with the ASCII name `abcdef` renders untouched, which is the property that keeps every committed card snapshot from churning. And the same card named with eight `❤️` (U+2764 + VARIATION SELECTOR-16, one column per `char` but a two-cell grapheme cluster as ratatui draws it) is also cut with a `…` and keeps its badge: a per-`char` width budget measured those at 8 columns against 16 drawn, passed the title whole, and the badge was drawn over its tail — the same symptom, on input the char count had handled correctly.
 - **Does not assert:** the eight `ui::truncate_styled_segments` unit tests beside the function, which own the emoji, combining-mark, keycap, halfwidth-dakuten, ZWJ, control-character, mid-wide-glyph, zero-budget and per-segment-style cases, measured against ratatui's own `Line::width` and `Buffer::set_line`; the `Dir:` / `Prmt:` lines, converted by PRD #339 to a per-`char` width sum and covered by `dashboard/pane/006`.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/016 — A card shows its pull request number with state and review glyphs at roomy and narrow widths.
+- **Layer:** L1 (ratatui TestBackend + insta).
+- **Agent:** none (synthetic SessionState).
+- **Asserts:** an open, review-required PR shows `#1234` at 80 and 30 columns; snapshots pin both sides of the review/state/stats/omission width boundaries and all lifecycle/review combinations, including Unknown (`?`) and absent review.
+- **Does not assert:** daemon resolution or browser invocation (`session/pr/*`).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/stats
@@ -545,8 +591,97 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### dashboard/help/002 — Help overlay content matches the committed snapshot.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`.
+- **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`; the dashboard shortcuts advertise the `m` host-metrics overlay, and the plain-letter commands list their `Ctrl` form after the letter (`m / Ctrl+m`, PR #1672).
 - **Does not assert:** dynamic content (none today).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/help/003 — Dashboard help advertises the shortcut to open the selected pull request.
+- **Layer:** L1 (ratatui TestBackend).
+- **Agent:** none.
+- **Asserts:** one rendered help row names the `o` key and opening a pull request.
+- **Does not assert:** browser invocation, covered by `session/pr/004`.
+- **Platform coverage:** mac+linux+windows.
+
+#### dashboard/host-metrics
+
+The attached deck's host measurements, supplied by the daemon. Desktop browser coverage of several decks is in `desktop/e2e/host-metrics.spec.ts`; the catalog IDs below name the Rust harness tests.
+
+##### dashboard/host-metrics/001 — The default `m` key opens the host overlay and Escape restores the dashboard.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** TestBackend frames through the production key handlers show the host title and disk roles only while the overlay is open; Escape returns the initial dashboard frame.
+- **Does not assert:** daemon transport or real host values (covered by `dashboard/host-metrics/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/002 — A fixed host sample renders all roles and unknown fields explicitly.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** an `insta` overlay snapshot names the deck's host and shows per-role free/total disk, load per core and core count, and memory used/available; independently absent fields show unknown, including both the load and core count.
+- **Does not assert:** the sampler's operating-system reads or cache expiry (covered by `protocol/host-metrics/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/003 — An older deck explicitly reports unavailable metrics.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** the overlay says `not available from this deck` beneath `Host of this deck`, without fabricated zero readings.
+- **Does not assert:** capability withholding on the wire (covered by `protocol/host-metrics/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/004 — The real TUI displays its daemon's host measurements and closes on Escape.
+- **Layer:** L2.
+- **Agent:** none.
+- **Asserts:** the real binary with its lazily spawned daemon renders numeric disk rows for Working root, Worktree parent and Temp root, with a numeric load-per-core row after `m`; Escape removes the overlay and restores the empty dashboard.
+- **Does not assert:** real-agent work, remote transport, or exact machine-specific utilisation; this synthetic PTY case is not a reel clip.
+- **Timing:** the first wait (the empty dashboard painting after the lazy daemon spawn) has a load-scaled ceiling: 30 s on an idle box, up to 120 s. The deck's daemon-start bound is set 5 s under that ceiling, so a daemon that never binds still prints its error before the wait ends. A starved run once spent 13.6 s on the daemon's pre-bind alone and overran the fixed 30 s (issue #1665).
+- **Platform coverage:** mac+linux.
+
+##### dashboard/host-metrics/005 — A role carrying control characters and a bidi override renders scrubbed.
+- **Layer:** L1 (ratatui `TestBackend` via `render_host_metrics_overlay_to_buffer`, report injected past the client's bounds).
+- **Agent:** none.
+- **Asserts:** a role carrying ESC, a clear-screen CSI sequence, a newline and a `U+202E` override renders on one row as its scrubbed text beside its disk figures, and no buffer cell holds a control character or bidi override (PRD #1258 audit A2).
+- **Does not assert:** the client's size bounds (covered by `protocol/host-metrics/007`–`009`); the desktop panel's scrubbing.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/006 — An oversized role count renders a bounded overlay without panicking.
+- **Layer:** L1 (ratatui `TestBackend`, report injected past the client's bounds).
+- **Agent:** none.
+- **Asserts:** a report of 65,525 roles, the count that overflowed the overlay's `u16` height arithmetic, renders without panicking and draws exactly `MAX_DISK_ROLES` role rows, with the rows after the roles still drawn (PRD #1258 audit A2).
+- **Does not assert:** that the client refuses such a reply (covered by `protocol/host-metrics/007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/007 — An oversized role name is clamped to the label column.
+- **Layer:** L1 (ratatui `TestBackend`, report injected past the client's bounds).
+- **Agent:** none.
+- **Asserts:** a 100 KiB role renders clamped below `MAX_ROLE_BYTES` with a trailing `…`, and its disk figures stay on the same row (PRD #1258 audit A2).
+- **Does not assert:** that the client refuses such a reply (covered by `protocol/host-metrics/008`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/008 — The overlay's words match the copy the desktop panel is tested against.
+- **Layer:** L1 (ratatui `TestBackend` reading `tests/fixtures/host-metrics-copy.json`).
+- **Agent:** none.
+- **Asserts:** for each shared sample, the overlay shows the shared title and subtitle and exactly the shared label/value rows in order, including the `(warning)` and `(critical)` words of the sample the daemon judged and none for a level it does not know; a deck without host metrics shows the shared not-available sentences. The desktop's `HostMetricsPanel.copy.test.tsx` asserts the same file against the deck card's panel, so a word changed in one client alone fails the other (CLAUDE.md rule 22).
+- **Does not assert:** layout or colours; the desktop's rendering (its own vitest file).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/010 — Each judged value is coloured by its level, with a word beside every non-ok one.
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, via `render_host_metrics_overlay_to_buffer`).
+- **Agent:** none.
+- **Asserts:** for a sample with disks judged `critical`, `warn`, `ok` and not at all, the load `warn` and memory `ok`, the value cells are red, yellow, green and the default colour, the load yellow and memory available green, while memory used and every label stay in the default colour; the critical and warning values end in `(critical)` and `(warning)` and no other row carries a word (PRD #1258); the snapshot pins the text.
+- **Does not assert:** the levels' computation (covered by `protocol/host-metrics/012`); the desktop's colours (`desktop/e2e/host-metrics.spec.ts`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/011 — On a narrow terminal the overlay's level words are shown in full.
+- **Layer:** L1 (TestBackend + insta, the live `render_host_metrics_overlay` through `render_host_metrics_overlay_to_buffer`).
+- **Agent:** none.
+- **Asserts:** at 60 and 34 columns, a critical disk, a warning disk and a warning load still show `(critical)` once and `(warning)` twice, each in its level's colour; at 60 columns the disk row that does not fit carries its word on the line below, the load row that fits keeps it beside its figures, and the frame matches its snapshot (PR #1672 review).
+- **Does not assert:** the figures' own truncation at the narrowest width; the desktop popover (covered by `host-metrics.spec.ts`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/host-metrics/012 — On every terminal width, a reading in a level's colour carries its whole level word.
+- **Layer:** L1 (TestBackend, the live `render_host_metrics_overlay` through `render_host_metrics_overlay_to_buffer`).
+- **Agent:** none.
+- **Asserts:** for every terminal width from 34 columns down to 1, with a critical disk, a warning disk and a warning load: where the overlay body holds the word `critical`, `critical` appears once and `warning` twice, whole and in their levels' colours, in parentheses whenever the body holds them too; on a narrower terminal no cell is drawn in a level's colour (PR #1672 review).
+- **Does not assert:** the figures' own truncation; the "too narrow" line's wording; the desktop popover (covered by `host-metrics.spec.ts`).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/config-gen
@@ -722,6 +857,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 
 ##### status/blocked/019 — OpenCode's plugin blocks on a marker, not a bare 429 (issue #714).
 - **Layer:** L2, lane 1, PTY-attached.
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1664"]` (CLAUDE.md rule 6). Under load the daemon's hook listener can apply the marker session's QuotaBlocked before its own SessionStart, so the card stays Idle; #1664 has the evidence, the command that runs it (`--run-ignored only`) and what lifts the quarantine.
 - **Agent:** two synthetic OpenCode panes loading the installed plugin under Node; no provider credential.
 - **Asserts:** the marked error yields Blocked and the bare 429 yields Error.
 - **Does not assert:** a real OpenCode API request.
@@ -1001,12 +1137,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the falling edge (`ShellIdle` once the command completes — that is `004`'s job against a stand-in, not repeated here against a real agent), the >120s-cap user-visible badge scenario (`status/shell-activity/006`, M6b), or no-false-positive-at-idle (`status/shell-activity/007`, M6c). The soft sentinel-content check on the model's final reply is logged, not gating — matching the model's free-text reply is more phrasing-sensitive than the two typed events the test actually gates on.
 - **Platform coverage:** mac+linux (real Claude Code interactive session; not run on Windows, and gated `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2, so it runs on a developer's machine and in no CI job (CLAUDE.md rule 5)).
 
-##### status/shell-activity/006 — A real interactive Haiku Claude agent's Bash call that crosses Claude Code's 120s default timeout keeps the pane's rendered badge on `Working`, with the command genuinely still running — the reported bug, reproduced as the user actually sees it (PRD #386 M6b). [reel]
+##### status/shell-activity/006 — After a real interactive Haiku Claude agent's Bash call crosses the 120s cap and its native Stop arrives, the rendered badge reads Idle with Background: 1 command while the ping is still running (#1678). [reel]
 - **Layer:** L2, PTY-attached, real agent (drives the actual `dot-agent-deck` binary, which lazily spawns its own daemon; no synthetic hook, no fabricated `SessionStart`, no hand-set `pane_id`).
 - **Agent:** a real interactive `claude --model claude-haiku-4-5-20251001 --allowedTools Bash` pane, spawned through the normal Ctrl+N new-pane flow with per-folder trust pre-seeded, exactly as a user would drive it.
-- **Asserts:** a directive prompt drives the agent to make exactly one Bash tool call running `ping -c 200 127.0.0.1 > <sentinel> 2>&1` — real, non-blocked foreground work lasting ~200s under **default** Bash settings (no `timeout` parameter, no `run_in_background`), reproducing the reported case exactly. After the native `ToolStart`/`Bash` hook event confirms the call actually started, the test waits for the real, native `Idle` event — mapped from Claude Code's own `Stop` hook, never fabricated — for this agent, bounded at 157s (the PRD's own measured 127s `ToolStart`-to-`Idle` gap plus a 30s margin). Only once that `Idle` genuinely lands does the test switch to the dashboard (`Ctrl+D`) and assert the rendered card badge reads `Working` (not `Idle`) — sampled at the instant a broken monitor would have painted it `Idle`. It also independently proves the command is genuinely still running at that moment: `process_table()` + `descendants()`, walked from the test binary's own pid (never a global `ps` scan, so a concurrently running e2e test's own processes can't be mistaken for this one's), finds a live process carrying the sentinel text in its argv (the Bash-tool shell's `eval '<user command>'` segment) with a live `ping` process beneath it. A miss on either half — badge or process — means the fix did not land or a different bug (a stale badge next to a finished command) is passing as one. **A PASS therefore means the bug path was genuinely exercised** — this is the guarantee added for PRD #386's tester follow-up: previously the test sampled on a fixed wall-clock offset regardless of whether Claude Code's `Stop` hook had actually fired, so roughly two runs in three (when Claude ended the capped call with `ToolEnd` and no `Stop`) passed without the card ever having anything to recover from. If the real `Idle` does not land within the bound, the test now **fails loudly** with a `PRECONDITION NOT MET` message distinguishing "this run never exercised the bug path" from "the badge was actually wrong" — an inconclusive run is never reported as a pass.
-- **Does not assert:** anything about the discriminator's internals (`descendant_shell_activity`, `003`) or the pane primitive in isolation (`004`) — this test only observes the full pipeline's user-visible output. Does not assert what happens after the sample point (the eventual falling edge once the 200s ping finishes) or what the agent does with the "moved to background" tool result. A `PRECONDITION NOT MET` panic is not a badge assertion at all — it asserts nothing about `Working`/`Idle` and must be read as inconclusive (rerun), not as evidence the fix broke.
+- **Asserts:** a directive prompt asks for one real Bash call running ping -c 200 against a unique sentinel with default settings, followed immediately by the end of the main turn without polling or inspecting the command. After ToolStart the test requires the real native Stop-mapped Idle event within 157 seconds and at least 120 seconds after ToolStart; absent hooks fail explicitly with PRECONDITION NOT MET and include the final pane for diagnosis. Once Stop arrives, the rendered card reads Idle with Background: 1 command and never Working. A process walk from this test's own pid independently confirms the sentinel-tagged tool shell and its ping are still live.
+- **Does not assert:** anything about the discriminator's internals (`descendant_shell_activity`, `003`) or the pane primitive in isolation (`004`) — this test observes the full pipeline's user-visible output. Does not assert the eventual falling edge once the 200s ping finishes. A `PRECONDITION NOT MET` panic is a setup failure requiring diagnosis; it asserts nothing about the rendered `Working`/`Idle` badge.
 - **Platform coverage:** mac+linux (real Claude Code interactive session; not run on Windows, and gated `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2, so it runs on a developer's machine and in no CI job (CLAUDE.md rule 5)).
+
 
 ##### status/shell-activity/007 — A real interactive Haiku Claude agent left at its idle prompt, with its real MCP servers alive as children, keeps the pane's rendered badge on `Idle` — no false positive against a live process table (PRD #386 M6c).
 - **Layer:** L2, PTY-attached, real agent (drives the actual `dot-agent-deck` binary, which lazily spawns its own daemon; no synthetic hook, no fabricated `SessionStart`, no hand-set `pane_id`).
@@ -1050,14 +1187,117 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Layer:** L1.
 - **Agent:** none.
 - **Asserts:** step by step through the main thread's `Agent` call, the subagent's `Bash` call, the subagent's `PermissionRequest` and its answered `PostToolUse`, `SubagentStop`, the `Agent` call's end and `Stop`: the card reads Working with `Agent` as active tool through the subagent's own calls, Needs Input on the subagent's prompt and Thinking once that call ends, and Idle at the end.
-- **Does not assert:** a subagent prompt answered after the main turn already stopped — that still leaves Thinking until the next event, as it did before issue #1354.
+- **Does not assert:** a subagent prompt answered after the main turn already stopped — since issue #1678 its answered `PostToolUse` resumes the card as `SubagentStop` does, to Idle there; a different subagent's call ending, which answers no prompt but its own (`hook.rs`'s `opencode_child_permission_another_childs_tool_end_keeps_the_prompt` and `…_a_childs_tool_end_keeps_the_main_threads_prompt`).
 - **Platform coverage:** mac+linux.
 
-##### status/subagent/005 — A subagent's tool call between `ShellBusy` and `ShellIdle` does not strand the synthetic Working.
+##### status/subagent/005 — Reporting panes stay Idle on new-daemon shell activity, while old-daemon synthetic Working retains its takeover protection.
 - **Layer:** L1.
 - **Agent:** none (the `ShellBusy`/`ShellIdle` frames are daemon-synthesized in production and built directly here).
-- **Asserts:** from an Idle card, `ShellBusy` sets Working; a subagent `ToolStart` (through the real hook CLI) followed by `ShellIdle` returns the card to Idle. The control, a main-thread `ToolStart` in the same spot, takes the status over as real and the card stays Working through the `ShellIdle`.
+- **Asserts:** on a Claude-shaped pane after SessionStart and Stop, a ShellBusy carrying the daemon's aggregate leaves Idle and retains one background command, including after a subagent ToolStart. ShellBusy without that aggregate (an older daemon) still sets synthetic Working; a subagent ToolStart followed by ShellIdle returns Idle, while a main-thread ToolStart takes over and stays Working.
 - **Does not assert:** the descendant scan that produces `ShellBusy` (`status/shell-activity/*`).
+- **Platform coverage:** mac+linux.
+
+##### status/background/001 — An ended reporting turn stays Idle while a detached command runs (#1678).
+- **Layer:** L2 synthetic, PTY-attached (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; daemon-owned Python parent with real detached Bash sessions and Claude-shaped hooks through the real hook CLI.
+- **Asserts:** Stop leaves Idle; sampled command activity appears as Background: 1 command on the rendered card; a main prompt hides it; the next Stop broadcasts the retained command immediately; command exit clears it. A no-hook/no-aggregate legacy reducer still promotes ShellBusy to Working.
+- **Does not assert:** real Claude behavior (007), process-table classifier details (005), desktop.
+
+##### status/background/002 — Paired subagent identity, receipt age and bounded tracking (#1678).
+- **Layer:** L2 synthetic, daemon hook ingestion (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; real hook CLI with Claude- and Codex-shaped payloads.
+- **Asserts:** two starts before Stop become two background subagents on Stop's broadcast and snapshot; duplicate start preserves oldest receipt time; three unpaired stops and a duplicate stop leave counts intact; paired stops remove only their ids; empty and oversized ids (including UTF-8 byte bounds) cannot become main-thread tool events; 128-entry cap; a same-agent clear removes old subagents but preserves the running command and its age, and a new subagent shares that command's aggregate after the generation rollover.
+- **Does not assert:** real Agent tool behavior (008), permission-wait resolution (status/subagent/006 and 007), desktop.
+
+##### status/background/003 — Snapshot hydration and revision ordering prevent replay resurrection (#1678).
+- **Layer:** L1 protocol/fold, fast tier (`subagent_tool_status.rs`).
+- **Agent:** none; serialized daemon snapshots and events applied to a fresh TUI AppState.
+- **Asserts:** snapshot background and revision survive hydration; older revision is ignored; equal revision is idempotent; zero aggregate clears and cannot be resurrected by an older replay; reseeding an existing placeholder preserves its newer clear or nonempty reading; a kept non-placeholder card accepts a newer background revision despite equal/older activity; SessionEnd's revision-4 clear survives same-spawn placeholder restoration and revision-3 snapshot/event replay, while a successor accepts its own revision 1; a successor hydrated under the same session key before the ending spawn's queued SessionEnd (Current verdict, revision 40) is drained keeps its card, identity, history and background, takes no revision-40 copy, and still accepts its own revision 1; the same holds when the ending spawn's card is filed under a different, stable key, so its end under the shared key is refused before the reuse remap rather than removing the successor's card (AU-15); an ending spawn's end under the key of a successor hydrated with a live hook generation leaves that generation, the pane's closure count and the ending spawn's generation-ended witness untouched (AU-16); an end naming another pane's card's key leaves that card and its generation alone; the ending spawn's own end, under its card's key or remapped from the pane key onto its stable card, still restores a bare placeholder, clears the generation and counts one closure; legacy JSON omitting both fields has no indicator and keeps ShellBusy promotion.
+- **Does not assert:** daemon admission/producer stripping, rendered layout (004), desktop replay, the hook generation's announced flag across the refused end (crate-internal; `a_rejected_session_end_for_another_spawn_keeps_the_generation_announced` in `src/state.rs` pins it).
+
+##### status/background/004 — The TUI card shows background kinds, counts and oldest elapsed span (#1678).
+- **Layer:** L1 widget, fixed-clock insta snapshot (`render_dashboard.rs`, fast tier).
+- **Agent:** none; snapshot-hydrated Idle card rendered through the production card seam.
+- **Asserts:** exact Background: 2 commands, 1 subagent · 3h 12m; singular and zero-kind omission; clock skew within 60 seconds clamps elapsed to zero; beyond tolerance, invalid or absent timestamp omits duration while keeping counts; zero counts hide the line; narrow card retains a background row.
+- **Does not assert:** live clock ticking, process scans or hook ingestion, desktop.
+
+##### status/background/005 — Count distinct qualifying POSIX sessions using every candidate's argv cross-check (#1678).
+- **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
+- **Agent:** none; process-table fixtures with the measured Claude fingerprint.
+- **Asserts:** many processes in one session count once; two matching sessions count twice; unmatched detached service is excluded even beside a match; nested terminal session re-rooting excludes the inner agent but includes its actual tool; unknown/missing root or session yields None.
+- **Does not assert:** monitor timing, OS sampling cost or background turn classification.
+
+##### status/background/006 — Monitor publishes count-only edges without Idle+busy spam and retires spawn observations (#1678).
+- **Layer:** L2 synthetic (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; daemon-owned stand-in with independently controlled real detached commands.
+- **Asserts:** subscribers receive count changes 1→2→1 despite unchanged busy=true; Idle+busy produces no repeated identical shell event for three seconds; replacing the spawn in the same pane cannot give its successor the old command aggregate or restamp observations with its identity.
+- **Does not assert:** a deterministically paused scan crossing replacement (there is no exposed deferred-sampler seam); real agent subprocess lifetime (007); desktop.
+
+##### status/background/007 — Real interactive Haiku background Bash work stays visible after Stop and clears on scoped kill (#1678). [reel]
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive Claude Haiku, onboarding/trust seeded, allowedTools Bash Agent, spawned through Ctrl+N.
+- **Asserts:** directive prompt launches run_in_background Bash writing a unique sentinel; native Stop arrives; rendered card reads Idle and Background: 1 command; a live ping is located via a process walk from this test's own pid and killed by exact pid; the indicator disappears while Idle remains.
+- **Does not assert:** capped default-timeout behavior (status/shell-activity/006), subagents (008), desktop.
+
+##### status/background/008 — Real interactive Haiku subagent work stays visible after the main Stop and clears on its paired stop (#1678).
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive Claude Haiku plus one real Haiku subagent, onboarding/trust seeded and allowedTools Bash Agent.
+- **Asserts:** one background Agent receives three exact slow Bash commands writing unique start/completion sentinels at absolute paths in the fixture directory (the start timeout reports observed Bash hook commands and cwd); after main Stop the rendered card reads Idle with 1 subagent (command counts may coexist); only the matching SubagentStop ends the wait, tolerating unpaired internal stops; completion sentinel and cleared indicator follow.
+- **Does not assert:** exact Claude transcript phrasing, desktop, other agent integrations.
+
+##### status/background/009 — A shell-activity sample that answers after its spawn was replaced touches neither the successor's card nor the broadcast (#1678).
+- **Layer:** unit, in-module (`src/daemon.rs`, `run_shell_activity_monitor_with` with a stub sampler on tokio's paused clock; fast tier).
+- **Agent:** none; two real `/bin/sh` spawns supply live pids, with Claude-shaped `SessionStart`/`Idle` frames applied to an ownership-backed daemon state.
+- **Asserts:** while the first sample is in flight the pane's agent is closed and a successor reports its own ended turn; the sample then answers busy for the old spawn with the measured Claude fingerprint. No `ShellBusy` and no non-empty aggregate is broadcast, and the successor's live snapshot reads Idle with no background work, because the monitor revalidates the sampled spawn under the state lock before it applies or broadcasts anything.
+- **Does not assert:** the resumed (retained-sample) path's identity filter (`shell_activity_monitor_ignores_a_pane_that_appeared_after_the_sample_started`), the end-to-end replacement through the real binary (006), desktop.
+- **Platform coverage:** mac+linux.
+
+##### status/background/010 — An OpenCode child session counts as a background subagent and leaves the card's status alone (#1678).
+- **Layer:** L2 synthetic, PTY-attached (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; daemon-owned stand-in pane typed OpenCode, with payloads shaped like the deck's OpenCode plugin's through the real `hook --agent opencode` CLI.
+- **Asserts:** a child's `subagent.start` and tagged tool call leave a live turn on Thinking with no background; the root's idle broadcast carries 1 subagent and the rendered card reads Idle with Background: 1 subagent; the same child going busy again and calling a tool neither double-counts nor turns the card Working; the child's `subagent.stop` clears the line while the card stays Idle.
+- **Does not assert:** the plugin's mapping of OpenCode's own session events (011), a real OpenCode run, desktop.
+
+##### status/background/011 — The OpenCode plugin pairs a child session's lifecycle into one subagent start and stop (#1678).
+- **Layer:** unit, in-module (`src/opencode_manage.rs`, the generated plugin under node; fast tier, skipped without node).
+- **Agent:** none; OpenCode-shaped bus events and tool hooks fed to the plugin, payloads captured by a recorder script.
+- **Asserts:** a child's busy/retry/busy sends one `subagent.start` under the root with the child's id; its tool calls carry `subagent_id`; a grandchild is filed under the root; idle plus `session.idle` sends one stop; busy again starts again, and `session.error` stops it; deleting an inactive child sends nothing and deleting an active one stops it; the child's creation, update and prompt are never sent as the root's; every payload decodes, attributed to a subagent exactly when it carries `subagent_id`.
+- **Does not assert:** daemon tracking (010), a real OpenCode process.
+- **Platform coverage:** mac+linux.
+
+##### status/background/012 — Conversation endings and direct pane removal retire background tracking (#1678).
+- **Layer:** unit, in-module (`src/state.rs`, fast tier).
+- **Agent:** none; ownership stub with genuine-shaped Claude frames and a retained command observation.
+- **Asserts:** after the first SessionEnd restores a placeholder, the same agent's second conversation uses that key and publishes a command and subagent; its SessionEnd leaves a restored card with no work. Direct remove_sessions_for_pane and apply_daemon_pane_closed likewise leave a reseeded same-agent card with no stale work.
+- **Does not assert:** registry exit detection (013), attached-client broadcast delivery (014), real agent lifetime.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/background/013 — Spawn retirement works before a valid sample and during unsupported or failed sampling (#1678).
+- **Layer:** unit, in-module (`src/daemon.rs`, paused-clock monitor sampler, fast tier).
+- **Agent:** none; real shell stand-ins with synthetic Claude subagent/Stop reports.
+- **Asserts:** an exact-pid exit without SessionEnd clears the departed card before any valid sample; a None sampler with another live pane does not prevent retirement; a prior valid sample followed by another pane's sampling failure/backoff does not prevent retirement. Unknown samples retain the still-live pane's subagent. Attested SessionStart/SubagentStart reports during paused spawn publication, with or without Stop, survive monitor polls and publication without a premature retirement broadcast; an abandoned reservation retires once released.
+- **Does not assert:** native Windows process execution (the None sampler models its observation shape), PTY-attached rendering (014), real agents.
+- **Platform coverage:** mac+linux.
+
+##### status/background/014 — Natural process exit clears only the departed attached card (#1678).
+- **Layer:** L2 synthetic, PTY-attached (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; Python parent exits naturally on a fixture sentinel, with Claude-shaped subagent/Stop hooks.
+- **Asserts:** a visible background subagent clears after the parent exits without SessionEnd; subscribers receive an explicit-zero aggregate with a higher revision and the departed agent's identity. A successor in the same pane holds its own subagent, including after replaying the departed clear through the client fold.
+- **Does not assert:** retirement without valid command samples (013), real agent behavior, desktop rendering.
+- **Platform coverage:** mac+linux.
+
+##### status/background/015 — Retirement cannot claim a generation on a client unaware of its marker (#1678).
+- **Layer:** unit, in-module (`src/daemon.rs`, real registry and serialized daemon retirement carrier; fast tier).
+- **Agent:** none; real shell stand-in with synthetic Claude subagent/Stop reports.
+- **Asserts:** an exited spawn with no successor reservation produces an explicit-zero ShellIdle carrying the legacy non-claiming Displaced verdict; after newer successor hydration, replaying that serialized carrier without its retirement marker preserves the successor and mints no departed card, for distinct and shared session keys and with additive background fields retained or ignored. An explicitly Displaced control preserves the successor.
+- **Does not assert:** execution of the released v0.46 binary, cross-version delegate/hook flows, real agents, or PTY rendering. The marker-less generation gates were checked against v0.46.0's source.
+- **Platform coverage:** mac+linux.
+
+##### status/background/016 — At Minimal density a Blocked or orphaned card keeps the reason on its one row and the background line after it (#1678).
+- **Layer:** L1 widget, fixed-clock insta snapshot (`render_dashboard.rs`, fast tier).
+- **Agent:** none; snapshot-hydrated Blocked card with background work rendered through the production card seam.
+- **Asserts:** at Minimal the one content row reads `⚠ Usage limit reached · Background: 1 command, 1 subagent · 4m` (snapshot); on a 40-column card the reason is kept whole and the background part is cut with `…`; an orphaned card's line shares its row the same way; at Normal the reason and the background line each keep a row of their own.
+- **Does not assert:** a card both Blocked and orphaned at Minimal (its second reason row is still clipped, as before), Compact density, the desktop (which has no density setting).
 - **Platform coverage:** mac+linux.
 
 ##### status/subagent/006 — A subagent that asked for permission and then ended takes its prompt with it: the card leaves Needs Input, to Idle after the turn ended and to Thinking inside it (issue #1364).
@@ -1079,6 +1319,113 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ### Agent protocol
 
 #### agent/readiness
+
+#### protocol/host-metrics
+
+##### protocol/host-metrics/001 — The daemon serves host numbers by role without exposing paths.
+- **Layer:** L2 synthetic socket (in-process real attach handler, lane 1, no PTY).
+- **Agent:** none.
+- **Asserts:** Hello advertises `host-metrics`; the reply contains exactly `working_root`, `worktree_parent`, and `temp_root`, bounded nonzero disk totals, CPU count, optional finite load, Linux memory readings, and numeric sample timestamp/age; serialized strings contain no absolute path.
+- **Does not assert:** TUI or desktop rendering; remote transport; unsupported-platform capability withholding; exact host utilisation.
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/002 — Socket queries reuse a fresh cached sample and refresh an expired one.
+- **Layer:** L2 synthetic socket (in-process real attach handler, lane 1, paused Tokio clock).
+- **Agent:** none.
+- **Asserts:** after the first reply completes, advancing time 250 ms and requesting on another connection preserves the sample timestamp and every payload field except age; age increases by exactly 250 ms; after the max age, the next query resets age through an on-demand refresh.
+- **Does not assert:** background sampling; wall-clock timing; clients' rendering; sampler cost.
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/003 — The client withholds metrics queries from older daemons.
+- **Layer:** unit (client library against a synthetic socket peer).
+- **Agent:** none.
+- **Asserts:** absent capabilities and unrelated capabilities both produce `NotAvailable`; a completed Hello barrier proves the peer received no metrics request frame.
+- **Does not assert:** the supported query's response decoding; client rendering; cached capabilities outliving a daemon replacement.
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/004 — An unreadable memory field is absent rather than zero.
+- **Layer:** unit (daemon memory-reader fixture).
+- **Agent:** none.
+- **Asserts:** an unreadable source produces absent readings; valid fixture values convert kB to bytes; malformed total memory leaves used memory absent while preserving available memory.
+- **Does not assert:** macOS memory sampling; disk/load failures; UI placeholders.
+- **Platform coverage:** linux.
+
+##### protocol/host-metrics/005 — A stuck sample starts one blocking job and every request still answers.
+- **Layer:** unit (the daemon's `HostMetricsCache` with an injected sampler that never finishes, paused Tokio clock).
+- **Agent:** none.
+- **Asserts:** eight concurrent requests on a cold cache whose sample never finishes start exactly one sample and all answer without one exactly `HOST_METRICS_SAMPLE_WAIT` later; a request waiting when the sample lands gets it at age 0 and starts none; a cache hit inside the max age starts none; after expiry, eight more requests during a second stuck sample start one more, the seven that did not start it answer at once with the last sample at its true age, and the one that did answers after the wait with the age that includes it (PRD #1258 audit A1).
+- **Does not assert:** a real hung filesystem; the production sampler's detached thread (counted by construction: one per sampler start; its effect on shutdown is `protocol/host-metrics/011`); socket transport (covered by `protocol/host-metrics/001`–`002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/006 — A zero fragment size leaves free disk absent rather than zero.
+- **Layer:** unit (`statvfs` figure arithmetic).
+- **Agent:** none.
+- **Asserts:** a zero fragment size yields neither a free nor a total figure; a zero available-block count beside a real total is a real `0`; ordinary figures multiply out; an overflowing product is absent.
+- **Does not assert:** a real `statvfs` call (covered by `protocol/host-metrics/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/007 — The client refuses a reply with more disk roles than its bound.
+- **Layer:** unit (client library against a synthetic socket peer advertising `host-metrics`).
+- **Agent:** none.
+- **Asserts:** a reply of `MAX_DISK_ROLES + 1` roles is `ClientError::Malformed` with a message naming no count; a reply of exactly `MAX_DISK_ROLES` decodes (PRD #1258 audit A2).
+- **Does not assert:** the renderers' own bounds (covered by `dashboard/host-metrics/006`).
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/008 — The client refuses a reply whose role name is longer than its bound.
+- **Layer:** unit (client library against a synthetic socket peer).
+- **Agent:** none.
+- **Asserts:** a role one byte over `MAX_ROLE_BYTES`, made of two-byte characters so the bound is measured in bytes, is `ClientError::Malformed` with a message that does not echo it; a role exactly at the bound decodes unchanged (PRD #1258 audit A2).
+- **Does not assert:** the renderers' clamp (covered by `dashboard/host-metrics/007`).
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/009 — Role text within the bounds reaches the renderer unchanged.
+- **Layer:** unit (client library against a synthetic socket peer).
+- **Agent:** none.
+- **Asserts:** a role carrying ESC, a CSI sequence, a newline and a `U+202E` override decodes unchanged: the client bounds size and leaves scrubbing to each renderer.
+- **Does not assert:** the TUI's scrub (covered by `dashboard/host-metrics/005`).
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/010 — A refresh that panics or is dropped releases its waiters and the next refresh starts.
+- **Layer:** unit (the daemon's `HostMetricsCache` with a scripted sampler on current-thread Tokio runtimes, event-sequenced).
+- **Agent:** none.
+- **Asserts:** a sample that panics on the refresh task, a refresh task dropped when its runtime shuts down, and a sampler that panics inside the request that started it each clear the in-flight marker; every request waiting on the refresh returns without a sample, released by the refresh ending rather than by the bounded wait (set to an hour here); a request that joined the refresh started none; the next request starts exactly one refresh and answers with its sample (PRD #1258 audit A1 follow-up).
+- **Does not assert:** the production sampler's detached thread (whose panic surfaces as a failed sample, not a panic); socket transport (covered by `protocol/host-metrics/001`–`002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/011 — Dropping the daemon's runtime does not wait on a stuck sample.
+- **Layer:** unit (the daemon's `HostMetricsCache` with the production `detached_sampler` around a sample that blocks until released, on a multi-thread Tokio runtime like `#[tokio::main]`'s, event-sequenced).
+- **Agent:** none.
+- **Asserts:** a request gives up on the stuck sample after its bounded wait; with the sample confirmed stuck in its call and not yet released, dropping the runtime returns, so a sample that never finishes cannot hold up the daemon's exit (PR #1672 review; a sample on Tokio's blocking pool fails this, since a runtime drop joins its blocking jobs).
+- **Does not assert:** a real hung filesystem; the daemon's full stop path; how long the drop takes (the 30 s receive only bounds a broken build).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/012 — Health levels move at their thresholds, and an absent number has no level.
+- **Layer:** unit (`apply_health_levels` and the default `HealthThresholds` in `src/host_metrics.rs`).
+- **Agent:** none.
+- **Asserts:** disk free at 15 % and 5 % of its total, memory available at 20 % and 10 % of used + available, and load per core at 0.8 and 1.5 stay on the healthier side, and one step past each moves to `warn` or `critical` (PRD #1258); a disk missing either figure or with a zero total, a non-finite load and memory without a used figure get no level, clearing any level the sample carried.
+- **Does not assert:** where the thresholds come from (covered by `protocol/host-metrics/013`); the levels on the wire (covered by `protocol/host-metrics/014`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/013 — The `[host_metrics]` thresholds parse per value, and an invalid one falls back to its default.
+- **Layer:** unit (`HealthThresholds::from_table`).
+- **Agent:** none.
+- **Asserts:** an empty table gives the defaults 15/5, 20/10 and 0.8/1.5; integers and floats are used; text, a negative, a percentage over 100 and `nan` each fall back to their own default while the valid keys beside them are kept, and each, like an unknown key, yields a warning naming it; a pair whose critical threshold is less severe than its warning resets both with a warning; equal thresholds are accepted.
+- **Does not assert:** `config set` / `config get` and a non-table `host_metrics` (the `config.rs` unit test `host_metrics_thresholds_round_trip_and_are_validated_by_config_set`); the daemon's log output.
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/host-metrics/014 — The reply serves each reading's level beside its number, by the deck's thresholds.
+- **Layer:** L2 (synthetic socket, in-process `serve_attach`; a fixed host sample through `DOT_AGENT_DECK_E2E_HOST_SAMPLE` and a deck config through `DOT_AGENT_DECK_CONFIG`).
+- **Agent:** none.
+- **Asserts:** with `load_per_core_warn = 0.5` and an invalid `load_per_core_critical`, a host-metrics reply carries `level` `critical`, `warn` and `ok` on disks 4 %, 10 % and 50 % free, no `level` key on a disk with no free figure, `load_level` `warn` for 0.6 per core (the configured warn, and the default critical the invalid value fell back to), and no `memory_level` key when memory used is absent; the numbers are served too.
+- **Does not assert:** the clients' colours (covered by `dashboard/host-metrics/010` and the desktop's `host-metrics.spec.ts`); a real host's levels.
+- **Platform coverage:** mac+linux.
+
+##### protocol/host-metrics/015 — A misconfigured deck's threshold warnings reach the daemon's log once per distinct set, not once per sample.
+- **Layer:** unit (`thresholds_and_warnings` and `newly_raised` in `src/host_metrics.rs`, which `configured_thresholds` composes around `DashboardConfig::load_bounded_reporting`).
+- **Agent:** none.
+- **Asserts:** the loader's own warning (a `host_metrics` that is not a table) is carried beside the thresholds' warnings; a set read several times in a row is reported once; a changed set is reported again, and so is a set that returns after a read with no warnings (PR #1672 review).
+- **Does not assert:** the loader's warnings themselves (the `config.rs` unit test `a_reporting_bounded_load_returns_its_warnings_instead_of_logging_them`); the `tracing` output.
+- **Platform coverage:** mac+linux+windows.
 
 #### protocol/live-target
 
@@ -1436,7 +1783,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 
 The per-agent prompt keys the deck serves for voice control of the open agent's prompt (PRD #1541): interrupt the turn, clear the prompt, delete characters. Each test reads the keys from the daemon's own `ListAgents` answer (`AgentRecord::prompt_keys`) and writes them as raw `KIND_STREAM_IN` frames on an attach stream to the agent — the desktop's terminal-write path — rather than as keystrokes through the TUI. File: `tests/e2e_prompt_keys_live.rs` (lane 2).
 
-Agent coverage (rule 20): Claude Code (001–003), Codex (004) and OpenCode (005). **Pi is not covered**: the harness's Pi path authenticates only through `ANTHROPIC_API_KEY` (there is no importer for Pi's own login into the per-test HOME), and that key was not set on the box that wrote these. **Devin carries no prompt keys** (PRD #1541 M1 decision 9), so there is nothing to exercise. Codex and OpenCode run on `common::codex_test_model()` / `common::opencode_test_model()`; with a ChatGPT-subscription login set `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-luna` and `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.6-luna` (the defaults are refused by that login, and the preflights say so).
+Agent coverage (rule 20): Claude Code (001–003), Codex (004) and OpenCode (005). **Pi is not covered**: the harness's Pi path authenticates only through `ANTHROPIC_API_KEY` (there is no importer for Pi's own login into the per-test HOME), and that key was not set on the box that wrote these. **Devin carries no prompt keys** (PRD #1541 M1 decision 9), so there is nothing to exercise. Codex and OpenCode run on `common::codex_test_model()` / `common::opencode_test_model()`; Codex picks its default from the login's auth mode (issue #656); with a ChatGPT-subscription login and no Anthropic key set `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.6-luna` (the OpenCode default is refused by that login, and the preflight says so).
 
 Measured while writing these, against Claude Code 2.1.289 through this path, and worth knowing for whoever sends the clear key: **separate writes are not separate reads.** Two writes of 32 `Ctrl+U` sent back to back left Claude's prompt untouched, exactly as one write of 64 does (Claude ignores a read holding 64 or more); two 250 ms apart did too on a box at load 174; two 1 s apart cleared it; a single write of 32 always did. `DEL` × 100 in one write was exact, and on 2026-10-04 so were single writes of 400 and 800 `DEL`s against Claude Code 2.1.289, Codex 0.160.0 and OpenCode 1.18.34. The paste-collapse threshold applies to what the agent reads, not to one write: an 8-character write followed at once by an 800-character one was read by Claude as one 808-character paste and collapsed, so 003 writes its long dictation only once the prompt before it is on screen. An `Enter` written in the same burst as the text before it is taken as part of a paste and inserts a newline, so the tests let typed text settle before `Enter`.
 
@@ -1945,6 +2292,15 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the exact sanitization output beyond "no raw control bytes survive into the rendered grid" (the pure-data `validate_tab_membership_*` tests pin the per-field policy).
 - **Platform coverage:** mac+linux.
 
+#### embed/clipboard
+
+##### embed/clipboard/001 — An agent's own clipboard copy in a pane reaches the user's terminal through the TUI (issue #1705).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness), in `tests/e2e_agent_clipboard.rs`. Asserts on the deck's raw OUTPUT byte stream (`stream_text`), because the harness PTY is the deck's controlling terminal and the copy is an escape sequence written to it, not a rendered cell.
+- **Agent:** none — the `--continue` pane runs `bash`, standing in for an agent: an OSC 52 set-clipboard request is the same bytes whichever program writes them, and the shell computes the copied text so neither it nor its base64 is ever typed.
+- **Asserts:** after the shell writes `ESC]52;c;<base64>BEL` for a computed line, the deck writes exactly one `ESC]52;c;<base64>ESC\` carrying that line to its terminal; the read request (`ESC]52;c;?BEL`) the same command writes is not passed on, so the stream holds exactly one OSC 52.
+- **Does not assert:** that a real terminal puts the text on its clipboard (that is the user's terminal's setting); that a copy inside the scrollback the daemon replays on an attach is not copied again (the pane reader skips each attach's first frame, which is that replay; no test drives a reattach); the desktop app's half, which is `TerminalViewport.clipboard.test.tsx` and the driver tier's `terminal_004`.
+- **Platform coverage:** mac+linux.
+
 #### embed/key-forwarding
 
 ##### embed/key-forwarding/001 — Shift+Enter typed into a focused embedded agent pane inserts a NEWLINE into the agent's draft instead of SUBMITTING it (PRD #227).
@@ -2027,6 +2383,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none (Claude Code-shaped payloads piped through the real `dot-agent-deck hook --agent claude-code` CLI at the per-test hook socket).
 - **Asserts:** the card's badge reads Working on the main turn's `Bash` (proving the needle can appear), then Idle after `Stop`; after a subagent `PreToolUse` carrying `agent_id` with no `PostToolUse`, and `SubagentStop`, the background call is visible in the card's tool history and the badge still reads Idle — held for 2 seconds with no `Working` anywhere on screen. Then a second subagent's `PermissionRequest` turns the badge to Needs Input (proving that needle can appear), and its `StopFailure` — delivered as `SubagentStop` — returns it to Idle, held for 2 seconds with no `Needs Input`, `Working`, `Blocked` or `Error` on screen (issue #1364).
 - **Does not assert:** a real Claude Code producing the sequence; the Codex half (`status/subagent/001`); anything but the one card.
+- **Platform coverage:** mac+linux.
+
+##### hooks/delivery/009 — Same-release stamped hooks update the card without a stale-binary notice.
+- **Layer:** L2 PTY-attached, lane 1.
+- **Agent:** none; synthetic Claude hook lines.
+- **Asserts:** session, Working and Idle states render after stamped hooks; Hello carries no notice for either the daemon's build or an equal release triple with a different build id and a different sender path.
+- **Does not assert:** a real agent producing the stamps, or an older release's notice.
 - **Platform coverage:** mac+linux.
 
 #### hooks/ingest
@@ -2204,6 +2567,85 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Asserts:** `hooks install --agent claude-code` exits non-zero with an error naming the path and the backslash, `settings.json` (seeded with an earlier deck entry and a user hook) is byte for byte as it was, and no `PWNED` file appears. fish, which Codex may run a hook in, reads a backslash inside single quotes as an escape, and the deck's hook command quoting does not keep a backslash safe under fish, so the installers refuse such a path.
 - **Does not assert:** the Codex and Devin installers and the startup install, which make the same check (`agent_hook_config`'s `every_installer_refuses_a_backslash_path_and_leaves_the_config_alone`), or fish running a written command (`the_override_command_runs_the_override_else_the_installed_binary`, where fish is installed).
 - **Platform coverage:** mac+linux.
+
+##### hooks/install/015 — Automatic startup takes over an older pin only from a newer installed durable copy.
+- **Layer:** fast real-binary subprocess integration, isolated HOME under `CARGO_TARGET_TMPDIR`.
+- **Agent:** none; version-reporting shell stubs stand in for the old and newer installed pins.
+- **Asserts:** a real copy in HOME's `.local/bin` replaces the `0.0.1` pin in place, leaves one deck handler per installed event and preserves the user's handler slot and matcher; a `999.0.0` pin is kept.
+- **Does not assert:** ties, failed version probes or other agents' writers (unit-covered).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/016 — A newer temporary copy on PATH cannot take over a durable old pin.
+- **Layer:** fast real-binary subprocess integration, isolated HOME.
+- **Agent:** none; old pin reports `0.0.1`.
+- **Asserts:** automatic startup from a scratch copy on PATH keeps the old binary, one handler per installed event and the user's shared rule.
+- **Does not assert:** other ephemeral classifiers or explicit installation.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/017 — Automatic startup refuses to pin a translocated sidecar and names /Applications.
+- **Layer:** fast real-binary subprocess integration.
+- **Agent:** none.
+- **Asserts:** a real copy under an `AppTranslocation` bundle-shaped path with no fallback writes no Claude settings and logs the move-to-Applications remedy.
+- **Does not assert:** macOS's actual translocation machinery, or the absolute `/Volumes/<name>` prefix, covered by `platform::paths::tests::step_3_refuses_a_mounted_or_translocated_copy`.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/018 — Claude Code's `PermissionRequest` hook is installed only for a Claude Code that is new enough (PRD #1631).
+- **Layer:** L1/fast unit (`src/hooks_manage.rs`, `install_impl_gated` against an in-memory settings object).
+- **Agent:** none (`claude --version` is not run; the version is given).
+- **Asserts:** Claude Code 2.1.136 or newer gets one deck `PermissionRequest` rule with no matcher and the deck's long `timeout`; 2.1.135 and an unknown version get no key at all, because an older Claude Code given an unknown hook key drops every hook in the file (issue #714); a second install leaves the file as it was; a downgrade removes a stale rule and its key; uninstall sweeps it with its emptied key; the held hook's own deadline is inside that timeout.
+- **Does not assert:** the `claude --version` probe itself (covered by the issue #714 probe tests in the same file); that a real Claude Code honours the timeout (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+#### hooks/stale
+
+##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and both versions at 60 columns.
+- **Layer:** L1 render buffer and insta snapshots.
+- **Agent:** none.
+- **Asserts:** the wide row names Claude Code and Codex, both versions, the binary and remedy; at 120 columns the path retains both ends with a middle ellipsis; at 60 columns the agents and both versions survive and no cut-down command is shown; an empty list draws nothing.
+- **Does not assert:** the dashboard's placement or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/002 — An older pin's startup notice becomes an unreported-version notice live in the dashboard.
+- **Layer:** L2 PTY-attached, lane 1.
+- **Agent:** none; old executable stub and synthetic Claude hook.
+- **Asserts:** with host PATH and login-shell lookup isolated and a sandbox installed link, the dashboard names the old pin and `0.0.1` above the experimental footer, Hello contains the startup notice, resized to 80 columns the row still names the agent, `0.0.1` and this deck's version with no cut-off remedy, and back at full width a stamp-less event creates its card and changes the visible notice to `predates version reporting` without reconnecting.
+- **Does not assert:** a real Claude emitting hooks, desktop rendering, takeover from an eligible binary, or a `brew upgrade` command (the sandbox's installed link makes the remedy this deck's own `hooks install`; `hooks/stale/006` covers the Homebrew row in L1); the built target binary and separate HOME keep takeover ineligible.
+- **Platform coverage:** mac+linux.
+
+##### hooks/stale/003 — Hello exposes stale notices and repeated unreported hooks produce one warning per reason.
+- **Layer:** L2 headless daemon, lane 1.
+- **Agent:** none; old executable stub and synthetic Claude hooks.
+- **Asserts:** with host PATH and login-shell lookup isolated and a sandbox installed link, Hello carries Older then Unreported for the stub pin, and after repeated events and an Idle processing barrier the log has exactly one warning for each reason and binary.
+- **Does not assert:** TUI rendering or real-agent work.
+- **Platform coverage:** mac+linux.
+
+##### hooks/stale/004 — A real interactive Haiku Claude works while the attached dashboard shows the old-hook notice. [reel]
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** real Claude Code, interactive Haiku `claude-haiku-4-5-20251001`, with imported credentials, seeded project trust and Bash allowed.
+- **Asserts:** a pinned version-reporting wrapper forwards genuine hooks with only the two version stamp keys removed; the real card renders Working then Idle alongside the unreported-version notice, and the visible agent terminal contains a unique on-disk sentinel from its list-files task. Zoom hides the dashboard notice and returning restores it.
+- **Does not assert:** an actual old release binary, the desktop strip, or model-specific prose; the wrapper changes stamp metadata but preserves event content and provenance.
+- **Platform coverage:** mac+linux; local credentials required, never CI.
+
+##### hooks/stale/005 — A command remedy is shown only beside the agents and both versions.
+- **Layer:** L1 render buffer and insta snapshot.
+- **Agent:** none.
+- **Asserts:** at 160 columns, where a two-agent `hooks install` command fits on its own but not beside the sentence naming the agents and both versions, the row shows the agents and both versions with the whole upgrade-or-reinstall advice, no part of the command and no clipped `⚠ Cl…` lead; at 300 columns it shows the command whole beside the full sentence.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/006 — A short command stays whole on a narrow row, with the facts shortened instead.
+- **Layer:** L1 render buffer and insta snapshots.
+- **Agent:** none.
+- **Asserts:** at 80 and 100 columns, the two-agent Homebrew notice shows `Run: brew upgrade dot-agent-deck` whole, the first agent and both versions, fits the row, and shows no cut-off upgrade-or-reinstall advice.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
+
+##### hooks/stale/007 — The count of further notices survives a narrow row.
+- **Layer:** L1 render buffer and insta snapshot.
+- **Agent:** none.
+- **Asserts:** with two notices, the row ends with `(+1 more)` at 40, 80 and 180 columns, and at 80 it still names the first agent and both versions.
+- **Does not assert:** the dashboard's placement, the desktop strip, or daemon transport.
+- **Platform coverage:** portable.
 
 ### Pane / agent lifecycle
 
@@ -2935,6 +3377,13 @@ without depending on the config struct API.
 - **Does not assert:** filesystem loading of `keybindings.toml` (covered by `keybindings/remap/001`); arbitrary per-mode config syntax (out of scope).
 - **Platform coverage:** mac+linux+windows.
 
+##### keybindings/remap/004 — A dashboard `host_metrics` remap opens the overlay on the configured key.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** a TOML `host_metrics = "F2"` remap produces no warnings; TestBackend frames stay on the dashboard after the old `m`, show the overlay after F2, and return to the dashboard after Escape; help names F2 on its host row.
+- **Does not assert:** loading the keybindings file from disk (covered by `keybindings/remap/001` and `/002`).
+- **Platform coverage:** mac+linux+windows.
+
 #### keybindings/safety
 
 ##### keybindings/safety/001 — `Ctrl+C` always opens the quit modal, even when another action is bound to `Ctrl+C`.
@@ -2964,6 +3413,57 @@ without depending on the config struct API.
 - **Asserts:** Dashboard, NewPane, and ToggleLayout still resolve from PaneInput; only ClosePane falls through to PTY input.
 - **Does not assert:** each action's downstream UI mutation (covered by its feature-specific tests).
 - **Platform coverage:** mac+linux+windows.
+
+#### keybindings/letters
+
+##### keybindings/letters/001 — Each default `Ctrl+<letter>` global action has its plain letter, and a remap or a conflict takes it away.
+- **Layer:** L1 (`KeybindingConfig::plain_alias` from parsed TOML).
+- **Agent:** none.
+- **Asserts:** under the defaults `dashboard`, `new_pane`, `close_pane`, `toggle_layout`, `toggle_orchestration_lock` and `toggle_zoom` answer to `d`, `n`, `w`, `t`, `e` and `z`; the split toggle gets no `l` (which stays `move_right`), no action answers to a plain `c`, and an action already on a letter gets none; remapping an action (even to another `Ctrl` chord) removes its letter while restating the default does not; binding the letter to another action removes it, and a shifted letter does not.
+- **Does not assert:** dispatch (covered by `keybindings/letters/002` and `/003`); the help overlay's rendering (covered by `dashboard/help/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/letters/002 — A plain letter performs its command in command mode and is typed into the pane in pane mode.
+- **Layer:** L1 (in-process production key mapper, `key_action_for_mode`).
+- **Agent:** none.
+- **Asserts:** in `UiMode::Normal`, plain `d`, `t`, `w`, `z` and `e` resolve to `DetachToNormal`, `ToggleLayout`, `CloseSelected`, `ToggleZoom` and `ToggleOrchestrationLock`; in `UiMode::PaneInput` each is forwarded to the pane as its own byte; `Shift` and `Alt` forms resolve nothing; after `toggle_layout` is remapped, `t` resolves nothing; in every `UiMode` other than `Normal` (a compile-time-exhaustive list), plain `d`, `t`, `w`, `z`, `e` and `n` resolve no global command — nothing, or in `PaneInput` the letter's own byte.
+- **Does not assert:** the tab and experimental-flag scoping applied at the live call site (the same scoping as the chords, covered by `orchestration/lock/001` and `orchestration/layout/005`, `/007`); `n` (covered by `keybindings/letters/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/letters/003 — `n` denies a pending permission, and starts a new agent otherwise.
+- **Layer:** unit (`handle_normal_key` in `src/ui.rs`).
+- **Agent:** none.
+- **Asserts:** with the selected card in `WaitingForInput`, `n` sends a deny; with it working, idle or unknown, or with no card, `n` returns `NewPane`; with `deny_permission` moved to another key, `n` is a new agent even on a waiting card; with `new_pane` remapped, `n` does nothing on an idle card.
+- **Does not assert:** the new-agent flow that follows (covered by its own tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/letters/004 — Through the live loop, a plain `t` toggles the layout in command mode and reaches the pane's program in a pane.
+- **Layer:** L2 (PTY + vt100, the real binary and daemon; a restored pane running `cat` as the stand-in program).
+- **Agent:** none.
+- **Asserts:** with the pane focused, `tz` and Enter are echoed back by `cat` (the line shows twice) and no `Layout:` status appears; after `Ctrl+D`, a plain `t` produces the `Layout:` status the `Ctrl+t` toggle does (PR #1672 review).
+- **Does not assert:** the other letters through the live loop (their resolution is `keybindings/letters/002`); `n` on a waiting card (`keybindings/letters/003`); what the toggled layout looks like (`render/layout/001`).
+- **Platform coverage:** mac+linux.
+
+##### keybindings/letters/005 — Each default plain-letter command has its `Ctrl` form in command mode, and a remap or a conflict takes it away; in a pane the chord reaches the program.
+- **Layer:** L1 (`KeybindingConfig::ctrl_alias` from parsed TOML, and the in-process key mapper `key_action_for_mode`).
+- **Agent:** none.
+- **Asserts:** under the defaults `host_metrics`, `open_scheduled_tasks`, `generate_config`, `open_upgrade` and `rename` answer to `Ctrl+m`, `Ctrl+s`, `Ctrl+g`, `Ctrl+u` and `Ctrl+r` and have no plain alias; in `UiMode::PaneInput` each chord is forwarded as its own control byte, and in `UiMode::Normal` none is a global command; navigation, filter, help, focus, clear-filter, approve/deny and the `Ctrl+` actions get no `Ctrl` form; remapping `rename` or `host_metrics` removes its chord while restating `open_upgrade`'s default does not; `scroll_pane_up = "Ctrl+u"` and `toggle_layout = "Ctrl+s"` take those chords; `Enter` is not `Ctrl+m`'s alias (PR #1672).
+- **Does not assert:** the command-mode dispatch (covered by `keybindings/letters/006`); a real terminal's encoding of `Ctrl+M` (legacy terminals send it as `Enter`).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/letters/006 — A `Ctrl` form performs its letter's command in command mode, and `Enter` still focuses.
+- **Layer:** unit (`handle_normal_key` and `handle_host_metrics_key` in `src/ui.rs`).
+- **Agent:** none.
+- **Asserts:** with a card selected, `Ctrl+r`, `Ctrl+g`, `Ctrl+s`, `Ctrl+m` and `Ctrl+u` return `EnterRename`, `RequestConfigGen`, `OpenScheduledTasks`, `OpenHostMetrics` and `OpenUpgrade`; `Enter` returns `Focus`; with `rename` remapped `Ctrl+r` does nothing, and with `scroll_pane_up` on `Ctrl+u` it is not the upgrade dialog; `Ctrl+m` closes the open host overlay (PR #1672).
+- **Does not assert:** the dialogs those actions open (covered by their own tests); the live loop (covered by `keybindings/letters/007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/letters/007 — Through the live loop, `Ctrl+R` in a pane reaches the program, and `Ctrl+S` in command mode opens Schedules.
+- **Layer:** L2 (PTY + vt100, the real binary and daemon; a restored pane running `cat` as the stand-in program, and a seeded schedule).
+- **Agent:** none.
+- **Asserts:** with the pane focused, `ab` then `Ctrl+R` makes the pane's terminal reprint the line (`ab^R`), no rename opens and `cat` echoes the line after Enter, and the Schedules manager does not open; after `Ctrl+D`, `Ctrl+S` opens it, listing the seeded task (PR #1672).
+- **Does not assert:** the other chords through the live loop (their resolution is `keybindings/letters/006`); `Ctrl+M` in a terminal that disambiguates it (the harness sends legacy bytes).
+- **Platform coverage:** mac+linux.
 
 #### keybindings/unbind
 
@@ -4083,6 +4583,77 @@ without depending on the config struct API.
 - **Does not assert:** the newly-dirtied direction (the dialog stays silent and the daemon still keeps the tree — same mechanism, opposite sign); the warning's wording (`prompt/close-confirm/007`).
 - **Platform coverage:** mac+linux.
 
+#### dispatch/close-verb
+
+##### dispatch/close-verb/001 — A completed single unit closes from its dispatcher's environment; its worktree is removed and its branch kept.
+- **Layer:** L2 synthetic, lane 1, real CLI/daemon with an attached `TuiDeck` (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording probes that emit a synthetic `SessionStart` and exec `cat`, using their own minted pane capabilities under the default provenance policy.
+- **Asserts:** attested `work-done --done` returns to the caller; `close <name>` exits 0 and says `closed`; the unit disappears from `ListAgents`, its clean worktree is removed before the reply, its branch remains and the dispatcher remains registered.
+- **Platform coverage:** mac+linux (Unix PTY/socket harness).
+
+##### dispatch/close-verb/002 — Closing a completed orchestration names every role, orchestrator first.
+- **Layer:** L2 synthetic, lane 1, real CLI/daemon and attached TUI (`tests/e2e_close_verb.rs`).
+- **Agent:** none — two identity-recording `cat` roles.
+- **Asserts:** a two-role dispatch reports terminal completion; close exits 0, names each pane with the orchestrator first, removes every role from `ListAgents` and retains its dispatcher. The reply order is the observable stop-order contract; internal stop sequencing belongs to the daemon tests.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/003 — An unreported unit refuses name and pane selectors, then closes with an explicit force disclosure.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** both selector spellings exit 1 with JSON `refused` / `not-reported` and keep the target registered; force exits 0, says `closed` and `forced`, and removes the target.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/004 — A sibling dispatcher cannot close another dispatcher's unit, including with force.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — distinct live caller panes with their own minted agent identities and tokens.
+- **Asserts:** the sibling's requests exit 1 with JSON `refused` / `not-your-unit`; the unit and both dispatchers remain registered.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/005 — A person shell closes a completed unit and its tab disappears from an already attached TUI.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_close_verb.rs`); records a cast but is not reel eligible.
+- **Agent:** none — identity-recording `cat` roles; close runs with all three caller identity variables absent.
+- **Asserts:** the dispatched orchestration tab is visible before close; the person command exits 0 and the tab disappears from the same attached TUI; the roles disappear and the dispatcher remains registered.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/006 — Closing a dirty dispatched unit preserves its uncommitted work and explains why.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** close exits 0 and says `closed`, `kept` and `uncommitted`; the agent disappears from `ListAgents` and the sentinel file remains intact in the kept worktree.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/007 — A dispatched team remains closeable by name after its orchestrator closes first.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` roles.
+- **Asserts:** existing `StopAgent` removes the completed team's orchestrator while its worker stays registered; close by dispatch name exits 0 and removes that worker while retaining the dispatcher.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/008 — An interactive Haiku dispatcher closes the completed single unit it dispatched, through the real close CLI. [reel]
+- **Layer:** L2 PTY-attached real-agent, lane 2, local only (`tests/e2e_dispatcher_mode.rs`).
+- **Agent:** real interactive Claude Code on Haiku for dispatcher and unit, with imported credentials, pre-seeded project trust and allowed Bash/Read/Write tools; no print mode.
+- **Asserts:** the dispatcher invokes `dispatch --single`; the isolated unit discovers a committed sentinel whose full filename was absent from its prompt; its completion appears in the dispatcher's rendered pane; a subsequent directive causes that dispatcher to invoke `close <name>` itself; the unit's card and worktree disappear while the original dispatcher remains registered. Shares the genuine return-path setup with `dispatch/return/006`.
+- **Platform coverage:** mac+linux; credentialed tests run on the developer's machine and nowhere in CI.
+
+##### dispatch/close-verb/009 — Bulk confirmation closes the two completed units that a preview leaves running.
+- **Layer:** L2 synthetic, lane 1, real CLI/daemon with an attached `TuiDeck` (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** `close --all --json` lists both reported single units, exits 0 and stops nothing; `close --all --yes --json` exits 0 and reports those same ids closed, removes both agents and clean worktrees, and retains the dispatcher.
+- **Does not assert:** an interactive confirmation prompt or a concurrent change between preview and apply.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/010 — Closing a completed single unit by pane removes its clean worktree and reports the verdict.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** `close --pane <pane> --json` exits 0, removes the completed single unit and its clean worktree before replying, reports `removed` for that path, keeps the dispatch branch and retains the dispatcher.
+- **Does not assert:** worktree retention while orchestration siblings still use it, or dirty-worktree cleanup (006).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/011 — A stable unit id from the bulk listing closes exactly the selected unit.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** a two-unit JSON listing supplies a stable `unit_id`; `close --unit-id <id> --json` exits 0 and reports only that id closed, removes its agent and worktree, and leaves the other unit, its worktree and the dispatcher alive.
+- **Does not assert:** selector conflicts, ambiguous names or stale ids, which belong to CLI/daemon regression tests.
+- **Platform coverage:** mac+linux.
+
 #### dispatch/single
 
 ##### dispatch/single/001 — A `--single` unit runs the command its dispatcher was started with, as its dispatcher's agent, instead of the deck's `default_command` (issue #1602).
@@ -5090,6 +5661,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** Codex's own writes to `config.toml` (`/hooks` in its UI), which take no part in the deck's lock; the Claude and Devin writers, which share the lock helper (`agent_hook_config::lock_config`) and its unit tests (`the_config_lock_*`, `stale_temp_pid_recognises_only_the_deck_temp_shape`) but have no multi-process test of their own.
 - **Platform coverage:** mac+linux+windows.
 
+##### codex/trust/009 — The wrapper's trust write waits for a `codex app-server` that is slow to answer (PRD #1631).
+- **Layer:** L1/fast real-binary subprocess integration: the real `wrap` inside a deck-managed pane (pane id set, so the trust step runs), a pinned Codex home, a seeded durable deck, and a deterministic `codex app-server` stand-in.
+- **Agent:** the `codex/trust/002` stand-in with a 6 s sleep after it reads `initialize`, which puts its `hooks/list` reply past the 5 s bound the daemon's startup install and `hooks install` use.
+- **Asserts:** the wrapper exits 0, the stand-in Codex is launched, and `[hooks.state]` in the pinned home's `config.toml` holds exactly the deck's listed key. RED before the fix: no `config.toml` was written, which against real Codex 0.160.0 is the "1 hook needs review before it can run" dialog `question/live/004` stopped on twice on a starved box.
+- **Does not assert:** the upper bound itself (`SPAWN_HOOKS_LIST_TIMEOUT`, 30 s), which a test would have to wait out; that the startup and CLI paths keep the 5 s bound; real Codex timing, which `question/live/004` exercises.
+- **Platform coverage:** mac+linux (the file is `#![cfg(unix)]`).
+
 #### codex/spawn
 
 ##### codex/spawn/001 — Plain restored Codex panes launch through the Wrapper strategy (PRD #20, blocker 3).
@@ -5150,8 +5728,8 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### codex/spawn/012 — A real script-launched Codex role badges at spawn before its first prompt.
 - **Layer:** L2 PTY-attached real-agent orchestration flow; runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
-- **Agent:** real interactive Codex on the cheap test model, launched by a bespoke `run-codex.sh` role command whose config declares `agent = "codex"`.
-- **Asserts:** the bespoke script starts the genuine Codex CLI and, before any prompt-bearing event or user input, the role card visibly reads `Codex` and `Idle`.
+- **Agent:** real interactive Codex on the cheap test model, launched by a bespoke `run-codex.sh` role command, opening on the environment assignment `CODEX_LAUNCH_PROBE=1685`, whose config declares `agent = "codex"`.
+- **Asserts:** the bespoke script starts with the assignment in its environment (issue #1685: before the fix the wrapper was handed the assignment as its program and nothing started), it starts the genuine Codex CLI and, before any prompt-bearing event or user input, the role card visibly reads `Codex` and `Idle`.
 - **Does not assert:** prompt delivery, model prose, tool execution, `clear = true` respawn, or post-prompt native hook behavior.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
@@ -5161,6 +5739,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** synthetic Codex recorder.
 - **Asserts:** submitting the Ctrl+N form with no mode and Command bare `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex` — the wrapper once, never bare Codex and never a second wrapper. Issue #533 moved this path's rewrite from the TUI to the daemon's spawn boundary, which this pins from the outside.
 - **Does not assert:** which deck binary the daemon names as the wrapper (the recorder is injected through `DOT_AGENT_DECK_WRAP_BIN`; renamed-build resolution is unit-tested in `src/wrap.rs`); a real Codex process (`codex/live/001`).
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/014 — A Codex command that begins with an environment assignment or a shell compound starts under the wrapper (issue #1685).
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` with `DOT_AGENT_DECK_WRAP_BIN` pointed at a shim that records the wrapper's argv word by word and then execs the REAL built wrapper).
+- **Agent:** a `codex-standin` script explicitly declared as Codex (`AgentType::Codex`), which records that it started and the assignment it sees, under an isolated `HOME`/`CODEX_HOME` and no pane id, so the wrapper installs no Codex hooks.
+- **Asserts:** `CODEX_WRAPPER_PROBE=1 <standin>` and `(umask 077; : > <marker>); exec <standin>` each reach the wrapper as `wrap --agent codex -- /bin/sh -c <command>`, with the command as one argument, and their agent starts (the assignment visible to it, the compound's subshell having run); the plain `<standin> --flag` control keeps the direct `-- <standin> --flag` shape and starts. Measured RED before the fix: the assignment was handed to the wrapper as its program and the agent never started, and the compound was a syntax error in the shell before the wrapper ran.
+- **Does not assert:** a real Codex process, or the hook install and trust for a shell-routed command inside a pane (the `pane_id` path `codex/hooks/002` covers for a non-`codex` launcher); the user's `$SHELL` (pinned to `/bin/sh` here; the classification and the argv shape for another shell are unit-tested in `src/wrap.rs`); detection of an undeclared compound as Codex.
 - **Platform coverage:** mac+linux.
 
 #### codex/hooks
@@ -5250,11 +5835,18 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the startup and wrapper paths' warn line (they share `trust_deck_hooks_in` with this one); that Codex itself honours `enabled = false` (measured on codex-cli 0.149.0 in issue #1027's thread, not here).
 - **Platform coverage:** mac+linux.
 
+##### codex/hooks/013 — The deck installs Codex's `Interrupt` hook, which clears a question denied by keyboard (PRD #1631).
+- **Layer:** L1/fast unit (`src/codex_hooks_manage.rs`, `install_to` against a temporary Codex home).
+- **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
+- **Asserts:** `Interrupt` is in the installed event set and `hooks.json` carries a deck command rule for it after an install. That the event reads as Idle is `question/detect/006`.
+- **Does not assert:** that Codex asks the user to re-trust the deck's hooks once the set changes, which is inferred from its trust model and not run here; scoped trust of the new rule (`codex_hooks_safety`).
+- **Platform coverage:** mac+linux.
+
 #### codex/live
 
 ##### codex/live/001 — A real interactive cheap-model Codex run launched through the normal new-pane flow works visibly and reports live status (PRD #20, rule 4 / finding 16). [reel]
 - **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
-- **Agent:** real interactive bare `codex` using `gpt-5.1-codex-mini`, isolated copied credentials, workspace-write sandbox, and low reasoning effort; automatic wrapping occurs at the normal pane spawn seam.
+- **Agent:** real interactive bare `codex` using `common::codex_test_model()`, isolated copied credentials, workspace-write sandbox, and low reasoning effort; automatic wrapping occurs at the normal pane spawn seam.
 - **Asserts:** the interactive pane becomes ready, accepts a typed prompt, uses the shell to list the fixture and writes a proof file naming `codex_sentinel_a7c91f.txt`; after detach, the visible Codex card has traversed Thinking → Idle.
 - **Does not assert:** exact model phrasing or token usage.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
@@ -5287,7 +5879,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### codex/worker/001 — A real wrapped Codex orchestration worker receives a delegated task, does the work, and signals work-done (PRD #20 parity gap #12).
 - **Layer:** L2 headless in-process daemon plus a real interactive Codex PTY; runtime-skipped unless `check_codex_available` verifies the CLI, persisted auth, and model access.
-- **Agent:** real `gpt-5.1-codex-mini` Codex configured as the `coder` role with workspace-write sandboxing, approval disabled, low reasoning effort, isolated copied credentials, and project trust; the common spawn seam automatically launches it through `dot-agent-deck wrap`.
+- **Agent:** real Codex on `common::codex_test_model()` configured as the `coder` role with workspace-write sandboxing, approval disabled, low reasoning effort, isolated copied credentials, and project trust; the common spawn seam automatically launches it through `dot-agent-deck wrap`.
 - **Asserts:** Codex auto-submits the daemon-injected single-line `worker-task-coder.md` pointer, reads the delegated task, creates `codex_worker_sentinel_c81f2a.txt` with exact known contents, and runs the task footer's `dot-agent-deck work-done` command so the daemon writes `.dot-agent-deck/work-done-coder.md`.
 - **Does not assert:** exact model phrasing, token usage, or dashboard rendering (covered by `codex/live/001`).
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
@@ -7009,7 +7601,7 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 
 ##### voice/reading-reply/005 — A REAL interactive Codex turn delivers its discovered sentinel filename exactly once despite its Stop hook and rollout reporting completion. [reel]
 - **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, genuine Codex Stop hook and rollout tailer).
-- **Agent:** REAL interactive Codex on the cheap test model, using the `prompt/voice-keys/004` harness with imported credentials; ChatGPT-login hosts can override the model with `DOT_AGENT_DECK_CODEX_TEST_MODEL`.
+- **Agent:** REAL interactive Codex on the cheap test model, using the `prompt/voice-keys/004` harness with imported credentials; the model follows the login's auth mode and `DOT_AGENT_DECK_CODEX_TEST_MODEL` overrides it.
 - **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by Codex; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window spanning multiple rollout polls, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
 - **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, either specific arrival order of hook and rollout, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Codex authentication and runs nowhere in CI.
@@ -7701,6 +8293,660 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** A sandboxed model shell fetch; trusted hooks run outside the sandbox.
 - **Platform coverage:** mac+linux.
 
+### Test harness: Claude Code prompt submission
+
+#### harness/claude-prompt
+
+##### harness/claude-prompt/001 — A prompt too long for the harness to type is pasted, shown by Claude Code as a `[Pasted text #N]` placeholder, and still submitted whole.
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive Claude Haiku, onboarding/trust seeded, allowedTools Bash Agent, spawned through Ctrl+N.
+- **Asserts:** a one-line prompt of over 1,000 characters, which `submit_claude_prompt_shown` sends as one bracketed paste because it is longer than `CLAUDE_TYPED_PROMPT_MAX_CHARS`, is shown by Claude Code as a paste placeholder rather than its text; the helper reports that it submitted the placeholder (with `CLAUDE_PASTE_DIRECTIVE` typed after it, since Haiku declines instructions that arrive only inside a paste), and its hook-text match passes; the instruction at the prompt's very end (touch a uniquely named sentinel) is carried out, so the submission held the whole text and not only the 200 bytes the hook reports. `status/background/008` failed on 2026-10-12 because the helper typed its ~900-character prompt, which Claude Code then took as a paste: collapsed, which the helper waited on for text that never renders, or with its head lost.
+- **Does not assert:** what Claude Code does with a typed prompt over 800 characters (the helper no longer types one), the placeholder's exact wording, desktop.
+- **Platform coverage:** mac+linux; requires local Claude credentials and runs nowhere in CI.
+
+### Agent questions (PRD #1631)
+
+The question an agent is waiting on — a permission prompt, a menu, a form — as the daemon knows it (`pending_question` on the session's snapshot), and the `answer-question` verb that answers it through the agent's own channel. `question/live/001`–`005` run real agents in lane 2; `006` exercises an offline Pi extension dialog in lane 1.
+
+#### question/model
+
+##### question/model/001 — A pending question round-trips through JSON and is additive on the snapshot.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none.
+- **Asserts:** a question with every optional field set is read back unchanged; a `false` keyboard-only flag is not written; a snapshot without the key decodes with no question, writes no key, and carries one when set — the `PROTOCOL_VERSION`-free additive-field rung.
+- **Does not assert:** the daemon filling the field (`question/state/006`).
+- **Platform coverage:** mac+linux.
+
+##### question/model/002 — Values from a newer build decode as Unknown and are never answerable.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none.
+- **Asserts:** an unknown kind, channel, option role and refusal code each decode to `Unknown` instead of failing the whole question; an `Unknown` option is refused as keyboard-only and an `Unknown` channel as unsupported.
+- **Does not assert:** a client's rendering of an unknown kind (desktop task).
+- **Platform coverage:** mac+linux.
+
+##### question/model/003 — Sanitizing caps and strips every text field, and drops a question it cannot route.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none.
+- **Asserts:** escape sequences, C0/C1 controls and bidi overrides are stripped from prompts, headers and labels (newlines kept in a prompt only); each field is capped; a form is cut to its question and option limits; an id outside `[A-Za-z0-9_-]` or over its limit, a question with no options, a duplicated option index or an empty form drops the whole question.
+- **Does not assert:** the desktop's own display scrub (`safe_display_text`).
+- **Platform coverage:** mac+linux.
+
+##### question/model/004 — A form with more questions than the deck shows is keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none (an OpenCode `question.asked` of nine questions built by the deck's own parser).
+- **Asserts:** after an event's sanitizing the card shows the first eight questions with the channel `unsupported`, no client answer to the eight is accepted (`unsupported`), and a reply naming eight answers forged past the daemon is never turned into OpenCode's reply.
+- **Does not assert:** the desktop's keyboard-only row for such a form (`question/desktop/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/model/005 — A Codex form with a question of more than nine options is keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none (a Codex `request_user_input` built by the deck's own parser).
+- **Asserts:** a form whose second question has ten options shows all ten with the channel `unsupported`, offers no option, and refuses an answer picking option 10, or one picking only options 1–9, as `unsupported`; `answer_keys` types nothing for option 10; a form of nine options per question stays on `keys` and types `9` for the ninth, with Codex's appended None of the above tenth and keyboard-only.
+- **Does not assert:** Codex's own UI (digits `1`–`9` only, read from Codex 0.160.0's `request_user_input` source, not measured live); the desktop's keyboard-only row (`question/desktop/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/model/006 — A question with more than sixteen options of its own makes its whole form keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none (a Claude Code `AskUserQuestion`, an OpenCode `question.asked` and a Pi `select` dialog built by the deck's own parsers).
+- **Asserts:** a form whose second question has seventeen options is shown with the channel `unsupported`, offers no option, and refuses an answer picking option 1 or option 16 as `unsupported`, for Claude Code and OpenCode; a Pi select of seventeen is the same; at sixteen options each stays held and answerable, Claude Code's Type something. and Chat about this and OpenCode's Type your own answer still listed after the sixteenth, Claude Code's free-text option still answerable; every agent's appended options fit `MAX_APPENDED_OPTIONS`.
+- **Does not assert:** that any agent sends a question of more than sixteen options; the desktop's keyboard-only row (`question/desktop/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/model/007 — A form with an option the deck cannot read is keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none (a Codex `request_user_input`, a Claude Code `AskUserQuestion` and an OpenCode `question.asked` built by the deck's own parsers).
+- **Asserts:** a form whose second question lists an option with no label between two labelled ones is shown with the channel `unsupported`, the option after it keeping index 3, offers no option, and refuses an answer picking option 1, 2 or 3, for all three agents; a reply forged past the daemon is not turned into Claude Code's decision or OpenCode's reply; `sanitized` makes a held question whose option indices have a gap keyboard-only.
+- **Does not assert:** that any agent sends an option without a label; the desktop's keyboard-only row (`question/desktop/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/model/008 — The mark for an option the agent may leave out is additive.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none.
+- **Asserts:** an option marked `maybe_hidden` is written with the key and read back unchanged, and sanitizing keeps it; an unmarked option writes no key, and a question without the key reads every option unmarked; a deserializer without the field (an older build's option) reads the marked question's numbers, labels, roles and keyboard-only flags as before; `Question::screen_numbers` gives `[1]`, `[2]`, `[3]`, `[3, 4]` for Yes, Always, the marked option and No, and `number_certain` is true only before the marked option.
+- **Does not assert:** the producer setting the mark (`question/detect/019`); the desktop's handling of it (`question/desktop/031`).
+- **Platform coverage:** mac+linux.
+
+#### question/detect
+
+##### question/detect/001 — A Claude Code permission request for a Bash command becomes a held Permission question.
+- **Layer:** L1/fast unit (`src/hook.rs`, the hook CLI's event builder on a captured Claude Code 2.1.289 payload, `tests/fixtures/agent-questions/claude-permission-bash.json`).
+- **Agent:** none (captured payload).
+- **Asserts:** the event is a `PermissionRequest` carrying a deck-minted question: options Yes (allow once), "Yes, and always allow access to /work/proj from this project" (always, its scope naming the directory and the session destination from the first `permission_suggestions` entry) and No (deny); channel held; the tool and its detail; and nothing held without a pane id.
+- **Does not assert:** that Claude Code draws exactly these labels — they come from the option table and are pinned by `question/live/*`.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/002 — A Claude Code permission request suggesting accept-edits names that option.
+- **Layer:** L1/fast unit (`src/hook.rs`, captured Write payload).
+- **Agent:** none (captured payload).
+- **Asserts:** option 2 reads "Yes, and switch to accept edits for this session", as an always option with a scope.
+- **Does not assert:** the label for any other suggestion kind, which M1 did not see.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/003 — A two-question `AskUserQuestion` form becomes a held Choice question with Claude Code's appended options.
+- **Layer:** L1/fast unit (`src/hook.rs`, `claude-ask-user-question-form.json`, reconstructed in the observed shape).
+- **Agent:** none.
+- **Asserts:** both questions with their prompts, headers and options, the second multi-select, and each followed by "Type something." (free text) and "Chat about this" (keyboard-only); channel held; the tool named so its own `ToolEnd` clears it.
+- **Does not assert:** that a real two-question form's payload matches the reconstruction (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/detect/004 — Claude Code's plan approval is answered by keys and not held.
+- **Layer:** L1/fast unit (`src/hook.rs`, captured `ExitPlanMode` payload).
+- **Agent:** none.
+- **Asserts:** a Plan question on the keys channel, its third option keyboard-only, the hook not holding it (a hook decision does not dismiss the plan dialog), and "manually approve" answered by the key `2`.
+- **Does not assert:** the key `1`, which is inferred.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/005 — Codex's `request_user_input` form rides its `ToolStart` and is answered by keys.
+- **Layer:** L1/fast unit (`src/hook.rs`, captured Codex 0.160.0 `PreToolUse`).
+- **Agent:** none.
+- **Asserts:** the event stays a `ToolStart` and carries a Choice question whose id and tool use id are the call's `tool_use_id`; each question ends in a keyboard-only "None of the above"; none is multi-select.
+- **Does not assert:** the keys themselves (`question/answer/003`).
+- **Platform coverage:** mac+linux.
+
+##### question/detect/006 — A Codex approval is answered by `1`, `p` and `3`, and Codex's `Interrupt` reads as Idle.
+- **Layer:** L1/fast unit (`src/hook.rs`, reconstructed Codex `PermissionRequest`).
+- **Agent:** none.
+- **Asserts:** a Permission question on the keys channel whose options map to the keys `1`, `p` and `3`, the always option's scope naming the command; `Interrupt` maps to Idle.
+- **Does not assert:** that Codex accepts those keys (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/detect/007 — The OpenCode plugin holds a question through `await-answer` and replies through OpenCode.
+- **Layer:** L1/fast real-Node integration (`src/opencode_manage.rs`: the generated plugin loaded by Node with its binary pinned to a recorder and a stand-in OpenCode client, captured OpenCode 1.18.34 events).
+- **Agent:** none (stand-in client and recorder).
+- **Asserts:** `question.asked` starts `await-answer --agent opencode --ack` with the event's properties as its first stdin line and the plugin posts the printed answer to `/question/{requestID}/reply`; a `permission.asked` still waiting when OpenCode reports `permission.replied` gets its child stopped and nothing posted; `permission.replied` and `question.rejected` are forwarded with their request id, which the hook CLI turns into a resolved-question marker; each child that printed an answer is told what OpenCode made of it, and a reply OpenCode refuses (an error response, which the SDK reports rather than throws) is reported `{"delivered": false, "detail": "OpenCode answered 500"}` and the question raised again, whose second reply is reported delivered. Skips where `node` is missing.
+- **Does not assert:** a real OpenCode dismissing its dialog on that post (`question/live/*`); the Rust side's question building and reply mapping, which the hook CLI's own unit test covers.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/008 — Pi dialogs map to held questions and back, and the deck's `ctx.ui` wrapper races them.
+- **Layer:** L1/fast unit (`src/hook.rs`), running `pi-extension/test/questions.test.ts` under Node when it can strip TypeScript types (23.6+).
+- **Agent:** none (stand-in `ctx.ui` and `exec`).
+- **Asserts:** a `select`, `confirm` and `input` description become held questions and each answer maps back to the option string, true/false or the typed text; the wrapper builds the `await-answer` argv, a deck answer aborts the original dialog and resolves the caller, a keyboard answer aborts the `await-answer` child, an empty reply leaves the dialog to the keyboard, a deck that cannot be launched leaves it to the keyboard too, wrapping twice wraps once, and a missing or read-only `ctx.ui` is left alone.
+- **Does not assert:** a real Pi (`question/live/*`); the JS half where Node is older than 23.6, which prints `SKIP:`.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/009 — A Devin permission request uses the docs-derived table, Allow once and Deny only.
+- **Layer:** L1/fast unit (`src/hook.rs`).
+- **Agent:** none (Devin is not logged in on any measured host).
+- **Asserts:** a Permission question on the keys channel with Devin's eight documented options, of which only Allow once and Deny are answerable.
+- **Does not assert:** anything about a real Devin: the table is documentation-derived and untested.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/010 — A question answered by keys leaves the hook through the provenance gate, with a plain fallback.
+- **Layer:** L1/fast unit (`src/hook.rs`, stand-in daemons on a Unix socket).
+- **Agent:** none (a captured Codex payload).
+- **Asserts:** a Codex approval is sent as an unheld `question` message (`hold: false`) for its pane, carrying the question, and the daemon's one reply line ends it; when no reply comes (an older daemon) or the gate refuses it, the event is re-sent as a plain event with no question metadata.
+- **Does not assert:** the real daemon applying it (`question/detect/011`).
+- **Platform coverage:** mac+linux.
+
+##### question/detect/011 — A bare frame's question metadata can neither raise nor clear a question; attested ones can.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop on a Unix socket with an attested pane token).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** a bare event carrying a question sets the status but no question; an unheld `question` message with the pane's token makes it pending and is acknowledged; a bare "answered" marker clears nothing and an attested one clears it; a message for a pane never issued a token has its question removed.
+- **Does not assert:** the hook CLI's side (`question/detect/010`); a bare lifecycle status clearing a question under `question_cleared_by`, which stays possible by design.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/012 — One parse of a permission prompt yields both the status reading mode announces and the pending question (PRD #1631).
+- **Layer:** L1/fast unit (`src/daemon.rs`, the hook CLI's one parser `crate::hook::hook_payload_event` feeding the real hook loop on a Unix socket with an attested pane token).
+- **Agent:** none (`/bin/sh` stand-in; captured Claude Code 2.1.289 `PermissionRequest` and OpenCode 1.18.34 `permission.asked` payloads).
+- **Asserts:** for each payload, while the producer still holds the question, the status stream carries one `PermissionRequest` for the pane, not marked unproven, naming the tool and what it would run; the pane's pending question is exactly the question that frame carries, about the same tool and detail; the card reads Needs Input.
+- **Does not assert:** the desktop's reading mode turning that frame into a spoken sentence (desktop tests); Claude Code's later `Notification` `permission_prompt`; answering the question.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/013 — Unattested question messages retain the outside-card provenance and budget.
+- **Layer:** L1/fast unit (`src/daemon.rs`, real hook socket and hook loop, registry-free client mirror).
+- **Agent:** none (synthetic producer).
+- **Asserts:** token-less unheld `question` messages for invented outer panes, carrying either `SessionStart` or a status-only `WaitingForInput` fallback with no question metadata, broadcast `daemon_unproven` just like raw events; the mirror shows outside cards without promoting their panes to managed, and those cards count toward the outside-card cap during a raw-event flood.
+- **Does not assert:** held-answer delivery or real agent behaviour.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/014 — A departed owner's status-only question cannot type its successor.
+- **Layer:** L1/fast unit (`src/daemon.rs`, real hook socket and hook loop).
+- **Agent:** none (`true` predecessors and `cat` successors).
+- **Asserts:** on sixteen reused panes, unheld status-only question messages carrying the departed owners' still-known tokens leave the successors' registry types unknown; a fresh control agent's own attested question can still learn its type.
+- **Does not assert:** answering a question or typing bytes into a pane.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/015 — An Unattested question admitted before a spawn cannot type the fresh agent.
+- **Layer:** L1/fast unit (`src/daemon.rs`, real hook socket and hook loop; a thread-local tracing observer forces a spawn after admission and before the handler's type update).
+- **Agent:** none (`cat` stands in for the fresh agent).
+- **Asserts:** an unheld outside question for an unknown pane cannot give the subsequently spawned agent the outside producer's reported type.
+- **Does not assert:** live agent behaviour or question answering.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/016 — An `await-answer` child that fails before handing off falls back to the plain event.
+- **Layer:** L1/fast real-Node integration (`src/opencode_manage.rs`: the generated plugin loaded by Node with its binary pinned to a recorder).
+- **Agent:** none (recorder; captured OpenCode 1.18.34 `permission.asked`).
+- **Asserts:** a `permission.asked` whose child exits non-zero, one whose child is killed, and a `question.asked` whose child exits non-zero are each forwarded once as the plain event with its request id, which the hook CLI reads as Needs Input; a child that exits 0 adds no report. Skips where `node` is missing.
+- **Does not assert:** a spawn that fails outright (a missing binary also takes the plain event's own route away); a real OpenCode.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/017 — An OpenCode subagent's question form is filed as that subagent's.
+- **Layer:** L1/fast real-Node integration (`src/opencode_manage.rs`: the generated plugin loaded by Node with its binary pinned to a recorder).
+- **Agent:** none (recorder; captured OpenCode `question.asked`, its `sessionID` set to a child session).
+- **Asserts:** a child session's `question.asked` is handed to `await-answer` under the root session with the child's `subagent_id`, and decodes as that subagent's `WaitingForInput` with a question naming the subagent; its `question.replied` and `question.rejected` are forwarded under the root with the child's id and request id, and decode as the subagent's answered prompt; applied to a card, the question and the wait are the subagent's, and the reply clears the question and takes the card off Needs Input. Red before the fix: the child's question events carried no `subagent_id`. Skips where `node` is missing.
+- **Does not assert:** the daemon holding and answering the child's question (`question/hold/019` does that for a child's permission prompt, on the same path); a real OpenCode subagent.
+- **Platform coverage:** mac+linux.
+
+
+##### question/detect/018 — A Claude Code Bash prompt lists the auto-mode option Claude draws, keyboard-only, so its numbers match the screen.
+- **Layer:** L1/fast unit (`src/hook.rs`, `tests/fixtures/agent-questions/claude-permission-bash-auto-mode.json`, reconstructed from Claude Code 2.1.296's hook schema and its Bash dialog's code, not captured live; and the captured `claude-permission-bash.json`).
+- **Agent:** none.
+- **Asserts:** a Bash `PermissionRequest` in the `default` mode with no suggestion is Yes (1), "Yes, and switch to auto mode" (2, keyboard-only, no scope) and No (3), the numbers Claude draws; beside an `addDirectories` suggestion the always option keeps its scope and the auto-mode option sits between it and No; the auto-mode option is listed in `acceptEdits` mode and not in `plan`, `auto`, `bypassPermissions` or `dontAsk`, nor for a Write.
+- **Does not assert:** that a given account's Claude Code draws the option — the payload does not say whether auto mode is available; `question/live/001` checks the numbering against a real Claude Code.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/019 — Only Claude Code's auto-mode option is marked as one the agent may leave out.
+- **Layer:** L1/fast unit (`src/hook.rs`, the captured and reconstructed payloads in `tests/fixtures/agent-questions/`).
+- **Agent:** none.
+- **Asserts:** a Claude Code Bash `PermissionRequest` in the `default` mode, with and without an `addDirectories` suggestion, marks "Yes, and switch to auto mode" `maybe_hidden` and no other option; in `plan` mode nothing is marked; Claude Code's Write, plan and `AskUserQuestion` questions and Codex's approval and form mark nothing; across every agent's option tables in `agent_registry::ALL`, the auto-mode entry is the only marked one.
+- **Does not assert:** whether Claude draws the option (nothing in the payload says); the desktop's handling of the mark (`question/desktop/031`).
+- **Platform coverage:** mac+linux.
+
+##### question/detect/020 — A permission question is tied to its own call, from real payloads.
+- **Layer:** L1/fast unit (`src/hook.rs`, the captured `claude-permission-bash.json` and `opencode-permission-asked.json`).
+- **Agent:** none.
+- **Asserts:** Claude Code's `PermissionRequest` names no call and fingerprints its input like the call's `PreToolUse`, and unlike another command's; applied to state, the question ties to that call, survives the other call's `PostToolUse` on Needs Input, and clears on its own. OpenCode's `permission.asked` puts `tool.callID` in `tool.use_id`, a `tool.execute.after` carries its `call_id` as `tool_use_id`, and only the matching call's end clears it.
+- **Does not assert:** live agents running parallel calls; Codex's `PreToolUse` and `PermissionRequest` inputs agreeing.
+- **Platform coverage:** mac+linux.
+#### question/state
+
+##### question/state/001 — A question event sets the pending question and Needs Input.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`, `AppState::apply_event`).
+- **Agent:** none.
+- **Asserts:** a permission request carrying a question sets it and Needs Input; a `ToolStart` carrying one (Codex's form) does too instead of Working; a question that fails sanitizing sets nothing.
+- **Does not assert:** the daemon's admission of the metadata key (`admit_producer_event`).
+- **Platform coverage:** mac+linux.
+
+##### question/state/002 — The question's own tool ending clears it; another tool's does not.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`).
+- **Agent:** none.
+- **Asserts:** matched by `tool_use_id` where the question has one and by tool name where it has none; a `ToolEnd` for another call or another tool leaves it.
+- **Does not assert:** subagent tool ends beyond the name match.
+- **Platform coverage:** mac+linux.
+
+##### question/state/003 — The agent moving on clears the question; a notification does not.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`).
+- **Agent:** none.
+- **Asserts:** a prompt, an idle, a session start and an error each clear it; a session end removes it with the session; a `Notification` and a `Thinking` without a prompt leave it; a subagent's question ends with that subagent's `SubagentStop` and not another's.
+- **Does not assert:** Codex's `Interrupt` itself (it arrives as Idle — `question/detect/006`).
+- **Platform coverage:** mac+linux.
+
+##### question/state/004 — The agent reporting the question answered clears exactly that one.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`).
+- **Agent:** none.
+- **Asserts:** an event whose resolved-question marker names the pending id clears it; one naming another id does not.
+- **Does not assert:** where the marker comes from (`question/detect/007`).
+- **Platform coverage:** mac+linux.
+
+##### question/state/005 — A newer question supersedes an older one and releases the older one's holder.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`, the daemon's `ingest_event` with a real registry).
+- **Agent:** none.
+- **Asserts:** the older hold receives a `released`/`superseded` reply when the newer question lands, the newer hold stays, and a later idle releases it as `cleared`.
+- **Does not assert:** the hook socket (`question/hold/003`).
+- **Platform coverage:** mac+linux.
+
+##### question/state/006 — The snapshot carries the question and hydration restores it.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`).
+- **Agent:** none.
+- **Asserts:** `live_session_for` and `pending_question_for` return the question, it survives JSON, and a client seeding a card from that snapshot holds the same question.
+- **Does not assert:** the `ListAgents` wire round trip.
+- **Platform coverage:** mac+linux.
+
+##### question/state/007 — A resync after an event-stream gap restores a question raised during the gap and drops one answered during it.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`, `AppState::resync_after_event_gap` against an `attach_live_sessions` reply).
+- **Agent:** none.
+- **Asserts:** a question (with its revision) raised on the daemon while the client was not listening reaches the client's card through the resync, and the card reads Needs Input; a question resolved on the daemon during a later gap is gone from the card after the next resync.
+- **Does not assert:** the subscriber's reconnect loop itself (`event_subscriber`'s own tests, issue #1520); the desktop, which reads `ListAgents` snapshots directly.
+- **Platform coverage:** mac+linux.
+
+##### question/state/008 — A parallel call of the same tool ending does not clear the question.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`).
+- **Agent:** none.
+- **Asserts:** with two Bash calls in flight, a Claude-shaped question raised for call A (no `tool_use_id`, A's input fingerprint) stays pending and the card stays on Needs Input when call B, a different command, ends — as a `ToolEnd` or as a promoted failure `Error`; call A's own end clears it.
+- **Does not assert:** the hook stamping the fingerprint from real payloads (`question/detect/020`).
+- **Platform coverage:** mac+linux.
+
+##### question/state/009 — A question that cannot be tied to one call still clears when its tool ends.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`).
+- **Agent:** none.
+- **Asserts:** one fitting call ties the question to it; two calls with the same input leave it untied and the first end clears it; no `ToolStart` seen, and a tool end naming no call, fall back to the tool-name match; an earlier call that already ended and a subagent's call with the same input are not candidates; an `AskUserQuestion` tied to its call clears on its own end even when its input was rewritten.
+- **Does not assert:** a `ToolStart` applied after its `PermissionRequest` (untied, falls back by name).
+- **Platform coverage:** mac+linux.
+
+#### question/answer
+
+##### question/answer/001 — Every refusal of an answer, each with its own reason.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, the `AnswerQuestion` handler against a real registry with a `cat` stand-in and real state).
+- **Agent:** none (`/bin/cat` stand-in).
+- **Asserts:** agent not found, no pending question, a stale id (naming the current one), answers that do not fit (index out of range, missing question, nothing chosen, two options on a single-select question, text without a free-text option), keyboard-only, always-allow unconfirmed, unsupported channel, and a held question nothing holds — which also drops the question; refusals before it change nothing.
+- **Does not assert:** the TUI, which does not answer (decision 9).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/002 — A held answer reaches its holder and moves the card on.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`).
+- **Agent:** none (`/bin/cat` stand-in).
+- **Asserts:** the holder receives one `answered` reply with the chosen option's index, label and role; the question clears; the card reads Thinking; the daemon broadcasts its own answered event, marked daemon-synthetic.
+- **Does not assert:** the producer's decision format (`question/hold/001`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/003 — A keys answer types the table's keys in order and re-checks the question between them.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, keys read back from the stand-in's PTY echo).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** a Codex "don't ask again" types `p` with no Enter; a two-question form answered out of order types one digit per question in question order; when the question changes after the first key, the second is never typed and the answer fails as a write failure.
+- **Does not assert:** that Codex acts on the keys (`question/live/*`); the 400 ms gap's adequacy, which is chosen.
+- **Platform coverage:** mac+linux.
+
+##### question/answer/004 — `answer-question` is capability-gated in the client library.
+- **Layer:** L1/fast unit (`src/daemon_client.rs`, stand-in older daemons and an in-process attach server).
+- **Agent:** none.
+- **Asserts:** both platforms' capability lists name the verb; against a daemon advertising no capabilities, and one advertising up to `focus-gained`, the client withholds and sends nothing; `still_wanted` returning false drops the answer; this build's daemon answers, and its refusal arrives as an outcome naming the reason.
+- **Does not assert:** a real older release (rule 12's cross-version run).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/005 — Answer validation and the request and refusal wire.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none.
+- **Asserts:** every malformed answer is refused as invalid, keyboard-only, unconfirmed or unsupported in the documented order; a valid form resolves to its labels and trimmed free text; the `answer-question` request and every refusal round-trip; `confirmed_always` defaults to false; an older daemon's response without `answer_refusal` decodes.
+- **Does not assert:** the handler's agent and id checks (`question/answer/001`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/006 — The keys channel refuses a pane the keyboard has started on.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, questions raised through the daemon's ingest, keys read back from the stand-in's PTY echo).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** after a keystroke reaches the pane following the question, a Codex form and a Codex approval are each refused `KeyboardStarted`, nothing is typed and the question stays pending; a keystroke from before the question does not refuse it.
+- **Does not assert:** Codex's own dialog position (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/007 — Two simultaneous answers reach the agent once.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`).
+- **Agent:** none (`/bin/cat` stand-ins for Codex and Claude Code).
+- **Asserts:** two concurrent answers to one keys question type its key once and exactly one succeeds; two to one held question deliver one reply and exactly one succeeds; a question the deck already answered is refused as stale if it reappears under the same id.
+- **Does not assert:** two separate client processes (the handler is what serialises them).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/008 — A half-typed answer leaves the question keyboard-only.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** when the user types into the pane between the first and second digit of a form's answer, the second is never typed, the refusal is `KeyboardStarted`, and the question stays pending with an `unsupported` channel at a new revision, which a second answer cannot use; a client folding the daemon's broadcast events sees the same keyboard-only question at that revision, with the card still waiting on it.
+- **Does not assert:** a write failure from the PTY itself (the same branch).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/009 — A deny answered by the deck does not show Thinking.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`).
+- **Agent:** none (`/bin/cat` stand-in for Claude Code).
+- **Asserts:** a held deny reaches the holder, clears the question and leaves the card on Needs Input; the deck's broadcast event is `unknown`, names the question and is daemon-synthetic.
+- **Does not assert:** the agent's next event (the agent's own).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/010 — An answer is bound to the revision it was checked against.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier between validation and delivery).
+- **Agent:** none (`/bin/cat` stand-ins for Claude Code and Codex).
+- **Asserts:** the daemon stamps a revision and a repeat of the pending question keeps it; a same-id hold registered between validation and delivery makes the held answer stale, the first holder is let go as superseded, the replacement stays held and pending and its own answer reaches it; a request naming a revision no longer pending is refused stale; a Codex question re-raised under its id with other content between validation and the first key is refused stale and no key is typed.
+- **Does not assert:** a client sending the revision (`question/desktop/006` covers the webview's staleness check).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/011 — A keystroke right after the deck's own key is not mistaken for it.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier after the first key's write returns).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** a human keystroke recorded after the deck's first form digit was written, but before the deck continues, refuses the second digit with `keyboard_started`; the second digit is never typed and the question becomes keyboard-only.
+- **Does not assert:** a real Codex form (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/012 — No question change lands between a key's check and its queueing.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier after a key's revalidation and before it is queued on the PTY).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** an event replacing the form under its id, or one clearing it, waits while the deck's first digit is between its check and its queueing on the PTY thread (audit R2); once it is queued, the change applies and the digit is either typed — and the answer then fails at the second digit — or dropped unwritten and the answer refused stale (audit T1), whichever the PTY thread reaches first; the second digit is never typed; a replacement stays pending at its own revision and is not marked keyboard-only.
+- **Does not assert:** which of the two orders a run takes (`question/answer/013` pins the dropped one); a real Codex form (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/013 — A queued key is dropped when its question changes first.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier on the pane's PTY thread after the first key is queued and before the thread checks it).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** with the PTY thread stalled on the queued first digit, an event replacing the form under its id, or one clearing it, is ingested without waiting (audit T1); on release the digit is not typed and the answer is refused stale, naming the replacement or nothing; with no change the same stall ends with both digits typed.
+- **Does not assert:** a change that lands after the PTY thread's check, which the key is not protected from (the accepted residual in `docs/develop/agent-questions.md`); a real Codex form (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/014 — An event naming no pane waits for its session's pane, and reaches no question of a deck agent on a pane.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, the registry's ownership oracle installed and the pane outside the managed set, as on an ordinary daemon pane; a barrier after a key's revalidation).
+- **Agent:** none (`/bin/cat` stand-ins for Codex and Claude Code).
+- **Asserts:** a bare `Idle` naming the session but no pane, ingested through `ingest_event`, waits while the deck's first digit is between its check and its queueing (audit T2) — the pane-less event is serialised with the key's check-to-queue window; once applied it changes nothing, because a pane-less report from an agent spawned on a pane is admitted only as an outside agent's (issue #601) and reaches no proven card: the question stays pending at the revision checked, both digits are typed and the answer is sent; the same event leaves a held question pending and its producer holding.
+- **Does not assert:** a pane-less report from an agent spawned without a pane (it has no pane whose question it could reach); the hook socket's framing (the event enters at `ingest_event`, which the hook loop calls); a real agent.
+- **Platform coverage:** mac+linux.
+
+##### question/answer/015 — An event naming no pane follows its session onto a pane.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier after a pane-less event resolves its session's pane).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** a pane-less `Idle` that resolved its session to no pane, and whose session then moves onto a pane during that pane's question transition, is applied only after the transition releases the pane's lifecycle (audit T2's re-check under the state lock).
+- **Does not assert:** a session leaving a pane, which no event can do while the pane's lifecycle is held.
+- **Platform coverage:** mac+linux.
+
+##### question/answer/016 — A second answer while one is being sent is refused at once.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier after the first answer is validated).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** while one answer to an agent is stopped part way, a second answer to the same agent is refused with `answer_in_progress` within 2 s instead of waiting for the agent's answer slot; the first then completes and its key is typed once, and the refused answer types nothing.
+- **Does not assert:** answers to two different agents, which never share a slot.
+- **Platform coverage:** mac+linux.
+
+##### question/answer/017 — A same-id replacement during a key answer stays answerable.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier after the key is written and before the answer is marked).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** a question raised again under the same id with other content, at the moment the deck's key has been written, stays pending at its new revision and is answered by its own key rather than refused as already answered; once that answer is over, the same id raised again is refused as stale.
+- **Does not assert:** whether the replacement was a new prompt or a redraw of the answered one, which the deck cannot tell apart.
+- **Platform coverage:** mac+linux.
+
+##### question/answer/018 — A late "not taken" leaves a later answer to the same id settled.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, held producers whose acknowledgement the test sends by hand).
+- **Agent:** none (`/bin/cat` stand-ins for Claude Code, before and after a respawn of the pane).
+- **Asserts:** while a held answer waits for its acknowledgement, the pane's agent is respawned and the new one has another question and then the same question id answered; when the first answer's acknowledgement then reports the agent did not take it, that answer is refused `write_failed`, and the new agent's answered question raised again is refused as stale rather than handed to its producer a second time (PR #1698 review: the "not taken" forgets only its own revision's mark).
+- **Does not assert:** that the refused answer's own question is answerable again, which `question/hold/015` covers; the hook loop's acknowledgement reading.
+- **Platform coverage:** mac+linux.
+
+#### question/desktop
+
+The desktop half of answering by voice. These tests live in the desktop crate (`desktop/src-tauri/src/voice/question_tests.rs`, run by `cargo test-fast`) and the webview (`desktop/src/components/VoiceQuestion.test.tsx`, run by `pnpm test` in `desktop/`), which linkage-check does not walk, so they are named here by test rather than as `#[spec]` IDs.
+
+- **question/desktop/001** — `question_desktop_001_the_projection_is_safe_and_says_what_can_be_answered`: the agent DTO's `pendingQuestion` keeps every option in order, scrubs control and bidi characters from every text field, carries the always option's scope, and marks an option answerable only when it is not keyboard-only and the question's channel is one the deck can use; the key is absent when nothing is pending.
+- **question/desktop/002** — `question_desktop_002_the_model_maps_the_utterance_and_the_app_checks_it` and `question_desktop_002_a_form_answering_a_question_twice_is_not_sent`: "go ahead" mapped by the (stub) Commands model to allow-once is taken and counts down as "Allow once — touch x"; a model answer naming an option not offered, two options on a single choice, a keyboard-only option, or a question the deck cannot answer is refused with a sentence; a form handed back for sending that answers one question twice, or picks one option twice, is refused as `invalid_answer` before it is sent; an exact label ("No") or position ("option two") is matched locally with no model call.
+- **question/desktop/003** — `question_desktop_003_the_form_fills_in_across_utterances`: a two-question form fills in over "red for colour" and "small and large" (multi-select), a later answer replaces an earlier one, a free-text option takes the next utterance verbatim with no model call, and an always option asks for the confirmation naming its scope and is never sent unconfirmed.
+- **question/desktop/004** — `question_desktop_004_a_non_answer_falls_through_and_no_is_the_question_s`: a `not_answer` verdict leaves the utterance to ordinary command handling, which dispatches it; "no", a numbered choice's cancel phrase, is the pending question's deny option first; "cancel" calls a started answer off.
+- **question/desktop/005** — vitest `question/desktop/005: always allow is sent only after a confirmation naming its scope`: "always" opens the confirmation and starts no countdown; Cancel sends nothing; Confirm, by click or by saying "confirm", starts the five-second countdown and the send asserts `confirmedAlways`.
+- **question/desktop/006** — vitest `question/desktop/006: …` (three tests): the countdown is called off, with nothing sent, when the pending question's id changes, and — the same id at a new revision with nothing else changed (audit R5) — a countdown is called off at once, while an answer already on its way keeps its lease and the row reports the deck's own stale refusal; `questionLost` names each reason (question — including the same id at another revision — pane, replaced, confirmation, deck); every outcome the deck can send back, each refusal and the withheld case included, is what the row says; a non-answer goes on to the command resolver. The Rust side of the sentences is `question_desktop_every_refusal_has_its_sentence`.
+- **question/desktop/007** — `question_desktop_007_the_model_s_choice_must_be_grounded_in_what_was_said` (audit A1): a model answer that selects Allow once without grounding — citing words the user never said (for an unrelated utterance, or for a "no"), or citing nothing — is refused and arms nothing; the refusal is about missing or fabricated evidence, not about what the utterance meant; free text not spoken is refused, and spoken free text is taken as the transcript's own words. It also documents the accepted residual: an Allow once citing the unrelated utterance's own words, or the "run that" of "no don't run that", passes grounding and is armed, complete, with an "Allow once" summary. `question_desktop_007_grounding_drops_a_textless_selection_borrowing_another_questions_words` checks the final merged verdict when the model supplies Colour free text plus a Sizes selection borrowing Colour's evidence, with or without copied text: Colour is filled, Sizes is unanswered even with a prior Large answer, the form stays incomplete and the send seam refuses it. `question_desktop_007_borrowed_invalid_selections_are_still_refused` requires an invalid borrowed question or option to refuse the answer before a drop could make it sendable, including strict-containment drops; `question_desktop_007_grounding_keeps_a_selection_citing_its_own_words` keeps separate free-text answers with their own evidence and checks the final sendable form. `question_desktop_007_grounding_drops_strictly_contained_evidence` leaves Colour unanswered when its evidence is strictly contained in Sizes' longer evidence, in either selection order, with or without free text, clearing a prior Colour answer; `question_desktop_007_grounding_keeps_disjoint_or_equal_evidence` keeps both answers for disjoint or exactly equal evidence. These grounding tests use deterministic stub answers without a real model call.
+  The duplicate-selection cases `question_desktop_007_borrowed_drop_cannot_be_refilled_by_a_kept_duplicate`, `question_desktop_007_contained_drop_cannot_be_refilled_by_a_kept_duplicate` and `question_desktop_007_copied_text_drop_cannot_be_refilled_by_a_kept_duplicate` require a dropped question to stay unanswered even when the same model answer includes an independently grounded selection for it. Each checks the final form, completeness and send refusal, with and without an earlier answer.
+- **question/desktop/008** — vitest `question/desktop/008: a bare yes does not confirm always allow`: with the always-allow confirmation open, "yes", "sure", "ok" and "yes please" leave it open and say to say "confirm", and no countdown starts; "always allow" said again confirms it.
+- **question/desktop/009** — vitest `question/desktop/009: speaking stops the answer countdown before the words are worked out` (audit A3): speech a second before the countdown ends stops it at once, with transcription and resolution stalled far past the end; a resolver error and a refusal leave it stopped; only a fresh complete answer re-arms it.
+- **question/desktop/010** — vitest `question/desktop/010: an answer needs the agent's terminal on screen` (audit A7): over a hidden terminal "yes" is an ordinary command and no question is resolved; hiding the terminal mid-countdown calls it off with nothing sent; `questionLost` reports `hidden`.
+- **question/desktop/011** — `question_desktop_011_a_cancelled_lease_writes_no_frame` (`voice/lease.rs`) and vitest `question/desktop/011: …` (audit A8): a lease cancelled while the send is stalled writes no frame; a cancel arriving before its send kills it; one after the write is reported too late; a send that times out or breaks after the request was let through is reported `unconfirmed` ("may have been sent — check the agent"), never "nothing was sent", while one that fails before is the plain error; the panel keeps the form with its Cancel while sending, cancels the lease on a pane change, and always reports the outcome; the question leaving the pane, or another question arriving, while the answer is on its way — its own delivery clearing it before the send returns — cancels nothing, and the row reports the answer as sent, not too late to cancel (PR #1698 review); a cancel that fails to reach the app is reported with the outcome rather than swallowed, whether its failure arrives before the outcome or after it (audit R5: the row the outcome wrote is then amended).
+- **question/desktop/012** — vitest `question/desktop/012: …` (audit A1, accepted residual): an Allow once the model ties to words that do not mean it ("what time is it", "no don't run that") is shown in the countdown as exactly what would be sent; Cancel, or speaking, stops it, and nothing is sent.
+- **question/desktop/013** — `question_desktop_013_a_typing_mode_switch_is_not_an_answer`: with a question pending, every typing-mode switch said on its own (each of `DICTATION_ON_PHRASES` and `DICTATION_OFF_PHRASES`, bare and wrapped in "okay … please") is a `not_answer` decided with no model call — with nothing answered, with an answer started, and while a free-text option waits for its words — so it goes on to switch typing mode; the same words inside a sentence ("I was talking on the phone") are still the free-text answer, and an option the agent labelled "Start typing" is still that option when the deck can answer it — said bare or with an edge politeness word ("Start typing, please", "Okay, start typing"), compared as the switch is — while a keyboard-only option with that label, or one on a question the deck cannot answer, leaves the utterance a switch.
+- **question/desktop/014** — vitest `question/desktop/014: an answer heard while the app spoke is not taken` (`desktop/src/components/VoiceControlPanel.test.tsx`, PRD #1631): with reading on and the app speaking, a "yes" recorded over that speech — which may be the app reading the prompt aloud (#1497 D8) — is not offered to the pending question: nothing is resolved against it, no countdown starts and nothing is sent, and it is declared as heard while speaking; the same "yes" once the app is quiet starts the countdown.
+- **question/desktop/015** — `question_desktop_015_a_permission_hook_and_its_notification_are_announced_once` (`voice/reading.rs`): a Claude permission hook followed six seconds later by its `permission_prompt` notification yields one spoken announcement through status conversion, coalescing and announcement; two hooks followed by two delayed notices within 30 seconds yield exactly the two prompt announcements. `question_desktop_015_a_missing_notice_does_not_silence_the_next_prompt` pins notice debt to event timestamps: a lone notice at +6 or +29 seconds is absorbed even after the agent answered, started or ended a tool, reported Thinking, or became Idle; at +31 seconds the missing notice's debt has lapsed and a notification-only Q2 speaks. `question_desktop_015_a_notice_before_its_hook_does_not_pay_the_debt` announces a notice stamped five seconds before its hook and preserves the debt for a later duplicate; `question_desktop_015_a_notice_six_seconds_after_its_hook_is_absorbed` controls the positive gap. The notification-only prompt within 30 seconds of an unpaid hook remains an accepted residual. A notification-only older Claude with no debt still yields an announcement; no real agent or speech provider is used.
+- **question/desktop/016** — `question_desktop_016_answering_a_held_prompt_retracts_its_announcement` (`voice/reading.rs`) and vitest `question/desktop/016: a voice answer retracts the queued prompt without silencing other agents` (`desktop/src/lib/reading.test.ts`): a held prompt is announced, its deck-answer marker yields a silent `permission_answered` control message, and its delayed notification is suppressed; the real speech queue drops the answered agent's queued prompt while preserving another agent's speech and prompt, and a later new prompt remains speakable. This tests the Rust pipeline and webview queue separately, without a live Tauri channel.
+- **question/desktop/017** — vitest `question/desktop/017: speech finished during %s still overlaps the recording` (`desktop/src/components/VoiceControlPanel.test.tsx`), parameterized over transcription and fresh microphone startup: with Voice and Reading on, a held permission prompt is read and finishes while the capture operation waits; its "yes, go ahead" in that recording must not resolve the question, show a confirmation, start a countdown or send an answer, while the same words in a later quiet segment start the countdown. Uses synthetic capture and speech callbacks; does not assert device-level buffering or a real transcription backend.
+
+  Vitest `question/desktop/017: speech starting %s belongs to the correct segment` holds the stop of a recording containing "yes" pending, and has the stand-in backend report the recording split before it transcribes, while a permission announcement starts and finishes: before the split, the answer must not resolve, arm or send; after the split but while `voiceStop` is still pending, and after it resolves, the old answer stays eligible and its countdown starts. Vitest `question/desktop/017: without a split signal, speech before voiceStop resolves still overlaps` pins the fail-closed side: a stop that never reports its split treats speech before it resolves as overlap. Capture, transcription and speech are synthetic, so this pins the frontend's boundary at the split signal and at bridge resolution rather than measuring device timing; `desktop_voice_stop`'s ordering of the signal is pinned in Rust.
+
+- **question/desktop/018** — vitest `question/desktop/018: %s presses nothing while a question waits`, `question/desktop/018: %s still submits with no question waiting` (each over "go ahead", "send it" and "enter"), `question/desktop/018: a dictation types nothing while a question waits`, `question/desktop/018: a dictation still types with no question waiting`, `question/desktop/018: a countdown presses nothing once a question arrives`, `question/desktop/018: the refusal names an orchestration agent by its run title`, `question/desktop/018: $said presses nothing while a question waits` (over "interrupt", "clear the prompt" and "scratch that") and `question/desktop/018: the refusal names what to do for each way voice cannot answer` (`desktop/src/components/VoiceControlPanel.test.tsx`, PRD #1631): with the open agent waiting on a permission prompt and the utterance `not_answer` to it, voice writes nothing into the pane — a resolved submit presses no Enter, "type run the tests" writes no bytes and starts no countdown, and interrupt, clear and scratch press no keys — and the row says the agent is waiting on a question, to answer it by saying an option or its number — listing them with their numbers — or use the keyboard, and nothing is sent to the question; an agent that is a role of an orchestration run is named there, and in the name the question's own sentences are given, by its run's title and its name ("prd-1401 Planner", issue #1668); a countdown over words typed before the question arrived ends without pressing Enter; the wording helper's advice is pinned for each case (voice, with and without options to list, a hidden terminal, a question voice cannot answer), and typing mode no longer counts as a case (PR #1698, `question/desktop/029`–`030`); with no question waiting each send phrase still presses Enter at once (issue #1246) and a dictation still types and sends. The submit and dictation resolutions are stubbed at the runtime seam, so `desktop_voice_resolve`'s own choice of the row is not exercised here, and the hidden-terminal wording is pinned on the helper alone, since the pane gate refuses a hidden terminal first.
+- **question/desktop/019** — `question_desktop_019_a_forgotten_cancel_still_stops_its_send` (`voice/lease.rs`) and vitest `question/desktop/019: every lease is numbered above the one before` (`desktop/src/components/VoiceQuestion.test.tsx`, PR #1698 review): a cancel that reached Rust before its send and was then pushed out by more cancels than Rust keeps still stops that send — it begins dead and nothing is written — while a cancel still kept holds, the panel's next answer is sent, and a name that is not a lease begins dead; the panel numbers each lease above the one before, with the clock standing still or stepping back, and within a safe integer.
+- **question/desktop/020** — `question_desktop_020_an_option_is_chosen_by_its_number` (PR #1698): against each agent's real option list, built by the daemon's own producers from the captured payloads — Claude Code 2.1.296's Bash prompt (Yes, the keyboard-only "Yes, and switch to auto mode", No), Codex's approval, OpenCode's unnumbered permission row, a Pi `select` and Devin's documented prompt — "2"/"two"/"second"/"option two"/"option 2"/"number two"/"the second one"/"um, two please" (and Claude's "1", Devin's "8") choose the option the agent draws with that number, matched in the desktop with no model call; Claude's "two", which is the auto-mode option where Claude draws it and No where it does not, is refused saying to say No by name; "the last one" is the last option; a number no option has is refused naming the options with their numbers.
+- **question/desktop/021** — `question_desktop_021_part_of_one_label_chooses_it`: a part only one label has chooses it — Codex's "proceed", "don't ask again", "no, and tell codex", OpenCode's "always", Pi's "production please"; "auto mode", "switch to auto mode", "yes, switch to auto mode" and a misspelt "swich to auto mode" on Claude's prompt name the keyboard-only option and are refused as such; words not all in a label ("the nowhere one") go to the model; OpenCode's always option still raises its confirmation.
+- **question/desktop/022** — `question_desktop_022_a_whole_label_wins_and_the_countdown_names_it` (the user's case): "Yes", "yes.", "yes please", "um, yes", "Yes, do it", "YES" on Claude's prompt choose Yes, not "Yes, and switch to auto mode"; the countdown names the option sent — "“Yes” (allow once) — git push origin main", "“No” (deny) — …" — and does for Codex, OpenCode, Devin and a Pi choice, and OpenCode's always option as "(always allow)".
+- **question/desktop/023** — `question_desktop_023_words_that_fit_several_options_choose_none`: "yes and" to Claude Code (its always option and the auto-mode one) and "allow for" to Devin (three keyboard-only options) fit several options, none allowing once, and are no whole label, so nothing is chosen and the refusal names them — with their numbers, except the auto-mode option's, whose number depends on whether Claude draws it, and then says "say more of its words"; "yes proceed" and "allow once" choose one; a number naming one option by its place and another by its label is refused as ambiguous.
+- **question/desktop/024** — `question_desktop_024_words_that_match_nothing_choose_nothing`: "go to the overview" matches no option of any agent's prompt, so the (stub) model is asked, once, and its `not_answer` goes on to command handling; a model answer the question cannot take is refused naming the options — Claude's Yes with its number, No by name alone.
+- **question/desktop/025** — `question_desktop_025_a_keyboard_only_question_refuses_every_way_of_naming_an_option`: a Codex form question of ten options and a question on a channel the deck cannot use refuse "option two", "2", a whole label and part of one with the keyboard-only sentence, with no model call.
+- **question/desktop/026** — `question_desktop_026_a_form_is_answered_question_by_question`: on Codex's two-question form "two" answers Colour (Green) and the row names Size's options with their numbers, then "the second one" answers Size and the countdown names both; on OpenCode's form "blue" then "one and three", "small and large", "small, medium and large please" and a misheard "medum and large" fill the multi-select Sizes; "small and a hamster" goes to the model rather than half-taking it; on Claude's form "green" then "1 and 3"; a whole label on a later question ("large") answers that question.
+- **question/desktop/027** — `question_desktop_027_a_short_word_picks_the_one_option_that_has_it`: "no" picks Codex's "No, and tell Codex …", "deny" Devin's Deny past six keyboard-only options, "reject it" OpenCode's Reject; "stop" with nothing answered goes to the model.
+- **question/desktop/028** — `question_desktop_028_a_prompt_is_announced_with_the_numbers_to_say` (`voice/reading.rs`): reading mode announces Claude's prompt as "… Bash: git push origin main. Say 1 for Yes, or say No.", leaving the keyboard-only auto-mode option out and naming No without a number; Codex's approval reads its three options; an OpenCode form its first question's; a question voice cannot answer, and a notice with no question, none.
+- **question/desktop/029** — vitest `question/desktop/029: in typing mode an option said out loud answers the question` (`desktop/src/components/VoiceControlPanel.test.tsx`) and `question_desktop_029_typing_mode_matches_on_this_machine_only` (PR #1698, the user's case): with typing mode on and Claude's three-option prompt waiting, "Yes" is offered to the question, local-only, the countdown names "“Yes” (allow once) — git push origin main", nothing is typed, typing mode stays on, the answer is sent, and once the question is gone "run the tests" is typed; in Rust a local-only "Yes" is Yes, "two" is refused, and "go ahead" is `not_answer` with no model call. The verdict is stubbed at the runtime seam in the vitest half.
+- **question/desktop/030** — vitest `question/desktop/030: in typing mode words that are no option are refused, listing the options`: with typing mode on and the same prompt waiting, "run the tests" types nothing and the row says to answer by saying an option or its number — 1 “Yes”, “No”, No without a number since Claude may leave the auto-mode option before it out — or use the keyboard; "send it" presses nothing with the same list; typing mode stays on.
+- **question/desktop/031** — `question_desktop_031_numbers_after_an_option_claude_may_leave_out_choose_nothing` (PR #1698): on Claude Code's default-mode Bash prompt built from the captured payload (Yes, the always option, the keyboard-only auto-mode option marked as one Claude may leave out, No), "1" chooses Yes and "two" the always option; "3", "three", "4", "four", "the fourth one" and "option 4" choose nothing and say "On screen “No” may be 3 or 4 — say “No”."; "no", "No.", "um, no" and "the last one" choose No; "seven" and a model answer the question cannot take are refused listing No by name only; reading mode says "Say 1 for Yes or 2 for …, or say No."; without the suggestion "2" and "3" are refused the same way, "4" is no option, and "no" is No.
+- **question/desktop/032** — `question_desktop_032_a_leading_word_shared_with_allow_once_chooses_it` (PR #1698): "yes", "Yes." and "um, yes please" to Codex's approval, which begin "Yes, proceed" and "Yes, and don't ask again …", choose "Yes, proceed" because only it allows once, and the countdown says "“Yes, proceed” (allow once) — touch codex_b.txt" with no always confirmation; OpenCode's "allow" is Allow once the same way; Claude's "yes and" (two options, neither allowing once), "yes" with two allow-once options, and "allow" against "Allow once" and "Always allow" (a leading part of one only) stay ambiguous; Claude's "yes" is still Yes by its whole label.
+
+#### question/hold
+
+##### question/hold/001 — The held Claude Code hook prints exactly the decision for its own question.
+- **Layer:** L1/fast unit (`src/hook.rs`, a one-shot stand-in daemon on a Unix socket).
+- **Agent:** none (captured payloads).
+- **Asserts:** the hook sends a held `question` message for its pane; allow once prints `allow`; always prints `allow` with the payload's first `permission_suggestions` entry, alone, as `updatedPermissions`; deny prints `deny`; a form prints `allow` with `updatedInput` = the payload's questions unchanged plus `answers` (a label, an array for the multi-select question, or the typed text).
+- **Does not assert:** Claude Code acting on the decision (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/002 — The held hook decides nothing without its own answer.
+- **Layer:** L1/fast unit (`src/hook.rs`).
+- **Agent:** none.
+- **Asserts:** no decision on EOF, on a release, on a reply for another question, on an unparseable line or an unreachable socket; a provenance refusal is recognised, which is what makes the hook re-send the event as a plain one.
+- **Does not assert:** the re-send itself, which writes to the production socket.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/003 — On the real hook loop, a closed hold clears its question and an open one hears the answer.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop on a Unix socket with an attested pane token).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** a producer that holds a question and closes its connection without an answer clears the question and leaves Needs Input; a second producer's question answered through the daemon handler arrives on its connection as one `answered` line.
+- **Does not assert:** Claude Code's own `SIGTERM` (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/004 — A closed hold is told to every attached client without moving the status.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop on a Unix socket with an attested pane token, plus an `AppState` fed only the daemon's broadcast).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** when a producer holding a question closes its connection without an answer, the daemon broadcasts an event carrying `question_resolved_id` and its own release marker; a client applying the broadcast drops the question and keeps Needs Input, as the daemon does; the frame's `event_type` is `unknown`, which an older client reads as a no-op.
+- **Does not assert:** the desktop's projection of the snapshot (`question/desktop/001`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/005 — Always allow grants exactly what the confirmation names.
+- **Layer:** L1/fast unit (`src/question.rs`, the captured two-suggestion Bash payload).
+- **Agent:** none (captured payloads).
+- **Asserts:** the always option's scope describes the first suggestion, with its `session` destination, and the decision's `updatedPermissions` is that one update, whose own description equals the confirmed scope — the later `setMode` is not sent; per-mode and per-destination wording; an update the deck cannot describe makes the option keyboard-only and produces no decision.
+- **Does not assert:** Claude Code applying the update (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/006 — Identical question ids on two panes stay apart.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop with two attested panes).
+- **Agent:** none (`/bin/sh` stand-ins).
+- **Asserts:** answering one agent's question reaches only the producer on its pane; the other pane's producer hears nothing and stays held; a hold is never answered for an agent that did not register it.
+- **Does not assert:** OpenCode or Codex reusing an id (both producers here are stand-ins).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/007 — A superseded handler cannot drop its replacement.
+- **Layer:** L1/fast unit (`src/daemon.rs`).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** a second registration for the same pane and question releases the first producer as superseded; the first registration letting go late leaves the replacement held and the question pending, and the answer reaches the replacement.
+- **Does not assert:** the timing of a real producer's close.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/008 — Held questions never starve the hook pool, and no question connection outlives its reply.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the hook loop with its connection cap cut to two, then its hold budget cut to one).
+- **Agent:** none (`/bin/sh` stand-ins).
+- **Asserts:** with three questions held on a two-slot pool, a completion hook still gets in, clears the first question and releases its producer; past the hold budget a question is not held, its producer is released at once and the card still reads Needs Input; every question connection is closed with its one reply — cleared, not held, superseded or released at the hold deadline — so a producer that keeps its socket open and sends another line has it read by nothing, across more producers than the pool and the budget hold, and a fresh producer still gets in.
+- **Does not assert:** the production numbers (32 and 64).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/009 — The daemon releases a hold at its deadline.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the hook loop with a short hold deadline).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** a producer that never lets go is released at the deadline, the question is dropped, and a daemon-synthetic release naming it is broadcast.
+- **Does not assert:** the production deadline.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/010 — An always-allow too long or too odd to show whole is keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`, through the event's own sanitizing).
+- **Agent:** none (synthetic suggestions in Claude Code's shape).
+- **Asserts:** a first suggestion whose description would pass the snapshot's 300-byte cap (many directories with the broadest last, many rules), or whose target sanitizing would alter (a bidi character) or that reads ambiguously (a comma), has no scope, reaches the card as a keyboard-only always option, is refused `keyboard_only` by validation, and produces no decision for a forged reply; a short one shows the same scope after sanitizing that the decision is checked against, and is sent.
+- **Does not assert:** the desktop's confirmation rendering (`question/desktop/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/011 — A late cleanup cannot clear a same-id replacement.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop, barriers after the old cleanup's `forget` and after the replacement's hold registration).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** a producer's connection closes and the daemon lets go of its hold; a same-id replacement asked before the cleanup clears the question is not registered until the cleanup has finished (audit R3); it then registers and is published at its own revision, stays held and pending, and the deck's answer naming that revision reaches it.
+- **Does not assert:** a real producer's timing.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/012 — A superseded registration cannot publish its question or lend its revision.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop, a barrier after a hold's registration and before its publication; plus a direct late ingestion).
+- **Agent:** none (`/bin/sh` stand-ins).
+- **Asserts:** a second producer asking the same id with other content waits while the first is registered but unpublished (audit R1), then replaces it: the first producer is let go as superseded, the pane shows the second command at the second registration's revision, an answer naming the first revision is refused stale and the answer reaches the second producer; an event ingested late for the superseded registration is refused and changes nothing; an unheld event naming a held id with other content gets a fresh revision and the hold is released.
+- **Does not assert:** a real producer's timing.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/013 — An answer's clearing event cannot release a new registration.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop, a barrier after the held reply and before the deck's clearing event).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** the same id asked again right after the deck's held answer reached its producer is not registered until the deck's clearing event is applied (audit R3); it then stays held and pending at its own revision.
+- **Does not assert:** answering the re-asked question — the pane's last-answered id refuses the same id by design (`question/answer/007`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/014 — OpenCode's and Codex's always options are shown whole or keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`, through the event's own sanitizing).
+- **Agent:** none (synthetic payloads in OpenCode's, Codex's and Devin's shapes).
+- **Asserts:** an OpenCode `always` list whose sentence would pass the snapshot's 300-byte cap, a pattern sanitizing would alter (a bidi character), one that reads ambiguously (a comma) or an empty list has no scope, reaches the card as a keyboard-only "Allow always", is refused `keyboard_only` by validation, and a forged reply maps to no `always`; a Codex command too long, spanning lines, carrying a bidi character or missing does the same for `p`, and `answer_keys` refuses it; a short pattern list shows every pattern and replies `always`, a short command is named whole and types `p`; Devin's "allow for …" options are keyboard-only with no scope.
+- **Does not assert:** the desktop's confirmation rendering (`question/desktop/*`), or what prefix Codex itself grants.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/015 — An answer the agent does not take is reported and answerable again.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop with a short acknowledgement wait).
+- **Agent:** none (`/bin/sh` stand-in; a raw socket producer acknowledging as the OpenCode plugin's child does).
+- **Asserts:** a producer that asks to acknowledge reports the agent refused the answer: the deck's answer is refused `write_failed`, naming the sanitized reason and that the agent is asking again; the same id raised again is answerable and, reported taken, answered once; a producer that reports nothing within the wait leaves the answer `unconfirmed`, and the question is not offered again.
+- **Does not assert:** the plugin's own report or re-raise (`question/detect/007`), or the child's bridge (`question/hold/016`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/016 — The OpenCode child passes on what OpenCode made of the reply.
+- **Layer:** L1/fast unit (`src/hook.rs`, a one-shot stand-in daemon on a Unix socket that reads the held message, answers, and reads the acknowledgement).
+- **Agent:** none (captured OpenCode 1.18.34 `permission.asked`).
+- **Asserts:** `await-answer --ack`'s hold carries `ack`; the child prints OpenCode's `once` reply, then passes the plugin's report — OpenCode refused it, and why — to the daemon on the same connection; a report that never comes or does not parse is passed on as nothing.
+- **Does not assert:** the daemon's handling of the report (`question/hold/015`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/017 — A late question from a superseded session leaves the live one.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, the daemon's own ingest and hold registration).
+- **Agent:** none (`/bin/cat` stand-in for Claude Code).
+- **Asserts:** after the pane moves to a new hook session that holds a permission prompt, a question event from the session it left — with a fresh timestamp — neither becomes the pane's question nor reaches a client's copy of the event; the live question keeps its revision and its hold, and is then answered.
+- **Does not assert:** a late event from the current session with an older timestamp, which is applied as before.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/018 — A session switch releases the predecessor's hold.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop and the daemon's own ingest).
+- **Agent:** none (`/bin/sh` stand-in agent; the successor is the placeholder card a respawn mints).
+- **Asserts:** with a held question on the pane's old session and a newer session without one beside it, the next event on the pane — a late frame from the old session — releases the old producer, and the old question is neither the pane's pending question nor answerable.
+- **Does not assert:** how the successor card came to sit beside the old one without retiring it.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/019 — An OpenCode subagent's permission prompt is held, attributed to the subagent, and answered.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop; the frames are built by the OpenCode parser from the plugin's child-session payloads).
+- **Agent:** none (`/bin/sh` stand-in; a raw socket producer acknowledging as the OpenCode plugin's child does; captured OpenCode 1.18.34 `permission.asked` re-pointed at a child session).
+- **Asserts:** a child session's `permission.asked` carrying `subagent_id` is held as the pane's pending question with that `subagent_id`, the card is on Needs Input with the wait held by that subagent, `AnswerQuestion` answers it and the producer's acknowledgement makes it succeed; the child's `permission.replied` carrying `request_id` is a subagent permission reply that names the question, and it takes the card off Needs Input with nothing pending.
+- **Does not assert:** that the plugin routes the child's ask through `await-answer` (`question/detect/007` and `opencode_plugin_attributes_a_childs_permission_prompt_to_its_subagent`), or the reply posted to OpenCode.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/020 — An answer a non-acknowledging producer never received is not reported delivered.
+- **Layer:** L1/fast unit (`src/daemon.rs`, `write_held_reply` over an in-memory duplex).
+- **Agent:** none.
+- **Asserts:** for a producer that does not acknowledge (Claude Code's hook, Pi's child), a reply whose write fails because the producer closed its end is reported `Unconfirmed`, and a reply written to an open producer is reported `Delivered`.
+- **Does not assert:** the desktop's sentence for an unconfirmed answer (`question_desktop_every_refusal_has_its_sentence`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/021 — A hold the daemon never takes is shown as a plain prompt at once.
+- **Layer:** L1/fast unit (`src/hook.rs`, `hold_question_within_at` against a stand-in socket).
+- **Agent:** none (a captured Claude Code `PermissionRequest`).
+- **Asserts:** the held message asks the daemon to confirm the hold; against a daemon that reads it and answers nothing with the connection open (what 0.46.0 does with an unknown `question`), or one that closes the connection, the hook gives up within the hold-start bound and sends the event again as a plain `PermissionRequest` without its question; a daemon that says `held` and later releases the question gets no plain event, and the release is the reply the hook acts on.
+- **Does not assert:** the daemon writing the `held` line (`question/hold/022`), or a provenance refusal's fallback (`question/hold/002`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/022 — A producer that asks is told the hold started.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop over a Unix socket).
+- **Agent:** none (a `/bin/sh` stand-in pane).
+- **Asserts:** a held question sent with `confirm_hold` gets a `held` line once the hold is registered, then the release that ends it when a newer question supersedes it; a held question sent without `confirm_hold` gets no `held` line, and its first line is the release.
+- **Does not assert:** what the hook does without a `held` line (`question/hold/021`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/023 — A late frame from a superseded session revives no question.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop and the daemon's own ingest).
+- **Agent:** none (a `/bin/sh` stand-in pane).
+- **Asserts:** with a held question on the pane, the same agent's new hook session (a `SessionStart` under a new session id) releases the producer; a late question and a late `ToolStart` from the old session, stamped newer than anything the new session sent, then leave no question pending on the pane, on the agent's snapshot or for an answer, which is refused `no_pending_question`; and the pane has one card, since the reuse guard files both sessions of one agent on it.
+- **Does not assert:** a different agent's late frames, which admission refuses before ingest (issue #320).
+- **Platform coverage:** mac+linux.
+
+##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.
+- **Asserts:** Needs Input and a pending held Permission question; permission labels match the visible menu, and No's number matches the screen's, one higher where the screen leaves out "Yes, and switch to auto mode" (PR #1698: the payload does not say whether Claude draws it); no sentinel before approval; one client-library `AnswerQuestion` creates the unique sentinel and the agent finishes Idle.
+- **Does not assert:** desktop voice recognition or the always-allow confirmation.
+- **Platform coverage:** mac+linux.
+
+##### question/live/002 — One client answer fills a real Claude form, including multiple choices.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive Haiku Claude Code.
+- **Asserts:** the whole two-question form, multi-select sizes, appended free-text and keyboard-only options, one held reply selecting Green/Small/Large, the reported choices, and Idle with no pending question.
+- **Does not assert:** free-text dictation or keyboard form navigation.
+- **Platform coverage:** mac+linux.
+
+##### question/live/003 — Keyboard denial clears a held Claude question and rejects a late answer.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive Haiku Claude Code.
+- **Asserts:** typing the number Claude draws beside No (3, or one less than the deck's when the screen leaves out the auto-mode option the deck lists) denies the visible permission, the snapshot clears, a late client answer is refused `NoPendingQuestion`, and the sentinel stays absent.
+- **Does not assert:** a keyboard allow or another client's simultaneous answer.
+- **Platform coverage:** mac+linux.
+
+##### question/live/004 — Codex approval and two-question Plan form accept the daemon's keys.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive Codex, cheap `common::codex_test_model()` (default gpt-5.1-codex-mini), read-only sandbox and on-request approvals.
+- **Asserts:** permission table labels and visible allow/deny choices; approval creates a unique sentinel; Plan mode exposes a whole two-question form with appended `None of the above`; client answers both questions and Codex reports Green/Large.
+- **Does not assert:** always-allow persistence or free-text notes.
+- **Platform coverage:** mac+linux.
+
+##### question/live/005 — OpenCode replies through its plugin for permissions and whole forms.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive OpenCode, cheap `common::opencode_test_model()` (default Haiku); a subscription host can override `DOT_AGENT_DECK_OPENCODE_TEST_MODEL` with `openai/gpt-5.6-luna`, while compatible API credentials can use a mini model.
+- **Asserts:** permission options and held channel, a unique sentinel after approval, a two-question form with multiple sizes and appended free-text, one plugin reply and reported Green/Small/Large choices.
+- **Does not assert:** plugin HTTP stale-reply errors or desktop voice.
+- **Platform coverage:** mac+linux.
+
+##### question/live/006 — Pi answers another extension's selector without a model or credential.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_pi_questions.rs`), offline and credential-free.
+- **Agent:** real Pi TUI with the deck's production extension and a stand-in slash-command extension; no model call, not reel-eligible.
+- **Asserts:** the select dialog's real labels and pending question, a client answer resolves Blue to the asking extension, the dialog closes and Pi visibly reports the selected value.
+- **Does not assert:** a live model, confirm/input dialogs or Pi's undocumented API stability beyond this installed version.
+- **Platform coverage:** mac+linux; runtime skip when Pi is absent (failure with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`).
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:
@@ -8188,3 +9434,16 @@ Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when sche
 - **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn are acknowledged and acted on, and the actual inbox list CLI lists each as acknowledged, within a 300-second agent window; a message left queued fails it (until 2026-10-14 a queued message passed, so a run with nothing acknowledged was green). Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
+
+## Desktop native network scenarios
+
+These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner. They use the native driver harness, and network scenarios are explicitly opted into locally rather than included in the deterministic desktop CI run.
+
+##### desktop/pull-request/001 — A real GitHub PR renders and closes from the agent screen and the overview row.
+
+- **Test:** `desktop/driver/pull-request.live.test.ts`, `pull_request_001`.
+- **Layer:** native Tauri/WebKitGTK driver with real GitHub network access; local opt-in using `DAD_DRIVER_REAL_GITHUB=1`, skipped by default.
+- **Agent:** a shell plus a synthetic session-start hook, matching `session/pr/001`'s session setup; real `gh` lookup on PR #1601's branch and the real native child webview. No LLM is started.
+- **Asserts:** the native child has nonzero dimensions matching the overlay frame; OCR of the composed X display inside that frame finds the real PR title; Back, Open in browser and Close are visible and usable; Close and Escape from both the toolbar and focused GitHub page remove the overlay and native view; the system-browser handoff receives the real PR URL. The same checks run from the agent pane and the overview row as a control.
+- **Does not assert:** macOS WKWebView or Windows WebView2 placement; GitHub login or cookie persistence; real-agent work. The system browser is replaced by a URL recorder, while the embedded GitHub page is real.
+- **Platform coverage:** Verified on Linux WebKitGTK only, under Xvfb at 96 DPI; macOS WKWebView is not covered and the reported macOS blank/unclosable page was not reproduced here. In addition to the driver tier's prerequisites, this local scenario needs authenticated `gh`, network access to GitHub and PR #1601, Tesseract (`DAD_DRIVER_TESSERACT` or PATH), `/usr/bin/python3` with PyGObject/Gdk 3, and `xdotool` (`DAD_DRIVER_XDOTOOL` or PATH). Nix WebKitGTK also needs its `glib-networking` modules supplied in `GIO_EXTRA_MODULES` for HTTPS. From the repository root, run `DAD_DRIVER_REAL_GITHUB=1 bash desktop/scripts/driver-test.sh` to build and run the driver suite including this scenario; use `--no-build` only with an existing driver-seam-enabled embedded bundle. Evidence, including passing runs, is saved under the gitignored `desktop/driver-results/pull-request-live-<pid>/`.

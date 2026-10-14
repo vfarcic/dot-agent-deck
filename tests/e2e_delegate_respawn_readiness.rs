@@ -185,7 +185,7 @@ fn run_real_clear_true_delegate(deck: &TuiDeck, worker_command: &str, case: Real
     // The orchestration opens focused on its start role. Detach, then jump to
     // the second role card so the real worker TUI itself is visibly on screen.
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     deck.send_bytes(b"2");
     // Any-of over `input_ready_needles`, via the existing grid-predicate helper
     // so this stays in the test file rather than widening shared harness surface.
@@ -218,7 +218,7 @@ fn run_real_clear_true_delegate(deck: &TuiDeck, worker_command: &str, case: Real
     // status sequence below is captured only from this point forward, so it is
     // the delegated turn rather than boot-time card paint.
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     // Issue #243: stamped so the submission wait below can be scoped to events
     // broadcast AFTER the delegate, and so the latency bound has an anchor. The
     // FIRST worker has been up for a while by now and `EventSub::wait_for` scans

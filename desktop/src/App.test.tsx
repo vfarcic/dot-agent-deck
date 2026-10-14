@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { agentKey } from "./lib/agentKey";
 import { WINDOWS_ORCHESTRATION_BLOCK_REASON } from "./lib/platform";
-import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, DEFAULT_VOICE_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
 import { LaunchCleanupError } from "./lib/actionError";
 import type { UpgradeEvent, UpgradeOutcome } from "./lib/upgrade";
 import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState, SendResult } from "./types";
@@ -388,6 +388,26 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime()} />);
     fireEvent.keyDown(document.body, { key: "k", metaKey: true });
     expect(screen.getByRole("button", { name: /Manage projects/ })).toHaveTextContent("Choose projects & orchestrations");
+  });
+
+  /**
+   * Scenario: two runs of one orchestration each have a Coder, beside a
+   * standalone agent. The command palette's Focus entries name each Coder by
+   * its run's title and its role (issue #1668) and the standalone agent by its
+   * role as before, and the second run's entry selects that run's tile.
+   */
+  it("names the palette's Focus entries for orchestration agents by run title and role", () => {
+    const member = (id: string, run: string, title: string): AgentSession => ({ ...agentIn(id, "/tmp/project"), role: "Coder", displayName: "Coder", tab: { kind: "orchestration", orchestrationId: run, name: "mixed", displayTitle: title, roleName: "coder", roleIndex: 1, isStartRole: false } });
+    const standalone = { ...agentIn("solo", "/tmp/project"), role: "Claude code", displayName: "Changelog sweep" };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: liveSnapshot([member("coder-a", "run-a", "prd-1401"), member("coder-b", "run-b", "prd-1500"), standalone]) })} />);
+    fireEvent.keyDown(document.body, { key: "k", metaKey: true });
+    expect(screen.getByRole("button", { name: /Focus prd-1401 Coder/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Focus Claude code/ })).toBeVisible();
+    expect(screen.queryByRole("button", { name: /^Focus Coder/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Focus prd-1500 Coder/ }));
+    const [first, second] = screen.getAllByTestId("agent-tile-coder");
+    expect(second.className).toContain("is-selected");
+    expect(first.className).not.toContain("is-selected");
   });
 
   /**
@@ -2046,8 +2066,8 @@ describe("ControlDeck", () => {
     // states stay pinned with stub sections in
     // `components/SettingsSheet.test.tsx`, so this does not become their only
     // coverage. PRD #741's Daemons row took it to three and PRD #802 M4's Voice
-    // row to four.
-    expect(SETTINGS_SECTIONS).toHaveLength(4);
+    // row to four, and PRD #1401's GitHub row to five.
+    expect(SETTINGS_SECTIONS).toHaveLength(5);
     expect(screen.getByTestId("settings-layout")).not.toHaveClass("is-single");
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
 
@@ -3031,5 +3051,41 @@ describe("upgrading an older local daemon at launch (issue #1636)", () => {
       expect(screen.queryByTestId("upgrade-dialog"), name).not.toBeInTheDocument();
       view.unmount();
     }
+  });
+});
+
+/**
+ * Issue #1667 — what Reading is told to call each agent: an orchestration
+ * agent by its run's title (the overview's group heading) and its name, a
+ * standalone agent by its name.
+ */
+describe("Reading's agent labels", () => {
+  beforeEach(() => window.history.replaceState({}, "", "/"));
+
+  /** Scenario: Reading is on with a titled run's coder, an untitled run's coder and a standalone agent on the deck; Reading names the first "prd-1401 Coder", the second by its orchestration's name and "Coder", and the standalone agent by its own name — the same titles the overview shows as the group headings. */
+  it("names an orchestration agent by the run title and its name", async () => {
+    const coder = (id: string, orchestrationId: string, displayTitle: string | undefined): AgentSession => ({
+      ...agentIn(id, "/work/app"),
+      displayName: "Coder",
+      tab: { kind: "orchestration", orchestrationId, name: "mixed", displayTitle, roleName: "coder", roleIndex: 1, isStartRole: false },
+    });
+    const solo = { ...agentIn("3", "/work/app"), displayName: "Reviewer" };
+    const snapshot = liveSnapshot([coder("1", "run-a", "prd-1401"), coder("2", "run-b", undefined), solo]);
+    const settings = settingsStore({ voice: { ...DEFAULT_VOICE_SETTINGS, reading: "on", reading_notice: "shown" } });
+    const voiceReadingStart = vi.fn(async (_target: { deckId: string; agentId: string; label: string }) => ({ kind: "started" as const, session: 1 }));
+    const live = runtime({
+      snapshot,
+      ...settings,
+      voiceSpeechPlan: vi.fn(async () => ({ kind: "system" as const })),
+      voiceReadingStart,
+      voiceReadingStop: vi.fn(async () => undefined),
+      onVoiceReadingConsentOff: vi.fn(async () => () => undefined),
+      onVoiceReadingConsentOn: vi.fn(async () => () => undefined),
+    });
+    render(<DeckShell runtime={live} />);
+
+    await waitFor(() => expect(voiceReadingStart).toHaveBeenCalledTimes(3));
+    const labels = Object.fromEntries(voiceReadingStart.mock.calls.map(([target]) => [target.agentId, target.label]));
+    expect(labels).toEqual({ "1": "prd-1401 Coder", "2": "mixed Coder", "3": "Reviewer" });
   });
 });

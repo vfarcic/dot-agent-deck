@@ -82,6 +82,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {
+        name: "pull-request-badge",
+        description: "An agent with open pull request #1234 awaiting review, on its TUI card and desktop Dashboard row.",
+        clients: &[Client::Tui, Client::Desktop],
+    },
+    Scenario {
         name: "dashboard-fleet",
         description: "The desktop Dashboard with agents grouped under two connected daemons.",
         clients: &[Client::Desktop],
@@ -147,6 +152,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "voice-question",
+        description: "The desktop agent pane with a Codex command approval waiting and \"go ahead\" heard: the voice row shows the answer, naming the option (Yes, proceed) and the command, with its five-second countdown and Cancel.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "voice-numbers",
         description: "The desktop agent dashboard with voice on: a number before each agent row, one sequence across the daemons, ready to be said or pressed.",
         clients: &[Client::Desktop],
@@ -165,6 +175,11 @@ pub const SCENARIOS: &[Scenario] = &[
         name: "help",
         description: "The TUI keyboard shortcut help overlay.",
         clients: &[Client::Tui],
+    },
+    Scenario {
+        name: "host-metrics",
+        description: "The host of a deck: the TUI's Host of this deck overlay and the desktop Dashboard's Host button opened, for one fixed sample.",
+        clients: &[Client::Tui, Client::Desktop],
     },
 ];
 

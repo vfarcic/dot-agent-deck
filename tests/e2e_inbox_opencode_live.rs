@@ -19,7 +19,7 @@ fn opencode_015_live_idle_delegate_runs_in_shown_session() {
     let session = op.route()["route"]["params"]["sessionID"].clone();
     assert!(session.is_string());
     op.deck.send_bytes(b"\x04");
-    op.deck.wait_for_string("[New Agent Ctrl+N]");
+    op.deck.wait_for_string("[New Agent n/Ctrl+N]");
     let id = op.delegate_body(&format!("Use the shell to run exactly: printf '{}' > '{}'; sleep 5. Then reply DONE-opencode-idle-173ce9.txt and end your turn.",live::CONTENT,op.work.join("opencode-idle-173ce9.txt").display()));
     assert!(
         op.deck.wait_for_grid_string_within("Working", BUDGET),

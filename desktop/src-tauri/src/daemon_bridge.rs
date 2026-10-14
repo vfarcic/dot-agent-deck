@@ -20,9 +20,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent_view::AgentView;
 use crate::dto::{
-    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, deck_path_text,
-    deck_wire_id, disconnected_snapshot_because, map_agent, observed_fleet, observed_fleet_decks,
-    safe_message, selection_fields, unconfigured_fleet,
+    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, HostMetricsReportDto,
+    deck_path_text, deck_wire_id, disconnected_snapshot_because, map_agent, observed_fleet,
+    observed_fleet_decks, safe_message, selection_fields, unconfigured_fleet,
 };
 use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
@@ -62,6 +62,8 @@ pub(crate) struct HandshakeInfo {
     /// Whether the deck honours the directory browser's listing options
     /// (issue #1240) — see [`listing_options`].
     pub(crate) listing_options: bool,
+    /// Issue #1637: the daemon's hook-binary notices, from the same reply.
+    pub(crate) hook_binary_notices: Vec<crate::dto::HookBinaryNoticeDto>,
 }
 
 /// An established link to one deck: the handshake that classified it, and a
@@ -1218,7 +1220,22 @@ fn classify_handshake(
             .flatten(),
         new_agent_reason: response.ok.then(|| new_agent_reason(response)).flatten(),
         listing_options: response.ok && listing_options(response),
+        hook_binary_notices: hook_binary_notices(response),
     }
+}
+
+/// Issue #1637: the notices a `Hello` reply carries, for the webview. None from
+/// a refused handshake or a daemon that predates them.
+fn hook_binary_notices(response: &AttachResponse) -> Vec<crate::dto::HookBinaryNoticeDto> {
+    if !response.ok {
+        return Vec::new();
+    }
+    response
+        .hook_binary_notices
+        .iter()
+        .flatten()
+        .map(crate::dto::HookBinaryNoticeDto::new)
+        .collect()
 }
 
 /// [`classify_handshake`] with the process-wide allowance read, for
@@ -1280,6 +1297,7 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         daemon_version: handshake.daemon_version,
         // A daemon answered the handshake, so this is no disconnected deck.
         disconnected_reason: None,
+        hook_binary_notices: handshake.hook_binary_notices,
     }
 }
 
@@ -1374,6 +1392,7 @@ async fn hello_exchange(socket_path: &Path) -> Result<(HandshakeInfo, AttachResp
         &AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: Some(client_build.clone()),
+            follow_on: false,
         },
     )
     .await
@@ -1585,8 +1604,17 @@ pub(crate) async fn snapshot_of(endpoint: &Endpoint, links: &DaemonLinks) -> Des
 pub(crate) async fn snapshot_with(
     endpoint: &Endpoint,
     links: &DaemonLinks,
-    view: Option<&mut AgentView>,
+    mut view: Option<&mut AgentView>,
 ) -> DesktopSnapshot {
+    // Issue #1637: the daemon's hook-binary notices changed, and they live on
+    // the `Hello` reply the held link captured. Drop it so this refresh
+    // handshakes again.
+    if view
+        .as_deref_mut()
+        .is_some_and(AgentView::take_handshake_due)
+    {
+        links.invalidate(endpoint).await;
+    }
     let daemon = match links.trusted(endpoint).await {
         Ok(daemon) => daemon,
         Err(error) => return disconnected_with_reason(endpoint, links, error).await,
@@ -1610,18 +1638,34 @@ pub(crate) async fn snapshot_with(
             unconfigured: unconfigured_fleet(),
             observed: observed_fleet_decks(),
             all_decks: crate::dto::all_decks_applied(),
+            host_metrics: None,
         };
     }
 
     if let Some(view) = view {
         if view.needs_fetch(tokio::time::Instant::now()).is_none() {
             let records = view.records();
-            return connected_snapshot(connection, records, view.schedule_revision());
+            let host = held_host_metrics(view);
+            return connected_snapshot(connection, records, view.schedule_revision(), host);
         }
-        return match bounded_reply("ListAgents", daemon.client.list_agents_detailed()).await {
+        // PRD #1258 M4: the host sample rides the same refreshes the list does —
+        // the first one, every reconcile tick and every refetch — and is asked
+        // concurrently, so the two waits overlap rather than add up: the refresh
+        // waits for the slower of the two replies. The host request is bounded
+        // at `HOST_METRICS_REPLY_TIMEOUT` (2 s), so it can lengthen a refresh by
+        // at most that much, and only when the deck's sample is slower than its
+        // agent list.
+        let (listing, host) = tokio::join!(
+            bounded_reply("ListAgents", daemon.client.list_agents_detailed()),
+            fetch_host_metrics(&daemon.client),
+        );
+        return match listing {
             Ok(listing) => {
-                view.install(listing, tokio::time::Instant::now());
-                connected_snapshot(connection, view.records(), view.schedule_revision())
+                let now = tokio::time::Instant::now();
+                view.install(listing, now);
+                view.install_host_metrics(host, now);
+                let host = held_host_metrics(view);
+                connected_snapshot(connection, view.records(), view.schedule_revision(), host)
             }
             Err(error) => {
                 // The fetch failed, so the view's demand stands: it was never
@@ -1636,8 +1680,17 @@ pub(crate) async fn snapshot_with(
     // PRD #742 M14: bounded, like the handshake above it. This is the call that
     // produces a deck's FIRST snapshot, so a peer that stalls here is a deck the
     // webview never hears from rather than a request that is merely slow.
-    match bounded_reply("ListAgents", daemon.client.list_agents_detailed()).await {
-        Ok(listing) => connected_snapshot(connection, listing.records, listing.schedule_revision),
+    let (listing, host) = tokio::join!(
+        bounded_reply("ListAgents", daemon.client.list_agents_detailed()),
+        fetch_host_metrics(&daemon.client),
+    );
+    match listing {
+        Ok(listing) => connected_snapshot(
+            connection,
+            listing.records,
+            listing.schedule_revision,
+            host.map(|report| HostMetricsReportDto::from_report(&report, Duration::ZERO)),
+        ),
         Err(error) => {
             // The held link just failed to carry a request. Whatever is at the
             // other end is not the daemon this handshake classified, so the
@@ -1681,10 +1734,41 @@ pub(crate) async fn disconnected_with_reason(
 /// advisory in any case: the refusal that actually protects a live orchestration
 /// is made daemon-side by `run_daemon_stop` (issue #770), not by this figure,
 /// and every `DesktopAction` — Stop included — tails a full `refresh_and_emit`.
+/// PRD #1258 M4: how long the bridge waits for a host-metrics answer. Short,
+/// because the sample is a few `statvfs` calls and two small reads on the
+/// daemon's side, and a deck whose filesystem stalls should cost a refresh this
+/// much at most rather than [`DECK_REPLY_TIMEOUT`].
+const HOST_METRICS_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// PRD #1258 M4: ask the deck for its host sample. The capability check is
+/// [`DaemonClient::host_metrics`]'s, read from the cache the handshake seeded,
+/// so an older daemon costs no connection and answers `NotAvailable`. `None`
+/// when the request failed or did not answer in time: a host reading is
+/// informational, so a failure here never marks the link stale.
+async fn fetch_host_metrics(
+    client: &DaemonClient,
+) -> Option<dot_agent_deck::daemon_client::HostMetricsReport> {
+    match tokio::time::timeout(HOST_METRICS_REPLY_TIMEOUT, client.host_metrics()).await {
+        Ok(Ok(report)) => Some(report),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+/// PRD #1258 M4: the view's held host answer, aged by how long it has been held.
+fn held_host_metrics(view: &AgentView) -> Option<HostMetricsReportDto> {
+    view.host_metrics().map(|(report, at)| {
+        HostMetricsReportDto::from_report(
+            report,
+            tokio::time::Instant::now().saturating_duration_since(*at),
+        )
+    })
+}
+
 fn connected_snapshot(
     connection: DesktopConnection,
     records: Vec<dot_agent_deck::daemon_client::AgentRecord>,
     schedule_revision: Option<u64>,
+    host_metrics: Option<HostMetricsReportDto>,
 ) -> DesktopSnapshot {
     DesktopSnapshot {
         connection: DesktopConnection {
@@ -1706,6 +1790,7 @@ fn connected_snapshot(
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
         all_decks: crate::dto::all_decks_applied(),
+        host_metrics,
     }
 }
 
@@ -3633,6 +3718,7 @@ mod tests {
                     project_actions_reason: None,
                     new_agent_reason: None,
                     listing_options: false,
+                    hook_binary_notices: Vec::new(),
                 },
             );
             assert_eq!(connection.daemon_version.as_deref(), daemon_version);
@@ -3650,6 +3736,63 @@ mod tests {
         assert_eq!(offer(Some(CLIENT_VERSION))["kind"], "current");
         assert_eq!(offer(Some("999.0.0"))["kind"], "daemon-newer");
         assert_eq!(offer(None)["kind"], "unknown");
+    }
+
+    /// Issue #1637: a deck's connection carries the hook-binary notices its
+    /// daemon put on the `Hello` reply, camelCased for the webview, with the
+    /// daemon's remedy verbatim. A refused handshake carries none.
+    #[test]
+    fn the_connection_carries_the_hook_binary_notices_from_the_handshake() {
+        use dot_agent_deck::daemon_protocol::{HookBinaryNotice, HookBinaryReason};
+        let notice = HookBinaryNotice {
+            binary: "/opt/homebrew/bin/dot-agent-deck".into(),
+            agents: vec!["Claude Code".into()],
+            version: Some("0.45.1".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: "Run:".into(),
+            command: Some("brew upgrade dot-agent-deck".into()),
+        };
+        let mut response = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+        response.build_version = Some(dot_agent_deck::build_id::local_build_id());
+        response.hook_binary_notices = Some(vec![notice]);
+        let handshake =
+            classify_handshake_for_test(&response, &dot_agent_deck::build_id::local_build_id());
+        let connection = connection_from_handshake(
+            &Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")),
+            handshake,
+        );
+        let wire = serde_json::to_value(&connection).unwrap();
+        let notices = wire["hookBinaryNotices"].as_array().expect("on the wire");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["binary"], "/opt/homebrew/bin/dot-agent-deck");
+        assert_eq!(notices[0]["agents"][0], "Claude Code");
+        assert_eq!(notices[0]["version"], "0.45.1");
+        assert_eq!(notices[0]["daemonVersion"], "0.46.0");
+        assert_eq!(notices[0]["reason"], "older");
+        assert_eq!(notices[0]["remedy"], "Run:");
+        assert_eq!(notices[0]["command"], "brew upgrade dot-agent-deck");
+
+        let mut refused = response.clone();
+        refused.ok = false;
+        refused.error = Some("no".into());
+        let handshake =
+            classify_handshake_for_test(&refused, &dot_agent_deck::build_id::local_build_id());
+        assert!(handshake.hook_binary_notices.is_empty());
+
+        let mut silent = response;
+        silent.hook_binary_notices = None;
+        let connection = connection_from_handshake(
+            &Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")),
+            classify_handshake_for_test(&silent, &dot_agent_deck::build_id::local_build_id()),
+        );
+        assert!(
+            serde_json::to_value(&connection)
+                .unwrap()
+                .get("hookBinaryNotices")
+                .is_none(),
+            "omitted when the daemon reports none"
+        );
     }
 
     /// The revalidation backstop, at the predicate rather than through a
@@ -3674,6 +3817,7 @@ mod tests {
                     project_actions_reason: None,
                     new_agent_reason: None,
                     listing_options: false,
+                    hook_binary_notices: Vec::new(),
                 },
             ),
             _transport: tokio::runtime::Runtime::new()
@@ -3908,6 +4052,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         })
     }
 
@@ -4018,6 +4164,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }));
         let _ = snapshot_with(&endpoint, &links, Some(&mut view)).await;
 
@@ -4234,6 +4382,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         })
     }
 

@@ -43,6 +43,8 @@ import { SelectDeckNote } from "./components/SelectDeckNote";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPanel";
+import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
+import { OpenPullRequest, PrBrowserHostContext } from "./lib/prBrowser";
 import { SelfUpgradeDialog } from "./components/SelfUpgradeDialog";
 import { SelfUpgradeBanner, SelfUpgradeRailButton, noticeOf } from "./components/SelfUpgradeNotice";
 import { tauriSelfUpgradeApi } from "./lib/selfUpgrade";
@@ -54,13 +56,14 @@ import { voicePaneAgent } from "./lib/promptKeys";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, disconnectedRemedy, incompatibleRemedy, startDaemonConfirmCopy } from "./lib/connectionRemedy";
 import { upgradeKindOf, upgradeOffered } from "./lib/upgrade";
 import { ConnectionDetail } from "./components/ConnectionDetail";
+import { HookBinaryNotices } from "./components/HookBinaryNotice";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
-import { useInertBackground } from "./hooks/useInertBackground";
+import { OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
@@ -73,7 +76,7 @@ import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, typ
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey } from "./lib/agentKey";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
-import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
@@ -85,7 +88,9 @@ import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./l
 import { desktopFeaturesOf } from "./types";
 import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { DEFAULT_VOICE_SETTINGS, modeScopedKey } from "./lib/bridge";
-import type { ReadingAgent } from "./lib/reading";
+import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
+import { agentSpokenName } from "./lib/agentNames";
+import { questionAgentName } from "./lib/voiceQuestion";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
@@ -138,6 +143,14 @@ const PROJECT_STALE_REVISION_CODE = "stale-revision: ";
 const PROJECT_STALE_TOKEN_CODE = "stale-token: ";
 const PROJECT_STALE_PREPARATION_CODE = "stale-preparation: ";
 const PROJECT_UNSUPPORTED_PLATFORM_CODE = "unsupported-platform: ";
+/** PRD #1401 — what opening a pull request answers when its agent is no longer listed. */
+export const PULL_REQUEST_AGENT_GONE = "That agent is no longer on its daemon.";
+/** PRD #1401 — "open it in the browser" with no pull request open. */
+export const PULL_REQUEST_NONE_OPEN = "No pull request is open.";
+/** PRD #1401 — a spoken scroll while one of the app's dialogs is over the pull request. */
+export const PULL_REQUEST_COVERED = "Close what is in front of the pull request first.";
+/** PRD #1401 — a pull request in the in-app browser: the view it opened over, and which frame it is in. */
+type OpenPrBrowser = PullRequestBrowserSession & { over: DeckView; opened: number };
 const DESKTOP_EVIDENCE_QUERY = "(min-width: 1260px)";
 
 function evidenceOpenOnFirstLoad(): boolean {
@@ -168,6 +181,8 @@ const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
 const SWITCH_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "switchDeck";
 /** Issue #1496 — the one entry whose params are the dashboard filter's facets. */
 const FILTER_DASHBOARD_INVOKE: keyof typeof VOICE_ACTIONS = "filterDashboard";
+/** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
+const SETTINGS_PANEL = "[data-testid='settings-panel']";
 
 /**
  * Issue #1198 — what a view that names the deck is shown as while the deck is
@@ -269,7 +284,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * settings state instead of taking this one would re-create the bug.
    */
   const settings = useDesktopSettings(runtime);
-  useZoom(runtime, settings);
+  /* PRD #1401 reads the level: a zoom change moves the pull request browser's
+     frame, which it then reports again. */
+  const zoom = useZoom(runtime, settings);
   /**
    * PRD #1195 — the settings as of the LATEST render, for a voice dispatch
    * that writes them. `VoiceControlPanel` captures `dispatchVoice` when an
@@ -367,10 +384,14 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * Reader restored on close would answer the next `Escape` instead of the
    * deck.
    */
+  /* PRD #1401 — not while the pull request browser is open over the pane: the
+     browser takes `Escape` first, and while one of the app's dialogs covers the
+     browser the key is that dialog's, never the pane's under both. */
+  const prBrowserOpen = useRef(false);
   useEffect(() => {
     if (!agentView) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeAgentView();
+      if (event.key === "Escape" && !prBrowserOpen.current) closeAgentView();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -627,6 +648,134 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (paneAgentRetired) closeAgent();
   }, [paneAgentRetired, closeAgent]);
   /**
+   * PRD #1401 — the in-app pull request browser: whose pull request is open,
+   * and the view it was opened over.
+   *
+   * Held HERE because it opens over the deck's pane and the overview's alike,
+   * and this is the one component mounted for both. It does not outlive what
+   * it was opened over: leaving that view, or the agent leaving a deck that is
+   * answering, closes it (the effect below), the way the agent's pane closes
+   * when its own subject goes.
+   */
+  const prBrowserHost = useContext(PrBrowserHostContext);
+  /* `prBrowser` is the pull request the page SHOWS: a switch to another one
+     is held in `prBrowserRequest` until the host has put the page on it, so a
+     switch that failed leaves the toolbar naming the page still on screen.
+     `opened` numbers the frame — one per first open, kept across switches —
+     so a host call that settles late never ends a frame opened after it. */
+  const [prBrowser, setPrBrowser] = useState<OpenPrBrowser | undefined>(undefined);
+  const [prBrowserRequest, setPrBrowserRequest] = useState<OpenPrBrowser | undefined>(undefined);
+  const prBrowserOpened = useRef(0);
+  const prBrowserNow = useRef(prBrowser);
+  prBrowserNow.current = prBrowser;
+  prBrowserOpen.current = prBrowser !== undefined;
+  /* What the open page last failed to do, held against the frame it failed
+     in (`opened`) so a new frame never inherits an old failure. Only the LAST
+     call asked of the page (`prBrowserCalls`, numbered as they are asked) may
+     say why it failed: the next one cleared the problem, so an earlier one
+     failing after it is not what the page is doing now (PR #1680 review,
+     finding 13). Not keyed to the toolbar's session object: a queued switch
+     that lands first replaces it, and the failure of what was asked after it
+     is about the page still on screen. The caller still gets its own
+     failure's sentence, so voice reports what it asked. */
+  // voice-registry-exempt: a report of what the page did not do, written by the entries that asked it, and not something anybody opens
+  const [prBrowserProblem, setPrBrowserProblem] = useState<{ opened: number; text: string }>();
+  const prBrowserCalls = useRef(0);
+  /** Run one thing on the frame numbered `opened`, and show why if it did not happen. Settles to that sentence, or `undefined`. */
+  const onPrBrowserPage = useCallback((opened: number, work: Promise<void>): Promise<string | undefined> => {
+    prBrowserCalls.current += 1;
+    const call = prBrowserCalls.current;
+    setPrBrowserProblem(undefined);
+    return work.then(() => undefined, (cause: unknown) => {
+      const text = cause instanceof Error ? cause.message : String(cause);
+      if (call === prBrowserCalls.current) setPrBrowserProblem({ opened, text });
+      return text;
+    });
+  }, []);
+  /** The frame numbered `opened` is gone: forget it, and any switch it was waiting on. */
+  const forgetPrBrowser = useCallback((opened: number) => {
+    // voice-registry-exempt: the host has already closed the page (Close, Escape, voice's "close", the hand-off, or the page's own Escape), and this only forgets it
+    setPrBrowser((open) => (open?.opened === opened ? undefined : open));
+    // voice-registry-exempt: a switch the closed frame was waiting on, forgotten with it
+    setPrBrowserRequest((pending) => (pending?.opened === opened ? undefined : pending));
+  }, []);
+  /**
+   * The toolbar's Close, `Escape`, voice's "close", and the browser's subject
+   * going away. The frame goes only once the host has closed the page: a close
+   * the platform refused leaves the page on screen, so the frame stays with
+   * its Close and the reason under the toolbar, and the next close tries
+   * again. Settles to that reason, or `undefined`.
+   */
+  const closePrBrowser = useCallback((): Promise<string | undefined> => {
+    const open = prBrowserNow.current;
+    if (!open) return Promise.resolve(undefined);
+    return onPrBrowserPage(open.opened, prBrowserHost.close()).then((failed) => {
+      if (failed === undefined) forgetPrBrowser(open.opened);
+      return failed;
+    });
+  }, [forgetPrBrowser, onPrBrowserPage, prBrowserHost]);
+  const pullRequestContext = useMemo<PullRequestContext>(() => ({
+    openPullRequest: (target) => {
+      const deck = runtime.fleet.find((entry) => entry.connection.deckId === target.deckId);
+      const agent = deck?.agents.find((candidate) => candidate.id === target.agentId);
+      if (!agent) return PULL_REQUEST_AGENT_GONE;
+      const name = displayText(agent.displayName, DISPLAY_LIMITS.name);
+      const pullRequest = agent.pullRequest;
+      if (!pullRequest) return `${name} has no pull request.`;
+      if (!pullRequest.url) return `${name}'s pull request #${pullRequest.number} has no github.com address the app can open.`;
+      const wanted = { deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view };
+      /* With a page open this is a switch, which the page makes and only then
+         the toolbar shows (`switchPrBrowser`); the page already on it, with
+         no other switch waiting, needs nothing. */
+      if (prBrowser) {
+        if (prBrowserRequest || prBrowser.url !== wanted.url) setPrBrowserRequest({ ...wanted, opened: prBrowser.opened });
+      } else {
+        prBrowserOpened.current += 1;
+        setPrBrowser({ ...wanted, opened: prBrowserOpened.current });
+      }
+      return undefined;
+    },
+    /* Closed only once the system browser has the page: a hand-off that
+       failed leaves it here, with the reason under the toolbar, so the user
+       still has it and can try again. */
+    openPullRequestInBrowser: () => {
+      if (!prBrowser) return PULL_REQUEST_NONE_OPEN;
+      const session = prBrowser;
+      return onPrBrowserPage(session.opened, prBrowserHost.openExternal()).then((failed) => {
+        if (failed === undefined) forgetPrBrowser(session.opened);
+        return failed;
+      });
+    },
+    closePullRequest: closePrBrowser,
+    pullRequestBack: () => { if (prBrowser) void onPrBrowserPage(prBrowser.opened, prBrowserHost.back()); },
+  }), [closePrBrowser, forgetPrBrowser, onPrBrowserPage, prBrowser, prBrowserHost, prBrowserRequest, runtime.fleet, view]);
+  /* The page has moved to `request`, or failed to: the toolbar names it only
+     once the host has it there, and a failure is said under the toolbar of
+     the pull request still on screen. The host runs its calls in order, so a
+     switch that settles has put the page where it says, whatever else was
+     asked meanwhile; one about a frame that has since closed is ignored. */
+  const switchPrBrowser = useCallback((request: OpenPrBrowser, work: Promise<void>) => {
+    const failure = prBrowserNow.current?.opened === request.opened ? onPrBrowserPage(request.opened, work) : work.then(() => undefined, () => undefined);
+    void failure.then((failed) => {
+      // voice-registry-exempt: the switch `openPullRequest` asked for has settled, and is no longer waiting
+      setPrBrowserRequest((pending) => (pending === request ? undefined : pending));
+      // voice-registry-exempt: the toolbar follows the page the host now shows; the switch itself was asked through `openPullRequest`
+      if (failed === undefined) setPrBrowser((open) => (open?.opened === request.opened ? request : open));
+    });
+  }, [onPrBrowserPage]);
+  const openPullRequest = useCallback((target: { deckId: string; agentId: string }) => VOICE_ACTIONS.openPullRequest.run(pullRequestContext, target), [pullRequestContext]);
+  const prBrowserDeck = prBrowser ? runtime.fleet.find((entry) => entry.connection.deckId === prBrowser.deckId) : undefined;
+  /* Gone from a deck that is ANSWERING — a deck that is not reports no agents
+     at all, which is not evidence the agent ended (see `paneAgentRetired`). */
+  const prBrowserAgentGone = prBrowser !== undefined && prBrowserDeck?.connection.status === "connected" && !prBrowserDeck.agents.some((agent) => agent.id === prBrowser.agentId);
+  const prBrowserViewLeft = prBrowser !== undefined && JSON.stringify(prBrowser.over) !== JSON.stringify(view);
+  useEffect(() => {
+    /* The browser's subject went away (its agent ended, or the view it was
+       opened over was left): closed like any close, so a page the platform
+       will not close keeps its frame. */
+    if (prBrowserAgentGone || prBrowserViewLeft) void closePrBrowser();
+  }, [closePrBrowser, prBrowserAgentGone, prBrowserViewLeft]);
+  /**
    * PRD #1260 — the pane on screen as the voice panel's dictation mode sees
    * it: whose it is, what the deck calls it, and why it cannot take input if
    * it cannot. `undefined` whenever no pane is RENDERED, which is the same
@@ -660,12 +809,20 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       inputBlocked: paneInput.readOnly
         ? (paneInput.notice ?? "its terminal cannot take input.")
         : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
-      terminalHidden: paneTab !== "terminal" || undefined,
+      /* The pull request browser is drawn over the pane, so its prompt is
+         not on screen either (PRD #1401). */
+      terminalHidden: paneTab !== "terminal" || prBrowser !== undefined || undefined,
       /* PRD #1541 — the agent's type, turn and the deck's prompt keys, for
          the interrupt / clear / scratch commands. */
       ...voicePaneAgent(paneShownAgent),
+      /* PRD #1631 — the question the agent is waiting on, which voice answers
+         from this pane, and only from this pane (decision 9). */
+      question: paneShownAgent.pendingQuestion,
+      /* Issue #1668 — sentences about that question name the agent as
+         Reading does: an orchestration agent by its run's title too. */
+      questionLabel: questionAgentName(paneShownAgent),
     }
-    : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab]);
+    : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab, prBrowser]);
   /**
    * PRD #1260 — a D5 confirmation open on whichever screen is mounted, which
    * outranks dictation. Both the overview and the deck report theirs here
@@ -687,7 +844,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /**
    * PRD #1497 decisions 1–3 of 2026-10-09 — reading: the Settings switch, and
    * while it is on, every agent on the deck being viewed (every observed deck
-   * under All Decks). The voice panel reads them, on any screen. Handed over
+   * under All Decks). The voice panel reads them, on any screen, and narrows
+   * what is spoken to one agent while that agent's pane is open (issue
+   * #1667). Each is labelled as a sentence about it names it: an
+   * orchestration agent by the run's title and its name. Handed over
    * only once the settings are loaded, so the document being read is not
    * taken for the switch being turned.
    */
@@ -703,7 +863,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     .flatMap((deck) => {
       const deckId = deck.connection.deckId;
       if (deckId === undefined) return [];
-      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agent.displayName, incarnation: agent.spawnedAtMs }));
+      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agentSpokenName(agent, READING_LABEL_MAX_CHARS), incarnation: agent.spawnedAtMs }));
     }), [allDecksSelected, runtime.fleet, selectedDeckId]);
   /* Audit A7 — the decks being viewed, so what was still to be said about a
      deck the user moved away from is dropped. Joined into one string so the
@@ -917,16 +1077,43 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* The shell's, so Settings opens from the overview as from the deck (#1197). */
       openOverlay: railContext.openOverlay,
       closeOverlays: railContext.closeOverlays,
-      /* Only while Settings is open, so `close` reads its presence (#1197). */
-      ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
+      /* Only while Settings is open and nothing is drawn over it, so `close`
+         reads its presence as "Settings is on top" (#1197, PR #1680 review). */
+      ...(overlaysOpen.settings && !overlayAbove(document.querySelector(SETTINGS_PANEL)) ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
+      /* The topmost overlay when it is one with no member of its own — the
+         deck's command menu, its shortcut sheet, a configuration sheet — read
+         from the fence's stack, which orders them as they are drawn. */
+      ...(topmostOverlayClose() ? { closeOverlay: () => topmostOverlayClose()?.() } : {}),
+      /* PR #1672 — the overview publishes the Host popover's close while one
+         is open; a stop or upgrade confirmation is modal over the dashboard,
+         so while one is open `close` does not reach behind it to the popover. */
+      ...(confirmationOpen ? { closeHostMetrics: undefined } : {}),
       /* Issue #1492 — the dashboard's scroll, refused while anything is in
          front of it: a dialog layer (the open Daemon selector's menu), the
          Settings sheet, a stop confirmation, or any other modal. Voice acts on what is in front,
          and a dashboard moved behind an overlay is somewhere unexpected when
-         the overlay closes. */
-      ...(overviewVoiceContext.current?.scrollDashboard
-        ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
-        : {}),
+         the overlay closes.
+
+         PRD #1401 — while the pull request browser is open it is what is in
+         front, so the four scrolls move its PAGE instead, from outside it (a
+         fixed script per direction, and nothing read back), unless one of the
+         app's own dialogs is over the browser. */
+      ...(prBrowser
+        ? { scrollDashboard: (move: DashboardScroll) => {
+          if (pullRequestBrowserCovered()) return PULL_REQUEST_COVERED;
+          void onPrBrowserPage(prBrowser.opened, prBrowserHost.scroll(move));
+          return undefined;
+        } }
+        : overviewVoiceContext.current?.scrollDashboard
+          ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
+          : {}),
+      /* PRD #1401 — the browser's members; `closePullRequest` only while the
+         browser is open and nothing is drawn over it, so `close` reads its
+         presence as "the browser is on top". */
+      openPullRequest: pullRequestContext.openPullRequest,
+      openPullRequestInBrowser: pullRequestContext.openPullRequestInBrowser,
+      pullRequestBack: pullRequestContext.pullRequestBack,
+      ...(prBrowser && !pullRequestBrowserCovered() ? { closePullRequest: pullRequestContext.closePullRequest } : {}),
       /* The Deck selector's own write, which its menu calls too (PRD #1195). */
       switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),
       /* The page of whichever list on screen pages (PR #1451 round 3, change 4).
@@ -963,7 +1150,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, overlaysOpen.settings, paneAgent, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -1080,6 +1267,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     or re-created by a navigation.
   */
   return (
+    <OpenPullRequest.Provider value={openPullRequest}>
     <VoiceOn.Provider value={voiceOn}>
       <VoiceNumberingContext.Provider value={numbering}>
       <VoicePagingContext.Provider value={paging}>
@@ -1091,15 +1279,32 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {screenNode}
         {selfUpgradeOpen && selfUpgrade && selfUpgradeApi && <SelfUpgradeDialog check={selfUpgrade} api={selfUpgradeApi} onClose={() => { setSelfUpgradeOpen(false); recheckSelfUpgrade(); }} />}
         {/* The newer-release dialog asks before upgrading anything, so it counts as a confirmation for voice too (issue #1635). */}
-        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
+        {/* PRD #1401: with the pull request browser open, voice is on the browser's screen. */}
+        <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
         {localUpgrade.target && <UpgradeDialog target={localUpgrade.target} runtime={runtime} onClose={localUpgrade.close} autoStart />}
+        {/* PRD #1401 — LAST, so opening it moves no sibling's position (see above). */}
+        {prBrowser && (
+          <PullRequestBrowser
+            session={prBrowser}
+            request={prBrowserRequest}
+            onSwitch={switchPrBrowser}
+            host={prBrowserHost}
+            zoom={zoom.level}
+            problem={prBrowserProblem?.opened === prBrowser.opened ? prBrowserProblem.text : undefined}
+            onClose={() => VOICE_ACTIONS.closePullRequest.run(pullRequestContext)}
+            onBack={() => VOICE_ACTIONS.pullRequestBack.run(pullRequestContext)}
+            onOpenExternal={() => VOICE_ACTIONS.openPullRequestInBrowser.run(pullRequestContext)}
+            onClosedByPage={() => forgetPrBrowser(prBrowser.opened)}
+          />
+        )}
       </KeyboardInput.Provider>
       </VoiceChoiceOpen.Provider>
       </DialogNumbered.Provider>
       </VoicePagingContext.Provider>
       </VoiceNumberingContext.Provider>
     </VoiceOn.Provider>
+    </OpenPullRequest.Provider>
   );
 }
 
@@ -1247,6 +1452,18 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
 const TILE_PAGE = 4;
 
 /**
+ * Issue #1668 — what voice calls a tile, in its numbered list, its off-page
+ * sentence and the palette's Focus entry. An orchestration agent is named by
+ * {@link agentSpokenName}, its run's title and its name, as the overview's
+ * heading and Reading name it: every run of one orchestration names its roles
+ * alike, so "Coder" alone could be any run's. A standalone agent keeps the role
+ * its tile is headed with.
+ */
+function tileVoiceName(agent: AgentSession): string {
+  return agent.tab.kind === "orchestration" ? agentSpokenName(agent) : agent.role;
+}
+
+/**
  * PRD #1105 M3 — the pane's WRAPPER, and the reason it is rendered whether or
  * not the pane is open.
  *
@@ -1280,7 +1497,7 @@ function AgentPaneFrame({ open, offPage, onOpen, onClose, ...tile }: Omit<AgentT
     of this one inert and moving focus inside. See that hook for why it walks
     siblings rather than marking one subtree.
   */
-  const paneRef = useInertBackground<HTMLDivElement>(open);
+  const paneRef = useInertBackground<HTMLDivElement>(open, OVERLAY_LAYER.pane);
   return (
     <div
       ref={paneRef}
@@ -1407,19 +1624,22 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       turn: (delta) => setTilePage(tileSlice.page + delta),
       elsewhere: snapshot.agents.flatMap((agent, index): VoiceOffPageItem[] => (index >= tileSlice.start && index < tileSlice.end
         ? []
-        : [{ kind: "agent", value: agent.id, deckId: agent.daemonId, label: agent.role, page: Math.floor(index / TILE_PAGE) + 1 }])),
+        : [{ kind: "agent", value: agent.id, deckId: agent.daemonId, label: tileVoiceName(agent), page: Math.floor(index / TILE_PAGE) + 1 }])),
     }
     : undefined), [snapshot.agents, tileSlice, tilesPaged]);
   usePager("screen", tilePager);
   const numberedTiles = useMemo(() => (
     tilesPageable
-      ? shownTiles.map((agent): VoiceNumberedEntryDto => ({
-        kind: "agent",
-        value: agent.id,
-        deckId: agent.daemonId,
-        label: agent.role,
-        names: [agent.displayName, agent.cli].filter((name): name is string => Boolean(name) && name !== agent.role),
-      }))
+      ? shownTiles.map((agent): VoiceNumberedEntryDto => {
+        const label = tileVoiceName(agent);
+        return {
+          kind: "agent",
+          value: agent.id,
+          deckId: agent.daemonId,
+          label,
+          names: [...new Set([agent.role, agent.displayName, agent.cli])].filter((name): name is string => Boolean(name) && name !== label),
+        };
+      })
       : undefined
   ), [shownTiles, tilesPageable]);
   const numberedTileSections = useMemo<VoiceNumberedSectionDto[] | undefined>(() => numberedTiles && [{ kind: "agent", entries: numberedTiles }], [numberedTiles]);
@@ -2125,7 +2345,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     ...(features.showOrchestrations ? [{ label: "Edit orchestration order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
     { label: evidenceOpen ? "Hide events drawer" : "Show events drawer", hint: "Toggle transition events", icon: PanelRight, run: () => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext) },
-    ...snapshot.agents.map((agent, index) => ({ label: `Focus ${agent.role}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id }) })),
+    ...snapshot.agents.map((agent, index) => ({ label: `Focus ${tileVoiceName(agent)}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id }) })),
     ...(mode === "fixture" ? [{ label: "Advance fixture", hint: "Move the deterministic loop one node", icon: Zap, run: () => VOICE_ACTIONS.advanceFixture.run(voiceContext) }] : []),
   ];
 
@@ -2220,6 +2440,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
             {snapshot.connection.status !== "loading" && <div className="connection-actions">{offersStart && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon-banner" onClick={requestUpgrade}><ArrowUpCircleIcon size={13} /> Upgrade</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}{offersReconnect && <button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button>}</div>}
           </div>
         )}
+
+        {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. Not the banner above — the connection is fine. */}
+        {!allDecks && <HookBinaryNotices notices={snapshot.connection.hookBinaryNotices} />}
 
         {allDecks && (
           <section className="workspace-section" aria-label="Select a daemon">
@@ -2499,10 +2722,15 @@ function EmptyDeck({ onReconnect, onProfiles }: { onReconnect: () => void; onPro
 function CommandPalette({ commands, onClose }: { commands: { label: string; hint: string; icon: typeof Bot; run: () => void }[]; onClose: () => void }) {
   const [query, setQuery] = useState(""); // voice-registry-exempt: the palette's search text
   const filtered = commands.filter((item) => `${item.label} ${item.hint}`.toLowerCase().includes(query.toLowerCase()));
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="command-palette" role="dialog" aria-modal="true" aria-label="Command menu" onMouseDown={(event) => event.stopPropagation()}><label><Search size={17} /><input autoFocus placeholder="Search controls, agents, and views…" value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>ESC</kbd></label><div>{filtered.map(({ label, hint, icon: Icon, run }) => <button key={label} onClick={() => { run(); onClose(); }}><Icon size={16} /><span><strong>{label}</strong><small>{hint}</small></span><ChevronRight size={14} /></button>)}{!filtered.length && <p>No matching controls.</p>}</div><footer><span><Command size={12} /> local control surface</span><span><kbd>↵</kbd> select</span></footer></section></div>;
+  /* It can open over the pull request browser, which fences the deck it is
+     mounted in, so it fences too: the topmost fence is the one that holds. */
+  const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, onClose);
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className="command-palette" role="dialog" aria-modal="true" aria-label="Command menu" onMouseDown={(event) => event.stopPropagation()}><label><Search size={17} /><input autoFocus placeholder="Search controls, agents, and views…" value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>ESC</kbd></label><div>{filtered.map(({ label, hint, icon: Icon, run }) => <button key={label} onClick={() => { run(); onClose(); }}><Icon size={16} /><span><strong>{label}</strong><small>{hint}</small></span><ChevronRight size={14} /></button>)}{!filtered.length && <p>No matching controls.</p>}</div><footer><span><Command size={12} /> local control surface</span><span><kbd>↵</kbd> select</span></footer></section></div>;
 }
 
 function ShortcutHelp({ onClose }: { onClose: () => void }) {
   const shortcuts = [["⌘ K", "Command menu"], ["⌘/Ctrl + / − / 0", "Zoom in, out, reset"], ["1 — 4", "Focus agent"], ["J / K", "Move through events"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-title" onMouseDown={(event) => event.stopPropagation()}><header><div><HelpCircle size={18} /><h2 id="shortcut-title">Control keys</h2></div><button aria-label="Close shortcut guide" onClick={onClose}><X size={16} /></button></header>{shortcuts.map(([keys, label]) => <div key={keys}><span>{label}</span><kbd>{keys}</kbd></div>)}</section></div>;
+  /* Fenced for the command palette's reason (above). */
+  const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, onClose);
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-title" onMouseDown={(event) => event.stopPropagation()}><header><div><HelpCircle size={18} /><h2 id="shortcut-title">Control keys</h2></div><button aria-label="Close shortcut guide" onClick={onClose}><X size={16} /></button></header>{shortcuts.map(([keys, label]) => <div key={keys}><span>{label}</span><kbd>{keys}</kbd></div>)}</section></div>;
 }

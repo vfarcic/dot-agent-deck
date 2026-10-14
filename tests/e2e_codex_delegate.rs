@@ -61,7 +61,7 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     deck.send_keys(b"\r");
     deck.wait_for_string("coder");
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     deck.send_bytes(b"2");
     assert!(
         deck.wait_for_grid_predicate_within(live::BUDGET, |grid| grid
@@ -79,7 +79,7 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
         .unwrap_or_else(|| panic!("coder record: {before}"))["id"]
         .clone();
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     std::fs::write(deck.workdir().join("delegate-now"), "").unwrap();
     common::wait_for_file_trimmed_eq(&deck.workdir().join(SENTINEL), CONTENT, live::BUDGET)
         .unwrap_or_else(|why| {

@@ -238,6 +238,25 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 filter = 'test(opencode_auto_submits_daemon_injected_prompt)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# PRD #1631: `codex/hooks/001` drives one real interactive Codex turn, behind
+# `check_codex_available`'s preflight. In that PRD's lane-2 run, on a box with
+# `io full` near 70%, its isolated retry spent over 120s in the preflight, ran
+# the scenario green in about 40s, and was then still regenerating its paired
+# `.md` (a `DOT_AGENT_DECK_RECORD=1` run's success path) when the default
+# 3 x 60s window SIGKILLed it, reporting a bare TIMEOUT for a passing test. The
+# preflight now has a ceiling, `load_scaled(CODEX_PREFLIGHT_BASE)`, which is
+# 60s on a quiet box and 360s at the most it scales. 8 x 60s sits above that
+# ceiling, so a wedged preflight reports its own message before the kill,
+# and above the starved run's observed ~200s (preflight, scenario, teardown and
+# paired doc) with room to spare. Scoped by name; still bounded.
+#
+# The filter tracks the TEST FUNCTION name, so it must be updated in lockstep
+# with any rename — a stale filter matches nothing and silently drops this test
+# back to the 3 x 60s default.
+[[profile.default.overrides]]
+filter = 'test(codex_hooks_001_real_interactive_turn_reaches_idle_without_exit)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # Issue #1381: the two real-OpenCode `clear = true` delegates in
 # `tests/e2e_delegate_respawn_readiness.rs` wait in phases whose own bounds sum
 # well past the default 3 x 60s kill window. Being killed there costs each
@@ -292,6 +311,13 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(dispatch_return_006_real_single_agent_reports_to_the_dispatcher)'
 slow-timeout = { period = "60s", terminate-after = 6 }
+
+# The close scenario adds a third interactive turn after the real dispatch and
+# completion, so retain its own assertion diagnostics on a loaded host. Its
+# pane/daemon lifetime cap is pinned to the same 900s in the test helper.
+[[profile.default.overrides]]
+filter = 'test(close_verb_008_real_dispatcher_closes_its_reported_single_unit)'
+slow-timeout = { period = "60s", terminate-after = 15 }
 
 # Issue #1616: `scheduler/dispatch/028` waits in five phases on a real
 # interactive Haiku — the first turn starting (90s), its output (90s), the card
@@ -404,8 +430,8 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 # machine's cores; the tests already known to be contention-sensitive keep
 # their own carve-outs above.
 #
-# `slow-timeout` is REVISITED AND KEPT at 120s x 10, which is what issue #928
-# asked for rather than what it guessed. The cold case has NOT gone away — a
+# `slow-timeout` was REVISITED AND KEPT at 120s x 10 by issue #928, which is
+# what that issue asked for rather than what it guessed (raised since; below). The cold case has NOT gone away — a
 # runner whose cache did not restore (4 of the 16 runs whose cache status was
 # checked reported "No cache found") or a fresh worktree still pays the full
 # dependency build — and the observed spread across those 13 runs is 71.9s to
@@ -419,10 +445,21 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 # separates "the injection never reached the binary" from "the build did not
 # finish" (same reasoning as the overrides above). Widened here rather than
 # globally, and still bounded so a wedged build cannot run forever.
+#
+# RAISED FROM 10 TO 20 (PRD #1631), on a measurement rather than a guess. On a
+# 16-core dev box whose IO was saturated by other worktrees' builds, the test was
+# killed at 1200s in a broad `cargo test-e2e` run, and passed when run alone in
+# 1283s while its own load-context heartbeat logged `io full` at 59-73% of every
+# minute (at a 1-minute load of only 11-38). That is the IO half of the 6x spread
+# the test file's table records, and it is past the old 1200s with nothing else
+# of the suite running. 2400s is ~1.9x that isolated pass, for a broad run that
+# adds the rest of the tier's IO to it. What it costs is only on a WEDGED build,
+# which now takes 40 minutes rather than 20 to be killed; a passing run pays
+# nothing for it, and CI's observed range (71.9-369.9s) is far inside either.
 [[profile.default.overrides]]
 filter = 'test(version_001_injected_build_env_reaches_the_binary)'
 priority = 25
-slow-timeout = { period = "120s", terminate-after = 10 }
+slow-timeout = { period = "120s", terminate-after = 20 }
 
 # `devin/live/001` boots a THIRD-PARTY interactive TUI (the Devin CLI) inside a
 # pane and must wait for it to become ready before it can type anything —
@@ -456,7 +493,7 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 # be updated in lockstep with any rename — a stale filter matches nothing and
 # silently drops this test back to the 3 x 60s default, killing it mid-wait.
 [[profile.default.overrides]]
-filter = 'test(shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_working)'
+filter = 'test(shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_background)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
 # PRD #386, PR #390 maintainer review (Finding 4, "worth considering for 005
@@ -683,3 +720,19 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(claude_001_thinking_working_idle)'
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# PRD #1631: real question tests have bounded agent startup, prompt submission,
+# permission paint, answer delivery and completion waits; /004 and /005 run
+# two sequential turns. Preserve their assertion diagnostics on a loaded host.
+# Their daemon's self-exit cap, `QUESTION_DAEMON_MAX_LIFETIME_SECS` in
+# `tests/common/questions.rs` (780 s), sits above this 720 s window and the
+# 360 s one below, so the daemon cannot leave before the test is killed; raise
+# either window past it and the cap has to move too.
+[[profile.default.overrides]]
+filter = 'test(/^question_live_00[1-5]_/)'
+slow-timeout = { period = "60s", terminate-after = 12 }
+
+# Offline Pi still boots Node and loads the two extensions before its dialog.
+[[profile.default.overrides]]
+filter = 'test(question_live_006_pi_extension_select_without_model)'
+slow-timeout = { period = "60s", terminate-after = 6 }

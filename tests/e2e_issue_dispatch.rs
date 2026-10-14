@@ -368,7 +368,15 @@ fn git_branch_exists(clone: &Path, branch: &str) -> bool {
     matches!(out, Ok(o) if !String::from_utf8_lossy(&o.stdout).trim().is_empty())
 }
 
-const W: Duration = Duration::from_secs(15);
+/// The ceiling on a dispatch outcome that must HAPPEN — a clone, a worktree, an
+/// agent registering, its output, a removal. Each is real `git` work and a
+/// process start on the daemon's side, so it is [`common::load_scaled`]: a flat
+/// 15 s failed `dispatch_007`, `dispatch_008` and `dispatch_009` in PRD #1631's
+/// broad e2e run with `io full` at 75-79%, and all three passed alone. Never used
+/// for a window in which something must NOT happen; those stay flat.
+fn w() -> Duration {
+    common::load_scaled(Duration::from_secs(15))
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -412,7 +420,7 @@ fn dispatch_001_clone_worktree_spawn() {
     let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
 
     assert!(
-        common::wait_for_path(&paths.worktree_dir, W),
+        common::wait_for_path(&paths.worktree_dir, w()),
         "firing an issue_dispatch task must create the per-issue worktree at {:?}",
         paths.worktree_dir
     );
@@ -422,16 +430,15 @@ fn dispatch_001_clone_worktree_spawn() {
         paths.clone_dir
     );
     assert!(
-        common::wait_until(Duration::from_secs(5), || git_branch_exists(
-            &paths.clone_dir,
-            &paths.branch
-        )),
+        common::wait_until(common::load_scaled(Duration::from_secs(5)), || {
+            git_branch_exists(&paths.clone_dir, &paths.branch)
+        }),
         "the per-issue branch {} must exist in the clone",
         paths.branch
     );
 
     let agent = daemon
-        .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+        .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), w())
         .unwrap_or_else(|| {
             panic!(
                 "dispatch must spawn an orchestrator-role agent into {:?}",
@@ -443,7 +450,7 @@ fn dispatch_001_clone_worktree_spawn() {
             &daemon.attach_socket,
             agent.pane_id_env.as_deref().expect("the agent's pane id"),
             "ISSUEDISPATCH-7",
-            W,
+            w(),
         ),
         "the substituted per-issue prompt must be delivered to the dispatched orchestrator"
     );
@@ -484,12 +491,12 @@ fn dispatch_002_idempotent_skip_existing_worktree() {
     // First fire: dispatch issue 7.
     daemon.run_now("dispatch-task").expect("run-now (first)");
     assert!(
-        common::wait_for_path(&paths.worktree_dir, W),
+        common::wait_for_path(&paths.worktree_dir, w()),
         "the first fire must create the issue-7 worktree"
     );
     assert!(
         daemon
-            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), w())
             .is_some(),
         "the first fire must spawn an orchestrator agent for issue 7"
     );
@@ -517,7 +524,7 @@ fn dispatch_002_idempotent_skip_existing_worktree() {
         "the clone must be preserved (no re-clone error)"
     );
 
-    let surfaced = common::wait_until(Duration::from_secs(10), || {
+    let surfaced = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
         daemon.stderr_contains("issue-7")
             || daemon.stderr_contains("issue 7")
             || daemon.stderr_contains("skip")
@@ -569,12 +576,12 @@ fn dispatch_003_skip_open_pr() {
 
     // Issue 8 (no PR) dispatches — proves the flow ran end to end.
     assert!(
-        common::wait_for_path(&p8.worktree_dir, W),
+        common::wait_for_path(&p8.worktree_dir, w()),
         "issue 8 (no open PR) must be dispatched: its worktree must exist"
     );
     assert!(
         daemon
-            .wait_for_agent_where(|r| orchestrator_in(r, &p8.worktree_dir), W)
+            .wait_for_agent_where(|r| orchestrator_in(r, &p8.worktree_dir), w())
             .is_some(),
         "issue 8 must spawn an orchestrator agent"
     );
@@ -685,11 +692,11 @@ fn dispatch_004_orchestration_vs_single_agent() {
 
     // Orchestration clone → orchestration tab + prompt to the orchestrator role.
     assert!(
-        common::wait_for_path(&orch_wt, W),
+        common::wait_for_path(&orch_wt, w()),
         "orchestration issue worktree must exist"
     );
     let orch_agent = daemon
-        .wait_for_agent_where(|r| orchestrator_in(r, &orch_wt), W)
+        .wait_for_agent_where(|r| orchestrator_in(r, &orch_wt), w())
         .expect("orchestration clone must open an orchestrator tab in the worktree");
     assert!(
         view::wait_for(
@@ -699,18 +706,18 @@ fn dispatch_004_orchestration_vs_single_agent() {
                 .as_deref()
                 .expect("the agent's pane id"),
             "ORCHDISP-11",
-            W,
+            w(),
         ),
         "the prompt must reach the orchestrator role of the orchestration dispatch"
     );
 
     // Plain clone → single-agent card + prompt delivered.
     assert!(
-        common::wait_for_path(&plain_wt, W),
+        common::wait_for_path(&plain_wt, w()),
         "single-agent issue worktree must exist"
     );
     let plain_agent = daemon
-        .wait_for_agent_where(|r| single_card_in(r, &plain_wt), W)
+        .wait_for_agent_where(|r| single_card_in(r, &plain_wt), w())
         .expect("plain clone must open a single-agent card in the worktree");
     assert!(
         view::wait_for(
@@ -720,12 +727,12 @@ fn dispatch_004_orchestration_vs_single_agent() {
                 .as_deref()
                 .expect("the agent's pane id"),
             "PLAINDISP-22",
-            W,
+            w(),
         ),
         "the prompt must reach the single-agent card of the plain dispatch"
     );
     assert!(
-        common::wait_for_file_substr_count(&launch_record, "WRAPPED", 2, W),
+        common::wait_for_file_substr_count(&launch_record, "WRAPPED", 2, w()),
         "both issue-dispatch Codex paths must reach a launch recorder"
     );
     // PRD #20 §4.2.1: the daemon's startup scoped-trust step runs `codex
@@ -789,12 +796,12 @@ fn dispatch_005_respects_max_per_run() {
     for n in [1u64, 2] {
         let paths = pd(n);
         assert!(
-            common::wait_for_path(&paths.worktree_dir, W),
+            common::wait_for_path(&paths.worktree_dir, w()),
             "issue {n} must be dispatched"
         );
         assert!(
             daemon
-                .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+                .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), w())
                 .is_some(),
             "issue {n} must spawn an orchestrator agent before the cap is counted"
         );
@@ -850,11 +857,11 @@ fn dispatch_006_close_removes_worktree_preserves_clone() {
 
     let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
     assert!(
-        common::wait_for_path(&paths.worktree_dir, W),
+        common::wait_for_path(&paths.worktree_dir, w()),
         "the issue worktree must exist before close"
     );
     let agent = daemon
-        .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+        .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), w())
         .expect("dispatch must spawn the orchestrator before close");
 
     // Close the dispatched tab.
@@ -865,7 +872,7 @@ fn dispatch_006_close_removes_worktree_preserves_clone() {
         .expect("StopAgent over the attach socket");
 
     // Cleanup removes the worktree (disk + git registry) but preserves the clone.
-    let removed = common::wait_until(W, || {
+    let removed = common::wait_until(w(), || {
         !paths.worktree_dir.exists() && !git_worktree_listed(&paths.clone_dir, &paths.worktree_dir)
     });
     assert!(
@@ -919,12 +926,12 @@ fn dispatch_007_one_issue_fails_others_dispatch() {
 
     // The healthy issue still dispatches.
     assert!(
-        common::wait_for_path(&p10.worktree_dir, W),
+        common::wait_for_path(&p10.worktree_dir, w()),
         "issue 10 must still dispatch despite issue 11 failing"
     );
     assert!(
         daemon
-            .wait_for_agent_where(|r| orchestrator_in(r, &p10.worktree_dir), W)
+            .wait_for_agent_where(|r| orchestrator_in(r, &p10.worktree_dir), w())
             .is_some(),
         "issue 10 must spawn an orchestrator agent"
     );
@@ -941,7 +948,7 @@ fn dispatch_007_one_issue_fails_others_dispatch() {
     );
 
     // The failure is surfaced, not swallowed.
-    let surfaced = common::wait_until(Duration::from_secs(10), || {
+    let surfaced = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
         daemon.stderr_contains("issue-11")
             || daemon.stderr_contains("issue 11")
             || daemon.stderr_contains("#11")
@@ -989,11 +996,11 @@ fn dispatch_008_refire_after_close_redispatches() {
     // First fire: dispatch issue 7.
     daemon.run_now("dispatch-task").expect("run-now (first)");
     assert!(
-        common::wait_for_path(&paths.worktree_dir, W),
+        common::wait_for_path(&paths.worktree_dir, w()),
         "the first fire must create the issue-7 worktree"
     );
     let agent = daemon
-        .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+        .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), w())
         .expect("the first fire must spawn the orchestrator for issue 7");
 
     // Close the dispatched tab. Cleanup removes the worktree but `git worktree
@@ -1004,16 +1011,15 @@ fn dispatch_008_refire_after_close_redispatches() {
         })
         .expect("StopAgent over the attach socket");
     assert!(
-        common::wait_until(W, || !paths.worktree_dir.exists()),
+        common::wait_until(w(), || !paths.worktree_dir.exists()),
         "closing the dispatched tab must remove the worktree (precondition for the re-fire)"
     );
     // Precondition for B1: the branch survives the close, so a naive
     // `worktree add -b agent/issue-7` on the next fire would collide.
     assert!(
-        common::wait_until(Duration::from_secs(5), || git_branch_exists(
-            &paths.clone_dir,
-            &paths.branch
-        )),
+        common::wait_until(common::load_scaled(Duration::from_secs(5)), || {
+            git_branch_exists(&paths.clone_dir, &paths.branch)
+        }),
         "the close preserves branch {} (the leftover that makes the re-fire trip)",
         paths.branch
     );
@@ -1026,12 +1032,12 @@ fn dispatch_008_refire_after_close_redispatches() {
     // re-creates the worktree and re-dispatches instead of surfacing an
     // `IssueDispatchFailed`.
     assert!(
-        common::wait_for_path(&paths.worktree_dir, W),
+        common::wait_for_path(&paths.worktree_dir, w()),
         "re-firing must re-create the issue-7 worktree (B1: worktree-add must tolerate the existing branch)"
     );
     assert!(
         daemon
-            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), w())
             .is_some(),
         "re-firing must spawn the orchestrator again for the reclaimed issue 7"
     );
@@ -1083,16 +1089,16 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
     let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
     let wt = paths.worktree_dir.clone();
     assert!(
-        common::wait_for_path(&wt, W),
+        common::wait_for_path(&wt, w()),
         "dispatch must create the issue worktree"
     );
 
     // Both role panes spawn into the SAME issue worktree.
     let orchestrator = daemon
-        .wait_for_agent_where(|r| role_in(r, "orchestrator", &wt), W)
+        .wait_for_agent_where(|r| role_in(r, "orchestrator", &wt), w())
         .expect("the orchestrator role must spawn into the issue worktree");
     let reviewer = daemon
-        .wait_for_agent_where(|r| role_in(r, "reviewer", &wt), W)
+        .wait_for_agent_where(|r| role_in(r, "reviewer", &wt), w())
         .expect("the reviewer role must spawn into the same issue worktree");
 
     // Close ONE role (the reviewer). The worktree must SURVIVE — the
@@ -1122,7 +1128,7 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
             id: orchestrator.id.clone(),
         })
         .expect("StopAgent orchestrator over the attach socket");
-    let removed = common::wait_until(W, || {
+    let removed = common::wait_until(w(), || {
         !wt.exists() && !git_worktree_listed(&paths.clone_dir, &wt)
     });
     assert!(
@@ -1174,12 +1180,12 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
     // worktree and one orchestrator exist — the precondition for the short-circuit.
     daemon.run_now("dispatch-task").expect("run-now (first)");
     assert!(
-        common::wait_for_path(&paths.worktree_dir, W),
+        common::wait_for_path(&paths.worktree_dir, w()),
         "the first fire must create the issue-7 worktree"
     );
     assert!(
         daemon
-            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), w())
             .is_some(),
         "the first fire must spawn an orchestrator agent for issue 7"
     );
@@ -1209,7 +1215,7 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
     // The present worktree must short-circuit to an IssueDispatchSkipped notice.
     // (With the OLD code the PR-check error fires first and no skip is surfaced,
     // so this wait would time out — making the test RED against the regression.)
-    let skipped = common::wait_until(Duration::from_secs(10), || {
+    let skipped = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
         daemon.stderr_contains("already-claimed issue #7")
     });
     assert!(

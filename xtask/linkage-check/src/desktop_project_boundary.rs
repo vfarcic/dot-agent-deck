@@ -219,6 +219,17 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // `std::env::current_dir` — all zero for it.
     "login_shell",
     "platform",
+    // PRD #1401, argued rather than added quietly. The desktop names
+    // `PullRequestInfo` here — the type `SessionSnapshot.pull_request` carries,
+    // which `dto::DesktopAgent` copies through to the webview as is — so the
+    // pull request badge has one shape on both clients. The module is the
+    // value's shape and nothing else, split out of `pull_request` for exactly
+    // this rule: `pull_request` is the daemon's resolver, which runs `git` and
+    // `gh` against each session's working directory, and stays off this list.
+    // Checked against this rule's lines: three serde types, no function, no
+    // I/O, no project, no FORBIDDEN_SYMBOL or project-state literal, and no
+    // `std::env::current_dir` — all zero for it.
+    "pull_request_info",
     // PRD #1497, argued rather than added quietly. Reading mode names ONE item
     // here, `NOTIFICATION_TYPE_METADATA_KEY`: it tells a Claude-shaped
     // permission prompt from the other `WaitingForInput` notifications on the
@@ -230,6 +241,21 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // at all, names no FORBIDDEN_SYMBOL or project-state literal, and contains
     // no `std::env::current_dir` — all zero for it.
     "quota_block",
+    // PRD #1542, argued rather than added quietly. The desktop names the
+    // pending-question model the daemon carries on the snapshot
+    // (`PendingQuestion` and its parts, read to project it for the webview),
+    // the `QuestionAnswer` an `AnswerQuestion` sends, the `AnswerRefusal` it
+    // can come back with, and three bounds (`MAX_QUESTIONS`, `MAX_OPTIONS`,
+    // `MAX_ANSWER_TEXT_CHARS`) its IPC boundary checks a form against. These
+    // are wire types and their limits: a desktop-side copy would be a second
+    // definition of the contract to keep in step with the daemon's (CLAUDE.md
+    // rule 18). The module's producer helpers (`claude_permission_request` and
+    // the rest) build questions from hook payloads and are the daemon's and the
+    // hook's to call, not the desktop's. Checked against this rule's lines: the
+    // module resolves no project, reads no file, names no FORBIDDEN_SYMBOL or
+    // project-state literal, and contains no `std::env::current_dir` — all
+    // zero for it.
+    "question",
     // PRD #741 M6, argued rather than added quietly. The desktop's settings
     // schema is built from this module's validating ssh-argument newtypes
     // (`Hostname`, `SshUser`, `KeyPath`, `HostAlias`, `RemoteSocketPath`), and
@@ -288,6 +314,24 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // literal, and contains no `std::env::current_dir` — all zero for it.
     "self_upgrade",
     "state",
+    // PRD #1666, argued rather than added quietly. The desktop names ONE item
+    // here, `truncate_on_char_boundary`, the byte bound it puts on a host
+    // metrics disk role (PRD #1258); it lived in `prompt_delivery`, which PRD
+    // #1666 deleted with the typed delivery it served, and it moved here.
+    // Checked against this rule's lines: string functions only — no I/O, no
+    // project, no FORBIDDEN_SYMBOL or project-state literal, and no
+    // `std::env::current_dir` — all zero for it.
+    "submitted_prompt",
+    // PRD #1401, argued rather than added quietly. The desktop's Open in
+    // browser hands the page to `system_browser::open_with_platform_opener`,
+    // the same watched launch the TUI's `o` uses, so a platform opener that
+    // exits non-zero is a failure in both clients rather than a success in
+    // one of them (CLAUDE.md rule 22). Checked against this rule's lines: the
+    // module validates a URL and spawns a browser or the platform opener on
+    // it; it resolves no project, reads no file outside its tests, names no
+    // FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "system_browser",
     // PRD #741 M7, argued rather than added quietly.
     // `untrusted_text::strip_control_and_bidi` is the policy the connection
     // footer applies to a settings-supplied endpoint label: `dto::safe_message`

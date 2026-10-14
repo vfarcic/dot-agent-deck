@@ -7,6 +7,10 @@ pub mod authoring_seeds;
 pub mod bounded_read;
 pub mod build_id;
 pub mod build_version_handshake;
+// PRD #1589: the daemon side of `close` — resolve, authorize, refuse or close.
+pub mod close_agents;
+// PRD #1589: the `close` command's request building and report rendering.
+pub mod close_cli;
 pub mod codex_hooks_manage;
 pub mod codex_rollout_tail;
 pub mod config;
@@ -37,6 +41,8 @@ pub mod dispatch;
 pub mod dispatch_return;
 // PRD #1666 S4: the fixed one-line doorbell for an agent with no armed inbox component.
 pub mod doorbell;
+// PRD #1589: the record of dispatched units the `close` verb is authorized from.
+pub mod dispatched_units;
 pub mod draft_deferral;
 pub mod embedded_pane;
 // PRD #1419 Decision 4: the user docs embedded at build time for `docs [topic]`.
@@ -58,10 +64,15 @@ pub mod features;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
 pub mod focus_report;
+// PRD #1258: measurements of the host the process runs on. Its load-per-CPU is
+// the one implementation the lib tests' `test_budget` and the test harness both
+// call (M2).
+pub mod host_metrics;
 // Issue #1181: the ambient git location environment, and the one place this
 // crate switches it off. Every `git` the crate spawns is built here.
 pub(crate) mod git_env;
 pub mod hook;
+pub mod hook_binary;
 pub mod hook_provenance;
 pub mod hooks_manage;
 pub mod hyperlink;
@@ -87,6 +98,7 @@ pub mod new_agent_options;
 pub mod opencode_manage;
 pub mod orchestrator_context;
 pub mod orchestrator_ext;
+pub mod osc52;
 pub mod palette;
 pub mod pane;
 pub mod pane_input;
@@ -101,6 +113,10 @@ pub mod project_config;
 // there is for files this process wrote, and this one is for a path a caller
 // selected over the attach socket.
 pub mod project_resolve;
+// PRD #1401: the pull request an agent's work produced, on the session wire.
+pub mod pull_request;
+pub mod pull_request_info;
+pub mod question;
 pub mod quota_block;
 pub mod quota_signals;
 pub mod remote;
@@ -115,6 +131,8 @@ pub mod self_upgrade;
 pub mod spawn;
 pub mod state;
 pub mod submitted_prompt;
+// PRD #1401: the TUI's `o` key, which hands a wire URL to the system browser.
+pub mod system_browser;
 pub mod tab;
 pub mod tab_layout;
 pub mod terminal_hangup;
@@ -138,6 +156,10 @@ mod test_temp;
 mod test_budget;
 #[cfg(test)]
 mod test_isolation;
+// Issue #1637: test-only. A Unix-style fixture path is not absolute on Windows,
+// so tests of absolute-vs-relative classification spell their paths through it.
+#[cfg(test)]
+mod test_paths;
 // Issue #1132: test-only, and shared for the same reason as the two above —
 // unit tests in `spawn.rs`, `ui.rs` and `state.rs` all drive the same `/bin/cat`
 // PTY byte target, and the content-keyed waits that make their assertions

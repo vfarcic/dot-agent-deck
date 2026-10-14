@@ -129,10 +129,10 @@ permissions:
 # block says (`.claude/skills/verify-pr/SKILL.md`). Both still hold; the flag is
 # a layer under them.
 #
-# It says nothing about the other workflows in this directory. `release.yml`,
-# `docs-publish.yml` and `tag-release.yml` push to `main` and MUST keep a usable
-# credential in the checkout — they check out under the RELEASE_TOKEN admin PAT
-# for exactly that reason (CLAUDE.md rule 8). Do not copy this flag onto them.
+# It says nothing about the other workflows in this directory. `release.yml`
+# and `tag-release.yml` push to `main` and MUST keep a usable credential in the
+# checkout — they check out under the RELEASE_TOKEN admin PAT for exactly that
+# reason (CLAUDE.md rule 8). Do not copy this flag onto them.
 
 jobs:
   # Renovate automerges devbox digest/pin/patch/minor bumps (renovate.json), and
@@ -304,7 +304,7 @@ jobs:
       # site in .github/workflows/ is not an exact version or disagrees with it.
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 11.22.0
+          version: 11.25.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
@@ -383,7 +383,7 @@ jobs:
       # Exact, and in lockstep with devbox.json — see `desktop-web` above.
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 11.22.0
+          version: 11.25.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
@@ -495,12 +495,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Exact, and in lockstep with devbox.json — see `desktop-web` above.
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 11.22.0
+          version: 11.25.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
@@ -570,12 +570,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-nextest@0.9.146
       # The desktop crate's Linux build deps, needed because clippy/nextest below
       # run with --workspace, which includes desktop/src-tauri
       # (dot-agent-deck-desktop). Without them that crate fails to build on this
@@ -819,11 +819,11 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-nextest@0.9.146
       # The same Linux deps the `build` job installs, for the same reason: the
       # alias carries `--workspace`, which includes desktop/src-tauri
       # (dot-agent-deck-desktop), and without them that crate does not build on
@@ -907,7 +907,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, and
       # both of the harness's namespaces are unprivileged ones. The runner is a
@@ -1068,7 +1068,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Type-check the workspace for Windows from Linux
@@ -1156,13 +1156,13 @@ jobs:
           scripts/check-symlinks.sh
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
           targets: x86_64-pc-windows-msvc
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-nextest@0.9.146
       - run: cargo build
       # Match the Linux `build` job's clippy invocation (no --all-targets) so a
       # test-only lint can't fail Windows-only and be unreproducible on the
@@ -1219,12 +1219,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-nextest@0.9.146
       - run: cargo build
       # Match the Linux `build` job's clippy invocation (no --all-targets) so a
       # test-only lint can't fail macOS-only and be unreproducible on the Linux
@@ -1288,7 +1288,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit

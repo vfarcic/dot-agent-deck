@@ -213,6 +213,11 @@ pub enum NumberAnswer {
     /// as a count, is or ends in it. In on-screen order, each section's item
     /// showing the number before the names that collide with it.
     Ambiguous { choices: Vec<NumberRef> },
+    /// PRD #1401 — the answer about an agent said by its number, asked for
+    /// its pull request ("open the PR for agent 3", "open agent 3's pull
+    /// request"): the webview runs `open_pr` for the agent `of` names instead
+    /// of opening the agent. `of` is never [`NumberAnswer::NotNumber`].
+    PullRequest { of: Box<NumberAnswer> },
 }
 
 /// Verbs that may lead a section word: "select directory 13", "go to mode 2".
@@ -226,6 +231,67 @@ const LEADING_VERBS: [&[&str]; 7] = [
     &["go", "to"],
     &["switch", "to"],
 ];
+
+/// The words that name a pull request, as a transcriber writes them.
+const PULL_REQUEST_WORDS: [&[&str]; 3] = [&["pr"], &["p", "r"], &["pull", "request"]];
+
+/// Verbs that may lead a pull request asked for by number.
+const PULL_REQUEST_VERBS: [&[&str]; 3] = [&["open"], &["show", "me"], &["show"]];
+
+/// `words` less the first of `leads` they start with, if any.
+fn after<'a>(words: &'a [String], leads: &[&[&str]]) -> Option<&'a [String]> {
+    leads
+        .iter()
+        .find(|lead| {
+            words.len() >= lead.len() && lead.iter().zip(words).all(|(want, word)| word == want)
+        })
+        .map(|lead| &words[lead.len()..])
+}
+
+/// `words` less the first of `tails` they end with, if any.
+fn before<'a>(words: &'a [String], tails: &[&[&str]]) -> Option<&'a [String]> {
+    tails
+        .iter()
+        .find(|tail| {
+            words.len() >= tail.len()
+                && tail
+                    .iter()
+                    .zip(&words[words.len() - tail.len()..])
+                    .all(|(want, word)| word == want)
+        })
+        .map(|tail| &words[..words.len() - tail.len()])
+}
+
+/// The words naming the agent in a request for its pull request by number —
+/// "open the PR for agent 3", "open agent 3's pull request" — or `None` when
+/// the utterance is not one. Only an agent named with its section word is
+/// read here ("agent 3", "the agent three"); "open the PR for the tester" and
+/// every other form are left to the resolver, which resolves `open_pr`'s
+/// `agent_ref` against the agents' names and knows nothing of the numbers.
+fn pull_request_of(words: &[String]) -> Option<&[String]> {
+    let mut rest = after(words, &PULL_REQUEST_VERBS).unwrap_or(words);
+    if rest.first().is_some_and(|word| word == "the") {
+        rest = &rest[1..];
+    }
+    let agent = match after(rest, &PULL_REQUEST_WORDS) {
+        Some(tail) => {
+            let (link, agent) = tail.split_first()?;
+            (link == "for" || link == "of").then_some(agent)?
+        }
+        None => {
+            let (owned, agent) = before(rest, &PULL_REQUEST_WORDS)?.split_last()?;
+            (owned == "s").then_some(agent)?
+        }
+    };
+    let named = match agent.split_first() {
+        Some((first, named)) if first == "the" => named,
+        _ => agent,
+    };
+    named
+        .first()
+        .is_some_and(|word| SectionKind::named(word) == Some(SectionKind::Agent))
+        .then_some(agent)
+}
 
 /// `words` split into the section said, if any — with the word that said it —
 /// and the words that should be the number: a bare ordinal ("three", "the
@@ -282,12 +348,26 @@ struct Said<'a> {
 /// said as a count ("one", "1", "number one" — never "first" or "the last
 /// one", which are positions by grammar). One item is
 /// [`NumberAnswer::Selected`]; several are [`NumberAnswer::Ambiguous`].
+///
+/// An agent's pull request asked for by its number ("open the PR for agent 3")
+/// is that agent's answer, wrapped in [`NumberAnswer::PullRequest`].
 pub fn answer(utterance: &str, heard: &VoiceNumberedList, now: u64) -> NumberAnswer {
     let words = whole_utterance(utterance);
+    if let Some(agent) = pull_request_of(&words) {
+        return match answer_words(agent, heard, now) {
+            NumberAnswer::NotNumber => NumberAnswer::NotNumber,
+            of => NumberAnswer::PullRequest { of: Box::new(of) },
+        };
+    }
+    answer_words(&words, heard, now)
+}
+
+/// [`answer`] for the utterance's words.
+fn answer_words(words: &[String], heard: &VoiceNumberedList, now: u64) -> NumberAnswer {
     let Some(Said {
         section,
         number: said_words,
-    }) = read(&words)
+    }) = read(words)
     else {
         return NumberAnswer::NotNumber;
     };
@@ -524,6 +604,62 @@ mod tests {
         }
         // No numbered list on screen: a number is an ordinary utterance.
         assert_eq!(answer("three", &list(7, &[]), 7), NumberAnswer::NotNumber);
+    }
+
+    /// PRD #1401 — "open agent 3" opens the agent showing 3 on the
+    /// dashboard, so its pull request is asked for the same way: the answer
+    /// about that agent, wrapped for `open_pr`. Only an agent named with its
+    /// section word is read; every other pull request request is the
+    /// resolver's, as before.
+    #[test]
+    fn a_pull_request_asked_for_by_an_agents_number() {
+        let heard = list(7, &DASHBOARD);
+        let pull_request = |of: NumberAnswer| NumberAnswer::PullRequest { of: Box::new(of) };
+        for said in [
+            "open the PR for agent 3",
+            "open agent 3's pull request",
+            "Show the pull request for agent three.",
+            "open agent 3's P.R.",
+            "open the pull request of the agent 3",
+            "agent 3's PR",
+            "show me agent 3's PR",
+        ] {
+            assert_eq!(answer(said, &heard, 7), pull_request(agent(3)), "{said}");
+        }
+        assert_eq!(
+            answer("open the PR for agent 9", &heard, 7),
+            pull_request(NumberAnswer::OutOfRange {
+                section: Some(SectionKind::Agent),
+                number: 9,
+                elsewhere: Vec::new(),
+            })
+        );
+        assert_eq!(
+            answer("open the PR for agent 3", &heard, 8),
+            pull_request(NumberAnswer::Stale)
+        );
+        assert_eq!(
+            answer("open the PR for agent 1", &list(7, &["Plan", "agent-1"]), 7),
+            pull_request(agents(&[1, 2]))
+        );
+        for said in [
+            "open the PR",
+            "open the PR for the tester",
+            "open coder two's PR",
+            "open the PR for directory 3",
+            "open the PR for agent",
+            "close the PR for agent 3",
+            "open the PR 3",
+        ] {
+            assert_eq!(answer(said, &heard, 7), NumberAnswer::NotNumber, "{said}");
+        }
+        assert_eq!(
+            serde_json::to_value(answer("open the PR for agent 3", &heard, 7)).unwrap(),
+            serde_json::json!({
+                "kind": "pull_request",
+                "of": { "kind": "selected", "section": "agent", "number": 3 }
+            })
+        );
     }
 
     #[test]

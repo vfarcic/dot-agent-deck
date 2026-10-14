@@ -197,5 +197,5 @@ fn remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts() {
         .push(("DOT_AGENT_DECK_BUILD_ID_OVERRIDE".into(), NEW_BUILD.into()));
     let mut connected = remote.tty(&["connect", DECK]);
     connected.wait("No active agents");
-    assert!(connected.screen().contains("[New Agent Ctrl+N]"));
+    assert!(connected.screen().contains("[New Agent n/Ctrl+N]"));
 }

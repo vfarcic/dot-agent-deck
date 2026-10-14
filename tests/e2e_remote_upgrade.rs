@@ -401,7 +401,7 @@ fn remote_connect_001_upgrade_choices_connect_without_second_question() {
         assert!(
             common::wait_until(WAIT, || {
                 let grid = terminal.screen();
-                grid.contains("[New Agent Ctrl+N]")
+                grid.contains("[New Agent n/Ctrl+N]")
                     && if mode == "live-keep" {
                         grid.contains("Dashboard")
                             && grid.contains("upgrade-team [×]")

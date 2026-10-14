@@ -34,6 +34,34 @@ import { enterDeck } from "./support/overview";
  * already selected — which is why this one is a peer and the selector is not.
  */
 test.describe("the agent pane is a real modal", () => {
+  /** Scenario: open a PR from the full-screen agent pane in a real browser. The frontmost toolbar accepts focus and clicks while the underlying pane is inert. */
+  test("keeps the PR toolbar interactive above the agent pane", async ({ page }) => {
+    await page.goto("/?fixture=1&state=docs-pr");
+    await page.getByTestId("open-overview").click();
+    await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+    const pane = page.getByTestId("agent-pane-overlay");
+    await expect(pane).toBeVisible();
+    await pane.getByTestId("pr-badge-2").click();
+
+    const browser = page.getByTestId("pr-browser");
+    await expect(browser).toBeVisible();
+    // A second turn lets the pane's sibling observer process the PR overlay.
+    await page.evaluate(() => new Promise<void>((done) => requestAnimationFrame(() => done())));
+    expect(await pane.evaluate((node) => node.closest("[inert]") !== null)).toBe(true);
+    expect(await browser.evaluate((node) => node.closest("[inert]") !== null), "The frontmost PR browser is inert").toBe(false);
+    for (const name of ["Back", "Open in browser", "Close pull request"]) {
+      const button = browser.getByRole("button", { name });
+      expect(await button.evaluate((node) => node.closest("[inert]") !== null), `${name} is inert`).toBe(false);
+      await button.focus();
+      await expect(button).toBeFocused();
+    }
+    await browser.getByRole("button", { name: "Back" }).click();
+    await expect(browser).toBeVisible();
+    await browser.getByRole("button", { name: "Close pull request" }).click();
+    await expect(browser).toHaveCount(0);
+    await expect(pane).toBeVisible();
+  });
+
   /**
    * Scenario: open Planner's pane from the deck, then press Tab twenty times.
    * Focus never lands outside the pane except on the peer Voice trigger — not on

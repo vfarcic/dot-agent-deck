@@ -47,6 +47,7 @@ import {
 	nextWatcherBackoff,
 	parseInboxFetch,
 	parseInboxLine,
+	installQuestionWrappers,
 	piEventReport,
 	resolveDeckBin,
 	spawnFailureMessage,
@@ -820,6 +821,26 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	// acknowledge the seed before Pi committed it.
 	const inbox = createPiInbox(pi);
 
+	// --- PRD #1631: answer other extensions' dialogs from the deck --------
+	// Pi's `ctx.ui` is one object shared by every extension and is rebuilt when
+	// Pi rebinds its UI, so the wrappers are (re)applied on every
+	// session_start. Only inside a deck pane, where `await-answer` has a daemon
+	// to talk to. Best-effort and guarded: a Pi whose `ctx.ui` is not what
+	// 0.87.1 had leaves its dialogs to the keyboard, never crashes.
+	const wrapDialogs = (ctx: ExtensionContext): void => {
+		if (!process.env.DOT_AGENT_DECK_PANE_ID) {
+			return;
+		}
+		try {
+			installQuestionWrappers((ctx as unknown as { ui?: unknown }).ui, {
+				exec: (argv, signal) => pi.exec(deckBin, argv, { signal }),
+				mintId: () => `q-${globalThis.crypto.randomUUID().replace(/-/g, "")}`,
+			});
+		} catch {
+			// Unsupported on this Pi: the keyboard answers.
+		}
+	};
+
 	pi.on(
 		"session_start",
 		guarded(async (event, ctx) => {
@@ -827,6 +848,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			// off until it arms, then the status (Idle — a Pi pane awaiting its
 			// first prompt is idle, matching every other backend's
 			// session-start), so the deck never sees an idle, unarmed Pi.
+			wrapDialogs(ctx);
 			inbox.start(ctx);
 			try {
 				await pi.exec(deckBin, buildInboxAnnounceArgv(), { signal: ctx.signal, timeout: 5000 });

@@ -30,11 +30,17 @@ const { writes, terminalInstances, FakeTerminal, FakeFitAddon } = vi.hoisted(() 
     }
     loadAddon(addon: { activate?: (terminal: FakeTerminal) => void }): void { addon.activate?.(this); }
     open(host: HTMLElement): void { host.appendChild(this.textarea); }
-    write(data: string | Uint8Array): void {
+    write(data: string | Uint8Array, callback?: () => void): void {
       const decoded = typeof data === "string" ? data : decoder.decode(data);
-      writes.push(decoded);
-      this.writes.push(decoded);
+      // Issue #1705's replay brackets are empty writes; they carry no output.
+      if (decoded) {
+        writes.push(decoded);
+        this.writes.push(decoded);
+      }
+      callback?.();
     }
+    /* Issue #1705's OSC 52 handler; `TerminalViewport.clipboard.test.tsx` drives it through the real xterm. */
+    readonly parser = { registerOscHandler: (): { dispose: () => void } => ({ dispose: () => {} }) };
     reset(): void {}
     focus(): void {}
     resize(cols: number, rows: number): void { this.cols = cols; this.rows = rows; }

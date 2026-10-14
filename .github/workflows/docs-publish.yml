@@ -1,27 +1,36 @@
 name: Docs Publish
 
+# Builds the docs site and deploys it to Netlify production
+# (agent-deck.devopstoolkit.ai). Reached two ways: release.yml's `docs` job via
+# `uses:` on every release, and `workflow_dispatch` (the `/publish-docs` skill)
+# to publish `main` between releases.
+#
+# It pushes nothing to the repository and nothing to a registry. Until #514 it
+# also built a docs image for GHCR and committed a Helm chart bump straight to
+# `main` under the admin RELEASE_TOKEN; nothing deployed either once the site
+# moved to Netlify, so both went, and with them this workflow's only reason to
+# hold that token.
 on:
   workflow_call:
     inputs:
-      image_tag:
-        description: 'GHCR image tag to publish (e.g. v0.26.0). Required when called by another workflow.'
+      version_label:
+        description: 'Label for the Netlify deploy message (e.g. v0.26.0). The manual path uses main-<short sha>.'
         required: true
         type: string
-      chart_version:
-        description: 'If set, also update Chart.yaml version/appVersion (release path only).'
-        required: false
-        type: string
-        default: ''
-      push_latest:
-        description: 'Also push :latest tag (release path only).'
-        required: false
-        type: boolean
-        default: false
+    # Declared, rather than received through the caller's `secrets: inherit`,
+    # so the release path hands this workflow these two and nothing else. A
+    # caller whose `secrets:` map leaves one out is refused before any job
+    # runs. `required` checks that the caller passes the secret, not that it
+    # holds a value: an unset repository secret still arrives empty.
+    secrets:
+      NETLIFY_AUTH_TOKEN:
+        required: true
+      NETLIFY_SITE_ID:
+        required: true
   workflow_dispatch:
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
   group: docs-publish
@@ -29,16 +38,12 @@ concurrency:
 
 jobs:
   # The site is generated HERE, in a job with a read-only token and no secret,
-  # and handed to both deploy paths as an artifact. `publish` below holds the
-  # admin RELEASE_TOKEN (its checkout persists it for the push) and
-  # `packages: write`; running `cargo xtask site` there would hand both to
-  # every build script in the crates it compiles. The same reasoning kept
-  # `npm ci` out of that job while the site was Docusaurus. The deploy jobs
-  # run no code from the dependency tree at all.
+  # and handed to the deploy as an artifact. Running `cargo xtask site` in the
+  # job that holds the Netlify token would hand that token to every build
+  # script in the crates it compiles. The deploy job runs no code from the
+  # dependency tree at all.
   site-build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
     steps:
@@ -47,19 +52,18 @@ jobs:
           ref: main
           persist-credentials: false
 
-      # The commit everything downstream publishes: `publish` builds its image
-      # from this artifact and checks this commit out, and the Netlify deploy
-      # reads its site/netlify.toml, so `main` moving mid-run cannot mix two.
+      # The commit the deploy publishes: it checks this out for
+      # site/netlify.toml, so `main` moving mid-run cannot mix two commits.
       - name: Record the commit
         id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
 
       - name: Build site
-        run: cargo xtask site site/build/public --nginx-redirects site/build/nginx-redirects.conf
+        run: cargo xtask site site/build/public
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -68,261 +72,33 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  publish:
+  # Netlify production deploy of the `site-build` artifact. It is the only job
+  # holding the Netlify token, and it runs no code from the site's build.
+  netlify-deploy:
     needs: site-build
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-      sha: ${{ steps.tag.outputs.sha }}
-    steps:
-      # Fail here, not at the "Commit chart changes" push. This job pushes the
-      # chart bump straight to `main`, which only an admin identity may do:
-      # `main` is ruleset-protected and `github-actions[bot]` is deliberately
-      # NOT a bypass actor (GITHUB_TOKEN cannot be one on a user-owned repo).
-      # RELEASE_TOKEN is the admin PAT that bypasses it.
-      #
-      # This step replaces a `|| github.token` fallback whose stated purpose --
-      # keeping the workflow unchanged "while the secret is unset, so this
-      # change is safe to merge before `main` is protected" -- expired when
-      # `main` was protected on 2026-08-08. All it can do now is downgrade an
-      # unset or empty secret to an identity that cannot push.
-      #
-      # What this guard does NOT cover: it tests emptiness, so a token that is
-      # present but expired, revoked or under-scoped passes it and still fails
-      # later at `git push origin main`. Probing the token would cost an API
-      # call and add a failure mode of its own on the release path, so the
-      # cheap check is deliberate -- just do not read it as proof the token
-      # works. Nor did the old fallback ever help there: GitHub's `||` returns
-      # the left operand whenever it is non-empty, so an expired PAT was passed
-      # straight through to the checkout.
-      #
-      # This workflow is reached two ways and BOTH need the secret in scope:
-      # `workflow_dispatch` (where it is), and release.yml's `docs` job via
-      # `uses:`, which gets it only because that call forwards it -- today with
-      # `secrets: inherit`, which #514 tracks narrowing to an explicit
-      # RELEASE_TOKEN map. Dropping the forwarding altogether is how v0.35.9's
-      # docs job died at "Commit chart changes" with the image already
-      # published but `main`'s chart pointer stale -- fixed in 428acef. A guard
-      # here catches that class of mistake at step 1 of the callee instead,
-      # before anything reaches GHCR.
-      - name: Verify RELEASE_TOKEN is present
-        env:
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${RELEASE_TOKEN}" ]; then
-            echo "::error::RELEASE_TOKEN is unset or empty. This job pushes the chart bump to the protected \`main\` branch and needs the admin PAT to bypass the ruleset; GITHUB_TOKEN cannot. If this run was triggered by release.yml, check that its \`docs\` job forwards the secret. See CLAUDE.md rule 8."
-            exit 1
-          fi
-      # The commit `site-build` generated the site from. "Commit chart
-      # changes" switches to `main` before it commits.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-          ref: ${{ needs.site-build.outputs.sha }}
-          token: ${{ secrets.RELEASE_TOKEN }}
-
-      - name: Resolve image tag
-        id: tag
-        env:
-          INPUT_TAG: ${{ inputs.image_tag }}
-        run: |
-          set -euo pipefail
-          if [ -n "${INPUT_TAG}" ]; then
-            TAG="${INPUT_TAG}"
-            ORIGIN="workflow_call"
-          else
-            SHORT_SHA=$(git rev-parse --short=7 HEAD)
-            TAG="main-${SHORT_SHA}"
-            ORIGIN="manual"
-          fi
-          # `sha` is the commit the image is built from, the one `site-build`
-          # generated the site from. "Commit chart changes" pulls `main`
-          # forward, so the Netlify job below checks this out rather than
-          # `main` to publish exactly what the image holds.
-          {
-            echo "tag=${TAG}"
-            echo "origin=${ORIGIN}"
-            echo "sha=$(git rev-parse HEAD)"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Compose tag list
-        id: tags
-        env:
-          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
-          PUSH_LATEST: ${{ inputs.push_latest }}
-        run: |
-          {
-            echo "list<<EOF"
-            echo "ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}"
-            if [ "${PUSH_LATEST}" = "true" ]; then
-              echo "ghcr.io/vfarcic/dot-agent-deck-docs:latest"
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      # The generated site, which site/Dockerfile copies (it has no build
-      # stage). Data only: nothing in it runs here.
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: docs-site
-          path: site/build
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
-
-      - name: Login to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push docs image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
-        with:
-          context: .
-          file: site/Dockerfile
-          push: true
-          tags: ${{ steps.tags.outputs.list }}
-
-      # yq is pinned by CONTENT, not just by tag. A GitHub release asset is
-      # mutable -- a tag can be re-pointed and the binary re-uploaded -- so the
-      # version in the URL guarantees nothing on its own. That matters here
-      # because this job holds the admin PAT: `yq` runs after the checkout and
-      # two steps before `git push origin main`, so the blast radius of a
-      # substituted binary is a commit of the attacker's choosing on a
-      # ruleset-protected branch under an admin identity.
-      #
-      # The digest is committed HERE rather than fetched from the release's own
-      # `checksums` asset, which is what issue #515 first proposed. That file is
-      # an asset of the same mutable release and is signed by nothing, so
-      # downloading it would verify the transfer but NOT the content: whoever
-      # can re-upload the binary can re-upload its checksum alongside it. Only a
-      # digest committed to this repo pins the bytes.
-      #
-      # THE VERSION AND THE DIGEST MUST MOVE TOGETHER, BY HAND. Nothing bumps
-      # either one today -- Renovate has no manager that reads a URL out of a
-      # `run:` block, and none of the customManagers in renovate.json matches
-      # this -- and a regex manager taught to bump only the version would
-      # produce a PR that fails the check below. To refresh both:
-      #
-      #   curl -fsSLO https://github.com/mikefarah/yq/releases/download/<ver>/yq_linux_amd64
-      #   sha256sum yq_linux_amd64
-      #
-      # For a second source, cross-check that against the release's `checksums`
-      # asset: each row is `<file> <hash> <hash> ...` and the column order is
-      # listed in `checksums_hashes_order`, where SHA-256 is line 18 -- i.e.
-      # field 19 of the row, counting the filename as field 1.
-      #
-      # No `sudo`, and no download straight into a system path: curl writes to a
-      # job-local temp file, the digest is checked, and only then is the binary
-      # installed into a directory added to PATH via $GITHUB_PATH. An unverified
-      # download therefore never reaches a root-owned location, and `--fail`
-      # plus `--show-error` (replacing wget's `-q`) make a 404 or an HTML error
-      # page fail at the download, printing why, instead of leaving a bad file
-      # to fail later at `yq -i`.
-      #
-      # `--retry` is not a flourish: it preserves behaviour, because wget
-      # retries by default (`--tries` defaults to 20) and bare curl does not.
-      # This step runs AFTER "Build and push docs image", so a transient blip
-      # here strands the job in the half-done state this file's other comments
-      # keep warning about -- image already in GHCR, `main`'s chart pointer
-      # stale. curl retries transient failures (5xx/408/429, plus a refused
-      # connection) and does NOT retry a 404, which stays fatal as it should.
-      - name: Install yq
-        env:
-          YQ_VERSION: v4.52.5
-          YQ_SHA256: 75d893a0d5940d1019cb7cdc60001d9e876623852c31cfc6267047bc31149fa9
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/bin"
-          curl --fail --location --silent --show-error \
-            --retry 3 --retry-delay 2 --retry-connrefused \
-            -o "${RUNNER_TEMP}/yq" \
-            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
-          echo "${YQ_SHA256}  ${RUNNER_TEMP}/yq" | sha256sum --check --strict -
-          install -m 0755 "${RUNNER_TEMP}/yq" "${RUNNER_TEMP}/bin/yq"
-          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
-          "${RUNNER_TEMP}/bin/yq" --version
-
-      - name: Update Helm values
-        env:
-          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          yq -i '.image.tag = strenv(IMAGE_TAG)' site/helm/values.yaml
-
-      - name: Update Chart.yaml (release path only)
-        if: inputs.chart_version != ''
-        env:
-          CHART_VERSION: ${{ inputs.chart_version }}
-        run: |
-          yq -i '.version = strenv(CHART_VERSION)' site/helm/Chart.yaml
-          yq -i '.appVersion = "v" + strenv(CHART_VERSION)' site/helm/Chart.yaml
-
-      - name: Commit chart changes
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
-          ORIGIN: ${{ steps.tag.outputs.origin }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Sync local main to remote before re-applying our changes so the
-          # push at the end fast-forwards cleanly even if main advanced
-          # between checkout and this step (e.g. the release workflow's
-          # changelog commit pushed in the finalize job).
-          git stash --include-untracked || true
-          git checkout main
-          git pull --rebase --autostash origin main
-          git stash pop || true
-          git add site/helm/Chart.yaml site/helm/values.yaml
-          if git diff --cached --quiet; then
-            echo "No chart changes to commit"
-            exit 0
-          fi
-          if [ "${ORIGIN}" = "manual" ]; then
-            MSG="chore: publish docs image ${TAG} [skip ci]"
-          else
-            MSG="chore: update docs chart to ${TAG} [skip ci]"
-          fi
-          git commit -m "$MSG"
-          git push origin main
-
-      - name: Summary
-        env:
-          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
-          PUSH_LATEST: ${{ inputs.push_latest }}
-          ORIGIN: ${{ steps.tag.outputs.origin }}
-        run: |
-          {
-            echo "## Docs publish"
-            echo ""
-            echo "- **Image**: \`ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}\`"
-            if [ "${PUSH_LATEST}" = "true" ]; then
-              echo "- **Also tagged**: \`:latest\`"
-            fi
-            echo "- **Trigger**: ${ORIGIN}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # Netlify production deploy, running ALONGSIDE the image + chart path above
-  # while agent-deck.devopstoolkit.ai still points at the cluster. It needs
-  # `publish`, so a Netlify failure cannot stop the cluster rolling forward,
-  # and it deploys the same `site-build` artifact the image was built from.
-  # It is the only job holding the Netlify token, and it runs no code from the
-  # site's build at all.
-  netlify-deploy:
-    needs: [publish, site-build]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       # For devbox.json (netlify-cli's pin) and site/netlify.toml, at the same
       # commit the site was built from.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.publish.outputs.sha }}
+          ref: ${{ needs.site-build.outputs.sha }}
           persist-credentials: false
+
+      # The release passes its version; a manual run has no inputs, so it is
+      # labelled by the commit it publishes.
+      - name: Resolve deploy label
+        id: label
+        env:
+          INPUT_LABEL: ${{ inputs.version_label }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_LABEL}" ]; then
+            LABEL="${INPUT_LABEL}"
+          else
+            LABEL="main-$(git rev-parse --short=7 HEAD)"
+          fi
+          echo "label=${LABEL}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -345,10 +121,10 @@ jobs:
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
-          IMAGE_TAG: ${{ needs.publish.outputs.tag }}
+          LABEL: ${{ steps.label.outputs.label }}
         run: |
           set -euo pipefail
           URL=$(devbox run -- netlify deploy --cwd site --prod --no-build --dir=build/public \
-            --message "docs-${IMAGE_TAG}" --json | jq -r '.url // .deploy_url')
+            --message "docs-${LABEL}" --json | jq -r '.url // .deploy_url')
           echo "Netlify production: ${URL}"
-          echo "## Netlify production: ${URL} (\`docs-${IMAGE_TAG}\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Netlify production: ${URL} (\`docs-${LABEL}\`)" >> "$GITHUB_STEP_SUMMARY"

@@ -501,6 +501,8 @@ fn inject_compacting(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     let line = serde_json::to_string(&event).expect("serialize synthetic Compacting AgentEvent");
     common::write_hook_line(deck.hook_socket_path(), &line)
@@ -605,6 +607,8 @@ fn prime_active_tool(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     let line = serde_json::to_string(&event).expect("serialize synthetic ToolStart AgentEvent");
     common::write_hook_line(deck.hook_socket_path(), &line)
@@ -662,6 +666,8 @@ fn inject_clear_session_start(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     let line = serde_json::to_string(&event)
         .expect("serialize synthetic clear-originated SessionStart AgentEvent");
@@ -1280,7 +1286,11 @@ fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
         deck.snapshot_grid()
     );
     let second_path = second_rearm().expect("second re-arm path");
-    let content = std::fs::read_to_string(&second_path).expect("read the second re-arm");
+    let content = read_announced_context(
+        &context_dir.with_file_name("orchestrator-prompt.log"),
+        &second_path,
+        &deck,
+    );
     assert!(
         content.contains(first_brief),
         "a TUI reattached after the startup context was swept must re-arm from the file \
@@ -1371,6 +1381,8 @@ fn synthetic_event(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -1410,6 +1422,36 @@ struct RearmedRun {
     deck: TuiDeck,
     title: &'static str,
     agent_ids: Vec<String>,
+}
+
+/// Read a re-armed context file only once the start role's pane has been
+/// pointed at it, and return its contents.
+///
+/// A new `orchestrator-context-<hex>.md` is written in place rather than renamed
+/// into place: `publish_orchestrator_context` (`src/orchestrator_context.rs`)
+/// relies on its name being fresh and announced only after the last byte is
+/// written. So a reader that finds the file by listing the directory, as these
+/// tests do, can see it before it is complete, and `orchestration_remit_009`
+/// read one that held neither brief on a starved box (`io full` 55%) in PRD
+/// #1631's broad e2e run. The announcement is the `Read .dot-agent-deck/<name>`
+/// pointer the fixture script appends to `log`, so that is what is waited for.
+#[cfg(unix)]
+fn read_announced_context(log: &std::path::Path, path: &std::path::Path, deck: &TuiDeck) -> String {
+    let name = path
+        .file_name()
+        .expect("context path has a file name")
+        .to_string_lossy();
+    let pointer = format!("Read .dot-agent-deck/{name}");
+    assert!(
+        common::wait_for_file_substr_count(log, &pointer, 1, REASSERTION_DELIVERY_TIMEOUT),
+        "the start role was never pointed at {} (no `{pointer}` in {}) within \
+         {REASSERTION_DELIVERY_TIMEOUT:?}; log:\n{}\nFinal grid:\n{}",
+        path.display(),
+        log.display(),
+        std::fs::read_to_string(log).unwrap_or_default(),
+        deck.snapshot_grid()
+    );
+    std::fs::read_to_string(path).expect("read the announced context file")
 }
 
 #[cfg(unix)]
@@ -1570,6 +1612,8 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     common::write_hook_line(
         &daemon.hook_socket,
@@ -1610,7 +1654,8 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
         deck.snapshot_grid()
     );
     let rearmed_path = rearmed().expect("new context path");
-    let content = std::fs::read_to_string(&rearmed_path).expect("read rearmed context");
+    let content =
+        read_announced_context(&cwd.join("orchestrator-prompt.log"), &rearmed_path, &deck);
     assert!(
         content.contains(first_brief) && !content.contains(second_brief),
         "the first tab must rearm from its own file, not the later mirror; {}: first={}, second={}",

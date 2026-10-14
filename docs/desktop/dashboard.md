@@ -18,6 +18,8 @@ Each daemon being shown gets its own section, headed with its name (**Local daem
 - One group per orchestration (kicker **ORCHESTRATION**), named after the run. Its rows are numbered in role order, and the start role, the one you message, carries an **ORCHESTRATOR** badge.
 - One group per workspace mode (kicker **MODE TAB**), named after the mode. You see one only while an agent started in a workspace mode by a release before 0.44.0 is still running; workspace modes were removed in 0.44.0, so neither client starts one.
 
+Beside the daemon's name, a small **Host** button shows how the machine that daemon runs on is doing: green when its disk, load and memory are fine, amber with **Host: warning** or red with **Host: critical** when one of them is not. Click it, or `Tab` to it and press `Enter`, to open **Host of this deck**: free disk space, load per core and memory, each coloured the same way, with `(warning)` or `(critical)` after a figure that needs attention. Its **X** button, `Esc` or a click elsewhere closes it. With voice on, saying "show host" opens it too, and "close" or "close host" closes it ([Voice Control → Checking a daemon's machine](voice.md#checking-a-daemons-machine)). A daemon from an older release opens it saying **Host metrics are not available from this deck** instead. The TUI shows the same figures when you press `m`. [Session Management → Check the machine a deck runs on](../session-management.md#check-the-machine-a-deck-runs-on) explains each row and how to change the limits.
+
 Each group header shows how many agents it holds, how many are in each status, and the working directory most of its agents share. A row shows its own directory only when it differs from that.
 
 ![The Dashboard with two daemons, each in its own section with its own New agent button: Local daemon with four agents and a remote daemon, dev@build-box, with two; the DAEMONS counter reads 2/2 and the other counters add up the agents of both](/img/dashboard-fleet-desktop.png)
@@ -67,7 +69,7 @@ The desktop app shows five statuses. Each covers one or more of the words the TU
 | --- | --- | --- |
 | **RUNNING** | Thinking, Working, Compacting | The agent is busy. An agent that has reported no status at all yet, for example a plain shell or an agent whose hooks are not installed, also shows **RUNNING**. |
 | **NEEDS INPUT** | Needs Input | The agent is waiting for you: a permission answer or other input. Answer it in its pane. |
-| **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
+| **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. Commands or subagents it left running keep it **IDLE**; open its pane to see what is still running. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
 | **error** (counted under **FAILED**) | Error | Something went wrong, including a message the deck could not deliver. Read the notice and open the pane. |
 | **BLOCKED** | Blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. Open the agent's pane to see which limit, and when it resets if the provider says. |
 
@@ -90,12 +92,14 @@ To watch or talk to one agent:
 1. Click its row, or its open control (`Open <name> agent`). Its live terminal opens in a full-window pane over the Dashboard.
 2. Type into the terminal as you would into the TUI's pane. [Keys typed into an agent's terminal](settings.md#keys-typed-into-an-agents-terminal) says which keys reach the agent, including your platform's editing and paste shortcuts.
 3. When the agent's output is longer than the terminal, a scrollbar stays on the terminal's right edge, so you can see that there is more above and how far back you are. Scroll up to read earlier output.
-4. To copy the agent's output, select it with the mouse and press `Ctrl+Shift+C` (`⌘C` on macOS). Plain `Ctrl+C` still goes to the agent as an interrupt, even while text is selected.
+4. To copy the agent's output, drag across it with the mouse. Some agents, such as Codex, OpenCode and Claude Code in its fullscreen mode, handle the mouse themselves: they highlight what you drag across and copy it when you release the button, so the text is on your clipboard with nothing more to press. Otherwise the terminal highlights the text, and you copy it with your system's copy key: `⌘C` on macOS, `Ctrl+Shift+C` on Linux, and `Ctrl+C` or `Ctrl+Shift+C` on Windows. On Windows, `Ctrl+C` copies only while text is highlighted and then clears the highlight, so pressing it again interrupts the agent. On macOS and Linux, plain `Ctrl+C` always goes to the agent as an interrupt, even while text is highlighted.
 5. Press **Back to dashboard**, or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
 
-The TUI copies differently: a mouse drag in a pane copies when you release the button, and whether that reaches your clipboard depends on your terminal.
+The TUI copies differently: a mouse drag in a pane copies when you release the button, whichever agent is running, and when an agent copies something itself, the TUI passes that on to your terminal too. Whether either reaches your clipboard depends on your terminal, which has to let programs set the clipboard. Some ask first or need it turned on, such as tmux, which needs `set-clipboard on`.
 
-The pane's header names the agent by its type (for example Codex), or by its role when it belongs to an orchestration, rather than by the display name its row shows. Beside that is its status, and below it the agent's command and its model, which reads `Unavailable` because the daemon does not report one.
+In either client, some agents (Codex and Pi among them) copy straight to the clipboard of the machine they run on, and ask the terminal only when that fails or when they run over SSH. When the daemon runs on another machine that has its own clipboard, such an agent's copy lands on that machine's clipboard, not yours.
+
+The pane's header names the agent by its type (for example Codex), or by its role when it belongs to an orchestration, rather than by the display name its row shows. Beside that is its status, and below it the agent's command and its model, which reads `Unavailable` because the daemon does not report one. When the agent has ended its turn but left commands or subagents running, a line below that says so, for example `Background: 2 commands, 1 subagent · 3h 12m`, in the same words as the TUI card; see [Session Management → Work left running after a turn](../session-management.md#work-left-running-after-a-turn).
 
 Between the header and the terminal, the pane shows the agent's assignment and two readings: **TIME**, how long the agent has been running (hover it for the exact time it started), and **TOOLS**, how many tool calls it has reported. TIME reads `—` when the daemon did not say when it started the agent.
 
@@ -106,6 +110,41 @@ What can go wrong in the pane:
 - **"No terminal here: the desktop has no live connection to <daemon>…"**: the agent's daemon stopped answering. The header then shows the last status the app saw. The terminal comes back on its own when the daemon answers again.
 - **"Terminal input unavailable — <reason>."**: the daemon refused input to this pane, and the reason says why. What you type is not sent.
 - **"Delivery was not confirmed — <reason>."**: the input may or may not have reached the agent. Check the terminal before typing it again.
+
+## Pull requests
+
+When an agent works on a branch that has a pull request on GitHub, the app shows a badge for it on the agent's row on the Dashboard and in the header of its pane. The badge is the pull request's number between an icon for its state (open, draft, merged or closed) and an icon for its review (approved, changes requested or review required). Hover it to read the same in words, for example `Pull request #1234: open, review required`.
+
+The badge appears by itself: you do not link the pull request. An agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. The badge follows the pull request, so a review or a merge shows up on it within about a minute. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](../troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
+
+**TUI:**
+
+![TUI card showing open pull request #1234 awaiting review beside the implementation agent's pane](/img/pull-request-badge-tui.png)
+
+**Desktop:**
+
+![Dashboard row showing the implementation agent's open pull request #1234 awaiting review](/img/pull-request-badge-desktop.png)
+
+### Read a pull request in the app
+
+1. Click the badge, on the agent's row or in its pane, or with voice on say "open the PR for the coder" on the dashboard, or "open the PR" while the agent's pane is open (see [Voice Control → Pull requests](voice.md#pull-requests)). GitHub's page for the pull request opens inside the app, over the screen you were on.
+2. Read, comment and review on the page as you would on github.com.
+3. Use the toolbar above the page: **Back** goes back one page, **Open in browser** opens the page you are on in your system browser and closes it in the app, and the close button (✕) in its corner closes it. If your system browser does not open, or the page cannot go back, the page stays in the app and a message under the toolbar says why, so you can try again.
+4. Press `Escape` to close the page and return to where you were. When you are typing in the page or a menu or dialog of GitHub's is open, `Escape` closes that first, as it does on github.com.
+
+A link to a site other than GitHub opens in your system browser, and the page stays where it was. While one of the app's own dialogs is open, for example Settings or voice's "What you can say" list, the page is hidden, and it comes back when the dialog closes.
+
+### Signing in to GitHub in the app
+
+The page has its own GitHub sign-in, separate from your system browser's. The first time you open a pull request that needs it, sign in on the page; the app remembers the sign-in, also after you restart it.
+
+A sign-in that leaves GitHub cannot finish in the app: if your organisation signs you in through SAML single sign-on, or you sign in to GitHub with Google or Apple, that step opens in your system browser instead. Use **Open in browser** to work on the pull request there.
+
+To sign out, use [Settings → GitHub → Sign out of GitHub](settings.md#github).
+
+### In the TUI
+
+The TUI shows the same pull request on the agent's card, as `#1234` with a glyph for its state and its review on the card's bottom border (see [Session Management → What a TUI card shows](../session-management.md#what-a-tui-card-shows)), and `o` opens the selected card's pull request in your system browser rather than inside the TUI. The desktop app has no `o` key, because it has no keyboard selection of a row: click the badge or say "open the PR for" and the agent's name instead.
 
 ## Closing agents and orchestrations
 

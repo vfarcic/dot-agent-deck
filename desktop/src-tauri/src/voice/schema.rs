@@ -365,6 +365,7 @@ mod tests {
                 "open_deck".to_string(),
                 "close".to_string(),
                 "open_settings".to_string(),
+                "show_host_metrics".to_string(),
                 "switch_deck".to_string(),
                 "voice_off".to_string(),
                 "list_commands".to_string(),
@@ -390,6 +391,9 @@ mod tests {
                 "scroll_up".to_string(),
                 "scroll_to_top".to_string(),
                 "scroll_to_bottom".to_string(),
+                // PRD #1401: the pull request browser.
+                "open_pr".to_string(),
+                "open_pr_in_browser".to_string(),
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
@@ -455,6 +459,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "show_host_metrics",
                 "switch_deck",
                 "voice_off",
                 "list_commands",
@@ -480,6 +485,9 @@ mod tests {
                 "scroll_up",
                 "scroll_to_top",
                 "scroll_to_bottom",
+                // PRD #1401: the pull request browser.
+                "open_pr",
+                "open_pr_in_browser",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
@@ -655,6 +663,7 @@ mod tests {
                 ("open_deck".to_string(), true),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), true),
+                ("show_host_metrics".to_string(), false),
                 ("switch_deck".to_string(), true),
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
@@ -685,6 +694,9 @@ mod tests {
                 ("scroll_up".to_string(), false),
                 ("scroll_to_top".to_string(), false),
                 ("scroll_to_bottom".to_string(), false),
+                // PRD #1401: `open_pr` is the dashboard's and the agent screen's, the hand-off the browser's own.
+                ("open_pr".to_string(), false),
+                ("open_pr_in_browser".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -709,6 +721,7 @@ mod tests {
                 ("close".to_string(), true),
                 // The shared rail offers Settings from the overview too.
                 ("open_settings".to_string(), true),
+                ("show_host_metrics".to_string(), true),
                 ("switch_deck".to_string(), true),
                 // Callable everywhere: stopping must never be unavailable,
                 // and neither must the phrase that lists what can be said.
@@ -739,6 +752,9 @@ mod tests {
                 ("scroll_up".to_string(), true),
                 ("scroll_to_top".to_string(), true),
                 ("scroll_to_bottom".to_string(), true),
+                // PRD #1401: `open_pr` is the dashboard's and the agent screen's, the hand-off the browser's own.
+                ("open_pr".to_string(), true),
+                ("open_pr_in_browser".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -764,6 +780,7 @@ mod tests {
                 ("open_deck".to_string(), false),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), false),
+                ("show_host_metrics".to_string(), false),
                 ("switch_deck".to_string(), false),
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
@@ -792,6 +809,9 @@ mod tests {
                 ("scroll_up".to_string(), false),
                 ("scroll_to_top".to_string(), false),
                 ("scroll_to_bottom".to_string(), false),
+                // PRD #1401: `open_pr` is the dashboard's and the agent screen's, the hand-off the browser's own.
+                ("open_pr".to_string(), true),
+                ("open_pr_in_browser".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),

@@ -19,8 +19,8 @@ The daemon sets each agent's status from the events its hooks report (see [Insta
 | **Thinking** | `Thinking` | running | The agent is reasoning before it acts. | Nothing. |
 | **Working** | `Working` | running | The agent is running a tool; the card shows which. | Nothing. |
 | **Compacting** | `Compacting` | running | The agent is compressing its context window. | Nothing. |
-| **Needs Input** | `WaitingForInput` | needs input | The agent is waiting for a permission answer or other input. | Answer it in the pane. In the TUI's command mode, `y` / `n` on the selected card sends approve / deny to a pending permission request. |
-| **Idle** | `Idle` | idle | The agent finished its turn and is waiting for a prompt. | Give it the next prompt. |
+| **Needs Input** | `WaitingForInput` | needs input | The agent is waiting for a permission answer, a choice from a menu, or other input. | Answer it in the pane. In the desktop app you can also [answer it by voice](desktop/voice.md#answering-an-agents-question). In the TUI's command mode, `y` / `n` on the selected card types `y` or `n` into the pane: Codex takes that as approve / deny, while Claude Code and OpenCode ignore it. |
+| **Idle** | `Idle` | idle | The agent finished its turn and is waiting for a prompt. Work it left running is shown beside it; see [Work left running after a turn](#work-left-running-after-a-turn). | Give it the next prompt. |
 | **Error** | `Error` | error | The agent reported a failure, or a deck message could not be delivered. Provider failures include an API error or a model the account cannot use. | Read the pane and any `not delivered: …` notice. |
 | **Blocked** | `Blocked` | blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. | Wait for the limit to reset, switch account or provider, or add credit. See [Blocked](#blocked). |
 | **No agent** | — | — | The pane is not running an agent the deck recognises (for example a plain shell), or the agent has not reported yet. | If it is an agent, see [Troubleshooting → Hooks](troubleshooting.md#hooks). |
@@ -29,18 +29,51 @@ A newer daemon can report a status this build does not know; both the TUI and th
 
 ### Which agents report which status
 
-The first five statuses come from each agent's hooks, plugin or extension, and how finely an agent separates them depends on what it reports: Pi's extension, for example, reports **Thinking**, **Working** while a tool runs, and **Idle**; Pi has no permission prompt for it to report, so a Pi card does not show **Needs Input**. Error and Blocked depend on the agent:
+The first five statuses come from each agent's hooks, plugin or extension, and how finely an agent separates them depends on what it reports: Pi's extension, for example, reports **Thinking**, **Working** while a tool runs, **Idle**, and **Needs Input** while a dialog another Pi extension shows is waiting; Pi asks no permission prompts of its own. Error, Blocked and when Needs Input appears depend on the agent:
 
 | Status | Claude Code | Codex | OpenCode | Pi | Devin |
 |---|---|---|---|---|---|
 | **Error** for a failed provider turn | Yes, 2.1.78 or newer | Yes, a few seconds after the failure | Yes | No | No |
 | **Blocked** | Yes, 2.1.78 or newer | Yes | Yes, once OpenCode stops retrying (it shows **Thinking** while it retries) | No | No |
-| A subagent's permission prompt told apart from the main agent's | Yes | Yes | No | No | No |
+| A subagent's permission prompt told apart from the main agent's | Yes | Yes | Yes | No | No |
+| **Needs Input** for a permission prompt | Yes | Yes | Yes | Pi asks none of its own | Yes |
+| **Needs Input** for a multiple-choice question or form | Yes | Yes, in Plan mode | Yes | Yes, for dialogs other Pi extensions show | Unverified |
+| The question and its options known to the deck, so it can be [answered by voice](desktop/voice.md#which-questions-each-agent-can-answer-by-voice) | Yes, 2.1.136 or newer | Yes | Yes | Yes, for dialogs other Pi extensions show | Permission prompts only, untested |
 
 - A Codex card follows Codex's hooks the way a Claude Code card does. In the TUI it shows **Idle** from the moment Codex starts until you send a prompt, **Thinking** and **Working** (with the tool) during the turn, **Needs Input** while a permission prompt is on screen, and **Idle** again when the turn ends, however much Codex redraws its screen (in the desktop app: **idle**, **running** while the turn runs, **needs input** at a permission prompt, and **idle** again). That needs the deck's Codex hooks to be trusted. When they are not (see [Troubleshooting → Codex events not showing](troubleshooting.md#codex-events-not-showing)), the card can only tell whether Codex's screen is changing: the TUI shows **Thinking** while Codex is drawing, including while you type into it and for a few seconds after it starts, and **Idle** once the screen has been still for about three seconds. In that case it shows no tool, no prompt and no **Needs Input**, and a turn waiting on a permission prompt reads **Idle**.
 - For Claude Code, Error and Blocked need the `StopFailure` hook, which the deck installs only when `claude --version` reports 2.1.78 or newer. After upgrading Claude Code to 2.1.78 or newer, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
+- For Claude Code, the question and its options need the `PermissionRequest` hook, which the deck installs only when `claude --version` reports 2.1.136 or newer. Older versions still show **Needs Input**, without the question. After upgrading, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
+- Pi's dialogs are known through behaviour Pi does not document, checked with Pi 0.87.1; a later Pi release may stop it working. Whether Devin reports its multiple-choice questions has not been checked.
 - OpenCode reaching Anthropic through an Anthropic "credit balance is too low" error does not turn the card Blocked; that error carries no marker the deck can read.
-- Where a subagent is told apart: when a subagent's permission prompt is abandoned (the subagent stops or fails without it being answered), the card goes back to Idle if the main agent's turn had ended, or to Thinking if it is still running.
+- Where a subagent is told apart: when a subagent's permission prompt is settled — it is allowed and the call it asked about finishes, the subagent stops or fails without it being answered, or, for OpenCode, it is answered either way — the card goes back to Idle if the main agent's turn had ended, or to Thinking if it is still running. An OpenCode subagent's question is told apart the same way, and is settled when it is answered or dismissed, or when the subagent stops. While the main agent's own prompt or another subagent's is also waiting, the card stays on **Needs Input**, and another subagent finishing a tool call does not answer it.
+
+### Work left running after a turn
+
+An agent can end its turn and leave something running: a command it started in the background (a dev server, a long build, a `sleep`), or a subagent that keeps working after the main agent has answered. The card then reads **Idle**, because the agent is waiting for its next prompt, and a line under it says what is still running and for how long:
+
+```
+Background: 2 commands, 1 subagent · 3h 12m
+```
+
+- A kind with nothing running is left out (`Background: 1 subagent · 4m`), and the time is how long the oldest of them has been running.
+- The line goes away by itself when the last of them ends, and while the agent is in a turn (after you send it a prompt) it is not shown.
+- If the deck cannot tell how long something has been running, the line shows the counts without a time.
+- In the TUI the line is on the card, under `Dir:`. In the desktop app it is in the agent's pane, under the agent's command and model, and on its tile on the Daemons screen, in the same words. The Dashboard row shows the status only.
+
+A command that has been running for hours is easy to spot this way. To stop it, open the agent's pane and ask the agent to stop it, or stop it yourself in the pane.
+
+What each agent reports:
+
+| | Claude Code | Codex | OpenCode | Pi | Devin |
+|---|---|---|---|---|---|
+| Background commands | Yes | Yes | Yes | Yes | Yes |
+| Background subagents | Yes | Yes | Yes | No | No |
+
+- On Windows, background commands are not counted for any agent; subagents still are.
+- An OpenCode subagent counts while its session is working, and stops counting when that session finishes, fails or is deleted.
+- The deck's Pi extension and Devin hooks do not report subagents, so a Pi or Devin card counts commands only.
+- Until an agent has reported a status of its own, a command it runs can still turn its card **Working**, and no `Background:` line appears.
+- A TUI or desktop app older than the daemon does not show the line and can show such a card as **Working**. With a daemon older than the app, cards behave the same way: a command left running turns the card **Working**, with no `Background:` line.
 
 ### Blocked
 
@@ -68,9 +101,11 @@ Long turns affect delivery in both clients:
 
 - **Title row**: the card number, the agent type, the pane's display name (or the session id if it has none), and on the right an animated dot and the status.
 - **`Dir:`**: the basename of the working directory, shortened with `…` when it does not fit.
+- **`Background:`**: commands and subagents the agent left running after its turn ended, and for how long; see [Work left running after a turn](#work-left-running-after-a-turn).
 - **`Prmt:`**: the most recent prompt or prompts.
 - **Recent tool calls**: the last commands the agent ran.
 - **`Last:` and `Tools:`**: time since the agent's last activity and its total tool-call count, in the bottom-right border. Narrow cards shorten them to `2m · 14 tools`, then `2m · 14`, and the narrowest omit them.
+- **Pull request**: when the agent's branch has a pull request on GitHub, its number and two glyphs, for its state and its review, in the bottom-left border, for example `#1234 ⊙ ◐`. See [Pull request badge](#pull-request-badge) below.
 
 ![Single agent card showing directory, last activity, tool count, recent prompt, and recent tool calls](/img/session-management-card.jpg)
 
@@ -83,9 +118,42 @@ The deck picks a density from how many cards it has to fit and the space availab
 | Compact | 1 | 1 |
 | Minimal | none | none |
 
-Minimal is used only when there are more cards than fit at Compact. Each card is then three rows: the title row, `Dir:`, and the bottom border with `Last:` and `Tools:`, so every card stays on screen instead of some being scrolled off. On a Blocked card the reason takes the place of `Dir:`, and on an orphaned card `Orphaned — delegation unavailable` does. When even Minimal cannot fit every card, the deck goes back to Compact cards and you scroll with the selection keys (`j`/`k` by default); the title row then shows how many cards are above or below the window.
+Minimal is used only when there are more cards than fit at Compact. Each card is then three rows: the title row, `Dir:`, and the bottom border with `Last:` and `Tools:`, so every card stays on screen instead of some being scrolled off. On a Blocked card the reason displaces `Dir:` when the card is too short to show both, and so do the `Background:` line on a card with work left running and `Orphaned — delegation unavailable` on an orphaned card. A Blocked or orphaned card that also has work left running keeps the reason on that row and adds the `Background:` line after it, separated by ` · ` (for example `⚠ Usage limit reached · Background: 1 command · 4m`), cut short with `…` when the card is too narrow for all of it. When even Minimal cannot fit every card, the deck goes back to Compact cards and you scroll with the selection keys (`j`/`k` by default); the title row then shows how many cards are above or below the window.
 
 ![Five agents running in parallel — cards switch to Compact density to fit them all without scrolling](/img/home-hero-dashboard.jpg)
+
+### Pull request badge
+
+When an agent works on a branch that has a pull request on GitHub, its card shows the pull request on the bottom border: the number, a glyph for the pull request's state and a glyph for its review.
+
+| Glyph | State |
+|---|---|
+| `⊙` | Open |
+| `◌` | Draft |
+| `◆` | Merged |
+| `⊘` | Closed |
+| `?` | A state this build does not know |
+
+| Glyph | Review |
+|---|---|
+| `✓` | Approved |
+| `✗` | Changes requested |
+| `◐` | Review required |
+| `?` | A review this build does not know |
+
+A pull request with no review yet shows only the state glyph. On a narrow card the badge drops its glyphs and shows only the number, and the `Last:`/`Tools:` text shortens or goes first.
+
+The badge appears by itself: an agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. It follows the pull request, so a review or a merge shows up on the card within about a minute. Press `o` on the selected card to open the pull request in your system browser (the `open_pull_request` key in [Keyboard Shortcuts](keyboard-shortcuts.md)); if no browser can be opened there, as in a TUI on a remote host, the status line shows the pull request's address so you can copy it. On a card with no badge, `o` says the agent has no pull request. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
+
+The desktop app shows the same pull request as a badge with icons on the agent's row and in its pane, and opens it inside the app when you click it; see [Desktop app → Dashboard → Pull requests](desktop/dashboard.md#pull-requests).
+
+**TUI:**
+
+![TUI implementation agent with #1234 and its open and review-required glyphs on the card's bottom border](/img/pull-request-badge-tui.png)
+
+**Desktop:**
+
+![Desktop Dashboard implementation agent row with the same open pull request #1234 awaiting review](/img/pull-request-badge-desktop.png)
 
 ### Diagnostic markers on a card
 
@@ -100,6 +168,61 @@ Minimal is used only when there are more cards than fit at Compact. Each card is
 *This section is about the TUI. The desktop app lists the agents the daemon started, so an agent you start yourself has no card there.*
 
 An agent you start yourself, outside the deck, still gets a card when its hooks report to the deck. Such a card is removed when that agent's session ends, rather than being left behind as an empty card. The deck keeps up to 256 of these cards at a time: when another arrives beyond that, the one that has been quiet the longest is removed, and it comes back the next time that agent starts a session. Cards of agents the running daemon started never count toward that limit and are never removed to make room. An agent that kept running across a daemon restart was started by the previous daemon, so in a TUI you open after the restart it counts as one of these cards. A TUI that stayed open through the restart keeps the card it already had for that agent instead: the card keeps updating, does not count toward the limit and is never removed to make room, and when the agent's session ends the card stays and shows Idle, still marked orphaned if the agent belonged to an orchestration, rather than disappearing. A TUI older than the daemon leaves an empty card for the pane where one of these cards is removed.
+
+## Check the machine a deck runs on
+
+Before you start more agents on a deck, you can check how much room its machine has left. Both clients show the same figures for the machine the deck's daemon runs on. For a remote deck that is the remote machine, not the one you are sitting at.
+
+- **TUI:** in command mode, press `m` or `Ctrl+m` (the `host_metrics` key, which you can remap in `keybindings.toml`; see [Keyboard Shortcuts](keyboard-shortcuts.md)). The **Host of this deck** overlay opens over the dashboard and shows the deck the TUI is attached to. Press `Esc`, `q` or `m` again to close it. While it is open, its figures refresh every couple of seconds.
+- **Desktop app:** each daemon's section on the [Dashboard](desktop/dashboard.md) has a small **Host** button beside the daemon's name. Its colour tells you at a glance how that machine is doing (see below), so with several daemons shown you can compare every machine at once. Click it, or reach it with `Tab` and press `Enter`, to open the **Host of this deck** figures; their **X** button, `Esc` or a click elsewhere closes them. With voice on, "show host" or "show resource usage" opens them too, and "close" or "close host" closes them ([Voice Control](desktop/voice.md#checking-a-daemons-machine)). The figures refresh at least every five seconds, and whenever the dashboard re-reads that daemon.
+
+**TUI:**
+
+![The Host of this deck overlay over an empty TUI dashboard: Working root and Worktree parent each 128 GiB free of 512 GiB total in green, Temp root 6 GiB free of 64 GiB total in yellow followed by (warning), load per core 0.42 across 16 cores and 43.5 GiB memory available in green, 18.5 GiB memory used](/img/host-metrics-tui.png)
+
+**Desktop:**
+
+![The desktop app's dashboard with the Host button beside the daemon's name, in amber and reading Host: warning, opened to show the same figures with the Temp root row in amber followed by (warning), and an X button in the corner of the figures](/img/host-metrics-desktop.png)
+
+What it shows:
+
+| Row | What it means |
+|---|---|
+| **Working root** | Free and total space on the disk holding the directory the deck's daemon was started in |
+| **Worktree parent** | Free and total space on the disk holding that directory's parent, where sibling worktrees (for example `../<repo>-dispatch-*`) are created |
+| **Temp root** | Free and total space on the disk holding the deck's test scratch directory |
+| **Load per core** | The machine's one-minute load average divided by its CPU cores, and the core count. Around `1.00` or more means the machine is fully busy. |
+| **Memory used** / **Memory available** | The machine's memory in use and still available |
+
+A figure the machine cannot report reads `unknown`, never `0`.
+
+### Warning and critical figures
+
+The deck judges each disk, its load and its available memory against its own machine's totals, and both clients colour the figure by the result: green when it is fine, yellow (amber in the desktop app) for a warning and red when it is critical. A warning or critical figure is also followed by the word `(warning)` or `(critical)`, so you do not need to tell the colours apart. In the desktop app the **Host** button takes the colour of the deck's worst figure and says it, for example **Host: critical**.
+
+| Figure | Warning | Critical |
+|---|---|---|
+| Disk (each row) | less than 15% of that disk free | less than 5% free |
+| Memory available | less than 20% of the machine's memory | less than 10% |
+| Load per core | above 0.8 | above 1.5 |
+
+A figure that reads `unknown` is never coloured. A deck whose daemon is from a release that does not judge its figures shows them uncoloured, and its desktop button stays neutral.
+
+You can change the limits for a deck in that deck's `config.toml`, on the machine its daemon runs on, under `[host_metrics]`. Each key is optional; a key you leave out keeps its default:
+
+```toml
+[host_metrics]
+disk_free_warn_percent = 15
+disk_free_critical_percent = 5
+memory_available_warn_percent = 20
+memory_available_critical_percent = 10
+load_per_core_warn = 0.8
+load_per_core_critical = 1.5
+```
+
+Or set one from the command line, for example `dot-agent-deck config set host_metrics.disk_free_warn_percent 20`. Percentages are from 0 to 100, and loads are 0 or more. A value that is not valid is ignored and that one limit keeps its default, which the daemon's log notes. A critical limit that is less strict than its warning resets both limits of that pair to their defaults, which the log also notes; `config set` refuses a value that would do that and names the other limit to change first. Changes apply within a few seconds, with no restart.
+
+When a deck's daemon is from a release before this feature, or runs on Windows, the overlay and the desktop popover say **Host metrics are not available from this deck** instead of showing figures. Upgrade that daemon to see them (for a remote daemon in the desktop app, see [Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)).
 
 ## Resuming Sessions
 

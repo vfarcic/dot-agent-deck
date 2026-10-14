@@ -114,6 +114,16 @@ use tracing::{error, info, warn};
 use crate::platform::ipc::{IpcListener, IpcStream};
 
 pub use crate::agent_pty::TabMembership;
+
+// Issue #1637: the hook-binary notice types `AttachResponse` and
+// `BroadcastMsg::HookBinaryNotice` carry, re-exported as wire types so a client
+// names them through the protocol module rather than `hook_binary`, which also
+// holds the daemon's probing and install-time logic.
+pub use crate::hook_binary::{
+    HookBinaryNotice, HookBinaryNotices, HookBinaryReason, MAX_NOTICE_COMMAND_BYTES, REMEDY_RUN,
+    REMEDY_UPGRADE_OR_REINSTALL,
+};
+
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
 use crate::event::{AgentType, BroadcastMsg};
@@ -526,6 +536,21 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// unreleased stream before any build that serves it shipped, so it changed
 /// the meaning of nothing a released client reads either.
 ///
+/// **PRD #1258 contributes no bump for [`AttachRequest::HostMetrics`]**, on the
+/// same rung: its one sender,
+/// [`crate::daemon_client::DaemonClient::host_metrics`], withholds it unless
+/// [`CAP_HOST_METRICS`] is advertised, and its answer
+/// [`AttachResponse::host_metrics`] is an additive optional field. It reads the
+/// host and changes no state, and no existing field or verb changed meaning, so
+/// no [`CONTRACT_BREAKS`] entry and no `.breaking.md`. The residual — a cached
+/// capability set outliving a daemon replaced by an older build — fails
+/// closed: that daemon refuses the unknown variant and the client reports an
+/// error rather than numbers. The health levels added beside the numbers
+/// ([`HealthLevel`]: `DiskUsage::level`, `HostMetrics::load_level` and
+/// `memory_level`) are additive optional fields of that reply, rule 18's
+/// additive rung, so no bump either: an older client ignores them, and an
+/// older daemon omits them, which a client shows as an uncoloured number.
+///
 /// # Where this constant is enforced
 ///
 /// **Two call sites refuse on it, and both require exact equality**
@@ -710,6 +735,15 @@ pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 /// Unix-only carve-out of [`CAP_PREPARE_ORCHESTRATION`].
 pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 
+/// Capability string for [`AttachRequest::AnswerQuestion`] (PRD #1631).
+///
+/// Same convention as [`CAP_FOCUS_GAINED`]: the string is the variant's `op`,
+/// and a client sends `answer-question` only to a daemon whose `Hello` reply
+/// names it — [`crate::daemon_client::DaemonClient::answer_question_while`]
+/// holds the check. Advertised on every platform: the dispatch arm is not
+/// `#[cfg]`-gated.
+pub const CAP_ANSWER_QUESTION: &str = "answer-question";
+
 /// Capability string for [`AttachRequest::RecordOrchestratorContext`] (issue
 /// #1445).
 ///
@@ -864,6 +898,161 @@ pub const CAP_INBOX: &str = "inbox";
 /// rollout tailer, which run on every platform this builds for.
 pub const CAP_TURN_REPLIES: &str = "turn-replies";
 
+/// Capability string for [`AttachRequest::HostMetrics`] (PRD #1258): this
+/// daemon reports its own host's disk, load and memory. Held by
+/// [`crate::daemon_client::DaemonClient::host_metrics`], so no call site checks
+/// it itself.
+///
+/// **Unix only.** Disk is read with `statvfs(3)` and load with `/proc/loadavg`
+/// or `getloadavg(3)`, none of which a Windows build has; there the dispatch arm
+/// refuses the verb, so advertising it would promise a reading the daemon
+/// cannot take. A client against such a daemon shows "not available from this
+/// deck", exactly as it does against a daemon that predates the verb.
+pub const CAP_HOST_METRICS: &str = "host-metrics";
+
+// PRD #1258: the host-metrics reply's wire shape and the bounds a client holds
+// it to. They live with the protocol rather than with the daemon's sampler in
+// `crate::host_metrics`, so a client names the reply without reaching into
+// the module that reads `/proc` and calls `statvfs` (PRD #819, linkage-check
+// rule 12).
+
+/// The role of the filesystem holding the deck's working root.
+pub const ROLE_WORKING_ROOT: &str = "working_root";
+/// The role of the filesystem holding the working root's parent, where sibling
+/// worktrees (`../<repo>-dispatch-*`) land.
+pub const ROLE_WORKTREE_PARENT: &str = "worktree_parent";
+/// The role of the filesystem holding the e2e harness's temp root.
+pub const ROLE_TEMP_ROOT: &str = "temp_root";
+
+/// One watched role's filesystem. Either figure is absent when it could not be
+/// read; neither is ever reported as zero in its place.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiskUsage {
+    /// One of [`ROLE_WORKING_ROOT`], [`ROLE_WORKTREE_PARENT`],
+    /// [`ROLE_TEMP_ROOT`]. A string rather than an enum so a client meeting a
+    /// role a newer daemon added still decodes the reply.
+    pub role: String,
+    /// Bytes available to an unprivileged writer (`f_bavail`), which is what a
+    /// build can actually use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    /// How healthy this filesystem's free space is, judged by the daemon
+    /// against its own thresholds ([`HealthLevel`]). Absent when either figure
+    /// is, and from a daemon that predates health levels.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_health_level"
+    )]
+    pub level: Option<HealthLevel>,
+}
+
+/// How healthy one host reading is (PRD #1258), judged by the **daemon** against
+/// the thresholds in its config (`[host_metrics]`, see
+/// [`crate::host_metrics::HealthThresholds`]) and served beside the number.
+/// Clients colour and label from it and never recompute it, so every client of
+/// one deck agrees, and a deck's own thresholds apply to its own host.
+///
+/// Additive and optional on the wire: a daemon that predates it omits every
+/// level, and a client then shows the number with no colour — not as `ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthLevel {
+    Ok,
+    Warn,
+    Critical,
+}
+
+/// A level a client does not recognise — one a newer daemon added — reads as
+/// absent, so the reply still decodes and the number shows uncoloured.
+fn deserialize_health_level<'de, D>(deserializer: D) -> Result<Option<HealthLevel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// The daemon's answer to `host-metrics`: its own host, as of `sampled_at_ms`.
+///
+/// Every reading degrades on its own: a field this host cannot read is absent,
+/// not zero. Memory is read from `/proc/meminfo` on Linux and from the Mach
+/// host statistics on macOS (see [`crate::host_metrics`]).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HostMetrics {
+    #[serde(default)]
+    pub disks: Vec<DiskUsage>,
+    /// [`crate::host_metrics::machine_load_per_cpu`]: the 1-minute load
+    /// average over the CPUs this process may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_per_cpu: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+    /// Total memory less available memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_available_bytes: Option<u64>,
+    /// The daemon's [`HealthLevel`] for [`Self::load_per_cpu`]; absent when the
+    /// load is, and from a daemon that predates health levels.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_health_level"
+    )]
+    pub load_level: Option<HealthLevel>,
+    /// The daemon's [`HealthLevel`] for available memory as a share of the
+    /// total (used + available); absent when either figure is.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_health_level"
+    )]
+    pub memory_level: Option<HealthLevel>,
+    /// Wall-clock epoch milliseconds the sample was taken at. Equal across
+    /// replies served from one cached sample.
+    pub sampled_at_ms: u64,
+    /// How old the sample was when this reply was written, in milliseconds.
+    pub sample_age_ms: u64,
+}
+
+/// The most disk roles a client accepts in one reply. The daemon names three;
+/// the headroom lets a newer daemon add roles without an older client refusing
+/// the reply, while a hostile or broken one cannot make a client allocate and
+/// render an unbounded list (PRD #1258 audit A2).
+pub const MAX_DISK_ROLES: usize = 16;
+
+/// The longest role name, in bytes, a client accepts. The daemon's are under
+/// twenty; a role is an identifier, not text.
+pub const MAX_ROLE_BYTES: usize = 64;
+
+impl HostMetrics {
+    /// Whether a reply is within [`MAX_DISK_ROLES`] and [`MAX_ROLE_BYTES`]. The
+    /// client refuses one that is not, rather than handing its renderers work
+    /// whose size the peer chose.
+    pub fn within_reply_bounds(&self) -> bool {
+        self.disks.len() <= MAX_DISK_ROLES
+            && self.disks.iter().all(|d| d.role.len() <= MAX_ROLE_BYTES)
+    }
+}
+
+/// Capability string for [`AttachRequest::CloseAgents`] (PRD #1589): close
+/// dispatched units, one agent, or one orchestration instance, with the
+/// default refusals and the caller authority the `close` verb applies. Held by
+/// [`crate::daemon_client::DaemonClient::close_agents`], which refuses to send
+/// the request to a daemon that does not advertise it. Advertised on every
+/// platform: the dispatch arm is not `#[cfg]`-gated.
+pub const CAP_CLOSE_AGENTS: &str = "close-agents";
+
+/// Capability string for [`AttachRequest::Hello`]'s `follow_on` (PRD #1589,
+/// review on PR #1681): this daemon serves one more request on a connection
+/// whose `Hello` set it. [`crate::daemon_client::DaemonClient::close_agents`]
+/// sends its request that way, so the daemon that answers it is the one whose
+/// reply advertised [`CAP_CLOSE_AGENTS`]. Advertised on every platform.
+pub const CAP_HELLO_FOLLOW_ON: &str = "hello-follow-on";
+
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -1015,7 +1204,8 @@ fn invalid_client_id_message() -> String {
 /// not `#[cfg]`-gated, and neither is issue #1555's
 /// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`] nor PRD #1497's [`CAP_TURN_REPLIES`].
 /// PRD #1487's [`CAP_RESTART_DAEMON`] is on both lists: its dispatch arm is
-/// not `#[cfg]`-gated either.
+/// not `#[cfg]`-gated either. PRD #1258's [`CAP_HOST_METRICS`] is on the Unix
+/// list only: its dispatch arm refuses the verb elsewhere.
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -1032,11 +1222,15 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_PREPARE_DEADLINE,
     CAP_LAST_COMMAND,
+    CAP_ANSWER_QUESTION,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
     CAP_INBOX,
+    CAP_HOST_METRICS,
+    CAP_CLOSE_AGENTS,
+    CAP_HELLO_FOLLOW_ON,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1049,11 +1243,14 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_AUTHORING_KIND,
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_LAST_COMMAND,
+    CAP_ANSWER_QUESTION,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
     CAP_INBOX,
+    CAP_CLOSE_AGENTS,
+    CAP_HELLO_FOLLOW_ON,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1655,6 +1852,19 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// mattered.
 const CLOSE_PREVIEW_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// PRD #1589 (review on PR #1681): how long the daemon waits for the request
+/// that follows a `Hello { follow_on: true }` reply — header and payload both —
+/// before dropping the connection. The one sender, `DaemonClient::close_agents`,
+/// writes that request as soon as it has read the reply, so this is the same
+/// "the peer cannot be doing its part" bound as [`CLIENT_WRITE_TIMEOUT`]; it
+/// keeps a stalled peer from holding a client-count slot, and with it idle
+/// shutdown. The first frame on a connection stays unbounded, as it always was.
+#[cfg(not(test))]
+const FOLLOW_ON_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Short under unit test, so the stall tests observe the release quickly.
+#[cfg(test)]
+const FOLLOW_ON_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------
 // Wire I/O
 // ---------------------------------------------------------------------------
@@ -1863,6 +2073,30 @@ pub enum AttachRequest {
     StopAgent {
         id: String,
     },
+    /// PRD #1589: close dispatched units, one agent, or one orchestration
+    /// instance — the `dot-agent-deck close` verb.
+    ///
+    /// Unlike [`Self::StopAgent`], which stops exactly the id it names with no
+    /// questions (its contract is unchanged), this request is resolved and
+    /// refused daemon-side: the caller's authority ([`CallerClaim`]), the
+    /// default refusals (`not-reported`, `busy`, `strands-orchestration`,
+    /// overridden by `force`), and a bulk selector that applies only as a dry
+    /// run. Answered with [`AttachResponse::close_report`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_CLOSE_AGENTS`]**, so no
+    /// [`PROTOCOL_VERSION`] bump: every sender gates in the client library.
+    CloseAgents {
+        selector: CloseSelector,
+        /// The calling agent's pane claim. Absent: a person.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerClaim>,
+        /// Override the forceable refusals. Never authority.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
+        /// Resolve and report, stop nothing.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+    },
     AttachStream {
         id: String,
         /// PRD #882 — the geometry this client can draw the agent at, if it
@@ -2033,10 +2267,21 @@ pub enum AttachRequest {
     /// it — mirroring the server-policy on `client_version`. Older clients
     /// omit the field; deserialization tolerates that via
     /// `#[serde(default)]`.
+    ///
+    /// PRD #1589 (review on PR #1681): `follow_on` asks the daemon to keep the
+    /// connection open after the reply and serve ONE more request on it, so a
+    /// client can check a capability and send the verb it gates to the same
+    /// daemon — a second connection could reach a daemon that replaced it.
+    /// Honoured by a daemon that advertises [`CAP_HELLO_FOLLOW_ON`]; an older
+    /// one ignores the field and closes after the reply, as it always did, and
+    /// its reply does not advertise the capability, so a client that checks it
+    /// never writes the follow-on request.
     Hello {
         client_version: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_build_version: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        follow_on: bool,
     },
     /// PRD #127 M1.3: re-read the global `schedules.toml` and diff/replace the
     /// daemon's registered scheduled-task set without a restart. The handler
@@ -2331,6 +2576,47 @@ pub enum AttachRequest {
         /// an invalid one is refused and changes no state.
         client_id: String,
     },
+    /// PRD #1631: answer the question `agent_id` is waiting on
+    /// ([`crate::state::SessionSnapshot::pending_question`]).
+    ///
+    /// The daemon refuses unless `question_id` names the question pending NOW,
+    /// validates the whole answer against it
+    /// ([`crate::question::PendingQuestion::validate`]), and answers through
+    /// the agent's own channel: the held hook, plugin or extension decision, or
+    /// the keys the agent's option table names. A refusal is answered
+    /// `ok: false` and says why on [`AttachResponse::answer_refusal`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_ANSWER_QUESTION`]** —
+    /// [`crate::daemon_client::DaemonClient::answer_question_while`] holds that
+    /// check, so no call site repeats it. An older daemon has no such variant
+    /// and answers the generic `malformed request: …` refusal, changing
+    /// nothing. Its own short-lived connection: one request, one response,
+    /// close.
+    AnswerQuestion {
+        agent_id: String,
+        question_id: String,
+        /// One per question of the form, in any order, each question exactly
+        /// once.
+        answers: Vec<crate::question::QuestionAnswer>,
+        /// The client asserts it showed the "always" confirmation naming the
+        /// option's scope. The daemon cannot verify it; it refuses an "always"
+        /// option without it, so a client that skipped the dialog has to claim
+        /// otherwise explicitly rather than by omission.
+        #[serde(default)]
+        confirmed_always: bool,
+        /// PRD #1631 (audit A4): the revision of the question the answer was
+        /// worked out against ([`crate::question::PendingQuestion::revision`]
+        /// on the snapshot). The daemon refuses the answer as stale unless it
+        /// is the revision pending now, so a question replaced under the same
+        /// id between the client's read and the request is never answered with
+        /// a choice made for the old one. A request that omits it is refused
+        /// the same way whenever the pending question has a revision (PR #1698
+        /// review); no released client sends this request, so none relied on
+        /// the id check alone. Optional on the wire only so that a pending
+        /// question the daemon stamped no revision on can still be named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
+    },
     /// Issue #1445: "the orchestrator in `pane_id` has just been re-armed from
     /// `context_path`" — a TUI's compaction or `/clear` re-arm published a new
     /// per-publish context file for that coordinator
@@ -2577,6 +2863,25 @@ pub enum AttachRequest {
         #[serde(default)]
         successor: RestartSuccessor,
     },
+    /// PRD #1258: "how loaded is your host?" — disk free/total for the deck's
+    /// three watched roles, load per CPU, CPU count and memory, with the
+    /// sample's age. **Read-only.** The reply rides back on
+    /// [`AttachResponse::host_metrics`]; the shape is
+    /// [`HostMetrics`], which names roles and never a
+    /// path.
+    ///
+    /// Answered from the daemon's [`crate::host_metrics::HostMetricsCache`],
+    /// sampled on demand and reused for
+    /// [`crate::host_metrics::HOST_METRICS_MAX_AGE`] — no timer drives it.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_HOST_METRICS`]**, by its
+    /// one sender [`crate::daemon_client::DaemonClient::host_metrics`], so it
+    /// contributes no [`PROTOCOL_VERSION`] bump: an older daemon is never sent
+    /// it, and refuses it with the generic `malformed request: …` if a raw
+    /// sender skips the check, changing nothing.
+    ///
+    /// Its own short-lived connection: one request, one response, close.
+    HostMetrics,
 }
 
 /// PRD #1487: who starts the daemon that replaces one answering
@@ -2860,6 +3165,290 @@ pub enum StopRefusalReason {
     Unknown,
 }
 
+// ---------------------------------------------------------------------------
+// PRD #1589: the `close` verb's wire types.
+// ---------------------------------------------------------------------------
+
+/// Why a close refused a target, or the whole request. See
+/// [`crate::dispatched_units::RefusalReason`]: kebab-case, with a
+/// `#[serde(other)] Unknown`.
+pub use crate::dispatched_units::RefusalReason as CloseRefusalReason;
+
+/// PRD #1589: the calling agent's claim to a pane — the same
+/// `(pane, token)` pair a hook-socket message presents, checked by the same
+/// [`crate::hook_provenance::classify`]. A standalone struct so PRD #1590's
+/// follow-up request can embed it unchanged.
+///
+/// **The token is a capability and never leaves this struct**: `Debug` redacts
+/// it, and nothing derived from a request — a log line, an error, a report, a
+/// tombstone — carries it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerClaim {
+    pub pane_id: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for CallerClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallerClaim")
+            .field("pane_id", &self.pane_id)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// PRD #1589: dispatched units by the name they were dispatched under. A
+/// standalone struct so PRD #1590 can embed it unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitSelector {
+    pub names: Vec<String>,
+}
+
+/// PRD #1589: what a [`AttachRequest::CloseAgents`] names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CloseSelector {
+    /// Dispatched units, by dispatch name (compared by sanitized slug).
+    Units(UnitSelector),
+    /// Dispatched units by the daemon-issued ids a preview listed — how a bulk
+    /// close applies, so a name reused between the preview and the apply
+    /// cannot retarget it.
+    UnitIds { ids: Vec<String> },
+    /// One agent, by the pane it holds.
+    Pane { pane_id: String },
+    /// Every role of the orchestration instance this pane belongs to.
+    OrchestrationOf { pane_id: String },
+    /// Every unit the caller may close. **Dry run only**: the daemon refuses it
+    /// otherwise ([`CloseRefusalReason::BulkRequiresDryRun`]), so bulk safety
+    /// does not rest on a CLI convention.
+    AllUnits,
+}
+
+/// PRD #1589: the answer to [`AttachRequest::CloseAgents`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseReport {
+    pub dry_run: bool,
+    #[serde(default)]
+    pub forced: bool,
+    /// The whole request was refused before any target was resolved: the
+    /// caller's claim did not attest it, its generation was superseded, or a
+    /// bulk selector came without `dry_run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<CloseRefusal>,
+    /// `--all` listed only the first `crate::close_agents::MAX_LISTED_TARGETS`
+    /// units: more were live. Additive (auditor S4); absent means `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// One entry per resolved target, or per selector entry that did not
+    /// resolve.
+    #[serde(default)]
+    pub targets: Vec<CloseTarget>,
+}
+
+/// A refusal and the sentence explaining it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseRefusal {
+    pub reason: CloseRefusalReason,
+    pub message: String,
+}
+
+/// What happened to one target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CloseOutcome {
+    /// Every pane of it stopped.
+    Closed,
+    /// Some panes stopped and others did not; [`CloseTarget::survivors`] names
+    /// them. Never reported as `Closed`.
+    PartiallyClosed,
+    /// Nothing was stopped; [`CloseTarget::reason`] says why.
+    Refused,
+    /// Nothing was stopped, or what was is in `panes`; [`CloseTarget::error`]
+    /// says what went wrong.
+    Failed,
+    /// A dry run: listed, nothing stopped.
+    Listed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One target of a close.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseTarget {
+    /// The selector entry that reached this target, as given (a name, an id or
+    /// a pane id). Producer input: escape it before showing it.
+    pub selector: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_id: Option<String>,
+    /// The unit's dispatch name, bounded. Producer input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `single`, `orchestration`, or `pane` for a target that is not a unit.
+    pub kind: String,
+    #[serde(default)]
+    pub panes: Vec<ClosePane>,
+    pub outcome: CloseOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<CloseRefusalReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// For [`CloseOutcome::PartiallyClosed`]: the pane ids still running.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub survivors: Vec<String>,
+    /// The refusals `force` overrode for this target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forced_over: Vec<CloseRefusalReason>,
+    /// In a preview: the forceable refusals a close without `force` would
+    /// meet right now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub would_refuse: Vec<CloseRefusalReason>,
+    /// For a unit: whether it reported an attested `work-done --done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatcher: Option<CloseDispatcher>,
+    /// What became of the unit's worktree, once the close's cleanup answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_verdict: Option<WorktreeVerdict>,
+    /// Units this target's agents dispatched that stay open: closing is not
+    /// transitive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_descendants: Vec<OpenDescendant>,
+    /// For [`CloseRefusalReason::Ambiguous`]: the units the name matched, at
+    /// most `crate::close_agents::MAX_LISTED_TARGETS` of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<AmbiguousCandidate>,
+    /// One of this entry's lists — `candidates`, a candidate's `panes`,
+    /// `open_descendants` or `panes` — was cut short: there was more than the
+    /// report lists (auditor S3). Also set when a report too large for its
+    /// size bound shortened this entry's long fields, each ending in `…`
+    /// (auditor SF3). Additive; absent means `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+impl CloseTarget {
+    /// A target that never resolved: refused before anything else was known.
+    pub fn refused(selector: &str, reason: CloseRefusalReason, message: String) -> Self {
+        Self {
+            selector: selector.to_string(),
+            unit_id: None,
+            name: None,
+            kind: "unknown".to_string(),
+            panes: Vec::new(),
+            outcome: CloseOutcome::Refused,
+            reason: Some(reason),
+            message: Some(message),
+            error: None,
+            survivors: Vec::new(),
+            forced_over: Vec::new(),
+            would_refuse: Vec::new(),
+            reported: None,
+            completed_at_ms: None,
+            dispatched_at_ms: None,
+            worktree: None,
+            branch: None,
+            clone: None,
+            dispatcher: None,
+            worktree_verdict: None,
+            open_descendants: Vec::new(),
+            candidates: Vec::new(),
+            truncated: false,
+        }
+    }
+}
+
+/// One pane of a close target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosePane {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub is_orchestrator: bool,
+    /// The card's status when the close looked, e.g. `Working`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// The agent had already exited on its own.
+    #[serde(default)]
+    pub exited: bool,
+    /// `Some(true)` once its stop was confirmed, `Some(false)` when the stop
+    /// failed, `None` when no stop was attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<bool>,
+}
+
+/// The pane and agent that dispatched a unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseDispatcher {
+    pub pane_id: String,
+    pub agent_id: String,
+}
+
+/// A unit a closed target's agents dispatched, left open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenDescendant {
+    pub unit_id: String,
+    pub name: String,
+    pub clone: String,
+}
+
+/// One unit an ambiguous name matched — enough to close it by id instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbiguousCandidate {
+    pub unit_id: String,
+    pub name: String,
+    pub worktree: String,
+    #[serde(default)]
+    pub panes: Vec<String>,
+}
+
+/// What a close's worktree cleanup did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeVerdict {
+    pub path: String,
+    pub verdict: WorktreeVerdictKind,
+}
+
+/// PRD #1589 D6: the typed cleanup verdict a close waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorktreeVerdictKind {
+    /// `git worktree remove` succeeded; the branch is kept.
+    Removed,
+    /// Kept: `git status` reported uncommitted changes.
+    KeptDirty,
+    /// Kept: whether it was dirty could not be checked.
+    KeptCouldNotCheck,
+    /// Kept: `git worktree remove` failed.
+    RemoveFailed,
+    /// Kept: something this daemon runs or is starting is still rooted in it.
+    StillInUse,
+    /// The daemon has no record of the worktree (it restarted since the
+    /// dispatch, or an earlier close already took it) — `worktree reclaim`'s
+    /// job now.
+    NotRecorded,
+    /// The agents are stopped, and the cleanup had not answered within the
+    /// bound; it is still running and its outcome is unknown.
+    TimedOut,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Discriminated by the populated optional fields rather than a tag, since
 /// each request type has a fixed shape and clients can decide what to read
 /// based on which request they sent.
@@ -3038,6 +3627,18 @@ pub struct AttachResponse {
     /// cannot answer the question at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration_roles: Option<Vec<crate::state::OrchestrationRoleRecord>>,
+    /// Issue #1637: the agents whose hooks run a `dot-agent-deck` older than
+    /// this daemon (or that this deck could not install hooks for, issue
+    /// #1157), with what to do about each. Set on the [`AttachRequest::Hello`]
+    /// and [`AttachRequest::SubscribeEventsWithSnapshot`] replies, so a client
+    /// learns it on connect and again on every reconnect; a change mid-session
+    /// arrives as [`crate::event::BroadcastMsg::HookBinaryNotice`].
+    ///
+    /// Additive and optional, so no [`PROTOCOL_VERSION`] bump: an older client
+    /// ignores the key and an older daemon omits it. `Some(vec![])` is a daemon
+    /// reporting nothing to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_binary_notices: Option<Vec<crate::hook_binary::HookBinaryNotice>>,
     /// Issue #887: this daemon's registered-schedule revision
     /// ([`crate::scheduler::Scheduler::revision`]), populated on the
     /// [`AttachRequest::ListAgents`] reply.
@@ -3119,6 +3720,28 @@ pub struct AttachResponse {
     /// other response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbox_messages: Option<Vec<crate::inbox::MessageSummary>>,
+    /// PRD #1631: why an [`AttachRequest::AnswerQuestion`] was refused, so a
+    /// client never branches on `error` text. `None` on success and on every
+    /// other response. Unlike [`Self::close_agents`], an answer refusal is
+    /// answered `ok: false` with this field set: `ok: true` means the answer
+    /// was delivered, and that is what
+    /// [`crate::daemon_client::DaemonClient::answer_question_while`] reads
+    /// first. Additive + optional, and the request it answers is
+    /// capability-gated, so neither moves [`PROTOCOL_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_refusal: Option<crate::question::AnswerRefusal>,
+    /// PRD #1258: the answer to [`AttachRequest::HostMetrics`]. `None` on every
+    /// other response, and on a refusal. Additive + optional, and the request
+    /// it answers is capability-gated, so neither moves [`PROTOCOL_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_metrics: Option<HostMetrics>,
+    /// PRD #1589: the answer to [`AttachRequest::CloseAgents`]. `None` on every
+    /// other response. A refusal is a report, answered `ok: true`; `ok: false`
+    /// is reserved for a request the daemon could not process at all. Additive
+    /// and optional, and the request it answers is capability-gated, so no
+    /// [`PROTOCOL_VERSION`] bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_report: Option<CloseReport>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -3484,6 +4107,9 @@ pub async fn serve_attach_with_restart(
     // Notify stores a permit if no waiter is registered, so a signal sent
     // between the monitor's loop iterations isn't lost.
     let change_notify: Arc<Notify> = registry.change_notify();
+    // PRD #1258: one host sample per attach server, shared by every connection
+    // so a cache hit holds across clients and reconnects.
+    let host_metrics = Arc::new(crate::host_metrics::HostMetricsCache::new());
     loop {
         match listener.accept().await {
             Ok(stream) => {
@@ -3497,6 +4123,7 @@ pub async fn serve_attach_with_restart(
                 let reuse_registry = reuse_registry.clone();
                 let worktree_registry = worktree_registry.clone();
                 let restart = restart.clone();
+                let host_metrics = host_metrics.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -3536,6 +4163,8 @@ pub async fn serve_attach_with_restart(
                         reuse_registry,
                         worktree_registry,
                         restart,
+                        host_metrics,
+                        None,
                     )
                     .await
                     {
@@ -3591,6 +4220,36 @@ pub async fn run_attach_server_with_counter(
         dummy_worktrees,
     )
     .await
+}
+
+/// PRD #1258: answer [`AttachRequest::HostMetrics`] from `cache`.
+///
+/// The cache decides on the async side whether any blocking work starts, and
+/// starts at most one sample at a time, so a hung filesystem cannot pile
+/// blocking jobs up behind this verb (audit A1; see
+/// [`crate::host_metrics::HostMetricsCache`]). With no sample to answer from
+/// within [`crate::host_metrics::HOST_METRICS_SAMPLE_WAIT`], the reply is a
+/// generic error the clients show as a failed read.
+#[cfg(unix)]
+async fn host_metrics_response(
+    cache: Arc<crate::host_metrics::HostMetricsCache>,
+) -> AttachResponse {
+    match cache.read().await {
+        Some(metrics) => AttachResponse {
+            host_metrics: Some(metrics),
+            ..AttachResponse::ok()
+        },
+        None => AttachResponse::err("host-metrics: no host sample is available yet"),
+    }
+}
+
+/// Not advertised here — see [`CAP_HOST_METRICS`] — so only a raw sender that
+/// skipped the capability check reaches this.
+#[cfg(not(unix))]
+async fn host_metrics_response(
+    _cache: Arc<crate::host_metrics::HostMetricsCache>,
+) -> AttachResponse {
+    AttachResponse::err("host-metrics is not supported on this platform")
 }
 
 /// The orchestration bits of a `StartAgent`'s `TabMembership`, captured before
@@ -4056,6 +4715,158 @@ async fn refuse_restart_for_stop(stream: &mut IpcStream) -> io::Result<()> {
     write_resp(stream, &resp).await
 }
 
+/// PRD #1589: the teardown `StopAgent` performs on one agent, shared with
+/// `CloseAgents` so the two cannot drift: everything between taking the
+/// pane-cleanup hold and answering, minus the dispatched-worktree cleanup —
+/// which `StopAgent` runs detached after its quick reply and `CloseAgents`
+/// awaits for its report.
+///
+/// `pane_id_env` is the pane the caller's [`PaneCleanupHold`] authorises
+/// cleaning up, `None` when the agent no longer holds a pane it may clean up
+/// (its successor owns it); the hold itself stays with the caller, which
+/// releases it after this returns. On success the agent's unit, if it was one
+/// and this was its last pane, ends with `end_reason`. On failure the closing
+/// mark is rolled back and the error returned.
+pub(crate) async fn stop_agent_steps(
+    id: &str,
+    stopping_record: Option<&AgentRecord>,
+    pane_id_env: Option<&str>,
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    end_reason: crate::dispatched_units::EndReason,
+) -> Result<(), String> {
+    // PRD #126 M1 review (finding 1) / audit (finding 2): open the
+    // race-safe close transition BEFORE terminating the child. This
+    // atomically marks the pane closing and drops every outstanding
+    // delegation that touches it — as the worker AND as the
+    // orchestrator. Three defects close here: the old cancellation ran
+    // only AFTER `close_agent`, so a timer firing during the up-to-3s
+    // SIGTERM grace window injected the very nudge a deliberate close
+    // exists to suppress; it was keyed by worker pane only, so closing
+    // an ORCHESTRATOR left every worker's timer armed against a pane id
+    // a later, unrelated agent could inherit; and it left a window in
+    // which a concurrent `handle_delegate` (holding only the state read
+    // guard) could arm after the cancellation, leaving a record nothing
+    // would remove. Arming is refused while the mark is set.
+    if let Some(pane_id) = pane_id_env {
+        let dropped = registry.begin_pane_close(pane_id);
+        if !dropped.is_empty() {
+            tracing::debug!(
+                pane_id = %pane_id,
+                dropped = dropped.len(),
+                "StopAgent: dropped outstanding delegations touching the closing pane"
+            );
+        }
+    }
+    // PRD #92 F8 followup (auditor #1): `close_agent` runs the
+    // synchronous SIGTERM-with-grace loop in
+    // `terminate_child_with_grace_and_wait`, which calls
+    // `std::thread::sleep` for up to 3 s while polling the
+    // child's `try_wait`. Calling that from inside the async
+    // attach-connection task would block a Tokio worker thread
+    // for the duration of the grace window — under load this
+    // can starve other connections. Mirror the
+    // `KIND_SHUTDOWN` handler's pattern: hop the blocking work
+    // onto a `spawn_blocking` pool task, await the
+    // `JoinHandle`, and surface a join error as a failed
+    // close.
+    let registry_for_close = registry.clone();
+    let id_for_close = id.to_string();
+    let close_result =
+        tokio::task::spawn_blocking(move || registry_for_close.close_agent(&id_for_close)).await;
+    let close_outcome: Result<(), String> = match close_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(join_err) => {
+            tracing::warn!(
+                error = %join_err,
+                agent_id = %id,
+                "spawn_blocking for close_agent panicked or was cancelled"
+            );
+            Err(format!("close_agent task failed: {join_err}"))
+        }
+    };
+    match close_outcome {
+        Ok(()) => {
+            if let Some(pane_id) = pane_id_env {
+                // PRD #126: a deliberately closed worker owes nothing.
+                // Without this, closing a stuck worker would still
+                // nag the orchestrator when its timeout expired hours
+                // later, pointing at a pane that no longer exists.
+                // Order matters: take the state write guard and
+                // unregister the pane first, then sweep once more and
+                // only then clear the closing mark, so no interleaving
+                // leaves a record behind.
+                state.write().await.unregister_pane(pane_id);
+                registry.finish_pane_close(pane_id, true);
+                // PRD #1223: tell every attached TUI the pane is gone,
+                // not only the client that asked — a desktop stop was
+                // otherwise invisible to an attached TUI, which kept
+                // the card (and an orchestration's tab) indefinitely.
+                // Here, and only here, for three reasons: it is the one
+                // arm every stop route reaches; `pane_id_env` is `Some`
+                // only while this agent still held the pane, so a stale
+                // stop never removes a successor's pane; and the
+                // cleanup hold is still held, so no successor's start
+                // can be broadcast ahead of this removal. After the
+                // child is reaped, so the removal describes a finished
+                // stop; a hook the dying agent posted that is still in
+                // flight lands on a pane the TUI has unregistered, where
+                // a non-`SessionStart` frame is dropped rather than
+                // redrawing the card. See
+                // `crate::spawn::surface_attach_stopped_agent`.
+                if let Some(record) = stopping_record {
+                    crate::spawn::surface_attach_stopped_agent(event_tx, record, pane_id);
+                }
+            }
+            // PRD #1589 D5: the unit this agent belonged to ends once no pane
+            // of it remains — for an orchestration, once neither this registry
+            // nor the role maps hold any pane of its instance.
+            if let Some(record) = stopping_record {
+                let instance = match &record.tab_membership {
+                    Some(crate::agent_pty::TabMembership::Orchestration {
+                        orchestration_id: Some(id),
+                        ..
+                    }) => Some(id.clone()),
+                    _ => None,
+                };
+                let in_state = match instance.as_deref() {
+                    Some(instance) => state
+                        .read()
+                        .await
+                        .pane_orchestration_map
+                        .values()
+                        .any(|identity| identity.id == instance),
+                    None => false,
+                };
+                if let Some(unit_id) =
+                    registry.note_unit_member_removed(record, in_state, end_reason)
+                {
+                    tracing::info!(
+                        unit_id = %unit_id,
+                        agent_id = %record.id,
+                        "dispatch: the unit's last pane closed; the unit has ended"
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(msg) => {
+            // PRD #126: the close failed, so the agent is still live. Roll the
+            // transition back by clearing the closing mark — future delegates
+            // to this pane can arm again. The records swept at `begin` are
+            // deliberately NOT restored: losing a watch fails safe,
+            // resurrecting one could nag about a pane the user explicitly
+            // asked to close.
+            if let Some(pane_id) = pane_id_env {
+                registry.finish_pane_close(pane_id, false);
+            }
+            Err(msg)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: IpcStream,
@@ -4067,10 +4878,19 @@ async fn handle_connection(
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
     restart: Arc<crate::daemon_restart::RestartControl>,
+    host_metrics: Arc<crate::host_metrics::HostMetricsCache>,
+    follow_on_frame: Option<(u8, Vec<u8>)>,
 ) -> io::Result<()> {
-    let frame = match read_frame(&mut stream).await? {
+    // PRD #1589: `follow_on_frame` is a `Hello` follow-on's frame, already read
+    // under [`FOLLOW_ON_READ_TIMEOUT`]; it is served as a fresh connection's
+    // first, and may not ask for a follow-on of its own.
+    let follow_on_allowed = follow_on_frame.is_none();
+    let frame = match follow_on_frame {
         Some(f) => f,
-        None => return Ok(()),
+        None => match read_frame(&mut stream).await? {
+            Some(f) => f,
+            None => return Ok(()),
+        },
     };
     // PRD #92 F1: client → server `KIND_SHUTDOWN` is a header-only frame
     // that means "shut the daemon down now." It comes before any
@@ -5009,62 +5829,90 @@ async fn handle_connection(
                     // We do this only for orchestration panes; dashboard
                     // panes (and a legacy `TabMembership::Mode` pane)
                     // don't participate in delegate dispatch.
-                    if let (Some(pane_id), Some(meta)) =
-                        (pane_id_env.as_deref(), orchestration_meta)
+                    //
+                    // PRD #1589 (auditor S1): registration and the start's
+                    // broadcast run under ONE state write guard, and only for a
+                    // generation still in the registry. A `close` that took this
+                    // generation down in the window since it was published
+                    // removed its record before taking this guard to unregister
+                    // the pane, so a start that sees the record registers and
+                    // announces ahead of that unregister and its removal
+                    // broadcast, and one that does not see it registers and
+                    // announces nothing — it would re-create a role and a card
+                    // for a pane already closed.
+                    registry.before_role_registration().await;
                     {
-                        // Shared with the daemon-internal spawn path
-                        // (`crate::spawn::spawn`) — see
-                        // [`crate::state::AppState::register_orchestration_role`]
-                        // for why this must not be inlined again. The identity
-                        // is the one the title check above scoped by
-                        // (`OrchestrationSpawnMeta::identity`).
-                        let identity = meta.identity();
                         let mut state = state.write().await;
-                        state.register_orchestration_role(
-                            pane_id,
-                            &meta.role_name,
-                            meta.is_start_role,
-                            identity.clone(),
-                            cwd_for_state.as_deref(),
-                        );
-                        // Issue #697: outside cards the registration dropped
-                        // leave every attached client's view too.
-                        state.announce_unproven_evictions(&event_tx);
-                        // Issue #555: the registered pane holds the title from
-                        // here on, so this start's in-flight claim ends — under
-                        // the same guard, so there is no instant in which
-                        // neither holds it.
-                        if title_claim.is_some() {
-                            state.release_orchestration_title_claim(&identity);
+                        if !registry.generation_registered(&id) {
+                            if let Some(identity) = title_claim.as_ref() {
+                                state.release_orchestration_title_claim(identity);
+                            }
+                            info!(
+                                agent_id = %id,
+                                "start: the agent was closed before its start was registered; \
+                                 registering and announcing nothing for it"
+                            );
+                        } else {
+                            if let (Some(pane_id), Some(meta)) =
+                                (pane_id_env.as_deref(), orchestration_meta)
+                            {
+                                // Shared with the daemon-internal spawn path
+                                // (`crate::spawn::spawn`) — see
+                                // [`crate::state::AppState::register_orchestration_role`]
+                                // for why this must not be inlined again. The
+                                // identity is the one the title check above
+                                // scoped by (`OrchestrationSpawnMeta::identity`).
+                                let identity = meta.identity();
+                                state.register_orchestration_role(
+                                    pane_id,
+                                    &meta.role_name,
+                                    meta.is_start_role,
+                                    identity.clone(),
+                                    cwd_for_state.as_deref(),
+                                );
+                                // Issue #697: outside cards the registration
+                                // dropped leave every attached client's view too.
+                                state.announce_unproven_evictions(&event_tx);
+                                // Issue #555: the registered pane holds the title
+                                // from here on, so this start's in-flight claim
+                                // ends — under the same guard, so there is no
+                                // instant in which neither holds it.
+                                if title_claim.is_some() {
+                                    state.release_orchestration_title_claim(&identity);
+                                }
+                                // Issue #1395: only the start role carries the
+                                // coordinator's context, so only it records the
+                                // file.
+                                if meta.is_start_role
+                                    && let Some(path) = prepared_context_path
+                                {
+                                    state.record_orchestration_context(&identity, path);
+                                }
+                            }
+                            // PRD #1223: announce the start to every attached
+                            // TUI, not only to the client that sent it — a
+                            // desktop start was otherwise invisible to an
+                            // already-attached TUI. After the record is published
+                            // and the role registered, before the reply. See
+                            // `crate::spawn::surface_attach_started_agent` for
+                            // what is emitted and why the sending TUI is
+                            // unaffected.
+                            if let Some(mut record) = registry.agent_record_any(&id) {
+                                // Issue #1395 item 1: the start role's surface
+                                // carries the context file recorded just above,
+                                // so a live tab re-arms from its own file.
+                                // Stamped from daemon state only — the
+                                // `ListAgents` rule — never from the request.
+                                state.attach_orchestrator_context_paths(std::slice::from_mut(
+                                    &mut record,
+                                ));
+                                crate::spawn::surface_attach_started_agent(
+                                    &event_tx,
+                                    &record,
+                                    command.as_deref(),
+                                );
+                            }
                         }
-                        // Issue #1395: only the start role carries the
-                        // coordinator's context, so only it records the file.
-                        if meta.is_start_role
-                            && let Some(path) = prepared_context_path
-                        {
-                            state.record_orchestration_context(&identity, path);
-                        }
-                    }
-                    // PRD #1223: announce the start to every attached TUI, not
-                    // only to the client that sent it — a desktop start was
-                    // otherwise invisible to an already-attached TUI. After the
-                    // record is published and the role registered, before the
-                    // reply. See `crate::spawn::surface_attach_started_agent`
-                    // for what is emitted and why the sending TUI is unaffected.
-                    if let Some(mut record) = registry.agent_record_any(&id) {
-                        // Issue #1395 item 1: the start role's surface carries
-                        // the context file recorded just above, so a live tab
-                        // re-arms from its own file. Stamped from daemon state
-                        // only — the `ListAgents` rule — never from the request.
-                        state
-                            .read()
-                            .await
-                            .attach_orchestrator_context_paths(std::slice::from_mut(&mut record));
-                        crate::spawn::surface_attach_started_agent(
-                            &event_tx,
-                            &record,
-                            command.as_deref(),
-                        );
                     }
                     // Issue #1540: the start is accepted, so a form start's
                     // command becomes the deck's last command — in memory
@@ -5182,91 +6030,25 @@ async fn handle_connection(
             let dispatched_worktree = stopping_record
                 .as_ref()
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
-            // PRD #126 M1 review (finding 1) / audit (finding 2): open the
-            // race-safe close transition BEFORE terminating the child. This
-            // atomically marks the pane closing and drops every outstanding
-            // delegation that touches it — as the worker AND as the
-            // orchestrator. Three defects close here: the old cancellation ran
-            // only AFTER `close_agent`, so a timer firing during the up-to-3s
-            // SIGTERM grace window injected the very nudge a deliberate close
-            // exists to suppress; it was keyed by worker pane only, so closing
-            // an ORCHESTRATOR left every worker's timer armed against a pane id
-            // a later, unrelated agent could inherit; and it left a window in
-            // which a concurrent `handle_delegate` (holding only the state read
-            // guard) could arm after the cancellation, leaving a record nothing
-            // would remove. Arming is refused while the mark is set.
-            if let Some(pane_id) = pane_id_env.as_deref() {
-                let dropped = registry.begin_pane_close(pane_id);
-                if !dropped.is_empty() {
-                    tracing::debug!(
-                        pane_id = %pane_id,
-                        dropped = dropped.len(),
-                        "StopAgent: dropped outstanding delegations touching the closing pane"
-                    );
-                }
-            }
-            // PRD #92 F8 followup (auditor #1): `close_agent` runs the
-            // synchronous SIGTERM-with-grace loop in
-            // `terminate_child_with_grace_and_wait`, which calls
-            // `std::thread::sleep` for up to 3 s while polling the
-            // child's `try_wait`. Calling that from inside the async
-            // attach-connection task would block a Tokio worker thread
-            // for the duration of the grace window — under load this
-            // can starve other connections. Mirror the
-            // `KIND_SHUTDOWN` handler's pattern: hop the blocking work
-            // onto a `spawn_blocking` pool task, await the
-            // `JoinHandle`, and surface a join error as a failed
-            // close.
-            let registry_for_close = registry.clone();
-            let id_for_close = id.clone();
-            let close_result =
-                tokio::task::spawn_blocking(move || registry_for_close.close_agent(&id_for_close))
-                    .await;
-            let close_outcome: Result<(), String> = match close_result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(join_err) => {
-                    tracing::warn!(
-                        error = %join_err,
-                        agent_id = %id,
-                        "spawn_blocking for close_agent panicked or was cancelled"
-                    );
-                    Err(format!("close_agent task failed: {join_err}"))
-                }
-            };
+            // PRD #1589: the teardown itself is shared with `CloseAgents`, which
+            // takes the same steps in the same order — see
+            // [`stop_agent_steps`]. The existing teardown is unchanged. What the
+            // extraction added is the unit-lifecycle end: a stop that removes a
+            // dispatched unit's last pane now also ends that unit, which touches
+            // only the daemon's in-memory dispatched-units record — nothing a
+            // client of this request, older or newer, reads.
+            let close_outcome = stop_agent_steps(
+                &id,
+                stopping_record.as_ref(),
+                pane_id_env.as_deref(),
+                &registry,
+                &state,
+                &event_tx,
+                crate::dispatched_units::EndReason::Stopped,
+            )
+            .await;
             match close_outcome {
                 Ok(()) => {
-                    if let Some(pane_id) = pane_id_env.as_deref() {
-                        // PRD #126: a deliberately closed worker owes nothing.
-                        // Without this, closing a stuck worker would still
-                        // nag the orchestrator when its timeout expired hours
-                        // later, pointing at a pane that no longer exists.
-                        // Order matters: take the state write guard and
-                        // unregister the pane first, then sweep once more and
-                        // only then clear the closing mark, so no interleaving
-                        // leaves a record behind.
-                        state.write().await.unregister_pane(pane_id);
-                        registry.finish_pane_close(pane_id, true);
-                        // PRD #1223: tell every attached TUI the pane is gone,
-                        // not only the client that asked — a desktop stop was
-                        // otherwise invisible to an attached TUI, which kept
-                        // the card (and an orchestration's tab) indefinitely.
-                        // Here, and only here, for three reasons: it is the one
-                        // arm every stop route reaches; `pane_id_env` is `Some`
-                        // only while this agent still held the pane, so a stale
-                        // stop never removes a successor's pane; and the
-                        // cleanup hold is still held, so no successor's start
-                        // can be broadcast ahead of this removal. After the
-                        // child is reaped, so the removal describes a finished
-                        // stop; a hook the dying agent posted that is still in
-                        // flight lands on a pane the TUI has unregistered, where
-                        // a non-`SessionStart` frame is dropped rather than
-                        // redrawing the card. See
-                        // `crate::spawn::surface_attach_stopped_agent`.
-                        if let Some(record) = stopping_record.as_ref() {
-                            crate::spawn::surface_attach_stopped_agent(&event_tx, record, pane_id);
-                        }
-                    }
                     // PRD #120 M2.4 + S1: if this agent was dispatched into a
                     // per-issue worktree, the tab close is its cleanup trigger.
                     // But a multi-role orchestration shares ONE worktree across
@@ -5329,15 +6111,8 @@ async fn handle_connection(
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }
                 Err(msg) => {
-                    // PRD #126: the close failed, so the agent is still live.
-                    // Roll the transition back by clearing the closing mark —
-                    // future delegates to this pane can arm again. The records
-                    // swept at `begin` are deliberately NOT restored: losing a
-                    // watch fails safe, resurrecting one could nag about a pane
-                    // the user explicitly asked to close.
-                    if let Some(pane_id) = pane_id_env.as_deref() {
-                        registry.finish_pane_close(pane_id, false);
-                    }
+                    // PRD #126: the close failed, so the agent is still live;
+                    // `stop_agent_steps` has already rolled the closing mark back.
                     write_resp(&mut stream, &AttachResponse::err(msg)).await?
                 }
             };
@@ -5355,6 +6130,32 @@ async fn handle_connection(
             // desktop both mint fresh ones), and one that relied on the stronger
             // order would still race older daemons.
             drop(pane_cleanup_hold);
+        }
+        AttachRequest::CloseAgents {
+            selector,
+            caller,
+            force,
+            dry_run,
+        } => {
+            // PRD #1589: resolve, authorize, refuse or close — see
+            // `crate::close_agents`. Every outcome, refusals included, is a
+            // report on an `ok` response.
+            let report = crate::close_agents::handle_close_agents(
+                selector,
+                caller,
+                force,
+                dry_run,
+                &registry,
+                &state,
+                &event_tx,
+                &worktree_registry,
+            )
+            .await;
+            let resp = AttachResponse {
+                close_report: Some(report),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
         }
         AttachRequest::SetAgentLabel {
             id,
@@ -5477,6 +6278,38 @@ async fn handle_connection(
                 .await?
             }
         }
+        AttachRequest::AnswerQuestion {
+            agent_id,
+            question_id,
+            answers,
+            confirmed_always,
+            revision,
+        } => {
+            let resp = match answer_question_at(
+                &registry,
+                &state,
+                &event_tx,
+                &agent_id,
+                &question_id,
+                revision,
+                &answers,
+                confirmed_always,
+            )
+            .await
+            {
+                Ok(()) => AttachResponse::ok(),
+                Err(refusal) => AttachResponse {
+                    ok: false,
+                    error: Some(refusal.to_string()),
+                    answer_refusal: Some(refusal),
+                    ..Default::default()
+                },
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::HostMetrics => {
+            write_resp(&mut stream, &host_metrics_response(host_metrics).await).await?
+        }
         AttachRequest::RecordOrchestratorContext {
             pane_id,
             context_path,
@@ -5499,6 +6332,7 @@ async fn handle_connection(
         AttachRequest::Hello {
             client_version: _,
             client_build_version,
+            follow_on,
         } => {
             // PRD #76 M2.21: the daemon never enforces or rejects on
             // `client_version` — we always reply with our own
@@ -5565,7 +6399,49 @@ async fn handle_connection(
                 let summary = RunningAgentsSummary::from_records(&registry.agent_records());
                 resp = resp.with_running_agents(summary);
             }
+            resp.hook_binary_notices = Some(state.read().await.hook_binaries.notices());
             write_resp(&mut stream, &resp).await?;
+            // PRD #1589 (review on PR #1681): serve one more request on this
+            // connection, so the verb a client gates on this reply reaches
+            // this daemon and no other. One only: the follow-on request is
+            // served as a fresh connection's first, without a follow-on of
+            // its own.
+            if follow_on && follow_on_allowed {
+                // Bounded (review on PR #1681): a peer that goes silent here,
+                // or sends a header and withholds the payload, would otherwise
+                // hold this connection's client-count slot — deferring idle
+                // shutdown — and the frame's allocation. Only the read is
+                // bounded; serving the request may legitimately take longer.
+                let frame =
+                    match tokio::time::timeout(FOLLOW_ON_READ_TIMEOUT, read_frame(&mut stream))
+                        .await
+                    {
+                        Ok(Ok(Some(frame))) => frame,
+                        Ok(Ok(None)) => return Ok(()),
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            warn!(
+                                timeout = ?FOLLOW_ON_READ_TIMEOUT,
+                                "no follow-on request arrived after Hello; dropping the connection"
+                            );
+                            return Ok(());
+                        }
+                    };
+                return Box::pin(handle_connection(
+                    stream,
+                    registry,
+                    event_tx,
+                    state,
+                    shutdown,
+                    scheduler,
+                    reuse_registry,
+                    worktree_registry,
+                    restart,
+                    host_metrics,
+                    Some(frame),
+                ))
+                .await;
+            }
         }
         AttachRequest::ReloadSchedules => {
             // PRD #127 M1.3: re-read the global config and diff/replace the
@@ -6287,6 +7163,496 @@ fn validate_task(task: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The pause between two keys of a form answered by keys. Codex draws the
+/// next question after each digit; the pending question is re-checked before
+/// every key. Chosen, not measured — the lane-2 Codex test is what pins it.
+const ANSWER_KEY_GAP: Duration = Duration::from_millis(400);
+
+/// PRD #1631: [`AttachRequest::AnswerQuestion`]'s handler, for a client that
+/// read `agent_id`'s pending question just now — [`answer_question_at`] naming
+/// the revision pending at the call (`None` when nothing is pending).
+#[cfg(test)]
+pub(crate) async fn answer_question(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    agent_id: &str,
+    question_id: &str,
+    answers: &[crate::question::QuestionAnswer],
+    confirmed_always: bool,
+) -> Result<(), crate::question::AnswerRefusal> {
+    let pane_id = registry
+        .agent_records()
+        .into_iter()
+        .find(|r| r.id == agent_id)
+        .and_then(|r| r.pane_id_env);
+    let revision = state
+        .read()
+        .await
+        .pending_question_for(agent_id, pane_id.as_deref())
+        .and_then(|(_, question)| question.revision);
+    answer_question_at(
+        registry,
+        state,
+        event_tx,
+        agent_id,
+        question_id,
+        revision,
+        answers,
+        confirmed_always,
+    )
+    .await
+}
+
+/// PRD #1631: [`AttachRequest::AnswerQuestion`]'s handler.
+///
+/// Refusal order: the agent, a pending question, the id and the revision the
+/// client named, then the answer itself
+/// ([`crate::question::PendingQuestion::validate`]), then the channel.
+/// On success the daemon ingests an event of its own carrying
+/// [`crate::event::QUESTION_RESOLVED_METADATA_KEY`] and its answered marker, so
+/// the question clears and the card moves on in this daemon and in every
+/// attached client alike — `Thinking` for an answer the agent goes on from,
+/// and a status-less `Unknown` for a deny, which ends or interrupts the turn
+/// rather than starting work (review S3); the agent's own next event then
+/// says where it went.
+///
+/// **Bound to one revision of the question (audit A4, R1–R3).** The answer is
+/// validated against the pending question's daemon-minted revision
+/// ([`crate::question::PendingQuestion::revision`]) and revalidated at each
+/// commit point under the pane's question lifecycle
+/// ([`crate::agent_pty::QuestionAnswers::lock_lifecycle`]), which every event
+/// ingested for the pane also holds. A held reply is delivered only to that
+/// revision: it goes only to the hold whose generation it is, and nothing can
+/// register, replace or clear the question between its revalidation, the reply
+/// and the deck's clearing event. A key is bound more loosely: it is queued on
+/// the PTY only while its revision is still pending, so an event that replaces
+/// or clears the question is ordered either before the check (and the key is
+/// refused) or after the queueing — and then the PTY thread, which checks the
+/// revision again immediately before writing the key
+/// ([`crate::agent_pty::AnswerGate`]), drops the key if the change was recorded
+/// first. A change recorded after that check is not stopped and receives the
+/// key; the next key's check detects it if it was ingested, and a redraw the
+/// agent makes with no hook stays undetectable, for that key and the ones after
+/// it. The deck's own clearing event and every clear on a failure name the
+/// revision too. So a same-id replacement that registers between validation
+/// and delivery is refused as stale, never answered with a choice made for the
+/// question it replaced, when the answer is a held reply or when the
+/// replacement is recorded before the PTY thread's check of the key.
+///
+/// **One answer per agent at a time, and not the same question twice in a
+/// row.** The agent's [`crate::agent_pty::QuestionAnswers::slot`] is held from
+/// the first read of the pending question to the last write, and taken
+/// without waiting: a second client's answer that finds it held is refused at
+/// once with [`AnswerRefusal::AnswerInProgress`], never queued behind a slow
+/// delivery. The pane's last-answered mark
+/// ([`crate::agent_pty::QuestionAnswers::mark_answered`]) refuses the revision
+/// the deck last emitted an answer for there as stale even if its clearing
+/// event was not applied, and — once the answer is over and settled
+/// ([`crate::agent_pty::QuestionAnswers::settle_answered`]) — the same id at
+/// any revision, so the producer raising it again is refused too. A same-id
+/// replacement registered while the answer was being sent, and still pending
+/// when it ends, leaves the mark unsettled and stays answerable. It is one mark
+/// per pane, not a history.
+///
+/// **The keys channel refuses a pane a human has typed into since the
+/// question arrived** ([`AnswerRefusal::KeyboardStarted`]): the daemon owns the
+/// PTY's input, but not the agent's dialog position, so keys aimed at a form
+/// the keyboard has half-answered, or at a prompt it already dismissed, would
+/// land on the wrong question or in the composer. The check compares
+/// human-input sequence numbers (audit N1) and is repeated under the writer
+/// before every key, against the sequence number the deck's previous key was
+/// committed at. When a write fails after some keys went in, the question is
+/// left pending but marked keyboard-only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn answer_question_at(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    agent_id: &str,
+    question_id: &str,
+    requested_revision: Option<u64>,
+    answers: &[crate::question::QuestionAnswer],
+    confirmed_always: bool,
+) -> Result<(), crate::question::AnswerRefusal> {
+    use crate::question::{AnswerChannel, AnswerRefusal, OptionRole, QuestionReply};
+    let record = registry
+        .agent_records()
+        .into_iter()
+        .find(|r| r.id == agent_id)
+        .ok_or(AnswerRefusal::AgentNotFound)?;
+    let pane_id = record.pane_id_env.clone();
+    let pane = pane_id.as_deref().unwrap_or_default();
+    let slot = registry.question_answers().slot(agent_id);
+    // Not waited for (Qodo #1561): an answer behind a slow delivery would only
+    // find its question gone or changed once that delivery ended.
+    let _answering = slot
+        .try_lock()
+        .map_err(|_| AnswerRefusal::AnswerInProgress)?;
+    let (session_id, agent_type, question) = {
+        let guard = state.read().await;
+        let (session_id, question) = guard
+            .pending_question_for(agent_id, pane_id.as_deref())
+            .ok_or(AnswerRefusal::NoPendingQuestion)?;
+        let agent_type = guard
+            .sessions
+            .get(&session_id)
+            .map(|s| s.agent_type.clone())
+            .unwrap_or(crate::event::AgentType::None);
+        (session_id, agent_type, question)
+    };
+    // PR #1698 review: a request naming no revision is refused like one naming
+    // another — it cannot say which registration of a reused id it was worked
+    // out against. No released client sends `AnswerQuestion`.
+    if question.id != question_id || requested_revision != question.revision {
+        return Err(AnswerRefusal::Stale {
+            current_id: Some(question.id),
+        });
+    }
+    if registry
+        .question_answers()
+        .is_answered(pane, &question.id, question.revision)
+    {
+        // The deck already answered this one; its clear has not landed, or
+        // the producer raised it again.
+        return Err(AnswerRefusal::Stale { current_id: None });
+    }
+    let revision = question.revision;
+    let resolved = question.validate(answers, confirmed_always)?;
+    let denied = resolved
+        .iter()
+        .any(|answer| answer.roles.contains(&OptionRole::Deny));
+    registry
+        .question_answers()
+        .barrier("answer_question:validated")
+        .await;
+    // The pane's question lifecycle, when this path already holds it — the
+    // held reply keeps it from its revalidation to the deck's clearing event.
+    let mut lifecycle = None;
+    // Where a held answer's handler reports what became of it.
+    let mut delivery = None;
+    match question.channel {
+        AnswerChannel::Held => {
+            // Audit R1–R3: revalidated at the commit point, under the pane's
+            // question lifecycle, which every registration, publication,
+            // reconciliation and cleanup on the pane also holds — so nothing
+            // can replace, clear or re-register the question between this
+            // check, the reply and the clearing event below.
+            let held = registry.question_answers().lock_lifecycle(pane).await;
+            let current = state
+                .read()
+                .await
+                .pending_question_for(agent_id, pane_id.as_deref())
+                .map(|(_, q)| q);
+            if current
+                .as_ref()
+                .is_none_or(|q| q.id != question.id || q.revision != revision)
+                || registry
+                    .question_answers()
+                    .is_answered(pane, &question.id, revision)
+            {
+                return Err(AnswerRefusal::Stale {
+                    current_id: current.map(|q| q.id),
+                });
+            }
+            let handed = pane_id.as_deref().and_then(|pane| {
+                registry.question_holds().answer(
+                    pane,
+                    agent_id,
+                    &question.id,
+                    revision,
+                    QuestionReply::answered(&question.id, resolved),
+                )
+            });
+            let Some(handed) = handed else {
+                // Either the holder went — the question goes with it — or a
+                // registration that replaced this revision holds it now, which
+                // this answer was never checked against.
+                let mut guard = state.write().await;
+                let cleared = guard.clear_pending_question_revision(pane, &question.id, revision);
+                crate::daemon::note_pending_question(&guard, registry, pane);
+                if cleared {
+                    return Err(AnswerRefusal::ChannelGone);
+                }
+                return Err(AnswerRefusal::Stale {
+                    current_id: guard.pending_question_id_on_pane(pane),
+                });
+            };
+            registry
+                .question_answers()
+                .mark_answered(pane, &question.id, revision);
+            registry
+                .question_answers()
+                .barrier("answer_question:delivered")
+                .await;
+            lifecycle = Some(held);
+            delivery = Some(handed);
+        }
+        AnswerChannel::Keys => {
+            let keys = crate::question::answer_keys(&agent_type, &question, &resolved)?;
+            // The human-input sequence number the deck's own last key was
+            // committed at (audit N1); `None` until one is.
+            let mut committed: Option<u64> = None;
+            // The mark this answer made covers the whole id from here, unless a
+            // same-id replacement registered while the keys were being typed is
+            // what is pending: that one was never answered (Qodo #1561). Asked
+            // under the pane's lifecycle, so nothing registers in between.
+            let settle_unless_replaced = |s: &crate::state::AppState| {
+                let replaced = s
+                    .pending_question_for(agent_id, pane_id.as_deref())
+                    .is_some_and(|(_, q)| q.id == question.id && q.revision != revision);
+                if !replaced {
+                    registry
+                        .question_answers()
+                        .settle_answered(pane, &question.id, revision);
+                }
+            };
+            let typed_since = |committed: Option<u64>| {
+                registry.user_typed_since_question(pane, &question.id, revision, committed)
+            };
+            if typed_since(None) {
+                return Err(AnswerRefusal::KeyboardStarted);
+            }
+            for (typed, key) in keys.iter().enumerate() {
+                if typed > 0 {
+                    tokio::time::sleep(ANSWER_KEY_GAP).await;
+                }
+                let baseline = committed;
+                let still_ours = || async {
+                    !typed_since(baseline)
+                        && state
+                            .read()
+                            .await
+                            .pending_question_for(agent_id, pane_id.as_deref())
+                            .is_some_and(|(_, q)| q.id == question.id && q.revision == revision)
+                };
+                match registry
+                    .write_answer_keys(
+                        agent_id,
+                        pane,
+                        &question.id,
+                        revision,
+                        key.as_bytes(),
+                        still_ours,
+                    )
+                    .await
+                {
+                    Ok(at) => {
+                        registry
+                            .question_answers()
+                            .barrier("answer_question:key_written")
+                            .await;
+                        committed = Some(at);
+                        registry
+                            .question_answers()
+                            .mark_answered(pane, &question.id, revision);
+                    }
+                    Err(detail) => {
+                        // Audit T1: with nothing typed, a question that is no
+                        // longer this revision — registered again under its
+                        // id, replaced, or cleared, before the key's check or
+                        // while the key waited for the PTY — makes the answer
+                        // stale rather than a failed write.
+                        let moved_on = if typed == 0 {
+                            let current = state
+                                .read()
+                                .await
+                                .pending_question_for(agent_id, pane_id.as_deref())
+                                .map(|(_, q)| q);
+                            (!current
+                                .as_ref()
+                                .is_some_and(|q| q.id == question.id && q.revision == revision))
+                            .then(|| current.map(|q| q.id))
+                        } else {
+                            None
+                        };
+                        let refusal = if typed_since(baseline) {
+                            AnswerRefusal::KeyboardStarted
+                        } else if let Some(current_id) = moved_on {
+                            AnswerRefusal::Stale { current_id }
+                        } else if typed > 0 {
+                            AnswerRefusal::WriteFailed {
+                                detail: format!(
+                                    "{detail} after {typed} of {} keys; finish it by keyboard",
+                                    keys.len()
+                                ),
+                            }
+                        } else {
+                            AnswerRefusal::WriteFailed {
+                                detail: detail.to_string(),
+                            }
+                        };
+                        if typed > 0 {
+                            // Part of the answer is in the agent's prompt: the
+                            // stored question no longer describes what is on
+                            // screen, so it is the keyboard's from here (S2).
+                            let lifecycle = registry.question_answers().lock_lifecycle(pane).await;
+                            let marked = {
+                                let mut guard = state.write().await;
+                                settle_unless_replaced(&guard);
+                                let new_revision = registry.question_holds().mint_revision();
+                                guard
+                                    .mark_pending_question_keyboard_only(
+                                        pane,
+                                        &question.id,
+                                        revision,
+                                        new_revision,
+                                    )
+                                    .map(|marked| (marked, new_revision))
+                            };
+                            // PR #1698 review: published, at its new revision,
+                            // so no attached client keeps offering the
+                            // half-answered form until its next full listing,
+                            // and a voice answer another client is counting
+                            // down for the old revision is called off.
+                            if let Some((marked, new_revision)) = marked {
+                                let event = crate::daemon::deck_keyboard_only_event(
+                                    session_id.clone(),
+                                    agent_type.clone(),
+                                    pane_id.clone(),
+                                    Some(agent_id.to_string()),
+                                    &marked,
+                                );
+                                crate::daemon::ingest_event_in_lifecycle(
+                                    state,
+                                    event_tx,
+                                    registry,
+                                    &lifecycle,
+                                    event,
+                                    None,
+                                    |s: &mut crate::state::AppState| {
+                                        !s.pending_question_for(agent_id, pane_id.as_deref())
+                                            .is_some_and(|(_, q)| {
+                                                q.id == question.id
+                                                    && q.revision == Some(new_revision)
+                                            })
+                                    },
+                                )
+                                .await;
+                            }
+                            drop(lifecycle);
+                            warn!(
+                                agent_id = %agent_id,
+                                question_id = %question.id,
+                                typed,
+                                of = keys.len(),
+                                %refusal,
+                                "question: the deck typed part of an answer and stopped; \
+                                 the question is now keyboard-only"
+                            );
+                        }
+                        return Err(refusal);
+                    }
+                }
+            }
+        }
+        AnswerChannel::Unsupported | AnswerChannel::Unknown => {
+            return Err(AnswerRefusal::Unsupported);
+        }
+    }
+    info!(
+        agent_id = %agent_id,
+        question_id = %question.id,
+        revision = ?revision,
+        channel = ?question.channel,
+        denied,
+        "question answered by the deck"
+    );
+    let event = crate::daemon::deck_question_event(
+        session_id,
+        agent_type,
+        pane_id.clone(),
+        Some(agent_id.to_string()),
+        &question.id,
+        if denied {
+            crate::event::EventType::Unknown
+        } else {
+            crate::event::EventType::Thinking
+        },
+        crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY,
+    );
+    // Clears this revision only: a same-id registration that replaced it
+    // after the answer went is left pending (audit A5). A held answer is still
+    // inside the lifecycle it was delivered under, so nothing registered in
+    // between; the keys path takes it here, after its last key.
+    let replaced = |s: &crate::state::AppState| {
+        s.pending_question_for(agent_id, pane_id.as_deref())
+            .is_some_and(|(_, q)| q.id == question.id && q.revision != revision)
+    };
+    let lifecycle = match lifecycle {
+        Some(held) => held,
+        None => registry.question_answers().lock_lifecycle(pane).await,
+    };
+    crate::daemon::ingest_event_in_lifecycle(
+        state,
+        event_tx,
+        registry,
+        &lifecycle,
+        event,
+        None,
+        |s: &mut crate::state::AppState| replaced(s),
+    )
+    .await;
+    // The answer is over: its mark covers the whole id from here, so the
+    // producer raising it again is refused — unless the same-id replacement
+    // `replaced` left pending is what is there, which was never answered and
+    // stays answerable (Qodo #1561). Under the lifecycle, so nothing registers
+    // between this check and the settle.
+    if !replaced(&*state.read().await) {
+        registry
+            .question_answers()
+            .settle_answered(pane, &question.id, revision);
+    }
+    drop(lifecycle);
+    // A held answer is reported only once its handler has written it — and,
+    // for a producer that acknowledges (OpenCode's plugin), once the agent has
+    // taken it. Awaited OUTSIDE the lifecycle: the agent's own events for the
+    // pane (OpenCode's `permission.replied`, forwarded while the plugin is
+    // still finishing its reply) must not wait behind it. The handler bounds
+    // the acknowledgement by `HELD_REPLY_ACK_WAIT`; this bound is only the
+    // backstop for a handler that never reports at all.
+    if let Some(delivery) = delivery {
+        use crate::agent_pty::ReplyDelivery;
+        let outcome = tokio::time::timeout(
+            crate::daemon::HELD_REPLY_ACK_WAIT + Duration::from_secs(1),
+            delivery,
+        )
+        .await;
+        match outcome {
+            Ok(Ok(ReplyDelivery::Delivered)) => {}
+            Ok(Ok(ReplyDelivery::NotAccepted(detail))) => {
+                // The agent never took it and is still asking: the producer
+                // raises it again, and the deck must be able to answer it.
+                // Only this answer's mark goes: one a later answer made while
+                // this one waited is that answer's (PR #1698 review).
+                let lifecycle = registry.question_answers().lock_lifecycle(pane).await;
+                registry
+                    .question_answers()
+                    .unmark_answered(pane, &question.id, revision);
+                drop(lifecycle);
+                warn!(
+                    agent_id = %agent_id,
+                    question_id = %question.id,
+                    %detail,
+                    "question: the agent did not take the deck's answer"
+                );
+                return Err(AnswerRefusal::WriteFailed {
+                    detail: format!("the agent did not take it ({detail}) and is asking again"),
+                });
+            }
+            Ok(Ok(ReplyDelivery::Unconfirmed)) | Ok(Err(_)) | Err(_) => {
+                warn!(
+                    agent_id = %agent_id,
+                    question_id = %question.id,
+                    "question: the agent did not confirm it took the deck's answer"
+                );
+                return Err(AnswerRefusal::Unconfirmed);
+            }
+        }
+    }
+    Ok(())
+}
+
 // CodeRabbit Fix C fixup: bound the response write with `CLIENT_WRITE_TIMEOUT`.
 // Every dispatch arm calls `write_resp` first; without a timeout, a same-UID
 // client that connected and then stopped reading could pin the dispatcher task
@@ -6365,16 +7731,20 @@ async fn handle_subscribe_events_with_snapshot(
     registry: &Arc<AgentPtyRegistry>,
     state: &SharedState,
 ) -> io::Result<()> {
-    let (rx, mut records) = {
+    let (rx, mut records, notices) = {
         let guard = state.read().await;
         let rx = event_tx.subscribe();
         let mut records = registry.agent_records();
         guard.attach_live_sessions(&mut records);
         guard.attach_orchestrator_context_paths(&mut records);
-        (rx, records)
+        (rx, records, guard.hook_binaries.notices())
     };
     crate::agent_pty::attach_cli_names(&mut records);
-    forward_event_stream(stream, rx, &AttachResponse::agent_records(records)).await
+    let mut resp = AttachResponse::agent_records(records);
+    // Issue #1637: read under the same guard as the receiver, so a notice
+    // change is either in this reply or on the stream.
+    resp.hook_binary_notices = Some(notices);
+    forward_event_stream(stream, rx, &resp).await
 }
 
 /// PRD #1497: [`AttachRequest::SubscribeTurnReplies`]. The receiver is opened
@@ -7034,6 +8404,33 @@ mod tests {
         assert!(!resp.ok, "{resp:?}");
         assert_eq!(saved(dir.path()), 1, "a post to a full inbox was saved");
         reg.shutdown_all();
+    }
+
+    /// Scenario: Read memory from an unreadable source and a malformed fixture;
+    /// unavailable readings stay absent while a readable available-memory field
+    /// survives independently, with a complete fixture proving valid values work.
+    #[cfg(target_os = "linux")]
+    #[spec("protocol/host-metrics/004")]
+    #[test]
+    fn protocol_host_metrics_004_unreadable_memory_is_absent_not_zero() {
+        let root = tempfile::tempdir().unwrap();
+        // Reading a directory fails even for a root test process, unlike chmod(0).
+        assert_eq!(
+            crate::host_metrics::read_memory_from(root.path()),
+            (None, None)
+        );
+        let meminfo = root.path().join("meminfo");
+        std::fs::write(&meminfo, "MemTotal: 100 kB\nMemAvailable: 40 kB\n").unwrap();
+        assert_eq!(
+            crate::host_metrics::read_memory_from(&meminfo),
+            (Some(60 * 1024), Some(40 * 1024))
+        );
+        std::fs::write(&meminfo, "MemTotal: unreadable kB\nMemAvailable: 40 kB\n").unwrap();
+        assert_eq!(
+            crate::host_metrics::read_memory_from(&meminfo),
+            (None, Some(40 * 1024)),
+            "an unreadable total must not erase the available field or become zero used bytes"
+        );
     }
 
     /// Issue #1445 (Qodo on PR #1554): two re-arm reports that reach the
@@ -7727,6 +9124,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -8772,6 +10171,11 @@ mod tests {
                 blocked: None,
                 hook_generation: None,
                 delivery_notice: None,
+                pending_question: None,
+                pull_request: None,
+                pull_request_revision: None,
+                background: None,
+                background_revision: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -8812,6 +10216,11 @@ mod tests {
                 blocked: None,
                 hook_generation: None,
                 delivery_notice: None,
+                pending_question: None,
+                pull_request: None,
+                pull_request_revision: None,
+                background: None,
+                background_revision: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
@@ -8892,6 +10301,9 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
         let snap = session.live_snapshot();
         assert_eq!(
@@ -9715,6 +11127,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
 
@@ -9786,6 +11200,7 @@ mod tests {
         let req = AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: Some(env!("DAD_BUILD_ID").to_string()),
+            follow_on: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -9798,6 +11213,7 @@ mod tests {
             AttachRequest::Hello {
                 client_version,
                 client_build_version,
+                ..
             } => {
                 assert_eq!(client_version, PROTOCOL_VERSION);
                 assert_eq!(client_build_version.as_deref(), Some(env!("DAD_BUILD_ID")));
@@ -9815,6 +11231,7 @@ mod tests {
         let req = AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: None,
+            follow_on: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -9836,6 +11253,7 @@ mod tests {
             AttachRequest::Hello {
                 client_version,
                 client_build_version,
+                ..
             } => {
                 assert_eq!(client_version, 2);
                 assert!(client_build_version.is_none());
@@ -11318,5 +12736,1638 @@ mod tests {
             std::collections::BTreeSet::from([first, second]),
             "both agents survived"
         );
+    }
+
+    /// An in-process attach server and the client count it keeps, for the
+    /// follow-on stall tests below.
+    #[cfg(unix)]
+    async fn follow_on_stall_server() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let server = {
+            let sock = sock.clone();
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    Arc::new(AgentPtyRegistry::new()),
+                    event_tx,
+                    counter,
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // The probe connection is itself counted; wait for it to drain.
+            if tokio::net::UnixStream::connect(&sock).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        wait_for_client_count(&counter, 0, Duration::from_secs(5)).await;
+        (dir, sock, counter, server)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_client_count(
+        counter: &std::sync::atomic::AtomicUsize,
+        want: usize,
+        within: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let now = counter.load(std::sync::atomic::Ordering::SeqCst);
+            if now == want {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "client count stayed at {now}, expected {want} within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Opens a connection, sends `Hello { follow_on: true }` and reads its
+    /// reply, leaving the daemon waiting for the follow-on.
+    #[cfg(unix)]
+    async fn hello_awaiting_follow_on(sock: &std::path::Path) -> tokio::net::UnixStream {
+        let mut s = tokio::net::UnixStream::connect(sock)
+            .await
+            .expect("connect");
+        let hello = serde_json::to_vec(&AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+            client_build_version: None,
+            follow_on: true,
+        })
+        .unwrap();
+        write_frame(&mut s, KIND_REQ, &hello).await.expect("hello");
+        let (kind, payload) = read_frame(&mut s).await.unwrap().expect("a reply");
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&payload).unwrap();
+        assert!(resp.ok, "{:?}", resp.error);
+        s
+    }
+
+    /// While a stalled follow-on holds its slot, and after, a fresh client is
+    /// still answered.
+    #[cfg(unix)]
+    async fn assert_serviceable(sock: &std::path::Path) {
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::daemon_client::DaemonClient::new(sock.to_path_buf()).list_agents(),
+        )
+        .await
+        .expect("another client is answered within 5 s")
+        .expect("ListAgents succeeds");
+        assert!(resp.is_empty());
+    }
+
+    /// Runs one stall: `stall` leaves the connection open after the Hello
+    /// reply without completing a follow-on frame. The daemon must drop the
+    /// connection — releasing its client-count slot — within the follow-on
+    /// deadline, and serve another client throughout.
+    #[cfg(unix)]
+    async fn a_stalled_follow_on_releases_its_slot(stall: &[u8]) {
+        let (_dir, sock, counter, server) = follow_on_stall_server().await;
+        let started = tokio::time::Instant::now();
+        let mut s = hello_awaiting_follow_on(&sock).await;
+        s.write_all(stall).await.expect("write the stall");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stalled peer holds a slot"
+        );
+        assert_serviceable(&sock).await;
+
+        // The slack covers scheduling on a loaded box, not the deadline.
+        wait_for_client_count(&counter, 0, FOLLOW_ON_READ_TIMEOUT + Duration::from_secs(4)).await;
+        assert!(
+            started.elapsed() >= FOLLOW_ON_READ_TIMEOUT,
+            "the slot is held until the deadline, not dropped early"
+        );
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("the daemon closed the stalled connection")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "the daemon closed the stalled connection");
+        assert_serviceable(&sock).await;
+        wait_for_client_count(&counter, 0, Duration::from_secs(5)).await;
+        server.abort();
+    }
+
+    /// Scenario: a client sends `Hello { follow_on: true }`, reads the reply
+    /// and then sends nothing. The daemon drops that connection once the
+    /// follow-on deadline passes, so its client count returns to zero, and
+    /// answers another client meanwhile (review on PR #1681, AU-M1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_peer_after_a_follow_on_hello_is_dropped_at_the_deadline() {
+        a_stalled_follow_on_releases_its_slot(&[]).await;
+    }
+
+    /// Scenario: after a `Hello { follow_on: true }` reply, a client sends a
+    /// frame header declaring a 1 KiB payload, a few bytes of it, and then
+    /// nothing. The daemon drops the connection at the follow-on deadline
+    /// rather than waiting for the rest (review on PR #1681, AU-M1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_truncated_follow_on_payload_is_dropped_at_the_deadline() {
+        let mut stall = vec![KIND_REQ];
+        stall.extend_from_slice(&1024u32.to_be_bytes());
+        stall.extend_from_slice(b"{\"op\":");
+        a_stalled_follow_on_releases_its_slot(&stall).await;
+    }
+}
+
+/// PRD #1631: [`answer_question`] against a real registry and state — every
+/// refusal, the held channel and the keys channel.
+#[cfg(all(test, unix))]
+mod question_answer_tests {
+    use super::*;
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::event::{AgentEvent, AgentType, EventType};
+    use crate::question::{
+        AnswerChannel, AnswerRefusal, OptionRole, PendingQuestion, QuestionAnswer, ReplyOutcome,
+    };
+    use crate::state::SessionStatus;
+    use spec::spec;
+
+    const PANE: &str = "pane-question-answer";
+    const SESSION: &str = "question-answer-session";
+
+    struct Fixture {
+        registry: Arc<AgentPtyRegistry>,
+        state: SharedState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        agent_id: String,
+    }
+
+    impl Fixture {
+        /// A `cat` in a PTY standing in for `agent_type`, with a session the
+        /// state attributes to it.
+        async fn start(agent_type: AgentType) -> Self {
+            Self::start_with(agent_type, true).await
+        }
+
+        /// [`Self::start`] as a daemon runs an ordinary dashboard pane: the
+        /// registry's ownership oracle installed, as `run_daemon_with` does,
+        /// and the pane NOT in the state's managed set — so an event naming no
+        /// pane is admitted (audit T2).
+        async fn start_unmanaged(agent_type: AgentType) -> Self {
+            Self::start_with(agent_type, false).await
+        }
+
+        async fn start_with(agent_type: AgentType, managed: bool) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let agent_id = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn the stand-in agent");
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            if managed {
+                state.write().await.register_pane(PANE.to_string());
+            } else {
+                let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+                state
+                    .write()
+                    .await
+                    .set_agent_ownership(Arc::downgrade(&ownership));
+            }
+            let (event_tx, _rx) = broadcast::channel(64);
+            let fx = Self {
+                registry,
+                state,
+                event_tx,
+                agent_id,
+            };
+            let mut start = fx.event(EventType::SessionStart);
+            start.agent_type = agent_type;
+            fx.state.write().await.apply_event(start);
+            fx
+        }
+
+        fn event(&self, event_type: EventType) -> AgentEvent {
+            AgentEvent {
+                session_id: SESSION.to_string(),
+                agent_type: AgentType::None,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: std::collections::HashMap::new(),
+                pane_id: Some(PANE.to_string()),
+                agent_id: Some(self.agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                background: None,
+                background_revision: None,
+            }
+        }
+
+        async fn ask(&self, question: &PendingQuestion) {
+            let mut event = self.event(EventType::PermissionRequest);
+            event.set_question(question);
+            self.state.write().await.apply_event(event);
+        }
+
+        /// A producer holding `question` on [`PANE`] for this agent: its hold
+        /// registered and its event published through the daemon's own path
+        /// ([`crate::daemon::register_and_publish_held`]). The receiver its
+        /// reply arrives on.
+        async fn hold_ingested(
+            &self,
+            question: &PendingQuestion,
+        ) -> tokio::sync::oneshot::Receiver<crate::question::QuestionReply> {
+            let mut event = self.event(EventType::PermissionRequest);
+            event.set_question(question);
+            let held = crate::daemon::register_and_publish_held(
+                &self.state,
+                &self.event_tx,
+                &self.registry,
+                PANE,
+                &self.agent_id,
+                event,
+            )
+            .await
+            .expect("the held question is pending")
+            .rx;
+            // Stands in for the hook loop's handler: a producer that does not
+            // acknowledge, so an answer handed to it is delivered.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                if let Ok(held) = held.await {
+                    if let Some(delivery) = held.delivery {
+                        let _ = delivery.send(crate::agent_pty::ReplyDelivery::Delivered);
+                    }
+                    let _ = tx.send(held.reply);
+                }
+            });
+            rx
+        }
+
+        /// [`Self::ask`] through the daemon's own ingest, which is what
+        /// records when the question arrived (audit A4).
+        async fn ask_ingested(&self, question: &PendingQuestion) {
+            let mut event = self.event(EventType::PermissionRequest);
+            event.set_question(question);
+            crate::daemon::ingest_event(&self.state, &self.event_tx, &self.registry, event).await;
+        }
+
+        /// Ingest `event` through the daemon's own path on a task of its own,
+        /// as a second hook connection would.
+        fn ingest_task(&self, event: AgentEvent) -> tokio::task::JoinHandle<()> {
+            let registry = self.registry.clone();
+            let state = self.state.clone();
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                crate::daemon::ingest_event(&state, &event_tx, &registry, event).await
+            })
+        }
+
+        /// An event that names neither a pane nor an agent — only the session.
+        fn paneless(&self, event_type: EventType) -> AgentEvent {
+            let mut event = self.event(event_type);
+            event.pane_id = None;
+            event.agent_id = None;
+            event
+        }
+
+        async fn pending_question(&self) -> Option<PendingQuestion> {
+            self.state
+                .read()
+                .await
+                .pending_question_for(&self.agent_id, Some(PANE))
+                .map(|(_, q)| q)
+        }
+
+        fn answer_task(
+            &self,
+            question_id: &'static str,
+            answers: Vec<QuestionAnswer>,
+            confirmed_always: bool,
+        ) -> tokio::task::JoinHandle<Result<(), AnswerRefusal>> {
+            let registry = self.registry.clone();
+            let state = self.state.clone();
+            let event_tx = self.event_tx.clone();
+            let agent_id = self.agent_id.clone();
+            tokio::spawn(async move {
+                answer_question(
+                    &registry,
+                    &state,
+                    &event_tx,
+                    &agent_id,
+                    question_id,
+                    &answers,
+                    confirmed_always,
+                )
+                .await
+            })
+        }
+
+        async fn answer(
+            &self,
+            question_id: &str,
+            answers: &[(u32, &[u32], Option<&str>)],
+            confirmed_always: bool,
+        ) -> Result<(), AnswerRefusal> {
+            self.answer_as(
+                &self.agent_id.clone(),
+                question_id,
+                answers,
+                confirmed_always,
+            )
+            .await
+        }
+
+        async fn answer_as(
+            &self,
+            agent_id: &str,
+            question_id: &str,
+            answers: &[(u32, &[u32], Option<&str>)],
+            confirmed_always: bool,
+        ) -> Result<(), AnswerRefusal> {
+            let answers: Vec<QuestionAnswer> = answers
+                .iter()
+                .map(|(qi, oi, text)| QuestionAnswer {
+                    question_index: *qi,
+                    option_indices: oi.to_vec(),
+                    text: text.map(str::to_string),
+                })
+                .collect();
+            answer_question(
+                &self.registry,
+                &self.state,
+                &self.event_tx,
+                agent_id,
+                question_id,
+                &answers,
+                confirmed_always,
+            )
+            .await
+        }
+
+        async fn pending(&self) -> Option<String> {
+            self.state
+                .read()
+                .await
+                .pending_question_for(&self.agent_id, Some(PANE))
+                .map(|(_, q)| q.id)
+        }
+
+        async fn status(&self) -> SessionStatus {
+            self.state.read().await.sessions[SESSION].status.clone()
+        }
+
+        /// What the stand-in agent's terminal shows: `cat` in a PTY echoes
+        /// every key typed into it.
+        async fn screen_shows(&self, needle: &str) -> bool {
+            self.screen_shows_within(needle, Duration::from_secs(5))
+                .await
+        }
+
+        async fn screen_shows_within(&self, needle: &str, budget: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                if let Ok(bytes) = self.registry.snapshot(&self.agent_id)
+                    && String::from_utf8_lossy(&bytes).contains(needle)
+                {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.registry.shutdown_all();
+        }
+    }
+
+    fn claude_bash() -> PendingQuestion {
+        crate::question::claude_permission_request(
+            "q-bash".into(),
+            "Bash",
+            None,
+            Some("touch x".into()),
+            Some(&serde_json::json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}])),
+            None,
+            1,
+            None,
+        )
+        .question
+    }
+
+    /// Scenario: Each way an answer can be refused is refused with its own
+    /// reason and changes nothing it should not: an agent the daemon does not
+    /// run, an agent with no question, a stale question id, an answer that does
+    /// not fit the question, a keyboard-only option, an unconfirmed
+    /// always-allow, a question the deck cannot answer, and a held question
+    /// whose producer is no longer holding — which also drops the question.
+    #[spec("question/answer/001")]
+    #[tokio::test]
+    async fn question_answer_001_every_refusal() {
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        assert_eq!(
+            fx.answer_as("no-such-agent", "q-bash", &[(0, &[1], None)], false)
+                .await,
+            Err(AnswerRefusal::AgentNotFound)
+        );
+        assert_eq!(
+            fx.answer("q-bash", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::NoPendingQuestion)
+        );
+        fx.ask(&claude_bash()).await;
+        assert_eq!(
+            fx.answer("q-older", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::Stale {
+                current_id: Some("q-bash".into())
+            })
+        );
+        for wrong in [
+            &[(0, &[9][..], None)][..],
+            &[(1, &[1][..], None)][..],
+            &[][..],
+            &[(0, &[1, 3][..], None)][..],
+            &[(0, &[1][..], Some("text"))][..],
+        ] {
+            assert!(
+                matches!(
+                    fx.answer("q-bash", wrong, false).await,
+                    Err(AnswerRefusal::InvalidAnswer { .. })
+                ),
+                "{wrong:?}"
+            );
+        }
+        assert_eq!(
+            fx.answer("q-bash", &[(0, &[2], None)], false).await,
+            Err(AnswerRefusal::AlwaysNotConfirmed)
+        );
+        assert_eq!(
+            fx.pending().await.as_deref(),
+            Some("q-bash"),
+            "refusals change nothing"
+        );
+        assert_eq!(
+            fx.answer("q-bash", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::ChannelGone),
+            "nothing holds the question"
+        );
+        assert_eq!(
+            fx.pending().await,
+            None,
+            "a question nobody holds is dropped"
+        );
+
+        let mut keyboard_only = claude_bash();
+        keyboard_only.id = "q-ko".into();
+        keyboard_only.questions[0].options[0].keyboard_only = true;
+        fx.ask(&keyboard_only).await;
+        assert_eq!(
+            fx.answer("q-ko", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::KeyboardOnly)
+        );
+
+        let mut unsupported = claude_bash();
+        unsupported.id = "q-un".into();
+        unsupported.channel = AnswerChannel::Unsupported;
+        fx.ask(&unsupported).await;
+        assert_eq!(
+            fx.answer("q-un", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::Unsupported)
+        );
+    }
+
+    /// Scenario: A held question answered with valid indices reaches the
+    /// producer holding it as an `answered` reply naming the deck's labels and
+    /// roles; the question clears and the card moves on to Thinking, in the
+    /// daemon and in what it broadcasts.
+    #[spec("question/answer/002")]
+    #[tokio::test]
+    async fn question_answer_002_a_held_answer_reaches_its_holder() {
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        let mut events = fx.event_tx.subscribe();
+        let held = fx.hold_ingested(&claude_bash()).await;
+        assert_eq!(fx.status().await, SessionStatus::WaitingForInput);
+        fx.answer("q-bash", &[(0, &[2], None)], true)
+            .await
+            .expect("answered");
+        let reply = held.await.expect("the holder hears the answer");
+        assert_eq!(reply.outcome, ReplyOutcome::Answered);
+        assert_eq!(reply.question_id, "q-bash");
+        assert_eq!(reply.answers[0].option_indices, vec![2]);
+        assert_eq!(reply.answers[0].roles, vec![OptionRole::AllowAlways]);
+        assert_eq!(
+            reply.answers[0].labels,
+            vec!["Yes, and switch to accept edits for this session"]
+        );
+        assert_eq!(fx.pending().await, None);
+        assert_eq!(fx.status().await, SessionStatus::Thinking);
+        let broadcast = loop {
+            match events.recv().await {
+                Ok(BroadcastMsg::Event(event)) if event.resolved_question_id().is_some() => {
+                    break event;
+                }
+                Ok(_) => {}
+                Err(_) => panic!("the deck's answered event is broadcast"),
+            }
+        };
+        assert_eq!(broadcast.resolved_question_id(), Some("q-bash"));
+        assert!(broadcast.is_daemon_synthetic());
+    }
+
+    /// Scenario: A Codex command approval answered by voice types the table's
+    /// key — `p` for "don't ask again" — into the agent's terminal with no
+    /// Enter. A two-question Codex form types one digit per question in
+    /// question order. When the question changes between two keys, the second
+    /// is never typed and the answer fails.
+    #[spec("question/answer/003")]
+    #[tokio::test]
+    async fn question_answer_003_keys_are_typed_in_order_and_revalidated() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        let approval = crate::question::codex_permission_request(
+            "q-approve".into(),
+            "Bash",
+            Some("touch x".into()),
+            Some("touch x"),
+            1,
+            None,
+        );
+        fx.ask_ingested(&approval).await;
+        fx.answer("q-approve", &[(0, &[2], None)], true)
+            .await
+            .expect("answered by keys");
+        assert!(fx.screen_shows("p").await, "the key reached the agent");
+        assert_eq!(fx.pending().await, None);
+
+        let form_input = serde_json::json!({"questions": [
+            {"id": "colour", "question": "Which colour?", "options": [{"label": "Red"}, {"label": "Green"}]},
+            {"id": "size", "question": "Which size?", "options": [{"label": "Small"}, {"label": "Large"}, {"label": "Huge"}]}
+        ]});
+        let form = crate::question::codex_request_user_input(
+            Some("call_form1"),
+            Some(&form_input),
+            1,
+            None,
+        )
+        .unwrap();
+        fx.ask_ingested(&form).await;
+        fx.answer("call_form1", &[(1, &[3], None), (0, &[2], None)], false)
+            .await
+            .expect("answered by keys");
+        assert!(
+            fx.screen_shows("p23").await,
+            "one digit per question, in order"
+        );
+
+        let mut second = form.clone();
+        second.id = "call_form2".into();
+        fx.ask_ingested(&second).await;
+        let answering = {
+            let registry = fx.registry.clone();
+            let state = fx.state.clone();
+            let event_tx = fx.event_tx.clone();
+            let agent_id = fx.agent_id.clone();
+            tokio::spawn(async move {
+                answer_question(
+                    &registry,
+                    &state,
+                    &event_tx,
+                    &agent_id,
+                    "call_form2",
+                    &[
+                        QuestionAnswer {
+                            question_index: 0,
+                            option_indices: vec![1],
+                            text: None,
+                        },
+                        QuestionAnswer {
+                            question_index: 1,
+                            option_indices: vec![1],
+                            text: None,
+                        },
+                    ],
+                    false,
+                )
+                .await
+            })
+        };
+        assert!(fx.screen_shows("p231").await, "the first key went in");
+        fx.state
+            .write()
+            .await
+            .clear_pending_question(PANE, "call_form2");
+        assert!(matches!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::WriteFailed { .. })
+        ));
+        assert!(
+            !fx.screen_shows_within("p2311", ANSWER_KEY_GAP * 2).await,
+            "the second key must not reach a question that changed"
+        );
+    }
+
+    fn one(question_index: u32, option: u32) -> QuestionAnswer {
+        QuestionAnswer {
+            question_index,
+            option_indices: vec![option],
+            text: None,
+        }
+    }
+
+    fn codex_form(id: &str) -> PendingQuestion {
+        let input = serde_json::json!({"questions": [
+            {"id": "colour", "question": "Which colour?", "options": [{"label": "Red"}, {"label": "Green"}]},
+            {"id": "size", "question": "Which size?", "options": [{"label": "Small"}, {"label": "Large"}]}
+        ]});
+        crate::question::codex_request_user_input(Some(id), Some(&input), 1, None).unwrap()
+    }
+
+    /// Scenario: A Codex prompt is waiting and the user starts answering it at
+    /// the keyboard. A voice answer that would type keys into that pane is then
+    /// refused with "finish it by keyboard" and types nothing — for a form
+    /// (whose on-screen position the deck cannot see) and for a permission
+    /// prompt alike. Keys the user typed BEFORE the question arrived do not
+    /// count.
+    #[spec("question/answer/006")]
+    #[tokio::test]
+    async fn question_answer_006_keys_refused_once_the_keyboard_has_started() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        // Typed before the question: not a reason to refuse.
+        fx.registry.note_user_input(PANE);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        fx.ask_ingested(&codex_form("call_kb1")).await;
+        fx.registry.note_user_input(PANE);
+        assert_eq!(
+            fx.answer("call_kb1", &[(0, &[1], None), (1, &[2], None)], false)
+                .await,
+            Err(AnswerRefusal::KeyboardStarted)
+        );
+        assert!(
+            !fx.screen_shows_within("1", Duration::from_millis(300))
+                .await,
+            "no key was typed"
+        );
+        assert_eq!(
+            fx.pending().await.as_deref(),
+            Some("call_kb1"),
+            "the question is still the keyboard's to finish"
+        );
+
+        let approval = crate::question::codex_permission_request(
+            "q-kb-approve".into(),
+            "Bash",
+            Some("touch x".into()),
+            Some("touch x"),
+            1,
+            None,
+        );
+        fx.ask_ingested(&approval).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            fx.answer("q-kb-approve", &[(0, &[1], None)], false)
+                .await
+                .is_ok(),
+            "keys typed before this question do not refuse it"
+        );
+        assert!(fx.screen_shows("1").await);
+
+        let mut again = approval.clone();
+        again.id = "q-kb-approve-2".into();
+        fx.ask_ingested(&again).await;
+        fx.registry.note_user_input(PANE);
+        assert_eq!(
+            fx.answer("q-kb-approve-2", &[(0, &[2], None)], true).await,
+            Err(AnswerRefusal::KeyboardStarted)
+        );
+        assert!(
+            !fx.screen_shows_within("p", Duration::from_millis(300))
+                .await
+        );
+    }
+
+    /// Scenario: Two clients answer the same pending question at the same
+    /// moment. Exactly one answer reaches the agent — one key typed for a keys
+    /// question, one reply for a held one — and the other is refused. A question
+    /// the deck already answered is refused if it shows up again under the same
+    /// id.
+    #[spec("question/answer/007")]
+    #[tokio::test]
+    async fn question_answer_007_simultaneous_answers_emit_once() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        let approval = crate::question::codex_permission_request(
+            "q-race".into(),
+            "Bash",
+            Some("touch x".into()),
+            Some("touch x"),
+            1,
+            None,
+        );
+        fx.ask_ingested(&approval).await;
+        let a = fx.answer_task("q-race", vec![one(0, 2)], true);
+        let b = fx.answer_task("q-race", vec![one(0, 2)], true);
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert_eq!(
+            [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "{a:?} {b:?}"
+        );
+        assert!(fx.screen_shows("p").await);
+        assert!(
+            !fx.screen_shows_within("pp", Duration::from_millis(600))
+                .await,
+            "the key was typed once"
+        );
+        // The same id again: the deck answered it already.
+        fx.ask(&approval).await;
+        assert_eq!(
+            fx.answer("q-race", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::Stale { current_id: None })
+        );
+
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        let mut held = fx.hold_ingested(&claude_bash()).await;
+        let a = fx.answer_task("q-bash", vec![one(0, 1)], false);
+        let b = fx.answer_task("q-bash", vec![one(0, 1)], false);
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert_eq!(
+            [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "{a:?} {b:?}"
+        );
+        let reply = (&mut held).await.expect("one answer");
+        assert_eq!(reply.outcome, ReplyOutcome::Answered);
+    }
+
+    /// Scenario: The deck is typing a Codex form's answer one digit per
+    /// question when the user types into the pane between two digits. The deck
+    /// stops, the refusal says to finish by keyboard, and the question stays
+    /// pending but is marked keyboard-only, so no client offers to answer the
+    /// half-answered form again: the change is broadcast at a new revision, so
+    /// a client folding the daemon's events sees it at once, and a voice answer
+    /// another client was counting down for the old revision is called off.
+    #[spec("question/answer/008")]
+    #[tokio::test]
+    async fn question_answer_008_a_partly_typed_answer_leaves_the_question_keyboard_only() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        // A client attached to the daemon: it folds every broadcast event into
+        // its own state, as the TUI and the desktop's agent view do.
+        let mut events = fx.event_tx.subscribe();
+        let mut client = crate::state::AppState::default();
+        client.register_pane(PANE.to_string());
+        let mut start = fx.event(EventType::SessionStart);
+        start.agent_type = AgentType::Codex;
+        client.apply_event(start);
+        fx.ask_ingested(&codex_form("call_half")).await;
+        let asked = fx.pending_question().await.expect("pending").revision;
+        let answering = fx.answer_task("call_half", vec![one(0, 2), one(1, 1)], false);
+        assert!(fx.screen_shows("2").await, "the first key went in");
+        // Inside the gap before the second key, and after the deck's own key.
+        tokio::time::sleep(ANSWER_KEY_GAP / 4).await;
+        fx.registry.note_user_input(PANE);
+        assert_eq!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::KeyboardStarted)
+        );
+        assert!(
+            !fx.screen_shows_within("21", ANSWER_KEY_GAP * 2).await,
+            "the second key was not typed"
+        );
+        let question = fx.pending_question().await.expect("still pending");
+        assert_eq!(question.id, "call_half");
+        assert_eq!(question.channel, AnswerChannel::Unsupported);
+        assert_ne!(
+            question.revision, asked,
+            "keyboard-only is another question for a client's staleness check"
+        );
+        while let Ok(msg) = events.try_recv() {
+            if let BroadcastMsg::Event(event) = msg {
+                client.apply_event(event);
+            }
+        }
+        let seen = client
+            .pending_question_on_pane(PANE)
+            .expect("the client still shows the question");
+        assert_eq!(seen.id, "call_half");
+        assert_eq!(
+            seen.channel,
+            AnswerChannel::Unsupported,
+            "the client is told the question is keyboard-only"
+        );
+        assert!(!seen.has_answerable_option());
+        assert_eq!(seen.revision, question.revision);
+        assert_eq!(
+            client.sessions[SESSION].status,
+            SessionStatus::WaitingForInput,
+            "the card still waits on the question"
+        );
+        assert_eq!(
+            fx.answer("call_half", &[(0, &[2], None), (1, &[1], None)], false)
+                .await,
+            Err(AnswerRefusal::Stale { current_id: None }),
+            "the deck does not answer a form it half-typed"
+        );
+    }
+
+    /// Scenario: An agent's question is answered and, after the daemon has
+    /// checked the answer but before it is delivered, the same question id is
+    /// registered again — a new hold for a held question, new content for one
+    /// answered by keys. The answer is refused as stale and reaches nothing: the
+    /// replacement stays pending and held, and its own answer later reaches it.
+    /// An answer naming a revision that is no longer pending, or naming none,
+    /// is refused before anything is checked, and a repeat of the pending
+    /// question keeps its revision.
+    #[spec("question/answer/010")]
+    #[tokio::test]
+    async fn question_answer_010_an_answer_is_bound_to_the_revision_it_was_checked_against() {
+        // Held: a same-id hold replaces the first between validation and
+        // delivery.
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        let mut first = fx.hold_ingested(&claude_bash()).await;
+        let first_revision = fx.pending_question().await.unwrap().revision;
+        assert!(first_revision.is_some(), "the daemon stamps a revision");
+        fx.ask_ingested(&claude_bash()).await;
+        assert_eq!(
+            fx.pending_question().await.unwrap().revision,
+            first_revision,
+            "a repeat of the pending question keeps its revision"
+        );
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_question:validated");
+        let answering = fx.answer_task("q-bash", vec![one(0, 1)], false);
+        reached.await.unwrap();
+        let mut second = fx.hold_ingested(&claude_bash()).await;
+        let second_revision = fx.pending_question().await.unwrap().revision;
+        assert_ne!(second_revision, first_revision);
+        resume.send(()).unwrap();
+        assert!(
+            matches!(answering.await.unwrap(), Err(AnswerRefusal::Stale { .. })),
+            "the answer was checked against the replaced registration"
+        );
+        let superseded = (&mut first).await.expect("the first holder is let go");
+        assert_eq!(superseded.outcome, ReplyOutcome::Released);
+        assert!(fx.registry.question_holds().is_held(PANE, "q-bash"));
+        assert_eq!(
+            fx.pending_question().await.unwrap().revision,
+            second_revision,
+            "the replacement is still pending"
+        );
+        // A request naming no revision cannot say which registration it was
+        // worked out against, so it is refused too (PR #1698 review).
+        assert_eq!(
+            answer_question_at(
+                &fx.registry,
+                &fx.state,
+                &fx.event_tx,
+                &fx.agent_id,
+                "q-bash",
+                None,
+                &[one(0, 1)],
+                false,
+            )
+            .await,
+            Err(AnswerRefusal::Stale {
+                current_id: Some("q-bash".into())
+            })
+        );
+        // A client that read the old revision is refused at the request.
+        assert_eq!(
+            answer_question_at(
+                &fx.registry,
+                &fx.state,
+                &fx.event_tx,
+                &fx.agent_id,
+                "q-bash",
+                first_revision,
+                &[one(0, 1)],
+                false,
+            )
+            .await,
+            Err(AnswerRefusal::Stale {
+                current_id: Some("q-bash".into())
+            })
+        );
+        answer_question_at(
+            &fx.registry,
+            &fx.state,
+            &fx.event_tx,
+            &fx.agent_id,
+            "q-bash",
+            second_revision,
+            &[one(0, 1)],
+            false,
+        )
+        .await
+        .expect("the replacement's own answer");
+        let reply = (&mut second).await.expect("the replacement hears it");
+        assert_eq!(reply.outcome, ReplyOutcome::Answered);
+
+        // Keys: the same id raised again with other content.
+        let fx = Fixture::start(AgentType::Codex).await;
+        let approval = crate::question::codex_permission_request(
+            "q-swap".into(),
+            "Bash",
+            Some("touch x".into()),
+            Some("touch x"),
+            1,
+            None,
+        );
+        fx.ask_ingested(&approval).await;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_question:validated");
+        let answering = fx.answer_task("q-swap", vec![one(0, 1)], false);
+        reached.await.unwrap();
+        let mut swapped = approval.clone();
+        swapped.tool.as_mut().unwrap().detail = Some("rm -rf build".into());
+        fx.ask_ingested(&swapped).await;
+        resume.send(()).unwrap();
+        assert_eq!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::Stale {
+                current_id: Some("q-swap".into())
+            })
+        );
+        assert!(
+            !fx.screen_shows_within("1", Duration::from_millis(300))
+                .await,
+            "no key reached the replaced prompt"
+        );
+        assert_eq!(fx.pending().await.as_deref(), Some("q-swap"));
+    }
+
+    /// Scenario: The deck is typing a Codex form's answer when, the instant the
+    /// first digit is written and before the deck goes on, the user presses a
+    /// key in the pane. The next digit is refused with "finish it by keyboard"
+    /// and never typed: the deck's own digit is told apart from the user's key
+    /// by an input sequence number recorded with the write, not by a clock read
+    /// afterwards.
+    #[spec("question/answer/011")]
+    #[tokio::test]
+    async fn question_answer_011_a_keystroke_right_after_the_deck_s_key_is_not_mistaken_for_it() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_form("call_seq")).await;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_question:key_written");
+        let answering = fx.answer_task("call_seq", vec![one(0, 2), one(1, 1)], false);
+        reached.await.unwrap();
+        assert!(fx.screen_shows("2").await, "the first key went in");
+        fx.registry.note_user_input(PANE);
+        resume.send(()).unwrap();
+        assert_eq!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::KeyboardStarted)
+        );
+        assert!(
+            !fx.screen_shows_within("21", ANSWER_KEY_GAP * 2).await,
+            "the second key was not typed"
+        );
+        assert_eq!(
+            fx.pending_question().await.unwrap().channel,
+            AnswerChannel::Unsupported
+        );
+    }
+
+    /// Scenario: The deck is typing a Codex form's answer and has just checked
+    /// that the form is still the pending question when an event replacing the
+    /// form arrives — the same id with other questions — or one that clears it.
+    /// That event waits until the deck's digit is queued for the terminal. The
+    /// digit is then either written after passing the terminal's check, or —
+    /// when the change reaches that check first — not typed at all and the
+    /// answer refused as stale; either way the deck's next digit is never
+    /// typed into the changed prompt.
+    #[spec("question/answer/012")]
+    #[tokio::test]
+    async fn question_answer_012_no_question_change_lands_between_a_key_s_check_and_its_queueing() {
+        for clear in [false, true] {
+            let fx = Fixture::start(AgentType::Codex).await;
+            let form = codex_form("call_r2");
+            fx.ask_ingested(&form).await;
+            let checked = fx.pending_question().await.unwrap().revision;
+            let (reached, resume) = fx
+                .registry
+                .question_answers()
+                .arm_barrier("answer_keys:revalidated");
+            let answering = fx.answer_task("call_r2", vec![one(0, 2), one(1, 1)], false);
+            reached.await.expect("the first key was revalidated");
+            let change = if clear {
+                fx.event(EventType::Idle)
+            } else {
+                let mut replaced = form.clone();
+                replaced.questions[0].prompt = "Which shade?".into();
+                let mut event = fx.event(EventType::PermissionRequest);
+                event.set_question(&replaced);
+                event
+            };
+            let changing = fx.ingest_task(change);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !changing.is_finished(),
+                "the change was applied between the key's check and its queueing"
+            );
+            assert_eq!(
+                fx.pending_question().await.unwrap().revision,
+                checked,
+                "nothing changed the question while the key was being committed"
+            );
+            resume.send(()).unwrap();
+            changing.await.unwrap();
+            let refused = answering.await.unwrap();
+            if fx
+                .screen_shows_within("2", Duration::from_millis(500))
+                .await
+            {
+                assert!(
+                    matches!(refused, Err(AnswerRefusal::WriteFailed { .. })),
+                    "the checked key was typed, the next refused: {refused:?}"
+                );
+            } else {
+                assert!(
+                    matches!(refused, Err(AnswerRefusal::Stale { .. })),
+                    "the checked key was dropped unwritten: {refused:?}"
+                );
+            }
+            assert!(
+                !fx.screen_shows_within("21", ANSWER_KEY_GAP * 2).await,
+                "no key reached the changed prompt"
+            );
+            let now = fx.pending_question().await;
+            if clear {
+                assert_eq!(now, None);
+            } else {
+                let now = now.expect("the replacement is pending");
+                assert_ne!(now.revision, checked);
+                assert_eq!(now.questions[0].prompt, "Which shade?");
+                assert_ne!(
+                    now.channel,
+                    AnswerChannel::Unsupported,
+                    "the replacement is not the half-typed form"
+                );
+            }
+        }
+    }
+
+    /// Scenario: The deck has checked a Codex form and queued its first digit
+    /// for the terminal, but the terminal has not taken it yet. An event
+    /// replacing the form — the same id with other questions — or one clearing
+    /// it is applied in that gap. The digit is then dropped instead of typed,
+    /// the answer is refused as stale, and nothing reaches the pane; with no
+    /// change in the gap the same queued digit is typed as usual.
+    #[spec("question/answer/013")]
+    #[tokio::test]
+    async fn question_answer_013_a_queued_key_is_dropped_when_its_question_changes_first() {
+        for change in ["none", "replace", "clear"] {
+            let fx = Fixture::start(AgentType::Codex).await;
+            let form = codex_form("call_t1");
+            fx.ask_ingested(&form).await;
+            let checked = fx.pending_question().await.unwrap().revision;
+            let (reached, resume) = fx
+                .registry
+                .question_answers()
+                .arm_barrier(crate::agent_pty::ANSWER_KEY_ON_PTY_THREAD);
+            let answering = fx.answer_task("call_t1", vec![one(0, 2), one(1, 1)], false);
+            reached
+                .await
+                .expect("the PTY thread reached the queued key");
+            let event = match change {
+                "none" => None,
+                "clear" => Some(fx.event(EventType::Idle)),
+                _ => {
+                    let mut replaced = form.clone();
+                    replaced.questions[0].prompt = "Which shade?".into();
+                    let mut event = fx.event(EventType::PermissionRequest);
+                    event.set_question(&replaced);
+                    Some(event)
+                }
+            };
+            if let Some(event) = event {
+                // Not held behind the queued key: the lifecycle was released
+                // when it was queued.
+                tokio::time::timeout(Duration::from_secs(5), fx.ingest_task(event))
+                    .await
+                    .expect("the change is ingested while the key waits on the PTY thread")
+                    .unwrap();
+            }
+            resume.send(()).unwrap();
+            let outcome = answering.await.unwrap();
+            match change {
+                "none" => {
+                    assert_eq!(outcome, Ok(()), "{change}");
+                    assert!(fx.screen_shows("21").await, "both keys were typed");
+                }
+                "clear" => {
+                    assert_eq!(outcome, Err(AnswerRefusal::Stale { current_id: None }));
+                    assert_eq!(fx.pending_question().await, None);
+                }
+                _ => {
+                    assert_eq!(
+                        outcome,
+                        Err(AnswerRefusal::Stale {
+                            current_id: Some("call_t1".into())
+                        })
+                    );
+                    let now = fx.pending_question().await.expect("the replacement");
+                    assert_ne!(now.revision, checked);
+                    assert_ne!(now.channel, AnswerChannel::Unsupported);
+                }
+            }
+            if change != "none" {
+                assert!(
+                    !fx.screen_shows_within("2", Duration::from_millis(500))
+                        .await,
+                    "{change}: the queued key was not typed into the changed prompt"
+                );
+            }
+        }
+    }
+
+    /// Scenario: On an ordinary daemon pane, the deck has checked a Codex form
+    /// and is about to queue its first digit when an Idle event arrives that
+    /// names the agent's session but no pane. It resolves to the session's pane,
+    /// so it waits for the deck's digit to be queued exactly as an event naming
+    /// the pane would. Once applied it changes nothing: a pane-less report is
+    /// admitted only as an outside agent's, which reaches no card of a deck
+    /// agent spawned on a pane, so the question stays pending, both digits are
+    /// typed and the answer is sent. The same event leaves a held question's
+    /// producer holding.
+    #[spec("question/answer/014")]
+    #[tokio::test]
+    async fn question_answer_014_an_event_naming_no_pane_waits_for_its_session_s_pane() {
+        let fx = Fixture::start_unmanaged(AgentType::Codex).await;
+        fx.ask_ingested(&codex_form("call_t2")).await;
+        let checked = fx.pending_question().await.unwrap().revision;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_keys:revalidated");
+        let answering = fx.answer_task("call_t2", vec![one(0, 2), one(1, 1)], false);
+        reached.await.expect("the first key was revalidated");
+        let clearing = fx.ingest_task(fx.paneless(EventType::Idle));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !clearing.is_finished(),
+            "the pane-less event was applied between the key's check and its queueing"
+        );
+        assert_eq!(
+            fx.pending_question().await.unwrap().revision,
+            checked,
+            "nothing changed the question while the key was being committed"
+        );
+        resume.send(()).unwrap();
+        clearing.await.unwrap();
+        // PRD #1631 port: issue #601 (on `main` since #1559, after PRD #1631's
+        // branch point) admits a pane-less report from an agent spawned on a
+        // pane only as an outside agent's, and an outside report reaches no
+        // proven card — so it cannot clear the pane's question, which is what
+        // this test asserted on PRD #1631's base.
+        assert_eq!(
+            fx.pending_question().await.map(|q| q.revision),
+            Some(checked),
+            "a pane-less report reaches no question of a deck agent on a pane"
+        );
+        assert_eq!(answering.await.unwrap(), Ok(()));
+        assert!(
+            fx.screen_shows_within("21", ANSWER_KEY_GAP * 4).await,
+            "both digits were typed"
+        );
+
+        // A held question's producer is not let go by a pane-less report.
+        let fx = Fixture::start_unmanaged(AgentType::ClaudeCode).await;
+        let mut held = fx.hold_ingested(&claude_bash()).await;
+        fx.ingest_task(fx.paneless(EventType::Idle)).await.unwrap();
+        assert_eq!(fx.pending().await.as_deref(), Some("q-bash"));
+        assert!(fx.registry.question_holds().is_held(PANE, "q-bash"));
+        assert!(held.try_recv().is_err(), "the holder has heard nothing");
+    }
+
+    /// Scenario: An Idle event names a session but no pane, and when it arrives
+    /// that session has no pane yet. Before it is applied, the session's agent
+    /// starts the session on a pane while that pane's question transition is
+    /// in progress. The Idle is then applied only after that
+    /// transition ends, as an event naming the pane would be.
+    #[spec("question/answer/015")]
+    #[tokio::test]
+    async fn question_answer_015_an_event_naming_no_pane_follows_its_session_onto_a_pane() {
+        const LATE: &str = "question-answer-late-session";
+        let fx = Fixture::start_unmanaged(AgentType::Codex).await;
+        // Setup: the pane's own session would adopt the late one's frame.
+        fx.state.write().await.sessions.remove(SESSION);
+        let mut start = fx.paneless(EventType::SessionStart);
+        start.session_id = LATE.into();
+        fx.ingest_task(start).await.unwrap();
+        assert_eq!(fx.state.read().await.session_pane(LATE), None);
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("ingest:paneless_resolved");
+        let mut idle = fx.paneless(EventType::Idle);
+        idle.session_id = LATE.into();
+        let idling = fx.ingest_task(idle);
+        reached
+            .await
+            .expect("the Idle resolved its session to no pane");
+        // A question transition on the pane, during which the session moves
+        // onto it.
+        let lifecycle = fx.registry.question_answers().lock_lifecycle(PANE).await;
+        let mut moving = fx.event(EventType::SessionStart);
+        moving.session_id = LATE.into();
+        assert!(
+            crate::daemon::ingest_event_in_lifecycle(
+                &fx.state,
+                &fx.event_tx,
+                &fx.registry,
+                &lifecycle,
+                moving,
+                None,
+                |_| false,
+            )
+            .await
+        );
+        assert_eq!(
+            fx.state.read().await.session_pane(LATE).as_deref(),
+            Some(PANE),
+            "the session moved onto the pane"
+        );
+        resume.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !idling.is_finished(),
+            "the Idle was applied to the pane's session during its question transition"
+        );
+        drop(lifecycle);
+        tokio::time::timeout(Duration::from_secs(5), idling)
+            .await
+            .expect("the Idle is applied once the transition ends")
+            .unwrap();
+        assert_eq!(
+            fx.state.read().await.sessions[LATE].status,
+            SessionStatus::Idle
+        );
+    }
+
+    /// A Codex question with one multiple-choice question, answered by a
+    /// single key.
+    fn codex_single(id: &str, prompt: &str) -> PendingQuestion {
+        let input = serde_json::json!({"questions": [
+            {"id": "colour", "question": prompt, "options": [{"label": "Red"}, {"label": "Green"}]}
+        ]});
+        crate::question::codex_request_user_input(Some(id), Some(&input), 1, None).unwrap()
+    }
+
+    /// Scenario: A voice answer to a Codex prompt is held up part way through
+    /// being sent when a second answer to the same agent arrives. The second
+    /// is refused at once with "an answer is already being sent" instead of
+    /// waiting behind the first, and the first then completes, typing its key
+    /// once.
+    #[spec("question/answer/016")]
+    #[tokio::test]
+    async fn question_answer_016_a_second_answer_is_refused_while_one_is_being_sent() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_busy", "Which colour?"))
+            .await;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_question:validated");
+        let first = fx.answer_task("call_busy", vec![one(0, 2)], false);
+        reached.await.expect("the first answer is being sent");
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            fx.answer("call_busy", &[(0, &[1], None)], false),
+        )
+        .await
+        .expect("the second answer is refused at once, not queued behind the first");
+        assert_eq!(second, Err(AnswerRefusal::AnswerInProgress));
+        resume.send(()).unwrap();
+        assert_eq!(first.await.unwrap(), Ok(()), "the first answer completes");
+        assert!(
+            fx.screen_shows("2").await,
+            "the first answer's key was typed"
+        );
+        assert!(
+            !fx.screen_shows_within("1", Duration::from_millis(300))
+                .await,
+            "the refused answer typed nothing"
+        );
+        assert_eq!(fx.pending().await, None);
+    }
+
+    /// Scenario: The deck has just typed the key answering a Codex prompt when,
+    /// before it records that it answered, the agent raises a new prompt under
+    /// the same id. The new prompt stays pending and is answered by voice as
+    /// usual — it is not refused as already answered — while the same prompt
+    /// raised again once that answer is over is still refused.
+    #[spec("question/answer/017")]
+    #[tokio::test]
+    async fn question_answer_017_a_replacement_during_a_key_answer_stays_answerable() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_mark", "Which colour?"))
+            .await;
+        let first_revision = fx.pending_question().await.unwrap().revision;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_question:key_written");
+        let answering = fx.answer_task("call_mark", vec![one(0, 2)], false);
+        reached.await.expect("the key was written");
+        let replacement = codex_single("call_mark", "Which shade?");
+        fx.ask_ingested(&replacement).await;
+        let replaced_revision = fx.pending_question().await.unwrap().revision;
+        assert_ne!(replaced_revision, first_revision);
+        resume.send(()).unwrap();
+        assert_eq!(answering.await.unwrap(), Ok(()));
+        assert!(fx.screen_shows("2").await);
+        let pending = fx.pending_question().await.expect("the replacement");
+        assert_eq!(pending.revision, replaced_revision);
+        assert_eq!(pending.questions[0].prompt, "Which shade?");
+        assert_eq!(
+            answer_question_at(
+                &fx.registry,
+                &fx.state,
+                &fx.event_tx,
+                &fx.agent_id,
+                "call_mark",
+                replaced_revision,
+                &[one(0, 1)],
+                false,
+            )
+            .await,
+            Ok(()),
+            "the replacement is answerable"
+        );
+        assert!(
+            fx.screen_shows("21").await,
+            "the replacement's key was typed"
+        );
+        // That answer is over: the same id raised again is refused.
+        fx.ask(&replacement).await;
+        assert_eq!(
+            fx.answer("call_mark", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::Stale { current_id: None })
+        );
+    }
+
+    /// Scenario: The deck answers a held permission prompt and waits for the
+    /// agent to say it took the answer. Meanwhile the pane's agent is replaced,
+    /// and the new agent asks another question and then the same prompt id
+    /// again, both answered by voice. When the first agent's late "not taken"
+    /// arrives, the new agent's answered prompt stays answered, so the same
+    /// prompt raised again is refused rather than answered a second time.
+    #[spec("question/answer/018")]
+    #[tokio::test]
+    async fn question_answer_018_a_late_refusal_leaves_a_later_answer_settled() {
+        const RESPAWNED: &str = "question-answer-respawned";
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        let hold = |agent_id: &str, session_id: &str, question: &PendingQuestion| {
+            let mut event = fx.event(EventType::PermissionRequest);
+            event.session_id = session_id.into();
+            event.agent_id = Some(agent_id.into());
+            event.set_question(question);
+            let (state, event_tx, registry, agent_id) = (
+                fx.state.clone(),
+                fx.event_tx.clone(),
+                fx.registry.clone(),
+                agent_id.to_string(),
+            );
+            async move {
+                crate::daemon::register_and_publish_held(
+                    &state, &event_tx, &registry, PANE, &agent_id, event,
+                )
+                .await
+                .expect("the question is held")
+            }
+        };
+        // A producer that acknowledges, and says it took the answer.
+        let delivered = |rx: tokio::sync::oneshot::Receiver<crate::agent_pty::HeldReply>| {
+            tokio::spawn(async move {
+                if let Ok(held) = rx.await
+                    && let Some(delivery) = held.delivery
+                {
+                    let _ = delivery.send(crate::agent_pty::ReplyDelivery::Delivered);
+                }
+            })
+        };
+
+        // The first agent's answer is handed over and waits for its
+        // acknowledgement, with its mark settled.
+        let first_hold = hold(&fx.agent_id, SESSION, &claude_bash()).await.rx;
+        let first = fx.answer_task("q-bash", vec![one(0, 1)], false);
+        let late = first_hold
+            .await
+            .expect("the first answer reaches its producer")
+            .delivery
+            .expect("the answer waits for the agent to take it");
+
+        // The pane's agent is replaced, and the new one asks another
+        // question, then the same id again; both are answered.
+        let respawned = fx
+            .registry
+            .respawn_agent_for_pane(PANE, "/bin/cat")
+            .await
+            .expect("respawn the pane's agent");
+        let mut start = fx.event(EventType::SessionStart);
+        start.session_id = RESPAWNED.into();
+        start.agent_id = Some(respawned.clone());
+        start.agent_type = AgentType::ClaudeCode;
+        fx.state.write().await.apply_event(start);
+        let mut other = claude_bash();
+        other.id = "q-other".into();
+        delivered(hold(&respawned, RESPAWNED, &other).await.rx);
+        assert_eq!(
+            fx.answer_as(&respawned, "q-other", &[(0, &[1], None)], false)
+                .await,
+            Ok(())
+        );
+        delivered(hold(&respawned, RESPAWNED, &claude_bash()).await.rx);
+        assert_eq!(
+            fx.answer_as(&respawned, "q-bash", &[(0, &[1], None)], false)
+                .await,
+            Ok(()),
+            "the new agent's question under the reused id is answerable"
+        );
+
+        // The first agent's late refusal arrives.
+        late.send(crate::agent_pty::ReplyDelivery::NotAccepted(
+            "the agent exited".into(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(AnswerRefusal::WriteFailed { .. })
+        ));
+
+        // The new agent's producer raises its answered question again: it is
+        // refused, not answered twice.
+        let _again = hold(&respawned, RESPAWNED, &claude_bash()).await;
+        assert_eq!(
+            fx.answer_as(&respawned, "q-bash", &[(0, &[1], None)], false)
+                .await,
+            Err(AnswerRefusal::Stale { current_id: None }),
+            "the answered question is not answered a second time"
+        );
+    }
+
+    /// Scenario: An agent's pane has moved on to a new conversation, which is
+    /// holding a permission prompt for an answer. A question event from the
+    /// conversation the pane left then arrives late, stamped with the current
+    /// time. The live prompt stays the pane's question at its revision and
+    /// stays held — the late question neither replaces it nor lets its holder
+    /// go — and the live prompt is still answered by voice.
+    #[spec("question/hold/017")]
+    #[tokio::test]
+    async fn question_hold_017_a_late_question_from_a_superseded_session_leaves_the_live_one() {
+        const NEW: &str = "question-answer-new-session";
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        let mut moved = fx.event(EventType::SessionStart);
+        moved.session_id = NEW.into();
+        moved.agent_type = AgentType::ClaudeCode;
+        crate::daemon::ingest_event(&fx.state, &fx.event_tx, &fx.registry, moved).await;
+        let mut asked = fx.event(EventType::PermissionRequest);
+        asked.session_id = NEW.into();
+        asked.set_question(&claude_bash());
+        let mut held = crate::daemon::register_and_publish_held(
+            &fx.state,
+            &fx.event_tx,
+            &fx.registry,
+            PANE,
+            &fx.agent_id,
+            asked,
+        )
+        .await
+        .expect("the live question is held")
+        .rx;
+        let live = fx
+            .state
+            .read()
+            .await
+            .pending_question_on_pane(PANE)
+            .unwrap();
+        assert_eq!(live.id, "q-bash");
+
+        let mut late = fx.event(EventType::PermissionRequest);
+        late.set_question(
+            &crate::question::claude_permission_request(
+                "q-late".into(),
+                "Bash",
+                None,
+                Some("rm -rf build".into()),
+                None,
+                None,
+                1,
+                None,
+            )
+            .question,
+        );
+        assert_eq!(late.session_id, SESSION, "from the session the pane left");
+        let mut clients = fx.event_tx.subscribe();
+        crate::daemon::ingest_event(&fx.state, &fx.event_tx, &fx.registry, late).await;
+        while let Ok(msg) = clients.try_recv() {
+            if let BroadcastMsg::Event(event) = msg {
+                assert_eq!(
+                    event.question(),
+                    None,
+                    "no client is shown the late question"
+                );
+            }
+        }
+
+        let now = fx.state.read().await.pending_question_on_pane(PANE);
+        assert_eq!(
+            now.as_ref().map(|q| (q.id.as_str(), q.revision)),
+            Some(("q-bash", live.revision)),
+            "the live question is still the pane's"
+        );
+        assert!(fx.registry.question_holds().is_held(PANE, "q-bash"));
+        assert!(
+            matches!(
+                held.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the live question's holder was not let go"
+        );
+        // Stands in for the hook loop's handler, as `hold_ingested` does.
+        let producer = tokio::spawn(async move {
+            let held = held.await.expect("the live holder hears the answer");
+            if let Some(delivery) = held.delivery {
+                let _ = delivery.send(crate::agent_pty::ReplyDelivery::Delivered);
+            }
+            held.reply
+        });
+        answer_question_at(
+            &fx.registry,
+            &fx.state,
+            &fx.event_tx,
+            &fx.agent_id,
+            "q-bash",
+            live.revision,
+            &[one(0, 1)],
+            false,
+        )
+        .await
+        .expect("the live question is answered");
+        assert_eq!(producer.await.unwrap().outcome, ReplyOutcome::Answered);
+    }
+
+    /// Scenario: The user answers a permission prompt with "no" by voice. The
+    /// question clears, but the card does not flash Thinking: the deck's own
+    /// event about the answer asserts no status, and the agent's next event
+    /// says where it went. An allow still moves the card to Thinking.
+    #[spec("question/answer/009")]
+    #[tokio::test]
+    async fn question_answer_009_a_deny_does_not_show_thinking() {
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        let mut events = fx.event_tx.subscribe();
+        let held = fx.hold_ingested(&claude_bash()).await;
+        fx.answer("q-bash", &[(0, &[3], None)], false)
+            .await
+            .expect("denied");
+        assert_eq!(held.await.unwrap().answers[0].roles, vec![OptionRole::Deny]);
+        assert_eq!(fx.pending().await, None);
+        assert_eq!(fx.status().await, SessionStatus::WaitingForInput);
+        let broadcast = loop {
+            match events.recv().await {
+                Ok(BroadcastMsg::Event(event)) if event.resolved_question_id().is_some() => {
+                    break event;
+                }
+                Ok(_) => {}
+                Err(_) => panic!("the deck's answered event is broadcast"),
+            }
+        };
+        assert_eq!(broadcast.event_type, EventType::Unknown);
+        assert_eq!(broadcast.resolved_question_id(), Some("q-bash"));
+        assert!(broadcast.is_daemon_synthetic());
     }
 }

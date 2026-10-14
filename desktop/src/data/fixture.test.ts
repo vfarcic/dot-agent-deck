@@ -165,6 +165,15 @@ describe("browser fixture prompt commands (PRD #1541)", () => {
   });
 });
 
+/** PRD #1401 — the preview's pull request row, on the two screens it runs on. */
+describe("browser fixture open_pr", () => {
+  /** Scenario: on the preview's agent dashboard a bare "open the PR" asks which agent's, and on an agent's screen it opens the pane's agent's. */
+  it("asks which agent on the dashboard and opens the pane's on an agent screen", () => {
+    expect(resolveFixtureVoice("open the PR", "overview", false).outcome).toMatchObject({ kind: "param_missing", action: "open_pr", param: "agent" });
+    expect(resolveFixtureVoice("open the PR", "agent", false).outcome).toMatchObject({ kind: "dispatch", action: "open_pr", invoke: "openPullRequest", params: [] });
+  });
+});
+
 function matchesAction(utterance: string, action: string, dictating: boolean): boolean {
   const outcome = resolveFixtureVoice(utterance, "agent", dictating).outcome;
   return outcome.kind === "dispatch" && outcome.action === action && outcome.params.length === 0;

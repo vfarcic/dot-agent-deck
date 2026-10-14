@@ -412,6 +412,8 @@ async fn session_start(cwd: &std::path::Path, pane_id: &str, agent_id: &str) -> 
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     dot_agent_deck::event::agent_event_line(
         &event,
@@ -1496,6 +1498,14 @@ async fn delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_
 // #584's control: the two spawn paths' respawns, side by side.
 // ---------------------------------------------------------------------------
 
+/// The base ceiling, before [`common::load_scaled`], on a recorder worker
+/// writing its launch block. A BOOT, not a behaviour, for
+/// [`common::CHILD_BOOT_BASE`]'s reason: each wait returns the instant the
+/// block is complete. Kept at the flat 10 s it replaced, so an idle box keeps
+/// the bound it had.
+#[cfg(unix)]
+const RECORDER_BOOT_BASE: Duration = Duration::from_secs(10);
+
 /// A recorder worker: appends everything that decides HOW it was launched to a
 /// log, then behaves like a `cat` pane so the delegate's pointer is observable.
 #[cfg(unix)]
@@ -1520,15 +1530,23 @@ fn write_recorder(path: &std::path::Path, log: &std::path::Path) {
         .expect("chmod recorder worker stand-in");
 }
 
-/// The recorder's completed per-invocation blocks, minus the agent id (which
-/// is expected to differ — it is the whole point of a respawn).
+/// The recorder's per-invocation blocks, minus the agent id (which is expected
+/// to differ — it is the whole point of a respawn).
+///
+/// Only COMPLETE blocks, ended by the recorder's `---` line: it writes one line
+/// at a time, so a block still being written must not count as a launch. When
+/// it did, the wait for the initial launches passed on a lone `argv0=` line,
+/// the respawn then killed that worker before it wrote the rest, and its torn
+/// block merged with the replacement's, so the log never showed a second
+/// launch (seen in a `test-fast` run at `io full` 90.6%).
 fn recorded_launches(log: &std::path::Path) -> Vec<String> {
-    std::fs::read_to_string(log)
-        .unwrap_or_default()
-        .split_inclusive("---\n")
-        // The shell appends each line separately. Until its terminal marker is
-        // visible, the existing wait loops must treat that launch as pending.
-        .filter_map(|block| block.strip_suffix("---\n"))
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let mut blocks: Vec<&str> = text.split("---\n").collect();
+    // What follows the last terminator is a block still being written, or
+    // nothing.
+    blocks.pop();
+    blocks
+        .into_iter()
         .map(str::trim)
         .filter(|block| !block.is_empty())
         .map(str::to_string)
@@ -1653,7 +1671,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
         ("dispatch", dispatch_log.as_path()),
         ("startagent", control_log.as_path()),
     ] {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + common::load_scaled(RECORDER_BOOT_BASE);
         while recorded_launches(log).is_empty() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -1749,7 +1767,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     );
 
     // --- and the two paths' relaunch parameters agree.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + common::load_scaled(RECORDER_BOOT_BASE);
     while recorded_launches(&dispatch_log).len() < 2 || recorded_launches(&control_log).len() < 2 {
         assert!(
             tokio::time::Instant::now() < deadline,

@@ -4,7 +4,7 @@ use super::choice::{ChoiceAnswer, ChoiceLive, answer};
 use super::outcome::ResolvedParam;
 use super::table::ParamKind;
 use super::{VoiceDeck, VoiceDirectories, VoiceDirectoryEntry};
-use crate::voice::fixtures::role_agent;
+use crate::voice::fixtures::{in_titled_orchestration, role_agent};
 
 fn candidate(kind: ParamKind, value: &str, label: &str) -> ResolvedParam {
     ResolvedParam {
@@ -341,4 +341,31 @@ fn choice_refuses_bare_controls_that_collide_with_another_spoken_name() {
         answer("number one", &offered, &live),
         ChoiceAnswer::Selected(offered[0].clone())
     );
+}
+
+/// Scenario (issue #1668): "coder" matched the coders of two runs of one
+/// orchestration, so the choice offers each by its run's title and role.
+/// Saying one of those names back selects that run's coder; the bare role
+/// still names both and is refused rather than guessed.
+#[test]
+fn choice_selects_a_run_member_by_its_run_title() {
+    let runs = [
+        in_titled_orchestration(role_agent("coder-a", "coder"), "o1", "mixed", "prd-1401"),
+        in_titled_orchestration(role_agent("coder-b", "coder"), "o2", "mixed", "prd-1500"),
+    ];
+    let live = ChoiceLive {
+        agents: &runs,
+        decks: &[],
+        directories: None,
+        new_agent: None,
+    };
+    let offered = [
+        candidate(ParamKind::AgentRef, "coder-a", "prd-1401 coder"),
+        candidate(ParamKind::AgentRef, "coder-b", "prd-1500 coder"),
+    ];
+    assert_eq!(
+        answer("prd 1500 coder", &offered, &live),
+        ChoiceAnswer::Selected(offered[1].clone())
+    );
+    assert_eq!(answer("coder", &offered, &live), ChoiceAnswer::Refused);
 }

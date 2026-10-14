@@ -303,12 +303,23 @@ pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<
     Ok(())
 }
 
-/// How long a writer waits for another process's read-modify-write of the same
-/// agent config to finish. One is a few milliseconds, most of it the `fsync`;
-/// a holder still busy after this long is stuck, and the caller's own error
-/// path (a logged warning on the startup install, a printed one from the CLI)
-/// beats blocking a pane's spawn forever.
+/// How long a writer waits without seeing the config published before it
+/// decides the holder is stuck. One read-modify-write is a few milliseconds,
+/// most of it the `fsync`; a holder that publishes nothing for this long is
+/// stuck, and the caller's own error path (a logged warning on the startup
+/// install, a printed one from the CLI) beats blocking a pane's spawn forever.
+///
+/// It bounds a STALL, not the whole wait: the lock is not fair, so under
+/// contention a waiter can lose the lock to other writers many times in a row
+/// while every one of them finishes promptly. Counting that queue against this
+/// window is what failed `codex/trust/008` on a loaded Windows runner — 160
+/// writes at ~90 ms each, and one waiter refused after 10 s while the lock
+/// changed hands throughout. [`CONFIG_LOCK_CEILING`] bounds the whole wait.
 const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The longest a writer waits for the lock in total, however steadily other
+/// writers keep publishing meanwhile.
+const CONFIG_LOCK_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How often a waiting writer retries the lock.
 const CONFIG_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
@@ -355,10 +366,22 @@ pub(crate) struct ConfigLock {
 ///
 /// Every other failure is an error: the sidecar's name is taken by something
 /// that is not a regular file (a lock would land on whatever it points at), it
-/// cannot be opened, or another process still holds it after
-/// [`CONFIG_LOCK_WAIT`]. Going ahead unlocked is exactly the race this exists
+/// cannot be opened, another process holds it for [`CONFIG_LOCK_WAIT`] without
+/// `dest` being published once, or others keep it busy past
+/// [`CONFIG_LOCK_CEILING`]. Going ahead unlocked is exactly the race this exists
 /// to stop.
 pub(crate) fn lock_config(dest: &Path) -> io::Result<ConfigLock> {
+    lock_config_waiting(dest, CONFIG_LOCK_WAIT, CONFIG_LOCK_CEILING)
+}
+
+/// [`lock_config`] with its two bounds as arguments, so tests can exercise them
+/// in milliseconds. `stall` is how long the lock may stay taken with `dest`
+/// unchanged; `ceiling` is the whole wait.
+fn lock_config_waiting(
+    dest: &Path,
+    stall: std::time::Duration,
+    ceiling: std::time::Duration,
+) -> io::Result<ConfigLock> {
     let dir = match dest.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -405,25 +428,54 @@ pub(crate) fn lock_config(dest: &Path) -> io::Result<ConfigLock> {
         opts.mode(0o600);
     }
     let file = opts.open(&lock_path)?;
-    let deadline = std::time::Instant::now() + CONFIG_LOCK_WAIT;
+    let started = std::time::Instant::now();
+    let give_up = started + ceiling;
+    // When the current window began: the wait's start, or the look that last
+    // saw `dest` change. The last window is cut short to end at the ceiling,
+    // so a window running out does not by itself mean `stall` has passed
+    // without a publish, and only a full one reads as a stuck holder.
+    let mut window_start = started;
+    let mut stall_deadline = (started + stall).min(give_up);
+    // Sampled only when a stall window runs out, not on every poll, so waiters
+    // add one `stat` of `dest` per window rather than hundreds per second.
+    let mut seen = PublishMark::of(dest);
     loop {
         match file.try_lock() {
             Ok(()) => {
                 reap_stale_temps(dir, name);
                 return Ok(ConfigLock { _file: Some(file) });
             }
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(CONFIG_LOCK_POLL);
-            }
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "another process has been updating {} for over {}s; not updating it",
-                        dest.display(),
-                        CONFIG_LOCK_WAIT.as_secs()
-                    ),
-                ));
+                let now = std::time::Instant::now();
+                if now >= stall_deadline {
+                    let current = PublishMark::of(dest);
+                    if current == seen && now >= window_start + stall {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "another process has been updating {} for over {stall:?} \
+                                 without finishing; not updating it",
+                                dest.display(),
+                            ),
+                        ));
+                    }
+                    if now >= give_up {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "other processes have kept {} busy for over {ceiling:?}; \
+                                 not updating it",
+                                dest.display(),
+                            ),
+                        ));
+                    }
+                    // Another writer published since the last look: the lock
+                    // is changing hands, not stuck. Start a fresh window.
+                    seen = current;
+                    window_start = now;
+                    stall_deadline = (now + stall).min(give_up);
+                }
+                std::thread::sleep(CONFIG_LOCK_POLL);
             }
             Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => {
                 tracing::warn!(
@@ -435,6 +487,41 @@ pub(crate) fn lock_config(dest: &Path) -> io::Result<ConfigLock> {
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
+    }
+}
+
+/// What [`lock_config_waiting`] compares to tell whether `dest` was published
+/// between two looks. Every deck writer publishes by renaming a fresh temp file
+/// over `dest` ([`write_atomic`]), so a publish changes the file's identity —
+/// its inode on unix, its creation time elsewhere (a rename keeps the temp
+/// file's) — as well as, nearly always, its modification time. `None` when
+/// `dest` cannot be read, which compares equal to itself: a config that stays
+/// absent shows no progress.
+#[derive(Debug, PartialEq, Eq)]
+struct PublishMark(Option<PublishMarkFields>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct PublishMarkFields {
+    #[cfg(unix)]
+    inode: (u64, u64),
+    created: Option<std::time::SystemTime>,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl PublishMark {
+    fn of(dest: &Path) -> Self {
+        Self(std::fs::symlink_metadata(dest).ok().map(|meta| {
+            #[cfg(unix)]
+            use std::os::unix::fs::MetadataExt as _;
+            PublishMarkFields {
+                #[cfg(unix)]
+                inode: (meta.dev(), meta.ino()),
+                created: meta.created().ok(),
+                modified: meta.modified().ok(),
+                len: meta.len(),
+            }
+        }))
     }
 }
 
@@ -1179,6 +1266,86 @@ pub(crate) fn rule_command_strs(rules: &[Value]) -> Vec<&str> {
     out
 }
 
+/// The largest hook config or plugin file the pin refresh reads (issue #1637
+/// audit A9); a longer one is no evidence. The deck's own entries take a few
+/// hundred bytes per event and a hand-kept settings file a few kilobytes, so
+/// 4 MiB is far past any real one while still bounding what one read can
+/// allocate.
+pub(crate) const MAX_HOOK_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most distinct absolute executables [`configured_deck_executables`]
+/// collects from one config. Larger than
+/// [`crate::hook_binary::MAX_BINARIES_PER_AGENT`], so the daemon's own cap is
+/// what decides; small enough that a config listing thousands of distinct
+/// binaries allocates nothing in proportion to them. Relative commands are
+/// counted separately, under
+/// [`crate::hook_binary::MAX_RELATIVE_PINS_PER_AGENT`], so however many a
+/// config lists ahead of an absolute pin, they never crowd it out (Qodo on
+/// #1656).
+pub(crate) const MAX_CONFIGURED_EXECUTABLES: usize = 64;
+
+/// A JSON hook config read for a read-back (issue #1637's pin refresh):
+/// `Some(Some(json))` when it was read, `Some(None)` when it is confirmed
+/// missing — evidence that it names nothing — and `None` when it is
+/// unreadable, not a regular file, longer than [`MAX_HOOK_CONFIG_BYTES`] or
+/// not JSON — no evidence either way. Reads through
+/// [`crate::bounded_read::read_config_file`], so it neither blocks on a FIFO
+/// with no writer nor reads a huge file whole (audit A9). Reads only: unlike
+/// the installers' readers it never sets a malformed file aside.
+pub(crate) fn read_json_config(path: &Path) -> Option<Option<Value>> {
+    match crate::bounded_read::read_config_file(path, MAX_HOOK_CONFIG_BYTES).ok()? {
+        Some(text) => serde_json::from_str(&text).ok().map(Some),
+        None => Some(None),
+    }
+}
+
+/// The distinct executables the deck's entries in a JSON hook config name,
+/// in file order: every command under `root.hooks.<event>[]`, in either shape
+/// [`rule_command_strs`] reads, that `executable_of` recognises as the deck's.
+/// Collects at most [`MAX_CONFIGURED_EXECUTABLES`] absolute paths and
+/// [`crate::hook_binary::MAX_RELATIVE_PINS_PER_AGENT`] relative commands no
+/// longer than [`crate::hook_binary::MAX_RELATIVE_PIN_BYTES`], each counted on
+/// its own, and stops once both are full (audit A9). Read-only, for issue
+/// #1637's pin refresh.
+pub(crate) fn configured_deck_executables(
+    root: &Value,
+    executable_of: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    use crate::hook_binary::{MAX_RELATIVE_PIN_BYTES, MAX_RELATIVE_PINS_PER_AGENT};
+    let mut out: Vec<String> = Vec::new();
+    let (mut absolute, mut relative) = (0usize, 0usize);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
+        return out;
+    };
+    for rules in hooks.values().filter_map(Value::as_array) {
+        for exe in rule_command_strs(rules)
+            .into_iter()
+            .filter_map(&executable_of)
+        {
+            if absolute >= MAX_CONFIGURED_EXECUTABLES && relative >= MAX_RELATIVE_PINS_PER_AGENT {
+                return out;
+            }
+            let count = if Path::new(&exe).is_absolute() {
+                if absolute >= MAX_CONFIGURED_EXECUTABLES {
+                    continue;
+                }
+                &mut absolute
+            } else {
+                if relative >= MAX_RELATIVE_PINS_PER_AGENT || exe.len() > MAX_RELATIVE_PIN_BYTES {
+                    continue;
+                }
+                &mut relative
+            };
+            if seen.insert(exe.clone()) {
+                *count += 1;
+                out.push(exe);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn strip_deck_commands(
     rules: &mut Vec<Value>,
     mut is_target: impl FnMut(&str) -> bool,
@@ -1602,6 +1769,13 @@ impl KeptDeckEntry {
 /// installs that each resolve to themselves still do not rewrite the agent's
 /// config on every start.
 ///
+/// **A sibling an eligible newer copy supersedes is not kept either** (issue
+/// #1637, [`crate::hook_binary::Takeover`]): when the installing binary is an
+/// install outside any temporary location and the sibling's `--version`
+/// reports a strictly older release, it is passed over exactly as a dead pin
+/// is, so it is overwritten in place and the event keeps one deck entry. A
+/// tie, a newer sibling and a sibling whose version cannot be read are kept.
+///
 /// [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]: crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX
 pub(crate) fn auto_install_kept_entry(
     rules: &[Value],
@@ -1610,6 +1784,7 @@ pub(crate) fn auto_install_kept_entry(
     executable_of: impl Fn(&str) -> Option<String>,
     command_for_exe: impl Fn(&str) -> String,
 ) -> Option<KeptDeckEntry> {
+    let takeover = crate::hook_binary::Takeover::current();
     let exe = rules
         .iter()
         .filter_map(|rule| rule.get("hooks").and_then(Value::as_array))
@@ -1620,6 +1795,7 @@ pub(crate) fn auto_install_kept_entry(
             executable_of(command)
                 .filter(|exe| auto_install_keeps(exe))
                 .filter(|exe| ensure_hook_path_is_shell_safe(exe).is_ok())
+                .filter(|exe| executables_match(exe, binary_path) || !takeover.supersedes(exe))
         })?;
     Some(if executables_match(&exe, binary_path) {
         KeptDeckEntry::ThisBinary
@@ -1674,6 +1850,134 @@ fn process_label() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("cstring");
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+        // call, and `mkfifo` only reads through it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+    }
+
+    /// `f` on a thread of its own, failing rather than hanging when it does
+    /// not return within ten seconds.
+    #[cfg(unix)]
+    fn within_ten_seconds<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the read blocked")
+    }
+
+    /// Scenario (issue #1637 audit A9): a hook config replaced by a FIFO with
+    /// no writer, directly and through a symlink. The pin refresh's read
+    /// returns at once with no evidence instead of waiting for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_config_is_no_evidence_and_does_not_block() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let fifo = dir.path().join("settings.json");
+        mkfifo_at(&fifo);
+        let link = dir.path().join("linked.json");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        for path in [fifo, link] {
+            let json = within_ten_seconds(move || read_json_config(&path));
+            assert_eq!(json, None);
+        }
+    }
+
+    /// Scenario (audit A9): a directory where the config should be is not a
+    /// regular file, so it is no evidence; a regular file there is read.
+    #[test]
+    fn a_non_regular_config_is_no_evidence() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(read_json_config(&path), None);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        assert_eq!(read_json_config(&path), Some(Some(json!({}))));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_json_config(&path), Some(None), "missing names nothing");
+    }
+
+    /// Scenario (audit A9): a config one byte past
+    /// [`MAX_HOOK_CONFIG_BYTES`] is no evidence, and one exactly at the cap
+    /// is read.
+    #[test]
+    fn an_oversized_config_is_rejected() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut huge = b"{\"hooks\": {}}".to_vec();
+        huge.resize(MAX_HOOK_CONFIG_BYTES as usize + 1, b' ');
+        std::fs::write(&path, &huge).unwrap();
+        assert_eq!(read_json_config(&path), None);
+        huge.truncate(MAX_HOOK_CONFIG_BYTES as usize);
+        std::fs::write(&path, &huge).unwrap();
+        assert!(
+            matches!(read_json_config(&path), Some(Some(_))),
+            "at the cap is read"
+        );
+    }
+
+    /// Scenario (Qodo on #1656): a config lists far more distinct relative
+    /// deck commands than any real one, then an absolute pin to an older
+    /// copy. The relative ones are capped on their own, an over-long one is
+    /// passed over, and the absolute pin is still collected.
+    #[test]
+    fn relative_commands_do_not_crowd_out_an_absolute_pin() {
+        use crate::hook_binary::{MAX_RELATIVE_PIN_BYTES, MAX_RELATIVE_PINS_PER_AGENT};
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
+        let long = "x".repeat(MAX_RELATIVE_PIN_BYTES + 1);
+        let mut commands: Vec<Value> = vec![json!({"command": format!("{long} hook")})];
+        commands.extend(
+            (0..MAX_CONFIGURED_EXECUTABLES * 2)
+                .map(|n| json!({"command": format!("bin-{n}/dot-agent-deck hook")})),
+        );
+        commands.push(json!({"command": format!("{old} hook")}));
+        let root = json!({"hooks": {"Stop": [{"hooks": commands}]}});
+        let found = configured_deck_executables(&root, |command| {
+            command.strip_suffix(" hook").map(str::to_string)
+        });
+        let expected: Vec<String> = (0..MAX_RELATIVE_PINS_PER_AGENT)
+            .map(|n| format!("bin-{n}/dot-agent-deck"))
+            .chain([old.to_string()])
+            .collect();
+        assert_eq!(found, expected);
+    }
+
+    /// Scenario (audit A9): a config naming far more distinct deck binaries
+    /// than any real one, each many times over. What is collected stops at
+    /// [`MAX_CONFIGURED_EXECUTABLES`], in file order, with no duplicates.
+    #[test]
+    fn a_config_with_many_distinct_pins_is_capped_and_deduped() {
+        let deck = |n: usize| crate::test_paths::abs(&format!("/opt/deck-{n}/dot-agent-deck"));
+        let commands: Vec<Value> = (0..MAX_CONFIGURED_EXECUTABLES * 4)
+            .flat_map(|n| {
+                let command = format!("{} hook", deck(n));
+                [
+                    json!({"command": command.clone()}),
+                    json!({"command": command}),
+                ]
+            })
+            .collect();
+        let root = json!({"hooks": {"Stop": [{"hooks": commands}]}});
+        let found = configured_deck_executables(&root, |command| {
+            command.strip_suffix(" hook").map(str::to_string)
+        });
+        assert_eq!(found.len(), MAX_CONFIGURED_EXECUTABLES);
+        let distinct: std::collections::HashSet<&String> = found.iter().collect();
+        assert_eq!(distinct.len(), found.len(), "no duplicates");
+        assert_eq!(found[0], deck(0));
+        assert_eq!(
+            found[MAX_CONFIGURED_EXECUTABLES - 1],
+            deck(MAX_CONFIGURED_EXECUTABLES - 1)
+        );
+    }
 
     /// Scenario: an automatic install keeps another install's entry only when
     /// that install is positively live and durable. A missing pin, a
@@ -2059,6 +2363,137 @@ mod tests {
         if let Some(named) = named {
             assert_eq!(named, a, "{agent}: the entries still name A");
         }
+    }
+
+    /// A live deck stub at `path` whose `--version` prints `version`, or, for
+    /// `None`, the plain `exit 0` stub every keep-rule fixture uses.
+    #[cfg(unix)]
+    fn seed_versioned_deck(path: &Path, version: Option<&str>) -> String {
+        let seeded = seed_deck(path);
+        if let Some(version) = version {
+            crate::test_isolation::write_script(
+                path,
+                format!("#!/bin/sh\necho 'dot-agent-deck {version}'\n").as_bytes(),
+            )
+            .unwrap();
+        }
+        seeded
+    }
+
+    /// Every event's rules with the deck's commands blanked, so a comparison
+    /// sees the user's handlers, the order and each rule's `matcher`.
+    #[cfg(unix)]
+    fn rules_around_the_deck(agent: &str, path: &Path) -> Value {
+        let suffix = format!("hook --agent {agent}");
+        let mut document: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for rules in document["hooks"].as_object_mut().unwrap().values_mut() {
+            for rule in rules.as_array_mut().unwrap() {
+                for handler in rule["hooks"].as_array_mut().into_iter().flatten() {
+                    if handler["command"]
+                        .as_str()
+                        .is_some_and(|command| command.ends_with(&suffix))
+                    {
+                        handler["command"] = Value::String("<deck>".into());
+                    }
+                }
+            }
+        }
+        document["hooks"].take()
+    }
+
+    /// Issue #1637: an automatic install by B under `takeover`, over a file
+    /// whose deck entry pins A reporting `pinned` (or nothing). Returns A, B
+    /// and the config path.
+    #[cfg(unix)]
+    fn auto_install_over_a_versioned_pin(
+        agent: &str,
+        fixture: &Path,
+        pinned: Option<&str>,
+        takeover: crate::hook_binary::Takeover,
+    ) -> (String, String, std::path::PathBuf, Value) {
+        let home = fixture.join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let a = seed_versioned_deck(&fixture.join("homebrew").join("dot-agent-deck"), pinned);
+        let b = seed_deck(&fixture.join("local").join("dot-agent-deck"));
+        install_config(agent, &home, &a).unwrap();
+        let path = home.join(config_name(agent));
+        surround_deck_rules(&path, None);
+        let around = rules_around_the_deck(agent, &path);
+        crate::hook_binary::with_takeover(takeover, || auto_install_config(agent, &home, &b));
+        (a, b, path, around)
+    }
+
+    /// Issue #1637's takeover matrix for one writer.
+    #[cfg(unix)]
+    fn takeover_matrix(agent: &str) {
+        use crate::hook_binary::Takeover;
+        // A newer, eligible copy replaces an older pin in place: one deck
+        // entry per event, where the old one was, with the user's handler and
+        // every rule's `matcher` unchanged.
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let (_, b, path, around) = auto_install_over_a_versioned_pin(
+            agent,
+            fixture.path(),
+            Some("0.0.1"),
+            Takeover::eligible("1.0.0"),
+        );
+        assert_every_event_names(agent, &path, &b, "a newer eligible copy takes the pin over");
+        assert_eq!(
+            rules_around_the_deck(agent, &path),
+            around,
+            "{agent}: only the deck's command changed"
+        );
+
+        // Kept: a tie, a newer pin, an unprobeable pin, and an ineligible copy
+        // even when it is newer.
+        for (pinned, takeover, why) in [
+            (
+                Some("1.0.0"),
+                Takeover::eligible("1.0.0"),
+                "a tie keeps the pin",
+            ),
+            (
+                Some("2.0.0"),
+                Takeover::eligible("1.0.0"),
+                "an older copy never displaces a newer pin",
+            ),
+            (
+                None,
+                Takeover::eligible("1.0.0"),
+                "a pin whose version cannot be read is kept",
+            ),
+            (
+                Some("0.0.1"),
+                Takeover::ineligible(),
+                "a copy that is not an install never takes over",
+            ),
+        ] {
+            let fixture = crate::test_temp::tempdir().unwrap();
+            let (a, _, path, _) =
+                auto_install_over_a_versioned_pin(agent, fixture.path(), pinned, takeover);
+            assert_every_event_names(agent, &path, &a, why);
+        }
+    }
+
+    /// Scenario: Codex hooks pin an older live install; a newer eligible copy's automatic install switches them to itself in place, while a tie, a newer pin, an unprobeable pin and an ineligible copy leave them alone.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_codex_takeover_matrix() {
+        takeover_matrix("codex");
+    }
+
+    /// Scenario: the same takeover matrix for Claude Code's settings file.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_claude_takeover_matrix() {
+        takeover_matrix("claude-code");
+    }
+
+    /// Scenario: the same takeover matrix for Devin's config file.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_devin_takeover_matrix() {
+        takeover_matrix("devin");
     }
 
     /// Scenario: Install Codex hooks from live install A, then auto-install from install B. The hooks file keeps its bytes, inode and mtime and still names A.
@@ -3585,6 +4020,218 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, dir.path().join(".config.toml.lock"))
             .expect("symlink");
         assert!(lock_config(&dest).is_err());
+    }
+
+    /// Publish `dest` the cheapest way [`PublishMark`] can see: one byte
+    /// appended, so its length grows.
+    ///
+    /// Not [`write_atomic`], and not a rename over `dest` either: both made the
+    /// holder's cadence the disk's. Beside eight `dd conv=fsync` loops,
+    /// `write_atomic`'s `fsync` failed each of the two tests below in 10 of 15
+    /// runs, and with the `fsync` gone a bare rename over `dest` still took up
+    /// to 1.59 s on ext4, which starts writing a file back when it is renamed
+    /// over another. Either way one publish outlasted a whole stall window,
+    /// and the waiter was right to read the holder as stuck. An append took at
+    /// most 452 ms under the same load. What these tests exercise is the
+    /// waiter's reading of publishes, not how fast a disk syncs.
+    fn publish_by_appending(dest: &Path) {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dest)
+            .and_then(|mut file| file.write_all(b"x"))
+            .expect("publish");
+    }
+
+    /// The stall window the busy-holder tests wait with: each window has to
+    /// see one of the holder's publishes, or the holder reads as stuck. It is
+    /// shared so the two tests cannot drift apart, and load-scaled from twice
+    /// the 452 ms the slowest [`publish_by_appending`] took under load. A flat
+    /// 500 ms failed both tests on a 16-CPU dev box at load average ~30
+    /// (2026-10-13); at that load the factor alone brings this window to about
+    /// the 2 s a flat window was raised to.
+    fn busy_holder_stall() -> std::time::Duration {
+        crate::test_budget::load_scaled(std::time::Duration::from_secs(1))
+    }
+
+    /// Hold the config's lock on a thread that publishes `dest` every `every`
+    /// until `stop` is set, then release it. Returns once the lock is held.
+    fn hold_and_keep_publishing(
+        dest: &Path,
+        every: std::time::Duration,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<usize> {
+        let dest = dest.to_path_buf();
+        let (locked, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lock = lock_config(&dest).expect("holder takes the lock");
+            locked.send(()).expect("signal the lock is held");
+            let mut published = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(every);
+                published += 1;
+                publish_by_appending(&dest);
+            }
+            published
+        });
+        held.recv().expect("the holder took the lock");
+        holder
+    }
+
+    /// `codex/trust/008` on a loaded Windows runner: the lock is not fair, so a
+    /// waiter can lose it to other writers for longer than the stall window
+    /// while every one of them finishes promptly. A config that keeps being
+    /// published is a lock changing hands, not a stuck holder, so the wait goes
+    /// on past the stall window and succeeds once the lock is free.
+    #[test]
+    fn the_config_lock_waits_past_the_stall_window_while_the_config_keeps_being_published() {
+        let dir = crate::test_temp::tempdir().expect("lock tempdir");
+        let dest = dir.path().join("config.toml");
+        std::fs::write(&dest, b"").expect("seed destination");
+        let stall = busy_holder_stall();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder =
+            hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
+        // The release is anchored to the instant the measurement starts, not to
+        // when this thread is next scheduled, so a delay before the wait cannot
+        // let the holder let go before the waiter has been blocked past `stall`.
+        let started = std::time::Instant::now();
+        let release = {
+            let stop = stop.clone();
+            let release_at = started + stall * 3;
+            std::thread::spawn(move || {
+                std::thread::sleep(release_at.saturating_duration_since(std::time::Instant::now()));
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
+        let waited = lock_config_waiting(&dest, stall, std::time::Duration::from_secs(60));
+        let elapsed = started.elapsed();
+        release.join().expect("release thread");
+        let published = holder.join().expect("holder thread");
+
+        waited.expect("a lock changing hands is waited for past the stall window");
+        assert!(
+            elapsed > stall,
+            "the wait ended after {elapsed:?}, inside the {stall:?} stall window, so it \
+             proved nothing about waiting past it"
+        );
+        assert!(published > 0, "the holder never published");
+    }
+
+    /// A holder that keeps the lock without publishing is stuck: the waiter
+    /// gives up once the stall window passes, long before the ceiling.
+    #[test]
+    fn the_config_lock_gives_up_on_a_holder_that_publishes_nothing() {
+        let dir = crate::test_temp::tempdir().expect("lock tempdir");
+        let dest = dir.path().join("config.toml");
+        std::fs::write(&dest, b"").expect("seed destination");
+        let _held = lock_config(&dest).expect("take the lock");
+
+        let stall = std::time::Duration::from_millis(200);
+        let ceiling = std::time::Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        let err = lock_config_waiting(&dest, stall, ceiling)
+            .err()
+            .expect("a stuck holder is not waited for");
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("without finishing"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            elapsed >= stall,
+            "gave up after {elapsed:?}, before {stall:?}"
+        );
+        assert!(
+            elapsed < ceiling / 2,
+            "waited {elapsed:?} for a stuck holder"
+        );
+    }
+
+    /// However steadily the config keeps being published, the whole wait is
+    /// bounded by the ceiling.
+    #[test]
+    fn the_config_lock_gives_up_at_the_ceiling_however_busy_the_config_is() {
+        let dir = crate::test_temp::tempdir().expect("lock tempdir");
+        let dest = dir.path().join("config.toml");
+        std::fs::write(&dest, b"").expect("seed destination");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder =
+            hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
+
+        // The stall window is sized as in the test above: a publish has to land
+        // inside each one for the wait to reach the ceiling at all.
+        let stall = busy_holder_stall();
+        let ceiling = stall.mul_f64(2.4);
+        let started = std::time::Instant::now();
+        let waited = lock_config_waiting(&dest, stall, ceiling);
+        let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        holder.join().expect("holder thread");
+
+        let err = waited.err().expect("the ceiling bounds the wait");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("busy"), "unexpected error: {err}");
+        assert!(
+            elapsed >= ceiling,
+            "gave up after {elapsed:?}, before {ceiling:?}"
+        );
+    }
+
+    /// The last window before the ceiling is cut short to end at it. A holder
+    /// that published well inside the stall window before then is busy, not
+    /// stuck, even though that short window saw no publish: the ceiling is
+    /// what ended the wait, and the error says so.
+    #[test]
+    fn the_config_lock_blames_the_ceiling_when_the_last_window_is_cut_short() {
+        let dir = crate::test_temp::tempdir().expect("lock tempdir");
+        let dest = dir.path().join("config.toml");
+        std::fs::write(&dest, b"").expect("seed destination");
+        let stall = crate::test_budget::load_scaled(std::time::Duration::from_millis(400));
+        // Windows end at `stall`, `2 * stall` and, cut short, the ceiling.
+        let ceiling = stall.mul_f64(2.4);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (locked, held) = std::sync::mpsc::channel();
+        let (go, started_at) = std::sync::mpsc::channel::<std::time::Instant>();
+        let holder = {
+            let dest = dest.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let _lock = lock_config(&dest).expect("holder takes the lock");
+                locked.send(()).expect("signal the lock is held");
+                let started = started_at.recv().expect("the wait's start");
+                // One publish in the middle of each of the first two windows,
+                // then none: the last is half a window before the third
+                // starts, and 0.9 of a window before the ceiling.
+                for at in [0.5, 1.5] {
+                    let when = started + stall.mul_f64(at);
+                    std::thread::sleep(when.saturating_duration_since(std::time::Instant::now()));
+                    publish_by_appending(&dest);
+                }
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+        held.recv().expect("the holder took the lock");
+
+        let started = std::time::Instant::now();
+        go.send(started).expect("start the holder's schedule");
+        let waited = lock_config_waiting(&dest, stall, ceiling);
+        let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        holder.join().expect("holder thread");
+
+        let err = waited.err().expect("the ceiling bounds the wait");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("busy"), "unexpected error: {err}");
+        assert!(
+            elapsed >= ceiling,
+            "gave up after {elapsed:?}, before {ceiling:?}"
+        );
     }
 
     #[test]

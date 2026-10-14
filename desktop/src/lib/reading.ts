@@ -57,13 +57,28 @@
  * turn is read as usual. Voice off turns the microphone off and leaves
  * reading on as well: the switch is reading's only state.
  *
+ * # What is read where (issue #1667)
+ *
+ * With no agent pane open — the overview, or any screen without one — every
+ * agent above is read. With an agent's pane open (the deck's pane, or the one
+ * opened over the overview), only that agent is: a sentence about any other
+ * agent is not spoken, a permission prompt or error included, since the
+ * overview's cards show those when the user goes back. Opening the pane drops
+ * whatever was still to be said about other agents, cutting off one being
+ * said ({@link DeckReader.focus}). Closing it reads every agent again from
+ * that moment; nothing skipped while it was open is said. This only filters
+ * what is spoken: every agent's session runs on whatever pane is open.
+ *
  * # Who is named (decision 4 of 2026-10-09)
  *
  * Every sentence comes in two forms, naming the agent and not. Which one is
  * said is decided when the speech queue takes the sentence up to say it
  * ({@link DeckReader}'s `openPane`), and checked again right before provider
  * audio plays: the bare one when that agent's pane is the one open at that
- * moment, the named one otherwise.
+ * moment, the named one otherwise. The name is the agent's
+ * {@link ReadingTarget.label}: for an agent in an orchestration, the run's
+ * title and its name (`agentSpokenName`, the rule the overview's group
+ * heading uses too).
  */
 
 import type { SpeechQueue } from "./speech";
@@ -72,9 +87,19 @@ import type { SpeechQueue } from "./speech";
 export interface ReadingTarget {
   deckId: string;
   agentId: string;
-  /** What the deck calls the agent; named in a sentence about it (decision 4). */
+  /**
+   * The agent's name in a sentence about it (decision 4): `agentSpokenName`,
+   * bounded to {@link READING_LABEL_MAX_CHARS}.
+   */
   label: string;
 }
+
+/**
+ * The most characters of a label that are sent: as many as a sentence names
+ * of it (`MAX_AGENT_NAME_CHARS` on the Rust side), which also keeps it inside
+ * the bytes the Rust side accepts for one. `agentSpokenName` bounds it.
+ */
+export const READING_LABEL_MAX_CHARS = 64;
 
 /** An agent the reader is told about. */
 export interface ReadingAgent extends ReadingTarget {
@@ -100,11 +125,13 @@ export type ReadingStartDto =
 /**
  * One sentence to speak, from `desktop_voice_reading_start`'s channel — or,
  * as `ended`, word that the Rust side ended the session (the Settings switch
- * was turned off), or, as `closed`, that the agent's events ended (it exited).
- * Neither of those two is spoken.
+ * was turned off), or, as `closed`, that the agent's events ended (it exited),
+ * or, as `permission_answered`, that the deck answered the agent's question by
+ * voice, so its permission prompts still waiting to be said are dropped.
+ * None of those three is spoken.
  */
 export interface ReadingSentenceDto {
-  kind: "turn" | "permission" | "blocked" | "ended" | "closed";
+  kind: "turn" | "permission" | "blocked" | "ended" | "closed" | "permission_answered";
   /** The sentence naming the agent. */
   text: string;
   /** The same sentence without the agent's name, for when its pane is open. */
@@ -193,12 +220,21 @@ export interface DeckReaderDeps {
   /** End the subscription `start` answered with `session`. */
   stop: (session: number) => Promise<void>;
   speech: Pick<SpeechQueue, "say" | "interrupt" | "drop">;
-  /** The agent whose pane is open right now, asked when a sentence is said. */
-  openPane?: () => { deckId: string; agentId: string } | undefined;
+  /**
+   * The agent whose pane is open right now, asked when a sentence arrives
+   * (another agent's is not spoken) and when it is said (its wording).
+   */
+  openPane?: () => OpenPane | undefined;
   /** A sentence about reading itself that the voice row shows; it is spoken too. */
   onProblem?: (sentence: string) => void;
   /** Run `run` after `ms`; answers how to cancel it. `setTimeout` when absent. */
   schedule?: (run: () => void, ms: number) => () => void;
+}
+
+/** An agent whose pane is open. */
+export interface OpenPane {
+  deckId: string;
+  agentId: string;
 }
 
 /** The key one agent incarnation is read under, and speaks under. */
@@ -345,6 +381,19 @@ export class DeckReader {
       this.refused.delete(key);
       if (agent !== undefined) this.unconfirmedRefusal(key, agent, undefined);
     }
+  }
+
+  /**
+   * The pane open now changed to `pane` (`undefined`: none is open). An
+   * agent's pane drops everything still to be said about any other agent,
+   * cutting off a sentence about one being said (issue #1667); the reader's
+   * own sentences are kept. Closing a pane drops nothing, and replays
+   * nothing: what was not spoken while it was open is gone.
+   */
+  focus(pane: OpenPane | undefined): void {
+    if (pane === undefined) return;
+    const own = `${pane.deckId}\u0000${pane.agentId}\u0000`;
+    this.deps.speech.drop((key) => !key.startsWith("\u0000") && !key.startsWith(own));
   }
 
   /** "stop" / "quiet": silence the app now. Reading stays on. */
@@ -625,16 +674,33 @@ export class DeckReader {
       this.capacityFreed(record.target.deckId);
       return;
     }
+    if (sentence.kind === "permission_answered") {
+      // The prompt was answered, so saying it now would ask for what is
+      // already decided. Only this agent's prompts go: its errors and its
+      // summary, and every other agent's speech, stay queued.
+      const prompts = `${key}\u0000permission\u0000`;
+      this.deps.speech.drop((queued) => queued.startsWith(prompts));
+      return;
+    }
     const { deckId, agentId } = record.target;
+    const mine = (open: OpenPane) => open.deckId === deckId && open.agentId === agentId;
+    // Another agent's pane is open: nothing about this one is said (issue #1667).
+    const open = this.deps.openPane?.();
+    if (open !== undefined && !mine(open)) return;
     const say = () => {
-      const open = this.deps.openPane?.();
-      return open !== undefined && open.deckId === deckId && open.agentId === agentId ? (sentence.bare ?? sentence.text) : sentence.text;
+      const now = this.deps.openPane?.();
+      if (now === undefined) return sentence.text;
+      /* Still queued when another agent's pane opened, before {@link focus}
+         dropped it: said as nothing, which the queue skips. */
+      return mine(now) ? (sentence.bare ?? sentence.text) : "";
     };
     /* A turn's summary replaces a waiting summary for the same agent (D6),
        and only that agent's: another agent's news is never dropped for it.
        Each permission prompt or error waits under a key of its own, so
-       nothing later drops what the user has to act on. */
-    this.deps.speech.say(sentence.kind === "turn" ? key : `${key}\u0000alert\u0000${++this.alerts}`, { say, safe: sentence.text });
+       nothing later drops what the user has to act on — except the deck's
+       own answer to that agent's question, which drops its prompts (above). */
+    const alert = sentence.kind === "permission" ? "permission" : "alert";
+    this.deps.speech.say(sentence.kind === "turn" ? key : `${key}\u0000${alert}\u0000${++this.alerts}`, { say, safe: sentence.text });
   }
 
   private problem(sentence: string): void {

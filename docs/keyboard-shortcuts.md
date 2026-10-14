@@ -4,7 +4,7 @@ Everything on this page is the TUI's, except [Editing an agent's prompt](#editin
 
 Press `?` in command mode to see the shortcuts in the TUI. The overlay and the bottom button bar are generated from your active [keybindings](#customizing-keybindings), so they show your real keys.
 
-![The TUI's help overlay, opened with ?, listing the shortcuts by section: Global (works from any pane), Tab Navigation and Dashboard (command mode) on the left; Mouse, New Agent Form, Directory Picker and Session on the right](/img/help-tui.png)
+![The TUI's help overlay, opened with ?, listing the shortcuts by section: Global (chords work from any pane), with each command's plain letter beside its Ctrl chord such as n / Ctrl+n, Tab Navigation and Dashboard (command mode), where the letter commands show their Ctrl form such as m / Ctrl+m, on the left; Mouse, New Agent Form, Directory Picker and Session on the right](/img/help-tui.png)
 
 ## Modes
 
@@ -13,7 +13,7 @@ The TUI is in one of two modes, and most keys depend on which:
 - **Command mode**: keys drive the deck. The chip at the far left of the bottom bar reads ` COMMAND `, the focused pane is dimmed, and a `COMMAND MODE — Ctrl+D to type` banner appears over it. The banner clears after a moment or when you press a command-mode key, and stays up if you press a key that is not bound to anything.
 - **Typing in a pane**: keys go to the program in the focused pane. The chip reads ` TYPING ` and the pane shows a cursor.
 
-`Ctrl+D` switches between them. The first button in the bar, `[Back to Pane Ctrl+D]` or `[Command Mode Ctrl+D]`, says where it takes you. The selected card keeps its `▸ ` marker in both modes.
+`Ctrl+D` switches between them; in command mode plain `d` does too. The first button in the bar, `[Back to Pane d/Ctrl+D]` or `[Command Mode Ctrl+D]`, says where it takes you. The selected card keeps its `▸ ` marker in both modes.
 
 ## Mouse
 
@@ -42,6 +42,37 @@ Whether there is anything to scroll depends on the agent; see [Scrolling back th
 | `Ctrl+C` | In a pane: sent to the program (interrupt). In command mode, the directory picker or the New Agent form: opens the [quit dialog](#dialogs). | Both modes |
 
 Where a key is not claimed (for example `Ctrl+W`, `Ctrl+L`, `Ctrl+Z` or `Ctrl+E` while typing in a pane), it is passed to the program in the pane. While the close confirmation is open, only its keys and `Ctrl+C` work.
+
+### Plain letters in command mode
+
+In command mode you can drop the `Ctrl`: the letter alone does the same thing as its chord. The chords keep working. This is the TUI's: the desktop app has no command mode, and its [own shortcuts](desktop/settings.md#keyboard-shortcuts) are unchanged.
+
+| Letter | Same as | Note |
+|---|---|---|
+| `d` | `Ctrl+D` | Back to the pane you came from |
+| `n` | `Ctrl+N` | New agent. When the selected card shows **Needs Input**, `n` denies the permission request instead, as it always has. |
+| `w` | `Ctrl+W` | Close, with its confirmation |
+| `t` | `Ctrl+T` | Toggle layout |
+| `z` | `Ctrl+Z` | Zoom, on the dashboard or an orchestration tab |
+| `e` | `Ctrl+E` | Command-entry lock, only where `Ctrl+E` works (experimental flag on, orchestration tab) |
+
+`l` stays **next tab**, so the orchestration split keeps only `Ctrl+L`, and there is no plain `c`: quitting is always `Ctrl+C`. While you are typing in a pane, every letter goes to the program as before.
+
+A letter works only while its action is on its default `Ctrl+` key and no other action uses that letter. If you [remap](#customizing-keybindings) `new_pane`, `n` no longer starts an agent, and if you bind `d` to another action, `d` does that action instead. The help overlay (`?`) lists `d`, `n`, `w`, `t` and `z` beside their chords, for example `n / Ctrl+n`, and the bottom bar shows `d`, `n`, `w` and `t`; each drops a letter that a remap has taken away. `e` is listed in neither. The bar's `n/Ctrl+N` stays on **New Agent** even while the selected card shows **Needs Input**, where `n` denies instead.
+
+It works the other way round too: in command mode, these commands, whose key is a plain letter, also answer to `Ctrl` with that letter.
+
+| Chord | Same as | Note |
+|---|---|---|
+| `Ctrl+M` | `m` | Host of this deck. In a terminal that sends `Ctrl+M` as `Enter`, such as macOS Terminal.app, it acts as `Enter` and opens the selected card's pane. Terminals that tell the two apart open the overlay: Ghostty, kitty, WezTerm, and iTerm2 with its CSI u reporting turned on. |
+| `Ctrl+S` | `s` | Schedules manager |
+| `Ctrl+G` | `g` | Generate config |
+| `Ctrl+U` | `u` | Upgrade |
+| `Ctrl+R` | `r` | Rename the selected agent |
+
+These are command mode only. While you are typing in a pane, `Ctrl+R`, `Ctrl+U`, `Ctrl+S`, `Ctrl+G` and `Ctrl+M` go to the program as before, so reverse search, clearing the line and your agent's own shortcuts keep working. Moving around (`j`, `k`, `h`, `l`), the digits, `?`, `/`, `y`, `n`, `o`, `Enter` and `Esc` have no `Ctrl` form.
+
+A chord works only while its command is on its default letter and no other command uses that chord: after `scroll_pane_up = "Ctrl+u"`, `Ctrl+U` scrolls the pane and no longer opens the upgrade dialog, and if you remap `rename`, `Ctrl+R` no longer renames. The help overlay lists each one after its letter, for example `m / Ctrl+m`.
 
 ### `Ctrl+W` closes only from command mode
 
@@ -92,8 +123,12 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 | `r` | Rename the selected agent |
 | `g` | Ask the selected agent to generate `.dot-agent-deck.toml` for its directory |
 | `s` or `S` | Open the **Schedules** manager (see [Schedules](scheduled-tasks.md)) |
+| `o` | Open the selected agent's pull request in your system browser (uses `$BROWSER` when set; a `$BROWSER` that puts the address into a shell command, such as `sh -c %s`, is refused); when no browser can be opened, for example in a TUI on a remote host, the status line shows the pull request's address so you can copy it. On a card with no [pull request badge](session-management.md#pull-request-badge) it says the agent has none. The desktop app has no `o`: click the badge or say "open the PR", and it opens inside the app ([Dashboard → Pull requests](desktop/dashboard.md#pull-requests)) |
+| `m` | Open the **Host of this deck** overlay: disk, load and memory of the machine the deck runs on (see [Session Management](session-management.md#check-the-machine-a-deck-runs-on)); `Esc` closes it |
 | `u` | Open the upgrade dialog while the footer shows an update notice (see [Upgrade from the TUI](installation.md#upgrade-from-the-tui)) |
-| `y` / `n` | Approve / deny a pending permission request; only when the selected card shows **Needs Input** |
+| `y` / `n` | Approve / deny a pending permission request; only when the selected card shows **Needs Input**. Otherwise `n` starts a new agent (see [Plain letters in command mode](#plain-letters-in-command-mode)). |
+| `d`, `n`, `w`, `t`, `z`, `e` | The same as `Ctrl+` with that letter (see [Plain letters in command mode](#plain-letters-in-command-mode)) |
+| `Ctrl+M`, `Ctrl+S`, `Ctrl+G`, `Ctrl+U`, `Ctrl+R` | The same as the letter alone (see [Plain letters in command mode](#plain-letters-in-command-mode)) |
 | `?` | Toggle the help overlay |
 
 ### Scrolling back through a pane
@@ -185,6 +220,7 @@ While filtering: `Enter` stops editing and keeps the filter, `Backspace` deletes
 | **Upgrade** | `u`, or a click on the footer's update notice | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Upgrade** · `Enter` confirms · `Esc` closes · `PageUp` / `PageDown` (or the mouse wheel) scroll a plan too long for the terminal; **Upgrade** waits until the whole plan has been on screen. It asks about one copy at a time; after one copy is upgraded, **Cancel** skips the next. A copy the TUI cannot upgrade offers only **Close**. See [Upgrade from the TUI](installation.md#upgrade-from-the-tui). |
 | **Star prompt** | Shown at startup about once every 10 launches, until dismissed | `s` opens the repository to star it · `l` or `Esc` asks again later · `d` never asks again |
 | **Help overlay** | `?` | `?`, `Esc` or `q` closes it |
+| **Host of this deck** | `m` (or `Ctrl+M`) | `Esc`, `q`, `m` or `Ctrl+M` closes it |
 
 ## Customizing Keybindings
 
@@ -255,13 +291,15 @@ Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Ent
 | `deny_permission` | `n` | Deny a pending permission request |
 | `generate_config` | `g` | Generate `.dot-agent-deck.toml` |
 | `open_scheduled_tasks` | `s` | Open the Schedules manager |
+| `open_pull_request` | `o` | Open the selected agent's pull request in the system browser |
 | `open_upgrade` | `u` | Open the upgrade dialog |
 | `scroll_pane_up` | `PageUp` | Scroll the focused pane back |
 | `scroll_pane_down` | `PageDown` | Scroll the focused pane forward |
+| `host_metrics` | `m` | Open the Host of this deck overlay |
 
 Not remappable, and they work alongside your bindings: `Down` / `Up` for card selection, `Tab` / `Shift+Tab` / `Left` / `Right` for tabs, `Ctrl+PageUp` / `Ctrl+PageDown`, `S` for the Schedules manager, and `Ctrl+C`, which always opens the quit dialog from command mode. There is no `quit` action.
 
-Rebinding an action also retires its default key: after `scroll_pane_up = "Ctrl+u"`, `PageUp` does nothing in command mode. With both scroll actions set to `""`, the wheel is the only way to scroll.
+Rebinding an action also retires its default key: after `scroll_pane_up = "Ctrl+u"`, `PageUp` does nothing in command mode. Rebinding one of the `Ctrl+` actions above also retires its [plain letter](#plain-letters-in-command-mode), and rebinding `host_metrics`, `open_scheduled_tasks`, `generate_config`, `open_upgrade` or `rename` retires its `Ctrl` form; binding another action to one of those letters or chords takes it over. With both scroll actions set to `""`, the wheel is the only way to scroll.
 
 ### Problems in the file
 

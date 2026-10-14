@@ -381,7 +381,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
         std::fs::write(self.work.join(format!("delegate-{n}.md")), body).unwrap();
         let previous = self.pane.agent.clone();
         self.deck.send_bytes(b"\x04");
-        self.deck.wait_for_string("[New Agent Ctrl+N]");
+        self.deck.wait_for_string("[New Agent n/Ctrl+N]");
         std::fs::write(self.work.join(format!("delegate-{n}.go")), "").unwrap();
         self.delegate_succeeded(n);
         let records = inbox::attach(&self.deck, json!({"op":"list-agents"}));

@@ -365,6 +365,10 @@ pub enum UiMode {
     /// selection emits [`Action::ConfirmCloseSelected`] and performs the
     /// teardown. The selection index lives in `UiState::close_confirm`.
     CloseConfirm,
+    /// PRD #1258 M3: the "Host of this deck" overlay — the attached daemon's
+    /// host sample (disk per watched role, load per core, memory).
+    /// Read-only; Escape closes it.
+    HostMetrics,
     /// Issue #1635: the upgrade dialog, opened by the `open_upgrade` key
     /// (default `u`) or a click on the footer's update badge. Its state lives
     /// in `UiState::upgrade_dialog`.
@@ -2133,6 +2137,33 @@ struct UiState {
     /// `Ctrl+n` form's pre-fill. `None` without a daemon-backed controller
     /// (tests), and the form then seeds from [`Self::last_command`] as before.
     last_command_reader: Option<crate::embedded_pane::LastCommandReader>,
+    /// PRD #1401: the number of the latest pull request launch from `o`. A
+    /// launch's outcome reaches the status line only while it is still the
+    /// latest, so a slow earlier launch never overwrites a later one's
+    /// ([`drain_pull_request_launch`]).
+    pull_request_launch: u64,
+    /// PRD #1258 M3 — what the host overlay shows: the attached daemon's last
+    /// answer, or that one is on its way.
+    host_metrics: HostMetricsView,
+    /// PRD #1258 M3 — when [`Self::host_metrics`] last received an answer, so the
+    /// open overlay knows when to ask again (see [`poll_host_metrics`]). `None`
+    /// before the first answer of an opening.
+    host_metrics_received_at: Option<std::time::Instant>,
+    /// PRD #1258 M3 — fetches the host sample off the TUI thread. `None`
+    /// without a daemon-backed controller (render seams), where the overlay
+    /// shows whatever [`Self::host_metrics`] already holds.
+    host_metrics_reader: Option<crate::embedded_pane::HostMetricsReader>,
+}
+
+/// PRD #1258 M3 — the host overlay's content.
+#[derive(Debug, Clone, PartialEq)]
+enum HostMetricsView {
+    /// A request is on its way and nothing has come back for this opening yet.
+    Loading,
+    /// The daemon answered: its sample, or that it does not report one.
+    Report(crate::daemon_client::HostMetricsReport),
+    /// The request failed; the message says why.
+    Failed(String),
 }
 
 /// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
@@ -2282,6 +2313,10 @@ impl UiState {
             last_command: None,
             pending_last_command: None,
             last_command_reader: None,
+            pull_request_launch: 0,
+            host_metrics: HostMetricsView::Loading,
+            host_metrics_received_at: None,
+            host_metrics_reader: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -4733,6 +4768,16 @@ pub enum Action {
     /// (PRD #80 parity), so both funnel through one dispatch path that loads the
     /// schedules and switches into [`UiMode::ScheduledTasks`].
     OpenScheduledTasks,
+    /// PRD #1401: open the selected card's pull request in the system browser
+    /// (dashboard `o`). No pull request, nothing opened.
+    OpenPullRequest,
+    /// PRD #1258 M3: open the "Host of this deck" overlay and ask the attached
+    /// daemon for its host sample. Reached from the dashboard `host_metrics`
+    /// binding (default `m`).
+    OpenHostMetrics,
+    /// PRD #1258 M3: close the host overlay — its Escape key and its `[Close]`
+    /// button share this arm.
+    CloseHostMetrics,
     /// Issue #1635: open the upgrade dialog. Shared by the `open_upgrade` key
     /// (default `u`) and a click on the footer's update badge.
     OpenUpgrade,
@@ -5290,7 +5335,7 @@ fn open_console_output() -> std::io::Result<std::fs::File> {
 }
 
 /// Minimal base64 encoder (no external dependency needed).
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
@@ -5868,6 +5913,22 @@ fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
     ));
 }
 
+/// PRD #1401: put how the latest `o` launch settled on the status line. The
+/// browser is watched off the UI thread, so its outcome is queued in the
+/// shared state and drained here, the way [`drain_worktree_kept`] drains its
+/// report. An outcome for an earlier launch is dropped.
+fn drain_pull_request_launch(state: &SharedState, ui: &mut UiState) {
+    if state.blocking_read().pending_pull_request_launch.is_none() {
+        return;
+    }
+    let Some((launch, message)) = state.blocking_write().take_pull_request_launch() else {
+        return;
+    };
+    if launch == ui.pull_request_launch {
+        ui.status_message = Some((message, std::time::Instant::now()));
+    }
+}
+
 /// Issue #717: what the dialog (and, after the close, the status line) says
 /// about a worktree that will be kept. Two sentences, because the probe has two
 /// honest outcomes — see [`KeptWorktree::confirmed_dirty`].
@@ -6397,6 +6458,107 @@ fn truncate_with_ellipsis(input: &str, max_width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// PRD #1401: the glyph a card's pull request badge shows for `state`, and
+/// its colour — GitHub's own colour roles (green open, grey draft, purple
+/// merged, red closed) in the palette's terms.
+fn pull_request_state_glyph(
+    state: crate::pull_request_info::PullRequestState,
+) -> (&'static str, Color) {
+    use crate::pull_request_info::PullRequestState;
+    match state {
+        PullRequestState::Open => ("⊙", palette::STATUS_WORKING),
+        PullRequestState::Draft => ("◌", palette::STATUS_IDLE),
+        PullRequestState::Merged => ("◆", palette::STATUS_WAITING),
+        PullRequestState::Closed => ("⊘", palette::STATUS_ERROR),
+        PullRequestState::Unknown => ("?", palette::STATUS_IDLE),
+    }
+}
+
+/// PRD #1401: the glyph a card's pull request badge shows for `review`, and
+/// its colour.
+fn pull_request_review_glyph(
+    review: crate::pull_request_info::PullRequestReview,
+) -> (&'static str, Color) {
+    use crate::pull_request_info::PullRequestReview;
+    match review {
+        PullRequestReview::Approved => ("✓", palette::STATUS_WORKING),
+        PullRequestReview::ChangesRequested => ("✗", palette::STATUS_ERROR),
+        PullRequestReview::ReviewRequired => ("◐", palette::STATUS_THINKING),
+        PullRequestReview::Unknown => ("?", palette::STATUS_IDLE),
+    }
+}
+
+/// PRD #1401: a card's pull request badge in its forms, widest first —
+/// `#<n>` with the state and review glyphs, then without the review glyph,
+/// then the number alone. A PR with no review decision has no first form.
+fn pull_request_badge_forms(
+    pr: &crate::pull_request_info::PullRequestInfo,
+) -> Vec<Vec<Span<'static>>> {
+    let number = Span::styled(
+        format!("#{}", pr.number),
+        text_primary().add_modifier(Modifier::BOLD),
+    );
+    let (state_glyph, state_color) = pull_request_state_glyph(pr.state);
+    let state = Span::styled(state_glyph, Style::default().fg(state_color));
+    let mut forms = Vec::new();
+    if let Some(review) = pr.review {
+        let (review_glyph, review_color) = pull_request_review_glyph(review);
+        forms.push(vec![
+            Span::raw(" "),
+            number.clone(),
+            Span::raw(" "),
+            state.clone(),
+            Span::raw(" "),
+            Span::styled(review_glyph, Style::default().fg(review_color)),
+            Span::raw(" "),
+        ]);
+    }
+    forms.push(vec![
+        Span::raw(" "),
+        number.clone(),
+        Span::raw(" "),
+        state,
+        Span::raw(" "),
+    ]);
+    forms.push(vec![Span::raw(" "), number, Span::raw(" ")]);
+    forms
+}
+
+/// PRD #1401: the bottom border's two labels — the pull request badge on the
+/// left and the `Last`/`Tools` stats on the right — fitted into
+/// `usable_width` cells together. The stats shorten first (their own forms),
+/// then the badge drops its glyphs; if no badge form fits beside any stats
+/// form, the badge wins and the stats go, and a badge that fits nowhere is
+/// dropped. With no pull request this is [`card_stats_border_label`] alone.
+#[doc(hidden)]
+pub fn card_bottom_border_labels(
+    usable_width: u16,
+    pull_request: Option<&crate::pull_request_info::PullRequestInfo>,
+    last: &str,
+    tools: usize,
+) -> (Option<Vec<Span<'static>>>, Option<String>) {
+    use unicode_width::UnicodeWidthStr;
+    let Some(pr) = pull_request else {
+        return (None, card_stats_border_label(usable_width, last, tools));
+    };
+    let width = |form: &[Span<'_>]| form.iter().map(|s| s.content.width()).sum::<usize>();
+    let forms = pull_request_badge_forms(pr);
+    for form in &forms {
+        let remaining = (usable_width as usize).saturating_sub(width(form));
+        let remaining = u16::try_from(remaining).unwrap_or(u16::MAX);
+        if let Some(stats) = card_stats_border_label(remaining, last, tools) {
+            return (Some(form.clone()), Some(stats));
+        }
+    }
+    let badge = forms
+        .into_iter()
+        .find(|form| width(form) <= usable_width as usize);
+    match badge {
+        Some(badge) => (Some(badge), None),
+        None => (None, card_stats_border_label(usable_width, last, tools)),
+    }
 }
 
 /// Pick the widest `Last`/`Tools` form that fits a card's bottom border, or
@@ -7226,7 +7388,12 @@ fn handle_normal_key(
     if kb.matches(KbAction::Help, &key) {
         return Action::ToggleHelp;
     }
-    if kb.matches(KbAction::Rename, &key) && total > 0 {
+    // PR #1672: each plain-letter command below also answers to `Ctrl` with
+    // its letter here, in command mode only ([`crate::keybindings::CTRL_LETTER_ALIASES`]);
+    // in a pane those chords never reach this handler and go to the program.
+    let pressed =
+        |action: KbAction| kb.matches(action, &key) || kb.matches_command_mode_alias(action, &key);
+    if pressed(KbAction::Rename) && total > 0 {
         return Action::EnterRename;
     }
     if kb.matches(KbAction::FocusPane, &key) && total > 0 {
@@ -7234,7 +7401,7 @@ fn handle_normal_key(
     }
     // generate_config (default `g`) — a first-class remappable action so it
     // participates in conflict detection and renders via display_notation.
-    if kb.matches(KbAction::GenerateConfig, &key) && total > 0 {
+    if pressed(KbAction::GenerateConfig) && total > 0 {
         return Action::RequestConfigGen;
     }
     // PRD #92 F2 (PRD #18 follow-through): approve / deny permission. Only
@@ -7254,18 +7421,34 @@ fn handle_normal_key(
     {
         return Action::SendPermissionResponse(false);
     }
+    // PRD #1258: `n` is a new agent whenever it did not just deny a permission
+    // — the plain-letter alias of `Ctrl+n`, resolved here rather than with the
+    // other letters because only this handler knows the selected card's status.
+    if kb.matches_plain_alias(KbAction::NewPane, &key) {
+        return Action::NewPane;
+    }
     // PRD #127 finding #4: open the "Schedules" manager dialog. Routed
     // through the keybinding registry (default `s`) so it is remappable and
     // shares one dispatch path with the `[Schedules s]` button-bar button
     // (PRD #80 parity). The legacy uppercase `S` (Shift+s) stays a hardcoded
     // non-configurable alias — mirroring the Down/Up aliases kept beside j/k —
     // so existing muscle memory keeps working while lowercase `s` is added.
-    if kb.matches(KbAction::OpenScheduledTasks, &key) || key.code == KeyCode::Char('S') {
+    if pressed(KbAction::OpenScheduledTasks) || key.code == KeyCode::Char('S') {
         return Action::OpenScheduledTasks;
+    }
+    // PRD #1401: open the selected card's pull request (default `o`). The
+    // dispatcher resolves the card and does nothing when it has none.
+    if kb.matches(KbAction::OpenPullRequest, &key) && total > 0 {
+        return Action::OpenPullRequest;
+    }
+    // PRD #1258 M3: the host-of-this-deck overlay (default `m`). Needs no card,
+    // so it opens on an empty dashboard too.
+    if pressed(KbAction::HostMetrics) {
+        return Action::OpenHostMetrics;
     }
     // Issue #1635: open the upgrade dialog the footer badge names (default
     // `u`), shared with a click on the badge.
-    if kb.matches(KbAction::OpenUpgrade, &key) {
+    if pressed(KbAction::OpenUpgrade) {
         return Action::OpenUpgrade;
     }
     if kb.matches(KbAction::ClearFilter, &key) {
@@ -7407,6 +7590,63 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> Action {
         _ => {}
     }
     Action::Continue
+}
+
+/// PRD #1258 M3: keys while the host overlay is up. Escape, `q` and the
+/// overlay's own binding (and its `Ctrl` form, PR #1672) close it; Ctrl+C keeps its PRD #40 safety net and
+/// opens the quit flow, as from every other modal.
+fn handle_host_metrics_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig) -> Action {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
+        ui.mode = UiMode::QuitConfirm;
+        return Action::Continue;
+    }
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+        || kb.matches(KbAction::HostMetrics, &key)
+        || kb.matches_command_mode_alias(KbAction::HostMetrics, &key)
+    {
+        return Action::CloseHostMetrics;
+    }
+    Action::Continue
+}
+
+/// PRD #1258 M3: collect the host overlay's answer and keep it fresh while the
+/// overlay is open. Called once per pass of the event loop — the loop that
+/// already wakes every frame to drain input — so the refresh rides an existing
+/// path rather than a timer of its own, and does nothing while the overlay is
+/// closed. A new request goes out once the shown answer is older than the
+/// daemon's own cache window ([`crate::host_metrics::HOST_METRICS_MAX_AGE`]):
+/// asking sooner would only return the same cached sample. A deck that does not
+/// report host metrics is not asked again until the overlay is reopened.
+fn poll_host_metrics(ui: &mut UiState, now: std::time::Instant) {
+    let Some(reader) = ui.host_metrics_reader.clone() else {
+        return;
+    };
+    // An answer that lands after the overlay closed is taken and dropped.
+    if let Some(answer) = reader.take()
+        && ui.mode == UiMode::HostMetrics
+    {
+        ui.host_metrics = match answer {
+            Ok(report) => HostMetricsView::Report(report),
+            Err(error) => HostMetricsView::Failed(error),
+        };
+        ui.host_metrics_received_at = Some(now);
+    }
+    if ui.mode != UiMode::HostMetrics
+        || reader.in_flight()
+        || matches!(
+            ui.host_metrics,
+            HostMetricsView::Report(crate::daemon_client::HostMetricsReport::NotAvailable)
+        )
+    {
+        return;
+    }
+    let due = ui.host_metrics_received_at.is_none_or(|at| {
+        now.saturating_duration_since(at) >= crate::host_metrics::HOST_METRICS_MAX_AGE
+    });
+    if due {
+        reader.request(DAEMON_REQUEST_TIMEOUT);
+    }
 }
 
 /// Issue #142: one step of the Schedules manager selection, WRAPPING at
@@ -8325,10 +8565,41 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     if mode == UiMode::CloseConfirm || mode == UiMode::Upgrade {
         return None;
     }
-    match global_action(kb, key) {
+    let resolved = global_action(kb, key).or_else(|| {
+        (mode == UiMode::Normal)
+            .then(|| command_mode_alias_action(kb, key))
+            .flatten()
+    });
+    match resolved {
         Some(Action::CloseSelected) if mode != UiMode::Normal => None,
         other => other,
     }
+}
+
+/// PRD #1258: the global command a plain letter names in command mode — `d`,
+/// `t`, `z`, `w` and `e` for their `Ctrl+` chords, under the rule
+/// [`crate::keybindings::PLAIN_LETTER_ALIASES`] documents. Keyboard only, so it
+/// stays out of [`global_action`], which the mouse and the button bar share.
+///
+/// `n` is not here: it denies a pending permission when the selected card is
+/// waiting for one, which only the dashboard handler knows, so
+/// [`handle_normal_key`] resolves it after the deny check. The actions this
+/// returns are the chords' own, so the orchestration and zoom scoping at the
+/// live call site narrows a letter exactly as it narrows its chord.
+fn command_mode_alias_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
+    [
+        (KbAction::Dashboard, Action::DetachToNormal),
+        (KbAction::ToggleLayout, Action::ToggleLayout),
+        (KbAction::ToggleZoom, Action::ToggleZoom),
+        (KbAction::ClosePane, Action::CloseSelected),
+        (
+            KbAction::ToggleOrchestrationLock,
+            Action::ToggleOrchestrationLock,
+        ),
+    ]
+    .into_iter()
+    .find(|(kb_action, _)| kb.matches_plain_alias(*kb_action, key))
+    .map(|(_, action)| action)
 }
 
 /// Un-resolve an orchestration-scoped chord unless the active tab is an
@@ -8625,6 +8896,8 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         | UiMode::Help
         | UiMode::DirPicker
         | UiMode::NewPaneForm
+        // PRD #1258 M3: the host overlay sits over the dashboard like help.
+        | UiMode::HostMetrics
         // Issue #142: the Schedules manager is a topmost modal as well.
         // The wheel over it belongs to ITS list (handled before this guard),
         // never to whatever pane the centered dialog happens to cover.
@@ -9495,6 +9768,37 @@ fn dispatch_action(
                 ));
             }
         }
+        Action::OpenPullRequest => {
+            let url = selected_id
+                .and_then(|sid| snapshot.sessions.get(sid))
+                .and_then(|session| session.pull_request.as_ref())
+                .map(|pr| pr.url.clone());
+            match url {
+                Some(url) => {
+                    // The browser is watched off this thread; its outcome comes
+                    // back through `drain_pull_request_launch`.
+                    ui.pull_request_launch += 1;
+                    let launch = ui.pull_request_launch;
+                    let settled = state.clone();
+                    let message = crate::system_browser::open_pull_request(
+                        &url,
+                        &crate::system_browser::BrowserEnv::from_process(),
+                        move |message| {
+                            settled
+                                .blocking_write()
+                                .queue_pull_request_launch(launch, message);
+                        },
+                    );
+                    ui.status_message = Some((message, std::time::Instant::now()));
+                }
+                None => {
+                    ui.status_message = Some((
+                        "This agent has no pull request.".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+        }
         Action::SendPermissionResponse(approve) => {
             // The handler already gated on `WaitingForInput` plus a
             // non-empty selection; re-resolve the pane here so the
@@ -10197,6 +10501,25 @@ fn dispatch_action(
         // `s`/`S` key and the `[Schedules s]` button-bar button. Loads the
         // schedules from the global config and snapshots which currently have a
         // live tab/agent (for the status indicator), then switches mode.
+        // PRD #1258 M3: open the host overlay. With a daemon-backed controller
+        // the view starts at "Reading…" and the request goes out off the TUI
+        // thread; `poll_host_metrics` puts the answer on screen when it lands.
+        // Without one (the render seams) the overlay shows what it was given.
+        Action::OpenHostMetrics => {
+            ui.mode = UiMode::HostMetrics;
+            if let Some(reader) = ui.host_metrics_reader.clone() {
+                // An answer left over from an earlier opening is stale now.
+                let _ = reader.take();
+                ui.host_metrics = HostMetricsView::Loading;
+                ui.host_metrics_received_at = None;
+                reader.request(DAEMON_REQUEST_TIMEOUT);
+            }
+        }
+        Action::CloseHostMetrics => {
+            if ui.mode == UiMode::HostMetrics {
+                ui.mode = UiMode::Normal;
+            }
+        }
         Action::OpenUpgrade => open_upgrade_dialog(ui),
         Action::UpgradeChoose(choice) => {
             if let Some(dialog) = ui.upgrade_dialog.as_mut() {
@@ -11096,6 +11419,7 @@ fn handle_key_event(
             }
             UiMode::CloseConfirm => handle_close_confirm_key(&mut ui.close_confirm, key),
             UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, ui),
+            UiMode::HostMetrics => handle_host_metrics_key(key, ui, &kb),
             // Issue #1635: `Ctrl+C` keeps its PRD #40 safety net here too, even
             // while an upgrade runs; the running upgrade's dialog is kept so the
             // upgrade key reopens it on the same run.
@@ -11300,6 +11624,11 @@ pub fn run_tui(
         .as_any()
         .downcast_ref::<EmbeddedPaneController>()
         .map(EmbeddedPaneController::last_command_reader);
+    // PRD #1258 M3: the host overlay asks the same daemon, on the same client.
+    ui.host_metrics_reader = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(EmbeddedPaneController::host_metrics_reader);
     if let (Some(reader), Some(command)) = (
         ui.last_command_reader.as_ref(),
         ui.last_command.as_deref().filter(|c| !c.trim().is_empty()),
@@ -12147,6 +12476,9 @@ pub fn run_tui(
         // on disk. Queued by the event subscriber, drained here because the
         // status line is `UiState`.
         drain_worktree_kept(&state, &mut ui);
+        // PRD #1401: how the latest `o` launch settled, from the thread that
+        // watches the browser.
+        drain_pull_request_launch(&state, &mut ui);
 
         let snapshot = state.blocking_read().clone();
 
@@ -12261,6 +12593,12 @@ pub fn run_tui(
         // column count it just drew with. It runs inside this loop's
         // `terminal.draw` below, i.e. before any key is handled, so navigation
         // never reads a value from before the first frame.
+
+        // PRD #1258 M3: land the host overlay's answer and refresh it while
+        // open. Before the frame is drawn, so an answer that landed since the
+        // last pass is on screen in this one, not a 16 ms input poll later,
+        // and its shown age starts from what the daemon reported.
+        poll_host_metrics(&mut ui, std::time::Instant::now());
 
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
@@ -12444,6 +12782,18 @@ pub fn run_tui(
         } else {
             (full_frame_area, None)
         };
+        // Issue #1637: one row above that for the hook-binary notice, on the
+        // dashboard only and only while the daemon reports one, so every other
+        // frame keeps its layout.
+        let show_hook_notice = !snapshot.hook_binary_notices.is_empty()
+            && matches!(tab_view, ActiveTabView::Dashboard { zoomed: false, .. });
+        let (frame_area, hook_notice_area) = if show_hook_notice {
+            let chunks =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(frame_area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (frame_area, None)
+        };
         let embedded_panes = pane.as_any().downcast_ref::<EmbeddedPaneController>();
         let all_pane_ids = embedded_panes.map(|e| e.pane_ids()).unwrap_or_default();
         let focused_pane_id = embedded_panes.and_then(|e| e.focused_pane_id());
@@ -12487,6 +12837,9 @@ pub fn run_tui(
             // the reservation above used.
             if let Some(footer_area) = experimental_footer_area {
                 render_experimental_footer(frame, &features_snap, footer_area);
+            }
+            if let Some(notice_area) = hook_notice_area {
+                render_hook_notice(frame, &snapshot.hook_binary_notices, notice_area);
             }
         })?;
         tick = tick.wrapping_add(1);
@@ -12802,6 +13155,14 @@ pub fn run_tui(
         // leave PaneInput — closing the server/UI race the pre-forward snapshot
         // can't. Drained each frame from the embedded controller's queue.
         if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+            // Issue #1705: an agent asked its terminal to copy text (OSC 52).
+            // The pane's terminal is the deck's parser, so pass the copy on to
+            // the user's own terminal — write-only, validated by
+            // `osc52::osc52_copy_text`, and only the newest when several
+            // arrived in one frame, since each would replace the last.
+            if let Some(text) = embedded.take_clipboard_copy() {
+                copy_to_clipboard_osc52(&text);
+            }
             let rejections = embedded.take_stream_rejections();
             if !rejections.is_empty() {
                 let focused = embedded.focused_pane_id();
@@ -13173,6 +13534,9 @@ pub fn run_tui(
                         | UiMode::ConfigGenPrompt
                         | UiMode::StarPrompt
                         | UiMode::Help
+                        // PRD #1258 M3: the host overlay's [Close] button lives
+                        // in `modal_button_rects`, like help's.
+                        | UiMode::HostMetrics
                         // PRD #127 finding #4: the Schedules dialog is a
                         // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
                         // buttons live in `modal_button_rects` and any miss is
@@ -15034,6 +15398,9 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     if ui.mode == UiMode::Help {
         ui.modal_button_rects = render_help_overlay(frame, &ui.keybindings);
     }
+    if ui.mode == UiMode::HostMetrics {
+        ui.modal_button_rects = render_host_metrics_overlay(frame, &ui.host_metrics);
+    }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
         // ends so they can be stored back on `ui`.
@@ -16080,7 +16447,29 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
 /// strings, while a remap (e.g. `new_pane = "Alt+p"`) renders `Alt+P`. An
 /// unbound action renders `(unbound)` (via `display_notation`).
 fn button_shortcut_label(keybindings: &KeybindingConfig, action: KbAction) -> String {
-    let s = display_notation(keybindings, action);
+    title_case_chord(display_notation(keybindings, action))
+}
+
+/// PRD #1258: [`button_shortcut_label`] for a button in `mode`. In command mode
+/// an action with a plain-letter alias shows the letter beside its chord
+/// (`n/Ctrl+N`), because there the letter is the shorter way to the same
+/// command; in every other mode it shows the chord alone, the only key that
+/// works there.
+fn button_shortcut_label_for_mode(
+    keybindings: &KeybindingConfig,
+    action: KbAction,
+    mode: UiMode,
+) -> String {
+    let chord = button_shortcut_label(keybindings, action);
+    match keybindings.plain_alias(action) {
+        Some(letter) if mode == UiMode::Normal => format!("{letter}/{chord}"),
+        _ => chord,
+    }
+}
+
+/// Upper-case the final letter of a modifier combo (`Ctrl+n` → `Ctrl+N`); see
+/// [`button_shortcut_label`].
+fn title_case_chord(s: String) -> String {
     if let Some(plus) = s.rfind('+') {
         let (head, tail) = s.split_at(plus + 1);
         let mut tail_chars = tail.chars();
@@ -16152,7 +16541,7 @@ fn global_bar_buttons(
         // a toggle, so one button serves both trips.
         Button::new(
             g.dashboard_button,
-            button_shortcut_label(keybindings, KbAction::Dashboard),
+            button_shortcut_label_for_mode(keybindings, KbAction::Dashboard, mode),
             Action::DetachToNormal,
             true,
         ),
@@ -16160,7 +16549,7 @@ fn global_bar_buttons(
         // create the first pane, even with no panes / controller yet.
         Button::new(
             "New Agent",
-            button_shortcut_label(keybindings, KbAction::NewPane),
+            button_shortcut_label_for_mode(keybindings, KbAction::NewPane, mode),
             Action::NewPane,
             true,
         ),
@@ -16169,13 +16558,13 @@ fn global_bar_buttons(
         // click is the same silent no-op the key now is.
         Button::new(
             "Close",
-            button_shortcut_label(keybindings, KbAction::ClosePane),
+            button_shortcut_label_for_mode(keybindings, KbAction::ClosePane, mode),
             Action::CloseSelected,
             has_pane_control && g.close_available,
         ),
         Button::new(
             "Toggle Layout",
-            button_shortcut_label(keybindings, KbAction::ToggleLayout),
+            button_shortcut_label_for_mode(keybindings, KbAction::ToggleLayout, mode),
             Action::ToggleLayout,
             has_pane_control,
         ),
@@ -17240,12 +17629,18 @@ fn jump_range_notation(keybindings: &KeybindingConfig) -> String {
 ///   hint now names the trip the user actually needs.
 fn dashboard_hints_string(keybindings: &KeybindingConfig, mode: UiMode) -> String {
     let g = ModeGlobals::for_mode(mode);
+    // PRD #1258: in command mode an aliased action shows its plain letter
+    // beside its chord, as the help overlay and the button bar do.
+    let hint = |action: KbAction| {
+        let chord = display_notation(keybindings, action);
+        match keybindings.plain_alias(action) {
+            Some(letter) if mode == UiMode::Normal => format!("{letter}/{chord}"),
+            _ => chord,
+        }
+    };
     // Only advertise close where close works.
     let close = if g.close_available {
-        format!(
-            "{}: close  ",
-            display_notation(keybindings, KbAction::ClosePane)
-        )
+        format!("{}: close  ", hint(KbAction::ClosePane))
     } else {
         String::new()
     };
@@ -17256,9 +17651,9 @@ fn dashboard_hints_string(keybindings: &KeybindingConfig, mode: UiMode) -> Strin
     // fixed string rather than a config-derived notation.
     format!(
         "{}: new  {close}{}: layout  {}: {dashboard_label} ({} {} {})  Ctrl+c: quit",
-        display_notation(keybindings, KbAction::NewPane),
-        display_notation(keybindings, KbAction::ToggleLayout),
-        display_notation(keybindings, KbAction::Dashboard),
+        hint(KbAction::NewPane),
+        hint(KbAction::ToggleLayout),
+        hint(KbAction::Dashboard),
         jump_range_notation(keybindings),
         display_notation(keybindings, KbAction::Help),
         display_notation(keybindings, KbAction::Filter),
@@ -17351,24 +17746,42 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
     // a key that no longer fires. Shared with the hints bar via
     // `display_notation` so the two renderers can't drift.
     let n = |action: KbAction| -> String { display_notation(keybindings, action) };
+    // PRD #1258: an action with a plain-letter alias lists the letter first
+    // (`n / Ctrl+n`). The letter works in command mode only — which is where
+    // this overlay opens — and the chord from any pane, as the heading says.
+    // PR #1672: the reverse too — a plain-letter action lists its `Ctrl` form
+    // after it (`m / Ctrl+m`), command mode only like the letters.
+    let lettered = |action: KbAction| -> String {
+        match (
+            keybindings.plain_alias(action),
+            keybindings.ctrl_alias(action),
+        ) {
+            (Some(letter), _) => format!("{letter} / {}", n(action)),
+            (None, Some(letter)) => format!("{} / Ctrl+{letter}", n(action)),
+            (None, None) => n(action),
+        }
+    };
 
     let left: Vec<Line> = vec![
-        Line::styled("  Global (works from any pane)", cyan),
+        Line::styled("  Global (chords work from any pane)", cyan),
         Line::from(""),
         // PRD #241 M4: the old "Command mode (dashboard)" named only the
         // outbound trip, so a user already in command mode read it as dead
         // text and could not find the way back to their pane (issue #88).
-        help_key_line(&n(KbAction::Dashboard), "Toggle command / pane"),
-        help_key_line(&n(KbAction::NewPane), "Create new agent"),
+        help_key_line(&lettered(KbAction::Dashboard), "Toggle command / pane"),
+        help_key_line(&lettered(KbAction::NewPane), "Create new agent"),
         // PRD #241 review F6: `close_pane` is NOT global any more — M1 scoped it
         // to command mode so the chord reaches the PTY as word-delete while you
         // are typing in a pane. It is listed under "Dashboard (command mode)"
         // below; leaving it here would document a key that does nothing where
         // the heading promises it works.
-        help_key_line(&n(KbAction::ToggleLayout), "Toggle layout (stacked/tiled)"),
+        help_key_line(
+            &lettered(KbAction::ToggleLayout),
+            "Toggle layout (stacked/tiled)",
+        ),
         // PRD #336: `toggle_orchestration_split` is NOT listed here, for the
         // same reason PRD #241 review F6 moved `close_pane` out — it is
-        // command-mode only, so this heading's "works from any pane" promise
+        // command-mode only, so this heading's "chords work from any pane" promise
         // would be false. It is listed under "Dashboard (command mode)" below.
         // Quit is not a remappable action: Ctrl+C (non-overridable) opens the
         // Detach/Stop/Cancel modal, so the help row is a fixed string.
@@ -17400,7 +17813,10 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         help_key_line(&jump_range_notation(keybindings), "Jump to card N"),
         help_key_line(&n(KbAction::FocusPane), "Focus selected pane"),
         // PRD #241: command-mode only, and it asks before it destroys anything.
-        help_key_line(&n(KbAction::ClosePane), "Close selected agent (confirms)"),
+        help_key_line(
+            &lettered(KbAction::ClosePane),
+            "Close selected agent (confirms)",
+        ),
         // PRD #336: command-mode only and orchestration-tab only, so it sits
         // here rather than under "Global" (see the note there). The description
         // names the tab scope, and stays within the ~30 columns this field
@@ -17412,12 +17828,12 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         // PRD #313: same scope as the split above (command mode, orchestration
         // tab), so it sits in the same place. The description names the tab
         // scope and stays inside the ~30 columns this field renders.
-        help_key_line(&n(KbAction::ToggleZoom), "Zoom focused pane"),
+        help_key_line(&lettered(KbAction::ToggleZoom), "Zoom focused pane"),
         help_key_line(&n(KbAction::Filter), "Filter agents"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
-        help_key_line(&n(KbAction::Rename), "Rename agent"),
+        help_key_line(&lettered(KbAction::Rename), "Rename agent"),
         help_key_line(
-            &n(KbAction::GenerateConfig),
+            &lettered(KbAction::GenerateConfig),
             "Generate .dot-agent-deck.toml",
         ),
         help_key_line(
@@ -17428,10 +17844,14 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
             ),
             "Approve / deny permission",
         ),
-        help_key_line(&n(KbAction::OpenScheduledTasks), "Schedules manager"),
+        help_key_line(&lettered(KbAction::OpenScheduledTasks), "Schedules manager"),
+        help_key_line(&lettered(KbAction::HostMetrics), "Host of this deck"),
+        // PRD #1401: the terminal has no in-app browser, so this hands the PR
+        // to the system browser.
+        help_key_line(&n(KbAction::OpenPullRequest), "Open pull request"),
         // Issue #1635: opens the upgrade dialog while the footer's update
         // badge shows.
-        help_key_line(&n(KbAction::OpenUpgrade), "Upgrade (update badge)"),
+        help_key_line(&lettered(KbAction::OpenUpgrade), "Upgrade (update badge)"),
         // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
         // and these keys scroll the focused pane's own scrollback without ever
         // reaching the agent.
@@ -17532,6 +17952,252 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
     // PRD #80 M5: explicit clickable [Close] button alongside the existing
     // "Press ? or Esc to close" hint. Drawn on the footer's blank first row.
     let close_button = [Button::new("Close", "", Action::ToggleHelp, true)];
+    let btn_row = Rect {
+        x: footer_area.x,
+        y: footer_area.y,
+        width: footer_area.width,
+        height: 1,
+    };
+    render_modal_button_row(frame, &close_button, btn_row, 2)
+}
+
+/// PRD #1258 M3: a byte count in GiB, as both clients show it — at most one
+/// decimal, and none when it would be `.0`, so a whole number reads `128 GiB`.
+fn format_gib(bytes: u64) -> String {
+    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let text = format!("{gib:.1}");
+    let text = text.strip_suffix(".0").unwrap_or(&text);
+    format!("{text} GiB")
+}
+
+/// PRD #1258 M3: the width of the host overlay's label column.
+const HOST_METRICS_LABEL_WIDTH: usize = 18;
+
+/// PRD #1258 M3: the label both clients give a watched role. A role a newer
+/// daemon added shows under its own name rather than being dropped — scrubbed
+/// of control and bidi characters and clamped to the label column, because the
+/// daemon chose it and its figures have to stay on the row (audit A2).
+fn host_metrics_role_label(role: &str) -> String {
+    match role {
+        crate::daemon_protocol::ROLE_WORKING_ROOT => "Working root".to_string(),
+        crate::daemon_protocol::ROLE_WORKTREE_PARENT => "Worktree parent".to_string(),
+        crate::daemon_protocol::ROLE_TEMP_ROOT => "Temp root".to_string(),
+        other => crate::untrusted_text::display_line(other, HOST_METRICS_LABEL_WIDTH),
+    }
+}
+
+/// PRD #1258: the word both clients write beside a host reading at `level`,
+/// so colour is never the only signal. `ok` needs none. The desktop's
+/// `hostLevelWord` returns the same words (CLAUDE.md rule 22).
+fn host_metrics_level_word(level: crate::daemon_protocol::HealthLevel) -> Option<&'static str> {
+    use crate::daemon_protocol::HealthLevel;
+    match level {
+        HealthLevel::Ok => None,
+        HealthLevel::Warn => Some("(warning)"),
+        HealthLevel::Critical => Some("(critical)"),
+    }
+}
+
+/// PR #1672 review: the narrowest overlay body that draws readings — the width
+/// of the widest level word without its parentheses, `critical`. A narrower
+/// body says it is too narrow instead, so no reading is drawn in its level's
+/// colour with its word cut.
+const HOST_METRICS_MIN_BODY_WIDTH: usize = "critical".len();
+
+/// PRD #1258 M3: the overlay's body rows. Every field the daemon could not read
+/// says `unknown`; nothing absent is ever drawn as zero.
+///
+/// `width` is the body's width in columns. A judged row that does not fit it
+/// gives its level word a line of its own below the value, so a narrow
+/// terminal cuts the figures' tail rather than the word — the signal that does
+/// not depend on colour (PR #1672 review). Below
+/// [`HOST_METRICS_MIN_BODY_WIDTH`] it draws no reading at all.
+fn host_metrics_lines(view: &HostMetricsView, width: u16) -> Vec<Line<'static>> {
+    use crate::daemon_client::HostMetricsReport;
+    use unicode_width::UnicodeWidthStr;
+    const UNKNOWN: &str = "unknown";
+    let row = |label: &str, value: String| {
+        Line::from(format!(
+            "  {label:<width$} {value}",
+            width = HOST_METRICS_LABEL_WIDTH
+        ))
+    };
+    // PRD #1258: a reading the daemon judged carries its level's colour, and a
+    // non-ok one its word as well, so the colour is never the only signal. No
+    // level — an older daemon, or an absent number — leaves the value plain.
+    let judged = |label: &str,
+                  value: String,
+                  level: Option<crate::daemon_protocol::HealthLevel>|
+     -> Vec<Line<'static>> {
+        let Some(level) = level else {
+            return vec![row(label, value)];
+        };
+        let style = Style::default().fg(palette::health_color(level));
+        let prefix = format!("  {label:<width$} ", width = HOST_METRICS_LABEL_WIDTH);
+        let Some(word) = host_metrics_level_word(level) else {
+            return vec![Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(value, style),
+            ])];
+        };
+        let fits = prefix.width() + value.width() + 1 + word.width() <= usize::from(width);
+        if fits {
+            return vec![Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(format!("{value} {word}"), style),
+            ])];
+        }
+        // Under the value when the word fits there; else as far in as the body's
+        // indent allows; else without its parentheses, which a body of
+        // `HOST_METRICS_MIN_BODY_WIDTH` columns still holds (PR #1672 review).
+        let width = usize::from(width);
+        let word = if word.width() <= width {
+            word
+        } else {
+            word.trim_matches(|c| c == '(' || c == ')')
+        };
+        let indent = if prefix.width() + word.width() <= width {
+            prefix.width()
+        } else {
+            width.saturating_sub(word.width()).min(2)
+        };
+        vec![
+            Line::from(vec![Span::raw(prefix), Span::styled(value, style)]),
+            Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(word.to_string(), style),
+            ]),
+        ]
+    };
+    let mut lines = vec![Line::styled(
+        "  Host of this deck",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    lines.push(Line::styled(
+        "  The machine this deck's daemon runs on",
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::from(""));
+    match view {
+        HostMetricsView::Loading => lines.push(Line::from("  Reading…")),
+        HostMetricsView::Failed(error) => {
+            lines.push(Line::from("  Could not read this deck's host:"));
+            lines.push(Line::from(format!(
+                "  {}",
+                crate::untrusted_text::display_line(
+                    error,
+                    crate::untrusted_text::REMOTE_MESSAGE_MAX_BYTES
+                )
+            )));
+        }
+        HostMetricsView::Report(HostMetricsReport::NotAvailable) => {
+            lines.push(Line::from(
+                "  Host metrics are not available from this deck.",
+            ));
+            lines.push(Line::from(
+                "  Its daemon is an older version, or runs on Windows.",
+            ));
+        }
+        HostMetricsView::Report(HostMetricsReport::Available(_))
+            if usize::from(width) < HOST_METRICS_MIN_BODY_WIDTH =>
+        {
+            // Too narrow for even a bare level word: no reading at all, rather
+            // than a coloured one whose word is cut (PR #1672 review).
+            lines.push(Line::from("  Too narrow to show readings"));
+        }
+        HostMetricsView::Report(HostMetricsReport::Available(metrics)) => {
+            let gib = |bytes: Option<u64>| bytes.map_or_else(|| UNKNOWN.to_string(), format_gib);
+            // The client refuses a reply over the bound; this keeps the render
+            // bounded even for a report that did not come through it.
+            for disk in metrics
+                .disks
+                .iter()
+                .take(crate::daemon_protocol::MAX_DISK_ROLES)
+            {
+                lines.extend(judged(
+                    &host_metrics_role_label(&disk.role),
+                    format!(
+                        "{} free of {} total",
+                        gib(disk.free_bytes),
+                        gib(disk.total_bytes)
+                    ),
+                    disk.level,
+                ));
+            }
+            // A non-finite load is not a reading; the desktop bridge drops it
+            // the same way. Rust's `{:.2}` rounds an exact tie to even, which
+            // the desktop's formatter matches (`fixedLikeRust`).
+            let load = metrics
+                .load_per_cpu
+                .filter(|load| load.is_finite())
+                .map_or_else(|| UNKNOWN.to_string(), |load| format!("{load:.2}"));
+            let cores = metrics
+                .cpu_count
+                .map_or_else(|| format!("{UNKNOWN} cores"), |n| format!("{n} cores"));
+            lines.extend(judged(
+                "Load per core",
+                format!("{load} across {cores}"),
+                metrics.load_level,
+            ));
+            lines.push(row("Memory used", gib(metrics.memory_used_bytes)));
+            lines.extend(judged(
+                "Memory available",
+                gib(metrics.memory_available_bytes),
+                metrics.memory_level,
+            ));
+        }
+    }
+    lines
+}
+
+/// PRD #1258 M3: the "Host of this deck" overlay. Returns its `[Close]` button
+/// rect for the mouse hit-test, as [`render_help_overlay`] does.
+fn render_host_metrics_overlay(frame: &mut Frame, view: &HostMetricsView) -> Vec<(Action, Rect)> {
+    let area = frame.area();
+    // Wide enough for a disk row with its level word (PRD #1258).
+    let popup_width = 72u16.min(area.width.saturating_sub(2));
+    let lines = host_metrics_lines(view, popup_width.saturating_sub(2));
+    // Body, then a blank row, the button row and the hint: plus the border.
+    // Counted in `usize` and clamped before narrowing, so no line count can
+    // overflow the `u16` (audit A2).
+    let popup_height = lines
+        .len()
+        .saturating_add(3 + 2)
+        .min(usize::from(area.height.saturating_sub(2))) as u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Host ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let footer_height: u16 = 2;
+    let body_height = inner.height.saturating_sub(footer_height);
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(inner.x, inner.y, inner.width, body_height),
+    );
+    let footer_area = Rect::new(
+        inner.x,
+        inner.y + body_height,
+        inner.width,
+        footer_height.min(inner.height),
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::styled("  Press Esc to close", text_primary()),
+        ]),
+        footer_area,
+    );
+    let close_button = [Button::new("Close", "", Action::CloseHostMetrics, true)];
     let btn_row = Rect {
         x: footer_area.x,
         y: footer_area.y,
@@ -18957,8 +19623,12 @@ fn render_session_card(
     // The border reads `Last: 2m`, not `Last: 2m ago` — four columns of suffix
     // are expensive there, and the `Last:` label already says "time since".
     let elapsed = format_elapsed(session.last_activity, now);
-    let stats_title = card_stats_border_label(
+    // PRD #1401: the pull request badge takes the bottom-LEFT border, which
+    // was empty, so it costs no row at any density. The two share the row: the
+    // stats shorten first, then the badge drops its glyphs, then the stats go.
+    let (pr_badge, stats_title) = card_bottom_border_labels(
         area.width.saturating_sub(2),
+        session.pull_request.as_ref(),
         &elapsed,
         session.tool_count as usize,
     );
@@ -18976,6 +19646,9 @@ fn render_session_card(
             }
             Line::from(badge).alignment(ratatui::layout::Alignment::Right)
         });
+    if let Some(badge) = pr_badge {
+        block = block.title_bottom(Line::from(badge).alignment(ratatui::layout::Alignment::Left));
+    }
     // Omitted entirely when even the shortest form would overrun the corners.
     if let Some(stats) = stats_title {
         block = block.title_bottom(
@@ -19026,11 +19699,14 @@ fn render_session_card(
     // survives every density (at Minimal it takes `Dir:`'s place), and ahead
     // of the prompt/tool rows because it is the fact that explains why those
     // rows keep advancing while the run has in fact stalled.
+    // The attention rows' text is kept whole until the background line below
+    // has decided whether it shares their row (Minimal density).
+    let mut attention: Vec<(String, Style)> = Vec::new();
     if is_orphaned {
-        status_lines.push(Line::from(Span::styled(
-            truncate_with_ellipsis("Orphaned — delegation unavailable", w),
+        attention.push((
+            "Orphaned — delegation unavailable".to_string(),
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
-        )));
+        ));
     }
 
     // Issue #714: say WHY a card is Blocked, directly under `Dir:` for the same
@@ -19066,10 +19742,42 @@ fn render_session_card(
             Some(detail) => format!("⚠ {label}{resets} — {detail}"),
             None => format!("⚠ {label}{resets}"),
         };
-        status_lines.push(Line::from(Span::styled(
-            truncate_with_ellipsis(&text, w),
+        attention.push((
+            text,
             Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
-        )));
+        ));
+    }
+
+    // Issue #1678: background work the agent left running after its turn
+    // ended, under the status rows and above the prompt. `fit_card_rows`
+    // sheds the separator, prompts and `Dir:` before a status row, but it
+    // cannot shrink a card below its status rows: Minimal has one content row,
+    // which a Blocked or orphaned reason already takes. There the reason keeps
+    // the row, since it needs the user's attention, and the background line is
+    // appended to it after ` · `, cut with `…` when the row runs out.
+    let background = if is_placeholder {
+        None
+    } else {
+        session
+            .background_work()
+            .and_then(|work| background_work_label(&work, now))
+    };
+    let plain = |(text, style): (String, Style)| {
+        Line::from(Span::styled(truncate_with_ellipsis(&text, w), style))
+    };
+    let shares_row = density == CardDensity::Minimal && !attention.is_empty();
+    let mut attention = attention.into_iter();
+    match background {
+        Some(text) if shares_row => {
+            let (reason, style) = attention.next().expect("checked non-empty");
+            status_lines.push(reason_with_background(&reason, style, &text, w));
+            status_lines.extend(attention.map(plain));
+        }
+        Some(text) => {
+            status_lines.extend(attention.map(plain));
+            status_lines.push(plain((text, text_primary())));
+        }
+        None => status_lines.extend(attention.map(plain)),
     }
 
     // PRD #1666 §2.8: why the card is in Error when the deck said — a message
@@ -19154,6 +19862,73 @@ fn card_inbox_badge(
         .short_text()
         .map(|text| format!("{text} "))
         .filter(|short| fits(short, 0))
+}
+
+/// Issue #1678: a Minimal card's one content row when it has both a status
+/// reason (Blocked or orphaned) and background work — `reason · background`,
+/// cut with `…` at `width`, so the reason is kept whole first. The reason keeps
+/// its own style and the background part reads as it does on its own line.
+fn reason_with_background(
+    reason: &str,
+    style: Style,
+    background: &str,
+    width: usize,
+) -> Line<'static> {
+    let row = truncate_with_ellipsis(&format!("{reason} · {background}"), width);
+    let split = row
+        .char_indices()
+        .nth(reason.chars().count())
+        .map_or(row.len(), |(at, _)| at);
+    let (head, tail) = row.split_at(split);
+    let mut spans = vec![Span::styled(head.to_string(), style)];
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail.to_string(), text_primary()));
+    }
+    Line::from(spans)
+}
+
+/// How far ahead of `now` a background start may sit and still read as "just
+/// started" — the desktop's clock-skew tolerance (`relativeTo` in
+/// `desktop/src/lib/displayText.ts`), so both clients say the same thing.
+const BACKGROUND_CLOCK_SKEW_MS: i64 = 60_000;
+
+/// Issue #1678: the card's background-work line —
+/// `Background: 2 commands, 1 subagent · 3h 12m` — or `None` when nothing is
+/// counted. A zero kind is omitted and each count is singular or plural. The
+/// duration uses the `Last:` vocabulary ([`format_elapsed`]); a start up to
+/// [`BACKGROUND_CLOCK_SKEW_MS`] in the future reads as `0s`, and one further
+/// ahead, or missing, or one the subtraction cannot represent, drops the
+/// duration and keeps the counts. Never names a subagent or a command.
+fn background_work_label(
+    work: &crate::state::BackgroundWork,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    fn count(n: u32, unit: &str) -> Option<String> {
+        (n > 0).then(|| format!("{n} {unit}{}", if n == 1 { "" } else { "s" }))
+    }
+    let kinds: Vec<String> = [
+        count(work.commands, "command"),
+        count(work.subagents, "subagent"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if kinds.is_empty() {
+        return None;
+    }
+    let elapsed = work
+        .since_ms
+        .and_then(|since| now.timestamp_millis().checked_sub(since))
+        .and_then(|ms| match ms {
+            ms if ms >= 0 => Some(ms),
+            ms if ms >= -BACKGROUND_CLOCK_SKEW_MS => Some(0),
+            _ => None,
+        })
+        .and_then(chrono::Duration::try_milliseconds)
+        .and_then(|elapsed| now.checked_sub_signed(elapsed))
+        .map(|since| format!(" · {}", format_elapsed(since, now)))
+        .unwrap_or_default();
+    Some(format!("Background: {}{elapsed}", kinds.join(", ")))
 }
 
 /// Which of a card's sheddable rows [`render_session_card`] draws.
@@ -19445,6 +20220,263 @@ pub fn render_experimental_footer_to_buffer(
         // `frame.area()` for the same reason as `render_stats_bar_to_buffer`.
         let area = frame.area();
         render_experimental_footer(frame, features, area);
+    })
+}
+
+/// Issue #1637 — the dashboard footer row naming agents whose hooks run an
+/// older `dot-agent-deck` (or, issue #1157, a deck that could not install
+/// hooks at all), with the daemon's remedy. Draws nothing for an empty list;
+/// the live dashboard reserves the row only while there is a notice. One row,
+/// so a second notice is counted rather than drawn, and that count is never
+/// cut. A remedy is shown whole or not at all: when the row is narrow, the
+/// facts (agents, path, versions) are what get shorter, the path first.
+fn render_hook_notice(
+    frame: &mut Frame,
+    notices: &[crate::hook_binary::HookBinaryNotice],
+    area: Rect,
+) {
+    let Some(line) = hook_notice_line(notices, area.width as usize) else {
+        return;
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// The text [`render_hook_notice`] draws, fitted to `width` columns.
+///
+/// Reserved first, so never cut: the mark and the `(+N more)` count. Then,
+/// for a remedy that is a command or the generic upgrade-or-reinstall advice
+/// (Qodo on #1656), the first of these that fits:
+///
+/// 1. the facts with the binary's path (shortened from the middle if need
+///    be) and the command, both whole;
+/// 2. the facts without the path and the command;
+/// 3. the same two with the advice in place of the command;
+/// 4. whichever of command and advice is shorter, whole, beside the facts
+///    shortened: the later agents dropped from the list, then the compact
+///    `… hooks run 0.45.1; deck 0.46.0` form — never fewer than the first
+///    agent and both versions, so a long command cannot reduce the facts to
+///    `⚠ Cl…`;
+/// 5. the facts alone, as long as fits, with no remedy: a cut command could
+///    be pasted and run wrong, and cut advice reads as a broken sentence.
+///
+/// A remedy of the daemon's own (the move-the-app advice) is what the notice
+/// is about, so it keeps its place and the facts give way to it.
+fn hook_notice_line(
+    notices: &[crate::hook_binary::HookBinaryNotice],
+    width: usize,
+) -> Option<Line<'static>> {
+    use crate::hook_binary::{HookBinaryReason, REMEDY_UPGRADE_OR_REINSTALL};
+    use unicode_width::UnicodeWidthStr;
+    // Sanitized again at the seam that writes to the terminal, whatever path
+    // the notice took to get here.
+    let notice = &notices.first()?.sanitized();
+    let version = notice.version.as_deref().unwrap_or("?");
+    let deck = &notice.daemon_version;
+    // `who` is the part of the facts that may be cut; `lead` and `tail`
+    // surround the path, and `compact` is the shortest form that still names
+    // both versions.
+    let mut who = notice.agents.join(", ");
+    let (lead, tail, compact) = match notice.reason {
+        HookBinaryReason::Older => (
+            format!(" hooks run dot-agent-deck {version} ("),
+            format!("); this deck is {deck}"),
+            Some(format!(" hooks run {version}; deck {deck}")),
+        ),
+        HookBinaryReason::Unreported => (
+            " hooks run an older dot-agent-deck (".to_string(),
+            format!(") that predates version reporting; this deck is {deck}"),
+            Some(format!(" hooks run an older version; deck {deck}")),
+        ),
+        HookBinaryReason::Unprobeable => (
+            " hooks run a dot-agent-deck that did not report its version (".to_string(),
+            format!("); this deck is {deck}"),
+            Some(format!(" hooks run an unreported version; deck {deck}")),
+        ),
+        HookBinaryReason::EphemeralLocation => {
+            who.clear();
+            (
+                "Agent hooks are off: this deck runs from a disk image or a temporary location ("
+                    .to_string(),
+                ")".to_string(),
+                None,
+            )
+        }
+        HookBinaryReason::Unknown => (" hooks run (".to_string(), ")".to_string(), None),
+    };
+    // `who` shortened to `room` columns by dropping whole agents from the end
+    // of the list, with `…` standing for them: never fewer than the first
+    // agent, and never an agent's name cut.
+    let agents = &notice.agents;
+    let shorten_who = |room: usize| -> Option<String> {
+        if who.is_empty() {
+            return None;
+        }
+        (1..agents.len())
+            .rev()
+            .map(|kept| format!("{}…", agents[..kept].join(", ")))
+            .find(|short| short.width() <= room)
+    };
+    let no_path = format!("{lead}…{tail}");
+
+    let mark = "⚠ ";
+    let more = match notices.len() {
+        1 => String::new(),
+        n => format!(" (+{} more)", n - 1),
+    };
+    let more = truncate_end(&more, width.saturating_sub(mark.width()));
+    let budget = width.saturating_sub(mark.width() + more.width());
+
+    // The facts at their fullest that fit `room`, or `None`. Without
+    // `shorten`, only the path gives way; with it, `who` may too.
+    let fit_facts = |room: usize, shorten: bool| -> Option<Vec<Span<'static>>> {
+        let fixed = who.width() + lead.width() + tail.width();
+        if let Some(path_budget) = room.checked_sub(fixed) {
+            let path = if path_budget >= notice.binary.width() {
+                Some(notice.binary.clone())
+            } else if path_budget >= 5 {
+                Some(truncate_middle(&notice.binary, path_budget))
+            } else {
+                None
+            };
+            if let Some(path) = path {
+                return Some(vec![
+                    Span::styled(format!("{who}{lead}"), text_primary()),
+                    Span::styled(path, text_dim()),
+                    Span::styled(tail.clone(), text_primary()),
+                ]);
+            }
+        }
+        let compact = compact.iter().filter(|_| shorten);
+        std::iter::once(&no_path).chain(compact).find_map(|rest| {
+            let who_room = room.checked_sub(rest.width())?;
+            let who = if who.width() <= who_room {
+                who.clone()
+            } else if shorten {
+                shorten_who(who_room)?
+            } else {
+                return None;
+            };
+            Some(vec![Span::styled(format!("{who}{rest}"), text_primary())])
+        })
+    };
+    let line = |facts: Vec<Span<'static>>, remedy: Option<String>| {
+        let mut spans = vec![Span::styled(mark, Style::default().fg(Color::Yellow))];
+        spans.extend(facts);
+        if let Some(remedy) = remedy {
+            spans.push(Span::styled(
+                remedy,
+                text_primary().add_modifier(Modifier::BOLD),
+            ));
+        }
+        if !more.is_empty() {
+            spans.push(Span::styled(more.clone(), text_primary()));
+        }
+        Some(Line::from(spans))
+    };
+
+    let advice = format!(" — {REMEDY_UPGRADE_OR_REINSTALL}");
+    let remedies: Vec<String> = match &notice.command {
+        Some(command) => vec![format!(" — {} {command}", notice.remedy), advice],
+        None if notice.remedy == REMEDY_UPGRADE_OR_REINSTALL => vec![advice],
+        None => {
+            // The daemon's own advice: whole if the facts fit beside it at
+            // all, else it keeps what it can and the facts take the rest.
+            let remedy = format!(" — {}", notice.remedy);
+            if let Some(facts) = budget
+                .checked_sub(remedy.width())
+                .and_then(|room| fit_facts(room, false))
+            {
+                return line(facts, Some(remedy));
+            }
+            let remedy = truncate_end(&remedy, budget);
+            let facts = truncate_end(&format!("{who}{no_path}"), budget - remedy.width());
+            return line(vec![Span::styled(facts, text_primary())], Some(remedy));
+        }
+    };
+    // Steps 1–3: a remedy whole beside the facts whole.
+    for remedy in &remedies {
+        if let Some(facts) = budget
+            .checked_sub(remedy.width())
+            .and_then(|room| fit_facts(room, false))
+        {
+            return line(facts, Some(remedy.clone()));
+        }
+    }
+    // Step 4: the shorter remedy whole beside shortened facts.
+    let shorter = remedies.iter().min_by_key(|remedy| remedy.width())?;
+    if let Some(facts) = budget
+        .checked_sub(shorter.width())
+        .and_then(|room| fit_facts(room, true))
+    {
+        return line(facts, Some(shorter.clone()));
+    }
+    // Step 5: the facts alone.
+    let facts = fit_facts(budget, true).unwrap_or_else(|| {
+        vec![Span::styled(
+            truncate_end(&format!("{who}{no_path}"), budget),
+            text_primary(),
+        )]
+    });
+    line(facts, None)
+}
+
+/// The longest prefix of `chars` that fits in `max` columns.
+fn take_columns(chars: impl Iterator<Item = char>, max: usize) -> Vec<char> {
+    use unicode_width::UnicodeWidthChar;
+    let mut used = 0;
+    chars
+        .take_while(|c| {
+            used += c.width().unwrap_or(0);
+            used <= max
+        })
+        .collect()
+}
+
+/// `text` shortened to `max` columns by replacing its middle with `…`.
+fn truncate_middle(text: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if text.width() <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let keep = max - 1;
+    let head = take_columns(text.chars(), keep / 2);
+    let mut tail = take_columns(text.chars().rev(), keep - keep / 2);
+    tail.reverse();
+    let mut out: String = head.into_iter().collect();
+    out.push('…');
+    out.extend(tail);
+    out
+}
+
+/// `text` cut to `max` columns, ending in `…` when it was cut.
+fn truncate_end(text: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if text.width() <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = take_columns(text.chars(), max - 1).into_iter().collect();
+    out.push('…');
+    out
+}
+
+/// L1 test seam: render the hook-binary notice row into a standalone Buffer.
+/// See `render_stats_bar_to_buffer` for the rationale. Renders nothing for an
+/// empty list.
+#[doc(hidden)]
+pub fn render_hook_notice_to_buffer(
+    notices: &[crate::hook_binary::HookBinaryNotice],
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    draw_to_buffer(width, height, |frame| {
+        let area = frame.area();
+        render_hook_notice(frame, notices, area);
     })
 }
 
@@ -20047,6 +21079,9 @@ pub fn render_orchestration_frame_to_buffer(
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
+                pending_question: None,
+                pull_request: None,
+                pull_request_revision: 0,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -20840,6 +21875,9 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
+                pending_question: None,
+                pull_request: None,
+                pull_request_revision: 0,
             },
         );
     }
@@ -21640,6 +22678,116 @@ pub fn observe_command_banner_key_burst(
     }
 }
 
+/// PRD #1258 M3 L1 seam: draw the live host overlay renderer for `report`
+/// into a `width × height` buffer.
+pub fn render_host_metrics_overlay_to_buffer(
+    report: &crate::daemon_client::HostMetricsReport,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let view = HostMetricsView::Report(report.clone());
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_host_metrics_overlay(frame, &view);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #1258 M3 L1 seam: start on an empty dashboard holding `report` as the
+/// attached daemon's answer, press `keys` one at a time through the production
+/// [`handle_key_event`] (key resolution from `keybindings`, the mode handlers,
+/// [`dispatch_action`]) and draw each frame with the production
+/// [`render_frame`]. Returns the frame before the first key and one after each.
+///
+/// The controller has no daemon behind it, so no request is sent: the overlay
+/// shows the injected answer, which keeps host load out of the frames.
+pub fn render_host_metrics_key_sequence_to_buffers(
+    keybindings: &KeybindingConfig,
+    report: &crate::daemon_client::HostMetricsReport,
+    keys: &[KeyEvent],
+    width: u16,
+    height: u16,
+) -> Vec<ratatui::buffer::Buffer> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::Arc;
+
+    let ctrl: Arc<EmbeddedPaneController> =
+        Arc::new(EmbeddedPaneController::for_render_seam_with_focused_pane(
+            BURST_SEAM_PANE_ID,
+            SCROLL_SEAM_ROWS,
+            SCROLL_SEAM_COLS,
+            b"",
+        ));
+    let mut tab_manager = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+    let shared: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let state = AppState::default();
+    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
+    ui.host_metrics = HostMetricsView::Report(report.clone());
+    // A fixed instant: the dashboard has no cards, so nothing measures against it.
+    let wall_now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("fixed instant");
+    let frame_area = Rect::new(0, 0, width, height);
+    let tab_view = ActiveTabView::Dashboard {
+        exclude_pane_ids: vec![],
+        zoomed: false,
+    };
+    let tab_bar = TabBarInfo {
+        show: false,
+        labels: vec!["Dashboard".into()],
+        active_index: 0,
+        orchestration_statuses: vec![],
+    };
+    let pane_ids: Vec<String> = Vec::new();
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
+
+    let mut draw = |ui: &mut UiState| {
+        let bar_rows = bottom_bar_rows(ui, width, height);
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &pane_ids,
+            PaneLayout::Stacked,
+            None,
+            bar_rows,
+        );
+        let filtered = filter_sessions(&state, ui);
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame, &state, ui, &filtered, 0, true, &*ctrl, &tab_view, &tab_bar, &layout,
+                    wall_now,
+                );
+            })
+            .expect("TestBackend draw should succeed");
+        terminal.backend().buffer().clone()
+    };
+
+    let mut frames = Vec::with_capacity(keys.len() + 1);
+    frames.push(draw(&mut ui));
+    for key in keys {
+        let filtered = filter_sessions(&state, &ui);
+        let _ = handle_key_event(
+            *key,
+            &mut ui,
+            &*ctrl,
+            &shared,
+            &mut tab_manager,
+            &state,
+            &filtered,
+            frame_area,
+        );
+        frames.push(draw(&mut ui));
+    }
+    frames
+}
+
 /// PRD #80 M6 L1 seam: render the filter-mode bottom row (the inline filter
 /// input carrying `filter_text`) into a one-row `Buffer`. After M6 this row
 /// also renders the inline `[Apply]` / `[Cancel]` buttons at its right edge.
@@ -22037,6 +23185,56 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    /// PRD #1401: the `o` key's browser is watched off the UI thread, and its
+    /// outcome reaches the status line through the render loop's drain — but
+    /// only for the latest launch, so a slow earlier one never overwrites it.
+    #[test]
+    fn a_pull_request_launch_outcome_reaches_the_status_line_only_while_latest() {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let mut ui = default_ui();
+        ui.pull_request_launch = 2;
+        ui.status_message = Some(("Opening B".into(), std::time::Instant::now()));
+
+        state
+            .blocking_write()
+            .queue_pull_request_launch(1, "Pull request: A (could not open)".into());
+        drain_pull_request_launch(&state, &mut ui);
+        assert_eq!(ui.status_message.as_ref().unwrap().0, "Opening B");
+        assert!(state.blocking_read().pending_pull_request_launch.is_none());
+
+        state
+            .blocking_write()
+            .queue_pull_request_launch(2, "Pull request: B (could not open)".into());
+        drain_pull_request_launch(&state, &mut ui);
+        assert_eq!(
+            ui.status_message.as_ref().unwrap().0,
+            "Pull request: B (could not open)"
+        );
+    }
+
+    /// PRD #1401: an earlier launch settling AFTER a later one queued its
+    /// outcome must not replace that outcome in the one-slot queue, or the
+    /// render loop drops the earlier one as stale and the later one is lost.
+    #[test]
+    fn an_older_pull_request_launch_cannot_overwrite_a_newer_queued_one() {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let mut ui = default_ui();
+        ui.pull_request_launch = 2;
+        ui.status_message = Some(("Opening B".into(), std::time::Instant::now()));
+
+        state
+            .blocking_write()
+            .queue_pull_request_launch(2, "Pull request: B (could not open)".into());
+        state
+            .blocking_write()
+            .queue_pull_request_launch(1, "Pull request: A (could not open)".into());
+        drain_pull_request_launch(&state, &mut ui);
+        assert_eq!(
+            ui.status_message.as_ref().unwrap().0,
+            "Pull request: B (could not open)"
+        );
     }
 
     /// Scenario: Open the schedule manager with no configured entries and
@@ -23096,6 +24294,9 @@ mod tests {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
+                pending_question: None,
+                pull_request: None,
+                pull_request_revision: 0,
             },
         );
         state
@@ -23579,21 +24780,25 @@ mod tests {
             "default `Ctrl+z` must resolve to Action::ToggleZoom, got {resolved:?}"
         );
 
-        // A PLAIN `z` must NOT resolve — it is an ordinary character and belongs
-        // to whatever the user is typing into. This is the inverse of the
-        // assertion this test carried before the binding moved, and it is the
-        // half that would break if someone "restored" the old default without
-        // also restoring its scoping.
+        // A PLAIN `z` typed into a pane must NOT resolve — it is an ordinary
+        // character and belongs to whatever the user is typing into. In command
+        // mode it is the zoom chord's plain-letter alias (PRD #1258), which the
+        // same `scope_zoom` narrows below exactly as it narrows the chord.
         let plain_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
-        for mode in [UiMode::Normal, UiMode::PaneInput] {
-            assert!(
-                !matches!(
-                    key_action_for_mode(&kb, mode, &plain_z),
-                    Some(Action::ToggleZoom)
-                ),
-                "a plain `z` must not resolve to the zoom toggle ({mode:?})"
-            );
-        }
+        assert!(
+            !matches!(
+                key_action_for_mode(&kb, UiMode::PaneInput, &plain_z),
+                Some(Action::ToggleZoom)
+            ),
+            "a plain `z` in a pane must not resolve to the zoom toggle"
+        );
+        assert!(
+            matches!(
+                key_action_for_mode(&kb, UiMode::Normal, &plain_z),
+                Some(Action::ToggleZoom)
+            ),
+            "a plain `z` in command mode is the zoom toggle's alias"
+        );
 
         let zoom = || Some(Action::ToggleZoom);
 
@@ -26499,6 +27704,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state.apply_event(event1.clone());
 
@@ -26522,6 +27729,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state.apply_event(event2);
 
@@ -26599,6 +27808,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -26622,6 +27833,9 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -26658,6 +27872,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         state.apply_event(event.clone());
 
@@ -27076,6 +28292,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -27781,6 +28999,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
         state
@@ -27821,6 +29041,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -27848,6 +29070,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -27876,6 +29100,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -27892,6 +29118,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut ui = default_ui();
@@ -27919,6 +29147,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -27935,6 +29165,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut ui = default_ui();
@@ -27964,6 +29196,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut ui = default_ui();
@@ -28433,11 +29667,117 @@ mod tests {
                 Some(status.clone()),
                 &KeybindingConfig::default(),
             );
+            // PRD #1258: off a pending permission, `n` is the plain-letter
+            // alias of `Ctrl+n`.
             assert!(
-                matches!(result_n, Action::Continue),
-                "n on status {status:?} must no-op, got {result_n:?}"
+                matches!(result_n, Action::NewPane),
+                "n on status {status:?} must start a new agent, got {result_n:?}"
             );
         }
+    }
+
+    /// Scenario: In command mode, press plain `n` with the selected card
+    /// waiting for a permission answer and it denies the permission; press it
+    /// with the card in any other state, or with no card, and it opens the
+    /// new-agent flow as `Ctrl+n` does. With deny moved to another key, `n`
+    /// is a new agent even on a waiting card; with `new_pane` remapped, `n`
+    /// no longer starts one.
+    #[spec("keybindings/letters/003")]
+    #[test]
+    fn letters_003_n_denies_a_pending_permission_and_is_a_new_agent_otherwise() {
+        let n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+        let press = |total: usize, status: Option<SessionStatus>, kb: &KeybindingConfig| {
+            handle_normal_key(n, &mut default_ui(), total, status, kb)
+        };
+        let defaults = KeybindingConfig::default();
+        assert!(matches!(
+            press(1, Some(SessionStatus::WaitingForInput), &defaults),
+            Action::SendPermissionResponse(false)
+        ));
+        for status in [
+            Some(SessionStatus::Working),
+            Some(SessionStatus::Idle),
+            None,
+        ] {
+            assert!(
+                matches!(press(1, status.clone(), &defaults), Action::NewPane),
+                "n on {status:?} must start a new agent"
+            );
+        }
+        assert!(matches!(press(0, None, &defaults), Action::NewPane));
+
+        let (deny_moved, warnings) =
+            KeybindingConfig::from_toml_str("[dashboard]\ndeny_permission = \"x\"\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(matches!(
+            press(1, Some(SessionStatus::WaitingForInput), &deny_moved),
+            Action::NewPane
+        ));
+
+        let (new_moved, warnings) =
+            KeybindingConfig::from_toml_str("[global]\nnew_pane = \"Alt+n\"\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(matches!(
+            press(1, Some(SessionStatus::Idle), &new_moved),
+            Action::Continue
+        ));
+    }
+
+    /// Scenario: In command mode, press `Ctrl+r`, `Ctrl+g`, `Ctrl+s`,
+    /// `Ctrl+m` and `Ctrl+u` with a card selected: each does what its plain
+    /// letter does — rename, generate config, the Schedules manager, the host
+    /// overlay and the upgrade dialog. `Enter` still focuses the pane. With
+    /// `rename` remapped, `Ctrl+r` does nothing; with `scroll_pane_up` on
+    /// `Ctrl+u`, `Ctrl+u` is not the upgrade dialog. `Ctrl+m` closes the open
+    /// host overlay as `m` does.
+    #[spec("keybindings/letters/006")]
+    #[test]
+    fn letters_006_ctrl_forms_of_the_letter_commands_act_in_command_mode() {
+        let ctrl = |ch: char| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+        let press = |key: KeyEvent, kb: &KeybindingConfig| {
+            handle_normal_key(key, &mut default_ui(), 1, Some(SessionStatus::Idle), kb)
+        };
+        let defaults = KeybindingConfig::default();
+        assert!(matches!(press(ctrl('r'), &defaults), Action::EnterRename));
+        assert!(matches!(
+            press(ctrl('g'), &defaults),
+            Action::RequestConfigGen
+        ));
+        assert!(matches!(
+            press(ctrl('s'), &defaults),
+            Action::OpenScheduledTasks
+        ));
+        assert!(matches!(
+            press(ctrl('m'), &defaults),
+            Action::OpenHostMetrics
+        ));
+        assert!(matches!(press(ctrl('u'), &defaults), Action::OpenUpgrade));
+        // The byte `Ctrl+m` shares with Enter arrives as Enter in a terminal
+        // that does not disambiguate, and Enter is unchanged.
+        assert!(matches!(
+            press(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &defaults),
+            Action::Focus
+        ));
+
+        let (renamed, warnings) =
+            KeybindingConfig::from_toml_str("[dashboard]\nrename = \"F7\"\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(matches!(press(ctrl('r'), &renamed), Action::Continue));
+
+        let (scroll_on_u, warnings) =
+            KeybindingConfig::from_toml_str("[dashboard]\nscroll_pane_up = \"Ctrl+u\"\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!matches!(
+            press(ctrl('u'), &scroll_on_u),
+            Action::OpenUpgrade
+        ));
+
+        let mut ui = default_ui();
+        ui.mode = UiMode::HostMetrics;
+        assert!(matches!(
+            handle_host_metrics_key(ctrl('m'), &mut ui, &defaults),
+            Action::CloseHostMetrics
+        ));
     }
 
     #[test]
@@ -28461,7 +29801,8 @@ mod tests {
             None,
             &KeybindingConfig::default(),
         );
-        assert!(matches!(result_n, Action::Continue));
+        // PRD #1258: with no card to answer for, `n` is a new agent.
+        assert!(matches!(result_n, Action::NewPane));
         // Also exercise the case where `total > 0` but `selected_status` is
         // None (the selected session is missing from the snapshot — a race we
         // tolerate gracefully).
@@ -29416,6 +30757,9 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -30208,6 +31552,9 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         }
     }
 
@@ -30617,6 +31964,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             });
         }
 
@@ -30640,6 +31989,9 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
 
         // Spacious: get all 3
@@ -30679,6 +32031,9 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -30709,6 +32064,9 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32041,6 +33399,8 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                background: None,
+                background_revision: None,
             }
         }
 
@@ -32136,6 +33496,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
         assert_eq!(
@@ -32168,6 +33530,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
         assert_eq!(
@@ -32477,12 +33841,21 @@ mod tests {
         // agent's `$PATH` cannot redirect, not by the bare name.
         let bin = crate::platform::paths::binary_name();
         let dispatch_verb = format!("{bin} dispatch <name>");
+        // PRD #1589: the seed teaches the `close` verb's mechanics, and leaves
+        // when to close to the user.
+        let close_verb = format!("{bin} close <name>");
+        let close_all = format!("{bin} close --all --yes");
+        let close_by_id = format!("{bin} close --unit-id <id>");
         assert!(
             !dispatcher_seed_prompt().contains("dot-agent-deck dispatch <name>"),
             "the dispatcher seed must not name the deck by its bare name"
         );
         for required in [
             dispatch_verb.as_str(),
+            close_verb.as_str(),
+            close_all.as_str(),
+            close_by_id.as_str(),
+            "When to close is the user's decision",
             "SELF-CONTAINED",
             "../<repo>-dispatch-<name>",
             "single-use",
@@ -32926,6 +34299,7 @@ mod tests {
             UiMode::DirPicker,
             UiMode::NewPaneForm,
             UiMode::ScheduledTasks,
+            UiMode::HostMetrics,
         ] {
             assert!(
                 overlay_blocks_mouse(&mode),
@@ -35077,6 +36451,7 @@ mod tests {
             | UiMode::StopConfirm
             | UiMode::ScheduledTasks
             | UiMode::CloseConfirm
+            | UiMode::HostMetrics
             | UiMode::Upgrade => mode,
         }
     }
@@ -35098,6 +36473,7 @@ mod tests {
             UiMode::StopConfirm,
             UiMode::ScheduledTasks,
             UiMode::CloseConfirm,
+            UiMode::HostMetrics,
             UiMode::Upgrade,
         ]
         .into_iter()
@@ -37826,6 +39202,136 @@ mod config_drift_tests {
         let (status, _) = ui.status_message.as_ref().expect("status line set");
         assert!(!status.contains(CONFIG_DRIFT_TAB_MARKER), "{status}");
         assert_eq!(ui.session_warnings, vec!["w".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod hook_notice_tests {
+    //! Issue #1637: the dashboard's hook-binary notice row.
+    use super::*;
+    use crate::hook_binary::{HookBinaryNotice, HookBinaryReason};
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn is_unsafe(c: char) -> bool {
+        c.is_control()
+            || crate::untrusted_text::is_bidi_format_char(c)
+            || matches!(c, '\u{2028}' | '\u{2029}')
+    }
+
+    #[test]
+    fn a_hostile_notice_renders_without_control_or_bidi_characters() {
+        let hostile = "\x1b[2J\r\n\u{202E}\u{2028}";
+        let notice = HookBinaryNotice {
+            binary: format!("/opt/old{hostile}/dot-agent-deck"),
+            agents: vec![format!("Codex{hostile}")],
+            version: Some(format!("0.45.0{hostile}")),
+            daemon_version: format!("0.46.0{hostile}"),
+            reason: HookBinaryReason::Older,
+            // Only characters that strip to nothing, so the lead-in is still
+            // `Run:` once cleaned and its dropped command is what is tested.
+            remedy: "Run:\r\n\u{202E}\u{2028}".to_string(),
+            command: Some(format!("brew upgrade dot-agent-deck{hostile}")),
+        };
+        for width in [40, 120, 400] {
+            let line = hook_notice_line(std::slice::from_ref(&notice), width).expect("a line");
+            let text = line_text(&line);
+            assert!(!text.chars().any(is_unsafe), "{width}: {text:?}");
+            let rendered = buffer_text(&render_hook_notice_to_buffer(
+                std::slice::from_ref(&notice),
+                width as u16,
+                1,
+            ));
+            assert!(!rendered.chars().any(is_unsafe), "{width}: {rendered:?}");
+        }
+        let text = line_text(&hook_notice_line(std::slice::from_ref(&notice), 400).unwrap());
+        assert!(text.contains("/opt/old[2J/dot-agent-deck"), "{text}");
+        // The altered command is dropped, not shown, and the remedy no longer
+        // leads in to it.
+        assert!(!text.contains("brew upgrade"), "{text}");
+        assert!(
+            text.contains(crate::hook_binary::REMEDY_UPGRADE_OR_REINSTALL),
+            "{text}"
+        );
+    }
+
+    /// Scenario (Greptile and Qodo on #1656): at 80 columns, a notice whose
+    /// command is the two-agent `hooks install` for `~/.local/bin`, wider than
+    /// the row on its own. The row shows no part of the command, never a
+    /// cut-off one, but the agents and both versions; at 120 columns the
+    /// advice does not fit whole either, so none of it is shown; at 160 it is
+    /// shown whole, and at a width the command fits beside the facts, the row
+    /// shows the command whole.
+    #[test]
+    fn a_command_wider_than_the_row_falls_back_to_the_advice() {
+        use unicode_width::UnicodeWidthStr;
+        let command = "/home/u/.local/bin/dot-agent-deck hooks install --agent claude-code && \
+                       /home/u/.local/bin/dot-agent-deck hooks install --agent codex";
+        assert!(command.width() > 80);
+        let notice = HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Claude Code".into(), "Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: crate::hook_binary::REMEDY_RUN.into(),
+            command: Some(command.into()),
+        };
+        let line = hook_notice_line(std::slice::from_ref(&notice), 80).unwrap();
+        let text = line_text(&line);
+        assert!(text.width() <= 80, "{text}");
+        assert!(!text.contains("hooks install --agent"), "{text}");
+        assert!(!text.contains("Run:"), "{text}");
+        for part in ["Claude Code, Codex", "0.45.0", "0.46.0"] {
+            assert!(text.contains(part), "missing {part:?}: {text}");
+        }
+        let roomier = line_text(&hook_notice_line(std::slice::from_ref(&notice), 120).unwrap());
+        assert!(!roomier.contains("Upgrade the"), "{roomier}");
+        assert!(!roomier.contains("hooks install --agent"), "{roomier}");
+        let advised = line_text(&hook_notice_line(std::slice::from_ref(&notice), 160).unwrap());
+        assert!(
+            advised.contains(crate::hook_binary::REMEDY_UPGRADE_OR_REINSTALL),
+            "{advised}"
+        );
+        let rendered = buffer_text(&render_hook_notice_to_buffer(
+            std::slice::from_ref(&notice),
+            80,
+            1,
+        ));
+        assert!(!rendered.contains("hooks install --agent"), "{rendered}");
+
+        let wide = line_text(&hook_notice_line(std::slice::from_ref(&notice), 400).unwrap());
+        assert!(wide.contains(&format!("Run: {command}")), "{wide}");
+    }
+
+    #[test]
+    fn truncation_counts_display_columns() {
+        use unicode_width::UnicodeWidthStr;
+        let wide = "/home/用户/工作/目录/dot-agent-deck";
+        for max in 5..wide.width() {
+            let middle = truncate_middle(wide, max);
+            assert!(
+                middle.width() <= max,
+                "{max}: {middle} is {}",
+                middle.width()
+            );
+            assert!(middle.contains('…'), "{middle}");
+            let end = truncate_end(wide, max);
+            assert!(end.width() <= max, "{max}: {end} is {}", end.width());
+            assert!(end.ends_with('…'), "{end}");
+        }
+        assert_eq!(truncate_middle(wide, wide.width()), wide);
+        assert_eq!(truncate_end("abcdef", 4), "abc…");
+        assert_eq!(truncate_middle("abcdefgh", 5), "ab…gh");
     }
 }
 

@@ -124,6 +124,13 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
     "PostCompact",
     "SubagentStart",
     "SubagentStop",
+    // PRD #1631: fires when a turn is interrupted — after a keyboard "No" on
+    // Codex's approval prompt [observed on 0.160.0] — so the deck can clear
+    // the question that prompt raised. Adding it changes the installed hook
+    // set; the install trusts it with the deck's other hooks
+    // (`trust_deck_hooks_in`). Whether a Codex session already running when
+    // the set changes asks the user to review it was not measured.
+    "Interrupt",
 ];
 
 /// Resolve the active Codex home the way Codex itself does: `$CODEX_HOME` when
@@ -842,6 +849,41 @@ const CONFIG_TOML: &str = "config.toml";
 /// best-effort — a timeout returns `Err` and the caller degrades.
 const HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the wrapper's trust write ([`crate::wrap`], right before it launches
+/// Codex in a deck pane) waits for `hooks/list`, in place of
+/// [`HOOKS_LIST_TIMEOUT`].
+///
+/// That launch is the one the trust is for, so giving up early costs more there:
+/// the hooks stay untrusted and Codex 0.160.0 stops on its "1 hook needs review
+/// before it can run" dialog, and a prompt typed into the pane goes nowhere
+/// until someone presses `t` there. Five seconds
+/// was not enough on a starved box. During PRD #1631's lane-2 run
+/// `question_live_004` met that dialog twice, and on the same box (`io full`
+/// 56–95%) `hooks/list` measured 3.4–27.7 s on a fresh Codex home and 0.19–2.1 s
+/// on one that had answered before, with almost all of the time spent before
+/// `initialize` answered. The wait returns as soon as the reply arrives, so a
+/// Codex that answers within the old 5 s waits no longer than before; what the
+/// wider ceiling costs is a pane whose Codex launches up to 30 s later when
+/// `codex app-server` answers slowly or never.
+///
+/// This bounds the listing wait only, not the pane. The rest of the wrapper's
+/// spawn prep has waits of its own: the `hooks.json` install and the
+/// `config.toml` trust write each take a cross-process lock that waits up to
+/// 10 s (`crate::agent_hook_config::lock_config`), so the whole prep can hold
+/// Codex's launch for about 50 s. Threading one deadline through
+/// `crate::wrap::codex_spawn_prep` is left to the readiness work in #1663. A
+/// delegate that respawned that pane can then pay for it twice: its readiness
+/// fallback (`crate::state::SESSION_START_WAIT_TIMEOUT`, also 30 s) is counted
+/// from the respawn, so when the prep takes most of its 30 s the fallback can
+/// expire before Codex has drawn its interface, and the task pointer is typed
+/// into a pane Codex is not yet reading. That is the fixed-timer readiness
+/// problem tracked in #1663 (and #1662 for Pi), which this bound does not
+/// address.
+/// The daemon's startup install and `hooks install` keep the shorter bound: the
+/// startup one sits before the daemon binds its sockets (issue #1665), and
+/// neither is about to launch Codex.
+pub const SPAWN_HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One hook as Codex itself reports it from `hooks/list`. The deck never computes
 /// these values: `current_hash` in particular is Codex's own canonicalization of
 /// the definition, so recording it (rather than a hand-rolled sha256) is what
@@ -981,12 +1023,26 @@ pub struct HooksListing {
 /// returning. EVERY failure — codex absent, non-zero exit, protocol drift, timeout
 /// — is an `Err` so the caller degrades quietly (no spawn is ever blocked).
 pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<HooksListing> {
-    list_hooks_with(Path::new("codex"), home, cwd)
+    list_hooks_in_within(home, cwd, HOOKS_LIST_TIMEOUT)
 }
 
-/// [`list_hooks_in`] with the `codex` program named, so a test can hand it a
-/// stand-in without rewriting this process's `PATH`.
-fn list_hooks_with(codex: &Path, home: &Path, cwd: &Path) -> std::io::Result<HooksListing> {
+/// [`list_hooks_in`] with the caller choosing how long to wait for the reply.
+fn list_hooks_in_within(
+    home: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> std::io::Result<HooksListing> {
+    list_hooks_with(Path::new("codex"), home, cwd, timeout)
+}
+
+/// [`list_hooks_in_within`] with the `codex` program named, so a test can hand
+/// it a stand-in without rewriting this process's `PATH`.
+fn list_hooks_with(
+    codex: &Path,
+    home: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> std::io::Result<HooksListing> {
     let mut child = Command::new(codex)
         .arg("app-server")
         .current_dir(cwd)
@@ -1043,13 +1099,28 @@ fn list_hooks_with(codex: &Path, home: &Path, cwd: &Path) -> std::io::Result<Hoo
                 }
             }
         });
-        read_hooks_list_reply(&rx, &mut stdin, Instant::now() + HOOKS_LIST_TIMEOUT)
+        read_hooks_list_reply(&rx, &mut stdin, hooks_list_deadline(timeout))
     });
 
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
     response
+}
+
+/// The instant a `hooks/list` wait of `timeout` gives up at.
+///
+/// The timeout is the caller's choice, and `Instant + Duration` panics on
+/// overflow, so a huge one such as `Duration::MAX` is clamped to a far-future
+/// deadline (about a century) instead. Should even that not fit the platform's
+/// `Instant`, the wait gives up at once and the caller degrades as it does on
+/// any other timeout, rather than panicking.
+fn hooks_list_deadline(timeout: Duration) -> Instant {
+    const FAR_FUTURE: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .or_else(|| now.checked_add(FAR_FUTURE))
+        .unwrap_or(now)
 }
 
 /// Is this line the `hooks/list` **response**, as opposed to some other message
@@ -1673,6 +1744,17 @@ pub fn trust_deck_hooks_for(
     cwd: &Path,
     binary_paths: &[String],
 ) -> std::io::Result<TrustOutcome> {
+    trust_deck_hooks_for_within(home, cwd, binary_paths, HOOKS_LIST_TIMEOUT)
+}
+
+/// [`trust_deck_hooks_for`] with the caller choosing how long to wait for Codex's
+/// `hooks/list` reply; the wrapper passes [`SPAWN_HOOKS_LIST_TIMEOUT`].
+pub(crate) fn trust_deck_hooks_for_within(
+    home: &Path,
+    cwd: &Path,
+    binary_paths: &[String],
+    hooks_list_timeout: Duration,
+) -> std::io::Result<TrustOutcome> {
     let mut expected_commands: Vec<String> = Vec::new();
     for binary_path in binary_paths {
         let command = expected_hook_command(binary_path);
@@ -1683,7 +1765,7 @@ pub fn trust_deck_hooks_for(
     let Some(expected) = expected_commands.first().cloned() else {
         return Ok(TrustOutcome::NothingListed);
     };
-    let listing = list_hooks_in(home, cwd)?;
+    let listing = list_hooks_in_within(home, cwd, hooks_list_timeout)?;
     let entries = &listing.entries;
     let eligible = trust_eligible(entries, home, &expected_commands);
     // Issue #559: taken from the same eligible set the records are, so it can
@@ -2262,24 +2344,70 @@ fn codex_present_on_path() -> bool {
 /// Guarded, idempotent, and best-effort: SKIPs unless `codex` is on `PATH` and a
 /// real home resolves (never a `/tmp` write), and any failure is logged, never
 /// fatal.
-pub fn auto_install_and_trust_at_startup() {
+///
+/// Returns what the hooks are pinned to afterwards (issue #1637). After a
+/// takeover that is the new copy, and the trust recorded here is for its
+/// command, so Codex may ask the user once to review the changed hooks.
+pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
     if !codex_present_on_path() {
         tracing::debug!("codex startup install: skipped (codex not on PATH)");
-        return;
+        return Vec::new();
     }
     let Some(home) = codex_home() else {
         tracing::debug!("codex startup install: skipped (no CODEX_HOME/HOME)");
-        return;
+        return Vec::new();
     };
     // No durable path means nothing was installed, so there is no command to
     // trust and no entry of ours in the listing. Fail closed rather than falling
     // back to a wider predicate (issue #730).
     let Some(binary_paths) = auto_install() else {
         tracing::debug!("codex startup install: skipped trust (no durable binary path resolved)");
-        return;
+        return Vec::new();
     };
+    let pins = binary_paths
+        .iter()
+        .map(|binary| crate::hook_binary::HookPin {
+            agent: crate::event::AgentType::Codex,
+            config: home.join("hooks.json"),
+            binary: binary.clone(),
+        })
+        .collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
     report_startup_trust(&trust_deck_hooks_for(&home, &cwd, &binary_paths), &cwd);
+    pins
+}
+
+/// What Codex's hooks are pinned to now, read back from the active
+/// `CODEX_HOME`'s `hooks.json` without installing or trusting anything (issue
+/// #1637's pin refresh, `CODEX.configured_pins`): every binary a deck entry
+/// names, across events. An empty list when `hooks.json` is missing; `None`
+/// under the same guards as [`auto_install_and_trust_at_startup`] or when
+/// the file cannot be read, which leaves the pins the daemon knows.
+pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
+    if !codex_present_on_path() {
+        return None;
+    }
+    configured_pins_in(&codex_home()?)
+}
+
+/// [`configured_pins`] for an explicit Codex home.
+fn configured_pins_in(home: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
+    let path = home.join("hooks.json");
+    let Some(root) = crate::agent_hook_config::read_json_config(&path)? else {
+        // Confirmed missing: it names nothing, which clears a notice about
+        // the binary it used to name (Qodo on #1656).
+        return Some(Vec::new());
+    };
+    Some(
+        crate::agent_hook_config::configured_deck_executables(&root, deck_command_executable)
+            .into_iter()
+            .map(|binary| crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::Codex,
+                config: path.clone(),
+                binary,
+            })
+            .collect(),
+    )
 }
 
 /// Log what [`auto_install_and_trust_at_startup`]'s trust write came to.
@@ -2319,6 +2447,42 @@ fn report_startup_trust(result: &std::io::Result<TrustOutcome>, cwd: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario (issue #1637): the daemon's pin refresh reads back every binary
+    /// Codex's `hooks.json` pins, one per distinct binary across events and
+    /// writing nothing; a missing file names nothing, and an unparseable one
+    /// is no evidence.
+    #[test]
+    fn configured_pins_reads_every_pinned_binary_back_without_writing() {
+        let home = crate::test_temp::tempdir().expect("codex home tempdir");
+        let path = home.path().join("hooks.json");
+        assert_eq!(configured_pins_in(home.path()), Some(Vec::new()));
+        assert!(!path.exists(), "a read-back creates nothing");
+        std::fs::write(&path, b"[").unwrap();
+        assert_eq!(configured_pins_in(home.path()), None);
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let current = crate::test_paths::abs("/opt/current/dot-agent-deck");
+        let (old, current) = (old.as_str(), current.as_str());
+        let rule = |binary: &str| serde_json::json!([{"hooks": [{"type": "command", "command": expected_hook_command(binary)}]}]);
+        let root = serde_json::json!({
+            "hooks": {
+                "SessionStart": rule(current),
+                "Stop": rule(old),
+                "PostToolUse": rule(current),
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/bin/true"}]}]
+            }
+        });
+        std::fs::write(&path, root.to_string()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut binaries: Vec<String> = configured_pins_in(home.path())
+            .expect("readable hooks.json")
+            .into_iter()
+            .map(|pin| pin.binary)
+            .collect();
+        binaries.sort();
+        assert_eq!(binaries, vec![current.to_string(), old.to_string()]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
     use spec::spec;
 
     /// The child half of `codex_trust_008`: when re-executed with these set,
@@ -2416,6 +2580,31 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// Scenario: Installing the deck's Codex hooks into a fresh Codex home
+    /// writes a command rule for `Interrupt` — the event Codex fires after a
+    /// keyboard "No" on its approval prompt — alongside the existing set, and
+    /// a payload naming it reads as Idle, which clears the prompt's question.
+    #[spec("codex/hooks/013")]
+    #[test]
+    fn codex_hooks_013_interrupt_is_installed() {
+        assert!(CODEX_HOOK_EVENTS.contains(&"Interrupt"));
+        let dir = tempfile::tempdir().expect("codex home tempdir");
+        install_to(dir.path(), "/abs/dot-agent-deck").expect("install hooks.json");
+        let root: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("hooks.json")).expect("read hooks.json"),
+        )
+        .expect("parse hooks.json");
+        let interrupt = root["hooks"]["Interrupt"]
+            .as_array()
+            .expect("an Interrupt rule");
+        assert!(
+            interrupt.iter().any(|rule| rule["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.ends_with(HOOK_COMMAND_SUFFIX))),
+            "{interrupt:?}"
         );
     }
 
@@ -3250,6 +3439,29 @@ mod tests {
         );
     }
 
+    /// `trust_deck_hooks_for_within` takes its `hooks/list` wait from the
+    /// caller, so a timeout too large for `Instant + Duration` must not panic: it
+    /// becomes a far-future deadline, and a reply that arrives is still read.
+    #[test]
+    fn a_duration_max_hooks_list_timeout_does_not_panic() {
+        let before = Instant::now();
+        let deadline = hooks_list_deadline(Duration::MAX);
+        assert!(
+            deadline >= before + Duration::from_secs(365 * 24 * 60 * 60),
+            "Duration::MAX must clamp to a far-future deadline, not give up at once"
+        );
+
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"data": [{"hooks": []}]}}).to_string(),
+        )
+        .expect("queue a line");
+        drop(tx);
+        let listing = read_hooks_list_reply(&rx, &mut Vec::new(), deadline)
+            .expect("a reply read under a far-future deadline must parse");
+        assert!(listing.entries.is_empty());
+    }
+
     /// The response test above must not be passing because the predicate demands
     /// a `result`: a JSON-RPC **error** reply is a response too, and skipping it
     /// would turn an immediate, named failure into a five-second timeout whose
@@ -3587,8 +3799,8 @@ mod tests {
         std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))
             .expect("make codex stand-in executable");
 
-        let listing =
-            list_hooks_with(&codex, &home, &project).expect("the stand-in answers hooks/list");
+        let listing = list_hooks_with(&codex, &home, &project, HOOKS_LIST_TIMEOUT)
+            .expect("the stand-in answers hooks/list");
 
         let pwd = std::fs::read_to_string(&pwd_record).expect("the stand-in recorded its cwd");
         assert_eq!(

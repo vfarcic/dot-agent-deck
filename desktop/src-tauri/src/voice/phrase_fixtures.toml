@@ -565,6 +565,130 @@ screen = "overview"
 action = "open_settings"
 outcome = "dispatch"
 
+# PR #1672 — a daemon's Host figures (`show_host_metrics`). The first two are
+# the phrasings the user tried on a Mac and expects to work; the next three are
+# the Host button's own labels (the label rule); the rest are natural ones. The
+# collision fixtures pin that Settings and switching daemon keep their words.
+# Not yet measured against a live backend.
+[[fixtures]]
+name = "show-host-open-host-info"
+utterance = "open host info"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-resource-usage"
+utterance = "show resource usage"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-label-host"
+utterance = "Host"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-label-warning"
+utterance = "Host warning"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-label-critical"
+utterance = "Host critical"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-disk-space"
+utterance = "how much disk space is left?"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-machine-doing"
+utterance = "how is the machine doing?"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-host-named-daemon"
+utterance = "show host for the build box"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "show-host-not-switch-deck"
+utterance = "switch daemon to the build box"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "show-host-unavailable"
+utterance = "open host info"
+screen = "agent"
+action = "show_host_metrics"
+outcome = "unavailable"
+
+# PR #1672 round 10 — closing the Host popover. Its words carry `host`,
+# `resource` and `usage`, which are `show_host_metrics`'s, so these are the
+# guard that a close is `close` and not a second open. The popover's open state
+# is not declared to the model, so a bare "close it" said over it is the
+# dashboard's bare close, which the app then sends to the popover.
+[[fixtures]]
+name = "close-host-button-label"
+utterance = "close host"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-host-info"
+utterance = "close host info"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-resource-usage"
+utterance = "close resource usage"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-resource-usage-hide"
+utterance = "hide resource usage"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-host-figures"
+utterance = "close the host figures"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-it-host-open"
+utterance = "close it"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "open-settings-unavailable"
 utterance = "open settings"
@@ -2541,4 +2665,152 @@ name = "dashboard-filter-control-show-the-dashboard"
 utterance = "show the dashboard"
 screen = "deck"
 action = "open_overview"
+outcome = "dispatch"
+
+# PRD #1401 — an agent's pull request in the app's own browser. `open_pr` is
+# the agent dashboard's and the agent screen's, and names its agent the way
+# `open_agent` does; `open_pr_in_browser` and the page's scrolls are the
+# browser's own screen's (`pull_request`); `close` closes the browser first.
+# On the dashboard with no agent named it asks which of the planted fleet's
+# four, each offered as a choice (`open-pr-on-the-dashboard-asks-which-agent`,
+# which replaced the refusal this case got while `open_pr` was the agent
+# screen's alone). The negatives: the PR does not open from the Daemons screen,
+# and the hand-off has nothing to hand off with no PR open.
+[[fixtures]]
+name = "open-pr"
+utterance = "open the PR"
+screen = "agent"
+action = "open_pr"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-pr-show-the-pull-request"
+utterance = "show the pull request"
+screen = "agent"
+action = "open_pr"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-pr-on-the-dashboard-asks-which-agent"
+utterance = "open the PR"
+screen = "overview"
+action = "open_pr"
+outcome = "param_ambiguous"
+candidates = ["agent-tester", "agent-coder-one", "agent-coder-two", "agent-reviewer"]
+
+[[fixtures]]
+name = "open-pr-for-the-tester-on-the-dashboard"
+utterance = "open the PR for the tester"
+screen = "overview"
+action = "open_pr"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "open-pr-show-the-pull-request-for-the-reviewer"
+utterance = "show the pull request for the reviewer"
+screen = "overview"
+action = "open_pr"
+outcome = "dispatch"
+resolved_agent = "agent-reviewer"
+
+[[fixtures]]
+name = "open-pr-possessive-on-the-dashboard"
+utterance = "open coder two's PR"
+screen = "overview"
+action = "open_pr"
+outcome = "dispatch"
+resolved_agent = "agent-coder-two"
+
+# On an agent's screen a named agent is that agent, not the open pane's.
+[[fixtures]]
+name = "open-pr-for-another-agent-on-an-agent-pane"
+utterance = "open the reviewer's pull request"
+screen = "agent"
+action = "open_pr"
+outcome = "dispatch"
+resolved_agent = "agent-reviewer"
+
+[[fixtures]]
+name = "open-pr-unavailable-on-the-daemons-screen"
+utterance = "open the PR"
+screen = "deck"
+action = "open_pr"
+outcome = "unavailable"
+
+# An agent's PR by its number ("open the PR for agent 3") is answered on the
+# dashboard from the numbered list (`voice::numbers`, PullRequest) and never
+# reaches the model there. On the Daemons screen, whose tiles are numbered too,
+# the webview leaves it to the model, which refuses it like any other `open_pr`.
+[[fixtures]]
+name = "open-pr-by-agent-number-unavailable-on-the-daemons-screen"
+utterance = "open the PR for agent 1"
+screen = "deck"
+action = "open_pr"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "open-pr-in-browser"
+utterance = "open it in the browser"
+screen = "pull_request"
+action = "open_pr_in_browser"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-pr-in-browser-unavailable-on-an-agent-pane"
+utterance = "open it in the browser"
+screen = "agent"
+action = "open_pr_in_browser"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "close-the-pull-request"
+utterance = "close"
+screen = "pull_request"
+action = "close"
+outcome = "dispatch"
+
+# "close the PR" closes the page in the app, and nothing on GitHub: no row acts
+# on a pull request, and these must land on `close` rather than `open_pr` (not
+# callable here) or `close_orchestration` (which needs a run named).
+[[fixtures]]
+name = "close-the-pr-closes-the-page"
+utterance = "close the PR"
+screen = "pull_request"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-the-pull-request-closes-the-page"
+utterance = "close the pull request"
+screen = "pull_request"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-down-the-pull-request"
+utterance = "scroll down"
+screen = "pull_request"
+action = "scroll_down"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up-the-pull-request"
+utterance = "scroll up"
+screen = "pull_request"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-top-of-the-pull-request"
+utterance = "scroll to the top"
+screen = "pull_request"
+action = "scroll_to_top"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-bottom-of-the-pull-request"
+utterance = "scroll to the bottom"
+screen = "pull_request"
+action = "scroll_to_bottom"
 outcome = "dispatch"

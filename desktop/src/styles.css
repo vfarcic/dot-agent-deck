@@ -513,6 +513,11 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .connection-banner > div { display: flex; flex-direction: column; gap: 2px; }
 .connection-banner strong { font-size: 11px; }
 .connection-banner span { font-size: 10px; }
+.hook-binary-notices { margin: 8px 16px 0; display: flex; flex-direction: column; gap: 6px; }
+.hook-binary-notice { padding: 6px 10px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--amber-edge); border-radius: var(--radius); color: var(--amber-ink); background: var(--amber-soft); }
+.hook-binary-notice > div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
+.hook-binary-notice span { overflow-wrap: anywhere; }
+.hook-binary-notice code { font-size: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .connection-detail { font-size: 10px; }
 .connection-detail summary { cursor: pointer; width: fit-content; }
 .connection-detail > span { display: block; margin-top: 2px; overflow-wrap: anywhere; }
@@ -574,6 +579,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* PRD #1666: the inbox line beside the status, and the undelivered-message notice under it. */
 .agent-inbox-badge { color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; white-space: nowrap; flex-shrink: 0; }
 .agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Issue #1678: background work still running after the turn ended. Ink rather
+   than --muted, as the TUI draws it in its primary text colour: it is a reading
+   about now, not a label. */
+.agent-identity p.agent-background-work { color: var(--ink); }
 .status-label.status-needs_input, .status-label.status-queued { color: var(--amber); background: var(--amber-soft); }
 /*
   Issue #1143 — a HELD record's status is a past reading, so it is drawn as one:
@@ -734,6 +743,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .empty-deck > div { margin-top: 15px; display: flex; gap: 7px; }
 
 .sheet-backdrop, .dialog-backdrop { position: fixed; z-index: 80; inset: 0; display: flex; justify-content: flex-end; background: rgb(var(--scrim-rgb) / .42); }
+/* PR #1680 review — a sheet opened over the agent's pane (90) or the pull
+   request browser (92), from the deck's command menu, is what the user just
+   asked for: drawn above both, and still below the voice row (95) and every
+   dialog (100). `OVERLAY_LAYER` in `useInertBackground.ts` holds these
+   numbers as the order voice's "close" walks; `overlayLayers.test.ts` reads
+   them back from this file. */
+.sheet-backdrop.is-raised { z-index: 93; }
 .config-sheet { width: min(780px, calc(100vw - 74px)); height: 100%; display: flex; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--paper); box-shadow: -12px 0 32px rgb(var(--scrim-rgb) / .12); }
 .orchestration-sheet { width: min(610px, calc(100vw - 74px)); }
 .projects-sheet { width: min(850px, calc(100vw - 74px)); }
@@ -1026,7 +1042,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .confirm-dialog { text-align: center; }
 .danger-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--red); background: var(--red-soft); }
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
-.confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; }
+.confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; overflow-wrap: anywhere; }
 .confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
 /* PRD #1487 M5 — the Upgrade / Replace daemon dialog: the confirm card, plus its stages and stop lists. */
 .upgrade-dialog { width: min(440px, 100%); }
@@ -1329,6 +1345,31 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .daemon-state { min-width: 0; margin: 0; overflow: hidden; color: var(--faint); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
 .daemon-pips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 5px; }
 .daemon-group-body { padding: 11px 12px 13px; }
+/* PRD #1258: the deck's host — a compact button beside the deck's name,
+   coloured by the worst level the deck's daemon reported, opening the numbers
+   in a popover. The green/amber/red families are the ones the status labels
+   use, with their light and dark values; no level leaves the button neutral. */
+.host-metrics-anchor { position: relative; flex: none; }
+.host-metrics-button.host-button-ok { color: var(--green); background: var(--green-soft); border-color: var(--green-rim); }
+.host-metrics-button.host-button-warn { color: var(--amber-ink); background: var(--amber-soft); border-color: var(--amber-rim); }
+.host-metrics-button.host-button-critical { color: var(--red-ink); background: var(--red-soft); border-color: var(--red-rim-strong); }
+.host-metrics-popover { position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; width: min(380px, calc(100vw - 24px)); border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); box-shadow: 0 10px 26px rgb(var(--scrim-rgb) / .13); }
+.host-metrics { padding: 9px 12px 10px; }
+/* PR #1672 — the popover's X, the other overlays' icon button, in the top-right
+   corner; the header keeps clear of it and is tall enough that the first row
+   starts below it. */
+.host-metrics-close { position: absolute; top: 4px; right: 4px; }
+.host-metrics-header { min-height: 26px; padding-right: 32px; display: flex; flex-wrap: wrap; align-items: baseline; align-content: center; gap: 8px; margin-bottom: 6px; }
+.host-metrics-header strong { font-size: 11px; font-weight: 720; }
+.host-metrics-subtitle { color: var(--faint); font-size: 9.5px; }
+.host-metrics-rows { margin: 0; display: grid; gap: 3px; }
+.host-metrics-row { display: flex; gap: 8px; min-width: 0; font-size: 10.5px; }
+.host-metrics-row dt { flex: 0 0 112px; color: var(--muted); }
+.host-metrics-row dd { margin: 0; min-width: 0; font-family: "JetBrains Mono", monospace; font-variant-numeric: tabular-nums; }
+.host-metrics-row dd.host-level-ok { color: var(--green); }
+.host-metrics-row dd.host-level-warn { color: var(--amber); }
+.host-metrics-row dd.host-level-critical { color: var(--red); font-weight: 650; }
+.host-metrics-unavailable { margin: 0; color: var(--muted); font-size: 10.5px; }
 
 .overview-legend { padding: 0 12px 6px; }
 .overview-legend span { color: var(--faint); font-size: 6.5px; font-weight: 800; letter-spacing: .12em; }
@@ -1761,3 +1802,44 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    Daemons screen's tiles, and the New agent dialog's daemons, directories and
    modes. Tabular figures, so 9 and 10 take the same width down a list. */
 .voice-number { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; min-width: 20px; height: 16px; padding: 0 4px; border-radius: 3px; color: var(--teal-deep); background: var(--teal-soft); font-family: "JetBrains Mono", monospace; font-size: 10px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1; }
+
+/* PRD #1401 — an agent's pull request: its badge, and GitHub's page over the
+   agent's screen. */
+
+/* The badge: the number between a state icon and a review icon, compact
+   enough to sit in the tile's title line beside the status. Colour repeats
+   what the accessible name already says; it never says it alone. */
+.pr-badge { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px; padding: 1px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--ink-soft); background: var(--paper-sunken); font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 700; line-height: 1.3; font-variant-numeric: tabular-nums; }
+button.pr-badge { cursor: pointer; }
+button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-focus); background: var(--teal-soft); }
+.pr-state-open .pr-badge-state { color: var(--green); }
+.pr-state-draft .pr-badge-state { color: var(--muted); }
+.pr-state-merged .pr-badge-state { color: var(--teal); }
+.pr-state-closed .pr-badge-state { color: var(--red); }
+.pr-state-unknown .pr-badge-state { color: var(--faint); }
+.pr-review-approved .pr-badge-review { color: var(--green); }
+.pr-review-changes_requested .pr-badge-review { color: var(--red); }
+.pr-review-review_required .pr-badge-review { color: var(--amber); }
+.pr-review-unknown .pr-badge-review { color: var(--faint); }
+
+/* The browser. Over the agent's pane (90) and below the voice row (95) and
+   every modal (100): the page is drawn by a native webview in `.pr-browser-frame`,
+   which sits above everything this document renders, so the frame stops at the
+   voice row's top edge (`--voice-reserved`) the way the pane does, and the page
+   is hidden while a modal is open over it. */
+.pr-browser-overlay { position: fixed; z-index: 92; inset: 0; display: flex; padding: 14px 14px calc(14px + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); }
+.pr-browser-panel { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; border: 1px solid var(--teal-focus); border-radius: 6px; overflow: hidden; background: var(--paper); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
+.pr-browser-toolbar { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 40px; padding: 0 10px; border-bottom: 1px solid var(--line-strong); background: var(--paper-strong); }
+.pr-browser-title { min-width: 0; display: flex; align-items: center; gap: 7px; color: var(--ink); font-size: 12px; }
+.pr-browser-title strong { flex: 0 0 auto; font-weight: 720; }
+.pr-browser-title span { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+/* The controls are the app's `.button.secondary.compact` and `.icon-button`;
+   only the gap between them is the toolbar's. Close sits apart, in the corner. */
+.pr-browser-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
+.pr-browser-actions .icon-button { margin-left: 6px; }
+.pr-browser-frame { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; background: var(--paper-sunken); }
+/* What the page did not do (Back, a scroll, the hand-off), above the frame: the
+   page is drawn over the frame, so a notice inside it would be hidden. */
+.pr-browser-problem { flex: 0 0 auto; margin: 0; padding: 6px 12px; overflow: hidden; border-bottom: 1px solid var(--red-rim); color: var(--red-ink); background: var(--red-soft); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.pr-browser-notice { max-width: 420px; margin: 0; padding: 0 16px; color: var(--muted); font-size: 12px; text-align: center; }
+@media (max-width: 680px) { .pr-browser-actions .button span { display: none; } }

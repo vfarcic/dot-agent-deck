@@ -5,12 +5,11 @@ expression: text
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
         ┌ Help ───────────────────────────────────────────────────────────────────────────────────────────────┐         
-        │  Global (works from any pane)                       Mouse                                           │         
+        │  Global (chords work from any pane)                 Mouse                                           │         
         │                                                                                                     │         
-        │  Ctrl+d             Toggle command / pane           Mouse click     Focus pane                      │         
-        │  Ctrl+n             Create new agent                Ctrl+click      Open hyperlink                  │         
+        │  d / Ctrl+d         Toggle command / pane           Mouse click     Focus pane                      │         
+        │  n / Ctrl+n         Create new agent                Ctrl+click      Open hyperlink                  │         
         │  Alt+Shift+l        Toggle layout (stacked/tiled)                                                   │         
         │  Ctrl+c             Quit                            New Agent Form                                  │         
         │                                                                                                     │         
@@ -27,16 +26,18 @@ expression: text
         │  k / Up             Select previous card            h / Left / Bksp     Go up one level             │         
         │  1-9                Jump to card N                  Space           Confirm current directory       │         
         │  Enter              Focus selected pane             /               Filter (case-insensitive)       │         
-        │  Ctrl+w             Close selected agent (confirms) Esc             Clear filter (twice = close)    │         
+        │  w / Ctrl+w         Close selected agent (confirms) Esc             Clear filter (twice = close)    │         
         │  Ctrl+l             Toggle orch tab split ratio     q               Cancel                          │         
-        │  Ctrl+z             Zoom focused pane                                                               │         
+        │  z / Ctrl+z         Zoom focused pane                                                               │         
         │  /                  Filter agents                   Session                                         │         
         │  Esc                Clear filter                                                                    │         
-        │  r                  Rename agent                    Panes auto-saved continuously.                  │         
-        │  g                  Generate .dot-agent-deck.toml   Restored automatically on launch.               │         
+        │  r / Ctrl+r         Rename agent                    Panes auto-saved continuously.                  │         
+        │  g / Ctrl+g         Generate .dot-agent-deck.toml   Restored automatically on launch.               │         
         │  y / n              Approve / deny permission                                                       │         
-        │  s                  Schedules manager                                                               │         
-        │  u                  Upgrade (update badge)                                                          │         
+        │  s / Ctrl+s         Schedules manager                                                               │         
+        │  m / Ctrl+m         Host of this deck                                                               │         
+        │  o                  Open pull request                                                               │         
+        │  u / Ctrl+u         Upgrade (update badge)                                                          │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  F1                 Toggle this help                                                                │         
         │  [Close]                                                                                            │         

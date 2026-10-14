@@ -963,8 +963,20 @@ async fn pane_restart_012_force_restart_cancels_the_task_a_busy_refusal_names() 
         vec![WORKER_ROLE.to_string()],
         "the first delegate to an idle worker must be dispatched; response = {first:?}"
     );
+    // One delivery shows the pointer twice: the pty echoes the typed line, and
+    // `cat` writes it back once the submit CR lands. The CR follows the text by
+    // at least `SUBMIT_DELAY` and, while the daemon's echo watch lags a loaded
+    // box, by up to `SUBMIT_ECHO_BOUND` (2 s), so the second copy is waited
+    // for rather than given a fixed settle. A fixed 500 ms settle here let
+    // `cat`'s copy land inside the negative window below on a loaded box,
+    // reading as a second pointer the refusal never wrote.
     assert!(
-        wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(20)).await,
+        wait_for_pointers(
+            &fx.daemon.registry,
+            1,
+            common::load_scaled(Duration::from_secs(20))
+        )
+        .await,
         "precondition: the first task never reached the worker"
     );
     let delivered_once = pointers_in_worker_pane(&fx.daemon.registry);
@@ -1018,7 +1030,12 @@ async fn pane_restart_012_force_restart_cancels_the_task_a_busy_refusal_names() 
         "nothing was outstanding to refuse or supersede; response = {after_restart:?}"
     );
     assert!(
-        wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(20)).await,
+        wait_for_pointers(
+            &fx.daemon.registry,
+            1,
+            common::load_scaled(Duration::from_secs(20))
+        )
+        .await,
         "the delegate after the restart must reach the replacement agent"
     );
 }

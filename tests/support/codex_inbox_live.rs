@@ -198,7 +198,7 @@ impl Codex {
             self.evidence()
         );
         self.deck.send_bytes(b"\x04");
-        self.deck.wait_for_string("[New Agent Ctrl+N]");
+        self.deck.wait_for_string("[New Agent n/Ctrl+N]");
     }
     pub fn input(&self, bytes: &str) -> common::AttachInput {
         let mut input =

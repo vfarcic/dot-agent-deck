@@ -46,6 +46,74 @@ const STOP_FAILURE_HOOK: &str = "StopFailure";
 /// version is treated as older.
 pub const STOP_FAILURE_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 78);
 
+/// PRD #1631: the hook Claude Code runs when it is about to ask the user for
+/// permission — a tool prompt, an `AskUserQuestion` form, a plan approval. Its
+/// payload carries the question, and a decision printed by a hook that is still
+/// running answers it, so the deck HOLDS this hook open until it has an answer
+/// ([`crate::hook`]'s `CLAUDE_HOLD_DEADLINE`). Installed with no matcher, with
+/// [`PERMISSION_REQUEST_HOOK_TIMEOUT_SECS`], and only for a Claude Code at least
+/// [`PERMISSION_REQUEST_MIN_CLAUDE_VERSION`].
+pub const PERMISSION_REQUEST_HOOK: &str = "PermissionRequest";
+
+/// PRD #1631: the first Claude Code release the deck installs
+/// [`PERMISSION_REQUEST_HOOK`] for.
+///
+/// The key exists from 2.0.45, but 2.1.136 is the release whose changelog
+/// fixes `AskUserQuestion` discarding multi-select answers supplied as an
+/// array — which is how the deck answers one. It is above
+/// [`STOP_FAILURE_MIN_CLAUDE_VERSION`], so the "an older release drops every
+/// hook given an unknown key" hazard that gate guards against (issue #714) is
+/// covered here too without measuring the releases in between. An unknown
+/// version is treated as older.
+pub const PERMISSION_REQUEST_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 136);
+
+/// PRD #1631: the `timeout`, in seconds, the deck writes on its
+/// `PermissionRequest` hook. Claude Code's default is 600 s, after which it
+/// cancels the hook and goes ahead as if there were none — so a user who
+/// leaves a prompt for longer still answers it by keyboard. An hour is a
+/// choice, not a measured maximum.
+pub const PERMISSION_REQUEST_HOOK_TIMEOUT_SECS: u64 = 3600;
+
+/// The version-gated hook keys an install writes for one Claude Code (issues
+/// #714 and PRD #1631).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClaudeHookGates {
+    pub stop_failure: bool,
+    pub permission_request: bool,
+    /// The native inbox waiter (PRD #1666, [`CLAUDE_ASYNC_REWAKE_MIN`]).
+    pub async_rewake: bool,
+}
+
+impl ClaudeHookGates {
+    /// The gates for a Claude Code reporting `version`; `None` (unknown) opens
+    /// none of them.
+    pub fn for_version(version: Option<(u64, u64, u64)>) -> Self {
+        Self {
+            stop_failure: version.is_some_and(|v| v >= STOP_FAILURE_MIN_CLAUDE_VERSION),
+            permission_request: version.is_some_and(|v| v >= PERMISSION_REQUEST_MIN_CLAUDE_VERSION),
+            async_rewake: version.is_some_and(|v| v >= CLAUDE_ASYNC_REWAKE_MIN),
+        }
+    }
+
+    /// Only the `StopFailure` gate, as the pre-PRD-#1631 seams take it.
+    pub fn stop_failure_only(stop_failure: bool) -> Self {
+        Self {
+            stop_failure,
+            ..Self::default()
+        }
+    }
+}
+
+/// PRD #1631: the gates for the `claude` on `PATH`, from the same
+/// `claude --version` probe as [`installed_claude_accepts_stop_failure`], with
+/// the raw first line for a message.
+pub fn installed_claude_hook_gates() -> (ClaudeHookGates, Option<String>) {
+    let (_, line) =
+        probe_claude_version(std::ffi::OsStr::new("claude"), CLAUDE_VERSION_PROBE_TIMEOUT);
+    let gates = ClaudeHookGates::for_version(line.as_deref().and_then(parse_claude_version));
+    (gates, line)
+}
+
 /// How long [`installed_claude_accepts_stop_failure`] waits for
 /// `claude --version` before treating the version as unknown. Since issue
 /// #1157 this also runs in `daemon serve` BEFORE it binds, so it is part of the
@@ -146,38 +214,6 @@ const WAITER_HOOK_TYPES: &[&str] = &["SessionStart", "Stop"];
 /// default kills an idle waiter silently (spike §e); 86,400 s was observed
 /// alive past it and is far below 2^31 ms.
 pub const WAITER_TIMEOUT_SECS: u64 = 86_400;
-
-/// Which version-gated Claude Code hook entries an install writes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ClaudeGates {
-    /// The `StopFailure` key (issue #714, [`STOP_FAILURE_MIN_CLAUDE_VERSION`]).
-    pub stop_failure: bool,
-    /// The native inbox waiter (PRD #1666, [`CLAUDE_ASYNC_REWAKE_MIN`]).
-    pub async_rewake: bool,
-}
-
-impl ClaudeGates {
-    /// The gates a Claude Code reporting `output` for `--version` passes; an
-    /// unknown version passes none.
-    pub fn from_version(output: Option<&str>) -> Self {
-        Self {
-            stop_failure: output.is_some_and(claude_version_accepts_stop_failure),
-            async_rewake: output.is_some_and(claude_version_accepts_async_rewake),
-        }
-    }
-}
-
-/// Whether a Claude Code reporting `output` for `--version` gets the native
-/// inbox waiter ([`CLAUDE_ASYNC_REWAKE_MIN`]).
-pub fn claude_version_accepts_async_rewake(output: &str) -> bool {
-    parse_claude_version(output).is_some_and(|v| v >= CLAUDE_ASYNC_REWAKE_MIN)
-}
-
-/// [`installed_claude_accepts_stop_failure`]'s probe, answered as every gate.
-pub fn installed_claude_gates() -> (ClaudeGates, Option<String>) {
-    let (_, line) = installed_claude_accepts_stop_failure();
-    (ClaudeGates::from_version(line.as_deref()), line)
-}
 
 /// Issue #714: parse the leading `MAJOR.MINOR.PATCH` of `claude --version`'s
 /// output (`2.1.283 (Claude Code)`). `None` for anything else.
@@ -441,15 +477,22 @@ fn kill_probe(child: &mut std::process::Child, tree: &crate::platform::proc::Age
 /// Every hook type the deck may have installed, gated or not — what uninstall
 /// sweeps.
 fn hook_types_all() -> Vec<&'static str> {
-    hook_types(true)
+    hook_types(ClaudeHookGates {
+        stop_failure: true,
+        permission_request: true,
+        async_rewake: true,
+    })
 }
 
 /// The hook types to install: [`HOOK_TYPES`], plus [`STOP_FAILURE_HOOK`] when
 /// the installed Claude Code accepts it.
-fn hook_types(with_stop_failure: bool) -> Vec<&'static str> {
+fn hook_types(gates: ClaudeHookGates) -> Vec<&'static str> {
     let mut types = HOOK_TYPES.to_vec();
-    if with_stop_failure {
+    if gates.stop_failure {
         types.push(STOP_FAILURE_HOOK);
+    }
+    if gates.permission_request {
+        types.push(PERMISSION_REQUEST_HOOK);
     }
     types
 }
@@ -753,6 +796,16 @@ fn make_rule(binary_path: &str, hook_type: &str, waiter: bool) -> Value {
             "matcher": "permission_prompt",
             "hooks": handlers
         })
+    } else if hook_type == PERMISSION_REQUEST_HOOK {
+        // PRD #1631: the hook waits for the daemon's answer, so it needs more
+        // than Claude Code's default 600 s.
+        json!({
+            "hooks": [{
+                "type": "command",
+                "command": handlers[0]["command"],
+                "timeout": PERMISSION_REQUEST_HOOK_TIMEOUT_SECS,
+            }]
+        })
     } else {
         json!({
             "hooks": handlers
@@ -920,10 +973,7 @@ fn install_impl(
     install_impl_gated(
         settings,
         binary_path,
-        ClaudeGates {
-            stop_failure: with_stop_failure,
-            async_rewake: false,
-        },
+        ClaudeHookGates::stop_failure_only(with_stop_failure),
     )
 }
 
@@ -931,7 +981,7 @@ fn install_impl(
 fn install_impl_gated(
     settings: &mut Value,
     binary_path: &str,
-    gates: ClaudeGates,
+    gates: ClaudeHookGates,
 ) -> InstallOutcome {
     install_impl_in(
         settings,
@@ -941,7 +991,7 @@ fn install_impl_gated(
     )
 }
 
-/// [`install_impl`] with the install mode spelled out. Under
+/// [`install_impl_gated`] with the install mode spelled out. Under
 /// [`crate::agent_hook_config::InstallMode::Automatic`] a deck command naming
 /// another live, durable install is kept as the hook type's one entry, rule and
 /// all, and a hook type with none gets that install's command — the policy the
@@ -949,12 +999,12 @@ fn install_impl_gated(
 fn install_impl_in(
     settings: &mut Value,
     binary_path: &str,
-    gates: ClaudeGates,
+    gates: ClaudeHookGates,
     mode: crate::agent_hook_config::InstallMode,
 ) -> InstallOutcome {
     use crate::agent_hook_config::{InstallMode, KeptDeckEntry};
 
-    let hook_types = hook_types(gates.stop_failure);
+    let hook_types = hook_types(gates);
     let deck_owned = |cmd: &str| {
         command_is_deck_install(cmd, binary_path) || waiter_is_deck_install(cmd, binary_path)
     };
@@ -1190,13 +1240,16 @@ fn uninstall_impl(settings: &mut Value) -> UninstallOutcome {
         }
     }
     // Issue #714: an emptied `StopFailure` key goes too — an older Claude Code
-    // rejects the key itself, empty or not.
-    if hooks
-        .get(STOP_FAILURE_HOOK)
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| a.is_empty())
-    {
-        hooks.remove(STOP_FAILURE_HOOK);
+    // rejects the key itself, empty or not. PRD #1631: so does an emptied
+    // `PermissionRequest`, for the same reason.
+    for gated in [STOP_FAILURE_HOOK, PERMISSION_REQUEST_HOOK] {
+        if hooks
+            .get(gated)
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| a.is_empty())
+        {
+            hooks.remove(gated);
+        }
     }
 
     UninstallOutcome {
@@ -1408,12 +1461,51 @@ fn owned_command_executable(command: &str) -> Option<String> {
 /// Intended for dashboard startup — **never prints to stdout**, including on
 /// the PRD #381 refusal path: the dashboard is already painting by the time
 /// this can fail, so a refusal goes to `tracing::warn!` and nowhere else.
-pub fn auto_install() {
-    auto_install_to_with_gates(
+///
+/// Returns what the hooks are pinned to afterwards (issue #1637), so the daemon
+/// can name the binary Claude Code's events come from.
+pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
+    auto_install_to_gated(
         &settings_path(),
         crate::platform::paths::durable_binary_path,
-        || installed_claude_gates().0,
-    );
+        || installed_claude_hook_gates().0,
+    )
+    .into_iter()
+    .collect()
+}
+
+/// What Claude Code's hooks are pinned to now, read back from its settings
+/// without installing anything (issue #1637's pin refresh,
+/// `CLAUDE.configured_pins`). An empty list when the settings file is
+/// missing, and `None` when its directory is (as at startup, which installs
+/// nothing then) or the file cannot be read, which leaves the pins the daemon
+/// knows.
+pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
+    configured_pins_in(&settings_path())
+}
+
+/// [`configured_pins`] against an explicit settings path. Like
+/// [`auto_install_to_gated`], nothing is read unless the settings directory
+/// exists.
+fn configured_pins_in(path: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
+    if path.parent().is_none_or(|p| !p.exists()) {
+        return None;
+    }
+    let Some(settings) = crate::agent_hook_config::read_json_config(path)? else {
+        // Confirmed missing: it names nothing, which clears a notice about
+        // the binary it used to name (Qodo on #1656).
+        return Some(Vec::new());
+    };
+    Some(
+        crate::agent_hook_config::configured_deck_executables(&settings, owned_command_executable)
+            .into_iter()
+            .map(|binary| crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::ClaudeCode,
+                config: path.to_path_buf(),
+                binary,
+            })
+            .collect(),
+    )
 }
 
 /// [`auto_install`] against an explicit settings path, with the binary-path
@@ -1436,8 +1528,11 @@ pub fn auto_install() {
 /// Issue #714: this seam installs the base hook set, which every Claude Code
 /// accepts, and never the version-gated `StopFailure`; [`auto_install_to_gated`]
 /// is the same seam with the gate injected, and what [`auto_install`] calls.
-pub fn auto_install_to(path: &Path, resolve: impl FnOnce() -> Result<String, String>) {
-    auto_install_to_gated(path, resolve, || false);
+pub fn auto_install_to(
+    path: &Path,
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> Option<crate::hook_binary::HookPin> {
+    auto_install_to_gated(path, resolve, ClaudeHookGates::default)
 }
 
 /// [`auto_install_to`] with the `StopFailure` gate injected (issue #714):
@@ -1448,24 +1543,10 @@ pub fn auto_install_to(path: &Path, resolve: impl FnOnce() -> Result<String, Str
 pub fn auto_install_to_gated(
     path: &Path,
     resolve: impl FnOnce() -> Result<String, String>,
-    stop_failure: impl FnOnce() -> bool,
-) {
-    auto_install_to_with_gates(path, resolve, || ClaudeGates {
-        stop_failure: stop_failure(),
-        async_rewake: false,
-    });
-}
-
-/// [`auto_install_to_gated`] with every version gate injected
-/// ([`installed_claude_gates`] in production). Asked at the same point, so a
-/// machine without Claude Code still never runs the probe.
-pub fn auto_install_to_with_gates(
-    path: &Path,
-    resolve: impl FnOnce() -> Result<String, String>,
-    gates: impl FnOnce() -> ClaudeGates,
-) {
+    gates: impl FnOnce() -> ClaudeHookGates,
+) -> Option<crate::hook_binary::HookPin> {
     if path.parent().is_none_or(|p| !p.exists()) {
-        return;
+        return None;
     }
 
     let binary_path = match resolve() {
@@ -1474,26 +1555,26 @@ pub fn auto_install_to_with_gates(
         // command name, not a build-artifact path that breaks later.
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return None;
         }
     };
     if let Err(e) = crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path) {
         tracing::warn!("auto-install: {e}");
-        return;
+        return None;
     }
 
     let _guard = match lock_settings(path) {
         Ok(guard) => guard,
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return None;
         }
     };
     let mut settings = match load_settings_or_refuse(path) {
         Ok(settings) => settings,
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return None;
         }
     };
     let before = settings.clone();
@@ -1506,13 +1587,18 @@ pub fn auto_install_to_with_gates(
 
     // Equal settings are not a write (PRD #1487); a pass that only PRUNED is
     // still a change and is published — PRD #381 M4.
+    let pin = crate::hook_binary::HookPin {
+        agent: crate::event::AgentType::ClaudeCode,
+        config: path.to_path_buf(),
+        binary: outcome.named.clone(),
+    };
     if settings == before {
-        return;
+        return Some(pin);
     }
 
     if let Err(e) = write_settings(path, &settings) {
         tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
-        return;
+        return None;
     }
     let binary_path = outcome.named.clone();
     crate::agent_hook_config::log_auto_install_change(
@@ -1539,6 +1625,7 @@ pub fn auto_install_to_with_gates(
             outcome.installed.join(", ")
         );
     }
+    Some(pin)
 }
 
 /// `dot-agent-deck hooks install --agent claude-code` — the explicit, chatty
@@ -1566,7 +1653,7 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
     // Before the settings are read, so a refusal leaves them as they were.
     crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path)
         .map_err(|e| e.to_string())?;
-    let (gates, claude_version) = installed_claude_gates();
+    let (gates, claude_version) = installed_claude_hook_gates();
 
     let path = settings_path();
     let _guard = lock_settings_for_install(&path).map_err(|e| e.to_string())?;
@@ -1607,6 +1694,16 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
              release ignores every hook in the file when it is present). Without it, a Claude \
              Code agent whose provider quota runs out is not shown as Blocked. Run this again \
              after updating Claude Code.",
+            claude_version.as_deref().unwrap_or("nothing usable")
+        );
+    }
+    if !gates.permission_request {
+        let (major, minor, patch) = PERMISSION_REQUEST_MIN_CLAUDE_VERSION;
+        println!(
+            "Note: the {PERMISSION_REQUEST_HOOK} hook was not installed: `claude --version` \
+             reported {}, and the deck installs it only for Claude Code {major}.{minor}.{patch} \
+             or newer. Without it, a Claude Code agent's questions cannot be answered from the \
+             desktop app. Run this again after updating Claude Code.",
             claude_version.as_deref().unwrap_or("nothing usable")
         );
     }
@@ -1669,15 +1766,16 @@ pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> i
     install_to_with_gates(
         path,
         binary_path,
-        ClaudeGates {
-            stop_failure,
-            async_rewake: false,
-        },
+        ClaudeHookGates::stop_failure_only(stop_failure),
     )
 }
 
-/// [`install_to`] with every version gate given.
-pub fn install_to_with_gates(path: &Path, binary_path: &str, gates: ClaudeGates) -> io::Result<()> {
+/// [`install_to`] with every version gate given (PRD #1631).
+pub fn install_to_with_gates(
+    path: &Path,
+    binary_path: &str,
+    gates: ClaudeHookGates,
+) -> io::Result<()> {
     crate::agent_hook_config::ensure_hook_path_is_shell_safe(binary_path)?;
     let _guard = lock_settings_for_install(path)?;
     let mut settings = load_settings_or_refuse(path)?;
@@ -1705,6 +1803,105 @@ pub fn uninstall_from(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
+
+    /// Scenario (issue #1637): the daemon's pin refresh reads back what Claude
+    /// Code's settings pin, writing nothing: no evidence for a missing
+    /// settings directory or an unparseable file (which is left as it is), no
+    /// pin for missing settings or settings holding no deck hook, and the
+    /// binary the deck's hooks name once they are there.
+    #[test]
+    fn configured_pins_reads_the_settings_back_without_writing() {
+        let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        assert_eq!(
+            configured_pins_in(&dir.path().join("absent").join("settings.json")),
+            None,
+            "no settings directory, as at startup"
+        );
+        let path = dir.path().join("settings.json");
+        assert_eq!(configured_pins_in(&path), Some(Vec::new()));
+        assert!(!path.exists(), "a read-back creates nothing");
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert_eq!(configured_pins_in(&path), None);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        assert!(!dir.path().join("settings.json.bak").exists());
+        let user_only = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/usr/bin/true"}]}]}
+        });
+        std::fs::write(&path, user_only.to_string()).unwrap();
+        assert_eq!(configured_pins_in(&path), Some(Vec::new()));
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
+        let pinned = serde_json::json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": hook_command(old)}]}],
+                "PreToolUse": [{"hooks": [{"type": "command", "command": hook_command(old)}]}]
+            }
+        });
+        std::fs::write(&path, pinned.to_string()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let pins = configured_pins_in(&path).expect("readable settings");
+        assert_eq!(
+            pins,
+            vec![crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::ClaudeCode,
+                config: path.clone(),
+                binary: old.to_string(),
+            }]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Scenario (Qodo on #1656): Claude Code's hooks are pinned to an older
+    /// copy, which raised its notice, and then the user deletes
+    /// `settings.json`. The next refresh reads it as naming nothing, so the
+    /// notice clears within one refresh; a settings file that becomes
+    /// unreadable instead keeps the pin and the notice.
+    #[test]
+    fn deleting_the_settings_clears_the_notice_and_a_read_error_keeps_it() {
+        use crate::hook_binary::{DeckIdentity, HookBinaryState, PinRefresh};
+        let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        let path = dir.path().join("settings.json");
+        let old = dir.path().join("missing-old").join("dot-agent-deck");
+        let old = old.to_string_lossy().into_owned();
+        let pinned = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": hook_command(&old)}]}]}
+        });
+        std::fs::write(&path, pinned.to_string()).unwrap();
+        let deck = DeckIdentity {
+            exe: None,
+            version: "0.46.0".into(),
+            self_install_path: None,
+        };
+        let pins = configured_pins_in(&path).expect("readable settings");
+        // `old` does not exist, so its probe fails: an `Unprobeable` notice.
+        let mut state = HookBinaryState::from_startup(deck.clone(), &pins, None);
+        assert_eq!(state.notices().len(), 1);
+        let refresh = |path: &Path| {
+            PinRefresh::classify(
+                &deck,
+                configured_pins_in(path)
+                    .map(|pins| vec![(crate::event::AgentType::ClaudeCode, pins)])
+                    .unwrap_or_default(),
+            )
+        };
+
+        #[cfg(unix)]
+        {
+            // A directory where the settings file should be: unreadable.
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert_eq!(configured_pins_in(&path), None);
+            assert!(!state.apply_refresh(refresh(&path)));
+            assert_eq!(state.notices().len(), 1, "a read error keeps the pin");
+            std::fs::remove_dir(&path).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(state.apply_refresh(refresh(&path)));
+        assert!(state.notices().is_empty(), "{:?}", state.notices());
+    }
 
     /// A malformed `settings.json` is copied to `settings.json.bak` — but never
     /// THROUGH a symlink planted at that path, and since #537 never over one
@@ -2001,6 +2198,99 @@ mod tests {
         assert!(!binary_names_match("some-other-name", &installed));
     }
 
+    /// Scenario: The deck's `PermissionRequest` hook — the one it holds open
+    /// to answer a question — is written with its long `timeout` for Claude
+    /// Code 2.1.136 or newer, and for nothing older or unknown, which would
+    /// drop every hook in the file over an unknown key. A downgrade removes a
+    /// stale one, and uninstall sweeps it with its emptied key.
+    #[spec("hooks/install/018")]
+    #[test]
+    fn hooks_install_018_permission_request_is_version_gated() {
+        assert_eq!(
+            ClaudeHookGates::for_version(Some((2, 1, 136))),
+            ClaudeHookGates {
+                stop_failure: true,
+                permission_request: true,
+                async_rewake: false,
+            }
+        );
+        assert_eq!(
+            ClaudeHookGates::for_version(Some((2, 1, 135))),
+            ClaudeHookGates {
+                stop_failure: true,
+                permission_request: false,
+                async_rewake: false,
+            }
+        );
+        assert_eq!(
+            ClaudeHookGates::for_version(None),
+            ClaudeHookGates::default()
+        );
+
+        let binary = "/opt/deck/dot-agent-deck";
+        let mut settings = serde_json::json!({"hooks": {}});
+        let outcome = install_impl_gated(
+            &mut settings,
+            binary,
+            ClaudeHookGates::for_version(parse_claude_version("2.1.289 (Claude Code)")),
+        );
+        assert!(outcome.installed.contains(&PERMISSION_REQUEST_HOOK));
+        let rules = settings["hooks"][PERMISSION_REQUEST_HOOK]
+            .as_array()
+            .expect("a PermissionRequest rule");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].get("matcher"), None, "every tool's request");
+        assert_eq!(
+            rules[0]["hooks"][0]["timeout"],
+            PERMISSION_REQUEST_HOOK_TIMEOUT_SECS
+        );
+        assert!(
+            rules[0]["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(command_is_ours)
+        );
+        // Idempotent: a second install with the same gates leaves the same file.
+        let before = settings.clone();
+        install_impl_gated(
+            &mut settings,
+            binary,
+            ClaudeHookGates::for_version(Some((2, 1, 289))),
+        );
+        assert_eq!(settings, before);
+
+        for older in [Some((2, 1, 135)), None] {
+            let mut fresh = serde_json::json!({});
+            install_impl_gated(&mut fresh, binary, ClaudeHookGates::for_version(older));
+            assert!(
+                fresh["hooks"].get(PERMISSION_REQUEST_HOOK).is_none(),
+                "{older:?} must not get the key"
+            );
+        }
+        let outcome = install_impl_gated(
+            &mut settings,
+            binary,
+            ClaudeHookGates::for_version(Some((2, 1, 100))),
+        );
+        assert!(
+            outcome.repaired >= 1,
+            "the stale rule is removed on a downgrade"
+        );
+        assert!(settings["hooks"].get(PERMISSION_REQUEST_HOOK).is_none());
+
+        install_impl_gated(
+            &mut settings,
+            binary,
+            ClaudeHookGates::for_version(Some((2, 1, 289))),
+        );
+        let removed = uninstall_impl(&mut settings);
+        assert!(removed.hook_types.contains(&PERMISSION_REQUEST_HOOK));
+        assert!(settings["hooks"].get(PERMISSION_REQUEST_HOOK).is_none());
+        assert!(
+            crate::hook::CLAUDE_HOLD_DEADLINE.as_secs() < PERMISSION_REQUEST_HOOK_TIMEOUT_SECS,
+            "the held hook gives up before Claude Code cancels it"
+        );
+    }
+
     /// Issue #714: the `StopFailure` gate — written for a Claude Code that
     /// accepts it, withheld (and a stale one removed) for one that does not,
     /// and swept by uninstall. The end-to-end half is `status/blocked/011` in
@@ -2087,7 +2377,10 @@ mod tests {
         let mut settings = serde_json::json!({});
 
         let first = install_impl(&mut settings, binary, false);
-        assert_eq!(first.installed, hook_types(false));
+        assert_eq!(
+            first.installed,
+            hook_types(ClaudeHookGates::stop_failure_only(false))
+        );
         assert!(first.skipped.is_empty(), "{:?}", first.skipped);
 
         let second = install_impl(&mut settings, binary, false);
@@ -2096,7 +2389,10 @@ mod tests {
             "a repeat install reported types as newly installed: {:?}",
             second.installed
         );
-        assert_eq!(second.skipped, hook_types(false));
+        assert_eq!(
+            second.skipped,
+            hook_types(ClaudeHookGates::stop_failure_only(false))
+        );
         assert_eq!(second.repaired, 0);
     }
 

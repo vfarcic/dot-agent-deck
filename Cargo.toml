@@ -29,7 +29,7 @@ members = [
 # claim with nothing behind it. `docs/develop/versioning.md` has the rest,
 # including what this means for `cargo update` and Renovate.
 [workspace.package]
-rust-version = "1.97.1"
+rust-version = "1.98.1"
 
 [package]
 name = "dot-agent-deck"
@@ -107,7 +107,7 @@ getrandom = "0.4"
 # release's checksum manifest before `dot-agent-deck upgrade` replaces
 # anything. Already in this workspace's lockfile (the desktop crate's graph
 # carries 0.10.9), so the version resolves to code the workspace builds today.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of
@@ -151,6 +151,10 @@ xtask-screenshots = { path = "xtask/screenshots" }
 # `tauri-utils`, with the same `default-features = false`, so this adds no
 # crate to the build.
 ctor = { version = "1.0", default-features = false }
+# PRD #1589: `src/agent_pty.rs`'s PTY-less test master implements
+# `portable_pty::MasterPty`, whose methods return `anyhow::Error`. Already in the
+# lockfile through `portable-pty` itself, so this adds no crate to the build.
+anyhow = "1"
 
 # PRD #42 M1: `libc` is Unix-only. Every `libc::` reference lives behind a
 # `#[cfg(unix)]` path (mostly `src/platform/*/unix.rs`), so on Windows the

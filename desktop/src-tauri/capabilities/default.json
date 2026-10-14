@@ -1,8 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core permissions for the local dot-agent-deck desktop window",
-  "windows": ["main"],
+  "description": "Core permissions for the app's own webview only. Scoped to the main WEBVIEW by label, not the main window: the in-app pull request browser is a child webview of that window and must match no capability (PRD #1401). Never add `remote` here.",
+  "webviews": ["main"],
   "permissions": ["core:default", "clipboard-manager:allow-write-text"]
 }
-

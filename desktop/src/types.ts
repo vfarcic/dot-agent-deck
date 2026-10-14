@@ -69,6 +69,19 @@ export type AgentInbox = {
   wake: string;
   component?: string;
 };
+/**
+ * Issue #1678: the background work an agent left running after its turn ended,
+ * as the DAEMON counts it — commands still running in their own session and
+ * subagents started and not yet stopped. Present only with at least one count
+ * above zero; `sinceMs` is when the oldest counted item started on the daemon's
+ * clock, absent when the daemon has no start for any of them. The background
+ * aggregate carries counts and an instant, not subagent ids or command lines.
+ */
+export type AgentBackground = {
+  commands: number;
+  subagents: number;
+  sinceMs?: number;
+};
 export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
 export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
 
@@ -261,6 +274,40 @@ export interface ConnectionView {
    * absent otherwise, and in fixture scenarios that do not play one.
    */
   disconnectedReason?: DisconnectedReason;
+  /**
+   * Issue #1637 — agents whose hooks on this deck run an older
+   * `dot-agent-deck` (or, issue #1157, a deck that could not install hooks),
+   * each with the daemon's own remedy so this app and the TUI say the same
+   * thing. Absent when there is nothing to show.
+   */
+  hookBinaryNotices?: HookBinaryNotice[];
+}
+
+/**
+ * Issue #1637 — one hook-binary notice, as the daemon reports it.
+ *
+ * - `"older"`: the hooks run an older release (`version`).
+ * - `"unreported"`: the hooks run a copy so old it does not report a version.
+ * - `"unprobeable"`: the hooks' copy did not answer when asked its version.
+ * - `"ephemeral_location"`: this deck runs from a disk image or a translocated
+ *   location and found no installed copy to pin instead, so it installed no
+ *   hooks; `binary` is its own path.
+ * - `"unknown"`: a reason a newer daemon added.
+ */
+export interface HookBinaryNotice {
+  binary: string;
+  agents: string[];
+  version?: string;
+  daemonVersion: string;
+  reason: "older" | "unreported" | "unprobeable" | "ephemeral_location" | "unknown";
+  /** What to do, in the daemon's words. Never carries a path or a command. */
+  remedy: string;
+  /**
+   * The command that applies the fix, when there is one, shown after
+   * `remedy` and copied by the Copy button. The daemon composes it from
+   * trusted data only, and the bridge drops one that a display would alter.
+   */
+  command?: string;
 }
 
 /**
@@ -684,6 +731,18 @@ export interface PromptKeys {
   deleteChar: { bytes: string; maxLiteralWriteChars?: number };
 }
 
+/**
+ * PRD #1401 — what the badge shows and opens. `url` is present only when it is
+ * a github.com pull request page (`pullRequestFromDto`), so a badge without it
+ * opens nothing.
+ */
+export interface AgentPullRequest {
+  number: number;
+  url?: string;
+  state: import("./lib/bridge").PullRequestState;
+  review?: import("./lib/bridge").PullRequestReview;
+}
+
 export interface AgentSession {
   /** HONEST. Per-daemon monotonic integer, so it is unique only within a daemon. */
   id: string;
@@ -858,6 +917,26 @@ export interface AgentSession {
    * only while the daemon reports the agent in error.
    */
   deliveryNotice?: string;
+  /**
+   * HONEST. PRD #1631: the question the agent is waiting on, from the daemon's
+   * snapshot. Every text field is the agent's own words, scrubbed by the
+   * crate; render it through `displayText` like any other free-form string.
+   */
+  pendingQuestion?: import("./lib/voiceQuestion").PendingQuestionDto;
+  /**
+   * HONEST. PRD #1401 — the pull request the daemon found for the branch this
+   * agent works on (`SessionSnapshot.pull_request`), shown as the tile's badge.
+   * Absent when the daemon knows of none, has no `gh` login, or predates the
+   * field; never filled in by this app.
+   */
+  pullRequest?: AgentPullRequest;
+  /**
+   * HONEST. Issue #1678: background work still running after the agent's turn
+   * ended, copied from the daemon's aggregate and validated at the bridge.
+   * Rendering goes through `displayBackgroundWork`, which words it exactly as
+   * the TUI card does.
+   */
+  background?: AgentBackground;
   /** HONEST. */
   rows: number;
   /** HONEST. */
@@ -931,6 +1010,48 @@ export interface AgentProfile {
   savedToProject: boolean;
 }
 
+/**
+ * PRD #1258 M4 — one watched role's filesystem on a deck's host, as its daemon
+ * reports it. A figure the daemon could not read is absent, never zero.
+ */
+export interface HostDiskUsage {
+  role: string;
+  freeBytes?: number;
+  totalBytes?: number;
+  /** PRD #1258 — the daemon's level for this filesystem's free space. */
+  level?: HostLevel;
+}
+
+/**
+ * PRD #1258 — how healthy one host reading is, as the deck's daemon judged it
+ * against its own thresholds. The app colours from it and never recomputes it;
+ * a reading without one (an older daemon, or an absent number) is shown
+ * uncoloured, not as `ok`.
+ */
+export type HostLevel = "ok" | "warn" | "critical";
+
+/** PRD #1258 M4 — a deck's host sample; every reading but the age may be absent. */
+export interface HostMetrics {
+  disks: HostDiskUsage[];
+  loadPerCpu?: number;
+  cpuCount?: number;
+  memoryUsedBytes?: number;
+  memoryAvailableBytes?: number;
+  /** PRD #1258 — the daemon's level for {@link loadPerCpu}. */
+  loadLevel?: HostLevel;
+  /** PRD #1258 — the daemon's level for available memory as a share of the total. */
+  memoryLevel?: HostLevel;
+  sampledAtMs: number;
+  sampleAgeMs: number;
+}
+
+/**
+ * PRD #1258 M4 — what a deck says about its host: its sample, or that its
+ * daemon does not report one (an older build), which the card states as "not
+ * available from this deck" rather than as zeros.
+ */
+export type HostMetricsReport = { status: "available"; metrics: HostMetrics } | { status: "not-available" };
+
 export interface DeckSnapshot {
   runId: string;
   repo: string;
@@ -968,6 +1089,12 @@ export interface DeckSnapshot {
    * to show "Select a deck" instead. Absent in fixture mode.
    */
   allDecks?: boolean;
+  /**
+   * PRD #1258 M4 — this deck's host, from its own daemon. Absent until the
+   * deck has answered, and for a deck that is not connected. Absent in fixture
+   * mode.
+   */
+  hostMetrics?: HostMetricsReport;
   stages: WorkflowStage[];
   agents: AgentSession[];
   evidence: EvidenceItem[];
@@ -1511,6 +1638,16 @@ export interface DeckRuntimeState {
    */
   answerVoiceNumber?: (utterance: string, heard: import("./lib/voiceNumbers").VoiceNumberedListDto, generation: number) => Promise<import("./lib/voiceNumbers").VoiceNumberAnswerDto>;
   /**
+   * PRD #1631 — an utterance said while the agent on screen waits on a
+   * question (`DeckBridge.resolveVoiceQuestion`), and the send of a whole
+   * answered form (`DeckBridge.sendVoiceAnswer`). Optional like the rest: a
+   * panel on a runtime without them treats nothing as an answer.
+   */
+  resolveVoiceQuestion?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, utterance: string, form: import("./lib/voiceQuestion").QuestionSelectionDto[], awaitingText?: import("./lib/voiceQuestion").QuestionTextSlotDto, localOnly?: boolean) => Promise<import("./lib/voiceQuestion").QuestionResultDto>;
+  sendVoiceAnswer?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, form: import("./lib/voiceQuestion").QuestionSelectionDto[], confirmedAlways: boolean, lease: string) => Promise<import("./lib/voiceQuestion").AnswerOutcomeDto>;
+  /** PRD #1631 (audit A8): cancel the lease an answer is being sent under (`DeckBridge.cancelVoiceAnswer`). */
+  cancelVoiceAnswer?: (lease: string) => Promise<void>;
+  /**
    * Every command in the table, annotated for one screen (PRD #802 D7) — what
    * the discovery overlay lists.
    *
@@ -1528,8 +1665,12 @@ export interface DeckRuntimeState {
   ) => Promise<import("./lib/bridge").VoiceCommandDto[]>;
   /** Open the microphone. Rejects with the not-configured sentence when transcription is off. */
   voiceStart?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
-  /** Close the microphone and transcribe what it heard. No audio crosses the boundary. */
-  voiceStop?: () => Promise<import("./lib/bridge").VoiceTranscriptionDto>;
+  /**
+   * Close the microphone and transcribe what it heard. No audio crosses the
+   * boundary. `onSplit` is called once the backend has split the recording,
+   * before it transcribes (PRD #1631).
+   */
+  voiceStop?: (onSplit?: () => void) => Promise<import("./lib/bridge").VoiceTranscriptionDto>;
   /**
    * What the microphone is doing, and whether one is offered at all.
    *

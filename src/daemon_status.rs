@@ -278,6 +278,11 @@ mod tests {
             blocked: None,
             hook_generation: None,
             delivery_notice: None,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
+            background: None,
+            background_revision: None,
         }
     }
 

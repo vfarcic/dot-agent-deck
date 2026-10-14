@@ -27,12 +27,14 @@
 #[path = "../src/test_temp.rs"]
 mod test_temp;
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use dot_agent_deck::event::{AgentEvent, EventType};
+use dot_agent_deck::event::{
+    AgentEvent, EventType, GenerationVerdict, PANE_GENERATION_METADATA_KEY,
+};
 use dot_agent_deck::state::{AppState, SessionStatus};
 use serde_json::{Value, json};
 use spec::spec;
@@ -73,23 +75,54 @@ fn invoke_hook(agent: &str, payload: &Value) -> AgentEvent {
         .expect("hook stdin")
         .write_all(payload.to_string().as_bytes())
         .expect("write hook payload");
-    let output = child.wait_with_output().expect("wait for hook command");
-    assert!(
-        output.status.success(),
-        "`hook --agent {agent}` rejected a payload: status={} stderr={}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let mut line = String::new();
+                // PRD #1631: a Claude `PermissionRequest` arrives as a held
+                // `question` envelope and waits for an answer on the same
+                // connection, so read ONE line rather than to EOF, unwrap the
+                // event, and release the hook.
+                //
+                // The stream is accepted while the hook is still running, so
+                // its line may not have arrived yet. On macOS an accepted
+                // socket inherits the listener's O_NONBLOCK (Linux's does
+                // not), and the read would fail with `WouldBlock`; make it
+                // blocking, bounded by the same deadline as the accept loop.
+                //
+                // The bound is best-effort. macOS refuses `SO_RCVTIMEO` with
+                // EINVAL once the peer has closed its end, which a short-lived
+                // hook can do before this line runs. A peer that is gone
+                // cannot hang the read: it returns what is buffered and then
+                // EOF, so a refused timeout costs nothing.
                 stream
-                    .read_to_string(&mut line)
+                    .set_nonblocking(false)
+                    .expect("make the accepted stream blocking");
+                let _ = stream.set_read_timeout(Some(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(1)),
+                ));
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut line)
                     .expect("read emitted AgentEvent");
-                return serde_json::from_str(line.trim()).expect("parse emitted AgentEvent");
+                let value: Value = serde_json::from_str(line.trim()).expect("parse emitted line");
+                if value["message_type"] == "question" {
+                    stream
+                        .write_all(b"{\"question_id\":\"\",\"outcome\":\"released\",\"reason\":\"cleared\"}\n")
+                        .expect("release the held hook");
+                    let _ = child.wait();
+                    return serde_json::from_value(value["event"].clone())
+                        .expect("parse the held question's AgentEvent");
+                }
+                let output = child.wait_with_output().expect("wait for hook command");
+                assert!(
+                    output.status.success(),
+                    "`hook --agent {agent}` rejected a payload: status={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return serde_json::from_value(value).expect("parse emitted AgentEvent");
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(
@@ -448,16 +481,39 @@ fn subagent_004_foreground_subagent_keeps_the_turn_working_and_its_prompt_answer
     }
 }
 
-/// Scenario: With the card's turn over (Idle), the daemon's shell-activity scan
-/// sets a synthetic Working (`ShellBusy`) for a detached shell command, a
-/// background subagent's tool call arrives, and the command then finishes
-/// (`ShellIdle`). The card must return to Idle, because the subagent's call says
-/// nothing about the main thread and must not take the synthetic Working over
-/// as its own and strand it. The control — a main-thread call in the same spot —
-/// is a real turn taking over, so the card stays Working through the `ShellIdle`.
+/// Scenario: After Claude's Stop, a new daemon's ShellBusy leaves the card Idle and supplies background work; a subagent's call cannot change the turn status. An old daemon's shell frames still promote to Working, and only a main-thread call may take that synthetic status over.
 #[spec("status/subagent/005")]
 #[test]
 fn subagent_005_subagent_call_does_not_strand_a_synthetic_shell_working() {
+    let mut reporting = apply_all(
+        "claude-code",
+        &[
+            (session_start(), EventType::SessionStart),
+            (stop(), EventType::Idle),
+        ],
+    );
+    let mut busy = serde_json::to_value(invoke_hook("claude-code", &stop())).unwrap();
+    busy["event_type"] = json!("shell_busy");
+    busy["background"] = json!({"commands": 1, "subagents": 0, "since_ms": null});
+    busy["background_revision"] = json!(1);
+    reporting.apply_event(serde_json::from_value(busy).unwrap());
+    assert_eq!(
+        status_of(&reporting),
+        SessionStatus::Idle,
+        "new-daemon ShellBusy must leave the ended turn Idle"
+    );
+    reporting.apply_event(invoke_hook(
+        "claude-code",
+        &subagent_pre_tool_use("toolu_bg_new", BACKGROUND_LS),
+    ));
+    assert_eq!(status_of(&reporting), SessionStatus::Idle);
+    assert_eq!(
+        serde_json::to_value(reporting.sessions[SESSION].live_snapshot()).unwrap()["background"]["commands"],
+        json!(1)
+    );
+
+    // An old daemon supplies no aggregate: preserve its synthetic-Working
+    // takeover protection even though this pane has genuine Claude hooks.
     for (trailing, from_subagent) in [
         (subagent_pre_tool_use("toolu_bg_1", BACKGROUND_LS), true),
         (main_pre_tool_use("toolu_main_2", BACKGROUND_LS), false),
@@ -672,6 +728,561 @@ fn pane_status_of(state: &AppState) -> SessionStatus {
         .unwrap_or_else(|| panic!("no card for {PANE:?}; sessions: {:?}", state.sessions))
         .status
         .clone()
+}
+
+/// Scenario: Attach a fresh TUI to a snapshot carrying background work and a revision, then replay older, equal and clearing updates and reseed an already-held card. Placeholder and real-session cards keep the newest background revision independently of their activity watermark, including after SessionEnd restores a same-spawn placeholder; a different spawn starts a fresh revision domain, a queued SessionEnd of the ending spawn leaves alone a successor hydrated under the same key before it — its card, history, background and hook generation — even when the ending spawn's own card sits under another key, while that spawn's own end still restores a placeholder and closes its generation; and legacy shell promotion still works without the fields.
+#[spec("status/background/003")]
+#[test]
+fn background_003_snapshot_hydration_and_revision_ordering() {
+    let daemon = apply_all(
+        "claude-code",
+        &[
+            (session_start(), EventType::SessionStart),
+            (stop(), EventType::Idle),
+        ],
+    );
+    let mut wire = serde_json::to_value(daemon.sessions[SESSION].live_snapshot()).unwrap();
+    wire["background"] = json!({"commands": 2, "subagents": 1, "since_ms": 1700000000000_i64});
+    wire["background_revision"] = json!(8);
+    let mut tui = AppState::default();
+    tui.register_pane(PANE.into());
+    tui.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        None,
+        Some(&serde_json::from_value(wire.clone()).unwrap()),
+    );
+    let snapshot = |state: &AppState| {
+        serde_json::to_value(
+            state
+                .sessions
+                .values()
+                .find(|s| s.pane_id.as_deref() == Some(PANE))
+                .unwrap()
+                .live_snapshot(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        snapshot(&tui)["background"],
+        wire["background"],
+        "snapshot hydration must retain background work"
+    );
+    assert_eq!(snapshot(&tui)["background_revision"], json!(8));
+    // Clients copy authoritative counts, never infer them from raw hooks.
+    tui.apply_event(invoke_hook(
+        "claude-code",
+        &with(base("SubagentStart"), json!({"agent_id": "raw-only"})),
+    ));
+    tui.apply_event(invoke_hook(
+        "claude-code",
+        &subagent_end("SubagentStop", "raw-only"),
+    ));
+    assert_eq!(
+        snapshot(&tui)["background"],
+        wire["background"],
+        "raw subagent hooks do not reconstruct the daemon aggregate"
+    );
+    let mut event = serde_json::to_value(invoke_hook("claude-code", &stop())).unwrap();
+    event["event_type"] = json!("shell_busy");
+    event["background"] = json!({"commands": 9, "subagents": 0, "since_ms": null});
+    event["background_revision"] = json!(7);
+    tui.apply_event(serde_json::from_value(event.clone()).unwrap());
+    assert_eq!(
+        snapshot(&tui)["background"],
+        wire["background"],
+        "stale replay cannot resurrect/replace newer work"
+    );
+    assert_eq!(pane_status_of(&tui), SessionStatus::Idle);
+    event["background"] = wire["background"].clone();
+    event["background_revision"] = json!(8);
+    tui.apply_event(serde_json::from_value(event.clone()).unwrap());
+    assert_eq!(snapshot(&tui)["background"], wire["background"]);
+    event["background"] = json!({"commands": 0, "subagents": 0, "since_ms": null});
+    event["background_revision"] = json!(9);
+    tui.apply_event(serde_json::from_value(event.clone()).unwrap());
+    assert!(
+        snapshot(&tui)["background"].is_null(),
+        "explicit zero clears the indicator"
+    );
+    event["background"] = wire["background"].clone();
+    event["background_revision"] = json!(8);
+    tui.apply_event(serde_json::from_value(event).unwrap());
+    assert!(
+        snapshot(&tui)["background"].is_null(),
+        "a finished item must not reappear from replay"
+    );
+
+    wire.as_object_mut().unwrap().remove("background");
+    wire.as_object_mut().unwrap().remove("background_revision");
+    let mut legacy = AppState::default();
+    legacy.register_pane(PANE.into());
+    legacy.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        None,
+        Some(&serde_json::from_value(wire).unwrap()),
+    );
+    assert!(snapshot(&legacy)["background"].is_null());
+    let mut old_busy = invoke_hook("claude-code", &stop());
+    old_busy.event_type = EventType::ShellBusy;
+    legacy.apply_event(old_busy);
+    assert_eq!(pane_status_of(&legacy), SessionStatus::Working);
+
+    let mut failures = Vec::new();
+    for placeholder in [true, false] {
+        for held_nonempty in [false, true] {
+            for activity_delta in [0, -1000] {
+                let mut state = AppState::default();
+                state.register_pane(PANE.into());
+                let mut held = invoke_hook("claude-code", &stop());
+                held.agent_id = Some("hydrated-agent".into());
+                held.session_id = if placeholder {
+                    format!("pane-{PANE}")
+                } else {
+                    SESSION.into()
+                };
+                held.background = serde_json::from_value(json!({
+                    "commands": u32::from(held_nonempty), "subagents": 0, "since_ms": null
+                }))
+                .ok();
+                held.background_revision = Some(if placeholder { 9 } else { 8 });
+                held.timestamp = chrono::Utc::now() - chrono::Duration::seconds(5);
+                state.apply_event(held.clone());
+                assert_eq!(state.sessions.len(), 1);
+                let held_card = state.sessions.values().next().unwrap();
+                assert_eq!(held_card.session_id, held.session_id);
+                let mut incoming = held_card.live_snapshot();
+                incoming.last_activity_ms =
+                    Some(held_card.last_activity.timestamp_millis() + activity_delta);
+                incoming.background_revision = Some(if placeholder { 8 } else { 9 });
+                incoming.background = serde_json::from_value(json!({
+                    "commands": u32::from(!held_nonempty), "subagents": 0, "since_ms": null
+                }))
+                .ok();
+                state.seed_hydrated_session(
+                    PANE.into(),
+                    None,
+                    None,
+                    Some("hydrated-agent".into()),
+                    Some(&incoming),
+                );
+                let got = snapshot(&state);
+                let expected_nonempty = if placeholder {
+                    held_nonempty
+                } else {
+                    !held_nonempty
+                };
+                if got["background"]["commands"].as_u64().unwrap_or(0)
+                    != u64::from(expected_nonempty)
+                    || got["background_revision"] != json!(9)
+                {
+                    failures.push(format!("placeholder={placeholder}, held_nonempty={held_nonempty}, activity_delta={activity_delta}: expected commands={}, revision=9; got {got}", u32::from(expected_nonempty)));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "hydration must merge background by revision, independently of activity:\n{}",
+        failures.join("\n")
+    );
+
+    let mut failures = Vec::new();
+    for replay in ["snapshot", "event"] {
+        let mut state = AppState::default();
+        state.register_pane(PANE.into());
+        let mut held: AgentEvent = serde_json::from_value(json!({
+            "session_id": SESSION, "pane_id": PANE, "agent_id": "ending-spawn",
+            "agent_type": "claude_code", "event_type": "idle",
+            "timestamp": chrono::Utc::now() - chrono::Duration::seconds(5),
+            "background": {"commands": 0, "subagents": 1, "since_ms": null},
+            "background_revision": 3
+        }))
+        .unwrap();
+        state.apply_event(held.clone());
+        let older_snapshot = state.sessions.values().next().unwrap().live_snapshot();
+        let mut end = held.clone();
+        end.event_type = EventType::SessionEnd;
+        end.timestamp += chrono::Duration::seconds(1);
+        end.background = serde_json::from_value(json!({
+            "commands": 0, "subagents": 0, "since_ms": null
+        }))
+        .ok();
+        end.background_revision = Some(4);
+        state.apply_event(end);
+        let placeholder = format!("pane-{PANE}");
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(
+            state.sessions[&placeholder].agent_id.as_deref(),
+            Some("ending-spawn")
+        );
+        let terminal = snapshot(&state);
+        if !terminal["background"].is_null() || terminal["background_revision"] != json!(4) {
+            failures.push(format!(
+                "{replay}: terminal clear must hold revision 4; got background={}, revision={}",
+                terminal["background"], terminal["background_revision"]
+            ));
+        }
+        match replay {
+            "snapshot" => state.seed_hydrated_session(
+                PANE.into(),
+                None,
+                None,
+                Some("ending-spawn".into()),
+                Some(&older_snapshot),
+            ),
+            "event" => {
+                held.event_type = EventType::ShellBusy;
+                state.apply_event(held.clone());
+            }
+            _ => unreachable!(),
+        }
+        let after = snapshot(&state);
+        if !after["background"].is_null() || after["background_revision"] != json!(4) {
+            failures.push(format!("{replay}: rev-3 replay resurrected work after terminal rev-4 clear; got background={}, revision={}", after["background"], after["background_revision"]));
+        }
+
+        // The pane's next process has its own ordering domain: revision 1
+        // from that spawn must not be suppressed by the old spawn's clear.
+        state.insert_placeholder_session(PANE.into(), None, None, Some("successor-spawn".into()));
+        held.session_id = placeholder;
+        held.agent_id = Some("successor-spawn".into());
+        held.event_type = EventType::Idle;
+        held.timestamp = chrono::Utc::now();
+        held.background_revision = Some(1);
+        state.apply_event(held);
+        assert_eq!(
+            snapshot(&state)["background"]["subagents"],
+            json!(1),
+            "{replay}: successor accepts its own revision 1"
+        );
+        assert_eq!(snapshot(&state)["background_revision"], json!(1));
+    }
+    assert!(
+        failures.is_empty(),
+        "SessionEnd must preserve the client's terminal replay barrier:\n{}",
+        failures.join("\n")
+    );
+
+    // AU-13: the successor is hydrated under the SAME key before the ending
+    // spawn's queued SessionEnd (Current verdict, revision 40) is drained. That
+    // end is the ending spawn's; it must not remove, restore or seed the
+    // successor's card.
+    let placeholder = format!("pane-{PANE}");
+    let mut state = AppState::default();
+    state.register_pane(PANE.into());
+    let ending: AgentEvent = serde_json::from_value(json!({
+        "session_id": placeholder, "pane_id": PANE, "agent_id": "ending-spawn",
+        "agent_type": "claude_code", "event_type": "idle",
+        "timestamp": chrono::Utc::now() - chrono::Duration::seconds(5),
+        "background": {"commands": 0, "subagents": 1, "since_ms": null},
+        "background_revision": 39
+    }))
+    .unwrap();
+    state.apply_event(ending.clone());
+    assert_eq!(
+        state.sessions[&placeholder].agent_id.as_deref(),
+        Some("ending-spawn")
+    );
+    let mut successor = state.sessions[&placeholder].live_snapshot();
+    successor.tool_count = 7;
+    successor.first_prompts = vec!["the successor's prompt".into()];
+    successor.last_user_prompt = Some("the successor's prompt".into());
+    successor.background =
+        serde_json::from_value(json!({"commands": 1, "subagents": 0, "since_ms": null})).ok();
+    successor.background_revision = Some(1);
+    state.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        Some("successor-spawn".into()),
+        Some(&successor),
+    );
+    let before = state.sessions[&placeholder].clone();
+    assert_eq!(before.agent_id.as_deref(), Some("successor-spawn"));
+    let mut end = ending;
+    end.event_type = EventType::SessionEnd;
+    end.timestamp += chrono::Duration::seconds(1);
+    end.background =
+        serde_json::from_value(json!({"commands": 0, "subagents": 0, "since_ms": null})).ok();
+    end.background_revision = Some(40);
+    end.metadata.insert(
+        PANE_GENERATION_METADATA_KEY.into(),
+        GenerationVerdict::Current.metadata_value().into(),
+    );
+    state.apply_event(end);
+    let after = state
+        .sessions
+        .get(&placeholder)
+        .expect("the successor keeps its card");
+    assert_eq!(after.agent_id.as_deref(), Some("successor-spawn"));
+    assert_eq!(after.started_at, before.started_at);
+    assert_eq!(after.tool_count, 7, "the successor keeps its history");
+    assert_eq!(after.first_prompts, before.first_prompts);
+    assert_eq!(after.last_user_prompt, before.last_user_prompt);
+    assert_eq!(after.recent_events.len(), before.recent_events.len());
+    let kept = snapshot(&state);
+    assert_eq!(
+        (
+            kept["background"]["commands"].clone(),
+            kept["background_revision"].clone()
+        ),
+        (json!(1), json!(1)),
+        "the ending spawn's revision-40 clear is not seeded onto the successor: {kept}"
+    );
+    let mut own: AgentEvent = serde_json::from_value(json!({
+        "session_id": placeholder, "pane_id": PANE, "agent_id": "successor-spawn",
+        "agent_type": "claude_code", "event_type": "idle",
+        "timestamp": chrono::Utc::now(),
+        "background": {"commands": 1, "subagents": 1, "since_ms": null},
+        "background_revision": 1
+    }))
+    .unwrap();
+    own.metadata.insert(
+        PANE_GENERATION_METADATA_KEY.into(),
+        GenerationVerdict::Current.metadata_value().into(),
+    );
+    state.apply_event(own);
+    assert_eq!(
+        snapshot(&state)["background"]["subagents"],
+        json!(1),
+        "the successor's own revision 1 is still accepted"
+    );
+
+    // AU-15 and AU-16: the ending spawn's queued SessionEnd is judged against
+    // the card under its key BEFORE the same-agent reuse remap or any terminal
+    // generation bookkeeping, so a rejected end changes nothing.
+    let frame = |key: &str, pane: &str, agent: &str, kind: EventType, seconds: i64| {
+        let mut event: AgentEvent = serde_json::from_value(json!({
+            "session_id": key, "pane_id": pane, "agent_id": agent,
+            "agent_type": "claude_code", "event_type": "thinking",
+            "timestamp": chrono::DateTime::from_timestamp(seconds, 0).unwrap(),
+        }))
+        .unwrap();
+        event.event_type = kind;
+        event.metadata.insert(
+            PANE_GENERATION_METADATA_KEY.into(),
+            GenerationVerdict::Current.metadata_value().into(),
+        );
+        event
+    };
+    let cards = |state: &AppState| {
+        let mut cards: Vec<_> = state
+            .sessions
+            .iter()
+            .map(|(key, card)| (key.clone(), card.agent_id.clone()))
+            .collect();
+        cards.sort();
+        cards
+    };
+
+    // AU-15: the ending spawn's card is filed under a stable key, its next
+    // conversation reports under the pane key, and the successor is hydrated
+    // under that pane key before the ending spawn's end is drained. The reuse
+    // guard must not spend the pane key — the successor's card — remapping the
+    // end onto the ending spawn's stable card.
+    let mut state = AppState::default();
+    state.register_pane(PANE.into());
+    state.apply_event(frame(
+        "stable-ending-card",
+        PANE,
+        "ending-spawn",
+        EventType::SessionStart,
+        1,
+    ));
+    state.apply_event(frame(
+        &placeholder,
+        PANE,
+        "ending-spawn",
+        EventType::SessionStart,
+        2,
+    ));
+    assert!(!state.sessions.contains_key(&placeholder));
+    let mut successor = state.sessions["stable-ending-card"].live_snapshot();
+    successor.tool_count = 5;
+    successor.first_prompts = vec!["the successor's prompt".into()];
+    successor.background =
+        serde_json::from_value(json!({"commands": 1, "subagents": 0, "since_ms": null})).ok();
+    successor.background_revision = Some(2);
+    state.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        Some("successor-spawn".into()),
+        Some(&successor),
+    );
+    let before_cards = cards(&state);
+    let before = state.sessions[&placeholder].clone();
+    assert_eq!(before.agent_id.as_deref(), Some("successor-spawn"));
+    let mut end = frame(&placeholder, PANE, "ending-spawn", EventType::SessionEnd, 3);
+    end.background =
+        serde_json::from_value(json!({"commands": 0, "subagents": 0, "since_ms": null})).ok();
+    end.background_revision = Some(40);
+    state.apply_event(end);
+    assert_eq!(
+        cards(&state),
+        before_cards,
+        "AU-15: a SessionEnd for another spawn moves no card"
+    );
+    let after = &state.sessions[&placeholder];
+    assert_eq!(after.agent_id.as_deref(), Some("successor-spawn"));
+    assert_eq!(after.started_at, before.started_at);
+    assert_eq!(
+        after.tool_count, 5,
+        "AU-15: the successor keeps its history"
+    );
+    assert_eq!(after.first_prompts, before.first_prompts);
+    assert_eq!(after.recent_events.len(), before.recent_events.len());
+    let kept = serde_json::to_value(after.live_snapshot()).unwrap();
+    assert_eq!(
+        (
+            kept["background"]["commands"].clone(),
+            kept["background_revision"].clone()
+        ),
+        (json!(1), json!(2)),
+        "AU-15: the ending spawn's revision-40 clear is not seeded onto the successor: {kept}"
+    );
+
+    // AU-16: the successor is hydrated with a live hook generation under the
+    // same session key the ending spawn's end names. The rejected end must not
+    // close that generation, count a closure, or record the ending spawn's
+    // generation as ended.
+    let mut state = AppState::default();
+    state.register_pane(PANE.into());
+    state.apply_event(frame(
+        &placeholder,
+        PANE,
+        "ending-spawn",
+        EventType::Thinking,
+        1,
+    ));
+    let mut successor = state.sessions[&placeholder].live_snapshot();
+    successor.hook_generation = Some(dot_agent_deck::state::HookGeneration {
+        session_id: placeholder.clone(),
+        established_ms: 1000,
+    });
+    state.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        Some("successor-spawn".into()),
+        Some(&successor),
+    );
+    let generation_before = state.pane_hook_session_id(PANE);
+    assert_eq!(generation_before.as_deref(), Some(placeholder.as_str()));
+    let closures_before = state.pane_generation_closures(PANE);
+    state.apply_event(frame(
+        &placeholder,
+        PANE,
+        "ending-spawn",
+        EventType::SessionEnd,
+        2,
+    ));
+    assert_eq!(
+        state.sessions[&placeholder].agent_id.as_deref(),
+        Some("successor-spawn")
+    );
+    assert_eq!(
+        state.pane_hook_session_id(PANE),
+        generation_before,
+        "AU-16: the successor's generation survives the rejected end"
+    );
+    assert_eq!(
+        state.pane_generation_closures(PANE),
+        closures_before,
+        "AU-16: the rejected end counts no closure"
+    );
+
+    // The pane check: an end naming the key of a card on ANOTHER pane is
+    // re-keyed to its own pane and leaves that card alone, even when the card
+    // names the same agent.
+    let other_pane = format!("{PANE}-other");
+    let mut state = AppState::default();
+    state.register_pane(PANE.into());
+    state.register_pane(other_pane.clone());
+    state.apply_event(frame(
+        "shared-key",
+        &other_pane,
+        "ending-spawn",
+        EventType::Thinking,
+        1,
+    ));
+    let before = state.sessions["shared-key"].clone();
+    state.apply_event(frame(
+        "shared-key",
+        PANE,
+        "ending-spawn",
+        EventType::SessionEnd,
+        2,
+    ));
+    let after = state
+        .sessions
+        .get("shared-key")
+        .expect("another pane's card survives an end on this pane");
+    assert_eq!(after.pane_id.as_deref(), Some(other_pane.as_str()));
+    assert_eq!(after.agent_id, before.agent_id);
+    assert_eq!(after.recent_events.len(), before.recent_events.len());
+    assert_eq!(
+        state.pane_hook_session_id(&other_pane).as_deref(),
+        Some("shared-key"),
+        "the other pane's generation is not closed by this pane's end"
+    );
+    assert_eq!(state.pane_generation_closures(&other_pane), 0);
+
+    // Controls: the ending spawn's own end still removes its card, restores
+    // the pane's placeholder and closes its generation — under the key its
+    // card is filed under, and remapped from the pane key onto its stable card.
+    for stable in [false, true] {
+        let mut state = AppState::default();
+        state.register_pane(PANE.into());
+        let card_key = if stable {
+            "stable-ending-card"
+        } else {
+            placeholder.as_str()
+        };
+        state.apply_event(frame(
+            card_key,
+            PANE,
+            "ending-spawn",
+            EventType::SessionStart,
+            1,
+        ));
+        state.apply_event(frame(
+            &placeholder,
+            PANE,
+            "ending-spawn",
+            EventType::SessionStart,
+            2,
+        ));
+        assert_eq!(
+            cards(&state),
+            vec![(card_key.to_string(), Some("ending-spawn".into()))],
+            "stable={stable}: the pane-key frame lands on the ending spawn's card"
+        );
+        assert_eq!(
+            state.pane_hook_session_id(PANE).as_deref(),
+            Some(placeholder.as_str())
+        );
+        let closures_before = state.pane_generation_closures(PANE);
+        state.apply_event(frame(
+            &placeholder,
+            PANE,
+            "ending-spawn",
+            EventType::SessionEnd,
+            3,
+        ));
+        assert_eq!(
+            cards(&state),
+            vec![(placeholder.clone(), Some("ending-spawn".into()))],
+            "stable={stable}: the ending spawn's own end restores a bare placeholder"
+        );
+        assert!(state.sessions[&placeholder].recent_events.is_empty());
+        assert_eq!(state.pane_hook_session_id(PANE), None);
+        assert_eq!(state.pane_generation_closures(PANE), closures_before + 1);
+    }
 }
 
 /// Scenario: A background subagent raises a permission request after the turn ended, and only then does a TUI attach, restoring the card from the daemon's live snapshot as it arrives over the wire. When that subagent then stops, the attached TUI's card must leave Needs Input for Idle, as the daemon's does; the control is a snapshot from a daemon that sends no subagent attribution, whose card keeps today's Needs Input.

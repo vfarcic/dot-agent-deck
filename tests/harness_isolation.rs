@@ -17,6 +17,32 @@
 
 mod common;
 
+/// Scenario: A newly spawned daemon loses six seconds of its readiness window,
+/// exceeding the old five-second ceiling. Startup still
+/// returns connectable hook and attach sockets once the runtime resumes.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn harness_inprocess_daemon_survives_delayed_scheduling() {
+    let blocker = tokio::spawn(async {
+        // Advance before the daemon's first poll. A paused clock preserves the
+        // six-second scheduling loss without charging unrelated disk stalls
+        // against the two seconds left in an idle machine's startup budget.
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+    });
+    let started = tokio::time::Instant::now();
+    let daemon = common::spawn_inprocess_daemon().await;
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(6),
+        "the scheduling delay must elapse before startup reports readiness"
+    );
+    blocker.await.expect("runtime blocker finished");
+    for path in [&daemon.hook_path, &daemon.attach_path] {
+        tokio::net::UnixStream::connect(path)
+            .await
+            .expect("startup must return an endpoint that accepts connections");
+    }
+}
+
 /// The five deck endpoint and identity variables, with values that mimic a live
 /// deck's.
 const LIVE_DECK_VARS: [(&str, &str); 5] = [
@@ -452,13 +478,14 @@ mod live_deck_fallback {
 /// The artifacts the harness dumps — the set the discard has to clear. Mirrors
 /// `RECORDING_ARTIFACTS` in `tests/common/mod.rs`; the guard below proves the two
 /// lists and the dump itself still agree.
-const RECORDING_ARTIFACTS: [&str; 6] = [
+const RECORDING_ARTIFACTS: [&str; 7] = [
     "provenance.json",
     "final-grid.txt",
     "final-grid.svg",
     "full-stream.cast",
     "fixture.toml",
     "daemon.log",
+    "deck.log",
 ];
 
 fn adapter_build_script() -> String {

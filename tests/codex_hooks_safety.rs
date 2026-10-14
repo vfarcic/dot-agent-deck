@@ -2031,3 +2031,57 @@ fn codex_trust_007_a_position_still_in_hooks_json_keeps_its_record() {
          {keys:?}"
     );
 }
+
+/// Scenario: Launch the real wrapper in a deck pane against a Codex stand-in whose `app-server` takes 6 s to answer `initialize`, the shape a starved box gave real Codex 0.160.0. The deck's hook must still be trusted in the pinned home's `config.toml` before the stand-in is launched, so Codex would run it rather than stopping on its hook-review dialog.
+#[spec("codex/trust/009")]
+#[test]
+fn codex_trust_009_a_slow_app_server_still_gets_the_spawn_trust_write() {
+    let fixture = test_temp::tempdir().expect("create wrapper fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+    let deck_command = expected_hook_command(
+        seed_durable_binary(deck_home.path())
+            .to_str()
+            .expect("durable path is UTF-8"),
+    );
+    let fake_codex = write_fake_codex(fixture.path());
+    let script = std::fs::read_to_string(&fake_codex).expect("read fake codex");
+    let slow = script.replacen(
+        "then\n    IFS= read -r _initialize\n",
+        "then\n    IFS= read -r _initialize\n    sleep 6\n",
+        1,
+    );
+    assert_ne!(
+        slow, script,
+        "the stand-in's app-server branch must gain the delay"
+    );
+    std::fs::write(&fake_codex, slow).expect("write slow fake codex");
+    let key = "__CODEX_HOME__/hooks.json:pre_tool_use:0:0";
+    let response = hook_list_response(vec![hook_entry(
+        key,
+        &deck_command,
+        "__CODEX_HOME__/hooks.json",
+        "sha256:deck",
+        false,
+    )]);
+
+    let (output, args, _) = run_wrapped_program(
+        std::path::Path::new("codex"),
+        home.path(),
+        fixture.path(),
+        deck_home.path(),
+        &response,
+    );
+
+    assert!(output.status.success(), "wrapper failed: {output:?}");
+    assert!(!args.is_empty(), "the stand-in Codex was never launched");
+    assert!(
+        home.path().join("config.toml").is_file(),
+        "a hooks/list reply 6 s late must still be waited for at spawn; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        trust_state_keys(home.path()),
+        vec![key.replace("__CODEX_HOME__", &home.path().display().to_string())],
+    );
+}

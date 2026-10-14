@@ -1,4 +1,4 @@
-import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -14,10 +14,14 @@ import { UPGRADE_ALREADY_RUNNING, upgradeEndedDeckSessions, type UpgradeChoice, 
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
 import { speechAudioError } from "./speech";
+import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "./voiceQuestion";
+import { pullRequestFromDto } from "./pullRequest";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
+  AgentBackground,
   AgentBlocked,
   AgentInbox,
+  HookBinaryNotice,
   AuthoringKind,
   AgentSession,
   AgentTarget,
@@ -36,6 +40,7 @@ import type { HandoffEdge,
   DesktopFeatures,
   DisconnectedReason,
   EvidenceItem,
+  HostMetricsReport,
   NewAgentOptions,
   NewAgentOrchestrations,
   PromptKeys,
@@ -114,6 +119,8 @@ export interface DesktopSnapshotDto {
     upgradeOffer?: UpgradeOffer;
     /** Issue #1490 — why the deck is not connected and which control to offer; present when `status` is `"disconnected"`. */
     disconnectedReason?: DisconnectedReason;
+    /** Issue #1637 — the daemon's hook-binary notices; omitted by the crate when there are none. */
+    hookBinaryNotices?: HookBinaryNotice[];
   };
   agents: DesktopAgentDto[];
   /*
@@ -213,6 +220,14 @@ export interface DesktopSnapshotDto {
    * `false`.
    */
   allDecks?: boolean;
+  /**
+   * PRD #1258 M4 — this deck's host as its daemon reports it: disk per watched
+   * role, load per core, memory and the sample's age. The crate asks the deck;
+   * nothing here is measured on this machine. Absent when the deck is not
+   * connected or the request failed, in which case the last answer for a
+   * connected deck is kept.
+   */
+  hostMetrics?: HostMetricsReport;
 }
 
 /** One configured-but-unaddressed deck (PRD #742 M12). */
@@ -325,6 +340,14 @@ export interface DesktopAgentDto {
    */
   blocked?: { kind: string; detectedAtMs: number; detail?: string; resetsAtMs?: number };
   /**
+   * Issue #1678: the background work the agent left running after its turn
+   * ended — commands and subagents still going, and when the oldest started
+   * (epoch milliseconds, daemon clock). Absent when there is nothing to show
+   * and from a daemon predating the field. A TYPE ASSERTION, not a validated
+   * value: `agentFromDto` checks every number before anything renders it.
+   */
+  background?: { commands: number; subagents: number; sinceMs?: number };
+  /**
    * PRD #1541 — the keys the daemon says interrupt this agent's turn and edit
    * its prompt (`AgentRecord.prompt_keys`), bounded by the desktop crate's
    * `map_prompt_keys`. Absent when the deck has none for the agent (Devin, an
@@ -351,6 +374,19 @@ export interface DesktopAgentDto {
    */
   deliveryNotice?: string;
   /**
+   * PRD #1631: the question this agent is waiting on
+   * (`SessionSnapshot.pending_question`), every text field scrubbed by the
+   * crate and still the agent's own words. Absent when it waits on nothing,
+   * and from a daemon that predates the field.
+   */
+  pendingQuestion?: PendingQuestionDto;
+  /**
+   * PRD #1401 — the pull request this agent's work produced, copied through
+   * from `SessionSnapshot.pull_request`. Absent when the daemon knows of no PR
+   * or predates the field.
+   */
+  pullRequest?: PullRequestInfoDto;
+  /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
    * value through rather than flattening it to a role string. If the IPC shape
@@ -358,6 +394,21 @@ export interface DesktopAgentDto {
    */
   tab: AgentTab;
 }
+
+/**
+ * PRD #1401 — the daemon's `pull_request_info::PullRequestInfo`. `"unknown"` is what
+ * a value from a newer daemon that this build does not know arrives as.
+ */
+export interface PullRequestInfoDto {
+  number: number;
+  url: string;
+  state: PullRequestState;
+  review?: PullRequestReview;
+}
+
+export type PullRequestState = "open" | "draft" | "merged" | "closed" | "unknown";
+
+export type PullRequestReview = "approved" | "changes_requested" | "review_required" | "unknown";
 
 /** Result returned after the ordered Tauri output channel is registered. */
 export interface TerminalAttachResult {
@@ -833,7 +884,8 @@ export interface SecretStatusDto {
  * by `xtask/linkage-check`'s rule 13, which reads the union in `types.ts` so the
  * table and the app's own type stay in step without a second list.
  */
-export type VoiceScreen = "deck" | "overview" | "agent";
+/** PRD #1401 adds `pull_request`: the in-app pull request browser is open over the screen, which voice treats as a screen of its own (`voice::table::Screen`). */
+export type VoiceScreen = "deck" | "overview" | "agent" | "pull_request";
 
 /**
  * What the New agent dialog's directory browser is showing, declared with an
@@ -1892,6 +1944,27 @@ export interface DeckBridge {
    */
   answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto>;
   /**
+   * PRD #1631 — one utterance said on an agent's own screen while it waits on
+   * a question (`desktop_voice_question`): which options it picks, merged
+   * into `form`, or `not_answer`, which the panel then resolves as a command.
+   * The question is read Rust-side from the deck's snapshot; `target` names
+   * the one the panel saw.
+   */
+  resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto, localOnly?: boolean): Promise<QuestionResultDto>;
+  /**
+   * PRD #1631 — send a whole answered form once the countdown ran out
+   * (`desktop_voice_answer_question`), under `lease`, which
+   * {@link cancelVoiceAnswer} cancels. Every outcome, a refusal included, is
+   * a sentence for the panel's row.
+   */
+  sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string): Promise<AnswerOutcomeDto>;
+  /**
+   * PRD #1631 (audit A8) — the panel no longer wants the answer sent under
+   * `lease` (`desktop_voice_answer_cancel`). Rust holds the request back if it
+   * has not been written yet, and reports "too late" if it has. Never refused.
+   */
+  cancelVoiceAnswer(lease: string): Promise<void>;
+  /**
    * Every row of the command table, annotated for `screen`
    * (`desktop_voice_commands`).
    *
@@ -1927,8 +2000,14 @@ export interface DeckBridge {
    * Stop transcribes rather than handing back a buffer, so no audio crosses the
    * IPC boundary — see the Rust command's own note. What arrives here is a
    * transcript and nothing else.
+   *
+   * `onSplit` is called once the backend has split the recording — the audio
+   * this stop transcribes ends there, and anything heard afterwards is the next
+   * utterance's — before transcription starts (PRD #1631). A runtime that
+   * cannot say when it split need not call it; the caller then treats the
+   * split as happening when this resolves.
    */
-  voiceStop(): Promise<VoiceTranscriptionDto>;
+  voiceStop(onSplit?: () => void): Promise<VoiceTranscriptionDto>;
   /**
    * What the microphone is doing, and whether one is offered at all
    * (`desktop_voice_status`).
@@ -2263,10 +2342,38 @@ function withDeliveryNotice(agents: AgentSession[], payload: unknown): AgentSess
   return next;
 }
 
+/** The largest value the daemon's `u32` counts can take. */
+const U32_MAX = 0xffff_ffff;
+
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= U32_MAX;
+}
+
+/**
+ * Issue #1678: the tile's view of `DesktopAgentDto.background`, or `undefined`
+ * when there is nothing honest to show. The DTO is an assertion about a shape,
+ * so both counts must be integers in the daemon's `u32` range — anything else
+ * drops the whole reading rather than rendering a count the daemon did not send
+ * — and at least one must be above zero. A `sinceMs` that is not a finite
+ * number is dropped on its own: the counts stay true without a duration.
+ */
+export function backgroundFromDto(background: unknown): AgentBackground | undefined {
+  if (typeof background !== "object" || background === null) return undefined;
+  const { commands, subagents, sinceMs } = background as Record<string, unknown>;
+  if (!isCount(commands) || !isCount(subagents) || commands + subagents === 0) return undefined;
+  return {
+    commands,
+    subagents,
+    ...(typeof sinceMs === "number" && Number.isFinite(sinceMs) ? { sinceMs } : {}),
+  };
+}
+
 function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): AgentSession {
+  const background = backgroundFromDto(agent.background);
   const status = statusFromDaemon(agent.status);
   const role = roleFromAgent(agent, index);
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
+  const pullRequest = pullRequestFromDto(agent.pullRequest);
   return {
     id: agent.id,
     daemonId,
@@ -2327,6 +2434,10 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     ...(agent.status === "error" && agent.deliveryNotice
       ? { deliveryNotice: displayText(agent.deliveryNotice, DISPLAY_LIMITS.prompt) }
       : {}),
+    ...(agent.pendingQuestion ? { pendingQuestion: agent.pendingQuestion } : {}),
+    // PRD #1401 — the badge. Checked, not copied: see `pullRequestFromDto`.
+    ...(pullRequest ? { pullRequest } : {}),
+    ...(background ? { background } : {}),
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,
@@ -2510,6 +2621,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
   */
   const daemonId = dto.connection.deckId;
   const agents = dto.agents.map((agent, index) => agentFromDto(agent, index, daemonId));
+  const hostMetrics = dto.connection.status === "connected" ? dto.hostMetrics ?? previous?.hostMetrics : undefined;
   // Three tiers since PRD #819 M6, not four. The daemon-reported agent cwd
   // leads, as it always did; the removed tier was the desktop's own guess at a
   // project directory, which is the read this PRD moved daemon-side.
@@ -2542,6 +2654,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     scheduleRevision: dto.scheduleRevision,
     // #1083: see `DesktopSnapshotDto.allDecks`.
     allDecks: dto.allDecks === true,
+    // PRD #1258 M4: a connected deck keeps its last host answer through a
+    // snapshot that carries none; a deck that is not connected shows none.
+    ...(hostMetrics === undefined ? {} : { hostMetrics }),
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
       deckId: dto.connection.deckId,
@@ -2563,6 +2678,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       listingOptions: dto.connection.listingOptions === true,
       ...(dto.connection.upgradeOffer === undefined ? {} : { upgradeOffer: dto.connection.upgradeOffer }),
       ...(dto.connection.disconnectedReason === undefined ? {} : { disconnectedReason: dto.connection.disconnectedReason }),
+      // Issue #1637: without this the live app never shows a notice, whatever
+      // the daemon reported — only the fixture, which skips this mapping, did.
+      ...(dto.connection.hookBinaryNotices?.length ? { hookBinaryNotices: dto.connection.hookBinaryNotices } : {}),
     },
     // Issue #714: a blocked agent needs a person, so it is `attention` — below
     // `failed`, since nothing has crashed.
@@ -2590,7 +2708,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet", "voice-pages", "upgrade", "upgrade-error"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -3112,6 +3230,35 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   /**
+   * PRD #1631 — the question the agent waits on, answered by the preview's
+   * canned replies (`resolveFixtureQuestion`). Only the `docs-question` state
+   * has an agent waiting on one; everywhere else nothing said is an answer.
+   */
+  async resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string): Promise<QuestionResultDto> {
+    await Promise.resolve();
+    return resolveFixtureQuestion(this.pendingQuestionOf(target), utterance);
+  }
+
+  /** PRD #1631 — the preview answers no agent, so it says so rather than pretending it did. */
+  async sendVoiceAnswer(target: VoiceQuestionTarget): Promise<AnswerOutcomeDto> {
+    await Promise.resolve();
+    if (this.pendingQuestionOf(target)?.id !== target.questionId) {
+      return { kind: "refused", code: "no_pending_question", sentence: "No question is waiting in this agent." };
+    }
+    return { kind: "refused", code: "unsupported", sentence: "The preview cannot answer an agent — nothing was sent." };
+  }
+
+  /** PRD #1631 — the preview sends no answer, so there is nothing to cancel. */
+  async cancelVoiceAnswer(): Promise<void> {
+    await Promise.resolve();
+  }
+
+  private pendingQuestionOf(target: VoiceQuestionTarget): PendingQuestionDto | undefined {
+    const deck = this.fleet.find((candidate) => candidate.connection.deckId === target.deckId);
+    return deck?.agents.find((agent) => agent.id === target.agentId)?.pendingQuestion;
+  }
+
+  /**
    * The preview's vocabulary, annotated the way Rust annotates the real one.
    *
    * Built from the same `FIXTURE_VOICE_COMMANDS` the preview resolves against,
@@ -3198,9 +3345,10 @@ class FixtureDeckBridge implements DeckBridge {
     return fixtureVoiceStatus({ state: "recording", available: true, backend: "remote" });
   }
 
-  async voiceStop(): Promise<VoiceTranscriptionDto> {
+  async voiceStop(onSplit?: () => void): Promise<VoiceTranscriptionDto> {
     const available = await this.voiceAvailable();
     this.microphone.recording = false;
+    onSplit?.();
     // Re-armed for the NEXT activation, which the pipeline opens by itself: the
     // cycle ends by listening again, so this is what lets the script's second
     // line be heard without a second press.
@@ -4814,6 +4962,21 @@ export class TauriDeckBridge implements DeckBridge {
     return invoke<VoiceNumberAnswerDto>("desktop_voice_number", { utterance, heard, generation });
   }
 
+  async resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto, localOnly = false): Promise<QuestionResultDto> {
+    const invoke = await this.getInvoke();
+    return invoke<QuestionResultDto>("desktop_voice_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, utterance, form, awaitingText: awaitingText ?? null, localOnly });
+  }
+
+  async sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string): Promise<AnswerOutcomeDto> {
+    const invoke = await this.getInvoke();
+    return invoke<AnswerOutcomeDto>("desktop_voice_answer_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, form, confirmedAlways, lease, revision: target.revision ?? null });
+  }
+
+  async cancelVoiceAnswer(lease: string): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke<void>("desktop_voice_answer_cancel", { lease });
+  }
+
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
     return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null, dictation: this.voiceDictation ?? null, reading: this.voiceReading ?? null }));
@@ -4839,9 +5002,12 @@ export class TauriDeckBridge implements DeckBridge {
     return invoke<VoiceStatusDto>("desktop_voice_start");
   }
 
-  async voiceStop(): Promise<VoiceTranscriptionDto> {
+  async voiceStop(onSplit?: () => void): Promise<VoiceTranscriptionDto> {
     const invoke = await this.getInvoke();
-    return invoke<VoiceTranscriptionDto>("desktop_voice_stop");
+    const { Channel } = await import("@tauri-apps/api/core");
+    const channel = new Channel<null>();
+    channel.onmessage = () => onSplit?.();
+    return invoke<VoiceTranscriptionDto>("desktop_voice_stop", { onSplit: channel });
   }
 
   async voiceStatus(): Promise<VoiceStatusDto> {

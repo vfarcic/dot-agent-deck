@@ -9,7 +9,7 @@ import { desktopScenario } from "./support";
  */
 
 /** Load a fixture state and open the agent dashboard through its rail control. */
-async function overview(page: Page, state: "docs" | "docs-fleet" | "empty"): Promise<void> {
+async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "empty"): Promise<void> {
   await page.goto(`/?fixture=1&state=${state}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
@@ -25,6 +25,15 @@ desktopScenario("dashboard", async (page) => {
 desktopScenario("dashboard-empty", async (page) => {
   await overview(page, "empty");
   await expect(page.getByTestId("overview-first-run")).toBeVisible();
+});
+
+desktopScenario("pull-request-badge", async (page) => {
+  await overview(page, "docs-pr");
+  await expect(page.locator(".overview-row")).toHaveCount(1);
+  const badge = page.getByTestId("overview-pr-badge");
+  await expect(badge).toHaveAccessibleName("Pull request #1234: open, review required");
+  await expect(badge).toHaveAttribute("data-pr-state", "open");
+  await expect(badge).toHaveAttribute("data-pr-review", "review_required");
 });
 
 desktopScenario("dashboard-fleet", async (page) => {
@@ -51,6 +60,20 @@ desktopScenario("dashboard-filter", async (page) => {
   await expect(page.getByTestId("dashboard-filter-menu")).toHaveCount(0);
   await expect(page.getByTestId("dashboard-filter-line")).toContainText("Working");
   await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
+});
+
+// PRD #1258 — the same fixed host the TUI `host-metrics` image shows
+// (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`), on the `docs` deck.
+// The host button beside the deck's name, opened: its popover is what the
+// image shows, with the temp root's warning and its X (PR #1672 round 10).
+desktopScenario("host-metrics", async (page) => {
+  await overview(page, "docs");
+  await expect(page.getByTestId("host-metrics-button")).toHaveAttribute("data-level", "warn");
+  await page.getByTestId("host-metrics-button").click();
+  await expect(page.getByTestId("host-metrics")).toContainText("0.42 across 16 cores");
+  await expect(page.getByTestId("host-metrics")).toContainText("6 GiB free of 64 GiB total (warning)");
+  await expect(page.getByTestId("host-metrics")).toContainText("Memory available43.5 GiB");
+  await expect(page.getByTestId("host-metrics-popover").getByRole("button", { name: "Close host" })).toBeVisible();
 });
 
 /** Select the fixture project's directory in the shared New agent form. */
@@ -224,6 +247,32 @@ desktopScenario("voice-choice", async (page) => {
   await expect(choice.getByRole("button", { name: "2. Desktop implementation" })).toBeVisible();
   await expect(choice.getByRole("timer")).toBeVisible();
   await expect(page.getByTestId("voice-report")).toContainText("open the agent");
+});
+
+// PRD #1631 — answering an agent's question, desktop-only (the TUI has no
+// voice). The `docs-question` fixture stops the Desktop implementation agent
+// (Codex) on a command approval; with its pane open, the scripted microphone
+// says "go ahead", and the image shows the voice row's answer, naming the
+// option and the command, with its countdown and Cancel, beside the prompt in
+// the pane.
+desktopScenario("voice-question", async (page) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({
+      version: 1,
+      appearance: { mode: "system" },
+      voice: { activation: "toggle", intent: "claude", transcription: "remote" },
+      zoom: { level: 1 },
+    }));
+  });
+  await page.goto("/?fixture=1&state=docs-question&voice=go%20ahead");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+  await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+  await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
+  await page.getByTestId("voice-trigger").click();
+  await expect(page.getByTestId("voice-question")).toContainText("“Yes, proceed” (allow once) — npm install --save-dev msw — sending in");
+  await expect(page.getByTestId("voice-question-cancel")).toBeVisible();
 });
 
 // PR #1451 round 3, change 3 — numbers on lists while voice is on,

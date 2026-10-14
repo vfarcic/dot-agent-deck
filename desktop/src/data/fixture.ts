@@ -1,5 +1,6 @@
 import type { VoiceCommandDto, VoiceReadingStateDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import type { PendingQuestionDto, QuestionResultDto } from "../lib/voiceQuestion";
 import type { SelfCopy, SelfUpgradeApi, SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
 import PROMPT_KEYS_JSON from "./prompt-keys.json";
 import { voicePagesFleet } from "./fixtureCrowded";
@@ -46,7 +47,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice" | "docs-question";
 
 /**
  * PRD #1487 M5 — the versions the `upgrade` scenarios play: this app's, and the
@@ -772,6 +773,122 @@ const docsMessagingAgents: AgentSession[] = [
   { ...crowdedAgent({ id: "2", displayName: "builder", role: "Builder", cli: "codex", status: "running", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 30, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/checkout/RetryPayment.tsx", lastUserPrompt: "Implement the checkout retry flow.", tab: orchestrationTab("docs-messaging", "demo-loop", "demo-loop", "builder", 1, false, "/home/dev/demo-project") }), inbox: { queued: 1, fetched: 0, undeliverable: 0, wake: "doorbell" }, transcript: "Ready to implement the checkout plan\r\n" },
 ];
 
+/**
+ * PRD #1631 — the docs fleet with the Desktop implementation agent (Codex)
+ * stopped on a command approval, as the daemon would project it: Codex's three
+ * options from its per-version table, answered by keys. Its pane shows the
+ * prompt Codex draws, so the `voice-question` screenshot pairs the question the
+ * voice row answers with the one on screen.
+ */
+const DOCS_QUESTION_COMMAND = "npm install --save-dev msw";
+const DOCS_QUESTION_TRANSCRIPT = [
+  // The pane's first two rows sit under its header in the preview, as the
+  // typing-mode image shows of the docs transcript; keep the prompt below them.
+  "",
+  "",
+  "  Would you like to run the following command?",
+  "",
+  "  Reason: install msw to mock the payments API in tests",
+  "",
+  `  $ ${DOCS_QUESTION_COMMAND}`,
+  "",
+  "\u001b[36m› 1. Yes, proceed (y)\u001b[0m",
+  "  2. Yes, and don't ask again for commands that start with `npm install` (p)",
+  "  3. No, and tell Codex what to do differently (esc)",
+  "",
+  "  Press enter to confirm or esc to cancel",
+].join("\r\n");
+export const DOCS_PENDING_QUESTION: PendingQuestionDto = {
+  id: "q-docs-question",
+  kind: "permission",
+  channel: "keys",
+  questions: [{
+    prompt: "Allow Bash?",
+    multiSelect: false,
+    options: [
+      { index: 1, label: "Yes, proceed", role: "allow_once", answerable: true },
+      { index: 2, label: "Yes, and don't ask again for commands that start with the prefix shown", role: "allow_always", answerable: true, scope: `commands that start with the prefix Codex shows for \`${DOCS_QUESTION_COMMAND}\`` },
+      { index: 3, label: "No, and tell Codex what to do differently", role: "deny", answerable: true },
+    ],
+  }],
+  tool: { name: "Bash", detail: DOCS_QUESTION_COMMAND },
+  answerable: true,
+};
+const docsQuestionAgents: AgentSession[] = docsAgents.map((agent) =>
+  agent.id === "2"
+    ? { ...agent, status: "needs_input", activeTool: "Bash", activeToolDetail: DOCS_QUESTION_COMMAND, transcript: DOCS_QUESTION_TRANSCRIPT, pendingQuestion: DOCS_PENDING_QUESTION }
+    : agent,
+);
+
+/**
+ * PRD #1631 — the preview's answer to an utterance said over a pane with a
+ * question waiting. The preview has no Commands model, so it knows the three
+ * replies a permission prompt is given most ("yes" / "go ahead" / "allow it",
+ * "no" / "deny", "always allow") and calls anything else not an answer, which
+ * hands it on to the preview's ordinary vocabulary.
+ */
+export function resolveFixtureQuestion(question: PendingQuestionDto | undefined, utterance: string): QuestionResultDto {
+  const notAnswer: QuestionResultDto = { verdict: { kind: "not_answer" }, resolveMs: null, backend: "fixture" };
+  const said = utterance.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const role = ["yes", "go ahead", "allow it", "allow"].includes(said)
+    ? "allow_once"
+    : ["no", "deny", "deny it"].includes(said)
+      ? "deny"
+      : said === "always allow" ? "allow_always" : undefined;
+  const option = role && question?.questions.length === 1 ? question.questions[0].options.find((candidate) => candidate.role === role && candidate.answerable) : undefined;
+  if (!question || !option) return notAnswer;
+  const what = question.tool?.detail ?? question.tool?.name ?? question.questions[0].prompt;
+  const summary = role === "allow_once" ? `“${option.label}” (allow once) — ${what}` : role === "deny" ? `“${option.label}” (deny) — ${what}` : `“${option.label}” (always allow) — ${option.scope ?? what}`;
+  return {
+    verdict: {
+      kind: "answered",
+      form: [{ questionIndex: 0, optionIndices: [option.index] }],
+      complete: true,
+      ...(role === "allow_always" ? { always: `This will always allow ${option.scope ?? what}. Confirm?` } : {}),
+      summary,
+    },
+    resolveMs: 1,
+    backend: "fixture",
+  };
+}
+
+const FIXTURE_GIB = 1024 ** 3;
+
+/**
+ * PRD #1258 M4 — a deck's host as its daemon reports it, so fixture-mode
+ * screens (and the docs screenshots taken from them) show the host button and
+ * its popover. The numbers are fixed: a screenshot must not change between
+ * runs. `local` is this machine's deck, `remote` a smaller build box.
+ *
+ * The levels are what a daemon with the default thresholds serves for these
+ * numbers — written out, because the app never computes a level itself: the
+ * local temp root at 9% free is a warning; the remote disks at 15% free are a
+ * warning, its load of 1.35 per core too, and its memory at 7% available is
+ * critical.
+ */
+export function fixtureHostMetrics(host: "local" | "remote"): HostMetricsReport {
+  const local = host === "local";
+  const disk = (role: string, free: number, total: number, level: HostLevel) => ({ role, freeBytes: free * FIXTURE_GIB, totalBytes: total * FIXTURE_GIB, level });
+  return {
+    status: "available",
+    metrics: {
+      disks: local
+        ? [disk("working_root", 128, 512, "ok"), disk("worktree_parent", 128, 512, "ok"), disk("temp_root", 6, 64, "warn")]
+        : [disk("working_root", 37.5, 256, "warn"), disk("worktree_parent", 37.5, 256, "warn"), disk("temp_root", 9.5, 32, "ok")],
+      loadPerCpu: local ? 0.42 : 1.35,
+      cpuCount: local ? 16 : 8,
+      memoryUsedBytes: (local ? 18.5 : 12) * FIXTURE_GIB,
+      memoryAvailableBytes: (local ? 43.5 : 1) * FIXTURE_GIB,
+      loadLevel: local ? "ok" : "warn",
+      memoryLevel: local ? "ok" : "critical",
+      sampledAtMs: 1_700_000_000_000,
+      // The local deck's figures are the TUI `host-metrics` capture's
+      // (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`): change the two together.
+      sampleAgeMs: local ? 0 : 1200,
+    },
+  };
+}
+
 /** Two answering daemons with synthetic projects and no demo-run paths. */
 function docsFleet(): DeckSnapshot[] {
   const local = createFixtureSnapshot("docs");
@@ -781,6 +898,7 @@ function docsFleet(): DeckSnapshot[] {
     repo: "service-api",
     worktree: "/home/dev/service-api",
     connection: { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+    hostMetrics: fixtureHostMetrics("remote"),
     agents: [
       crowdedAgent({ id: "1", displayName: "API implementation", role: "Codex", cli: "codex", status: "running", cwd: "/home/dev/service-api", toolCount: 2, upForMinutes: 44, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/routes.rs", lastUserPrompt: "Add the checkout endpoint.", tab: { kind: "dashboard" } }),
       crowdedAgent({ id: "2", displayName: "API review", role: "Claude code", cli: "claude", status: "idle", cwd: "/home/dev/service-api", toolCount: 0, upForMinutes: 19, quietForMinutes: 0, lastUserPrompt: "Review the endpoint contract.", tab: { kind: "dashboard" } }),
@@ -930,6 +1048,8 @@ function fleetDeck(
     stages: connection.status === "connected" ? base.stages : [],
     evidence: connection.status === "connected" ? base.evidence : [],
     handoffs: connection.status === "connected" ? base.handoffs : [],
+    // Only an answering deck reports its host, as in live mode.
+    ...(connection.status === "connected" ? { hostMetrics: fixtureHostMetrics(connection.deckKind === "remote" ? "remote" : "local") } : {}),
   };
 }
 
@@ -946,6 +1066,7 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
   if (state === "voice-pages") return voicePagesFleet(createFixtureSnapshot("crowded"));
   if (state === "upgrade") return upgradeFleet();
   if (state === "upgrade-error") return [upgradeIncompatibleDeck()];
+  if (state === "hook-notice") return hookNoticeFleet();
   if (state !== "fleet") return [createFixtureSnapshot(state)];
   return [
     fleetDeck(
@@ -1059,12 +1180,66 @@ function upgradeFleet(): DeckSnapshot[] {
   ];
 }
 
+/**
+ * Issue #1637 — `?fixture=1&state=hook-notice`: this machine's deck, whose
+ * Claude Code and Codex hooks still run an older Homebrew copy, beside a remote
+ * deck with nothing to report. The notice belongs to the first deck only.
+ */
+function hookNoticeFleet(): DeckSnapshot[] {
+  return [
+    fleetDeck(
+      FIXTURE_DAEMON_ID,
+      {
+        status: "connected",
+        deckId: FIXTURE_DAEMON_ID,
+        socketPath: FIXTURE_DAEMON_ID,
+        message: "Daemon responding",
+        deckKind: "local",
+        hookBinaryNotices: [
+          {
+            binary: "/opt/homebrew/bin/dot-agent-deck",
+            agents: ["Claude Code", "Codex"],
+            version: "0.45.1",
+            daemonVersion: "0.46.0",
+            reason: "older",
+            remedy: "Run:",
+            command: "brew upgrade dot-agent-deck",
+          },
+        ],
+      },
+      docsAgents,
+      DOCS_CWD,
+    ),
+    fleetDeck(
+      FIXTURE_REMOTE_DAEMON_ID,
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      remoteAgents,
+      "/home/dev/code/dot-agent-deck",
+    ),
+  ];
+}
+
 export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
+  if (state === "docs-pr") {
+    const snapshot = createFixtureSnapshot("docs");
+    return {
+      ...snapshot,
+      agents: [{
+        ...snapshot.agents[1],
+        pullRequest: {
+          number: 1234,
+          url: "https://github.com/test-org/test-repo/pull/1234",
+          state: "open",
+          review: "review_required",
+        },
+      }],
+    };
+  }
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
-  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages" || state === "upgrade" || state === "upgrade-error") return createFixtureFleet(state)[0];
-  const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs";
+  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages" || state === "upgrade" || state === "upgrade-error" || state === "hook-notice") return createFixtureFleet(state)[0];
+  const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs" || state === "docs-question";
   const connection = connected
     ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
     : state === "error"
@@ -1072,10 +1247,10 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
       : { status: "disconnected" as const, message: "No daemon is listening on the configured socket." };
 
   const messaging = state === "docs" && typeof window !== "undefined" && new URLSearchParams(window.location.search).get("messaging") === "1";
-  const fleet = messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : agents;
+  const fleet = messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : state === "docs-question" ? docsQuestionAgents : agents;
   // The docs scenario carries only what its screenshots show, so nothing from
   // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
-  const docs = state === "docs";
+  const docs = state === "docs" || state === "docs-question";
 
   return {
     runId: "run_7f24a",
@@ -1099,6 +1274,9 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
     ],
     evidence: state === "empty" || docs ? [] : evidence.map((item) => ({ ...item })),
     profiles: DEFAULT_PROFILES.map((profile) => ({ ...profile })),
+    // The docs scenarios show the host panel the dashboard now carries; the
+    // other single-deck states stay as the unit tests were written against.
+    ...(docs ? { hostMetrics: fixtureHostMetrics("local") } : {}),
   };
 }
 
@@ -1224,20 +1402,32 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Opening settings.",
   },
   {
+    // PR #1672 — a daemon's Host figures, on the dashboard with the New agent
+    // dialog closed, as `commands.toml` says.
+    phrases: ["show host", "host", "open host info", "show resource usage", "how is the machine doing"],
+    action: "show_host_metrics",
+    invoke: "showHostMetrics",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "the Host figures open from the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Showing the Host figures.",
+  },
+  {
     // The VIEW, never the terminal pane — the same line `commands.toml` draws at
-    // this row, because the two are one word apart in speech. Callable on all
-    // three screens for `voice_off`'s reason: the real row has no `screens`
+    // this row, because the two are one word apart in speech. Callable on every
+    // screen (the pull request browser's too, PRD #1401) for `voice_off`'s reason: the real row has no `screens`
     // column, because the overlay it dismisses can be up over any of them.
     phrases: ["close this", "close", "close the agent view", "stop looking at this one"],
     action: "close",
     invoke: "closeTopmost",
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "closing what is on top works anywhere",
     report: "Closed.",
   },
   {
-    // The only entry listing all three screens, because the real row lists
-    // NONE — an absent `screens` column means "everywhere". The fixture's own
+    // One of the entries listing every screen — the three views and the pull
+    // request browser (PRD #1401) — because the real row lists NONE: an absent
+    // `screens` column means "everywhere". The fixture's own
     // matcher is `screens.includes(screen)`, so an empty array here would mean
     // the opposite of what an empty column means in `commands.toml`; spelling
     // the three out is what keeps the preview and the table agreeing.
@@ -1247,7 +1437,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["voice off", "turn off the voice", "turn voice off", "stop listening", "stop voice control", "stop voice", "mute", "mic off"],
     action: "voice_off",
     invoke: "stopVoice",
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "turning voice off works anywhere",
     report: "Voice control off.",
   },
@@ -1260,7 +1450,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["what can i say?", "what can i say", "what can you do?", "help"],
     action: "list_commands",
     invoke: "showVoiceCommands",
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "the list of commands opens anywhere",
     report: "Here is what you can say.",
   },
@@ -1379,7 +1569,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     action: "reading_on",
     invoke: "startReading",
     // Every screen (decision 2 of 2026-10-09): the switch is not tied to a pane.
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "turning reading on works anywhere",
     report: "Reading on.",
   },
@@ -1387,7 +1577,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["reading off", "stop reading", "reading mode off", "done reading"],
     action: "reading_off",
     invoke: "stopReading",
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "turning reading off works anywhere",
     report: "Reading off.",
   },
@@ -1395,7 +1585,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["quiet", "be quiet", "silence", "hush", "shush"],
     action: "hush_reading",
     invoke: "quietSpeech",
-    screens: ["deck", "overview", "agent"],
+    screens: ["deck", "overview", "agent", "pull_request"],
     unavailableHint: "silencing the app's speech works anywhere",
     report: "Quiet.",
   },
@@ -1465,37 +1655,54 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["scroll down", "scroll down a bit", "go down", "move down"],
     action: "scroll_down",
     invoke: "scrollDown",
-    screens: ["overview"],
+    screens: ["overview", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
     report: "Scrolling down.",
   },
   {
     phrases: ["scroll up", "scroll up a bit", "go up", "move up"],
     action: "scroll_up",
     invoke: "scrollUp",
-    screens: ["overview"],
+    screens: ["overview", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
     report: "Scrolling up.",
   },
   {
     phrases: ["scroll to the top", "go to the top", "back to the top"],
     action: "scroll_to_top",
     invoke: "scrollToTop",
-    screens: ["overview"],
+    screens: ["overview", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
     report: "Scrolled to the top.",
   },
   {
     phrases: ["scroll to the bottom", "go to the bottom", "scroll to the end"],
     action: "scroll_to_bottom",
     invoke: "scrollToBottom",
-    screens: ["overview"],
+    screens: ["overview", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
     report: "Scrolled to the bottom.",
+  },
+  {
+    // PRD #1401 — an agent's pull request, in the app's own browser.
+    phrases: ["open the pr", "show the pull request", "open the pull request"],
+    action: "open_pr",
+    invoke: "openPullRequest",
+    screens: ["overview", "agent"],
+    unavailableHint: "a pull request opens from the agent dashboard or from its agent's own screen",
+    report: "Opening the pull request.",
+  },
+  {
+    phrases: ["open it in the browser", "open in browser"],
+    action: "open_pr_in_browser",
+    invoke: "openPullRequestInBrowser",
+    screens: ["pull_request"],
+    unavailableHint: "this works while a pull request is open in the app",
+    report: "Opened it in your browser.",
   },
 ];
 
@@ -1651,6 +1858,12 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
       ...stub,
       outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
     };
+  }
+  /* PRD #1401 — the dashboard has no pane whose pull request a bare "open the
+     PR" means, and the preview resolves no agent names, so it asks, as Rust
+     does when several agents are on the dashboard. */
+  if (command.action === "open_pr" && screen === "overview") {
+    return { ...stub, outcome: { kind: "param_missing", transcript: utterance, action: command.action, param: "agent", sentence: fixtureHeard(utterance, "say which agent's pull request to open") } };
   }
   if (command.action === "filter_directories") {
     const opener = command.openers!.find((candidate) => fixtureOpening(utterance, candidate) !== undefined);

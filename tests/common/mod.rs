@@ -51,6 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use dot_agent_deck::daemon_attach::{DAEMON_START_POLL_TIMEOUT, DAEMON_START_TIMEOUT_ENV};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 /// Decision 21: tunable harness constant for `wait_until_quiescent`.
@@ -121,51 +122,44 @@ pub const CLAUDE_PROMPT_SUBMIT_BASE: Duration = Duration::from_secs(20);
 /// after one Enter before pressing it again.
 pub const CLAUDE_SUBMIT_RETRY: Duration = Duration::from_secs(3);
 
-/// Issue #709: the 1-minute load average per CPU, or `None` where this platform
-/// does not publish one cheaply.
+/// What Claude Code draws in its input box in place of text it took as a paste
+/// too long to show (`[Pasted text #1]`, or `[Pasted text #1 +3 lines]`). See
+/// [`TuiDeck::submit_claude_prompt`] for when a prompt ends up there.
+pub const CLAUDE_PASTE_PLACEHOLDER: &str = "[Pasted text #";
+
+/// The longest prompt [`TuiDeck::submit_claude_prompt`] types; a longer one it
+/// pastes. Claude Code 2.1.296 takes any single read of more than 800
+/// characters as a paste (its input handler's `key.length > 800`), so a prompt
+/// no longer than this cannot be read as one, however its keystrokes are
+/// batched on the way.
+pub const CLAUDE_TYPED_PROMPT_MAX_CHARS: usize = 800;
+
+/// What [`TuiDeck::submit_claude_prompt`] types after a
+/// [`CLAUDE_PASTE_PLACEHOLDER`], so the model is asked, outside the paste, to
+/// act on it. Starts with a space so it does not run into the placeholder.
+pub const CLAUDE_PASTE_DIRECTIVE: &str = " Follow the pasted instructions.";
+
+/// How Claude Code's input showed a prompt before
+/// [`TuiDeck::submit_claude_prompt_shown`] pressed Enter on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudePromptShown {
+    /// Its own text, probe through last word.
+    Text,
+    /// A new [`CLAUDE_PASTE_PLACEHOLDER`] in its place.
+    PastePlaceholder,
+}
+
+/// Issue #709's measurement behind [`load_scaled`]: the 1-minute load average
+/// per CPU, or `None` where this platform does not publish one cheaply (every
+/// target but Linux and macOS). [`load_factor`] says why an unmeasurable load
+/// is not treated as a maximal one.
 ///
-/// Linux reads `/proc/loadavg` and macOS calls `getloadavg(3)`. Elsewhere the
-/// answer is `None`, and [`load_scaled`] then applies NO multiplier at all —
-/// see [`load_factor`] for why an unmeasurable load is not treated as a maximal
-/// one.
-///
-/// **macOS used to be `None` as well, and that was a flake.** This comment said
-/// `getloadavg` was not exposed by the `libc` crate for Apple targets. It is:
-/// `libc` declares it in `unix/bsd/mod.rs`, which `apple` sits under. So
-/// `build-macos` — a 3-core runner under a full `cargo nextest run` — got the
-/// flat [`CHILD_BOOT_BASE`] with no scaling, and `idle_worker_010` failed there
-/// at 8.248 s against that 8 s ceiling with "the pane never entered the closing
-/// state" (PR #1238, run 35747708815): #709's starvation shape, on the one
-/// platform #709 could not scale. [`load_factor`]'s clamp bounds a macOS
-/// reading exactly as it bounds a Linux one.
-pub fn machine_load_per_cpu() -> Option<f64> {
-    let one_minute = one_minute_load_average()?;
-    let cpus = std::thread::available_parallelism().ok()?.get() as f64;
-    if !one_minute.is_finite() || cpus <= 0.0 {
-        return None;
-    }
-    Some(one_minute / cpus)
-}
-
-#[cfg(target_os = "linux")]
-fn one_minute_load_average() -> Option<f64> {
-    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
-    raw.split_whitespace().next()?.parse().ok()
-}
-
-#[cfg(target_os = "macos")]
-fn one_minute_load_average() -> Option<f64> {
-    let mut sample = [0.0_f64; 1];
-    // SAFETY: `getloadavg` writes at most `nelem` (1) doubles into a buffer we
-    // own and have sized to 1, and returns how many it wrote, or -1 on failure.
-    let written = unsafe { libc::getloadavg(sample.as_mut_ptr(), 1) };
-    (written == 1).then_some(sample[0])
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn one_minute_load_average() -> Option<f64> {
-    None
-}
+/// PRD #1258 M2: this is the crate's own implementation, re-exported, not a
+/// copy of it — `src/host_metrics.rs` carries the doc, including why macOS
+/// joined (issue #1244). `load_context` reads `one_minute_load_average` from
+/// the same place.
+pub use dot_agent_deck::host_metrics::machine_load_per_cpu;
+use dot_agent_deck::host_metrics::one_minute_load_average;
 
 /// Issue #709: the largest factor [`load_scaled`] will multiply a base ceiling
 /// by, and therefore the ceiling on how long a starved child is waited for.
@@ -186,14 +180,55 @@ pub(crate) const MAX_LOAD_FACTOR: f64 = 6.0;
 /// the base is returned unscaled rather than at the maximum multiplier. [`load_factor`]
 /// carries that reasoning and the measurement behind it.
 ///
+/// **Contention is the load average OR an I/O / memory stall, whichever is
+/// worse** — see [`stall_factor`]. The load average alone missed the starvation
+/// that failed `delegate_012` with an empty snapshot: 15 on 16 CPUs is a factor
+/// of 1.0, while `/proc/pressure/io` reported `full` for 68% of the window.
+///
 /// Apply this ONLY to a ceiling on something that must HAPPEN, never to a
 /// negative window in which something must NOT happen: the waits it feeds return
 /// the moment their condition holds, so a wider ceiling is free on the happy
 /// path and is paid only where the alternative was a wrong verdict. A negative
 /// window is the opposite — it is always paid in full, and its length is part of
 /// what the test asserts.
+///
+/// PRD #1631's broad `cargo test-e2e` run met the same gap: thirteen tests
+/// failed with `io full` at 52-79% of their windows, and a reading on the same
+/// box afterwards showed a 1-minute load of 16.8 on 16 CPUs (a factor of 1.05)
+/// beside `io full avg10=60.5` (a factor of 2.5). `version_001`'s isolated rerun
+/// logged `io-full=71.9%` at a load of 11.2 on 16 CPUs — a factor of exactly
+/// 1.0 from the load average. Both readings share [`MAX_LOAD_FACTOR`]'s cap.
 pub fn load_scaled(base: Duration) -> Duration {
-    base.mul_f64(load_factor(machine_load_per_cpu()))
+    base.mul_f64(contention_factor(
+        machine_load_per_cpu(),
+        load_context::full_stall_share(),
+    ))
+}
+
+/// The factor [`load_scaled`] applies: the larger of [`load_factor`] and
+/// [`stall_factor`], so each source can only widen a ceiling the other left
+/// alone and the cap binds on both.
+pub(crate) fn contention_factor(load_per_cpu: Option<f64>, stall_share: Option<f64>) -> f64 {
+    load_factor(load_per_cpu).max(stall_factor(stall_share))
+}
+
+/// The factor an I/O or memory stall widens a ceiling by: `1 / (1 - share)`,
+/// clamped to `1.0..=`[`MAX_LOAD_FACTOR`].
+///
+/// `share` is the fraction of recent time during which NOTHING runnable made
+/// progress (PSI `full`), so a child that needs a fixed amount of progress gets
+/// it at roughly `1 - share` of the idle rate, and needs `1 / (1 - share)` of
+/// the idle time. At `delegate_012`'s measured 68% that is ~3.1, turning the
+/// 8 s [`CHILD_BOOT_BASE`] that expired into ~25 s; at 83% or more the cap
+/// binds. Unmeasurable (`None`, non-finite) is 1.0 for [`load_factor`]'s reason.
+pub(crate) fn stall_factor(stall_share: Option<f64>) -> f64 {
+    match stall_share {
+        Some(share) if share.is_finite() => {
+            let progress = (1.0 - share.clamp(0.0, 1.0)).max(1.0 / MAX_LOAD_FACTOR);
+            (1.0 / progress).clamp(1.0, MAX_LOAD_FACTOR)
+        }
+        _ => 1.0,
+    }
 }
 
 /// The factor [`load_scaled`] multiplies its base by, split out from it so the
@@ -275,6 +310,26 @@ pub fn daemon_task_start_budget() -> Duration {
     load_scaled(DAEMON_TASK_START_BASE)
 }
 
+/// PRD #1258: the most [`daemon_start_timeout_for_launch`] hands the deck. It
+/// sits under [`WAIT_TIMEOUT`], the fixed ceiling on the first wait every
+/// launching test makes, so a daemon that never binds still has its deck print
+/// `daemon failed to start within …` onto the screen before that wait expires;
+/// a bound past it would trade that message for an empty grid and buy nothing,
+/// because the test's wait has already given up.
+pub(crate) const DAEMON_START_HARNESS_CEILING: Duration =
+    WAIT_TIMEOUT.saturating_sub(Duration::from_secs(5));
+
+/// PRD #1258: the lazy-spawn start bound a launched deck is given through
+/// [`DAEMON_START_TIMEOUT_ENV`] — the binary's own default
+/// ([`DAEMON_START_POLL_TIMEOUT`], 15 s) widened by [`load_scaled`], up to
+/// [`DAEMON_START_HARNESS_CEILING`]. Measured cause: `dashboard/host-metrics/004`
+/// went red on a starved box (io stalled ~70% of the window) with the deck's
+/// fixed 15 s expiring while its debug daemon was still starting. Only an `e2e`
+/// build of the deck reads the variable, and it never goes below the default.
+pub fn daemon_start_timeout_for_launch() -> Duration {
+    load_scaled(DAEMON_START_POLL_TIMEOUT).min(DAEMON_START_HARNESS_CEILING)
+}
+
 /// Issue #709: how long after a child stops being live its output is still
 /// waited for, so a stand-in that printed and then died is not reported as one
 /// that printed nothing.
@@ -302,6 +357,15 @@ const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
 ///   generous ceiling might otherwise have slowed — a stand-in that DIED rather
 ///   than printed — still fails about as fast as it did against 2 s.
 ///
+/// **The ceiling is re-read while waiting, and can only move later.** Sizing it
+/// once at the start missed a stall that began mid-wait, and the load average
+/// missed an I/O stall altogether: `delegate_012` reported an empty snapshot
+/// after the flat 8 s at load 15 on 16 CPUs, with `io full` at 68% of its
+/// window. Each poll re-takes [`child_boot_budget`] from the wait's start and
+/// keeps the later deadline, so a stall that develops extends it while one that
+/// clears never shortens it, and it stays bounded by [`CHILD_BOOT_BASE`] x
+/// [`MAX_LOAD_FACTOR`].
+///
 /// Use it only for the boot leg. A wait on a BEHAVIOUR the daemon must perform
 /// belongs on that behaviour's own budget, and a negative window in which
 /// something must not happen must not be widened at all — its length is part of
@@ -312,13 +376,15 @@ pub async fn wait_for_child_first_output(
     agent_id: &str,
     needle: &[u8],
 ) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + child_boot_budget();
+    let started = tokio::time::Instant::now();
+    let mut deadline = started + child_boot_budget();
     let mut drain_deadline: Option<tokio::time::Instant> = None;
     loop {
         let snapshot = registry.snapshot(agent_id).unwrap_or_default();
         if snapshot.windows(needle.len()).any(|w| w == needle) {
             return snapshot;
         }
+        deadline = deadline.max(started + child_boot_budget());
         let now = tokio::time::Instant::now();
         if now >= deadline || drain_deadline.is_some_and(|drained| now >= drained) {
             return snapshot;
@@ -679,6 +745,12 @@ pub struct TuiDeck {
     /// [`TuiDeck::dump_recordings`] a failing test deleted the one line that says
     /// why. `None` when a test's `with_env` removed the state-dir pin.
     daemon_log_path: Option<PathBuf>,
+    /// The deck's tracing log (`DOT_AGENT_DECK_LOG`), which the TUI and its
+    /// lazy-spawned daemon both append to (PRD #1258). The harness points it at
+    /// `deck.log` in the test's own temp root so a red says where the time went;
+    /// dumped beside `daemon.log`. `None` when a test's `with_env` gave it a
+    /// value that is not an absolute path (`1`, a relative name).
+    deck_log_path: Option<PathBuf>,
 }
 
 /// Observable terminal-cell styling from the outer vt100 screen driven by the
@@ -1206,6 +1278,24 @@ impl TuiDeck {
         for (k, v) in pinned {
             final_env.insert((*k).into(), (*v).into());
         }
+        // PRD #1258: the deck's lazy-spawn start bound, load-scaled (see
+        // `daemon_start_timeout_for_launch`), and a tracing log for the deck and
+        // its daemon in the test's own temp root. The log sits in `work`, not in
+        // the state dir: the daemon creates that directory, and the TUI opens the
+        // log before any daemon exists — a missing parent would fail the open and
+        // print a warning into the very PTY the test reads. Both are layered
+        // under `with_env`, so a test that sets its own log keeps it.
+        final_env.insert(
+            DAEMON_START_TIMEOUT_ENV.into(),
+            daemon_start_timeout_for_launch().as_millis().to_string(),
+        );
+        final_env.insert(
+            "DOT_AGENT_DECK_LOG".into(),
+            work.join("deck.log")
+                .to_str()
+                .expect("deck log path is UTF-8")
+                .to_string(),
+        );
         // PRD #1487: `env_clear` above drops the test runner's own signal, so
         // pin the agent-config containment contract explicitly — every config
         // writer in the deck, its daemon and their children refuses a
@@ -1253,6 +1343,10 @@ impl TuiDeck {
         let teardown_attach_socket = final_env
             .get("DOT_AGENT_DECK_ATTACH_SOCKET")
             .map(PathBuf::from);
+        let deck_log_path = final_env
+            .get("DOT_AGENT_DECK_LOG")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
         for (k, v) in final_env {
             cmd.env(k, v);
         }
@@ -1366,6 +1460,7 @@ impl TuiDeck {
             record_on_success,
             recording_redactions,
             daemon_log_path,
+            deck_log_path,
         })
     }
 
@@ -1961,6 +2056,34 @@ impl TuiDeck {
     /// `e2e_codex_wrapper.rs` retries Codex's Enter on the same outcome-based
     /// reasoning.
     ///
+    /// **A prompt over [`CLAUDE_TYPED_PROMPT_MAX_CHARS`] is pasted, not typed,
+    /// and submitted with an instruction to follow it.** Claude Code takes a
+    /// single read of more than 800 characters as a paste, and whether a long
+    /// typed prompt's keystrokes arrive in one read is up to the machine's
+    /// load. Measured on `background_008` (a ~900-character prompt, typed)
+    /// on Claude Code 2.1.296, three outcomes: the text rendered; the input
+    /// read `[Pasted text #1]` and nothing else for 46 s (io-full 56%), which
+    /// the probe wait could never see; and, on a quiet machine, the input held
+    /// only the prompt's last 53 characters, starting mid-word, under a
+    /// "paste again to expand" hint — the head taken as a paste and then lost
+    /// when the tail was typed straight after it. The last is a lost prompt no
+    /// reading of the screen can recover. A bracketed paste marks its own end
+    /// rather than leaving Claude Code to infer it from how the bytes were
+    /// read, so a long prompt is sent as one, and every run since has ended in
+    /// the second outcome (four, on `harness/claude-prompt/001` and
+    /// `background_008`). A paste that long is drawn as
+    /// [`CLAUDE_PASTE_PLACEHOLDER`] instead of its text, so a placeholder that
+    /// was not on screen before the prompt was sent is read as the prompt
+    /// sitting in the input. Submitting it sends the whole text, but as pasted
+    /// content, and Haiku declines instructions that arrive only inside a
+    /// paste: measured with `harness/claude-prompt/001`, it echoed all of the
+    /// text and then asked what to do with it. So the helper types
+    /// [`CLAUDE_PASTE_DIRECTIVE`] after the placeholder, waits for it to render,
+    /// and then presses Enter, which is what a user who pasted a task would
+    /// type. That the submission carried the prompt's text and not the
+    /// placeholder's is what the hook-text match below checks, as it does for
+    /// a rendered prompt.
+    ///
     /// Only a `Thinking` event that carries prompt text and arrives AFTER the
     /// prompt is typed counts, so an earlier turn on the same agent — or a
     /// prompt-less `Thinking` such as `PostCompact`'s — cannot satisfy it, and
@@ -1977,6 +2100,20 @@ impl TuiDeck {
         prompt: &str,
         probe: &str,
     ) -> dot_agent_deck::event::AgentEvent {
+        self.submit_claude_prompt_shown(events, agent_id, prompt, probe)
+            .0
+    }
+
+    /// [`TuiDeck::submit_claude_prompt`], also returning how the input showed
+    /// the prompt before it was submitted.
+    #[cfg(unix)]
+    pub fn submit_claude_prompt_shown(
+        &self,
+        events: &EventSub,
+        agent_id: &str,
+        prompt: &str,
+        probe: &str,
+    ) -> (dot_agent_deck::event::AgentEvent, ClaudePromptShown) {
         assert!(
             prompt.contains(probe) && !probe.contains(char::is_whitespace) && !probe.is_empty(),
             "submit_claude_prompt: the probe {probe:?} must be a non-empty, space-free \
@@ -1996,7 +2133,16 @@ impl TuiDeck {
                 && e.user_prompt.is_some()
         };
         let before = events.snapshot().iter().filter(|e| is_submit(e)).count();
-        self.send_keys(prompt.as_bytes());
+        let placeholders = |grid: &str| grid.matches(CLAUDE_PASTE_PLACEHOLDER).count();
+        let placeholders_before = placeholders(&self.snapshot_grid());
+        if prompt.chars().count() > CLAUDE_TYPED_PROMPT_MAX_CHARS {
+            let mut pasted = b"\x1b[200~".to_vec();
+            pasted.extend_from_slice(prompt.as_bytes());
+            pasted.extend_from_slice(b"\x1b[201~");
+            self.send_keys(&pasted);
+        } else {
+            self.send_keys(prompt.as_bytes());
+        }
         // ONE deadline for both halves, so the helper reports its own failure
         // well inside a test's nextest kill window instead of being killed
         // between two back-to-back ceilings.
@@ -2006,24 +2152,59 @@ impl TuiDeck {
         // appearing after it proves the rest did. Word-wrap moves a whole word
         // to the next row rather than splitting it, so a space-free token is
         // matchable on one row.
-        let typed = || {
-            let grid = self.snapshot_grid();
+        let rendered = |grid: &str| {
             let Some(at) = grid.find(probe) else {
                 return false;
             };
             let after = &grid[at + probe.len()..];
             probe.ends_with(tail) || after.contains(tail)
         };
-        while !typed() {
+        let shown = loop {
+            let grid = self.snapshot_grid();
+            if rendered(&grid) {
+                break ClaudePromptShown::Text;
+            }
+            if placeholders(&grid) > placeholders_before {
+                eprintln!(
+                    "[harness] submit_claude_prompt: Claude Code shows the prompt as \
+                     {CLAUDE_PASTE_PLACEHOLDER}N]; typing \
+                     {CLAUDE_PASTE_DIRECTIVE:?} after it and submitting that"
+                );
+                break ClaudePromptShown::PastePlaceholder;
+            }
             if Instant::now() >= deadline {
                 panic!(
-                    "PROMPT NOT DELIVERED: the typed prompt never finished rendering in Claude \
-                     Code's input — no {probe:?} followed by its last word {tail:?} within \
-                     {budget:?} — so nothing after this point was exercised.\nFinal grid:\n{}",
+                    "PROMPT NOT DELIVERED: the prompt never finished rendering in Claude \
+                     Code's input — no {probe:?} followed by its last word {tail:?}, and no new \
+                     {CLAUDE_PASTE_PLACEHOLDER}N] placeholder, within {budget:?} — so nothing \
+                     after this point was exercised.\nFinal grid:\n{}",
                     self.snapshot_grid()
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
+        };
+        if shown == ClaudePromptShown::PastePlaceholder {
+            self.send_keys(CLAUDE_PASTE_DIRECTIVE.as_bytes());
+            let directive_tail = CLAUDE_PASTE_DIRECTIVE
+                .split_whitespace()
+                .last()
+                .expect("a non-empty directive");
+            let directive_typed = |grid: &str| {
+                grid.rfind(CLAUDE_PASTE_PLACEHOLDER)
+                    .is_some_and(|at| grid[at..].contains(directive_tail))
+            };
+            while !directive_typed(&self.snapshot_grid()) {
+                if Instant::now() >= deadline {
+                    panic!(
+                        "PROMPT NOT DELIVERED: Claude Code shows the prompt as a paste, but the \
+                         {CLAUDE_PASTE_DIRECTIVE:?} typed after its placeholder never rendered \
+                         within {budget:?} — so nothing after this point was exercised.\n\
+                         Final grid:\n{}",
+                        self.snapshot_grid()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         // The hook reports the submitted text truncated to 200 bytes, so the
         // match catches a prefix submitted short of that and a garbled one; a
@@ -2062,7 +2243,7 @@ impl TuiDeck {
                              only after Enter #{enters}"
                         );
                     }
-                    return ev;
+                    return (ev, shown);
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -2899,16 +3080,21 @@ const DAEMON_LOG_TAIL_LINES: usize = 40;
 /// front of whoever reads a red `e2e-deterministic` run. Bounded, because a
 /// chatty daemon must not bury the assertion that failed.
 fn eprint_daemon_log_tail(redacted: &[u8], where_the_rest_is: &str) {
+    eprint_log_tail("daemon.log", redacted, where_the_rest_is);
+}
+
+/// [`eprint_daemon_log_tail`] for any dumped log, labelled `name`.
+fn eprint_log_tail(name: &str, redacted: &[u8], where_the_rest_is: &str) {
     let text = String::from_utf8_lossy(redacted);
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(DAEMON_LOG_TAIL_LINES);
     eprintln!(
-        "[tui-harness] daemon.log (last {} of {} lines; {where_the_rest_is}):",
+        "[tui-harness] {name} (last {} of {} lines; {where_the_rest_is}):",
         lines.len() - start,
         lines.len(),
     );
     for line in &lines[start..] {
-        eprintln!("[daemon.log] {line}");
+        eprintln!("[{name}] {line}");
     }
 }
 
@@ -3040,6 +3226,30 @@ impl TuiDeck {
                     if outcome == RecordingOutcome::Failed {
                         let copy = dir.join("daemon.log");
                         eprint_daemon_log_tail(
+                            &redacted,
+                            &format!("full copy at {}", copy.display()),
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        // deck.log — PRD #1258. The TUI's and the daemon's tracing log, which
+        // `daemon.log` (stdout and stderr only) does not carry: it is where the
+        // daemon's pre-bind timing lands, so a start that timed out says whether
+        // the login-shell capture or the installers took the time. Redacted like
+        // the rest; its tail goes to stderr on a failure for the same reason.
+        if let Some(src) = self.deck_log_path.as_deref() {
+            match std::fs::read(src) {
+                Ok(bytes) => {
+                    let redacted = redact_known_credentials_bytes(&bytes, &redactions);
+                    atomic_write(&dir.join("deck.log"), &redacted)?;
+                    if outcome == RecordingOutcome::Failed {
+                        let copy = dir.join("deck.log");
+                        eprint_log_tail(
+                            "deck.log",
                             &redacted,
                             &format!("full copy at {}", copy.display()),
                         );
@@ -5009,13 +5219,14 @@ pub fn current_test_recordings_dir() -> PathBuf {
 /// will publish the cast, so removing it before the cast means a discard that
 /// panics partway has already made whatever survives unpublishable. The dump
 /// writes it LAST for the mirror-image reason.
-const RECORDING_ARTIFACTS: [&str; 6] = [
+const RECORDING_ARTIFACTS: [&str; 7] = [
     "provenance.json",
     "final-grid.txt",
     "final-grid.svg",
     "full-stream.cast",
     "fixture.toml",
     "daemon.log",
+    "deck.log",
 ];
 
 /// Schema version of the `provenance.json` sidecar (issue #808).
@@ -5893,21 +6104,35 @@ pub(crate) const OPENCODE_PROBE_PROMPT: &str =
     "Reply with only the number equal to 4000 plus 444. Do not use tools.";
 const OPENCODE_PROBE_ANSWER: &str = "4444";
 
-/// Upper bound on the [`check_opencode_available`] model probe.
+/// Upper bound on the [`check_opencode_available`] model probe on a quiet box;
+/// the probe waits [`load_scaled`] of it (issue #709's helper), so a quiet box
+/// still gives up after 60 s and a starved one waits up to [`MAX_LOAD_FACTOR`]
+/// times as long.
 ///
 /// 4.3 s warm, measured 2026-09-08 (`opencode run --model
 /// anthropic/claude-haiku-4-5-20251001` in a virgin HOME), so this is ~14x the
 /// observation — generous, because a cold OpenCode has a provider list to fetch
-/// and this must not become a flake source.
+/// and this must not become a flake source. Generous was still not enough on a
+/// starved box: during PRD #1631's lane-2 run `question_live_005`'s probe
+/// failed with "did not finish within 60s" at `io full` 70.7% of the window,
+/// and the same test passed alone. A flat ceiling cannot be generous enough
+/// there without being slow to fail on a quiet box, which is what scaling it
+/// avoids.
 ///
-/// FINITE, which the sibling [`check_codex_available`] probe is not. An
+/// FINITE, as the sibling [`check_codex_available`] preflight has also been
+/// since PRD #1631 ([`CODEX_PREFLIGHT_BASE`]). An
 /// unbounded probe that wedges spends the test's entire nextest kill window
 /// (3 x 60 s by default here; some callers widen theirs in
 /// `.config/nextest.toml`), after which the process is SIGKILLed — producing
 /// no skip, no failure message and no diagnostics whatever. 60 s leaves two
 /// thirds of the default window for the scenario the probe is only the gate
-/// for.
-const OPENCODE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// for. Scaled, it can reach 360 s, past that default window, so a test that
+/// keeps the default window loses its diagnostics to the kill once the box is
+/// starved enough to scale the probe past ~120 s — where the flat 60 s failed
+/// it anyway. When this was written, three OpenCode-probing tests kept the
+/// default: `prompt_voice_keys_005`, `reading_reply_004` and
+/// `status_blocked_023`.
+const OPENCODE_PROBE_BASE: Duration = Duration::from_secs(60);
 
 /// One bounded, minimal turn against [`opencode_test_model`], so a model these
 /// credentials cannot reach SKIPS with the model named rather than failing deep
@@ -5935,7 +6160,8 @@ fn opencode_model_probe() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("could not run the OpenCode model probe: {e}"))?;
 
-    let deadline = Instant::now() + OPENCODE_PROBE_TIMEOUT;
+    let ceiling = load_scaled(OPENCODE_PROBE_BASE);
+    let deadline = Instant::now() + ceiling;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -5959,7 +6185,7 @@ fn opencode_model_probe() -> Result<(), String> {
     // here and they need different fixes; #878/#921 is the cautionary case for
     // a diagnostic that picked one and asserted it.
     let observed = match status {
-        None => format!("did not finish within {OPENCODE_PROBE_TIMEOUT:?}"),
+        None => format!("did not finish within {ceiling:?}"),
         Some(s) if !s.success() => format!("exited unsuccessfully ({s})"),
         Some(_) => format!("exited 0 but never answered {OPENCODE_PROBE_ANSWER:?}"),
     };
@@ -6005,65 +6231,69 @@ fn opencode_env_key_authorises() -> bool {
         && anthropic_api_key().is_some()
 }
 
-/// Compiled-in default cheap model for Codex availability probes and real-agent
-/// e2e coverage. Reachable by an **API-key** `~/.codex/auth.json`; a
-/// ChatGPT-subscription (oauth) host must override it — see [`codex_test_model`].
-const CODEX_TEST_MODEL_DEFAULT: &str = "gpt-5.1-codex-mini";
+/// Default cheap Codex model on a host whose `~/.codex/auth.json` is a
+/// **ChatGPT-subscription** login (`"auth_mode": "chatgpt"`), the most common
+/// way Codex is authenticated. See [`codex_test_model`].
+///
+/// Measured 2026-10-10 on codex-cli 0.160.0 with a ChatGPT login: `codex exec
+/// --model gpt-5.6-luna` answered the probe, and six of the seven real-agent
+/// Codex tests ran and passed on it under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`
+/// (issue #656); `codex_live_001` stayed unverified there because that host
+/// refuses unprivileged user namespaces, a precondition of its own. The same
+/// login refused `gpt-5.1-codex-mini` and `gpt-5.4-mini` with "The '<id>' model
+/// is not supported when using Codex with a ChatGPT account".
+pub(crate) const CODEX_TEST_MODEL_CHATGPT_DEFAULT: &str = "gpt-5.6-luna";
+
+/// Default cheap Codex model on every other host — an **API-key**
+/// `~/.codex/auth.json`, or one whose `auth_mode` this harness does not
+/// recognise. See [`codex_test_model`].
+///
+/// Measured by PRD #225 (2026-07) on an API-key host: `gpt-5-nano` answered,
+/// while `gpt-5.1-codex-mini` and `gpt-5.1-codex` returned `404 Model not found`.
+/// Not re-measured since; the box that wrote issue #656's fix holds only a
+/// ChatGPT login.
+pub(crate) const CODEX_TEST_MODEL_API_KEY_DEFAULT: &str = "gpt-5-nano";
 
 /// Env var that overrides [`codex_test_model`] on a host whose Codex credentials
-/// cannot reach the default.
+/// cannot reach the default for their auth mode.
 pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
 
-/// Cheap model used by Codex availability probes and real-agent e2e coverage —
-/// [`CODEX_TEST_MODEL_DEFAULT`] unless `DOT_AGENT_DECK_CODEX_TEST_MODEL` is set
-/// to a non-empty value, which wins.
+/// The `auth_mode` recorded in the host's `~/.codex/auth.json`, or `None` when
+/// the file is missing, unreadable or carries no such string. Only the one field
+/// is read; no token leaves this function.
+fn codex_auth_mode() -> Option<String> {
+    let path = host_home().join(".codex").join("auth.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    root.get("auth_mode")?.as_str().map(str::to_string)
+}
+
+/// The default model for a given `auth_mode`: [`CODEX_TEST_MODEL_CHATGPT_DEFAULT`]
+/// for `chatgpt`, [`CODEX_TEST_MODEL_API_KEY_DEFAULT`] for anything else.
+pub(crate) fn codex_default_model_for(auth_mode: Option<&str>) -> &'static str {
+    match auth_mode {
+        Some(mode) if mode.eq_ignore_ascii_case("chatgpt") => CODEX_TEST_MODEL_CHATGPT_DEFAULT,
+        _ => CODEX_TEST_MODEL_API_KEY_DEFAULT,
+    }
+}
+
+/// Cheap model used by Codex availability probes and real-agent e2e coverage:
+/// `DOT_AGENT_DECK_CODEX_TEST_MODEL` when set to a non-empty value, otherwise a
+/// default chosen by the host's Codex auth mode ([`codex_default_model_for`]).
 ///
-/// The override exists because no single model id is reachable by both Codex
-/// auth modes, so whichever one the default targets, the other needs an escape
-/// hatch.
+/// **Why the default follows the auth mode (issue #656).** The two Codex auth
+/// modes reach different model families, and no id has been measured working
+/// for both. A single compiled-in default (`gpt-5.1-codex-mini` until #656)
+/// was refused by a ChatGPT login, so on the most common host every real-agent
+/// Codex test failed its probe, printed `SKIP:`, and was counted as passed by
+/// nextest — no coverage, reported green. Picking per mode makes the default
+/// reachable on both paths the harness has measured.
 ///
-/// The `codex-*` family is **API-key only**. On a ChatGPT-subscription (oauth)
-/// `~/.codex/auth.json`, `codex exec --model gpt-5.1-codex-mini` answers
-/// `400 invalid_request_error: The 'gpt-5.1-codex-mini' model is not supported
-/// when using Codex with a ChatGPT account` (measured 2026-08-23), so
-/// [`check_codex_available`] fails its probe and every real-agent Codex test
-/// SKIPS — a silent no-coverage outcome that reads as a pass.
-///
-/// A subscription host therefore exports a plain `gpt-5.*` model it *can* reach,
-/// e.g. `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-luna` (verified 2026-08-26:
-/// `codex exec` answered `CODEX_AUTH_OK`, and codex-cli 0.149.0's interactive TUI
-/// came up on it).
-///
-/// `gpt-5.4-mini` — what this line named until 2026-08-26 — was re-probed the
-/// same day and still worked then, by both routes. **It no longer does on a
-/// ChatGPT login:** on 2026-10-04 codex-cli 0.160.0 answered `The
-/// 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT
-/// account` while `gpt-5.6-luna` answered (issue #1564), so a host still
-/// exporting it now fails [`check_codex_available`]'s probe. (The 2026-08-26 probe
-/// that appeared to condemn it was measuring its own defect —
-/// a `pty.fork()` left at a 0x0 window size, into which codex-cli paints nothing
-/// whatever the model. Both ids emit the identical 523 bytes of empty repaint at
-/// 0x0 and the identical 2492 bytes ending in `? for shortcuts` at 180x45.)
-///
-/// **Setting it makes the tests run, not pass.** They then fail on an unrelated
-/// defect: Codex 0.149.0 does not execute the deck's trusted command hooks in
-/// **interactive TUI** mode, so no hook-sourced event ever reaches the deck and
-/// assertions wanting a `Thinking` carrying `user_prompt` time out. Measured
-/// 2026-08-23 against one `CODEX_HOME` with identical `hooks.json`, identical
-/// trust records and an identical socket: `codex exec` delivered `session_start`,
-/// `thinking` (with `user_prompt`) and `idle`; the same home driven interactively
-/// delivered nothing, while the turn itself ran (the deck still saw `ShellBusy`
-/// from the stdout classifier). `docs/develop/agent-adapters.md` records
-/// interactive hooks working on 0.145.0, so this is a regression in that range,
-/// and it is auth-mode independent — an API-key host on 0.149.0 fails the same
-/// way. The default is left on the API-key model so those tests SKIP rather than
-/// fail while that is outstanding.
-///
-/// (Before 2026-08-23 this comment asserted the reverse of the first paragraph —
-/// that `codex-*` was oauth-only and the override was for API-key hosts. That was
-/// wrong and cost a debugging session: the probe failed on a freshly
-/// authenticated subscription and the error text sent the reader looking for an
-/// API key that was not there.)
+/// **Ids die on OpenAI's schedule**, which is why a refused model now fails
+/// rather than skips (see [`check_codex_available`]): `gpt-5.4-mini`, verified
+/// here 2026-08-26, was refused by a ChatGPT login on 2026-10-04 (issue #1564).
+/// When a default stops answering, the failure names the model; update the
+/// matching constant, or export the env var on your host meanwhile.
 ///
 /// Single source of truth: [`check_codex_available`] probes the model this
 /// returns, so the availability gate and the model the tests actually launch can
@@ -6075,8 +6305,20 @@ pub fn codex_test_model() -> &'static str {
             .ok()
             .map(|raw| raw.trim().to_string())
             .filter(|model| !model.is_empty())
-            .unwrap_or_else(|| CODEX_TEST_MODEL_DEFAULT.to_string())
+            .unwrap_or_else(|| codex_default_model_for(codex_auth_mode().as_deref()).to_string())
     })
+}
+
+/// Does this `codex exec` output say the MODEL was refused, as opposed to the
+/// credential, the network or a quota? Takes the output already lowercased.
+///
+/// Two wordings, each measured: a ChatGPT login answers "The '<id>' model is not
+/// supported when using Codex with a ChatGPT account" (codex-cli 0.160.0,
+/// 2026-10-10), and an API key answered `404 Model not found` (PRD #225,
+/// 2026-07). A refusal worded any other way still reaches the ordinary skip.
+pub(crate) fn codex_probe_refused_model(lower_output: &str) -> bool {
+    lower_output.contains("model is not supported when using codex")
+        || lower_output.contains("model not found")
 }
 
 /// Compiled-in default cheap model for real-agent OpenCode e2e coverage.
@@ -6179,17 +6421,84 @@ pub fn opencode_test_model() -> &'static str {
     })
 }
 
+/// Upper bound on [`check_codex_available`]'s two `codex` calls together — the
+/// `login status` check and the model probe — on a quiet box. They share one
+/// deadline of [`load_scaled`] of this, as [`OPENCODE_PROBE_BASE`] bounds the
+/// OpenCode probe, so a starved box waits up to [`MAX_LOAD_FACTOR`] times as
+/// long.
+///
+/// Unbounded until PRD #1631's lane-2 run, where `codex_hooks_001`'s isolated
+/// retry spent more than 120 s here (its deck was built only after the +120 s
+/// load sample) on a box with `io full` near 70%, ran its scenario green in
+/// about 40 s, and was SIGKILLed at nextest's 180 s with no skip, no failure
+/// message and no grid. A wedged `codex` now reports here instead, naming the
+/// call and the ceiling. Scaled to the maximum the ceiling is 360 s, which is
+/// why `codex_hooks_001`'s kill window in `.config/nextest.toml` sits above it.
+const CODEX_PREFLIGHT_BASE: Duration = Duration::from_secs(60);
+
+/// Run one preflight `codex` call to completion or to `deadline`, killing it
+/// there. Output goes to a FILE rather than pipes for the reason
+/// [`opencode_model_probe`] gives. Returns the exit status, or `None` when the
+/// deadline killed it, with stdout and stderr together.
+fn run_codex_preflight(
+    command: &mut std::process::Command,
+    deadline: Instant,
+) -> Result<(Option<std::process::ExitStatus>, String), String> {
+    let sink = harness_tempfile()
+        .map_err(|e| format!("could not create the Codex preflight output file: {e}"))?;
+    let open = || {
+        sink.as_file()
+            .try_clone()
+            .map_err(|e| format!("could not open the Codex preflight output file: {e}"))
+    };
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(open()?))
+        .stderr(std::process::Stdio::from(open()?))
+        .spawn()
+        .map_err(|e| format!("could not run the Codex preflight: {e}"))?;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => return Err(format!("could not wait on the Codex preflight: {e}")),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok((
+        status,
+        std::fs::read_to_string(sink.path()).unwrap_or_default(),
+    ))
+}
+
 /// Runtime-skip helper for real Codex coverage. A version check alone is not
 /// enough: this verifies persisted auth and performs one minimal model request,
 /// so expired credentials, 401 responses, and unreachable accounts skip cleanly
-/// before the PTY scenario starts.
+/// before the PTY scenario starts. Both `codex` calls share one load-scaled
+/// deadline ([`CODEX_PREFLIGHT_BASE`]).
+///
+/// **One outcome panics instead of skipping**: a logged-in Codex that refuses
+/// the model ([`codex_probe_refused_model`]), since issue #656 — see the comment
+/// at that branch.
 pub fn check_codex_available() -> Result<(), String> {
     install_credential_redaction();
     if !cli_invocable("codex") {
         return Err("Codex CLI not installed (could not invoke `codex --version`)".into());
     }
 
-    let auth_path = host_home().join(".codex").join("auth.json");
+    // Both commands below read the home that `codex_test_model` and
+    // `import_codex_credentials` read, `~/.codex`, rather than an ambient
+    // `CODEX_HOME` the launched test never sees (the harness clears the
+    // environment). Otherwise a host whose `CODEX_HOME` holds the other auth
+    // mode would be probed with the wrong login and, since #656, fail on a
+    // model refusal that the test itself would not meet.
+    let codex_home = host_home().join(".codex");
+    let auth_path = codex_home.join("auth.json");
     let auth_is_regular = std::fs::symlink_metadata(&auth_path)
         .map(|meta| meta.file_type().is_file())
         .unwrap_or(false);
@@ -6199,23 +6508,32 @@ pub fn check_codex_available() -> Result<(), String> {
         );
     }
 
-    let login = std::process::Command::new("codex")
-        .args(["login", "status"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("could not check Codex login status: {e}"))?;
-    let login_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&login.stdout),
-        String::from_utf8_lossy(&login.stderr)
-    );
-    if !login.status.success() || login_text.to_ascii_lowercase().contains("not logged") {
+    let ceiling = load_scaled(CODEX_PREFLIGHT_BASE);
+    let deadline = Instant::now() + ceiling;
+    let timed_out = |call: &str| {
+        format!(
+            "Codex preflight `{call}` did not finish within {ceiling:?} (the shared ceiling \
+             for `codex login status` and the model probe, scaled with contention)"
+        )
+    };
+
+    let (login_status, login_text) = run_codex_preflight(
+        std::process::Command::new("codex")
+            .args(["login", "status"])
+            .env("CODEX_HOME", &codex_home),
+        deadline,
+    )?;
+    let Some(login_status) = login_status else {
+        return Err(timed_out("codex login status"));
+    };
+    if !login_status.success() || login_text.to_ascii_lowercase().contains("not logged") {
         return Err("Codex is not authenticated — log in with `codex login`".into());
     }
 
     let final_message =
         harness_tempfile().map_err(|e| format!("could not create Codex probe output file: {e}"))?;
-    let probe = std::process::Command::new("codex")
+    let mut probe = std::process::Command::new("codex");
+    probe
         .args([
             "exec",
             "--ephemeral",
@@ -6233,17 +6551,35 @@ pub fn check_codex_available() -> Result<(), String> {
         .arg("--output-last-message")
         .arg(final_message.path())
         .arg("Reply with exactly CODEX_AUTH_OK and do not use tools.")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("could not run Codex model probe: {e}"))?;
-    let probe_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&probe.stdout),
-        String::from_utf8_lossy(&probe.stderr)
-    );
+        .env("CODEX_HOME", &codex_home);
+    let (probe_status, probe_text) = run_codex_preflight(&mut probe, deadline)?;
+    let Some(probe_status) = probe_status else {
+        return Err(timed_out("codex exec"));
+    };
     let lower = probe_text.to_ascii_lowercase();
     let model_reply = std::fs::read_to_string(final_message.path()).unwrap_or_default();
-    if !probe.status.success()
+    // Issue #656: a refused MODEL fails the test instead of skipping it. By this
+    // point Codex is installed and logged in, so the developer has what these
+    // tests need, and the one thing wrong is the model id — a configuration
+    // defect, never a transient. As a skip it was invisible: nextest counts a
+    // skipped test as passed and hides its `SKIP:` line, which is how the
+    // previous default ran no Codex coverage on every ChatGPT-login host while
+    // reporting green. A credential, network or quota failure still skips below.
+    if !model_reply.contains("CODEX_AUTH_OK") && codex_probe_refused_model(&lower) {
+        discard_previous_recording(&current_test_name());
+        panic!(
+            "Codex is installed and logged in (auth_mode {:?}), but it refused model {:?}, so \
+             this real-agent test cannot run. Set {} to a model these credentials accept, or \
+             update the default for this auth mode in tests/common/mod.rs if OpenAI retired \
+             it. Measured choices: ChatGPT login {:?}, API key {:?}",
+            codex_auth_mode().unwrap_or_else(|| "unknown".to_string()),
+            codex_test_model(),
+            CODEX_TEST_MODEL_ENV,
+            CODEX_TEST_MODEL_CHATGPT_DEFAULT,
+            CODEX_TEST_MODEL_API_KEY_DEFAULT,
+        );
+    }
+    if !probe_status.success()
         || !model_reply.contains("CODEX_AUTH_OK")
         || [
             "401",
@@ -6255,10 +6591,9 @@ pub fn check_codex_available() -> Result<(), String> {
         .any(|marker| lower.contains(marker))
     {
         return Err(format!(
-            "Codex could not reach model {} with the current authentication — the two auth \
-             modes reach different model families, so set {} to one these credentials can \
-             reach (API key: e.g. gpt-5-nano or gpt-5.1-codex-mini; ChatGPT subscription: \
-             e.g. gpt-5.6-luna). Run `codex login status` to see which mode is in use",
+            "Codex could not complete a one-turn probe on model {} with the current \
+             authentication (expired login, network or quota). Run `codex login status`, \
+             and if the model is the problem set {} to one these credentials can reach",
             codex_test_model(),
             CODEX_TEST_MODEL_ENV,
         ));
@@ -9772,7 +10107,7 @@ pub fn spawn_daemon_serve_with_env(
     }
     let child = cmd.spawn().expect("spawn `dot-agent-deck daemon serve`");
 
-    let proc = DaemonProc {
+    let mut proc = DaemonProc {
         child,
         hook_socket,
         attach_socket,
@@ -9790,17 +10125,35 @@ pub fn spawn_daemon_serve_with_env(
 #[allow(dead_code)]
 impl DaemonProc {
     /// Block until the attach socket file exists (the daemon finished
-    /// binding) or a bounded timeout elapses.
-    fn wait_for_attach_socket(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+    /// binding), failing at once if the daemon exits first and otherwise after
+    /// `load_scaled(DAEMON_START_POLL_TIMEOUT)`.
+    ///
+    /// PRD #1258: the bound is the binary's own lazy-spawn bound
+    /// ([`DAEMON_START_POLL_TIMEOUT`], which covers the daemon's pre-bind work)
+    /// widened by [`load_scaled`]. It was a fixed 10 s, shorter than the time
+    /// the deck itself gives a daemon to bind, and a STARVED lane-1 run lost
+    /// seven tests to it — `deck.log` from the same run showed one daemon's
+    /// pre-bind work alone taking 5.7 s. PRD #1631 met the same flat 10 s
+    /// failing six tests at `io full` 52-72%, which `load_scaled`'s stall
+    /// share now widens for.
+    fn wait_for_attach_socket(&mut self) {
+        let budget = load_scaled(DAEMON_START_POLL_TIMEOUT);
+        let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if self.attach_socket.exists() {
                 return;
             }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "daemon exited ({status}) before binding its attach socket at {}; stderr:\n{}",
+                    self.attach_socket.display(),
+                    std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+                );
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!(
-            "daemon never bound its attach socket at {} within 10s",
+            "daemon never bound its attach socket at {} within {budget:?}",
             self.attach_socket.display()
         );
     }
@@ -11510,7 +11863,7 @@ pub fn wait_for_file_lines(path: &Path, want: usize, timeout: Duration) -> Resul
 /// prefer it over [`wait_for_path_async`] + an immediate read: a shell
 /// redirect creates the file before the write lands (issue #244).
 #[allow(dead_code)]
-async fn wait_for_file_matching_async(
+pub async fn wait_for_file_matching_async(
     path: &Path,
     timeout: Duration,
     matches: impl Fn(&str) -> bool,
@@ -11718,7 +12071,24 @@ impl Drop for InProcDaemon {
     }
 }
 
-/// Bring up an in-process daemon and block until its hook socket accepts
+/// How long [`spawn_inprocess_daemon`] waits for each of its daemon's sockets
+/// to accept a connection. Each wait returns at the first successful connect,
+/// so this bounds only a run in which the socket is late. It was 5 s, which an
+/// IO-starved box overran: during PR #1684's `cargo test-fast` four
+/// `daemon_status` tests panicked on the attach socket at `io full` 54.8% of
+/// the window and a 1-minute load of 41 on 16 CPUs, and all four passed when
+/// rerun alone. Between the hook bind and the attach bind the daemon writes
+/// its state and loads schedules synchronously, which is disk work that
+/// starvation stretches. PRD #1258 met the same overrun on the hook wait:
+/// `agent_event_007`/`008` went red at a 1-minute load of 143 on 16 CPUs (cpu
+/// PSI 98%) and passed once the box recovered. It is a flat ceiling rather than
+/// a `load_scaled(5 s)` one because 30 s is already the largest value that
+/// scaling could reach (`MAX_LOAD_FACTOR` is 6).
+#[cfg(unix)]
+#[allow(dead_code)]
+pub const INPROC_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bring up an in-process daemon and block until its hook and attach sockets accept
 /// connections (so an agent's first CLI call can't race startup). Mirrors
 /// `e2e_delegate_work_done_chain.rs::spawn_daemon`, centralized so the readiness
 /// poll lives in `common`.
@@ -11768,7 +12138,17 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
         let _ = run_daemon_with(&hook_for_daemon, daemon).await;
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // A daemon task getting going, not a behaviour: both readiness waits below
+    // take the larger of `daemon_task_start_budget` (load-scaled) and
+    // `INPROC_DAEMON_READY_TIMEOUT` (a flat floor). They were flat 5 s
+    // ceilings, and all nine `pane_restart` tests failed together at the attach
+    // one in a `test-fast` run under `/proc/pressure/io full` 89% — the attach
+    // listener binds behind a synchronous `LoadedSchedules::load()`, so an I/O
+    // stall lands squarely in the gap between the two sockets. Each wait
+    // returns the instant its socket accepts, so an idle box pays nothing for
+    // the headroom.
+    let budget = daemon_task_start_budget().max(INPROC_DAEMON_READY_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + budget;
     let mut ready = false;
     while tokio::time::Instant::now() < deadline {
         if hook_path.exists() && tokio::net::UnixStream::connect(&hook_path).await.is_ok() {
@@ -11779,7 +12159,8 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         ready,
-        "in-process daemon hook socket was not accepting connections within 5s"
+        "in-process daemon hook socket {} was not accepting connections within {budget:?}",
+        hook_path.display()
     );
 
     // Issue #954: and the ATTACH socket too, because this function hands one
@@ -11799,7 +12180,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     // harness-sized version of that bug being written next. `daemon_status.rs`
     // had already hand-rolled this wait for its own calls; the other consumer,
     // `delegate_respawn_recovery.rs`, had not, and nothing said it had to.
-    let attach_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let attach_deadline = tokio::time::Instant::now() + budget;
     let mut attach_ready = false;
     while tokio::time::Instant::now() < attach_deadline {
         if tokio::net::UnixStream::connect(&attach_path).await.is_ok() {
@@ -11810,7 +12191,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         attach_ready,
-        "in-process daemon attach socket {} was not accepting connections within 5s",
+        "in-process daemon attach socket {} was not accepting connections within {budget:?}",
         attach_path.display()
     );
 

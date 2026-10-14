@@ -323,6 +323,8 @@ fn drive_session_to_working(state: &mut AppState, session_id: &str, pane_id: &st
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
     state.apply_event(mk(EventType::SessionStart, None, None, None));
     state.apply_event(mk(
@@ -400,6 +402,9 @@ fn make_session(
         orchestration_orphaned: false,
         subagent_wait: None,
         output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
     }
 }
 
@@ -2967,6 +2972,11 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         blocked: None,
         hook_generation: None,
         delivery_notice: None,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: None,
+        background: None,
+        background_revision: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -3007,6 +3017,8 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     });
 
     let sessions: Vec<&SessionState> = state
@@ -3117,6 +3129,11 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         blocked: None,
                         hook_generation: None,
                         delivery_notice: None,
+                        pending_question: None,
+                        pull_request: None,
+                        pull_request_revision: None,
+                        background: None,
+                        background_revision: None,
                     }),
                     spawned_at_ms: None,
                     cli_name: None,
@@ -3256,6 +3273,9 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         orchestration_orphaned: false,
         subagent_wait: None,
         output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
     };
     let (buffer, _) =
         render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, now, 80, 20);
@@ -3372,6 +3392,9 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         orchestration_orphaned: false,
         subagent_wait: None,
         output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as
@@ -3585,6 +3608,8 @@ async fn live_017_reconnect_adopts_the_daemons_pane_generation_inner() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     };
 
     // The daemon sees the whole history: the wrapper, Codex's announcement,

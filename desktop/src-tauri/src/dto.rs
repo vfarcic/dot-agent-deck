@@ -143,6 +143,119 @@ pub struct DesktopSnapshot {
     /// A property of the applied document, like [`Self::fleet`], so every
     /// deck's snapshot carries the same value.
     pub all_decks: bool,
+    /// PRD #1258 M4: this deck's host — disk per watched role, load per core,
+    /// memory and the sample's age — as its daemon reports it through
+    /// [`dot_agent_deck::daemon_client::DaemonClient::host_metrics`]. The
+    /// desktop measures nothing itself: for a remote deck these are the remote
+    /// machine's numbers.
+    ///
+    /// Absent when nothing was asked (a deck that is not connected) or the
+    /// request failed; the webview then keeps the last answer it had for a
+    /// connected deck. A daemon that does not report host metrics is
+    /// [`HostMetricsReportDto::NotAvailable`], never absent and never zeros.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_metrics: Option<HostMetricsReportDto>,
+}
+
+/// PRD #1258 M4: a deck's host sample as the webview reads it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum HostMetricsReportDto {
+    /// The daemon does not advertise `host-metrics` (an older build, or one on
+    /// a platform it cannot sample), so it was never asked.
+    NotAvailable,
+    Available {
+        metrics: HostMetricsDto,
+    },
+}
+
+/// PRD #1258 M4: the camelCase form of
+/// [`dot_agent_deck::daemon_protocol::HostMetrics`]. Every reading the daemon
+/// could not take is absent here too, so the webview shows `unknown` rather
+/// than a zero.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostMetricsDto {
+    pub disks: Vec<DiskUsageDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_per_cpu: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_used_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_available_bytes: Option<u64>,
+    /// PRD #1258: the daemon's level for the load and for available memory,
+    /// passed through as it judged them; absent from a daemon that predates
+    /// levels, which the webview shows uncoloured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_level: Option<dot_agent_deck::daemon_protocol::HealthLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_level: Option<dot_agent_deck::daemon_protocol::HealthLevel>,
+    pub sampled_at_ms: u64,
+    /// How old the sample is as this snapshot leaves the bridge: the age the
+    /// daemon reported plus the time the bridge has held the answer since.
+    pub sample_age_ms: u64,
+}
+
+/// PRD #1258 M4: one watched role's filesystem, named by role, never by path.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskUsageDto {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    /// PRD #1258: the daemon's level for this filesystem's free space.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<dot_agent_deck::daemon_protocol::HealthLevel>,
+}
+
+impl HostMetricsReportDto {
+    /// Map the daemon's answer, adding `held` — how long the bridge has kept
+    /// it — to the sample's age so a cached answer does not claim to be as
+    /// fresh as when it arrived.
+    pub(crate) fn from_report(
+        report: &dot_agent_deck::daemon_client::HostMetricsReport,
+        held: std::time::Duration,
+    ) -> Self {
+        use dot_agent_deck::daemon_client::HostMetricsReport;
+        match report {
+            HostMetricsReport::NotAvailable => Self::NotAvailable,
+            HostMetricsReport::Available(metrics) => Self::Available {
+                metrics: HostMetricsDto {
+                    // `DaemonClient::host_metrics` already refuses a reply
+                    // over these bounds; bounding again here keeps the
+                    // webview's work bounded for any report (audit A2).
+                    disks: metrics
+                        .disks
+                        .iter()
+                        .take(dot_agent_deck::daemon_protocol::MAX_DISK_ROLES)
+                        .map(|disk| DiskUsageDto {
+                            role: dot_agent_deck::submitted_prompt::truncate_on_char_boundary(
+                                &disk.role,
+                                dot_agent_deck::daemon_protocol::MAX_ROLE_BYTES,
+                            ),
+                            free_bytes: disk.free_bytes,
+                            total_bytes: disk.total_bytes,
+                            level: disk.level,
+                        })
+                        .collect(),
+                    load_per_cpu: metrics.load_per_cpu.filter(|load| load.is_finite()),
+                    cpu_count: metrics.cpu_count,
+                    memory_used_bytes: metrics.memory_used_bytes,
+                    memory_available_bytes: metrics.memory_available_bytes,
+                    load_level: metrics.load_level,
+                    memory_level: metrics.memory_level,
+                    sampled_at_ms: metrics.sampled_at_ms,
+                    sample_age_ms: metrics
+                        .sample_age_ms
+                        .saturating_add(u64::try_from(held.as_millis()).unwrap_or(u64::MAX)),
+                },
+            },
+        }
+    }
 }
 
 /// One deck the app connects to, named without having been heard from (PRD
@@ -342,6 +455,72 @@ pub struct DesktopConnection {
     /// live bridge builds, and absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disconnected_reason: Option<DisconnectedReasonDto>,
+    /// Issue #1637: agents whose hooks on this deck run an older
+    /// `dot-agent-deck` (or, issue #1157, a deck that could not install hooks),
+    /// from the daemon's `Hello` reply. Each carries the daemon's own remedy, so
+    /// this app and the TUI show the same words. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hook_binary_notices: Vec<HookBinaryNoticeDto>,
+}
+
+/// One hook-binary notice as the webview reads it (issue #1637). Every string
+/// is sanitized: a remote deck's daemon composed them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookBinaryNoticeDto {
+    pub binary: String,
+    pub agents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub daemon_version: String,
+    pub reason: dot_agent_deck::daemon_protocol::HookBinaryReason,
+    pub remedy: String,
+    /// The command the Copy button copies, exactly as shown. Dropped, not
+    /// cleaned, when it carries anything a display would hide or alter (a
+    /// control, bidi or line-separator character), so what is copied is
+    /// always what is displayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// Whether `command` can be shown and copied verbatim.
+fn is_copyable_command(command: &str) -> bool {
+    !command.is_empty()
+        && command.len() <= dot_agent_deck::daemon_protocol::MAX_NOTICE_COMMAND_BYTES
+        && !command.chars().any(|c| {
+            c.is_control()
+                || dot_agent_deck::untrusted_text::is_bidi_format_char(c)
+                || matches!(c, '\u{2028}' | '\u{2029}')
+        })
+}
+
+impl HookBinaryNoticeDto {
+    pub(crate) fn new(notice: &dot_agent_deck::daemon_protocol::HookBinaryNotice) -> Self {
+        let command = notice
+            .command
+            .as_deref()
+            .filter(|command| is_copyable_command(command))
+            .map(str::to_string);
+        let mut remedy = safe_display_text(&notice.remedy);
+        // A `Run:` whose command is dropped would end the strip with nothing
+        // to run, so it reads as the daemon's no-command advice instead.
+        if command.is_none() && remedy == dot_agent_deck::daemon_protocol::REMEDY_RUN {
+            remedy = dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL.to_string();
+        }
+        Self {
+            binary: safe_message(notice.binary.clone()),
+            agents: notice
+                .agents
+                .iter()
+                .map(|agent| safe_message(agent.clone()))
+                .collect(),
+            version: notice.version.clone().map(safe_message),
+            daemon_version: safe_message(notice.daemon_version.clone()),
+            reason: notice.reason,
+            remedy,
+            command,
+        }
+    }
 }
 
 /// [`DesktopConnection::disconnected_reason`] on the wire.
@@ -550,6 +729,17 @@ pub struct DesktopAgent {
     /// older daemon, which never reports the status either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<DesktopBlocked>,
+    /// Issue #1678: the background work the agent left running after its turn
+    /// ended — commands and subagents still going, and since when — copied
+    /// from `SessionSnapshot.background`. The daemon computes it; nothing here
+    /// derives it from events or recounts it.
+    ///
+    /// Absent when there is nothing to show (no count above zero), when the
+    /// record carries no live snapshot, and from a daemon predating the field.
+    /// `since_ms` is NOT clamped here, for the reason `last_activity_ms` gives:
+    /// the webview owns the clock the comparison is made against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<DesktopBackground>,
     /// PRD #1541: the keys that interrupt this agent's turn and edit its
     /// prompt, **as the daemon served them** (`AgentRecord::prompt_keys`) —
     /// copied through, bounded by [`map_prompt_keys`], and never resolved from
@@ -582,6 +772,19 @@ pub struct DesktopAgent {
     /// `status: "error"`, and scrubbed here like every other daemon text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_notice: Option<String>,
+    /// PRD #1631: the question this agent is waiting on
+    /// (`SessionSnapshot.pending_question`), every text field made safe to
+    /// show, with whether each option can be answered by voice. Absent when
+    /// the agent waits on nothing, and from a daemon that predates the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_question: Option<DesktopPendingQuestion>,
+    /// PRD #1401: the pull request this agent's work produced, copied through
+    /// from `SessionSnapshot.pull_request`. Its fields are single words and its
+    /// enum values snake_case, so the core type is the webview's shape as is.
+    /// Absent when the record carries no `live` snapshot, the daemon knows of
+    /// no PR, or the daemon predates the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<dot_agent_deck::pull_request_info::PullRequestInfo>,
     pub tab: DesktopTab,
 }
 
@@ -646,6 +849,203 @@ pub struct DesktopDeleteCharKey {
     pub bytes: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_literal_write_chars: Option<u32>,
+}
+
+/// PRD #1631: the webview's view of the daemon's
+/// [`dot_agent_deck::question::PendingQuestion`].
+///
+/// **Every text field is untrusted agent or model output**
+/// (`docs/develop/voice-first-design.md` §6): the daemon caps and strips it on
+/// arrival, and it goes through [`safe_display_text`] again here, because this
+/// is the seam every desktop reader takes it from — the panel, and the voice
+/// model's data turn. It is shown verbatim and never interpreted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopPendingQuestion {
+    /// The daemon's id for the question — what an answer names, and what the
+    /// voice panel's staleness check compares.
+    pub id: String,
+    /// `permission`, `choice`, `plan`, `confirm` or `unknown`.
+    pub kind: String,
+    /// `held`, `keys`, `unsupported` or `unknown` — how the deck would answer.
+    pub channel: String,
+    pub questions: Vec<DesktopQuestion>,
+    /// What a permission or plan prompt is about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<DesktopQuestionTool>,
+    /// Whether the deck can answer this question at all: its channel is one
+    /// the deck can use and at least one option is answerable.
+    pub answerable: bool,
+    /// The daemon's revision of the question (audit A4): which registration
+    /// of it an answer is bound to. The webview echoes it with the answer, so
+    /// a question replaced under the same id since it was read is refused
+    /// rather than answered with a choice made for the old one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+}
+
+/// The tool a [`DesktopPendingQuestion`] asks about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopQuestionTool {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One question of a [`DesktopPendingQuestion`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopQuestion {
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    pub multi_select: bool,
+    pub options: Vec<DesktopQuestionOption>,
+}
+
+/// One option of a [`DesktopQuestion`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopQuestionOption {
+    /// 1-based, the number the agent shows beside it.
+    pub index: u32,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `allow_once`, `allow_always`, `deny`, `choice`, `free_text` or `unknown`.
+    pub role: String,
+    /// Whether the deck can send this option: not keyboard-only, a role this
+    /// build knows, and a question channel the deck can use.
+    pub answerable: bool,
+    /// For `allow_always`: what "always" covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// PR #1698: set when the number the agent draws beside this option is
+    /// not certain — every number it may be, lowest first — because the agent
+    /// may leave out an option before it, or this one. Such an option is
+    /// named by its label, never chosen by a number said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen_numbers: Option<Vec<u32>>,
+}
+
+impl DesktopQuestionOption {
+    /// Whether the agent draws `index` beside this option whatever it leaves
+    /// out.
+    pub fn number_certain(&self) -> bool {
+        self.screen_numbers.is_none()
+    }
+}
+
+impl DesktopPendingQuestion {
+    /// The question `question_index` names, if there is one.
+    pub fn question(&self, question_index: u32) -> Option<&DesktopQuestion> {
+        self.questions.get(question_index as usize)
+    }
+}
+
+impl DesktopQuestion {
+    /// The option whose shown number is `index`, if there is one.
+    pub fn option(&self, index: u32) -> Option<&DesktopQuestionOption> {
+        self.options.iter().find(|option| option.index == index)
+    }
+}
+
+/// PRD #1631: [`DesktopPendingQuestion`] from the daemon's question.
+pub(crate) fn map_pending_question(
+    question: &dot_agent_deck::question::PendingQuestion,
+) -> DesktopPendingQuestion {
+    use dot_agent_deck::question::{AnswerChannel, OptionRole, QuestionKind};
+    let channel_answers = matches!(question.channel, AnswerChannel::Held | AnswerChannel::Keys);
+    let questions: Vec<DesktopQuestion> = question
+        .questions
+        .iter()
+        .map(|q| DesktopQuestion {
+            prompt: safe_display_text(&q.prompt),
+            header: q
+                .header
+                .as_deref()
+                .map(safe_display_text)
+                .filter(|header| !header.is_empty()),
+            multi_select: q.multi_select,
+            options: q
+                .options
+                .iter()
+                .map(|option| DesktopQuestionOption {
+                    index: option.index,
+                    label: safe_display_text(&option.label),
+                    description: option
+                        .description
+                        .as_deref()
+                        .map(safe_display_text)
+                        .filter(|description| !description.is_empty()),
+                    role: match option.role {
+                        OptionRole::AllowOnce => "allow_once",
+                        OptionRole::AllowAlways => "allow_always",
+                        OptionRole::Deny => "deny",
+                        OptionRole::Choice => "choice",
+                        OptionRole::FreeText => "free_text",
+                        OptionRole::Unknown => "unknown",
+                    }
+                    .to_string(),
+                    answerable: channel_answers && option.answerable(),
+                    scope: option
+                        .scope
+                        .as_deref()
+                        .map(safe_display_text)
+                        .filter(|scope| !scope.is_empty()),
+                    screen_numbers: (!q.number_certain(option)).then(|| q.screen_numbers(option)),
+                })
+                .collect(),
+        })
+        .collect();
+    let answerable = questions
+        .iter()
+        .any(|q| q.options.iter().any(|option| option.answerable));
+    DesktopPendingQuestion {
+        id: question.id.clone(),
+        kind: match question.kind {
+            QuestionKind::Permission => "permission",
+            QuestionKind::Choice => "choice",
+            QuestionKind::Plan => "plan",
+            QuestionKind::Confirm => "confirm",
+            QuestionKind::Unknown => "unknown",
+        }
+        .to_string(),
+        channel: match question.channel {
+            AnswerChannel::Held => "held",
+            AnswerChannel::Keys => "keys",
+            AnswerChannel::Unsupported => "unsupported",
+            AnswerChannel::Unknown => "unknown",
+        }
+        .to_string(),
+        questions,
+        tool: question.tool.as_ref().map(|tool| DesktopQuestionTool {
+            name: safe_display_text(&tool.name),
+            detail: tool
+                .detail
+                .as_deref()
+                .map(safe_display_text)
+                .filter(|detail| !detail.is_empty()),
+        }),
+        answerable,
+        revision: question.revision,
+    }
+}
+
+/// Issue #1678: the webview's view of a `BackgroundWork`. The background
+/// aggregate carries counts and an instant, not subagent ids or command lines.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopBackground {
+    /// Commands still running in their own session below the agent.
+    pub commands: u32,
+    /// Subagents started and not yet stopped.
+    pub subagents: u32,
+    /// When the oldest counted item started, epoch milliseconds on the
+    /// daemon's clock; absent when the daemon has no start for any of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
 }
 
 /// Issue #714: the webview's view of a `BlockedReason`.
@@ -927,7 +1327,10 @@ pub enum DesktopActionError {
 #[serde(untagged)]
 pub enum DesktopSettingsSaveError {
     Message(String),
-    Partial(DesktopPartialSettingsSave),
+    /// Boxed because it carries a whole `DesktopSettings` and is much the
+    /// larger arm, so `clippy::result_large_err` would otherwise object.
+    /// `untagged` serializes the box as its contents: the wire is unchanged.
+    Partial(Box<DesktopPartialSettingsSave>),
 }
 
 /// A save whose deck edits landed and whose `desktop.toml` write did not, or
@@ -1748,6 +2151,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         .and_then(|snapshot| snapshot.live_target.as_ref())
         .map(|target| write_lease_name(&target.writable));
     let last_activity_ms = live.and_then(|snapshot| snapshot.last_activity_ms);
+    let pull_request = live.and_then(|snapshot| snapshot.pull_request.clone());
     // Issue #714: only beside the status it explains.
     let blocked = live
         .filter(|snapshot| snapshot.status == SessionStatus::Blocked)
@@ -1761,6 +2165,15 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
                 .map(safe_display_text)
                 .filter(|detail| !detail.is_empty()),
             resets_at_ms: reason.resets_at_ms,
+        });
+    // Issue #1678: the daemon's aggregate, only when it has something to show.
+    let background = live
+        .and_then(|snapshot| snapshot.background)
+        .filter(|work| !work.is_empty())
+        .map(|work| DesktopBackground {
+            commands: work.commands,
+            subagents: work.subagents,
+            since_ms: work.since_ms,
         });
     // PRD #745 M11: off the RECORD, not the live snapshot — the daemon knows
     // when it spawned a process whether or not that process has ever emitted an
@@ -1794,6 +2207,9 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         .and_then(|snapshot| snapshot.delivery_notice.as_deref())
         .map(safe_display_text)
         .filter(|notice| !notice.is_empty());
+    let pending_question = live
+        .and_then(|snapshot| snapshot.pending_question.as_ref())
+        .map(map_pending_question);
 
     DesktopAgent {
         id: record.id,
@@ -1812,10 +2228,13 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         last_activity_ms,
         spawned_at_ms,
         blocked,
+        background,
         prompt_keys,
         authoring_kind: record.authoring_kind,
         inbox,
         delivery_notice,
+        pending_question,
+        pull_request,
         tab,
     }
 }
@@ -2621,6 +3040,7 @@ pub(crate) fn disconnected_snapshot(
             listing_options: false,
             upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer::Unknown,
             disconnected_reason: None,
+            hook_binary_notices: Vec::new(),
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.
@@ -2631,6 +3051,8 @@ pub(crate) fn disconnected_snapshot(
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
         all_decks: all_decks_applied(),
+        // Nothing answered, so nothing was asked.
+        host_metrics: None,
     }
 }
 
@@ -2849,6 +3271,104 @@ pub(crate) fn ensure_desktop_orchestration_platform_supported(
 
 #[cfg(test)]
 mod tests {
+
+    /// Scenario (PRD #1258 M4): a daemon's host answer reaches the webview as
+    /// the camelCase `hostMetrics` shape, with absent readings omitted rather
+    /// than zeroed, the daemon's health levels passed through beside their
+    /// numbers (and absent where it sent none), and the time the bridge held
+    /// the answer added to its age; an incapable daemon is `not-available`.
+    #[test]
+    fn host_metrics_dto_keeps_absence_and_ages_a_held_answer() {
+        use dot_agent_deck::daemon_client::HostMetricsReport;
+        let metrics: dot_agent_deck::daemon_protocol::HostMetrics =
+            serde_json::from_value(serde_json::json!({
+                "disks": [{"role": "working_root", "free_bytes": 10, "total_bytes": 20,
+                           "level": "warn"},
+                          {"role": "temp_root"}],
+                "cpu_count": 8,
+                "memory_level": "critical",
+                "sampled_at_ms": 1_700_000_000_000_u64,
+                "sample_age_ms": 1500
+            }))
+            .unwrap();
+        let dto = HostMetricsReportDto::from_report(
+            &HostMetricsReport::Available(metrics),
+            std::time::Duration::from_millis(250),
+        );
+        assert_eq!(
+            serde_json::to_value(&dto).unwrap(),
+            serde_json::json!({
+                "status": "available",
+                "metrics": {
+                    "disks": [{"role": "working_root", "freeBytes": 10, "totalBytes": 20,
+                               "level": "warn"},
+                              {"role": "temp_root"}],
+                    "cpuCount": 8,
+                    "memoryLevel": "critical",
+                    "sampledAtMs": 1_700_000_000_000_u64,
+                    "sampleAgeMs": 1750
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(HostMetricsReportDto::from_report(
+                &HostMetricsReport::NotAvailable,
+                std::time::Duration::ZERO
+            ))
+            .unwrap(),
+            serde_json::json!({"status": "not-available"})
+        );
+    }
+
+    /// Scenario (PRD #1258 audit A2): a report carrying more roles than the
+    /// client's bound, one of them far longer than a role may be, reaches the
+    /// webview as at most the bound's number of roles, each clamped on a
+    /// character boundary.
+    #[test]
+    fn host_metrics_dto_bounds_a_hostile_report() {
+        use dot_agent_deck::daemon_client::HostMetricsReport;
+        use dot_agent_deck::daemon_protocol::{
+            DiskUsage, HostMetrics, MAX_DISK_ROLES, MAX_ROLE_BYTES,
+        };
+        let mut disks = vec![DiskUsage {
+            role: "é".repeat(10_000),
+            free_bytes: None,
+            total_bytes: None,
+            level: None,
+        }];
+        disks.extend((0..1000).map(|i| DiskUsage {
+            role: format!("role{i}"),
+            free_bytes: None,
+            total_bytes: None,
+            level: None,
+        }));
+        let dto = HostMetricsReportDto::from_report(
+            &HostMetricsReport::Available(HostMetrics {
+                disks,
+                load_per_cpu: None,
+                cpu_count: None,
+                memory_used_bytes: None,
+                memory_available_bytes: None,
+                load_level: None,
+                memory_level: None,
+                sampled_at_ms: 1,
+                sample_age_ms: 0,
+            }),
+            std::time::Duration::ZERO,
+        );
+        let HostMetricsReportDto::Available { metrics } = dto else {
+            panic!("available");
+        };
+        assert_eq!(metrics.disks.len(), MAX_DISK_ROLES);
+        let first = &metrics.disks[0].role;
+        assert!(
+            first.len() <= MAX_ROLE_BYTES + '…'.len_utf8(),
+            "{}",
+            first.len()
+        );
+        assert!(first.ends_with('…'));
+    }
+
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -3439,6 +3959,11 @@ mod tests {
                 blocked: None,
                 hook_generation: None,
                 delivery_notice: None,
+                pending_question: None,
+                pull_request: None,
+                pull_request_revision: None,
+                background: None,
+                background_revision: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is
@@ -3938,6 +4463,61 @@ mod tests {
                 .get("blocked")
                 .is_none()
         );
+    }
+
+    /// Issue #1678: the daemon's background aggregate reaches the webview as
+    /// counts and an instant under `background`, unclamped; an empty aggregate
+    /// (the daemon's explicit clear) and a record with no live snapshot both
+    /// leave the key off the wire.
+    #[test]
+    fn background_work_maps_from_the_live_snapshot() {
+        let mut record = fixture_record();
+        let live = record.live.as_mut().unwrap();
+        live.status = SessionStatus::Idle;
+        live.background = Some(dot_agent_deck::event::BackgroundWork {
+            commands: 2,
+            subagents: 1,
+            since_ms: Some(1_756_684_800_123),
+        });
+        live.background_revision = Some(7);
+        let mapped = map_agent(record.clone());
+        assert_eq!(
+            mapped.background,
+            Some(DesktopBackground {
+                commands: 2,
+                subagents: 1,
+                since_ms: Some(1_756_684_800_123),
+            })
+        );
+        let value = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(
+            value["background"],
+            serde_json::json!({ "commands": 2, "subagents": 1, "sinceMs": 1_756_684_800_123i64 })
+        );
+
+        // No start instant: the key is omitted, the counts stay.
+        record.live.as_mut().unwrap().background = Some(dot_agent_deck::event::BackgroundWork {
+            commands: 0,
+            subagents: 3,
+            since_ms: None,
+        });
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert_eq!(
+            value["background"],
+            serde_json::json!({ "commands": 0, "subagents": 3 })
+        );
+
+        // The daemon's explicit clear shows nothing.
+        record.live.as_mut().unwrap().background =
+            Some(dot_agent_deck::event::BackgroundWork::default());
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert!(value.get("background").is_none());
+
+        // Nor does a record with no live snapshot, or an older daemon's.
+        record.live.as_mut().unwrap().background = None;
+        assert!(map_agent(record.clone()).background.is_none());
+        record.live = None;
+        assert!(map_agent(record).background.is_none());
     }
 
     /// PRD #745 M8: the two `SessionSnapshot` fields the desktop's own DTO used
@@ -4615,12 +5195,12 @@ mod tests {
         );
         let written = crate::settings::DesktopSettings::default();
         assert_eq!(
-            serde_json::to_value(DesktopSettingsSaveError::Partial(
+            serde_json::to_value(DesktopSettingsSaveError::Partial(Box::new(
                 DesktopPartialSettingsSave {
                     message: "the deck list was saved".into(),
                     written: written.clone(),
                 }
-            ))
+            )))
             .unwrap(),
             serde_json::json!({
                 "message": "the deck list was saved",
@@ -4873,5 +5453,53 @@ mod tests {
             serde_json::to_value(&plain).unwrap(),
             serde_json::json!("not observed")
         );
+    }
+
+    /// Issue #1637 audit A3: a notice whose command carries a newline (a
+    /// hidden second command) or a bidi override reaches the webview with no
+    /// command at all, so there is nothing to copy; a newline in the remedy's
+    /// words is removed from what is shown. A clean command passes verbatim.
+    #[test]
+    fn a_hook_notice_command_that_display_would_alter_is_dropped() {
+        use dot_agent_deck::daemon_protocol::{HookBinaryNotice, HookBinaryReason};
+        let notice = |remedy: &str, command: Option<&str>| HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: remedy.into(),
+            command: command.map(str::to_string),
+        };
+        for hostile in [
+            "brew upgrade dot-agent-deck\ntouch /tmp/hook-notice-marker",
+            "brew upgrade dot-agent-deck\r",
+            "brew upgrade \u{202E}kced-tnega-tod",
+            "brew upgrade dot-agent-deck\u{2028}touch x",
+        ] {
+            let dto = HookBinaryNoticeDto::new(&notice("Run:", Some(hostile)));
+            assert_eq!(dto.command, None, "{hostile:?}");
+            // Never a bare `Run:`: the dropped command's lead-in becomes the
+            // daemon's no-command advice.
+            assert_eq!(
+                dto.remedy,
+                dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL,
+                "{hostile:?}"
+            );
+        }
+        let over_cap = format!(
+            "/{} hooks install",
+            "a".repeat(dot_agent_deck::daemon_protocol::MAX_NOTICE_COMMAND_BYTES)
+        );
+        let dto = HookBinaryNoticeDto::new(&notice("Run:", Some(&over_cap)));
+        assert_eq!(dto.command, None);
+        assert_eq!(
+            dto.remedy,
+            dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL
+        );
+        let dto = HookBinaryNoticeDto::new(&notice("Run:\ntouch /tmp/x", None));
+        assert!(!dto.remedy.contains('\n'), "{:?}", dto.remedy);
+        let dto = HookBinaryNoticeDto::new(&notice("Run:", Some("brew upgrade dot-agent-deck")));
+        assert_eq!(dto.command.as_deref(), Some("brew upgrade dot-agent-deck"));
     }
 }

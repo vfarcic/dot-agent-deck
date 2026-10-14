@@ -37,17 +37,34 @@ pub enum EventType {
     /// and strips from every other event type. An older reader decodes it as
     /// [`EventType::Unknown`], a no-op.
     QuotaBlocked,
+    /// PRD #1401: the DAEMON's report of the pull request a session's branch
+    /// has — or, with no [`PULL_REQUEST_METADATA_KEY`], that it has none any
+    /// more. Synthesized only by [`crate::pull_request`]'s monitor and
+    /// broadcast straight onto the fan-out; the hook socket drops a producer's
+    /// copy (`daemon::admit_producer_event`), so the URL a client opens is
+    /// always one the daemon resolved.
+    ///
+    /// Status-neutral: it sets [`crate::state::SessionState::pull_request`] on
+    /// the card it names and nothing else ([`crate::state::AppState::apply_event`]).
+    /// An older reader decodes it as [`EventType::Unknown`], the `QuotaBlocked`
+    /// precedent, so no `PROTOCOL_VERSION` bump; the daemon stamps it at the
+    /// session's current `last_activity`, so even that reader's activity clock
+    /// does not move.
+    PullRequest,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
-    /// without another `PROTOCOL_VERSION` bump. Deserialize-only — never
-    /// produced by this build. Treated as a no-op wherever `EventType` is
-    /// matched (never proof of agent activity, never changes `SessionStatus`).
+    /// without another `PROTOCOL_VERSION` bump. No producer sends it; the one
+    /// frame this build emits with it is the daemon's own question release
+    /// ([`QUESTION_RELEASED_BY_DECK_METADATA_KEY`]), chosen precisely because
+    /// every build reads it as a no-op. Treated as a no-op wherever `EventType`
+    /// is matched (never proof of agent activity, never changes
+    /// `SessionStatus`).
     #[serde(other)]
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentType {
     ClaudeCode,
@@ -169,7 +186,7 @@ fn is_shell_command_flag(arg: &str) -> bool {
 /// (e.g. `FOO=1`) rather than a program or path. Conservative: `NAME` must be a
 /// shell-identifier-shaped run before the first `=`, so a path that merely
 /// contains `=` isn't misread as an assignment.
-fn is_env_assignment(token: &str) -> bool {
+pub(crate) fn is_env_assignment(token: &str) -> bool {
     match token.split_once('=') {
         Some((name, _)) => {
             !name.is_empty()
@@ -509,9 +526,50 @@ pub const ORCHESTRATION_ORPHANED_METADATA_VALUE: &str = "1";
 /// reads any `SessionEnd` as "refetch the agent list now".
 pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
 
+/// `AgentEvent.metadata` key carrying the JSON of the
+/// [`crate::pull_request_info::PullRequestInfo`] an [`EventType::PullRequest`]
+/// reports (PRD #1401). Absent on that event means "no pull request".
+///
+/// **Daemon-authoritative**, like [`DAEMON_PANE_CLOSED_METADATA_KEY`]: the hook
+/// socket removes it from every producer frame and drops a producer's
+/// `pull_request` event outright, so a producer on the unauthenticated same-uid
+/// socket cannot put a URL of its choosing behind a card's badge.
+pub const PULL_REQUEST_METADATA_KEY: &str = "pull_request";
+
+/// `AgentEvent.metadata` key carrying, in decimal, the revision of the pull
+/// request an [`EventType::PullRequest`] reports — present on a report of none
+/// too (PRD #1401). It orders the report against a `ListAgents` reply, see
+/// [`crate::state::SessionState::pull_request_revision`]. Daemon-authoritative
+/// like [`PULL_REQUEST_METADATA_KEY`], and removed from producer frames with it.
+pub const PULL_REQUEST_REVISION_METADATA_KEY: &str = "pull_request_revision";
+
 /// The [`DAEMON_PANE_CLOSED_METADATA_KEY`] value meaning "yes". Fixed for the
 /// same reason as [`ORCHESTRATION_ORPHANED_METADATA_VALUE`].
 pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
+
+/// `AgentEvent.metadata` key marking the DAEMON's report that a spawn's process
+/// is gone, so the background work its card showed is over (issue #1678). It
+/// rides a [`EventType::ShellIdle`] naming the departed agent, its card's
+/// session key and its pane, stamped at the card's own last activity, carrying
+/// the explicit-zero aggregate with the advanced revision and the Displaced
+/// generation verdict ([`AgentEvent::is_background_retirement`]).
+///
+/// An attached client applies it to that agent's existing card on that pane
+/// and to nothing else: it creates, adopts, retires and re-keys no card and
+/// moves no status, so a successor on the same pane is out of its reach
+/// (`crate::state::AppState::apply_background_retirement`).
+///
+/// **Daemon-authoritative**, like [`DAEMON_PANE_CLOSED_METADATA_KEY`]: the
+/// event is broadcast straight onto the fan-out and never ingested, and
+/// `ingest_event` removes the key from every inbound hook event. Additive on the
+/// wire: an older client reads a plain `ShellIdle` stamped Displaced, which
+/// v0.46.0's generation gate refuses before any status or card logic — read
+/// from that release's source, not observed in a running released binary
+/// (`status/background/015` models the gate).
+pub const BACKGROUND_RETIRED_METADATA_KEY: &str = "background_retired";
+
+/// The one [`BACKGROUND_RETIRED_METADATA_KEY`] value.
+pub const BACKGROUND_RETIRED_METADATA_VALUE: &str = "spawn_exited";
 
 /// `AgentEvent.metadata` key carrying the DAEMON's verdict that a hook event is
 /// UNPROVEN (issues #601, #697): the hook-provenance gate admitted it for a pane
@@ -913,10 +971,80 @@ pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE: &str = "1";
 /// hook CLI never sets it, so no
 /// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump is needed. Nor is it a
 /// privilege: an event carrying it is kept from moving a card's status, with
-/// one exception that grants nothing a plain event lacks — a `SubagentStop`
+/// two exceptions that grant nothing a plain event lacks — a `SubagentStop`
 /// ends a `WaitingForInput` that only subagents of the same id raised (issue
-/// #1364, [`crate::state::SubagentWait`]), which a plain `Idle` would end too.
+/// #1364, [`crate::state::SubagentWait`]), which a plain `Idle` would end too,
+/// and so does that subagent's answered permission prompt (issue #1678,
+/// [`AgentEvent::is_subagent_permission_reply`]), which a plain `Thinking`
+/// would end too.
 pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
+
+/// PRD #1631: the question an event raises, as a JSON-encoded
+/// [`crate::question::PendingQuestion`] riding the free-form `metadata` map.
+///
+/// A metadata key rather than a new [`AgentEvent`] field, deliberately: the
+/// map is already on every producer's wire and every reader's decode, so the
+/// question moves no wire at all — an older daemon or TUI ignores an unknown
+/// key — and the dozens of places that build an `AgentEvent` stay as they are.
+/// Every reader decodes it through [`AgentEvent::question`], which sanitizes
+/// it ([`crate::question::PendingQuestion::sanitized`]); the daemon also
+/// rewrites it sanitized, or drops it, on arrival.
+pub const QUESTION_METADATA_KEY: &str = "pending_question";
+
+/// PRD #1631 (PR #1698 review): a fingerprint of a tool call's `tool_input`
+/// ([`tool_input_digest`]), stamped by the Claude-shaped hook on a `PreToolUse`
+/// (`ToolStart`) and a `PermissionRequest`. Claude Code's and Codex's
+/// `PermissionRequest` payloads carry no `tool_use_id`, but the call's own
+/// `PreToolUse` does, and carries the same input, so the state ties a question
+/// to the one call in flight whose input it was raised for
+/// ([`crate::state`]'s `question_call`). Additive like
+/// [`SUBAGENT_ID_METADATA_KEY`]: an older daemon ignores it, an older hook
+/// never sets it, and a question left untied clears by tool name as before.
+pub const TOOL_INPUT_DIGEST_METADATA_KEY: &str = "tool_input_digest";
+
+/// PRD #1631 (PR #1698 review): the [`TOOL_INPUT_DIGEST_METADATA_KEY`] value
+/// for `input` — SHA-256, in hex, of its JSON. `serde_json` keeps an object's
+/// keys sorted in this build (no `preserve_order`), so the same input digests
+/// alike whatever order the producer wrote its keys in.
+pub fn tool_input_digest(input: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.to_string().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// PRD #1631: the id of a question the AGENT reports answered — OpenCode's
+/// `permission.replied` / `question.replied` / `question.rejected` name their
+/// request id here. An event carrying it clears that question if it is the
+/// pending one. It can only take a question away, never raise one, so a forged
+/// value costs nothing a plain `Idle` would not.
+pub const QUESTION_RESOLVED_METADATA_KEY: &str = "question_resolved_id";
+
+/// PRD #1631: the daemon's marker on the event it ingests after answering a
+/// question itself. The daemon's alone: stripped from every producer frame,
+/// and [`AgentEvent::is_daemon_synthetic`] counts it.
+pub const QUESTION_ANSWERED_BY_DECK_METADATA_KEY: &str = "question_answered_by_deck";
+
+/// The value of [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`] and
+/// [`QUESTION_RELEASED_BY_DECK_METADATA_KEY`] — only the key is read.
+pub const QUESTION_ANSWERED_BY_DECK_METADATA_VALUE: &str = "1";
+
+/// PRD #1631: the daemon's marker on the event it ingests when a held
+/// question's producer stopped waiting without an answer (Claude Code kills its
+/// hook on a keyboard No or Esc [observed]). The event is an
+/// [`EventType::Unknown`] carrying [`QUESTION_RESOLVED_METADATA_KEY`], so a
+/// reader that knows the key drops the question and every reader leaves the
+/// status alone — an older client decodes `unknown` as the no-op it has always
+/// been. The daemon's alone, like [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`].
+pub const QUESTION_RELEASED_BY_DECK_METADATA_KEY: &str = "question_released_by_deck";
+
+/// Where a permission prompt stands, on the events the OpenCode hook builds
+/// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
+/// PRD #1631: a question form's answer or dismissal is marked replied too.
+pub const PERMISSION_STATE_METADATA_KEY: &str = "permission_state";
+
+/// [`PERMISSION_STATE_METADATA_KEY`]'s value on an answered permission prompt
+/// or question form.
+pub const PERMISSION_STATE_REPLIED: &str = "replied";
 
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
@@ -1004,6 +1132,15 @@ pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 1;
 ///   live PTY), else `process`/`history-only` for a standalone wrap. Native
 ///   PTY panes (Claude/OpenCode/Pi) omit it, which the UI reads as the
 ///   historical `live`/writable default. Absence never fails the decode.
+/// - **`background`** · object (`{ "commands": u32, "subagents": u32,
+///   "since_ms": i64 | null }`) · optional (**issue #1678**, added additively) ·
+///   the DAEMON's post-transition [`BackgroundWork`] for the card this event
+///   changed. Daemon-authored only: a producer's copy is stripped on arrival.
+///   `Some` with both counts zero is an explicit clear; absent means the event
+///   supplies no aggregate (a legacy event), not a clear.
+/// - **`background_revision`** · integer · optional (**issue #1678**) · the
+///   per-spawn revision of `background`; a client ignores an aggregate older
+///   than the one it holds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub session_id: String,
@@ -1068,6 +1205,46 @@ pub struct AgentEvent {
     /// it `None`, which the UI reads as the historical live/writable default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_target: Option<LiveTarget>,
+    /// Issue #1678: the daemon's post-transition background-work aggregate for
+    /// the card this event changed — see [`BackgroundWork`]. Additive optional
+    /// (`#[serde(default)]` + `skip_serializing_if`), so no `PROTOCOL_VERSION`
+    /// bump: an older reader ignores the key and a newer one reads its absence
+    /// as "no aggregate supplied". Daemon-authored only; a producer's copy is
+    /// stripped before admission (`crate::daemon::admit_producer_event`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundWork>,
+    /// Issue #1678: the revision of [`Self::background`] — a checked monotonic
+    /// per-spawn counter the daemon advances on every aggregate change, so a
+    /// client can refuse a replayed older aggregate. Same additive optional
+    /// shape as `background`, and stripped from producer frames the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_revision: Option<u64>,
+}
+
+/// Issue #1678: background work an agent left running after its turn ended —
+/// detached commands the shell-activity scan still sees, and subagents that
+/// started and have not stopped — as the DAEMON counts it. Clients copy it from
+/// snapshots and events and never reconstruct it from raw hook frames.
+///
+/// Counts are reported only while the agent's turn is over and the agent
+/// reports its own turn boundaries; while a turn is live both are zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BackgroundWork {
+    /// Distinct qualifying POSIX sessions below the pane's agent.
+    pub commands: u32,
+    /// Subagents started and not yet stopped.
+    pub subagents: u32,
+    /// When the oldest item still counted started, in epoch milliseconds on
+    /// the daemon's clock. `None` when the daemon has no start for any of them.
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+}
+
+impl BackgroundWork {
+    /// Whether there is anything to show: at least one counted item.
+    pub fn is_empty(&self) -> bool {
+        self.commands == 0 && self.subagents == 0
+    }
 }
 
 impl AgentEvent {
@@ -1089,6 +1266,22 @@ impl AgentEvent {
     /// behaviour.
     pub fn is_from_subagent(&self) -> bool {
         self.metadata.contains_key(SUBAGENT_ID_METADATA_KEY)
+    }
+
+    /// Issue #1678: is this a subagent's answered permission prompt — a
+    /// `Thinking` carrying both [`SUBAGENT_ID_METADATA_KEY`] and
+    /// [`PERMISSION_STATE_METADATA_KEY`] = [`PERMISSION_STATE_REPLIED`], which
+    /// the OpenCode hook builds from a child session's `permission.replied`
+    /// (and, PRD #1631, its `question.replied` or `question.rejected`)?
+    /// It ends that subagent's share of a wait and says nothing about the main
+    /// thread. `false` for every event an older hook CLI builds.
+    pub fn is_subagent_permission_reply(&self) -> bool {
+        self.event_type == EventType::Thinking
+            && self.is_from_subagent()
+            && self
+                .metadata
+                .get(PERMISSION_STATE_METADATA_KEY)
+                .is_some_and(|state| state == PERMISSION_STATE_REPLIED)
     }
 
     /// Issue #684: was this `SessionStart` authored by the DAEMON to draw a
@@ -1115,6 +1308,47 @@ impl AgentEvent {
                 .metadata
                 .get(DAEMON_PANE_CLOSED_METADATA_KEY)
                 .is_some_and(|v| v == DAEMON_PANE_CLOSED_METADATA_VALUE)
+    }
+
+    /// PRD #1401: the pull request an [`EventType::PullRequest`] reports —
+    /// `Some(None)` when it reports none, `None` when this is not such an
+    /// event. A value that does not decode reads as "none": the badge is
+    /// dropped rather than left showing something the daemon no longer says.
+    pub fn pull_request_report(&self) -> Option<Option<crate::pull_request_info::PullRequestInfo>> {
+        if self.event_type != EventType::PullRequest {
+            return None;
+        }
+        Some(
+            self.metadata
+                .get(PULL_REQUEST_METADATA_KEY)
+                .and_then(|json| serde_json::from_str(json).ok()),
+        )
+    }
+
+    /// PRD #1401: the revision an [`EventType::PullRequest`] carries under
+    /// [`PULL_REQUEST_REVISION_METADATA_KEY`], or `None` when it carries none
+    /// that decodes — a daemon that sends none, or a different event.
+    pub fn pull_request_revision(&self) -> Option<u64> {
+        if self.event_type != EventType::PullRequest {
+            return None;
+        }
+        self.metadata
+            .get(PULL_REQUEST_REVISION_METADATA_KEY)
+            .and_then(|revision| revision.parse().ok())
+    }
+
+    /// Issue #1678: is this the daemon's report that the named spawn's
+    /// background work is over (see [`BACKGROUND_RETIRED_METADATA_KEY`])?
+    /// Requires the shell event type and both identities, so a malformed frame
+    /// is never read as a statement about no card in particular.
+    pub fn is_background_retirement(&self) -> bool {
+        self.event_type == EventType::ShellIdle
+            && self.pane_id.is_some()
+            && self.agent_id.is_some()
+            && self
+                .metadata
+                .get(BACKGROUND_RETIRED_METADATA_KEY)
+                .is_some_and(|v| v == BACKGROUND_RETIRED_METADATA_VALUE)
     }
 
     /// Issue #601: does this event carry the daemon's UNPROVEN marker (see
@@ -1316,8 +1550,10 @@ impl AgentEvent {
     /// authentication marker (auditor) — a forged raw `Error` without it marks a
     /// card exactly as it did before.
     pub fn is_daemon_synthetic(&self) -> bool {
-        matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
-            || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+        matches!(
+            self.event_type,
+            EventType::ShellBusy | EventType::ShellIdle | EventType::PullRequest
+        ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
             || self
                 .metadata
                 .contains_key(DELIVERY_NOTICE_CLEARED_METADATA_KEY)
@@ -1335,6 +1571,38 @@ impl AgentEvent {
             || self
                 .metadata
                 .contains_key(crate::inbox_display::CARD_INBOX_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(QUESTION_ANSWERED_BY_DECK_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(QUESTION_RELEASED_BY_DECK_METADATA_KEY)
+    }
+
+    /// PRD #1631: the question this event raises, sanitized — `None` when it
+    /// carries none, or one that does not decode or does not survive
+    /// [`crate::question::PendingQuestion::sanitized`].
+    pub fn question(&self) -> Option<crate::question::PendingQuestion> {
+        let raw = self.metadata.get(QUESTION_METADATA_KEY)?;
+        serde_json::from_str::<crate::question::PendingQuestion>(raw)
+            .ok()?
+            .sanitized()
+    }
+
+    /// PRD #1631: put `question` on this event.
+    pub fn set_question(&mut self, question: &crate::question::PendingQuestion) {
+        if let Ok(json) = serde_json::to_string(question) {
+            self.metadata
+                .insert(QUESTION_METADATA_KEY.to_string(), json);
+        }
+    }
+
+    /// PRD #1631: the question id this event reports the agent answered, if
+    /// any ([`QUESTION_RESOLVED_METADATA_KEY`]).
+    pub fn resolved_question_id(&self) -> Option<&str> {
+        self.metadata
+            .get(QUESTION_RESOLVED_METADATA_KEY)
+            .map(String::as_str)
     }
 }
 
@@ -1354,21 +1622,23 @@ pub struct PresentedToken {
 /// Issue #318: serialize `event` as the one-line JSON a producer writes to the
 /// hook socket, with `token` added when there is one.
 ///
-/// With `None` the output is exactly `serde_json::to_string(event)`, so a
-/// producer without a token emits the bytes it always did and an older daemon
-/// receives nothing new. With a token, the key is added beside the event's own
-/// keys; an older daemon ignores it because [`AgentEvent`] does not deny
-/// unknown fields.
+/// The token is added beside the event's own keys; an older daemon ignores it
+/// because [`AgentEvent`] does not deny unknown fields. Issue #1637 adds the
+/// sender's stamp the same way, on every line
+/// ([`crate::hook_binary::stamp_hook_line`]): `deck_build` and `deck_exe`, which
+/// an older daemon ignores for the same reason.
 pub fn agent_event_line(event: &AgentEvent, token: Option<&str>) -> serde_json::Result<String> {
-    let Some(token) = token else {
-        return serde_json::to_string(event);
-    };
     let mut value = serde_json::to_value(event)?;
     if let serde_json::Value::Object(map) = &mut value {
-        map.insert(
-            "token".to_string(),
-            serde_json::Value::String(token.to_string()),
-        );
+        if let Some(token) = token {
+            map.insert(
+                "token".to_string(),
+                serde_json::Value::String(token.to_string()),
+            );
+        }
+        // Issue #1637: which deck sent this, so the daemon can tell when an
+        // agent's hooks run an older copy than itself.
+        crate::hook_binary::stamp_hook_line(map);
     }
     serde_json::to_string(&value)
 }
@@ -1491,6 +1761,21 @@ pub enum DaemonMessage {
     /// pool. Answered with an [`InboxClaimReply`].
     #[serde(rename = "inbox_release")]
     InboxRelease(InboxClaimRequest),
+    /// PRD #1631: a producer reports a question and, with `hold`, keeps this
+    /// connection open for the daemon's answer — the Claude Code
+    /// `PermissionRequest` hook, and the `await-answer` child the OpenCode
+    /// plugin and the Pi extension start. The daemon applies the event exactly
+    /// as a bare one and, for a held question it accepted, writes one
+    /// [`crate::question::QuestionReply`] line when the question is answered
+    /// or let go; otherwise it answers a `released` reply at once.
+    ///
+    /// Additive on the unversioned hook socket, so it does NOT move the attach
+    /// `PROTOCOL_VERSION`. An older daemon decodes it as neither a
+    /// `DaemonMessage` nor an [`AgentEvent`], logs it as malformed and answers
+    /// nothing; the producer then exits with no decision and the agent shows
+    /// its own prompt, as it did before.
+    #[serde(rename = "question")]
+    Question(Box<QuestionSignal>),
 }
 
 impl DaemonMessage {
@@ -1517,6 +1802,7 @@ impl DaemonMessage {
             DaemonMessage::InboxPublish(r) => &r.pane_id,
             DaemonMessage::InboxOffer(r) => &r.pane_id,
             DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => &r.pane_id,
+            DaemonMessage::Question(s) => &s.pane_id,
         }
     }
 
@@ -1539,6 +1825,7 @@ impl DaemonMessage {
             DaemonMessage::InboxPublish(r) => r.token.as_deref(),
             DaemonMessage::InboxOffer(r) => r.token.as_deref(),
             DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => r.token.as_deref(),
+            DaemonMessage::Question(s) => s.token.as_deref(),
         }
     }
 
@@ -1563,7 +1850,8 @@ impl DaemonMessage {
             | DaemonMessage::Dispatch(_)
             | DaemonMessage::ListTargets(_)
             | DaemonMessage::RestartRole(_)
-            | DaemonMessage::SpawnRole(_) => false,
+            | DaemonMessage::SpawnRole(_)
+            | DaemonMessage::Question(_) => false,
         }
     }
 
@@ -1587,7 +1875,8 @@ impl DaemonMessage {
             | DaemonMessage::ListTargets(_)
             | DaemonMessage::RestartRole(_)
             | DaemonMessage::SpawnRole(_)
-            | DaemonMessage::Ack(_) => None,
+            | DaemonMessage::Ack(_)
+            | DaemonMessage::Question(_) => None,
         };
         claimed.filter(|id| !id.is_empty())
     }
@@ -1612,6 +1901,7 @@ impl DaemonMessage {
             DaemonMessage::InboxOffer(_) => "inbox_offer",
             DaemonMessage::InboxComplete(_) => "inbox_complete",
             DaemonMessage::InboxRelease(_) => "inbox_release",
+            DaemonMessage::Question(_) => "question",
         }
     }
 
@@ -1678,6 +1968,15 @@ impl DaemonMessage {
             DaemonMessage::InboxComplete(_) | DaemonMessage::InboxRelease(_) => {
                 serde_json::to_string(&InboxClaimReply::refused(reason, message))
             }
+            // A refused question is released as `refused`: the producer prints
+            // no decision, the agent's own prompt stays on screen, and the
+            // producer re-sends the event as a plain one so it is not lost.
+            DaemonMessage::Question(s) => {
+                serde_json::to_string(&crate::question::QuestionReply::released(
+                    &s.question_id().unwrap_or_default(),
+                    crate::question::ReleaseReason::Refused,
+                ))
+            }
         };
         json.ok()
     }
@@ -1686,11 +1985,11 @@ impl DaemonMessage {
     /// provenance gate, or `None` for a verb whose own handler answers on the
     /// connection.
     ///
-    /// Only the two fire-and-forget verbs (`work_done` and `dispatch`) are
-    /// `Some`, and the exhaustive `match` is what enforces the invariant the hook
-    /// loop depends on: **exactly one line per message**. `delegate`,
-    /// `restart_role`, `spawn_role`, `list_targets`, `get_seed` and `ack` all
-    /// write their own response after their handler runs, so an admission line
+    /// Only `dispatch` is `Some`, and the exhaustive `match` is what enforces
+    /// the invariant the hook loop depends on: **exactly one line per
+    /// message**. `work_done`, `delegate`, `restart_role`, `spawn_role`,
+    /// `list_targets`, `get_seed` and `ack` all write their own response after
+    /// their handler runs, so an admission line
     /// here would be a second one and the caller — which reads exactly one line
     /// — would take the ack for the answer. `ack` answers after its handler
     /// (PR #1414 review) because admission is not what its caller needs to know:
@@ -1704,17 +2003,25 @@ impl DaemonMessage {
     /// as the dispatch takes. The price is stated in [`SignalAck::accepted`]: an
     /// admitted message is one the gate let through, not one whose work
     /// succeeded.
+    ///
+    /// `work_done` was acknowledged here too until PRD #1631, and that ordered
+    /// nothing: a worker whose first report was acked here could send its
+    /// second before the first was queued for delivery, and the two could reach
+    /// the recipient reversed (`orchestration/work-done/010`). Its handler
+    /// acknowledges once the report is queued — a state change under the
+    /// `state` read lock and a queue push, not the delivery, which may wait for
+    /// the recipient's draft — so a sender that waits for its ack is ordered.
     pub fn provenance_ack_reply(&self) -> Option<String> {
         match self {
-            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) => {
-                serde_json::to_string(&SignalAck::accepted()).ok()
-            }
-            DaemonMessage::Delegate(_)
+            DaemonMessage::Dispatch(_) => serde_json::to_string(&SignalAck::accepted()).ok(),
+            DaemonMessage::WorkDone(_)
+            | DaemonMessage::Delegate(_)
             | DaemonMessage::RestartRole(_)
             | DaemonMessage::SpawnRole(_)
             | DaemonMessage::ListTargets(_)
             | DaemonMessage::GetSeed(_)
             | DaemonMessage::Ack(_)
+            | DaemonMessage::Question(_)
             | DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
@@ -1746,8 +2053,10 @@ impl DaemonMessage {
 /// # What it claims, and what it does not
 ///
 /// It claims exactly one thing: **this daemon admitted the message past the
-/// provenance gate**. It is written before the handler runs, so it is not a
-/// receipt for the work. In particular these remain invisible to the sender, as
+/// provenance gate**. It is not a receipt for the work: `dispatch`'s is written
+/// before its handler runs, and `work_done`'s once the handler has made its
+/// state changes and queued the report for delivery (PRD #1631), before the
+/// report is written into any pane. In particular these remain invisible to the sender, as
 /// they were before:
 ///
 /// - a `dispatch` from a pane the registry holds no record for, which the hook
@@ -2618,6 +2927,21 @@ pub enum BroadcastMsg {
     /// it reads the tag as [`Self::Unknown`].
     #[serde(rename = "inbox")]
     Inbox(InboxNotice),
+    /// Issue #1637: the daemon's hook-binary notices changed — an agent's
+    /// hooks were seen running an older `dot-agent-deck`, or stopped doing so.
+    /// Carries the whole current list, which replaces what a client holds.
+    ///
+    /// No [`crate::daemon_protocol::PROTOCOL_VERSION`] bump: every client that
+    /// can attach to a v10 daemon carries [`Self::Unknown`] (it first shipped in
+    /// v0.40.0, before v10 in v0.41.0), so an older client decodes this as
+    /// `Unknown` and the stream survives.
+    ///
+    /// The list rides in a struct, not as the variant's own payload: this enum
+    /// is internally tagged, and serde cannot serialize a tagged newtype
+    /// variant whose payload is a sequence — the frame failed to encode and no
+    /// client ever received it.
+    #[serde(rename = "hook_binary_notice")]
+    HookBinaryNotice(crate::hook_binary::HookBinaryNotices),
     /// A `kind` tag this build has never heard of (issue #801 item 3, applied
     /// by PRD #741 M8).
     ///
@@ -3276,6 +3600,44 @@ pub struct InboxListReply {
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.
+/// PRD #1631: [`DaemonMessage::Question`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionSignal {
+    pub pane_id: String,
+    /// The hook capability token (issue #1077), as on every verb.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The event to apply. It carries the question
+    /// ([`QUESTION_METADATA_KEY`]).
+    pub event: AgentEvent,
+    /// Keep this connection open for the answer.
+    #[serde(default)]
+    pub hold: bool,
+    /// PRD #1631: after an answered reply this producer writes one
+    /// [`crate::question::ReplyAck`] line saying whether the agent took the
+    /// answer, and the daemon reports the answer only once it has. Only the
+    /// OpenCode plugin's `await-answer` child sets it: it hands the answer to
+    /// OpenCode's reply API, which can refuse it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ack: bool,
+    /// PRD #1631 (PR #1698 review): when the daemon starts holding the
+    /// question, it says so at once, with a [`crate::question::QuestionReply`]
+    /// whose outcome is `held`, before the reply that ends the hold. A
+    /// producer that asks for it can tell a daemon that took the hold from
+    /// one that never will: a daemon from before `question` existed reads the
+    /// line as a malformed event and answers nothing, and the producer then
+    /// sends the event as a plain one so the card still reads Needs Input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirm_hold: bool,
+}
+
+impl QuestionSignal {
+    /// The id of the question the event carries, as the producer sent it.
+    pub fn question_id(&self) -> Option<String> {
+        self.event.question().map(|q| q.id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkDoneSignal {
     pub pane_id: String,
@@ -3387,6 +3749,8 @@ mod tests {
             agent_version: Some("codex-1.2.3".into()),
             schema_version: Some(AGENT_EVENT_SCHEMA_VERSION),
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         // Both fields must appear on the wire when set…
@@ -3421,6 +3785,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(
@@ -3494,10 +3860,9 @@ mod tests {
         let ty: EventType = serde_json::from_str("\"some_future_event_type\"").unwrap();
         assert_eq!(ty, EventType::Unknown);
 
-        // Deserialize-only: `Unknown` is never produced by this build, so it
-        // has no "own" wire name to round-trip through — unlike
-        // `AgentType::None`, which legitimately serializes as `"none"`.
-        // Confirm the REAL variants this build DOES produce still round-trip
+        // No producer sends `Unknown`; the daemon's question release is its
+        // one emitter (`QUESTION_RELEASED_BY_DECK_METADATA_KEY`), and that
+        // frame relies on it reading back as the same no-op. Confirm the REAL variants this build DOES produce still round-trip
         // cleanly, so the catch-all didn't disturb ordinary encode/decode.
         assert_eq!(
             serde_json::from_str::<EventType>(
@@ -3853,6 +4218,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         });
         let json = serde_json::to_string(&event).expect("serialize");
         assert!(matches!(
@@ -3958,6 +4325,33 @@ mod tests {
     // through the same `BroadcastMsg` wire the daemon forwards over KIND_EVENT,
     // and tag itself `orchestration_surface` so it's distinguishable from the
     // `event` variant an older peer expects (the reason PROTOCOL_VERSION bumped).
+    // Issue #1637: the hook-binary notice broadcast must actually encode. This
+    // enum is internally tagged, so a variant whose payload is a sequence
+    // fails `serde_json::to_vec` and the daemon skips the frame.
+    #[test]
+    fn hook_binary_notice_broadcast_round_trips() {
+        let notice = crate::hook_binary::HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: crate::hook_binary::HookBinaryReason::Older,
+            remedy: "Run:".into(),
+            command: Some("brew upgrade dot-agent-deck".into()),
+        };
+        for notices in [Vec::new(), vec![notice]] {
+            let msg = BroadcastMsg::HookBinaryNotice(crate::hook_binary::HookBinaryNotices {
+                notices: notices.clone(),
+            });
+            let json = serde_json::to_value(&msg).expect("encodes");
+            assert_eq!(json["kind"], "hook_binary_notice", "{json}");
+            match serde_json::from_value::<BroadcastMsg>(json).expect("decodes") {
+                BroadcastMsg::HookBinaryNotice(payload) => assert_eq!(payload.notices, notices),
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn orchestration_surface_broadcast_round_trips() {
         let msg = BroadcastMsg::OrchestrationSurface(OrchestrationSurface {
@@ -4120,12 +4514,13 @@ mod tests {
     /// The invariant the hook loop rests on: **exactly one line per message**.
     /// A verb that answers in its own arm must return `None` from
     /// `provenance_ack_reply`, or the caller — which reads exactly one line —
-    /// would take the admission for the answer.
+    /// would take the admission for the answer. `work_done` answers in its own
+    /// arm since PRD #1631, once its report is queued.
     #[test]
-    fn only_the_fire_and_forget_verbs_are_acknowledged_at_the_gate() {
+    fn only_dispatch_is_acknowledged_at_the_gate() {
         for msg in one_of_every_variant() {
             let acked = msg.provenance_ack_reply().is_some();
-            let expected = matches!(msg, DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_));
+            let expected = matches!(msg, DaemonMessage::Dispatch(_));
             assert_eq!(
                 acked,
                 expected,
@@ -4176,17 +4571,14 @@ mod tests {
 
     /// The admission is affirmative: it identifies itself and carries no error.
     #[test]
-    fn an_admitted_fire_and_forget_verb_answers_an_affirmative_ack() {
-        let msg = DaemonMessage::WorkDone(WorkDoneSignal {
-            pane_id: "p".into(),
-            task: "t".into(),
-            done: false,
-            timestamp: chrono::Utc::now(),
-            token: None,
-        });
+    fn an_admitted_dispatch_answers_an_affirmative_ack() {
+        let msg = one_of_every_variant()
+            .into_iter()
+            .find(|msg| matches!(msg, DaemonMessage::Dispatch(_)))
+            .expect("a dispatch");
         let line = msg
             .provenance_ack_reply()
-            .expect("work_done is acknowledged");
+            .expect("dispatch is acknowledged at the gate");
         let ack: SignalAck = serde_json::from_str(&line).expect("the ack parses");
         assert!(ack.is_signal_ack());
         assert!(ack.accepted);

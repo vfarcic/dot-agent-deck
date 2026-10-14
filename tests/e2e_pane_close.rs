@@ -117,7 +117,7 @@ fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
     );
 }
 
-/// Scenario: Launch one live card at a roomy width, click the real persistent `[Close Ctrl+W]` button, cancel, then press Ctrl+W. Both production input paths must display the same Cancel-default close modal while leaving the agent alive until explicit confirmation.
+/// Scenario: Launch one live card at a roomy width, click the real persistent `[Close w/Ctrl+W]` button, cancel, then press Ctrl+W. Both production input paths must display the same Cancel-default close modal while leaving the agent alive until explicit confirmation.
 #[spec("prompt/close-confirm/003")]
 #[test]
 fn close_confirm_003_real_button_and_key_share_confirmation() {
@@ -127,9 +127,9 @@ fn close_confirm_003_real_button_and_key_share_confirmation() {
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_keys(b"\x04");
-    deck.wait_for_string("[Back to Pane Ctrl+D]");
+    deck.wait_for_string("[Back to Pane d/Ctrl+D]");
 
-    let (col, row) = deck.wait_for_in_grid("[Close Ctrl+W]");
+    let (col, row) = deck.wait_for_in_grid("[Close w/Ctrl+W]");
     deck.click(col + 1, row);
     deck.wait_for_string("Close selected agent?");
     let clicked_modal = deck.snapshot_grid();
@@ -154,7 +154,7 @@ fn close_confirm_003_real_button_and_key_share_confirmation() {
     );
 }
 
-/// Scenario: Launch one live card, send a single PTY burst containing the real `[Close Ctrl+W]` mouse click plus Down+Enter that was queued before the modal could render, and verify the burst cannot confirm it. After the modal is visibly drawn, a fresh Down+Enter must close the card.
+/// Scenario: Launch one live card, send a single PTY burst containing the real `[Close w/Ctrl+W]` mouse click plus Down+Enter that was queued before the modal could render, and verify the burst cannot confirm it. After the modal is visibly drawn, a fresh Down+Enter must close the card.
 #[spec("prompt/close-confirm/004")]
 #[test]
 fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
@@ -164,9 +164,9 @@ fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_keys(b"\x04");
-    deck.wait_for_string("[Back to Pane Ctrl+D]");
+    deck.wait_for_string("[Back to Pane d/Ctrl+D]");
 
-    let (col, row) = deck.wait_for_in_grid("[Close Ctrl+W]");
+    let (col, row) = deck.wait_for_in_grid("[Close w/Ctrl+W]");
     let click_col = col + 1;
     let sgr_col = click_col + 1;
     let sgr_row = row + 1;

@@ -21,8 +21,12 @@ tasks:
       Build this checkout and start the TUI against an ISOLATED sandbox daemon, so
       trying a branch build never bounces your everyday deck. Run it from the
       directory holding your .dot-agent-deck.toml. Vars: DIR (config dir, default
-      the dir you invoke from), SANDBOX (isolation state dir, default DIR/.dad-sandbox),
-      PROFILE (release|debug, default release). See docs/develop/local-run.md.
+      the dir you invoke from), SANDBOX (isolation state dir, default one per branch,
+      DIR/.dad-sandbox/branch-<slug>: the branch name with anything outside
+      A-Za-z0-9._- made `-`, plus a hash when it was changed, holds an uppercase
+      letter or was cut to fit; DIR/.dad-sandbox/commit-<sha> on a detached HEAD),
+      PROFILE (release|debug, default release).
+      See docs/develop/local-run.md.
     vars:
       DIR: '{{.DIR | default .USER_WORKING_DIR}}'
       SANDBOX: '{{.SANDBOX | default ""}}'
@@ -87,7 +91,8 @@ tasks:
       Stop what `task run`, `task run-desktop` or `task run-all` started in the
       sandbox — a background desktop, then the sandbox daemon — and leave your real
       daemon alone. Same DIR/SANDBOX vars; PROFILE defaults to the build that
-      started the sandbox. Arguments after -- go to `daemon stop`, e.g.
+      started the sandbox. With no SANDBOX it reaches the sandbox of the branch
+      this checkout is on. Arguments after -- go to `daemon stop`, e.g.
       `task run-stop -- --force` to stop a sandbox daemon that still has agents.
     vars:
       DIR: '{{.DIR | default .USER_WORKING_DIR}}'

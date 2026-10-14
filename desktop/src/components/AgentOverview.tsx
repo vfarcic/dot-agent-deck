@@ -10,6 +10,8 @@ import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
 import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
+import { HostMetricsButton } from "./HostMetricsPanel";
+import { chooseHostDeck } from "../lib/hostMetrics";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, incompatibleRemedy, startDaemonConfirmCopy } from "../lib/connectionRemedy";
 import { StartDaemonError } from "../lib/actionError";
 import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
@@ -17,9 +19,13 @@ import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { VoiceNumber } from "./VoiceNumber";
+import { PullRequestBadge } from "./PullRequestBadge";
+import { OpenPullRequest } from "../lib/prBrowser";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
+import { agentSpokenName, orchestrationTitle } from "../lib/agentNames";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
+import { HookBinaryNotices } from "./HookBinaryNotice";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -45,6 +51,8 @@ export type OverviewAgent = Pick<
   "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt" | "lastActivityMs" | "spawnedAtMs"
   /* Issue #1496 — read by the dashboard filter, not rendered. */
   | "agentType" | "daemonStatus" | "authoringKind"
+  /* PRD #1401 — the badge beside the agent's name. */
+  | "pullRequest"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -71,7 +79,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest } = agent;
   return {
     id,
     daemonId,
@@ -90,6 +98,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     lastActivityMs,
     spawnedAtMs,
     writeLease: writeLease === "unknown" ? undefined : writeLease,
+    ...(pullRequest ? { pullRequest } : {}),
   };
 }
 
@@ -232,7 +241,7 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
         id,
         key: id === undefined ? anonymousOrchestrationKey(agent) : groupKey("orchestration", id),
         kind: "orchestration" as const,
-        title: agent.tab.displayTitle || agent.tab.name,
+        title: orchestrationTitle(agent.tab),
         subtitle: agent.tab.displayTitle ? agent.tab.name : undefined,
         agents: [],
       };
@@ -1051,6 +1060,35 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     },
   };
   /*
+    PR #1672 — which daemon's Host popover is open, by deck id: at most one,
+    as before, now held here so the button and the spoken "show host" open it
+    through one registry action (`showHostMetrics`).
+  */
+  const [hostOpen, setHostOpen] = useState<string | undefined>();
+  const showHostMetrics = useCallback((deckId?: string): string | undefined => {
+    const choice = chooseHostDeck(decks.map((deck) => ({
+      deckId: deck.snapshot.connection.deckId,
+      name: deckName(deck.snapshot.connection),
+      connected: deck.connected,
+      hasFigures: deck.snapshot.hostMetrics !== undefined,
+    })), deckId);
+    if ("refused" in choice) return choice.refused;
+    setHostOpen(choice.open);
+    return undefined;
+  }, [decks]);
+  const closeHostMetrics = useCallback((deckId: string) => setHostOpen((open) => (open === deckId ? undefined : open)), []);
+  /*
+    PR #1672 — the open popover goes with its button. A daemon that
+    disconnects or stops sending figures loses its Host button, and the
+    popover is closed with it, so it does not reappear unasked when they come
+    back.
+  */
+  useEffect(() => {
+    if (hostOpen === undefined) return;
+    const shown = decks.some((deck) => deck.connected && deck.snapshot.connection.deckId === hostOpen && deck.snapshot.hostMetrics !== undefined);
+    if (!shown) setHostOpen(undefined);
+  }, [decks, hostOpen]);
+  /*
     Issue #1492 — the dashboard scrolls in its own region, and a row acted on
     by number or by name is scrolled into view first, so it is on screen
     behind the pane that opens over it, and on screen when that pane closes.
@@ -1123,13 +1161,19 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          scroll that lands under a pane moves only the screen behind it. */
       scrollDashboard: (move: DashboardScroll) => scrollDashboard(bodyRef.current, move),
       revealAgent,
+      /* PR #1672 — a daemon's Host figures, served always: Rust offers the
+         row only while the New agent dialog is closed. */
+      showHostMetrics,
+      /* And its close, published only while a popover is open, so
+         `closeTopmost` reads its presence the way it reads `closeNewAgent`'s. */
+      ...(hostOpen !== undefined ? { closeHostMetrics: () => setHostOpen(undefined) } : {}),
     };
     voiceChannel.current = newAgent
       ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
       : newAgentAvailable ? { openNewAgent, ...directoryMoves } : directoryMoves;
     return () => { voiceChannel.current = undefined; };
   });
-  const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent, revealAgent }), [onNavigate, openNewAgent, revealAgent]);
+  const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent, revealAgent, showHostMetrics }), [onNavigate, openNewAgent, revealAgent, showHostMetrics]);
   /* Issue #1198 — the deck is an experimental surface, so every "Open deck"
      door on this screen exists only while it is shown. `undefined` removes
      the top bar's button and each deck group's alike. */
@@ -1199,15 +1243,21 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       /* Issue #1496 — the rows SHOWING, so a number names a row on screen. */
       : decks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.sections.flatMap((section) => (section.matching ? section.group.agents : [])) : [])).slice(0, MAX_NUMBERED_ROWS)
   ), [decks, rowsShown]);
-  const numberedEntries = useMemo(() => numberedAgents?.map((agent): VoiceNumberedEntryDto => ({
-    kind: "agent",
-    value: agent.id,
-    deckId: agent.daemonId,
-    label: agent.displayName,
-    /* The names a spoken number can also be: the role and the CLI. Not the
-       id, which nobody reads off the row and which often ends in a digit. */
-    names: [agent.tab.kind === "orchestration" ? agent.tab.roleName : undefined, agent.cli].filter((name): name is string => Boolean(name)),
-  })), [numberedAgents]);
+  const numberedEntries = useMemo(() => numberedAgents?.map((agent): VoiceNumberedEntryDto => {
+    /* Issue #1668 — an orchestration's row by its run's title and its name,
+       as Reading names it, so two runs' coders are two names in a choice. */
+    const label = agentSpokenName(agent);
+    return {
+      kind: "agent",
+      value: agent.id,
+      deckId: agent.daemonId,
+      label,
+      /* The names a spoken number can also be: its own name, the role and the
+         CLI. Not the id, which nobody reads off the row and which often ends
+         in a digit. */
+      names: [...new Set([agent.displayName, agent.tab.kind === "orchestration" ? agent.tab.roleName : undefined, agent.cli])].filter((name): name is string => Boolean(name) && name !== label),
+    };
+  }), [numberedAgents]);
   /* One section across every daemon group (round 4, D7). */
   const numberedSections = useMemo<VoiceNumberedSectionDto[] | undefined>(() => numberedEntries && [{ kind: "agent", entries: numberedEntries }], [numberedEntries]);
   useNumberedList("screen", numberedSections);
@@ -1551,6 +1601,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
                 ? () => setUpgrade({ deckId: deck.snapshot.connection.deckId!, deckName: deckName(deck.snapshot.connection), kind: upgradeKindOf(deck.snapshot.connection), offer: deck.snapshot.connection.upgradeOffer })
                 : undefined}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
+              hostOpen={deck.snapshot.connection.deckId !== undefined && hostOpen === deck.snapshot.connection.deckId}
+              onOpenHost={() => VOICE_ACTIONS.showHostMetrics.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId })}
+              onCloseHost={() => { if (deck.snapshot.connection.deckId !== undefined) closeHostMetrics(deck.snapshot.connection.deckId); }}
             />
           ))}
         </section>
@@ -1651,7 +1704,7 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onNewAgent }: {
+function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
   deck: FleetDeck;
   now: number;
   columns: OverviewColumnId[];
@@ -1672,6 +1725,10 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
   onUpgrade?: () => void;
   /** Open the New agent flow with THIS deck preselected (PRD #1223 M4). Absent where the deck cannot take a spawn. */
   onNewAgent?: () => void;
+  /** PR #1672 — whether THIS deck's Host popover is the open one, and the two ways to change that. */
+  hostOpen: boolean;
+  onOpenHost: () => void;
+  onCloseHost: () => void;
 }) {
   const connection = deck.snapshot.connection;
   /*
@@ -1760,6 +1817,8 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
           */}
           <strong id={titleId} title={daemonIdentityTitle} data-testid="daemon-identity">{deckName(connection)}</strong>
         </div>
+        {/* PRD #1258: this deck's host, from its own daemon — a small button beside its name, coloured by the worst reading, that opens the numbers. Every deck in a fleet has its own. */}
+        {deck.connected && deck.snapshot.hostMetrics && <HostMetricsButton report={deck.snapshot.hostMetrics} deckLabel={deckName(connection)} open={hostOpen} onOpen={onOpenHost} onClose={onCloseHost} />}
         {/*
           Only when it says something the lamp does not. The element is
           not deleted — in the disconnected, incompatible and
@@ -1782,6 +1841,9 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
         {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={`Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
       </header>
+
+      {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. */}
+      {deck.connected && <HookBinaryNotices notices={connection.hookBinaryNotices} />}
 
       <div className="daemon-group-body">
         <DaemonBody
@@ -2451,6 +2513,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
   */
   const openAgent = useContext(OpenAgentContext);
   const stopControls = useContext(StopControlsContext);
+  const openPullRequest = useContext(OpenPullRequest);
   // ONE instant for the whole screen, ticked by `useOverviewClock` so these two
   // cells keep counting between daemon events. Passed down rather than read
   // here so every row on a repaint is relative to the same moment rather than
@@ -2495,6 +2558,20 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
             */}
             {agent.writeLease && <span className={`overview-lease lease-${agent.writeLease}`} title={WRITE_LEASE_TITLE[agent.writeLease]}>{agent.writeLease}</span>}
             {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
+            {/*
+              PRD #1401 — the same badge the agent's tile and screen show, and
+              the same click: it opens the PR in the in-app browser directly,
+              over this screen, rather than opening the agent first. It is a
+              button, so a click on it never also opens the agent's pane (see
+              `clickLandedOnRowControl`).
+            */}
+            {agent.pullRequest && (
+              <PullRequestBadge
+                pullRequest={agent.pullRequest}
+                testId="overview-pr-badge"
+                onOpen={openPullRequest && agent.pullRequest.url ? () => openPullRequest({ deckId: agent.daemonId, agentId: agent.id }) : undefined}
+              />
+            )}
             {openAgent && (
               <button
                 className="overview-open-agent"

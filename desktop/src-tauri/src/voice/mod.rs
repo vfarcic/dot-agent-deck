@@ -48,10 +48,13 @@ mod filter;
 pub mod hold;
 pub mod http;
 pub mod human_voice;
+pub mod lease;
 pub mod numbers;
 pub mod openai;
+pub mod option_match;
 pub mod outcome;
 pub mod prompt;
+pub mod question;
 pub mod reading;
 pub mod remote;
 pub mod resolver;
@@ -389,11 +392,11 @@ pub use capture::{
 pub use choice::{ChoiceAnswer, ChoiceLive, MAX_CHOICES};
 pub use hold::VoiceHold;
 pub use outcome::{
-    ChoiceMatch, DeckRefMatch, DirRefMatch, FILTER_DASHBOARD_ROW, ResolvedParam, SWITCH_DECK_ROW,
-    VoiceDeckIdentity, VoiceDeckSelection, VoiceOutcome, VoiceResult, address_deck_switch,
-    handle_utterance, handle_utterance_with, handle_utterance_with_dictation,
-    handle_utterance_with_modes, refuse_switch_beyond_selector, resolve_agent_type_ref,
-    resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
+    ChoiceMatch, DeckRefMatch, DirRefMatch, FILTER_DASHBOARD_ROW, ResolvedParam,
+    SHOW_HOST_METRICS_ROW, SWITCH_DECK_ROW, VoiceDeckIdentity, VoiceDeckSelection, VoiceOutcome,
+    VoiceResult, address_deck_switch, handle_utterance, handle_utterance_with,
+    handle_utterance_with_dictation, handle_utterance_with_modes, refuse_switch_beyond_selector,
+    resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
@@ -632,6 +635,17 @@ pub mod test_support {
         }
     }
 
+    /// PRD #1631: the daemon's pending question as the voice panel sees it,
+    /// through the projection the snapshot takes in production
+    /// (`dto::map_pending_question`). `tests/voice_question_fixtures.rs`
+    /// cannot call that itself because `dto` is private, which is the same
+    /// reason [`agent`] exists.
+    pub fn pending_question(
+        question: &dot_agent_deck::question::PendingQuestion,
+    ) -> crate::dto::DesktopPendingQuestion {
+        crate::dto::map_pending_question(question)
+    }
+
     /// A snapshot agent. Only the fields a spoken reference can reach are
     /// interesting; the rest are what the daemon would have reported.
     pub fn agent(id: &str, display_name: Option<&str>, agent_type: &str) -> DesktopAgent {
@@ -653,10 +667,13 @@ pub mod test_support {
             last_activity_ms: None,
             spawned_at_ms: None,
             blocked: None,
+            background: None,
             authoring_kind: None,
             inbox: None,
             delivery_notice: None,
+            pending_question: None,
             tab: DesktopTab::Dashboard,
+            pull_request: None,
         }
     }
 

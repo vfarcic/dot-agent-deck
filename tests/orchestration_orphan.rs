@@ -92,6 +92,8 @@ fn tool_start(pane_id: &str) -> AgentEvent {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -130,6 +132,9 @@ fn card(orphaned: bool) -> SessionState {
         orchestration_orphaned: orphaned,
         subagent_wait: None,
         output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
     }
 }
 

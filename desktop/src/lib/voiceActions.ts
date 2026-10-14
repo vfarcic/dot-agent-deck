@@ -264,6 +264,17 @@ export type VoiceActionContext = {
    */
   reportRefused: (reason: string) => void;
   /**
+   * PRD #1401 — say what a dispatch whose effect settles LATER is doing, and
+   * then how it ended: `pending` now, in place of the resolver's sentence
+   * (which was written before anything ran, and would claim a success nobody
+   * has seen yet), then `done` when `work` resolves to `undefined`, or the
+   * sentence it resolves to when it did not happen. A later report is
+   * dropped once the user has said something else, whose report it must not
+   * cover. `work` resolves rather than rejects, so a caller with no voice
+   * surface (the toolbar's button) leaves no rejection unhandled.
+   */
+  reportPending: (pending: string, work: Promise<string | undefined>, done: string) => void;
+  /**
    * Close the New agent dialog (PRD #1223 U5) — every close route the dialog
    * has, reached by voice. Answers `undefined` when it closed, or the dialog's
    * own sentence when it would not: while a start is in flight every route is
@@ -310,13 +321,25 @@ export type VoiceActionContext = {
   /**
    * Close the Settings sheet (issue #1197).
    *
-   * **Served by the SHELL, and only while Settings is OPEN**, for
-   * {@link dismissVoiceOverlay}'s reason: Settings is a shell-level overlay
-   * boolean (`useShellOverlays`), not a `DeckView`, so {@link closeTopmost}
-   * reads *"Settings is open"* as this member's presence. The shell and not a
-   * screen, because the sheet opens over the overview as well as the deck.
+   * **Served by the SHELL, and only while Settings is OPEN with nothing drawn
+   * over it**, for {@link dismissVoiceOverlay}'s reason: Settings is a
+   * shell-level overlay boolean (`useShellOverlays`), not a `DeckView`, so
+   * {@link closeTopmost} reads *"Settings is on top"* as this member's
+   * presence. The shell and not a screen, because the sheet opens over the
+   * overview as well as the deck. What is drawn over it is the fence's stack
+   * (`useInertBackground`), which orders the app's overlays as they paint.
    */
   closeSettings: () => void;
+  /**
+   * PR #1680 review — close the topmost of the app's overlays when it is one
+   * with no member of its own: the deck's command menu, its shortcut sheet, or
+   * a configuration sheet.
+   *
+   * **Served by the SHELL, and only while such an overlay is on top**, read
+   * from the fence's stack (`useInertBackground`) at dispatch time, for
+   * {@link dismissVoiceOverlay}'s reason.
+   */
+  closeOverlay: () => void;
   /**
    * Open the New agent dialog (PRD #1223), with `deckId` preselected when the
    * control that opened it belongs to one deck — a deck group's header.
@@ -328,6 +351,29 @@ export type VoiceActionContext = {
    * closed, for the same reason `Ctrl+N` stands down while it is open.
    */
   openNewAgent: (deckId?: string) => void;
+  /**
+   * PR #1672 — open one daemon's Host figures: the popover its **Host** button
+   * beside the daemon's name opens (PRD #1258). `deckId` is the daemon a
+   * row's `deck_ref` resolved to, or the button's own; without one, the one
+   * daemon on the dashboard that shows a Host button. Answers `undefined` when
+   * it opened, or the sentence saying why not: no daemon named and several
+   * shown, a named daemon that is not connected, or none to show.
+   *
+   * **Served by the OVERVIEW**, which renders the buttons and holds which
+   * popover is open; see {@link VoiceOverviewContext}.
+   */
+  showHostMetrics: (deckId?: string) => string | undefined;
+  /**
+   * PR #1672 — close the open Host popover: what its X (`Close host`), Escape
+   * and a press outside it do.
+   *
+   * **Published by the overview only while a popover is OPEN**, for
+   * {@link dismissVoiceOverlay}'s reason: *"a Host popover is open"* is a
+   * `useState` in the overview (`hostOpen`), not a `DeckView`, so
+   * {@link closeTopmost} reads it as this member's presence. Opening one is
+   * {@link showHostMetrics}, the `show_host_metrics` row.
+   */
+  closeHostMetrics: () => void;
   /**
    * PRD #1223 — the New agent dialog's directory browser, by voice: go into
    * the child a `dir_ref` resolved to (`target.directoryPath`), go up to `..`,
@@ -422,6 +468,39 @@ export type VoiceActionContext = {
    */
   confirmStopAgent: (target: VoiceDispatchTarget) => string | undefined;
   confirmCloseOrchestration: (target: VoiceDispatchTarget) => string | undefined;
+  /**
+   * PRD #1401 — open GitHub's page for one agent's pull request in the app's
+   * own browser, over the screen. Answers `undefined` when it opened, or the
+   * sentence saying why not (the agent has no pull request, or none the app
+   * can open). The badge's click and the `open_pr` row.
+   *
+   * **Served by the SHELL**, which owns the browser: it opens over the deck's
+   * pane and the overview's alike.
+   */
+  openPullRequest: (target: { deckId: string; agentId: string }) => string | undefined;
+  /**
+   * PRD #1401 — hand the page the browser is showing to the system browser,
+   * and close the in-app one once the system browser has it: the toolbar's
+   * Open in browser and the `open_pr_in_browser` row. Answers the sentence when
+   * no pull request is open, and otherwise the hand-off in flight, which
+   * settles to `undefined` when it happened or to the sentence saying why
+   * not — in which case the in-app page stays open and says so too.
+   */
+  openPullRequestInBrowser: () => string | Promise<string | undefined>;
+  /**
+   * PRD #1401 — close the in-app browser, back to exactly the screen under it.
+   *
+   * **Published only while the browser is open and nothing of the app's is
+   * over it**, for {@link dismissVoiceOverlay}'s reason: {@link closeTopmost}
+   * reads its presence, and the browser is at the TOP of that order.
+   *
+   * Answers the close in flight, which settles to `undefined` once the page
+   * has closed, or to the sentence saying why it did not — in which case the
+   * browser stays open, says so too, and the next close tries again.
+   */
+  closePullRequest: () => Promise<string | undefined>;
+  /** PRD #1401 — the browser toolbar's Back: one step back in the page's history. */
+  pullRequestBack: () => void;
 };
 
 /**
@@ -459,6 +538,15 @@ export type VoiceActionEntry = {
   /** Why this capability is not a spoken command. Mutually exclusive with `voice`. */
   no_voice?: string;
 };
+
+/** PRD #1401 — what voice says while the system browser is being handed the page. */
+export const PULL_REQUEST_HANDING_OFF = "Opening it in your browser…";
+/** …and once it has it: `open_pr_in_browser`'s own `report` in `commands.toml`, said when it is true. */
+export const PULL_REQUEST_HANDED_OFF = "Opened it in your browser.";
+/** PRD #1401 — what voice says while the pull request page is being closed. */
+export const PULL_REQUEST_CLOSING = "Closing the pull request…";
+/** …and once it has: `close`'s own `report` in `commands.toml`, said when it is true. */
+export const PULL_REQUEST_CLOSED = "Closed.";
 
 export const VOICE_ACTIONS = {
   // -- the ones the command table names today -----------------------------
@@ -600,6 +688,12 @@ export const VOICE_ACTIONS = {
      * top of everything, so closing what is underneath it would leave the
      * thing the user was looking at still on screen.
      *
+     * **The pull request browser is checked FIRST** (PRD #1401). It is the top
+     * of the order whenever it is published: the shell publishes
+     * `closePullRequest` only while nothing of the app's is drawn over the
+     * browser, so when the voice overlay or a dialog IS over it, that member is
+     * absent and the thing on top closes first, as it should.
+     *
      * The dialog may REFUSE: while a start is in flight it cannot be closed by
      * any route (PRD #1223 audit F5), and `close` says so in the dialog's own
      * sentence rather than falling through to the pane or answering "nothing
@@ -610,28 +704,55 @@ export const VOICE_ACTIONS = {
      * open, so its absence IS the answer to "is anything on top?". Declaring it
      * would refuse the whole row whenever the overlay was closed. The same
      * holds for `closeNewAgent`, which the overview publishes only while the
-     * dialog is open, and for `closeSettings`, which the shell publishes only
-     * while Settings is open.
+     * dialog is open, and for `closeSettings` and `closeOverlay`, which the
+     * shell publishes only while what they close is open and on top.
      *
-     * **Settings is checked LAST, below the agent's pane** (issue #1197). The
-     * sheet is a shell overlay that stays open across a pane opened over it —
-     * by voice, or from the rail — and that pane is then what the user is
-     * looking at, so `close` takes the pane first and Settings on the next
-     * utterance. Before Settings moved to the shell it was not in this order
-     * at all, and `close` with it open answered "nothing to close".
+     * **Settings, and the overlays with no member of their own, are published
+     * only while they are on top** (issue #1197, PR #1680 review). The sheet is
+     * a shell overlay that stays open across a pane opened over it — by voice,
+     * or from the rail — and that pane is then what the user is looking at, so
+     * `close` takes the pane first and Settings on the next utterance. Which is
+     * on top is the fence's stack (`useInertBackground`), ordered as the app
+     * paints them: a sheet opened over the pane or the browser is raised above
+     * them, and `close` takes it first. So they are checked before the pane,
+     * and whichever is published closes what is on top.
+     *
+     * **The Host popover is checked last of all** (PR #1672). It hangs from a
+     * daemon's Host button IN the dashboard (z-index 30 in the dashboard's own
+     * region), so it is under every other layer here, and each of them can be
+     * open over it: a click closes it, but a spoken "show commands", "new
+     * agent" or "open settings", `Ctrl+N`, or a spoken agent row leaves it open
+     * beneath the list (z 96), the New agent dialog (100), the agent's pane
+     * (90) or the Settings sheet (80). Nothing opens over the dashboard UNDER
+     * it, so with any of those up `close` takes that one first, and the
+     * popover on the utterance after — and with none of them up it is what the
+     * user is looking at, so `close` takes it rather than answering "nothing
+     * to close". The overview publishes `closeHostMetrics` only while one is
+     * open, as it does `closeNewAgent`, and the shell withholds it while a stop
+     * or upgrade confirmation is open, which is modal over the dashboard too
+     * and not in this chain.
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings" | "closeOverlay" | "closePullRequest" | "reportPending" | "closeHostMetrics">>,
       target: VoiceDispatchTarget,
     ) => {
+      /* Reported once the page has closed, for `openPullRequestInBrowser`'s
+         reason: a close the platform refused leaves the page on screen. */
+      if (context.closePullRequest) {
+        const closing = context.closePullRequest();
+        context.reportPending?.(PULL_REQUEST_CLOSING, closing, PULL_REQUEST_CLOSED);
+        return;
+      }
       if (context.dismissVoiceOverlay) return context.dismissVoiceOverlay();
       if (context.closeNewAgent) {
         const refused = context.closeNewAgent();
         if (refused !== undefined) context.reportRefused(refused);
         return;
       }
-      if (target.agentViewOpen) return context.closeAgentView();
       if (context.closeSettings) return context.closeSettings();
+      if (context.closeOverlay) return context.closeOverlay();
+      if (target.agentViewOpen) return context.closeAgentView();
+      if (context.closeHostMetrics) return context.closeHostMetrics();
       context.reportNothingToClose();
     },
   },
@@ -903,6 +1024,22 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "openNewAgent">, target?: { preselectDeckId?: string }) => context.openNewAgent(target?.preselectDeckId || undefined),
   },
 
+  /* PR #1672 — a daemon's Host button and the `show_host_metrics` row. It
+     opens a read-only popover and starts, stops and changes nothing. A spoken
+     daemon arrives as the row's optional `deck_ref`, which `App.tsx` carries
+     in as `preselectDeckId`; the button passes its own. `reportRefused` is
+     read through `?.` for `switchDeck`'s reason: the button serves no voice
+     surface, and offers only a daemon that has figures to show. */
+  showHostMetrics: {
+    label: "Show a daemon's Host figures",
+    voice: true,
+    needs: ["showHostMetrics"],
+    run: (context: Pick<VoiceActionContext, "showHostMetrics"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { preselectDeckId?: string }) => {
+      const refused = context.showHostMetrics(target?.preselectDeckId || undefined);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
   /* PRD #1223 — the three `requires`-gated rows: the New agent dialog's
      directory browser. None starts anything — the dialog's Start is still the
      only thing that does — so none is in PRD #802 D5's confirmation set. The
@@ -1069,6 +1206,50 @@ export const VOICE_ACTIONS = {
       const refused = context.confirmCloseOrchestration(target);
       if (refused !== undefined) context.reportRefused(refused);
     },
+  },
+
+  /* PRD #1401 — an agent's pull request, in the app's own browser. Opening,
+     handing off and closing change what is on screen and nothing else; the
+     page itself is GitHub's, and nothing here acts on the pull request. */
+  openPullRequest: {
+    label: "Open an agent's pull request in the app",
+    voice: true,
+    /* `reportRefused` is read through `?.`, for `switchDeck`'s reason: the
+       badge offers itself only for a pull request the app can open, so its
+       click never produces a refusal and serves no voice surface. */
+    needs: ["openPullRequest"],
+    run: (context: Pick<VoiceActionContext, "openPullRequest"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "deckId" | "agentId">) => {
+      const refused = context.openPullRequest({ deckId: target.deckId, agentId: target.agentId });
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  openPullRequestInBrowser: {
+    label: "Open the pull request on screen in the system browser",
+    voice: true,
+    needs: ["openPullRequestInBrowser"],
+    /* The hand-off is reported when it has happened, not when it was asked
+       for: a system browser that would not open leaves the page in the app,
+       and "Opened it in your browser" would then be false. */
+    run: (context: Pick<VoiceActionContext, "openPullRequestInBrowser"> & Partial<Pick<VoiceActionContext, "reportRefused" | "reportPending">>) => {
+      const handoff = context.openPullRequestInBrowser();
+      if (typeof handoff === "string") context.reportRefused?.(handoff);
+      else context.reportPending?.(PULL_REQUEST_HANDING_OFF, handoff, PULL_REQUEST_HANDED_OFF);
+    },
+  },
+
+  closePullRequest: {
+    label: "Close the pull request browser",
+    no_voice: "the browser toolbar's Close and the app's `Escape`, and what `closeTopmost` calls first while the browser is the top of the screen — a row naming this one directly would close the browser out from under the voice overlay or a dialog drawn over it, which is the precedence `close` exists to get right. It is voice-reachable through that entry",
+    needs: ["closePullRequest"],
+    run: (context: Pick<VoiceActionContext, "closePullRequest">) => context.closePullRequest(),
+  },
+
+  pullRequestBack: {
+    label: "Go back one page in the pull request browser",
+    no_voice: "a step through the page's own history, which the user steers with the mouse and keyboard inside the page; PRD #1401 asks voice for the four scrolls, `close` and the hand-off to the system browser there, and a spoken \"back\" would be one more reading of a word `close` already answers",
+    needs: ["pullRequestBack"],
+    run: (context: Pick<VoiceActionContext, "pullRequestBack">) => context.pullRequestBack(),
   },
 } satisfies Record<string, VoiceActionEntry>;
 
@@ -1309,7 +1490,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "startReading" | "stopReading" | "quietSpeech" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "startReading" | "stopReading" | "quietSpeech" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused" | "reportPending">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *
@@ -1339,10 +1520,18 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * The members only the SHELL serves (issue #1197): closing Settings, which is
  * the shell's overlay rather than a screen's, since it opens over the overview
  * as well as the deck — published only while the sheet is open, see
- * {@link VoiceActionContext.closeSettings} — and switching deck (PRD #1195),
+ * {@link VoiceActionContext.closeSettings} — closing the topmost overlay with
+ * no member of its own, read from the fence's stack, which spans both screens
+ * ({@link VoiceActionContext.closeOverlay}), and switching deck (PRD #1195),
  * whose selector sits on both screens and writes the shell's settings.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "switchDeck" | "turnPage">;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "turnPage" | keyof PullRequestContext>;
+
+/**
+ * PRD #1401 — the pull request browser's members, which the SHELL serves: the
+ * browser opens over the deck's pane and the overview's alike.
+ */
+export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "openPullRequestInBrowser" | "closePullRequest" | "pullRequestBack">;
 
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent
@@ -1352,7 +1541,7 @@ export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "swit
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics">;
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

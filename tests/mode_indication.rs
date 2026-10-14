@@ -140,6 +140,9 @@ fn selected_card_fixture() -> SessionState {
         orchestration_orphaned: false,
         subagent_wait: None,
         output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
     }
 }
 
@@ -387,7 +390,7 @@ fn mode_chip_002_is_universal_and_keeps_destination_button() {
         assert_mode_chip_at_origin(buffer, COMMAND_CHIP, context);
         let text = buffer_to_text(buffer);
         assert!(
-            text.contains("[Back to Pane Ctrl+D]"),
+            text.contains("[Back to Pane d/Ctrl+D]"),
             "{context} must retain the destination button alongside the COMMAND chip\n{text}"
         );
     }

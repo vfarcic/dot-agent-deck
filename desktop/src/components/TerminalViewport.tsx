@@ -4,10 +4,55 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import type { SendResult, TerminalBuffer, TerminalFeed } from "../types";
 import { writeClipboardText } from "../lib/clipboard";
-import { isTerminalCopyChord } from "../lib/terminalCopy";
+import { osc52CopyText } from "../lib/osc52";
+import { isSelectionCtrlC, isTerminalCopyChord } from "../lib/terminalCopy";
 import { agentKeySequence, keyPlatform, leavesPasteToWebview } from "../lib/terminalKeys";
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
 import { keepSelectionAcrossResize } from "../lib/terminalSelection";
+
+/**
+ * Issue #1705 — clipboard writes from agents' terminals, one at a time and
+ * newest last. `writeClipboardText` is asynchronous (an import, then an IPC
+ * round trip), so two copies started back to back, from one pane or from two,
+ * could finish out of order and leave the older text on the clipboard.
+ *
+ * So one write is in flight at a time, and while it is, only the NEWEST copy
+ * waits behind it: each copy replaces the last on the clipboard, so a copy
+ * overtaken before its turn would only be overwritten, and keeping one bounds
+ * what a stream of copies can hold. A write that has not settled after
+ * `CLIPBOARD_WRITE_TIMEOUT_MS` stops holding up the next, so a platform call
+ * that never returns cannot hold a pending copy forever. Such a write is not
+ * cancelled; if it finishes after a newer write has, `writeClipboardText`
+ * writes the newest text again, for every writer in the app. A write the
+ * platform refuses has no better outcome than the unchanged clipboard it
+ * leaves, so a failure ends that write and not the queue.
+ */
+const CLIPBOARD_WRITE_TIMEOUT_MS = 5_000;
+let clipboardWriting = false;
+let pendingClipboardText: string | undefined;
+function copyInOrder(text: string): void {
+  pendingClipboardText = text;
+  if (!clipboardWriting) void drainClipboardWrites();
+}
+async function drainClipboardWrites(): Promise<void> {
+  clipboardWriting = true;
+  try {
+    while (pendingClipboardText !== undefined) {
+      const text = pendingClipboardText;
+      pendingClipboardText = undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        writeClipboardText(text).catch(() => undefined),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, CLIPBOARD_WRITE_TIMEOUT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
+  } finally {
+    clipboardWriting = false;
+  }
+}
 
 interface TerminalViewportProps {
   agentId: string;
@@ -125,6 +170,11 @@ export function TerminalViewport({
   // Set by the terminal effect below so the geometry effect can re-run the
   // grid reconciliation without owning the xterm instance.
   const applyGridRef = useRef<(() => void) | undefined>(undefined);
+  // Issue #1705 — set by the terminal effect below: write bytes that are
+  // HISTORY (the transcript, a remount's backlog, an attach's replay) rather
+  // than output the agent is producing now, so an OSC 52 copy inside them is
+  // not honoured a second time.
+  const replayRef = useRef<((data: string | Uint8Array) => void) | undefined>(undefined);
   transcriptRef.current = transcript;
   onInputRef.current = onInput;
   onResizeRef.current = onResize;
@@ -198,6 +248,12 @@ export function TerminalViewport({
       webglAddon.onContextLoss(() => {
         webglAddon?.dispose();
         webglAddon = undefined;
+        // The DOM renderer that takes over draws nothing until something
+        // asks it to, so a pane whose context was lost mid-session would stay
+        // blank until its next output. Repaint what is already in the buffer.
+        // PRD #1401 is why this came up: on Linux the in-app pull request
+        // browser moves the app's webview between GTK containers.
+        terminal.refresh(0, terminal.rows - 1);
       });
       terminal.loadAddon(webglAddon);
     } catch {
@@ -215,9 +271,40 @@ export function TerminalViewport({
       textarea.setAttribute("aria-label", `${labelRef.current} terminal input`);
       textarea.disabled = Boolean(readOnlyRef.current);
     }
+    // Issue #1705 — honour an agent's OSC 52 copy. An agent that turns on
+    // mouse reporting (Claude Code) takes every drag for itself, so xterm holds
+    // no selection for the copy key; the agent selects and asks the terminal
+    // to copy with OSC 52 instead. `osc52CopyText` is write-only and refuses
+    // anything malformed, so a read request (`?`) is swallowed unanswered.
+    //
+    // Only output the agent produces while this pane is open is honoured.
+    // History reaches xterm through `replay`, which brackets its write with two
+    // empty writes whose callbacks xterm runs in write order, immediately
+    // before and after it parses those bytes — so a copy the agent made an hour
+    // ago, still in the backlog, does not overwrite the clipboard every time
+    // the pane opens. The daemon replays its scrollback as the first chunk of
+    // every attach, and the bridge delivers that as one replacing chunk, which
+    // the feed effect below writes through `replay`.
+    //
+    // Not gated on `readOnly`: copying out of a pane is reading it.
+    let replaying = false;
+    const replay = (data: string | Uint8Array) => {
+      terminal.write("", () => {
+        replaying = true;
+      });
+      terminal.write(data, () => {
+        replaying = false;
+      });
+    };
+    replayRef.current = replay;
+    const clipboardRequests = terminal.parser.registerOscHandler(52, (data) => {
+      const text = replaying ? undefined : osc52CopyText(data);
+      if (text !== undefined) copyInOrder(text);
+      return true;
+    });
     // Expose the instance so the Reader overlay can snapshot the resolved buffer.
     registerTerminal(deckId, agentId, terminal);
-    terminal.write(transcriptRef.current);
+    replay(transcriptRef.current);
 
     // Issue #1457 — a selection, or a drag still in progress, survives the
     // daemon reshaping this grid; see `keepSelectionAcrossResize`.
@@ -226,7 +313,8 @@ export function TerminalViewport({
     const inputDisposable = terminal.onData((data) => {
       if (!readOnlyRef.current) onInputRef.current(data);
     });
-    // Issue #1403 — copy the selection with `Ctrl+Shift+C` / `Cmd+C`.
+    // Issue #1403 — copy the selection with `Ctrl+Shift+C` / `Cmd+C`, and
+    // (issue #1705) on Windows with plain `Ctrl+C` while text is selected.
     //
     // A capture-phase listener on the wrapper runs before xterm's own `keydown`
     // on its helper textarea, so stopping the chord here means xterm never
@@ -234,20 +322,27 @@ export function TerminalViewport({
     // either chord today, but `preventDefault` also claims the webview's own
     // reaction to it, and a copy key that could ever leak a byte into an agent
     // is not one to leave to a library's key table. Plain `Ctrl+C` is not the
-    // chord and passes through untouched as the agent's interrupt.
+    // chord and passes through untouched as the agent's interrupt, except on
+    // Windows over a selection, where it is the copy key and clears the
+    // selection, so the next one interrupts.
     //
     // Deliberately a DOM listener rather than `attachCustomKeyEventHandler`:
     // xterm keeps exactly one custom handler per terminal, and taking the slot
     // for copy would silently collide with anything else that needs it.
     const wrapper = wrapperRef.current;
+    // The platform is the webview's (what `navigator` reports), read once per
+    // terminal: it decides the copy and paste keys. The editing keys are one
+    // table on every platform, the TUI's.
+    const platform = keyPlatform();
     const onCopyKey = (event: KeyboardEvent) => {
-      if (!isTerminalCopyChord(event)) return;
+      const hasSelection = terminal.hasSelection();
+      if (!isTerminalCopyChord(event, platform, hasSelection)) return;
       event.preventDefault();
       event.stopPropagation();
       const selection = terminal.getSelection();
-      // Nothing selected leaves the clipboard as it was. A write the platform
-      // refuses has no better outcome than the unchanged clipboard it leaves.
-      if (selection) void writeClipboardText(selection).catch(() => undefined);
+      if (isSelectionCtrlC(event, platform, hasSelection)) terminal.clearSelection();
+      // Nothing selected leaves the clipboard as it was.
+      if (selection) copyInOrder(selection);
     };
     // A read-only pane's textarea is `disabled` and cannot take focus, and
     // xterm's selection handler cancels the press that would otherwise have
@@ -269,11 +364,6 @@ export function TerminalViewport({
     // issue #1403's Ctrl+Shift+C / Cmd+C is the capture-phase listener on the
     // wrapper above, which sees the key before xterm or this handler does.
     // Keep Ctrl+Shift+C and Cmd+C out of both tables below.
-    //
-    // The platform is the webview's (what `navigator` reports), read once per
-    // terminal: it decides the paste key. The editing keys are one table on
-    // every platform, the TUI's.
-    const platform = keyPlatform();
     terminal.attachCustomKeyEventHandler((event) => {
       // The platform's paste key: keep xterm from encoding it (on Windows it
       // would send Ctrl+V as ^V and cancel the paste) and leave the event
@@ -351,6 +441,8 @@ export function TerminalViewport({
 
     return () => {
       applyGridRef.current = undefined;
+      replayRef.current = undefined;
+      clipboardRequests.dispose();
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();
@@ -438,9 +530,10 @@ export function TerminalViewport({
   // the effect below is authoritative and this one stands down.
   useEffect(() => {
     const terminal = terminalRef.current;
-    if (!terminal || lastStreamRef.current) return;
+    const replay = replayRef.current;
+    if (!terminal || !replay || lastStreamRef.current) return;
     terminal.reset();
-    terminal.write(transcript);
+    replay(transcript);
   }, [transcript]);
 
   // Bytes arrive straight from the bridge feed and go straight into xterm —
@@ -449,10 +542,14 @@ export function TerminalViewport({
     if (!terminalFeed) return;
     const apply = (buffer: TerminalBuffer) => {
       const terminal = terminalRef.current;
-      if (!terminal) return;
+      const replay = replayRef.current;
+      if (!terminal || !replay) return;
       const previous = lastStreamRef.current;
+      // Issue #1705 — every write here is `replay` (history: no OSC 52 copy is
+      // honoured) except the contiguous suffix, which is the only output the
+      // agent produced while this pane was watching.
       if (!previous) {
-        if (buffer.data.byteLength) terminal.write(buffer.data);
+        if (buffer.data.byteLength) replay(buffer.data);
       } else if (buffer !== previous && buffer.generation === previous.generation) {
         // Compare absolute stream offsets, not array lengths: when the rolling
         // buffer trims its head, baseOffset advances while the tail stays
@@ -467,14 +564,14 @@ export function TerminalViewport({
         } else {
           // Non-contiguous jump (daemon restart, missed chunks): rebuild.
           terminal.reset();
-          terminal.write(transcriptRef.current);
-          if (buffer.data.byteLength) terminal.write(buffer.data);
+          replay(transcriptRef.current);
+          if (buffer.data.byteLength) replay(buffer.data);
         }
       } else if (buffer !== previous) {
         // Generation changed: the PTY was respawned — a rebuild is correct.
         terminal.reset();
-        terminal.write(transcriptRef.current);
-        if (buffer.data.byteLength) terminal.write(buffer.data);
+        replay(transcriptRef.current);
+        if (buffer.data.byteLength) replay(buffer.data);
       }
       lastStreamRef.current = buffer;
     };

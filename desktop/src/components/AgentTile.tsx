@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { VoiceNumber } from "./VoiceNumber";
 import {
   AlertTriangle,
@@ -30,9 +30,11 @@ import type {
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
 import { blockedReasonText } from "../lib/blockedReason";
 import { inboxBadge } from "../lib/inboxWords";
-import { displayUptime } from "../lib/displayText";
+import { displayBackgroundWork, displayUptime } from "../lib/displayText";
 import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
+import { PullRequestBadge } from "./PullRequestBadge";
+import { OpenPullRequest } from "../lib/prBrowser";
 import { TerminalViewport } from "./TerminalViewport";
 
 const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
@@ -292,6 +294,8 @@ export function AgentTile({
   panePresent,
   onClose,
 }: AgentTileProps) {
+  /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
+  const openPullRequest = useContext(OpenPullRequest);
   const handleInput = useCallback((data: string) => {
     void onTerminalInput({ deckId: agent.daemonId, agentId: agent.id }, data);
   }, [agent.daemonId, agent.id, onTerminalInput]);
@@ -327,8 +331,17 @@ export function AgentTile({
      record's process may be gone, so it claims no running span; nor does a
      record with no spawn instant, which keeps `duration`'s own reading. */
   const counting = !held && agent.spawnedAtMs !== undefined;
-  const now = useTileClock(counting);
+  /* Issue #1678 — background work the agent left running after its turn, on
+     the same clock so its duration keeps counting between daemon events. A
+     held record's reading may be arbitrarily old, so it claims none: the work
+     it named may have ended long since, exactly as its process may have.
+     The words carry seconds below an hour and the tick is
+     `OVERVIEW_CLOCK_TICK_MS`, so between snapshots the reading advances in
+     steps of up to that tick; it never runs ahead of the real span. */
+  const background = held ? undefined : agent.background;
+  const now = useTileClock(counting || background?.sinceMs !== undefined);
   const uptime = counting ? displayUptime(agent.spawnedAtMs, now) : undefined;
+  const backgroundText = displayBackgroundWork(background, now);
   /**
    * The Reader is suppressed at overlay presentation (M1 difference 4, above)
    * AND whenever any pane is open over this screen (see `panePresent`). The
@@ -404,6 +417,14 @@ export function AgentTile({
                 `last seen queued` do not parse, where `last seen: passed` does.
               */}
               <span className={`status-label status-${agent.status}${held ? " is-held" : ""}`}>{held ? `last seen: ${tileStatusLabel}` : tileStatusLabel}</span>
+              {/* PRD #1401 — the agent's pull request, when the daemon found one. */}
+              {agent.pullRequest && (
+                <PullRequestBadge
+                  pullRequest={agent.pullRequest}
+                  testId={`pr-badge-${agent.id}`}
+                  onOpen={openPullRequest && agent.pullRequest.url ? () => openPullRequest({ deckId: agent.daemonId, agentId: agent.id }) : undefined}
+                />
+              )}
               {/* PRD #1666: the inbox line the TUI's card prints too. */}
               {badge && !held && <span className="agent-inbox-badge" data-testid={`inbox-badge-${agent.id}`}>{badge}</span>}
             </div>
@@ -448,6 +469,11 @@ export function AgentTile({
                 message it could not deliver. */}
             {agent.deliveryNotice && !held && (
               <p className="agent-delivery-notice" data-testid={`delivery-notice-${agent.id}`}>{agent.deliveryNotice}</p>
+            )}
+            {/* Issue #1678: the agent's turn is over and something it started
+                is still running — the TUI card's words, counts only. */}
+            {backgroundText && (
+              <p className="agent-background-work" data-testid={`background-work-${agent.id}`}>{backgroundText}</p>
             )}
           </div>
         </div>

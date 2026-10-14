@@ -148,6 +148,10 @@ pub(crate) enum FetchReason {
     /// A dispatched worktree was left on disk, which is emitted *after* the
     /// close that reaped its agents. The registry has certainly changed.
     WorktreeKept,
+    /// The daemon's hook-binary notices changed (issue #1637). They live on
+    /// the `Hello` reply, so the refresh that answers this re-reads it as well
+    /// as the list ([`AgentView::take_handshake_due`]).
+    HookBinaryNotice,
     /// A broadcast whose `kind` this build does not know (PRD #741 M8, issue
     /// #801 item 3).
     ///
@@ -186,12 +190,21 @@ pub(crate) struct AgentView {
     fold: AppState,
     /// Set when a refresh must fetch. Sticky until a fetch lands.
     due: Option<FetchReason>,
+    /// Set when the next refresh must also re-read the daemon's `Hello` (issue
+    /// #1637). Separate from [`Self::due`], which keeps only the first reason.
+    handshake_due: bool,
     /// When the last full fetch landed.
     fetched_at: Option<Instant>,
     /// Full `ListAgents` replies installed. Test/measurement only.
     fetches: usize,
     /// Events folded. Test/measurement only.
     folded: usize,
+    /// PRD #1258 M4: the daemon's last host-metrics answer and when it landed.
+    /// Fetched beside each full `ListAgents` (so at most every
+    /// [`RECONCILE_INTERVAL`] while the deck is quiet) and replayed on the
+    /// cached path, so a burst of folded events costs no host-metrics
+    /// connection. Cleared with the list on a new subscription.
+    host_metrics: Option<(dot_agent_deck::daemon_client::HostMetricsReport, Instant)>,
 }
 
 impl Default for AgentView {
@@ -201,9 +214,11 @@ impl Default for AgentView {
             schedule_revision: None,
             fold: AppState::default(),
             due: Some(FetchReason::Initial),
+            handshake_due: false,
             fetched_at: None,
             fetches: 0,
             folded: 0,
+            host_metrics: None,
         }
     }
 }
@@ -228,7 +243,29 @@ impl AgentView {
         // across a subscription gap would let the picker conclude "unchanged"
         // from a number this view is no longer entitled to report.
         self.schedule_revision = None;
+        // PRD #1258 M4: a new subscription may be a different daemon process.
+        self.host_metrics = None;
         self.due = Some(FetchReason::Resubscribed);
+    }
+
+    /// PRD #1258 M4: keep the host-metrics answer that came with the last fetch.
+    /// `None` (the request failed) keeps the previous answer rather than
+    /// discarding a reading because one refresh could not renew it.
+    pub(crate) fn install_host_metrics(
+        &mut self,
+        report: Option<dot_agent_deck::daemon_client::HostMetricsReport>,
+        now: Instant,
+    ) {
+        if let Some(report) = report {
+            self.host_metrics = Some((report, now));
+        }
+    }
+
+    /// PRD #1258 M4: the held host-metrics answer and when it landed.
+    pub(crate) fn host_metrics(
+        &self,
+    ) -> Option<&(dot_agent_deck::daemon_client::HostMetricsReport, Instant)> {
+        self.host_metrics.as_ref()
     }
 
     /// Fold one broadcast message, and note whether it opened a metadata gap a
@@ -255,6 +292,12 @@ impl AgentView {
             // PRD #1666 §2.8: an inbox message changed state, and the counts
             // the tile shows ride the record; see `FetchReason::Inbox`.
             BroadcastMsg::Inbox(_) => self.mark(FetchReason::Inbox),
+            // Issue #1637: the notices ride the `Hello` reply, which the held
+            // link captured once; re-read it, and the list with it.
+            BroadcastMsg::HookBinaryNotice(_) => {
+                self.handshake_due = true;
+                self.mark(FetchReason::HookBinaryNotice);
+            }
             // PRD #741 M8 (issue #801 item 3): a broadcast kind this build does
             // not know. It marks a fetch for the same reason the two above do —
             // this view is a FOLD, and a message it could not read is a hole in
@@ -286,6 +329,13 @@ impl AgentView {
             Some(at) if now.saturating_duration_since(at) < RECONCILE_INTERVAL => None,
             _ => Some(FetchReason::Reconcile),
         }
+    }
+
+    /// Whether the next refresh must re-read the daemon's `Hello` (issue
+    /// #1637), clearing the demand. The caller drops its held handshake, so
+    /// the refresh's own connection re-reads it.
+    pub(crate) fn take_handshake_due(&mut self) -> bool {
+        std::mem::take(&mut self.handshake_due)
     }
 
     /// Force the next refresh to fetch, without a specific transition behind it.
@@ -329,6 +379,13 @@ impl AgentView {
     /// twice is invisible. For the one **monotonic** field, `tool_count`, it
     /// over-counts by one until the next reconcile re-seeds the fold from a
     /// fresh reply, which is bounded by [`RECONCILE_INTERVAL`].
+    ///
+    /// Issue #1678's background-work aggregate is the other field a replay
+    /// could move, and it is NOT left to the reconcile: the daemon stamps every
+    /// aggregate with a per-spawn revision, and the shared fold ignores one
+    /// older than the revision it holds (the reply's, once installed). So an
+    /// event drained after a reply that already reflects a later revision
+    /// cannot bring finished background work back onto a tile.
     ///
     /// Closing it properly needs the reply to carry a position in the event
     /// stream — a sequence number on the wire — which is a `PROTOCOL_VERSION`
@@ -421,7 +478,7 @@ impl AgentView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dot_agent_deck::event::{AgentEvent, AgentType};
+    use dot_agent_deck::event::{AgentEvent, AgentType, BackgroundWork};
     use dot_agent_deck::state::SessionStatus;
 
     /// One `ListAgents` reply carrying just these records — the shape every
@@ -470,6 +527,8 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -507,6 +566,59 @@ mod tests {
             status_of(&view.records(), "7"),
             Some(SessionStatus::Working),
             "the fold must have moved the rendered status"
+        );
+        assert_eq!(view.fetch_count(), 1, "only the install fetched");
+    }
+
+    /// Scenario: install one working agent, then fold the daemon's PRD #1401
+    /// pull request report for it, and later the report that it has none. The
+    /// rendered record carries the pull request and then drops it, with no
+    /// fetch falling due and no change to the status.
+    #[test]
+    fn a_pull_request_report_is_served_from_the_fold_and_costs_no_fetch() {
+        use dot_agent_deck::pull_request_info::{
+            PullRequestInfo, PullRequestReview, PullRequestState,
+        };
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        view.apply(&BroadcastMsg::Event(tool_start("pane-7", "7", "Bash")));
+        let info = PullRequestInfo {
+            number: 1234,
+            url: "https://github.com/o/r/pull/1234".into(),
+            state: PullRequestState::Open,
+            review: Some(PullRequestReview::ReviewRequired),
+        };
+        let mut report = event("pane-7", "7", EventType::PullRequest);
+        report.metadata.insert(
+            dot_agent_deck::event::PULL_REQUEST_METADATA_KEY.into(),
+            serde_json::to_string(&info).unwrap(),
+        );
+        view.apply(&BroadcastMsg::Event(report));
+
+        let pull_request_of = |view: &AgentView| {
+            view.records()
+                .into_iter()
+                .find(|record| record.id == "7")
+                .and_then(|record| record.live)
+                .and_then(|live| live.pull_request)
+        };
+        assert_eq!(pull_request_of(&view), Some(info));
+        assert_eq!(
+            status_of(&view.records(), "7"),
+            Some(SessionStatus::Working)
+        );
+        assert_eq!(view.needs_fetch(now), None);
+
+        view.apply(&BroadcastMsg::Event(event(
+            "pane-7",
+            "7",
+            EventType::PullRequest,
+        )));
+        assert_eq!(
+            pull_request_of(&view),
+            None,
+            "a report of none drops the badge"
         );
         assert_eq!(view.fetch_count(), 1, "only the install fetched");
     }
@@ -665,6 +777,11 @@ mod tests {
             blocked: None,
             hook_generation: None,
             delivery_notice: None,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut view = AgentView::default();
@@ -709,6 +826,11 @@ mod tests {
             blocked: None,
             hook_generation: None,
             delivery_notice: None,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut view = AgentView::default();
@@ -750,6 +872,11 @@ mod tests {
             blocked: None,
             hook_generation: None,
             delivery_notice: None,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
+            background: None,
+            background_revision: None,
         });
 
         let mut view = AgentView::default();
@@ -789,6 +916,23 @@ mod tests {
             },
         ));
         assert_eq!(view.needs_fetch(now), Some(FetchReason::WorktreeKept));
+    }
+
+    /// Scenario: the daemon pushes changed hook-binary notices. The view marks
+    /// a fetch due and asks for the handshake to be re-read once, because the
+    /// notices live on the `Hello` reply (issue #1637).
+    #[test]
+    fn a_hook_binary_notice_marks_a_fetch_and_a_handshake_re_read() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        assert!(!view.take_handshake_due());
+
+        view.apply(&BroadcastMsg::HookBinaryNotice(Default::default()));
+
+        assert_eq!(view.needs_fetch(now), Some(FetchReason::HookBinaryNotice));
+        assert!(view.take_handshake_due());
+        assert!(!view.take_handshake_due(), "taken once");
     }
 
     /// Scenario: a newer daemon pushes a broadcast kind this build cannot read.
@@ -888,5 +1032,192 @@ mod tests {
         assert_eq!(view.schedule_revision(), Some(9));
         view.install(listing(vec![record("7", "pane-7")]), now);
         assert_eq!(view.schedule_revision(), None);
+    }
+
+    fn background(commands: u32, subagents: u32) -> BackgroundWork {
+        BackgroundWork {
+            commands,
+            subagents,
+            since_ms: Some(1_700_000_000_000),
+        }
+    }
+
+    /// A record whose live snapshot is an ended turn carrying the daemon's
+    /// background aggregate at `revision`.
+    fn record_with_background(
+        id: &str,
+        pane_id: &str,
+        work: BackgroundWork,
+        revision: u64,
+    ) -> AgentRecord {
+        let mut record = record(id, pane_id);
+        record.live = Some(dot_agent_deck::state::SessionSnapshot {
+            output_set_status: false,
+            subagent_wait: None,
+            status: SessionStatus::Idle,
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 3,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            last_activity_ms: Some(1_700_000_000_000),
+            blocked: None,
+            hook_generation: None,
+            delivery_notice: None,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
+            background: (!work.is_empty()).then_some(work),
+            background_revision: Some(revision),
+        });
+        record
+    }
+
+    fn carrying(mut event: AgentEvent, work: BackgroundWork, revision: u64) -> AgentEvent {
+        event.background = Some(work);
+        event.background_revision = Some(revision);
+        event
+    }
+
+    fn background_of(records: &[AgentRecord], id: &str) -> Option<BackgroundWork> {
+        records
+            .iter()
+            .find(|record| record.id == id)
+            .and_then(|record| record.live.as_ref())
+            .and_then(|live| live.background)
+    }
+
+    /// Scenario (issue #1678, the race the revision exists for): the daemon
+    /// broadcast "1 command" at revision 4 and then cleared it at revision 5,
+    /// and the desktop installed a reply already reflecting revision 5 before
+    /// it drained the revision-4 event (`install`'s double-apply). The replayed
+    /// older aggregate must not bring the finished command back onto the tile,
+    /// and the agent stays Idle.
+    #[test]
+    fn an_older_background_revision_replayed_after_install_does_not_resurrect_work() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(
+            listing(vec![record_with_background(
+                "7",
+                "pane-7",
+                BackgroundWork::default(),
+                5,
+            )]),
+            now,
+        );
+        assert_eq!(background_of(&view.records(), "7"), None);
+
+        view.apply(&BroadcastMsg::Event(carrying(
+            event("pane-7", "7", EventType::ShellBusy),
+            background(1, 0),
+            4,
+        )));
+        let rendered = view.records();
+        assert_eq!(
+            background_of(&rendered, "7"),
+            None,
+            "a replayed older revision must not resurrect finished work"
+        );
+        assert_eq!(status_of(&rendered, "7"), Some(SessionStatus::Idle));
+    }
+
+    /// Scenario: after an install, events carrying NEWER revisions move the
+    /// tile's background work both ways — a subagent appears, then the daemon's
+    /// explicit zero clears it — an equal revision is idempotent, and a legacy
+    /// event carrying no aggregate leaves the copy alone rather than clearing it.
+    #[test]
+    fn newer_background_revisions_update_the_tile_and_a_legacy_event_does_not_clear_it() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(
+            listing(vec![record_with_background(
+                "7",
+                "pane-7",
+                background(1, 0),
+                3,
+            )]),
+            now,
+        );
+        assert_eq!(background_of(&view.records(), "7"), Some(background(1, 0)));
+
+        view.apply(&BroadcastMsg::Event(carrying(
+            event("pane-7", "7", EventType::SubagentStart),
+            background(1, 1),
+            4,
+        )));
+        assert_eq!(background_of(&view.records(), "7"), Some(background(1, 1)));
+
+        // The same revision again (a double-apply) changes nothing.
+        view.apply(&BroadcastMsg::Event(carrying(
+            event("pane-7", "7", EventType::SubagentStart),
+            background(1, 1),
+            4,
+        )));
+        assert_eq!(background_of(&view.records(), "7"), Some(background(1, 1)));
+
+        // An event from no aggregate at all — absent is not a clear.
+        view.apply(&BroadcastMsg::Event(event(
+            "pane-7",
+            "7",
+            EventType::SubagentStop,
+        )));
+        assert_eq!(background_of(&view.records(), "7"), Some(background(1, 1)));
+
+        // The daemon's explicit clear.
+        view.apply(&BroadcastMsg::Event(carrying(
+            event("pane-7", "7", EventType::ShellIdle),
+            BackgroundWork::default(),
+            5,
+        )));
+        let rendered = view.records();
+        assert_eq!(background_of(&rendered, "7"), None);
+        assert_eq!(
+            rendered[0]
+                .live
+                .as_ref()
+                .and_then(|live| live.background_revision),
+            Some(5)
+        );
+    }
+
+    /// Scenario: a shell frame from a daemon that tracks turn boundaries
+    /// (it carries the aggregate) keeps an ended turn Idle in the desktop's
+    /// fold, while one from an older daemon (no aggregate) promotes it to
+    /// Working exactly as before — the client half of design D6's gate.
+    #[test]
+    fn the_fold_promotes_a_shell_frame_only_when_it_carries_no_aggregate() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(
+            listing(vec![record_with_background(
+                "7",
+                "pane-7",
+                BackgroundWork::default(),
+                1,
+            )]),
+            now,
+        );
+        view.apply(&BroadcastMsg::Event(carrying(
+            event("pane-7", "7", EventType::ShellBusy),
+            background(1, 0),
+            2,
+        )));
+        let rendered = view.records();
+        assert_eq!(status_of(&rendered, "7"), Some(SessionStatus::Idle));
+        assert_eq!(background_of(&rendered, "7"), Some(background(1, 0)));
+
+        let mut legacy = AgentView::default();
+        legacy.install(listing(vec![record("8", "pane-8")]), now);
+        legacy.apply(&BroadcastMsg::Event(event("pane-8", "8", EventType::Idle)));
+        legacy.apply(&BroadcastMsg::Event(event(
+            "pane-8",
+            "8",
+            EventType::ShellBusy,
+        )));
+        let rendered = legacy.records();
+        assert_eq!(status_of(&rendered, "8"), Some(SessionStatus::Working));
+        assert_eq!(background_of(&rendered, "8"), None);
     }
 }

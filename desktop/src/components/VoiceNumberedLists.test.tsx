@@ -4,9 +4,10 @@ import { DeckShell } from "../App";
 import { createFixtureFleet, createFixtureSnapshot, fixtureDirectoryTree, FIXTURE_HOMES } from "../data/fixture";
 import { VOICE_PAGES_HOME, voicePagesDirectory } from "../data/fixtureCrowded";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type VoiceResultDto, type VoiceStatusDto, type VoiceTranscriptionDto } from "../lib/bridge";
-import type { DeckRuntimeState } from "../types";
+import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "../types";
 import { VOICE_JOIN_WINDOW_MS, VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
 import type { VoiceNumberAnswerDto } from "../lib/voiceNumbers";
+import { PrBrowserHostContext, type PrBrowserHost } from "../lib/prBrowser";
 
 vi.mock("./TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <div data-testid={`terminal-${agentId}`} />,
@@ -113,6 +114,29 @@ async function finishPossibleNoMatch() {
   await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_JOIN_WINDOW_MS); });
 }
 
+/**
+ * Issue #1668 — two runs of one orchestration definition (`mixed`), titled
+ * prd-1401 and prd-1500, each with a Coder, a Reviewer and a Tester, in that
+ * order: so every role is shared by two agents, and on the Daemons screen's
+ * four-tile page the second run's Reviewer and Tester are on page 2.
+ */
+function twoRunsOfOneDefinition(): DeckSnapshot {
+  const snapshot = createFixtureSnapshot("docs");
+  const seed = snapshot.agents[0];
+  const member = (run: string, title: string, roleIndex: number, roleName: string): AgentSession => {
+    const role = roleName[0].toUpperCase() + roleName.slice(1);
+    return { ...seed, id: `${title}-${roleName}`, role, displayName: role, cli: "claude", tab: { kind: "orchestration", orchestrationId: run, name: "mixed", displayTitle: title, roleName, roleIndex, isStartRole: roleIndex === 0 } };
+  };
+  const roles = ["coder", "reviewer", "tester"];
+  return {
+    ...snapshot,
+    agents: [
+      ...roles.map((role, index) => member("run-a", "prd-1401", index, role)),
+      ...roles.map((role, index) => member("run-b", "prd-1500", index, role)),
+    ],
+  };
+}
+
 describe("numbered voice lists through the dashboard", () => {
   beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -131,6 +155,58 @@ describe("numbered voice lists through the dashboard", () => {
     expect(resolveVoice).not.toHaveBeenCalled();
     expect(screen.getByTestId("agent-pane-overlay").querySelector(".agent-assignment p"))
       .toHaveTextContent("Check the payment API for breaking changes.");
+  });
+
+  /** Scenario: every dashboard agent has a pull request, and “open the PR for agent 3” or “open agent 3's pull request” opens the PR of the agent showing 3, in the app's browser. Neither phrase asks the Commands backend. */
+  it.each(["open the PR for agent 3", "open agent 3's pull request"])("opens the third agent's pull request for %s without a Commands backend call", async (phrase) => {
+    const voice = microphone();
+    const docs = createFixtureSnapshot("docs");
+    const snapshot = {
+      ...docs,
+      agents: docs.agents.map((agent, index) => ({
+        ...agent,
+        pullRequest: { number: 100 + index, url: `https://github.com/test-org/test-repo/pull/${100 + index}`, state: "open" as const, review: "review_required" as const },
+      })),
+    };
+    const { runtime, resolveVoice } = makeRuntime(voice, snapshot);
+    const host = {
+      available: true,
+      open: vi.fn(async () => undefined), setBounds: vi.fn(async () => undefined), setVisible: vi.fn(async () => undefined),
+      back: vi.fn(async () => undefined), scroll: vi.fn(async () => undefined), openExternal: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined), signOut: vi.fn(async () => undefined), onClosed: vi.fn(() => () => undefined),
+    } satisfies PrBrowserHost;
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime} initialView={{ kind: "overview" }} />
+      </PrBrowserHostContext.Provider>,
+    );
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+    const [third] = screen.getAllByRole("row", { name: /^3\./ });
+    const owner = snapshot.agents.find((agent) => within(third).queryByText(agent.displayName) !== null);
+    expect(owner, "the third row names one of the fixture's agents").toBeDefined();
+    voice.deliver(phrase);
+    await poll();
+    await finishPossibleNoMatch();
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("no matching action");
+    expect(resolveVoice).not.toHaveBeenCalled();
+    expect(host.open).toHaveBeenCalledTimes(1);
+    expect(host.open).toHaveBeenCalledWith(owner?.pullRequest?.url, expect.anything());
+    expect(screen.getByTestId("pr-browser")).toHaveAccessibleName(`Pull request #${owner?.pullRequest?.number} for ${owner?.displayName}`);
+  });
+
+  /** Scenario: on the Daemons screen, whose agent tiles are numbered too, “open the PR for agent 1” is not answered by number: it goes to the Commands backend, which says where a pull request opens. */
+  it("leaves a pull request by number on the Daemons screen to the Commands backend", async () => {
+    const voice = microphone();
+    const { runtime, resolveVoice } = makeRuntime(voice);
+    /* The Daemons screen is behind the experimental flag (issue #1198). */
+    runtime.desktopFeatures = fixtureDesktopFeatures("?experimental=1");
+    render(<DeckShell runtime={runtime} initialView={{ kind: "deck" }} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+    expect(document.querySelector(".agent-tile[data-voice-number='1']"), "the Daemons screen's first tile shows 1").not.toBeNull();
+    voice.deliver("open the PR for agent 1");
+    await poll();
+    await finishPossibleNoMatch();
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
   });
 
   /** Scenario: the New agent dialog shows daemon 1, and “Select daemon 1” chooses that daemon locally. The selected daemon's directory browser opens without a Commands call. */
@@ -310,6 +386,62 @@ describe("numbered voice lists through the dashboard", () => {
     expect(choice).toHaveTextContent("orchestrator-1");
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
     expect(resolveVoice).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: two runs of one orchestration each have a Tester, and the second run's is named “Tester 1”. On the dashboard, saying “one” offers a choice that names each row by its run's title and its name, so the two runs' agents read differently. */
+  it("names an orchestration row in a numbered choice by its run's title", async () => {
+    const voice = microphone();
+    const snapshot = twoRunsOfOneDefinition();
+    snapshot.agents[5] = { ...snapshot.agents[5], displayName: "Tester 1" };
+    const { runtime, resolveVoice } = makeRuntime(voice, snapshot);
+    render(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+    voice.deliver("one");
+    await poll();
+    const choice = screen.getByRole("dialog", { name: "Which agent?" });
+    expect(within(choice).getAllByRole("button").map((button) => button.textContent)).toEqual(expect.arrayContaining(["1. prd-1401 Coder", "2. prd-1500 Tester 1"]));
+    expect(resolveVoice).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: the same two runs on the Daemons screen, whose tiles are numbered while voice is on. Saying “one” when the second run's Tester is named “Tester 1” offers a choice naming the first tile “prd-1401 Coder”, not the bare role every run shares. */
+  it("names an orchestration tile in a numbered choice by its run's title", async () => {
+    const voice = microphone();
+    const snapshot = twoRunsOfOneDefinition();
+    snapshot.agents[3] = { ...snapshot.agents[3], displayName: "Coder 1" };
+    const { runtime, resolveVoice } = makeRuntime(voice, snapshot);
+    runtime.desktopFeatures = fixtureDesktopFeatures("?experimental=1");
+    render(<DeckShell runtime={runtime} initialView={{ kind: "deck" }} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+    expect(screen.getByTestId("deck-tiles-page")).toHaveTextContent(/Page 1 of 2/i);
+    voice.deliver("one");
+    await poll();
+    const choice = screen.getByRole("dialog", { name: "Which agent?" });
+    expect(within(choice).getAllByRole("button").map((button) => button.textContent)).toEqual(expect.arrayContaining(["1. prd-1401 Coder", "2. prd-1500 Coder 1"]));
+    expect(resolveVoice).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: the same two runs on the Daemons screen, paged four tiles at a time while voice is on. A command that resolves to the second run's Tester, on page 2, is refused with a sentence naming it “prd-1500 Tester”, the way the screen's heading and Reading name it. */
+  it("names an orchestration tile on another page by its run's title", async () => {
+    const voice = microphone();
+    const snapshot = twoRunsOfOneDefinition();
+    const { runtime, resolveVoice } = makeRuntime(voice, snapshot);
+    resolveVoice.mockImplementation(async (transcript: string): Promise<VoiceResultDto> => ({
+      backend: "stub", resolveMs: 21,
+      outcome: {
+        kind: "dispatch", transcript, action: "open_agent", invoke: "openAgent",
+        params: [{ name: "agent", kind: "agent_ref", spoken: "prd 1500 tester", value: "prd-1500-tester", label: "prd-1500 Tester" }],
+        sentence: "Opening prd-1500 Tester.",
+      },
+    }));
+    runtime.desktopFeatures = fixtureDesktopFeatures("?experimental=1");
+    render(<DeckShell runtime={runtime} initialView={{ kind: "deck" }} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+    expect(screen.getByTestId("deck-tiles-page")).toHaveTextContent(/Page 1 of 2/i);
+    voice.deliver("open the prd 1500 tester");
+    await poll();
+    await finishPossibleNoMatch();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("“prd-1500 Tester” is on page 2");
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
   });
 
   /** Scenario: while a spoken number is being captured, the first dashboard agent disappears and the visible numbers move. The old answer is refused with nothing opened or sent to Commands. */

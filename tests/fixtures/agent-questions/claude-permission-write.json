@@ -1,0 +1,18 @@
+{
+  "session_id": "11e159a7-9408-43a1-8c85-2f593d8479bf",
+  "prompt_id": "18863ebb-831e-438d-8ba9-6daa55129f09",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "/work/proj/plan_probe.txt",
+    "content": ""
+  },
+  "permission_suggestions": [
+    {
+      "type": "setMode",
+      "mode": "acceptEdits",
+      "destination": "session"
+    }
+  ]
+}

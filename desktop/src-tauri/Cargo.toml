@@ -16,7 +16,12 @@ tauri-build = { version = "2", features = [] }
 dot-agent-deck = { path = "../.." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = [] }
+# PRD #1401: `unstable` is what exposes `Window::add_child`, the child webview
+# the in-app pull request browser is drawn in (`pr_browser.rs`). It adds no
+# crate; what it changes is that the main webview, too, is created as a child
+# of its window (sized to fill it), which is the mode Tauri's multiwebview
+# support runs every webview in.
+tauri = { version = "2", features = ["unstable"] }
 # PRD #803: the desktop app's own settings document is TOML, a sibling of
 # the TUI's config.toml. Same version pin as the root package.
 #
@@ -326,6 +331,20 @@ tauri = { version = "2", features = ["test"] }
 # for them.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
+# PRD #1401: the Linux half of the PR browser's placement (`pr_browser.rs`'s
+# `overlay`). Tauri packs a window's webviews into one `GtkBox`, so the PR
+# webview is moved into a `GtkOverlay` over the main one. NOT a new dependency:
+# `tauri`, `tao` and `wry` all build on this `gtk` on Linux and the lockfile
+# carries one 0.18. Declared for the discipline the `zbus` entry states.
+# renovate.json holds this, `webkit2gtk`, `webview2-com` and `windows-core` to
+# patch updates: they move by hand, in the Tauri upgrade that moves them.
+gtk = "0.18"
+# PRD #1401's sign-out: `webkit_website_data_manager_clear` with its completion
+# callback, which wry's `clear_all_browsing_data` calls but discards, so the
+# app can say "signed out" only once WebKitGTK has said the delete finished.
+# NOT a new dependency: wry builds on this `webkit2gtk` on Linux and the
+# lockfile carries one 2.0; `v2_16` is the version `clear` first appears in.
+webkit2gtk = { version = "2.0", features = ["v2_16"] }
 
 # PRD #802's sleep work: the Windows half of `voice/wake.rs` —
 # `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`, which is the
@@ -340,3 +359,26 @@ zbus = "5"
 # three constants and one `link!`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
+# PRD #1401's sign-out: `ICoreWebView2Profile2::ClearBrowsingDataAll` with a
+# completion handler that reports its status (wry's discards it). NOT new
+# dependencies: wry and tauri build on these on Windows and the lockfile
+# carries one of each. Held to patch updates by renovate.json, as `gtk` is.
+webview2-com = "0.39"
+windows-core = "0.62"
+
+# PRD #1401's sign-out on macOS: `removeDataOfTypes:modifiedSince:completionHandler:`
+# on the webview's `WKWebsiteDataStore` with a handler of our own (wry's is
+# empty). NOT new dependencies: wry builds on all four on Apple targets and
+# the lockfile carries one of each.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "WKWebView",
+    "WKWebViewConfiguration",
+    "WKWebsiteDataStore",
+] }

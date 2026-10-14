@@ -23,6 +23,7 @@ mod common;
 #[path = "support/fake_releases.rs"]
 mod fake_releases;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -417,7 +418,7 @@ fn open_pane(deck: &TuiDeck, agent: &Agent, command: &str, last_command: &str) {
     // The transcript's first line is its prompt, which no card shows yet.
     deck.wait_for_string(&format!("> {}", agent.prompt));
     deck.send_keys(b"\x04"); // Ctrl+D -> back to the dashboard
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 }
 
 /// The daemon's record of the pane named `name`, once it has one that
@@ -566,7 +567,7 @@ fn stage_dashboard() -> DashboardScene {
     deck.send_keys(b"\r");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_keys(b"\x04");
-    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 
     // The cards' `Last:` ages. A card's last activity is a high-water mark
     // that starts at its pane's spawn, so every status event is stamped after
@@ -678,7 +679,143 @@ fn docs_screenshot_dashboard_empty() {
     html_dir();
     let deck = launch();
     capture(&deck, "dashboard-empty", |grid| {
-        grid.contains("No active agents") && grid.contains("[New Agent Ctrl+N]")
+        grid.contains("No active agents") && grid.contains("[New Agent n/Ctrl+N]")
+    });
+}
+
+/// Scenario: Open a stand-in implementation agent on a fixture GitHub branch
+/// whose strict offline gh stub reports open PR #1234 awaiting review. Capture
+/// the dashboard only when its card badge and fixed pane transcript are visible.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_pull_request_badge() {
+    html_dir();
+    let scratch = common::harness_tempdir().expect("PR screenshot scratch");
+    let bin = scratch.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, r#"#!/bin/sh
+[ "$1" = pr ] && [ "$2" = list ] || exit 91
+shift 2
+head= state= repo= fields=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --head) shift; head="$1" ;;
+        --state) shift; state="$1" ;;
+        --repo) shift; repo="$1" ;;
+        --json) shift; fields="$1" ;;
+        *) exit 92 ;;
+    esac
+    shift
+done
+[ "$head" = feat/pr-badge ] && [ "$repo" = test-org/test-repo ] && [ "$state" = all ] || exit 93
+for field in number state isDraft reviewDecision url headRefName; do
+    case ",$fields," in
+        *",$field,"*) ;;
+        *) exit 94 ;;
+    esac
+done
+printf '%s\n' '[{"number":1234,"headRefName":"feat/pr-badge","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","url":"https://github.com/test-org/test-repo/pull/1234"}]'
+"#).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let deck = launch_with(|builder| {
+        builder
+            .with_launch_subdir(LAUNCH_DIR)
+            .impersonating_pane_signals()
+            .with_env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .with_env("DOT_AGENT_DECK_PR_REFRESH_SECS", "1")
+    });
+    deck.wait_for_string("No active agents");
+    let repo = deck.workdir().join(LAUNCH_DIR);
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["commit", "--allow-empty", "-m", "fixture"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/test-org/test-repo.git",
+        ],
+        vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+        vec![
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+        vec!["checkout", "-b", "feat/pr-badge"],
+    ] {
+        let output = common::fixture_git(&repo, scratch.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stand_ins = deck.workdir().join("docs-stand-ins");
+    let commands = write_stand_ins(&stand_ins);
+    let agent = &DASHBOARD_AGENTS[1];
+    open_pane(&deck, agent, &commands[1], "");
+    let names = std::fs::read_to_string(env_names_path(&stand_ins, agent)).unwrap();
+    for key in common::AGENT_CREDENTIAL_ENV {
+        assert!(
+            !names.lines().any(|name| name == key),
+            "{key} reached the screenshot pane"
+        );
+    }
+    let record = wait_for_record(&deck, agent.name, |_| true);
+    let pane_id = record.pane_id_env.expect("screenshot pane id");
+    send(
+        &deck,
+        serde_json::json!({
+            "session_id": agent.session,
+            "agent_type": agent.agent_type,
+            "event_type": "session_start",
+            "timestamp": (Utc::now() - ChronoDuration::minutes(agent.up_for_minutes)).to_rfc3339(),
+            "cwd": repo,
+            "pane_id": pane_id,
+            "agent_id": record.id,
+            "metadata": { "display_name": agent.name },
+        }),
+    );
+    wait_for_record(&deck, agent.name, |r| {
+        r.live.as_ref().is_some_and(|live| {
+            live.agent_type.as_ref().map(|kind| serde_json::json!(kind))
+                == Some(serde_json::Value::from(agent.agent_type))
+        })
+    });
+    send(
+        &deck,
+        serde_json::json!({
+            "session_id": agent.session,
+            "agent_type": agent.agent_type,
+            "event_type": "tool_start",
+            "timestamp": (Utc::now() + ChronoDuration::seconds(30)).to_rfc3339(),
+            "cwd": repo,
+            "pane_id": pane_id,
+            "agent_id": record.id,
+            "user_prompt": agent.prompt,
+            "tool_name": "Edit",
+            "tool_detail": "src/components/RetryPayment.tsx",
+        }),
+    );
+    capture(&deck, "pull-request-badge", |grid| {
+        grid.contains(agent.name)
+            && grid.contains(agent.prompt)
+            && grid.contains("#1234 ⊙ ◐")
+            && grid.contains("Last: 0s ")
+            && grid.contains("Working")
+            && !grid.contains("Ctrl+D to type")
+            && FOCUSED_PANE_LINES.iter().all(|line| grid.contains(line))
     });
 }
 
@@ -905,6 +1042,46 @@ fn docs_screenshot_schedules() {
             && grid.contains("NEXT FIRE")
             && grid.contains("nightly-triage")
             && grid.contains("disabled")
+    });
+}
+
+/// The host the `host-metrics` capture reports: the desktop fixture's local
+/// deck (`fixtureHostMetrics("local")` in `desktop/src/data/fixture.ts`), so
+/// the TUI and desktop images show the same machine. Change the two together.
+const HOST_SAMPLE: &str = r#"{
+    "disks": [
+        {"role": "working_root", "free_bytes": 137438953472, "total_bytes": 549755813888},
+        {"role": "worktree_parent", "free_bytes": 137438953472, "total_bytes": 549755813888},
+        {"role": "temp_root", "free_bytes": 6442450944, "total_bytes": 68719476736}
+    ],
+    "load_per_cpu": 0.42,
+    "cpu_count": 16,
+    "memory_used_bytes": 19864223744,
+    "memory_available_bytes": 46707769344,
+    "sampled_at_ms": 1700000000000,
+    "sample_age_ms": 0
+}"#;
+
+/// Scenario: Press `m` on the empty dashboard, with the daemon reporting a
+/// fixed host sample, so the Host of this deck overlay shows per-role disk,
+/// load per core and memory, with the temp root's 9%
+/// free marked as a warning by the daemon's default thresholds.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_host_metrics() {
+    html_dir();
+    let deck =
+        launch_with(|builder| builder.with_env("DOT_AGENT_DECK_E2E_HOST_SAMPLE", HOST_SAMPLE));
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"m");
+    // The overlay's first and last rows, so a frame caught while it is still
+    // being drawn is not the one written.
+    capture(&deck, "host-metrics", |grid| {
+        grid.contains("Host of this deck")
+            && grid.contains("0.42 across 16 cores")
+            && grid.contains("(warning)")
+            && grid.contains("Memory available")
+            && grid.contains("Press Esc to close")
     });
 }
 

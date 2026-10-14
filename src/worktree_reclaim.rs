@@ -334,7 +334,7 @@ fn ownership_of(worktree_path: &Path) -> Ownership {
 /// that doesn't parse as `owner/name`, or a host other than `github.com`
 /// (`gh` only ever talks to GitHub, so a non-GitHub remote must never resolve
 /// to a slug `gh` would misinterpret rather than reject).
-fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
+pub(crate) fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
     let out = git_at(repo_dir)
         .args(["remote", "get-url", "origin"])
         .output()
@@ -350,7 +350,7 @@ fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
 /// `owner/name` slug. Returns `None` for anything else, including a
 /// non-GitHub host, a URL with no path, or a path with more than two
 /// segments — fail closed rather than guess.
-fn parse_github_owner_repo(url: &str) -> Option<String> {
+pub(crate) fn parse_github_owner_repo(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("git@github.com:")
         .or_else(|| url.strip_prefix("ssh://git@github.com/"))
@@ -386,18 +386,11 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
     };
     let out = Command::new("gh")
         .current_dir(repo_dir)
-        .args([
-            "pr",
-            "list",
-            "--head",
+        .args(crate::pull_request::gh_pr_list_args(
             branch,
-            "--state",
-            "all",
-            "--repo",
             &repo_slug,
-            "--json",
             "state,headRefName",
-        ])
+        ))
         .output();
     let out = match out {
         Ok(o) => o,
