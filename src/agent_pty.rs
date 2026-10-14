@@ -7271,13 +7271,13 @@ impl AgentPtyRegistry {
         self.dispatch_returns.lock().unwrap().take(unit_pane_id)
     }
 
-    /// How many dispatched units still owe a report. Observability and tests.
-    /// PRD #1666 S11: every outstanding dispatch return as `(unit pane,
-    /// caller pane)`.
-    pub fn dispatch_callers(&self) -> Vec<(String, String)> {
-        self.dispatch_returns.lock().unwrap().callers()
+    /// PRD #1666 S11: every outstanding dispatch return as an edge, with the
+    /// agent that held each end when the dispatch was made (audit F1).
+    pub fn dispatch_edges(&self) -> Vec<crate::dispatch_return::DispatchEdge> {
+        self.dispatch_returns.lock().unwrap().edges()
     }
 
+    /// How many dispatched units still owe a report. Observability and tests.
     pub fn outstanding_dispatch_returns(&self) -> usize {
         self.dispatch_returns.lock().unwrap().len()
     }

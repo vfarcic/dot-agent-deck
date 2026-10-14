@@ -93,13 +93,33 @@ pub struct RetainedReturn {
     pub caller: DispatchCaller,
 }
 
+/// PRD #1666 S11: one outstanding dispatch return as an edge of the dispatch
+/// tree a publish or offer is scoped by, with the agent that held each end
+/// when the dispatch was made.
+///
+/// Both agents travel with the panes (audit F1): an entry outlives a respawn
+/// of either end, so an edge read by pane alone would hand a successor its
+/// predecessor's place in the tree. A reader accepts the edge only while each
+/// pane is still held by the agent named here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchEdge {
+    pub unit_pane_id: String,
+    pub unit_agent_id: String,
+    pub caller_pane_id: String,
+    pub caller_agent_id: String,
+}
+
 impl DispatchReturns {
-    /// PRD #1666 S11: every outstanding return as `(unit pane, caller pane)`,
-    /// the edges of the dispatch trees a publish or offer is scoped by.
-    pub fn callers(&self) -> Vec<(String, String)> {
+    /// PRD #1666 S11: every outstanding return as a [`DispatchEdge`].
+    pub fn edges(&self) -> Vec<DispatchEdge> {
         self.by_unit_pane
             .iter()
-            .map(|(unit, retained)| (unit.clone(), retained.caller.pane_id.clone()))
+            .map(|(unit, retained)| DispatchEdge {
+                unit_pane_id: unit.clone(),
+                unit_agent_id: retained.unit_agent_id.clone(),
+                caller_pane_id: retained.caller.pane_id.clone(),
+                caller_agent_id: retained.caller.agent_id.clone(),
+            })
             .collect()
     }
 

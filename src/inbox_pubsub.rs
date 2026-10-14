@@ -10,8 +10,8 @@
 //! in its pool to the next taker ([`spawn_offer_assigner`]).
 //!
 //! Who may do what: any attested agent in a scope may publish; only an
-//! orchestrator — a start role, or a pane that dispatched a unit still owing it
-//! a report — may offer; only an offer's claimant may complete or release it.
+//! orchestrator — a start role, or the agent that dispatched a unit, both still
+//! in their panes, that owes it a report — may offer; only an offer's claimant may complete or release it.
 //! Each verb acts for the agent the request's token attests, and only while
 //! that agent is still its pane's live agent. The process check (the request
 //! comes from the agent's own process tree) is the hook loop's, before these
@@ -45,7 +45,8 @@ struct ScopeView {
     /// The directory whose `.dot-agent-deck.toml` subscribes each pane.
     cwd_of: HashMap<String, String>,
     orchestrators: HashSet<String>,
-    /// Panes that dispatched a unit still owing them a report.
+    /// Panes whose live agent dispatched a unit, still live, that owes it a
+    /// report.
     dispatch_callers: HashSet<String>,
     configs: ProjectConfigs,
 }
@@ -55,7 +56,27 @@ impl ScopeView {
     /// directory with no state guard held.
     async fn gather(state: &SharedState, registry: &AgentPtyRegistry) -> Self {
         let live = registry.live_pane_agents();
-        let callers: HashMap<String, String> = registry.dispatch_callers().into_iter().collect();
+        // Audit F1: an edge counts only while both of its panes are still held
+        // by the agents that made it. A respawn of either end leaves the edge
+        // retained (its report is still owed, or refused, by agent), and read
+        // by pane alone it would put the successor in its predecessor's tree
+        // and let it offer jobs as the dispatcher.
+        let callers: HashMap<String, String> = {
+            let holder: HashMap<&str, &str> = live
+                .iter()
+                .map(|(pane, agent)| (pane.as_str(), agent.as_str()))
+                .collect();
+            registry
+                .dispatch_edges()
+                .into_iter()
+                .filter(|edge| {
+                    holder.get(edge.unit_pane_id.as_str()) == Some(&edge.unit_agent_id.as_str())
+                        && holder.get(edge.caller_pane_id.as_str())
+                            == Some(&edge.caller_agent_id.as_str())
+                })
+                .map(|edge| (edge.unit_pane_id, edge.caller_pane_id))
+                .collect()
+        };
         let (facts, cwd_of, orchestrators) = {
             let state = state.read().await;
             let mut cwd_of = HashMap::new();
@@ -457,4 +478,139 @@ pub fn spawn_offer_assigner(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::dispatch_return::DispatchCaller;
+    use crate::state::AppState;
+
+    fn spawn_in(registry: &Arc<AgentPtyRegistry>, pane: &str, cwd: Option<&str>) -> String {
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                cwd,
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in")
+    }
+
+    fn shared() -> SharedState {
+        Arc::new(tokio::sync::RwLock::new(AppState::default()))
+    }
+
+    fn offer_from(pane: &str, agent: &str) -> InboxOfferRequest {
+        InboxOfferRequest {
+            pane_id: pane.to_string(),
+            agent_id: Some(agent.to_string()),
+            token: None,
+            pool: "jobs".to_string(),
+            body: "do the job".to_string(),
+            claim_ttl_ms: None,
+        }
+    }
+
+    /// `caller` dispatched the unit in `unit`, as `dispatch` retains it.
+    fn dispatched(registry: &AgentPtyRegistry, unit: (&str, &str), caller: (&str, &str)) {
+        registry.register_dispatch_return(
+            unit.0,
+            unit.1,
+            DispatchCaller {
+                pane_id: caller.0.to_string(),
+                agent_id: caller.1.to_string(),
+                unit_name: "unit".to_string(),
+            },
+        );
+    }
+
+    fn in_scope(view: &ScopeView, sender: &str, member: &str) -> bool {
+        view.scope_of(sender)
+            .is_some_and(|scope| scope.members.iter().any(|m| m.recipient.pane_id == member))
+    }
+
+    /// Audit F1: a dispatch edge is retained across a respawn of its caller,
+    /// but it names the agent that dispatched. The successor in that pane
+    /// joins neither the unit's tree nor gains the right to offer it jobs.
+    #[tokio::test]
+    async fn a_respawned_dispatcher_inherits_neither_scope_nor_offer_authority() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let caller = spawn_in(&registry, "f1-caller", None);
+        let unit = spawn_in(&registry, "f1-unit", None);
+        dispatched(&registry, ("f1-unit", &unit), ("f1-caller", &caller));
+        let state = shared();
+
+        let view = ScopeView::gather(&state, &registry).await;
+        assert!(
+            view.may_offer("f1-caller"),
+            "the dispatcher itself may offer"
+        );
+        assert!(in_scope(&view, "f1-caller", "f1-unit"));
+
+        let successor = registry
+            .respawn_agent_for_pane("f1-caller", "cat")
+            .await
+            .expect("respawn the dispatcher");
+        assert_ne!(successor, caller);
+        assert_eq!(
+            registry.outstanding_dispatch_returns(),
+            1,
+            "precondition: the respawn leaves the edge retained"
+        );
+
+        let view = ScopeView::gather(&state, &registry).await;
+        assert!(
+            !view.may_offer("f1-caller"),
+            "the successor did not dispatch anything"
+        );
+        assert!(!in_scope(&view, "f1-caller", "f1-unit"));
+        assert!(!in_scope(&view, "f1-unit", "f1-caller"));
+        let reply = handle_offer(
+            &registry,
+            &state,
+            &offer_from("f1-caller", &successor),
+            &successor,
+        )
+        .await;
+        assert_eq!(
+            reply.refused.as_deref(),
+            Some("not_orchestrator"),
+            "{reply:?}"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Audit F1, the unit side: the successor of a dispatched unit's agent was
+    /// never dispatched, so it is not in its predecessor's dispatch tree, and
+    /// the edge no longer makes its caller an orchestrator.
+    #[tokio::test]
+    async fn a_respawned_unit_is_not_in_its_predecessors_dispatch_tree() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let caller = spawn_in(&registry, "f1b-caller", None);
+        let unit = spawn_in(&registry, "f1b-unit", None);
+        dispatched(&registry, ("f1b-unit", &unit), ("f1b-caller", &caller));
+        let state = shared();
+        assert!(in_scope(
+            &ScopeView::gather(&state, &registry).await,
+            "f1b-caller",
+            "f1b-unit"
+        ));
+
+        registry
+            .respawn_agent_for_pane("f1b-unit", "cat")
+            .await
+            .expect("respawn the unit");
+        assert_eq!(registry.outstanding_dispatch_returns(), 1);
+
+        let view = ScopeView::gather(&state, &registry).await;
+        assert!(!in_scope(&view, "f1b-caller", "f1b-unit"));
+        assert!(!in_scope(&view, "f1b-unit", "f1b-caller"));
+        assert!(!view.may_offer("f1b-caller"));
+        registry.shutdown_all();
+    }
 }
