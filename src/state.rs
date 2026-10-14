@@ -9635,11 +9635,18 @@ impl AppState {
         // case it exists to surface. See
         // [`AgentPtyRegistry::retire_silence_watch`] for why the accounting
         // cannot simply borrow the idle detector's generation.
-        // PRD #1666 S5: a worker reporting work-done has the delegated tasks it
-        // fetched and has not acknowledged retired as superseded — so no
-        // undelivered notice is posted about a task the worker has answered. A
-        // newer task still queued is not answered by this completion, and stays
-        // owed and watched, for the reason above (delegate_021).
+        // PRD #1666 S5: a worker reporting work-done has delegated tasks it has
+        // not acknowledged retired as superseded — so no undelivered notice is
+        // posted about a task the worker has answered. Which ones depends on
+        // whether it acknowledged a task since its previous work-done
+        // (delegate_021): if it did, only the tasks it fetched are retired and
+        // a newer task never fetched stays owed and watched, for the reason
+        // above; if it did not, every unacknowledged task goes, a never-fetched
+        // one included. The worker chooses the branch by what it acknowledges
+        // and reports, so within its own pane a repeated work-done silently
+        // retires a newer task it never fetched, and acknowledging a task it
+        // does not complete keeps a later file-taken task queued (audit A2-3;
+        // see `InboxHub::retire_answered_delegates_to`).
         registry
             .inbox()
             .retire_answered_delegates_to(&signal.pane_id);

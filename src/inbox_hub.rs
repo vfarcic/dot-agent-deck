@@ -752,6 +752,16 @@ impl InboxHub {
     /// * otherwise the worker answered a task it took some other way, such as
     ///   its task file, without acknowledging the message (idle-worker/029),
     ///   and every task to the pane not yet acknowledged is retired.
+    ///
+    /// Nothing ties a completion to a task, so the worker steers the inference
+    /// for its own pane, and no other (audit A2-3): a second `work-done` after
+    /// the one that answered an acknowledged task takes the second branch and
+    /// retires a newer task the worker never fetched, unreported; and a task
+    /// acknowledged but never completed makes the completion of a later task
+    /// taken from its file take the first branch, which leaves that later task
+    /// queued — its orchestrator may be told it did not reach the worker, and
+    /// it may be handed out again. A `work-done` naming its task id would close
+    /// both; it is not implemented.
     pub fn retire_answered_delegates_to(&self, pane_id: &str) -> usize {
         let received = self.lock().received_since_done.remove(pane_id);
         if received {

@@ -2760,7 +2760,10 @@ thread_local! {
 /// Audit D3: remove the file [`write_coordination_file_as`] created at `path`
 /// and then failed to fill. On Unix it first checks that `path` still names
 /// the file it holds open, so a file another process had moved into its place
-/// by then is left alone.
+/// by the time of that check is left alone. The check and the unlink are two
+/// steps, not one conditional unlink: a file renamed over `path` between them
+/// is removed instead (audit A2-2, accepted — it takes a concurrent writer in
+/// the coordination directory). Other platforms do not check.
 fn remove_created_file(path: &std::path::Path, file: &std::fs::File) {
     #[cfg(unix)]
     {
