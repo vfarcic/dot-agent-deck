@@ -2044,7 +2044,7 @@ impl TuiDeck {
         // no wider (a trailing NBSP stays significant) (PR #1408 review).
         let is_ours = |e: &dot_agent_deck::event::AgentEvent| {
             e.user_prompt.as_deref().is_some_and(|reported| {
-                dot_agent_deck::prompt_delivery::prompt_submission_matches(prompt, reported)
+                dot_agent_deck::submitted_prompt::prompt_submission_matches(prompt, reported)
             })
         };
         // Submissions reported since typing began. The FIRST one carrying THIS

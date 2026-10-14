@@ -669,7 +669,7 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
 /// emitted at all, which for a `user_prompt` now also means a delivered prompt
 /// can never be confirmed. Identical output for ASCII, so nothing else moves.
 fn truncate(s: &str, max: usize) -> String {
-    crate::prompt_delivery::truncate_on_char_boundary(s, max)
+    crate::submitted_prompt::truncate_on_char_boundary(s, max)
 }
 
 /// Record a reported prompt as the text the agent actually submitted, with the
@@ -687,7 +687,7 @@ fn truncate(s: &str, max: usize) -> String {
 ///   show the prompt instead of `<pasted_content id="239f">You a…`, which is
 ///   what the pane rendered for every seeded Claude agent (measured on
 ///   `prompt/new-pane/016`);
-/// * the [`crate::prompt_delivery::USER_PROMPT_MAX_LEN`] budget below is spent
+/// * the [`crate::submitted_prompt::USER_PROMPT_MAX_LEN`] budget below is spent
 ///   on the prompt rather than partly on a wrapper.
 ///
 /// **This does not replace [`crate::prompt_delivery`]'s envelope shape and must
@@ -699,7 +699,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// to read them.
 ///
 /// Unwrapping is refused for anything but a turn that is wholly one paste (see
-/// [`crate::prompt_delivery::paste_envelope_payload`]): a turn where someone
+/// [`crate::submitted_prompt::paste_envelope_payload`]): a turn where someone
 /// typed prose AROUND a paste is reported as they composed it.
 fn record_submitted_prompt(prompt: &str) -> String {
     // The closing delimiter is stripped ONLY when an opening one was found and
@@ -707,11 +707,11 @@ fn record_submitted_prompt(prompt: &str) -> String {
     // `</pasted_content …>` off a turn this deliberately declined to unwrap —
     // pinned by `a_turn_that_merely_contains_a_paste_is_recorded_unchanged`,
     // which is what caught it.
-    let recorded = match crate::prompt_delivery::paste_envelope_payload(prompt) {
-        Some((payload, _)) => crate::prompt_delivery::strip_paste_envelope_close(payload),
+    let recorded = match crate::submitted_prompt::paste_envelope_payload(prompt) {
+        Some((payload, _)) => crate::submitted_prompt::strip_paste_envelope_close(payload),
         None => prompt,
     };
-    truncate(recorded, crate::prompt_delivery::USER_PROMPT_MAX_LEN)
+    truncate(recorded, crate::submitted_prompt::USER_PROMPT_MAX_LEN)
 }
 
 /// PRD #20 W1: normalize a Codex `shell` tool's `command` value into a single
@@ -2220,10 +2220,10 @@ mod tests {
     #[test]
     fn an_ordinary_prompt_is_recorded_exactly_as_before() {
         assert_eq!(record_submitted_prompt("ls -la"), "ls -la");
-        let long = "x".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN + 40);
+        let long = "x".repeat(crate::submitted_prompt::USER_PROMPT_MAX_LEN + 40);
         assert_eq!(
             record_submitted_prompt(&long),
-            truncate(&long, crate::prompt_delivery::USER_PROMPT_MAX_LEN)
+            truncate(&long, crate::submitted_prompt::USER_PROMPT_MAX_LEN)
         );
     }
 
@@ -2232,11 +2232,11 @@ mod tests {
     /// have if the envelope had been truncated along with it.
     #[test]
     fn unwrapping_spends_the_budget_on_the_prompt() {
-        let long = "y".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN * 2);
+        let long = "y".repeat(crate::submitted_prompt::USER_PROMPT_MAX_LEN * 2);
         let enveloped = format!("<pasted_content id=\"239f\">\n{long}");
         assert_eq!(
             record_submitted_prompt(&enveloped),
-            truncate(&long, crate::prompt_delivery::USER_PROMPT_MAX_LEN)
+            truncate(&long, crate::submitted_prompt::USER_PROMPT_MAX_LEN)
         );
     }
 
@@ -2374,7 +2374,7 @@ mod tests {
 
     #[test]
     fn agent_event_cli_prompt_is_recorded_like_any_producer_prompt() {
-        let long = "p".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN + 50);
+        let long = "p".repeat(crate::submitted_prompt::USER_PROMPT_MAX_LEN + 50);
         let event = build_agent_event_cli(
             "pane-7".into(),
             None,

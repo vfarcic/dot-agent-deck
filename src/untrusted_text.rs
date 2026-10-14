@@ -49,7 +49,7 @@
 //! #833.
 
 use crate::agent_pty::DISPLAY_NAME_MAX_LEN;
-use crate::prompt_delivery::truncate_on_char_boundary;
+use crate::submitted_prompt::truncate_on_char_boundary;
 
 /// Returns `true` for Unicode bidirectional formatting / override codepoints.
 ///

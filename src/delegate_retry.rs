@@ -345,7 +345,7 @@ pub fn classify_event(event: &AgentEvent) -> EventVerdict {
 /// standing as proof and lets the pointer be typed again: only a tail matches,
 /// which ends in the delivery id's last characters and `]`, so a prompt
 /// someone types into the worker (`Read`, `task`, a digit) does not; and a
-/// report [`crate::prompt_delivery::prompt_submission_matches`] accepts (the
+/// report [`crate::submitted_prompt::prompt_submission_matches`] accepts (the
 /// pointer, or its truncated report) is the pointer itself.
 pub fn is_pointer_fragment(pointer: &str, reported: &str) -> bool {
     let reported = reported.trim();
@@ -353,7 +353,7 @@ pub fn is_pointer_fragment(pointer: &str, reported: &str) -> bool {
     reported.chars().count() >= MIN_FRAGMENT_CHARS
         && reported.len() < pointer.len()
         && pointer.ends_with(reported)
-        && !crate::prompt_delivery::prompt_submission_matches(pointer, reported)
+        && !crate::submitted_prompt::prompt_submission_matches(pointer, reported)
 }
 
 /// The shortest tail [`is_pointer_fragment`] reads as a cut-short pointer: the
@@ -2221,9 +2221,9 @@ mod tests {
             "Read .dot-agent-deck/worker-task-{}.md for your task. [delivery d-6aaf2b1b]",
             "r".repeat(300)
         );
-        let reported = crate::prompt_delivery::truncate_on_char_boundary(
+        let reported = crate::submitted_prompt::truncate_on_char_boundary(
             &long,
-            crate::prompt_delivery::USER_PROMPT_MAX_LEN,
+            crate::submitted_prompt::USER_PROMPT_MAX_LEN,
         );
         assert!(!is_pointer_fragment(&long, &reported));
     }

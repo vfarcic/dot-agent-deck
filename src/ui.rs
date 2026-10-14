@@ -30,15 +30,16 @@ use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome, SubmitReply};
 use crate::project_config::{OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
-    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, ConfirmedSubmission,
-    attempt_delivery_id, attempt_writes_payload, classify_prompt_submission,
-    confirmation_latency_floor, log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed,
-    log_prompt_probe_submitted, log_prompt_stopped, log_prompt_unconfirmable,
-    log_prompt_unconfirmed, log_prompt_written, mint_delivery_id, pane_confirmation_capability,
-    prompt_submission_accumulated, submission_is_after_watermark, unconfirmed_retry_delay,
+    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, attempt_delivery_id,
+    attempt_writes_payload, confirmation_latency_floor, log_prompt_abandoned,
+    log_prompt_accumulated, log_prompt_confirmed, log_prompt_probe_submitted, log_prompt_stopped,
+    log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written, mint_delivery_id,
+    pane_confirmation_capability, prompt_submission_accumulated, submission_is_after_watermark,
+    unconfirmed_retry_delay,
 };
 use crate::repo_identity;
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
+use crate::submitted_prompt::{ConfirmedSubmission, classify_prompt_submission};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::tab_layout::fit_tab_labels;
 use crate::terminal_hangup;
@@ -4751,7 +4752,7 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
 ///   and re-created #424's silent loss in a shape no log would explain;
 /// * the TEXT — an unrelated prompt the human typed into the target pane is not
 ///   our prompt arriving, and comparison goes through
-///   [`crate::prompt_delivery::prompt_submission_matches`] so a seed longer than
+///   [`crate::submitted_prompt::prompt_submission_matches`] so a seed longer than
 ///   `USER_PROMPT_MAX_LEN` still matches its truncated report, and a
 ///   CR-swallowed newline-separated doubled submission counts as delivered
 ///   rather than leaving the retry armed;
@@ -4839,7 +4840,7 @@ fn prompt_submission_evidence(
 enum SubmissionEvidence {
     /// The agent reported submitting our prompt — verbatim, truncated, as
     /// newline-separated copies, or inside the producer's paste envelope
-    /// ([`crate::prompt_delivery::prompt_submission_matches`]). The delivery is
+    /// ([`crate::submitted_prompt::prompt_submission_matches`]). The delivery is
     /// real.
     ///
     /// Issue #685: carries WHICH of those shapes it was, so the delivery log
@@ -7557,7 +7558,7 @@ pub fn opened_link_status(url: &str) -> String {
     // `> 60` gate is kept so the set of URLs that get shortened at all is
     // unchanged; only the cut itself moves to a character boundary.
     let display = if url.len() > 60 {
-        crate::prompt_delivery::truncate_on_char_boundary(url, 57)
+        crate::submitted_prompt::truncate_on_char_boundary(url, 57)
     } else {
         url.to_string()
     };
@@ -21342,7 +21343,7 @@ fn render_session_card(
     // function — and because it runs inside the render loop, EVERY frame died
     // and the whole deck went down with the one bad card. Same truncator the
     // hook binary already uses on prompts, for the same reason.
-    let id_display = crate::prompt_delivery::truncate_on_char_boundary(&session.session_id, 11);
+    let id_display = crate::submitted_prompt::truncate_on_char_boundary(&session.session_id, 11);
 
     let num_prefix = match card_number {
         Some(n) => format!("{n} "),
@@ -38795,7 +38796,7 @@ mod tests {
             ),
         ];
         assert!(
-            seeds[1].1.len() > crate::prompt_delivery::USER_PROMPT_MAX_LEN,
+            seeds[1].1.len() > crate::submitted_prompt::USER_PROMPT_MAX_LEN,
             "the long fixture must exercise hook truncation"
         );
         let mut doubled_outcomes = Vec::new();
@@ -38824,9 +38825,9 @@ mod tests {
                 assert_eq!(doubled_attempts.load(Ordering::SeqCst), 2);
 
                 let doubled = format!("{seed}{separator}{seed}");
-                let reported = crate::prompt_delivery::truncate_on_char_boundary(
+                let reported = crate::submitted_prompt::truncate_on_char_boundary(
                     &doubled,
-                    crate::prompt_delivery::USER_PROMPT_MAX_LEN,
+                    crate::submitted_prompt::USER_PROMPT_MAX_LEN,
                 );
                 apply_prompt_confirmation(
                     &mut doubled_snapshot,
@@ -38862,14 +38863,14 @@ mod tests {
         );
 
         let repeated = "bounded repetition";
-        assert!(crate::prompt_delivery::prompt_submission_matches(
+        assert!(crate::submitted_prompt::prompt_submission_matches(
             repeated,
             &std::iter::repeat_n(repeated, 16)
                 .collect::<Vec<_>>()
                 .join("\n")
         ));
         assert!(
-            !crate::prompt_delivery::prompt_submission_matches(
+            !crate::submitted_prompt::prompt_submission_matches(
                 repeated,
                 &std::iter::repeat_n(repeated, 17)
                     .collect::<Vec<_>>()
@@ -38877,7 +38878,7 @@ mod tests {
             ),
             "the recovery shape is deliberately bounded to 16 copies"
         );
-        assert!(!crate::prompt_delivery::prompt_submission_matches(
+        assert!(!crate::submitted_prompt::prompt_submission_matches(
             repeated,
             &format!("{repeated}\nsomething else")
         ));
