@@ -1300,6 +1300,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** a card both Blocked and orphaned at Minimal (its second reason row is still clipped, as before), Compact density, the desktop (which has no density setting).
 - **Platform coverage:** mac+linux.
 
+##### status/background/017 — At Minimal density a not-delivered notice keeps the card's one row ahead of the background line (PRD #1666).
+- **Layer:** L1 widget, fixed clock (`render_dashboard.rs`, fast tier).
+- **Agent:** none; snapshot-hydrated Error card carrying a delivery notice and background work, rendered through the production card seam.
+- **Asserts:** at Minimal the one content row reads the not-delivered notice followed by ` · ` and the background line (before PRD #1666 MC-2 the background line took the row and the notice was clipped); on a 60-column card the row still starts with the whole notice; at Normal the notice and the background line each keep a row of their own. The desktop tile shows the notice ahead of the background line too (`desktop/src/components/AgentTile.tsx`).
+- **Does not assert:** a card that is also Blocked or orphaned, Compact density, the desktop (which has no density setting).
+- **Platform coverage:** mac+linux.
+
 ##### status/subagent/006 — A subagent that asked for permission and then ended takes its prompt with it: the card leaves Needs Input, to Idle after the turn ended and to Thinking inside it (issue #1364).
 - **Layer:** L1 (each payload goes through the real `hook --agent <agent>` CLI, then `AppState::apply_event`).
 - **Agent:** none (Claude Code- and Codex-shaped hook payloads, as `status/subagent/001`).

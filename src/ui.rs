@@ -19748,11 +19748,24 @@ fn render_session_card(
         ));
     }
 
+    // PRD #1666 §2.8: why the card is in Error when the deck said — a message
+    // it could not deliver. Daemon-authored text, under `Dir:` like the
+    // Blocked reason, and an attention reason like it, so at Minimal density
+    // it keeps the row ahead of background work, as the desktop tile orders
+    // them (PRD #1666 MC-2, CLAUDE.md rule 22).
+    if !is_placeholder && let Some(notice) = session.delivery_notice() {
+        attention.push((
+            notice.to_string(),
+            Style::default().fg(palette::status_color(&SessionStatus::Error)),
+        ));
+    }
+
     // Issue #1678: background work the agent left running after its turn
     // ended, under the status rows and above the prompt. `fit_card_rows`
     // sheds the separator, prompts and `Dir:` before a status row, but it
     // cannot shrink a card below its status rows: Minimal has one content row,
-    // which a Blocked or orphaned reason already takes. There the reason keeps
+    // which a Blocked, orphaned or delivery-failure reason already takes. There
+    // the reason keeps
     // the row, since it needs the user's attention, and the background line is
     // appended to it after ` · `, cut with `…` when the row runs out.
     let background = if is_placeholder {
@@ -19778,16 +19791,6 @@ fn render_session_card(
             status_lines.push(plain((text, text_primary())));
         }
         None => status_lines.extend(attention.map(plain)),
-    }
-
-    // PRD #1666 §2.8: why the card is in Error when the deck said — a message
-    // it could not deliver. Daemon-authored text, under `Dir:` like the
-    // Blocked reason.
-    if !is_placeholder && let Some(notice) = session.delivery_notice() {
-        status_lines.push(Line::from(Span::styled(
-            truncate_with_ellipsis(notice, w),
-            Style::default().fg(palette::status_color(&SessionStatus::Error)),
-        )));
     }
 
     let prompts = if density.max_prompts() == 0 {

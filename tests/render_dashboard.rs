@@ -353,6 +353,64 @@ fn background_016_minimal_card_keeps_background_beside_its_reason() {
     );
 }
 
+/// Scenario: Hydrate an Error card whose message the deck could not deliver and which also has background work, and render it at Minimal density, whose one content row both want. The not-delivered notice keeps the row, as the desktop tile shows it ahead of the background line, and the background line follows it on that row after ` · `; at Normal density each keeps a row of its own.
+#[spec("status/background/017")]
+#[test]
+fn background_017_minimal_card_keeps_the_delivery_notice_ahead_of_background() {
+    let now = render_now();
+    let notice = "Not delivered: review fixture (agent exited)";
+    let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+        "status": "Error", "agent_type": "claude_code", "tool_count": 0,
+        "last_activity_ms": now.timestamp_millis(),
+        "delivery_notice": notice,
+        "background": {"commands": 1, "subagents": 1, "since_ms": now.timestamp_millis() - 240_000},
+        "background_revision": 1,
+    }))
+    .unwrap();
+    let mut state = AppState::default();
+    state.register_pane("background-card".into());
+    state.seed_hydrated_session("background-card".into(), None, None, None, Some(&snapshot));
+    let card = state.sessions.values().next().unwrap().clone();
+    assert_eq!(card.delivery_notice(), Some(notice), "the premise");
+    let render = |density: CardDensityKind, width: u16| {
+        buffer_to_text(&render_card_to_buffer(
+            &card,
+            Some("background"),
+            Some(1),
+            density,
+            0,
+            now,
+            false,
+            width,
+            density.rendered_height(),
+        ))
+    };
+
+    let minimal = render(CardDensityKind::Minimal, 120);
+    let row = minimal.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+    assert_eq!(
+        row,
+        "Not delivered: review fixture (agent exited) · Background: 1 command, 1 subagent · 4m",
+        "{minimal}"
+    );
+
+    // Narrow: the notice is kept whole and the background part is cut.
+    let narrow = render(CardDensityKind::Minimal, 60);
+    let row = narrow.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+    assert!(row.starts_with(notice), "{narrow}");
+
+    let normal = render(CardDensityKind::Normal, 120);
+    let rows: Vec<&str> = normal
+        .lines()
+        .map(|line| line.trim_matches(['│', ' ']))
+        .collect();
+    assert!(rows.contains(&notice), "{normal}");
+    assert!(
+        rows.contains(&"Background: 1 command, 1 subagent · 4m"),
+        "{normal}"
+    );
+}
+
 /// Scenario: Render a single dashboard card for a Working agent with a Read
 /// tool and recent prompt into an 80-column, Normal-density L1 buffer, then
 /// snapshot it. The title must carry the card number, display name, and status
