@@ -41,10 +41,14 @@ import {
 	execWithStdin,
 	inboxIdsIn,
 	inboxIdsToAck,
+	INBOX_ACK_CONFIRM_ATTEMPTS,
+	INBOX_ACK_CONFIRM_DELAY_MS,
+	INBOX_ACK_CONFIRM_MAX_DELAY_MS,
 	INBOX_ADMISSION_RECHECK_MS,
 	type InboxMessage,
 	inboxUserText,
 	nextWatcherBackoff,
+	parseInboxAckReply,
 	parseInboxFetch,
 	parseInboxLine,
 	installQuestionWrappers,
@@ -225,6 +229,16 @@ function createPiInbox(pi: ExtensionAPI) {
 	/** Waiting for `admitting` to settle, in inbox order. */
 	let held: InboxMessage[][] = [];
 	let recheck: ReturnType<typeof setTimeout> | undefined;
+	/**
+	 * Committed ids whose acknowledgement the deck has not confirmed, with the
+	 * confirmations asked so far. The watcher's stdin answers nothing, and the
+	 * deck may never hand a message over again (it ran out of hand-overs, or
+	 * allows one), so each is confirmed with the CLI until the deck records it.
+	 */
+	const unconfirmed = new Map<string, number>();
+	let confirmTimer: ReturnType<typeof setTimeout> | undefined;
+	let confirming = false;
+	let confirmAgain = false;
 
 	const current = () => active && generation === inboxShared().generation;
 
@@ -428,38 +442,121 @@ function createPiInbox(pi: ExtensionAPI) {
 		flush();
 	};
 
-	/**
-	 * Acknowledge with `dot-agent-deck ack`. A failure, or a stale `pi`, leaves
-	 * the message unacknowledged: the deck hands it over again, and `deliver`
-	 * acknowledges that redelivery of a committed id instead of running it.
-	 */
-	const ackByCli = (id: string): void => {
-		try {
-			void pi.exec(deckBin, buildInboxAckArgv(id), { timeout: 5000 }).catch(() => undefined);
-		} catch {
-			// A stale `pi`: the message stays unacknowledged and is handed over again.
+	const clearConfirm = (): void => {
+		if (confirmTimer !== undefined) {
+			clearTimeout(confirmTimer);
+			confirmTimer = undefined;
 		}
 	};
 
-	/** Acknowledge `ids` over the watcher's stdin, or with the CLI when no watcher takes the line. */
-	const acknowledge = (ids: string[], viaCli: string[] = []): void => {
-		const cli = [...viaCli];
-		if (ids.length > 0) {
-			let written = false;
-			if (writable(watcher)) {
+	/** Confirm the unconfirmed acknowledgements after `delay`, replacing any confirmation already due. */
+	const scheduleConfirm = (delay: number): void => {
+		clearConfirm();
+		if (!current() || unconfirmed.size === 0) {
+			return;
+		}
+		confirmTimer = setTimeout(() => {
+			confirmTimer = undefined;
+			void confirm();
+		}, delay);
+		try {
+			(confirmTimer as { unref?: () => void }).unref?.();
+		} catch {
+			// A timer without unref.
+		}
+	};
+
+	/** Tell the user in Pi that the deck could not record message `id` as delivered. */
+	const reportUnconfirmed = (id: string, why: string): void => {
+		try {
+			context?.ui?.notify?.(
+				`dot-agent-deck could not record message ${id} as delivered (${why}). Pi received it; the deck may show it as not delivered.`,
+				"warning",
+			);
+		} catch {
+			// A stale context: nothing more to tell.
+		}
+	};
+
+	/**
+	 * Acknowledge every unconfirmed id with `dot-agent-deck ack --json`, one at
+	 * a time. An id is done once the deck records it, or refuses it for good,
+	 * or after `INBOX_ACK_CONFIRM_ATTEMPTS` unanswered asks; the last two are
+	 * reported to the user. The rest are asked again after a backoff.
+	 */
+	const confirm = async (): Promise<void> => {
+		if (confirming) {
+			confirmAgain = true;
+			return;
+		}
+		clearConfirm();
+		confirming = true;
+		try {
+			for (const [id, asked] of [...unconfirmed]) {
+				if (!current()) {
+					return;
+				}
+				let stdout: unknown;
 				try {
-					watcher.stdin!.write(`${JSON.stringify({ ack: ids })}\n`);
-					written = true;
+					stdout = (await pi.exec(deckBin, buildInboxAckArgv(id), { timeout: 5000 })).stdout;
 				} catch {
-					// Falls back to the CLI below.
+					// A stale `pi`, or the CLI did not run: not confirmed.
+				}
+				if (!unconfirmed.has(id)) {
+					continue;
+				}
+				const outcome = parseInboxAckReply(stdout);
+				if (outcome === "recorded") {
+					unconfirmed.delete(id);
+				} else if (outcome !== "unconfirmed") {
+					unconfirmed.delete(id);
+					reportUnconfirmed(id, outcome.refused);
+				} else if (asked + 1 >= INBOX_ACK_CONFIRM_ATTEMPTS) {
+					unconfirmed.delete(id);
+					reportUnconfirmed(id, "the deck did not confirm it");
+				} else {
+					unconfirmed.set(id, asked + 1);
 				}
 			}
-			if (!written) {
-				cli.push(...ids);
+		} finally {
+			confirming = false;
+		}
+		if (confirmAgain) {
+			confirmAgain = false;
+			void confirm();
+			return;
+		}
+		if (unconfirmed.size > 0) {
+			const fewest = Math.min(...unconfirmed.values());
+			scheduleConfirm(Math.min(INBOX_ACK_CONFIRM_DELAY_MS * 2 ** fewest, INBOX_ACK_CONFIRM_MAX_DELAY_MS));
+		}
+	};
+
+	/**
+	 * Acknowledge `ids` over the watcher's stdin, or with the CLI for `viaCli`
+	 * and when no watcher takes the line, and keep each until the deck confirms
+	 * it ([`confirm`]): at once when the CLI carries it, else after
+	 * `INBOX_ACK_CONFIRM_DELAY_MS`.
+	 */
+	const acknowledge = (ids: string[], viaCli: string[] = []): void => {
+		let written = false;
+		if (ids.length > 0 && writable(watcher)) {
+			try {
+				watcher.stdin!.write(`${JSON.stringify({ ack: ids })}\n`);
+				written = true;
+			} catch {
+				// Confirmed with the CLI below.
 			}
 		}
-		for (const id of cli) {
-			ackByCli(id);
+		for (const id of [...ids, ...viaCli]) {
+			if (!unconfirmed.has(id)) {
+				unconfirmed.set(id, 0);
+			}
+		}
+		if (viaCli.length > 0 || (ids.length > 0 && !written)) {
+			void confirm();
+		} else if (ids.length > 0) {
+			scheduleConfirm(INBOX_ACK_CONFIRM_DELAY_MS);
 		}
 	};
 
@@ -571,6 +668,8 @@ function createPiInbox(pi: ExtensionAPI) {
 		stop(): void {
 			active = false;
 			clearRecheck();
+			clearConfirm();
+			unconfirmed.clear();
 			outstanding = [];
 			admitting = undefined;
 			held = [];

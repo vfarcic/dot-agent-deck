@@ -930,4 +930,41 @@ mod tests {
     /// file and exec bits are not consulted.
     #[cfg(not(unix))]
     fn set_mode(_path: &Path, _mode: u32) {}
+
+    /// The extension's own Node suites — its inbox delivery and
+    /// acknowledgement (`inbox.test.ts`) and its orchestrator helpers
+    /// (`orchestrator.test.ts`) — run here, so a change to the extension this
+    /// module embeds is checked by the fast tier and CI's `build` job.
+    /// `questions.test.ts` runs from `question_detect_008` in `src/hook.rs`.
+    /// They need a Node that strips TypeScript types (23.6+) and nothing from
+    /// `node_modules`; without one this prints `SKIP:` and passes.
+    #[test]
+    fn the_pi_extensions_node_suites_pass() {
+        const SUITES: [&str; 2] = ["test/inbox.test.ts", "test/orchestrator.test.ts"];
+        let Ok(node) = std::process::Command::new("node").arg("--version").output() else {
+            eprintln!("SKIP: node is not available for the pi-extension suites {SUITES:?}");
+            return;
+        };
+        let version = String::from_utf8_lossy(&node.stdout);
+        let mut parts = version.trim().trim_start_matches('v').split('.');
+        let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        if (major, minor) < (23, 6) {
+            eprintln!("SKIP: node {version} cannot strip TypeScript types");
+            return;
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pi-extension");
+        let out = std::process::Command::new("node")
+            .arg("--test")
+            .args(SUITES)
+            .current_dir(&dir)
+            .output()
+            .expect("run node --test");
+        assert!(
+            out.status.success(),
+            "pi-extension suites {SUITES:?} failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

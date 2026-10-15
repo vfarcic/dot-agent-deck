@@ -16,7 +16,7 @@ const hooks = registerHooks({
 	},
 });
 const { default: extension } = await import("../src/index.ts");
-const { INBOX_ADMISSION_RECHECK_MS } = await import("../src/orchestrator.ts");
+const { INBOX_ADMISSION_RECHECK_MS, INBOX_ACK_CONFIRM_ATTEMPTS } = await import("../src/orchestrator.ts");
 hooks.deregister();
 
 type Handler = (event: any, ctx: any) => unknown;
@@ -704,7 +704,7 @@ test("pi_inbox_026_a_failed_cli_acknowledgement_is_sent_again_on_redelivery", as
 	const f = fixture(); const pi = admission(f);
 	const acksByCli: string[] = [];
 	f.pi.exec = async (_bin: string, argv: string[]) => {
-		if (argv[0] === "ack") acksByCli.push(argv[1]);
+		if (argv[0] === "ack") acksByCli.push(argv[argv.length - 1]);
 		return { code: 1, stdout: "", stderr: "the deck did not answer", killed: false };
 	};
 	await f.emit("session_start"); const first = f.watcher();
@@ -729,5 +729,72 @@ test("pi_inbox_026_a_failed_cli_acknowledgement_is_sent_again_on_redelivery", as
 	assert.equal(f.sent.length, 1, "a committed message is not handed to Pi again");
 	assert.equal(commitsOf(pi.committed, id), 1, "Pi runs it once");
 	assert.deepEqual(acksOf(second), [id], "its acknowledgement is sent again on the new watcher");
+	pi.shutdown();
+});
+
+const ackReply = (reply: object, code = 0) => ({ code, stdout: JSON.stringify(reply), stderr: "", killed: false });
+
+/// Scenario: Pi commits an inbox message and acknowledges it over its watcher, which then exits without forwarding the acknowledgement, and the deck never hands the message over again. The extension confirms the acknowledgement with the deck CLI on its own, retrying while the deck does not answer, and stops once the deck records it.
+test("pi_inbox_027_an_unconfirmed_acknowledgement_is_retried_without_another_delivery", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(); const pi = admission(f);
+	const acksByCli: string[] = [];
+	let unreachable = 2;
+	f.pi.exec = async (_bin: string, argv: string[]) => {
+		if (argv[0] !== "ack") return { code: 0, stdout: "", stderr: "", killed: false };
+		acksByCli.push(argv[argv.length - 1]);
+		if (unreachable > 0) {
+			unreachable--;
+			return ackReply({ acknowledged: false, final: false, reason: "the deck is not reachable" });
+		}
+		return ackReply({ acknowledged: true });
+	};
+	await f.emit("session_start"); const first = f.watcher();
+	const [id] = idsN(1);
+	first.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1);
+	assert.deepEqual(acksOf(first), [id], "the acknowledgement goes to the watcher first");
+	first.emit("exit", 1, null);
+	for (let i = 0; i < 20; i++) { t.mock.timers.tick(60_000); await pi.quiesce(); }
+	assert.deepEqual(acksByCli, [id, id, id], "confirmed with the CLI until the deck records it, then no more");
+	assert.equal(f.sent.length, 1, "Pi is handed the message once");
+	pi.shutdown();
+});
+
+/// Scenario: Pi commits two inbox messages whose acknowledgements never reach the deck: for one the deck keeps not answering, and the other it reports as no longer deliverable. The extension stops retrying the first after a bounded number of attempts and the second at once, and tells the user in Pi which messages the deck could not record as delivered.
+test("pi_inbox_028_an_acknowledgement_that_finally_fails_is_reported", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(); const pi = admission(f);
+	const notices: string[] = [];
+	(f.ctx as any).ui = { notify: (message: string, type?: string) => { notices.push(`${type}: ${message}`); } };
+	const [silent, refused] = idsN(2);
+	const attempts = new Map<string, number>();
+	f.pi.exec = async (_bin: string, argv: string[]) => {
+		if (argv[0] !== "ack") return { code: 0, stdout: "", stderr: "", killed: false };
+		const id = argv[argv.length - 1];
+		attempts.set(id, (attempts.get(id) ?? 0) + 1);
+		return id === refused
+			? ackReply({ acknowledged: false, final: true, reason: "undeliverable" }, 1)
+			: ackReply({ acknowledged: false, final: false, reason: "the deck did not answer" });
+	};
+	await f.emit("session_start"); const watcher = f.watcher();
+	watcher.stdout.emit("data", Buffer.from(`${line(silent)}\n${line(refused)}\n`));
+	for (let i = 0; i < 4; i++) {
+		await pi.quiesce();
+		if (pi.running) await pi.settle();
+	}
+	assert.equal(commitsOf(pi.committed, silent), 1);
+	assert.equal(commitsOf(pi.committed, refused), 1);
+	for (let i = 0; i < 40; i++) { t.mock.timers.tick(60_000); await pi.quiesce(); }
+	assert.equal(attempts.get(refused), 1, "a refusal by id is final");
+	assert.equal(attempts.get(silent), INBOX_ACK_CONFIRM_ATTEMPTS, "a deck that never answers is asked a bounded number of times");
+	assert.ok(notices.some(n => n.startsWith("warning: ") && n.includes(silent)), `the user is told about ${silent}: ${notices}`);
+	assert.ok(notices.some(n => n.startsWith("warning: ") && n.includes(refused)), `the user is told about ${refused}: ${notices}`);
+	const before = [...attempts.values()].reduce((a, b) => a + b, 0);
+	for (let i = 0; i < 10; i++) { t.mock.timers.tick(60_000); await pi.quiesce(); }
+	assert.equal([...attempts.values()].reduce((a, b) => a + b, 0), before, "nothing is retried after the outcome is reported");
 	pi.shutdown();
 });

@@ -267,6 +267,10 @@ enum Commands {
     Ack {
         /// The message id (`m-…`).
         delivery_id: String,
+        /// Print the deck's answer as one JSON line, for the agent-side
+        /// components that confirm their acknowledgements.
+        #[arg(long, hide = true)]
+        json: bool,
     },
     /// Read and manage this agent's dot-agent-deck inbox.
     Inbox {
@@ -1023,6 +1027,33 @@ fn ack_was_refused_by_id(reply: &AckReply) -> bool {
     })
 }
 
+/// PR #1735 second review: `ack --json`'s one line, for an agent-side
+/// component that must know whether the deck recorded its acknowledgement (the
+/// Pi extension confirms each one it sends over its watcher, which answers
+/// nothing). `final` is true when the deck refused the id itself, so asking
+/// again changes nothing; every other unrecorded answer may be asked again.
+fn ack_json(reply: &AckReply) -> serde_json::Value {
+    use dot_agent_deck::event::AckDelivery;
+    use dot_agent_deck::hook::SocketReply;
+    if let AckReply::Socket(SocketReply::Line(line)) = reply
+        && let Some(ack) = parse_signal_ack(line)
+        && ack.accepted
+    {
+        let refused = |reason: &str| serde_json::json!({"acknowledged": false, "final": true, "reason": reason});
+        match ack.delivery {
+            Some(delivery) if delivery.recorded() => {
+                return serde_json::json!({"acknowledged": true});
+            }
+            Some(AckDelivery::Unknown) => return refused("unknown"),
+            Some(AckDelivery::WrongAgent) => return refused("wrong_agent"),
+            Some(AckDelivery::Undeliverable) => return refused("undeliverable"),
+            _ => {}
+        }
+    }
+    let (_, message) = ack_report(reply);
+    serde_json::json!({"acknowledged": false, "final": false, "reason": message})
+}
+
 fn ack_report(reply: &AckReply) -> (AckStream, String) {
     use dot_agent_deck::event::AckDelivery;
     use dot_agent_deck::hook::SocketReply;
@@ -1745,7 +1776,7 @@ fn main() -> ExitCode {
             InboxAction::Complete { id } => dot_agent_deck::inbox_cli::settle(&id, true),
             InboxAction::Release { id } => dot_agent_deck::inbox_cli::settle(&id, false),
         },
-        Some(Commands::Ack { delivery_id }) => {
+        Some(Commands::Ack { delivery_id, json }) => {
             let reply = match (
                 dot_agent_deck::inbox::is_valid_message_id(&delivery_id)
                     || is_retired_delivery_id(&delivery_id),
@@ -1770,10 +1801,14 @@ fn main() -> ExitCode {
                     }
                 }
             };
-            let (stream, message) = ack_report(&reply);
-            match stream {
-                AckStream::Stdout => println!("{message}"),
-                AckStream::Stderr => eprintln!("{message}"),
+            if json {
+                println!("{}", ack_json(&reply));
+            } else {
+                let (stream, message) = ack_report(&reply);
+                match stream {
+                    AckStream::Stdout => println!("{message}"),
+                    AckStream::Stderr => eprintln!("{message}"),
+                }
             }
             if ack_was_refused_by_id(&reply) {
                 ExitCode::FAILURE
@@ -4852,5 +4887,45 @@ mod tests {
             refused_message.contains("missing_token"),
             "{refused_message}"
         );
+    }
+
+    /// PR #1735 second review: `ack --json` says whether the deck recorded the
+    /// acknowledgement, and whether a refusal is final, for the components
+    /// that confirm theirs.
+    #[test]
+    fn ack_json_says_whether_the_deck_recorded_it() {
+        use dot_agent_deck::event::{AckDelivery, SignalAck};
+        use dot_agent_deck::hook::SocketReply;
+        let line = |ack: SignalAck| {
+            AckReply::Socket(SocketReply::Line(serde_json::to_string(&ack).unwrap()))
+        };
+        for delivery in [AckDelivery::Acknowledged, AckDelivery::AlreadyAcknowledged] {
+            assert_eq!(
+                ack_json(&line(SignalAck::acknowledged(delivery))),
+                serde_json::json!({"acknowledged": true})
+            );
+        }
+        for (delivery, reason) in [
+            (AckDelivery::Unknown, "unknown"),
+            (AckDelivery::WrongAgent, "wrong_agent"),
+            (AckDelivery::Undeliverable, "undeliverable"),
+        ] {
+            let reply = ack_json(&line(SignalAck::acknowledged(delivery)));
+            assert_eq!(reply["acknowledged"], false, "{reply}");
+            assert_eq!(reply["final"], true, "{reply}");
+            assert_eq!(reply["reason"], reason, "{reply}");
+        }
+        for reply in [
+            line(SignalAck::accepted()),
+            line(SignalAck::refused("inbox_not_agent_process", "outside")),
+            AckReply::Socket(SocketReply::NoReply),
+            AckReply::Socket(SocketReply::Unreachable),
+            AckReply::NoPane,
+        ] {
+            let reply = ack_json(&reply);
+            assert_eq!(reply["acknowledged"], false, "{reply}");
+            assert_eq!(reply["final"], false, "{reply}");
+            assert!(reply["reason"].is_string(), "{reply}");
+        }
     }
 }

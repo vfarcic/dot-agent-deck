@@ -936,10 +936,52 @@ export function buildInboxDoorbellFetchArgv(id: string): string[] {
 	return ["inbox", "fetch", "--json", "--doorbell", id];
 }
 
-/** argv acknowledging message `id` when no watcher is there to carry the ack. */
+/**
+ * argv acknowledging message `id` with the deck CLI, which answers whether the
+ * deck recorded it ([`parseInboxAckReply`]). The watcher's stdin carries an
+ * acknowledgement faster but answers nothing, so this is also how one is
+ * confirmed.
+ */
 export function buildInboxAckArgv(id: string): string[] {
-	return ["ack", id];
+	return ["ack", "--json", id];
 }
+
+/** What the deck said to `dot-agent-deck ack --json`. */
+export type InboxAckOutcome =
+	/** The deck recorded the acknowledgement, now or before. */
+	| "recorded"
+	/** The deck refused it for this id (no longer deliverable, another agent's): asking again changes nothing. */
+	| { refused: string }
+	/** No answer the deck stands behind: ask again. */
+	| "unconfirmed";
+
+/** Read the CLI's answer to [`buildInboxAckArgv`]; anything it cannot read is "unconfirmed". */
+export function parseInboxAckReply(stdout: unknown): InboxAckOutcome {
+	if (typeof stdout !== "string") {
+		return "unconfirmed";
+	}
+	for (const line of stdout.split("\n")) {
+		try {
+			const reply = JSON.parse(line) as { acknowledged?: unknown; final?: unknown; reason?: unknown };
+			if (reply.acknowledged === true) {
+				return "recorded";
+			}
+			if (reply.acknowledged === false) {
+				return reply.final === true ? { refused: typeof reply.reason === "string" ? reply.reason : "refused" } : "unconfirmed";
+			}
+		} catch {
+			// Not the JSON line.
+		}
+	}
+	return "unconfirmed";
+}
+
+/** How long after Pi commits a message its acknowledgement is first confirmed with the CLI. */
+export const INBOX_ACK_CONFIRM_DELAY_MS = 1000;
+/** The longest wait between two confirmations of one acknowledgement. */
+export const INBOX_ACK_CONFIRM_MAX_DELAY_MS = 30000;
+/** How many times one acknowledgement is asked for before the extension reports it failed. */
+export const INBOX_ACK_CONFIRM_ATTEMPTS = 8;
 
 /** The ids of the deck message blocks whose opener `text` carries, in order, once each. */
 export function inboxIdsIn(text: unknown): string[] {
