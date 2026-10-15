@@ -27,43 +27,117 @@ fn hooks_stale_004_real_interactive_claude_works_with_a_visible_notice() {
     skip_unless!(common::check_claude_available());
     let fixture = StaleHome::new();
     let forwarded = fixture.home.join("forwarded-hook-types.txt");
-    // The wrapper proxies the hook CLI's socket output, preserving the genuine
-    // pane capability and all event data while removing only the two new keys.
-    // This models an old binary without adding a production stamp-disable seam.
+    // The wrapper runs the genuine hook CLI behind a proxy of its hook socket
+    // that removes only the two version keys from producer (status) lines,
+    // preserving the genuine pane capability and all event data. This models an
+    // old binary without adding a production stamp-disable seam.
+    //
+    // PRD #1666 MC-1: the proxy is concurrent and bidirectional. The inbox
+    // hook's `UserPromptSubmit` sends an acknowledging `InboxFetch` and waits
+    // for its reply, which a one-way, after-the-fact forwarder could neither
+    // answer nor return — the fetch timed out, and the forwarded request then
+    // acknowledged a task whose body never reached Claude. Every connection the
+    // CLI opens is relayed while it runs, replies included, and each side's EOF
+    // is passed on as a half-close, so connection lifetime is the CLI's own. The
+    // CLI inherits stdin and stdout, so a hook's context output and a
+    // long-lived waiter behave as with a direct call, with no timeout of ours.
     let script = format!(
         r#"#!/usr/bin/env python3
-import json, os, socket, subprocess, sys, tempfile
+import json, os, socket, subprocess, sys, tempfile, threading
 if sys.argv[1:] == ['--version']:
     print('dot-agent-deck 0.0.1')
     sys.exit(0)
-payload = sys.stdin.buffer.read()
 destination = os.environ['DOT_AGENT_DECK_SOCKET']
+audit_lock = threading.Lock()
+
+def rewrite(line):
+    # Producer lines are bare AgentEvent JSON; requests carry `message_type`
+    # and pass through untouched.
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return line
+    if not isinstance(event, dict) or 'message_type' in event:
+        return line
+    event.pop('deck_build', None)
+    event.pop('deck_exe', None)
+    with audit_lock, open({forwarded}, 'a') as audit:
+        audit.write(event.get('event_type', 'unknown') + '\n')
+    return json.dumps(event).encode()
+
+def half_close(sock):
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+
+def upstream(incoming, outgoing):
+    pending = b''
+    try:
+        while True:
+            chunk = incoming.recv(65536)
+            if not chunk:
+                break
+            pending += chunk
+            while b'\n' in pending:
+                line, pending = pending.split(b'\n', 1)
+                outgoing.sendall(rewrite(line) + b'\n')
+        if pending:
+            outgoing.sendall(rewrite(pending))
+    except OSError:
+        pass
+    half_close(outgoing)
+
+def downstream(outgoing, incoming):
+    try:
+        while True:
+            chunk = outgoing.recv(65536)
+            if not chunk:
+                break
+            incoming.sendall(chunk)
+    except OSError:
+        pass
+    half_close(incoming)
+
+def relay(incoming):
+    with incoming, socket.socket(socket.AF_UNIX) as outgoing:
+        outgoing.connect(destination)
+        back = threading.Thread(target=downstream, args=(outgoing, incoming), daemon=True)
+        back.start()
+        upstream(incoming, outgoing)
+        back.join()
+
 with tempfile.TemporaryDirectory(prefix='old-hook-') as root:
     path = root + '/proxy.sock'
     with socket.socket(socket.AF_UNIX) as server:
         server.bind(path)
-        server.listen(1)
-        server.settimeout(5)
+        server.listen(16)
+        server.settimeout(0.1)
+        done = threading.Event()
+        relays = []
+        def accept_loop():
+            while True:
+                try:
+                    connection, _ = server.accept()
+                except socket.timeout:
+                    if done.is_set():
+                        return
+                    continue
+                except OSError:
+                    return
+                connection.settimeout(None)
+                worker = threading.Thread(target=relay, args=(connection,), daemon=True)
+                worker.start()
+                relays.append(worker)
+        acceptor = threading.Thread(target=accept_loop, daemon=True)
+        acceptor.start()
         env = dict(os.environ, DOT_AGENT_DECK_SOCKET=path)
-        result = subprocess.run([{binary}] + sys.argv[1:], input=payload, env=env, timeout=10)
-        with server.accept()[0] as incoming:
-            incoming.settimeout(5)
-            data = b''
-            while not data.endswith(b'\n'):
-                chunk = incoming.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
-        with socket.socket(socket.AF_UNIX) as outgoing:
-            outgoing.connect(destination)
-            for line in data.splitlines():
-                event = json.loads(line)
-                event.pop('deck_build', None)
-                event.pop('deck_exe', None)
-                with open({forwarded}, 'a') as audit:
-                    audit.write(event.get('event_type', 'unknown') + '\n')
-                outgoing.sendall(json.dumps(event).encode() + b'\n')
-sys.exit(result.returncode)
+        code = subprocess.call([{binary}] + sys.argv[1:], env=env)
+        done.set()
+        acceptor.join()
+        for worker in relays:
+            worker.join(5)
+sys.exit(code)
 "#,
         binary = serde_json::to_string(common::contained_deck_binary()).unwrap(),
         forwarded = serde_json::to_string(&forwarded).unwrap()
