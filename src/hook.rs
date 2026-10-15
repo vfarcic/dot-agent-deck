@@ -1386,10 +1386,8 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // as `dot-agent-deck wrap` does on its fork-time event (PRD #225 M3).
     // Without this, the whole `metadata` object of a Claude-compatible payload
     // was dropped on the floor here, so such a launcher was INDISTINGUISHABLE
-    // from an initialized session — which is what made a boot-time generation
-    // change and a `/clear` look identical to the delivery latch, and what was
-    // used to argue for the (rejected) forward-tracking rule. See
-    // [`crate::state::latch_generation`].
+    // from an initialized session: its boot-time start read as the agent's
+    // conversation announcing itself.
     //
     // Deliberately narrow: ONE key, only on `SessionStart`, only the one value
     // the repo defines. Everything else in an incoming `metadata` object is
@@ -1401,10 +1399,10 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // `WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`) and neither is forwardable
     // here. The asymmetry is deliberate: boot provenance is a producer CONFESSING
     // that its child is not up yet, which costs it privilege and is therefore safe
-    // to believe from anyone; interface readiness is a producer CLAIMING that its
-    // child is up, which BUYS privilege — it releases the readiness gate, and the
-    // strong value additionally selects which post-readiness buffer is paid over
-    // it. So this CLI does not carry it, and should not be taught to.
+    // to believe from anyone; an interface origin is a producer CLAIMING that its
+    // child is up, which is the kind of claim a privilege gets keyed on (today
+    // it only lets a wrapped agent's `Idle` stand in for its own hooks' until
+    // they report). So this CLI does not carry it, and should not be taught to.
     //
     // **This narrowing is NOT the trust boundary, and the comment that used to
     // stand here claimed it was.** `build_event_typed` is one of several
@@ -1415,10 +1413,9 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // `wrapper_interface_ready` `SessionStart` from a bare `python3` with no deck
     // environment variables at all. Keep the narrowing — it is correct and cheap,
     // and it keeps the Claude-shaped path honest — but do not build an argument on
-    // it. The privilege is gated where it is USED, by asking whether this daemon
-    // spawned the named agent as a wrapper: see
-    // `crate::agent_pty::AgentPtyRegistry::agent_spawned_as_wrapper_host` and its
-    // caller in `crate::state::dispatch_one_owned`.
+    // it. A privilege keyed on an interface origin has to be gated where it is
+    // USED, by asking whether this daemon spawned the named agent as a wrapper
+    // — see `crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`.
     if event_type == EventType::SessionStart
         && extra
             .get("metadata")
@@ -2297,9 +2294,10 @@ fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
 /// no matter what the daemon is doing — `crate::wrap`'s interface-ready
 /// announcement, which fires from the wrapper's supervisory loop.
 ///
-/// Fire-and-forget by design: a failure is a lost readiness event, which costs
-/// the readiness gate its fast path and nothing else, so there is no outcome for
-/// a caller on a detached thread to act on.
+/// Fire-and-forget by design: a failure is a lost interface-ready event, which
+/// leaves the card and the doorbell waiting for the agent's own hooks to report
+/// and costs nothing else, so there is no outcome for a caller on a detached
+/// thread to act on.
 pub fn send_to_socket_bounded(json: &str, timeout: std::time::Duration) {
     let _ = send_to_socket_bounded_at(&client_socket_path(), json, timeout);
 }
