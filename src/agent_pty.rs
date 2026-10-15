@@ -23679,11 +23679,9 @@ mod spawn_tests {
     }
 
     /// Issue #617 (finding 6). A `tracing` subscriber scoped to this test's
-    /// thread, so the refusal [`arm_seed_fallback`] reports can be asserted as a
-    /// fact rather than inferred: the fallback is a fire-and-forget
-    /// `tokio::spawn` that returns nothing, and "no bytes in the successor"
-    /// alone cannot tell a REFUSED injection apart from one that never reached
-    /// the write.
+    /// thread, so what the code under test logs can be asserted as a fact
+    /// rather than inferred. Written for the seed fallback PRD #1666 removed;
+    /// the two force-kill reap tests read it now.
     ///
     /// Deliberately a third copy rather than a shared helper. `mod tests` is
     /// private to its file, so sharing this with the two that already exist
