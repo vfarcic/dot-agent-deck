@@ -13112,10 +13112,24 @@ impl AppState {
             // the card has already seen, it is a boot observation the card has
             // moved past, and asserts nothing. Codex's native `SessionStart`
             // carries no wrapper origin and is not affected.
+            //
+            // Nor, whatever its stamp, once Codex's own hooks have reported on
+            // this card: the wrapper only noticed the interface late (a loaded
+            // machine was measured stamping it after the prompt hook's
+            // Thinking), and an agent whose hooks are running is past boot. Left
+            // to the arm below it ended that turn, and the doorbell then typed
+            // into a busy Codex (`inbox/codex/007`). Read from `recent_events`,
+            // so a card whose native frames have all aged out of that window
+            // takes it again; a boot observation arrives long before then.
             EventType::SessionStart
                 if event.agent_type == AgentType::Codex
                     && event.is_wrapper_session_start()
-                    && event.timestamp < newest_before =>
+                    && (event.timestamp < newest_before
+                        || session.recent_events.iter().any(|seen| {
+                            !seen.is_wrapper_session_start()
+                                && !seen.is_wrapper_output_classified()
+                                && !seen.is_daemon_synthetic()
+                        })) =>
             {
                 false
             }
@@ -18900,6 +18914,48 @@ mod tests {
             .collect();
         assert_eq!(cards.len(), 1, "one Codex pane keeps one card: {cards:#?}");
         cards[0].clone()
+    }
+
+    /// Scenario: a deck-launched Codex's native hooks start a session and
+    /// submit a prompt, and only then does the wrapper's interface-ready start
+    /// arrive, stamped after them because the wrapper noticed the interface
+    /// late (a loaded machine). The card stays Thinking: the wrapper's start
+    /// is a boot observation, and the agent its hooks have already reported on
+    /// is past boot. The same start before any hook still reads Idle.
+    #[test]
+    fn a_late_wrapper_interface_start_does_not_end_a_turn_the_hooks_reported() {
+        let interface_start = |secs| {
+            let mut event = codex_status_frame(EventType::SessionStart, true, secs);
+            event.metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN.to_string(),
+            );
+            event
+        };
+
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
+        state.apply_event(codex_status_frame(EventType::SessionStart, false, 2));
+        let mut prompt = codex_status_frame(EventType::Thinking, false, 3);
+        prompt.user_prompt = Some("busy human turn".to_string());
+        state.apply_event(prompt);
+        state.apply_event(interface_start(4));
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::Thinking,
+            "a late boot observation must not end the turn the hooks reported"
+        );
+        assert!(
+            !state.agent_doorbell_idle("agent-x", "pane-x"),
+            "nor may it make the busy agent ringable"
+        );
+
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
+        state.apply_event(interface_start(2));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
     }
 
     /// Scenario: Feed one deck-launched Codex card the wrapper's start and its
