@@ -682,8 +682,11 @@ heard_as    = ["host", "resource", "usage", "disk", "machine", "memory", "cpu", 
 # switch daemon". Saying it here, on its own line so nothing above re-flows,
 # took it to 80 of 80 and the full manifest to 323 of 323 twice (2026-10-15).
 # It also sent a bare "start it" (fixture `start-new-agent-dialog-closed`) to
-# `stop_agent` more often, which `outcome::UNGROUNDED_READS_AS` now answers as
-# `open_new_agent`.
+# `stop_agent` more often, until the stop rule's own start words went (see
+# `stop_agent`'s comment). "build box" is the table's example daemon, and this is
+# `filter_dashboard`'s own example. Rewording the sentence round it measured
+# worse for that "start it": 6 to 27 stop picks in 60 replays against 0 to 5
+# (2026-10-15), each answered as the opener only by `outcome::UNGROUNDED_READS_AS`.
 [[commands]]
 id          = "switch_deck"
 description = """Switch which daemon the app is showing — the Daemon selector at the top of the
@@ -1990,6 +1993,13 @@ heard_as_whole = [
 # false` there, and `schema`'s tie-break sends a start-worded request to the
 # callable start. It narrows where a stop can run and changes nothing about
 # what one does: each still only opens a confirmation.
+#
+# **`stop_agent`'s description names no start words** (PRD #1666). It used to
+# end "and "start" is its opposite: "start it" is never this one, it is
+# `open_new_agent`" (#1495, measured 8 of 9 then). Beside the instructions'
+# matching sentence it drew a bare "start it" with the dialog closed to this row
+# instead: 34 of 60 replays, against 0–5 of 60 with both removed
+# (`schema::TOOL_INSTRUCTIONS` has the numbers).
 [[commands]]
 id          = "stop_agent"
 description = """Stop one running agent on the agent dashboard — the voice form of its row's close
@@ -2000,8 +2010,7 @@ does. It never stops anything by itself: the app shows the same confirmation the
 and the user confirms by hand, so pick it whenever the user asks to stop an agent, however
 urgently. It needs a word that can only mean stopping: "close" is NOT one — "close the agent" and
 "close the tester" close the VIEW (`close`) and stop nothing, on every screen and even with nothing
-open to close, although this row's button is labelled Close — and "start" is its opposite: "start
-it" is never this one, it is `open_new_agent`. Ending a whole orchestration is
+open to close, although this row's button is labelled Close. Ending a whole orchestration is
 `close_orchestration`. Never for isolating or hiding — "get rid of everything except the tester"
 means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmStopAgent"

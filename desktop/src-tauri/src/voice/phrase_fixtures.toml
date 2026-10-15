@@ -2064,9 +2064,7 @@ outcome = "dispatch"
 # With the dialog CLOSED, a start-shaped request opens it (PRD #1223, D3)
 # rather than being refused as "not here": `open_new_agent` is the callable row
 # that answers "start", and it starts nothing by itself. This fixture used to
-# expect `start_new_agent` → `unavailable`. Since PRD #1666 a bare start said
-# on its own like this one is answered without the model (`outcome::bare_start`),
-# so this fixture and `start-the-new-agent-dialog-closed` no longer measure it.
+# expect `start_new_agent` → `unavailable`.
 [[fixtures]]
 name = "start-new-agent-dialog-closed"
 utterance = "start it"
