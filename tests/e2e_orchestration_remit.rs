@@ -1286,11 +1286,7 @@ fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
         deck.snapshot_grid()
     );
     let second_path = second_rearm().expect("second re-arm path");
-    let content = read_announced_context(
-        &context_dir.with_file_name("orchestrator-prompt.log"),
-        &second_path,
-        &deck,
-    );
+    let content = read_announced_context(&daemon.attach_socket, &second_path, &deck);
     assert!(
         content.contains(first_brief),
         "a TUI reattached after the startup context was swept must re-arm from the file \
@@ -1424,8 +1420,8 @@ struct RearmedRun {
     agent_ids: Vec<String>,
 }
 
-/// Read a re-armed context file only once the start role's pane has been
-/// pointed at it, and return its contents.
+/// Read a re-armed context file only once the start role has been pointed at
+/// it, and return its contents.
 ///
 /// A new `orchestrator-context-<hex>.md` is written in place rather than renamed
 /// into place: `publish_orchestrator_context` (`src/orchestrator_context.rs`)
@@ -1433,22 +1429,37 @@ struct RearmedRun {
 /// written. So a reader that finds the file by listing the directory, as these
 /// tests do, can see it before it is complete, and `orchestration_remit_009`
 /// read one that held neither brief on a starved box (`io full` 55%) in PRD
-/// #1631's broad e2e run. The announcement is the `Read .dot-agent-deck/<name>`
-/// pointer the fixture script appends to `log`, so that is what is waited for.
+/// #1631's broad e2e run. The announcement is the remit posted to the start
+/// role's inbox carrying `Read .dot-agent-deck/<name>` (PRD #1666 S5), so that
+/// is what is waited for, on the daemon's attach `socket`.
 #[cfg(unix)]
-fn read_announced_context(log: &std::path::Path, path: &std::path::Path, deck: &TuiDeck) -> String {
+fn read_announced_context(
+    socket: &std::path::Path,
+    path: &std::path::Path,
+    deck: &TuiDeck,
+) -> String {
     let name = path
         .file_name()
         .expect("context path has a file name")
         .to_string_lossy();
     let pointer = format!("Read .dot-agent-deck/{name}");
+    let announced = || {
+        view::all_messages(socket).iter().any(|message| {
+            message
+                .text
+                .as_deref()
+                .is_some_and(|t| t.contains(&pointer))
+        })
+    };
     assert!(
-        common::wait_for_file_substr_count(log, &pointer, 1, REASSERTION_DELIVERY_TIMEOUT),
-        "the start role was never pointed at {} (no `{pointer}` in {}) within \
-         {REASSERTION_DELIVERY_TIMEOUT:?}; log:\n{}\nFinal grid:\n{}",
+        common::wait_until(REASSERTION_DELIVERY_TIMEOUT, announced),
+        "the start role was never pointed at {} (no inbox message carrying `{pointer}`) \
+         within {REASSERTION_DELIVERY_TIMEOUT:?}; inbox:\n{:?}\nFinal grid:\n{}",
         path.display(),
-        log.display(),
-        std::fs::read_to_string(log).unwrap_or_default(),
+        view::all_messages(socket)
+            .into_iter()
+            .filter_map(|message| message.text)
+            .collect::<Vec<_>>(),
         deck.snapshot_grid()
     );
     std::fs::read_to_string(path).expect("read the announced context file")
@@ -1654,8 +1665,7 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
         deck.snapshot_grid()
     );
     let rearmed_path = rearmed().expect("new context path");
-    let content =
-        read_announced_context(&cwd.join("orchestrator-prompt.log"), &rearmed_path, &deck);
+    let content = read_announced_context(&daemon.attach_socket, &rearmed_path, &deck);
     assert!(
         content.contains(first_brief) && !content.contains(second_brief),
         "the first tab must rearm from its own file, not the later mirror; {}: first={}, second={}",

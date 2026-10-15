@@ -4588,7 +4588,7 @@ without depending on the config struct API.
 ##### dispatch/close-verb/001 — A completed single unit closes from its dispatcher's environment; its worktree is removed and its branch kept.
 - **Layer:** L2 synthetic, lane 1, real CLI/daemon with an attached `TuiDeck` (`tests/e2e_close_verb.rs`).
 - **Agent:** none — identity-recording probes that emit a synthetic `SessionStart` and exec `cat`, using their own minted pane capabilities under the default provenance policy.
-- **Asserts:** attested `work-done --done` returns to the caller; `close <name>` exits 0 and says `closed`; the unit disappears from `ListAgents`, its clean worktree is removed before the reply, its branch remains and the dispatcher remains registered.
+- **Asserts:** attested `work-done --done` is posted to the caller's inbox; `close <name>` exits 0 and says `closed`; the unit disappears from `ListAgents`, its clean worktree is removed before the reply, its branch remains and the dispatcher remains registered.
 - **Platform coverage:** mac+linux (Unix PTY/socket harness).
 
 ##### dispatch/close-verb/002 — Closing a completed orchestration names every role, orchestrator first.
