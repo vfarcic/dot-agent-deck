@@ -203,9 +203,9 @@ type Reading = (&'static str, Option<Requirement>);
 ///   run. Words that ground no stop and do ground a start never asked to
 ///   stop, and the opener opens the New agent dialog and starts nothing. The
 ///   model still answers a bare "start it" there with the stop now and then:
-///   17 of 30 runs on `gpt-5-mini` until the instructions and the stop's own
-///   description stopped pairing start words with the stop
-///   ([`super::schema::TOOL_INSTRUCTIONS`]), 2 of 30 after (2026-10-15).
+///   17 of 30 runs on `gpt-5-mini` while the instructions and the stop's own
+///   description paired start words with the stop
+///   ([`super::schema::TOOL_INSTRUCTIONS`]), 4 of 30 after (2026-10-15).
 ///
 /// A row's readings are tried in order and the first its words ground wins,
 /// each only where its requirement, if it names one, holds. The reading still

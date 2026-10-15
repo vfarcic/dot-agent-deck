@@ -686,7 +686,8 @@ heard_as    = ["host", "resource", "usage", "disk", "machine", "memory", "cpu", 
 # `stop_agent`'s comment). "build box" is the table's example daemon, and this is
 # `filter_dashboard`'s own example. Rewording the sentence round it measured
 # worse for that "start it": 6 to 27 stop picks in 60 replays against 0 to 5
-# (2026-10-15), each answered as the opener only by `outcome::UNGROUNDED_READS_AS`.
+# (2026-10-15, with the instructions' start sentence removed), each answered as
+# the opener only by `outcome::UNGROUNDED_READS_AS`.
 [[commands]]
 id          = "switch_deck"
 description = """Switch which daemon the app is showing — the Daemon selector at the top of the
@@ -1996,10 +1997,9 @@ heard_as_whole = [
 #
 # **`stop_agent`'s description names no start words** (PRD #1666). It used to
 # end "and "start" is its opposite: "start it" is never this one, it is
-# `open_new_agent`" (#1495, measured 8 of 9 then). Beside the instructions'
-# matching sentence it drew a bare "start it" with the dialog closed to this row
-# instead: 34 of 60 replays, against 0–5 of 60 with both removed
-# (`schema::TOOL_INSTRUCTIONS` has the numbers).
+# `open_new_agent`" (#1495, measured 8 of 9 then). Beside the instructions' old
+# sentence about start words it drew a bare "start it" with the dialog closed to
+# this row instead (`schema::TOOL_INSTRUCTIONS` has the numbers).
 [[commands]]
 id          = "stop_agent"
 description = """Stop one running agent on the agent dashboard — the voice form of its row's close
