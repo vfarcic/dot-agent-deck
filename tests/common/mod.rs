@@ -451,6 +451,7 @@ pub struct TuiDeckBuilder {
     suppress_success_recording: bool,
     suppress_agent_credentials: bool,
     launch_subdir: Option<PathBuf>,
+    binary_outside_checkout: bool,
 }
 
 impl TuiDeckBuilder {
@@ -512,6 +513,25 @@ impl TuiDeckBuilder {
     /// is no less isolated than one launching at the root.
     pub fn with_launch_subdir(mut self, subdir: impl Into<PathBuf>) -> Self {
         self.launch_subdir = Some(subdir.into());
+        self
+    }
+
+    /// Launch the deck from a link to the binary under test inside the per-test
+    /// HOME, and put that link's directory on the deck's `PATH` in place of
+    /// cargo's build directory, so nothing the deck hands an agent names the
+    /// developer's checkout.
+    ///
+    /// The deck spells itself into agent text as its own absolute path
+    /// (`binary_name()`: the work-done footer of every delegated task, the
+    /// orchestrator context, inbox instructions). Launched from cargo's
+    /// `CARGO_BIN_EXE_…` that path is `<checkout>/target/<profile>/dot-agent-deck`,
+    /// and a real agent told to work "in the current directory" was measured
+    /// resolving that to the checkout and writing its file there
+    /// (`orchestration/dispatch/002`, PRD #1666) — a real-agent test writing into
+    /// the developer's repository. For a real-agent test, this is the
+    /// containment. A stand-in test has no use for it.
+    pub fn with_binary_outside_checkout(mut self) -> Self {
+        self.binary_outside_checkout = true;
         self
     }
 
@@ -932,6 +952,7 @@ impl TuiDeck {
             suppress_success_recording: false,
             suppress_agent_credentials: false,
             launch_subdir: None,
+            binary_outside_checkout: false,
         }
     }
 
@@ -1009,6 +1030,12 @@ impl TuiDeck {
         // resolve, pointed at the binary under test. See `seed_durable_binary`.
         #[cfg(unix)]
         seed_durable_binary(&home);
+        // `with_binary_outside_checkout`: the deck runs from a link in this HOME.
+        let deck_binary = if builder.binary_outside_checkout {
+            Some(link_binary_outside_checkout(&home)?)
+        } else {
+            None
+        };
 
         // PRD #201: the per-test HOME deliberately starts WITHOUT the bundled Pi
         // extension. Because `TuiDeck` drives the REAL binary, its lazy-spawned
@@ -1172,8 +1199,10 @@ impl TuiDeck {
         // test. The `env!()` evaluates at compile time so the harness
         // always launches whatever the current test build produced
         // (debug vs. release matches the test's profile).
-        let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-        let mut cmd = CommandBuilder::new(bin);
+        let bin = deck_binary
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_dot-agent-deck")));
+        let mut cmd = CommandBuilder::new(&bin);
         // Default: launch at the fixture root. `with_launch_subdir` moves the
         // deck's cwd below it without moving the fixture (issue #577).
         let launch_dir = match &builder.launch_subdir {
@@ -1331,6 +1360,15 @@ impl TuiDeck {
             for k in AGENT_CREDENTIAL_ENV {
                 final_env.remove(k);
             }
+        }
+        // After the `with_env` layer, because the tests that need the branch
+        // build to win `PATH` put cargo's build directory there themselves.
+        if let Some(dir) = deck_binary.as_deref().and_then(Path::parent) {
+            let cargo_dir = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+                .parent()
+                .expect("the binary under test has a parent directory");
+            let path = final_env.get("PATH").cloned().unwrap_or_default();
+            final_env.insert("PATH".into(), path_without_dir(&path, cargo_dir, dir));
         }
         // Read AFTER the `with_env` layer, so a test that moves the state dir
         // still gets its own daemon's log dumped rather than a missing path.
@@ -5149,6 +5187,52 @@ fn seed_durable_binary(home: &Path) {
     let link = bin_dir.join("dot-agent-deck");
     let _ = std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dot-agent-deck"), link);
 }
+
+/// [`TuiDeckBuilder::with_binary_outside_checkout`]'s link: the binary under
+/// test at `<home>/.deck-under-test/dot-agent-deck`, which is what the launched
+/// deck — and the daemon it lazy-spawns from its own executable — then reports
+/// as `current_exe()`.
+///
+/// A **hard link**, not [`seed_durable_binary`]'s symlink: Linux's
+/// `/proc/self/exe` resolves a symlink back to cargo's build directory, which
+/// is the path this exists to keep out of agent text, while a hard link is
+/// reported by the name it was executed through. A copy is the fallback for a
+/// HOME on another filesystem than the build directory, where a hard link
+/// cannot be made; it costs the binary's size, once per launch.
+fn link_binary_outside_checkout(home: &Path) -> Result<PathBuf, String> {
+    let dir = home.join(".deck-under-test");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let link = dir.join("dot-agent-deck");
+    let built = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    if std::fs::hard_link(built, &link).is_err() {
+        std::fs::copy(built, &link).map_err(|e| {
+            format!(
+                "link or copy {} to {}: {e}",
+                built.display(),
+                link.display()
+            )
+        })?;
+    }
+    Ok(link)
+}
+
+/// `path` (a `PATH` value) with every entry naming `drop` removed and `first`
+/// prepended, so the binary under test still wins the lookup by name.
+fn path_without_dir(path: &str, drop: &Path, first: &Path) -> String {
+    std::iter::once(first.to_string_lossy().into_owned())
+        .chain(
+            std::env::split_paths(path)
+                .filter(|entry| entry != drop && !entry.as_os_str().is_empty())
+                .map(|entry| entry.to_string_lossy().into_owned()),
+        )
+        .collect::<Vec<_>>()
+        .join(PATH_SEPARATOR)
+}
+
+#[cfg(unix)]
+const PATH_SEPARATOR: &str = ":";
+#[cfg(not(unix))]
+const PATH_SEPARATOR: &str = ";";
 
 fn locate_fixture(name: &str) -> PathBuf {
     // CARGO_MANIFEST_DIR is the repo root for integration tests.

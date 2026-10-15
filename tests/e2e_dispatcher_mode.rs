@@ -1207,6 +1207,11 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         // diagnostics to be readable).
         .with_pty_size(200, 55)
         .with_imported_claude_credentials()
+        // Containment: launched from cargo's build directory, the deck names
+        // itself to these agents as `<checkout>/target/…`, and the coder was
+        // measured writing its sentinel into the checkout root
+        // (`orchestration/dispatch/006`).
+        .with_binary_outside_checkout()
         // The branch build must win over any host-installed `dot-agent-deck`.
         .with_env("PATH", path_with_binary_dir())
         // Issue #663: run the PRODUCTION post-respawn readiness buffer. The
@@ -1406,6 +1411,10 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // (rule 4): it survives LLM phrasing and tool variance, and — unlike anything
     // on the grid — it cannot be produced by an agent merely echoing the task back.
     const SENTINEL: &str = "dispatch_delegate_a41f.txt";
+    // Where a coder that took the checkout for its project would put it. A file
+    // already there is an earlier run's, and is left for whoever moves it.
+    let stray = Path::new(env!("CARGO_MANIFEST_DIR")).join(SENTINEL);
+    let stray_before = stray.exists();
     let worker_task = format!(
         "Create a file named {SENTINEL} in the current directory containing the single \
          word DONE. Do not ask what to do, offer numbered choices, or wait for a task to \
@@ -1486,8 +1495,22 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // read as a broken one.
     const WORK_WAIT: Duration = Duration::from_secs(300);
     let sentinel_path = expected_worktree.join(SENTINEL);
+    let done = common::wait_for_path(&sentinel_path, WORK_WAIT);
+    // Checked before the work assertion, so a coder that wrote into the
+    // developer's checkout is reported as that, and the file is removed rather
+    // than left in the repository.
+    if !stray_before && stray.exists() {
+        let _ = std::fs::remove_file(&stray);
+        panic!(
+            "a test agent wrote {SENTINEL} into the developer's checkout at {} (removed) — \
+             the agents of this test must never learn the checkout's path. \
+             Orchestrator pane {orchestrator_pane}, coder pane {coder_pane}.{}",
+            stray.display(),
+            role_diagnostics(&deck, ORCH, &ROLES),
+        );
+    }
     assert!(
-        common::wait_for_path(&sentinel_path, WORK_WAIT),
+        done,
         "the dispatched orchestration's `coder` never did the delegated work within {}s — \
          no {SENTINEL} at {}. A dispatched orchestration whose orchestrator cannot reach \
          its own workers looks completely healthy (panes up, cards named, tab live) and \
@@ -1534,6 +1557,132 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         role_diagnostics(&deck, ORCH, &ROLES),
         deck.snapshot_grid()
     );
+}
+
+/// Scenario: Launch the deck on the `orch-deck` fixture from outside the
+/// developer's checkout, dispatch its two-role orchestration through the real
+/// CLI and delegate a task to the worker. The orchestrator's context file and the
+/// worker's task, on disk and in its inbox, must name the deck by its per-test
+/// path and never by any path inside the checkout the tests were built in.
+#[spec("orchestration/dispatch/006")]
+#[test]
+fn orchestration_dispatch_006_agent_instructions_never_name_the_developer_checkout() {
+    const UNIT: &str = "contain-probe";
+    const TASK: &str = "Contained delegation.";
+    let checkout = env!("CARGO_MANIFEST_DIR");
+
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_binary_outside_checkout()
+        .with_env("PATH", path_with_binary_dir())
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active agents");
+    common::commit_fixture_repo(deck.workdir());
+    let caller_pane = open_cat_caller_pane(&deck);
+    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    let _guard = SiblingWorktreeGuard(expected_worktree.clone());
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args([
+            "dispatch",
+            UNIT,
+            "--task",
+            "Say hello, then stop.",
+            "--orchestration=demo-orch",
+        ])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
+        .output()
+        .expect("the dispatch CLI should run");
+    assert!(
+        out.status.success(),
+        "`dispatch --orchestration demo-orch` failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    const WAIT: Duration = Duration::from_secs(90);
+    let worktree_dir = expected_worktree
+        .file_name()
+        .expect("the dispatch worktree has a basename")
+        .to_string_lossy()
+        .into_owned();
+    let is_worktree = |basename: &str| basename == worktree_dir;
+    let panes = wait_for_role_panes(
+        &deck,
+        "demo-orch",
+        "dispatched orchestration",
+        &["orchestrator", "worker"],
+        is_worktree,
+        WAIT,
+    );
+    let out = run_delegate(&deck, &panes["orchestrator"], "worker", TASK);
+    assert!(
+        out.status.success(),
+        "`delegate` from the dispatched orchestrator exited {:?}.\nstdout: {}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_for_delegate_inbox(&deck, "demo-orch", is_worktree, "worker", TASK, WAIT),
+        "the dispatched worker never received the delegated task within {}s.\nFinal grid:\n{}",
+        WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
+
+    // What the agents are handed: the orchestrator's context, the worker's task
+    // file, and the task as it sits in the worker's inbox.
+    let coordination = expected_worktree.join(".dot-agent-deck");
+    let context = std::fs::read_dir(&coordination)
+        .expect("list the dispatched coordination files")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("orchestrator-context-") && name.ends_with(".md")
+                })
+        })
+        .expect("the dispatched orchestration publishes a context file");
+    let inbox_task = inbox_view::messages(deck.attach_socket_path(), &panes["worker"])
+        .into_iter()
+        .filter_map(|message| message.text)
+        .find(|text| text.contains(TASK))
+        .expect("the delegated task is in the worker's inbox");
+    let handed = [
+        (
+            "the orchestrator context".to_string(),
+            std::fs::read_to_string(&context).expect("read the orchestrator context"),
+        ),
+        (
+            "the worker task file".to_string(),
+            std::fs::read_to_string(coordination.join("worker-task-worker.md"))
+                .expect("read the worker task file"),
+        ),
+        ("the worker's inbox task".to_string(), inbox_task),
+    ];
+
+    // The positive half keeps the containment claim from passing vacuously: the
+    // deck does name itself in this text, by a path under the per-test HOME.
+    let homes: Vec<String> = std::iter::once(deck.home_dir().to_path_buf())
+        .chain(deck.home_dir().canonicalize().ok())
+        .map(|home| home.to_string_lossy().into_owned())
+        .collect();
+    for (what, text) in &handed {
+        assert!(
+            !text.contains(checkout),
+            "{what} names the developer's checkout {checkout} — a real agent handed this \
+             text was measured writing its work into that checkout instead of its own \
+             directory (orchestration/dispatch/002). Text:\n{text}"
+        );
+        assert!(
+            homes.iter().any(|home| text.contains(home.as_str())),
+            "{what} does not name the deck by its per-test path under {homes:?}, so the \
+             containment above proves nothing. Text:\n{text}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
