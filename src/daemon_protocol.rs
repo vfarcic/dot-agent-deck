@@ -8292,23 +8292,20 @@ async fn handle_attach_stream(
                     break;
                 }
                 // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
-                // stamp the pane's deliver-on-idle debounce clock so a
-                // concurrent scheduled reuse fire queues its prompt instead of
-                // interrupting active typing. Keyed by `pane_id_env` (the same
-                // key the reuse path delivers to).
+                // record it as the pane's human input, keyed by `pane_id_env`.
+                // That record is what lets the deck refuse to type an answer
+                // to an agent's question into a pane a human has typed into
+                // since the question arrived
+                // (`crate::agent_pty::AgentPtyRegistry::user_typed_since_question`,
+                // PRD #1631).
                 //
-                // Issue #424 H1 (both reviewers): stamped BEFORE the writer is
-                // released, and the `write_user` above stamps it too (the pane
+                // Issue #424 H1 (both reviewers): recorded BEFORE the writer is
+                // released, and the `write_user` above records it too (the pane
                 // writer observes every non-daemon byte — see
-                // `crate::agent_pty::PaneWriter`). This used to drop the writer
-                // first and stamp afterwards, and a guarded automatic sender
-                // queued on that writer acquired it inside the gap, read the
-                // stale clock, and submitted the draft that was already
-                // physically in the input box. Both halves are deliberate: the
-                // writer-level observation is what makes the stamp atomic with
-                // respect to handoff, and this call keeps the frame-level
-                // contract (including the zero-byte frame the auditor noted)
-                // exactly as it was.
+                // `crate::agent_pty::PaneWriter`), so whatever takes the writer
+                // next sees this frame's input. This call keeps the frame-level
+                // contract, including the zero-byte frame the auditor noted:
+                // a frame counts as input even when it carries no byte.
                 //
                 // Issue #542: stamped THROUGH the held writer, which skips it
                 // once this agent has been closed — a frame that passed the
