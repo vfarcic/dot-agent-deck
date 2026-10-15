@@ -682,7 +682,7 @@ heard_as    = ["host", "resource", "usage", "disk", "machine", "memory", "cpu", 
 # switch daemon". Saying it here, on its own line so nothing above re-flows,
 # took it to 80 of 80 and the full manifest to 323 of 323 twice (2026-10-15).
 # It also sent a bare "start it" (fixture `start-new-agent-dialog-closed`) to
-# `stop_agent` more often, until the stop rule's own start words went (see
+# `stop_agent` more often, until the stop rule's quoted start words went (see
 # `stop_agent`'s comment). "build box" is the table's example daemon, and this is
 # `filter_dashboard`'s own example. Rewording the sentence round it measured
 # worse for that "start it": 6 to 27 stop picks in 60 replays against 0 to 5
@@ -1995,11 +1995,24 @@ heard_as_whole = [
 # callable start. It narrows where a stop can run and changes nothing about
 # what one does: each still only opens a confirmation.
 #
-# **`stop_agent`'s description names no start words** (PRD #1666). It used to
+# **`stop_agent`'s description quotes no start word** (PRD #1666). It used to
 # end "and "start" is its opposite: "start it" is never this one, it is
 # `open_new_agent`" (#1495, measured 8 of 9 then). Beside the instructions' old
 # sentence about start words it drew a bare "start it" with the dialog closed to
-# this row instead (`schema::TOOL_INSTRUCTIONS` has the numbers).
+# this row instead (`schema::TOOL_INSTRUCTIONS` has the numbers). Without any
+# such sentence, "just launch the agent immediately" over an open dialog
+# (fixture `start-new-agent-adversarial-incomplete-form`) was answered `none`
+# in 9 of 50 harness runs, against 0 of 50 on `main`, and in 15 of 60 replays
+# of the captured request against `gpt-5-mini`, against 1 of 60 with `main`'s
+# prompt: that sentence was what sent it to a start. "A start is its opposite:
+# never this one, it is `open_new_agent`" keeps the pointer without quoting a
+# start word — 8 `none` in 180 replays there, and "start it" 3 in 120 against
+# 3 in 60 without the sentence — and passed 49 of 50 harness runs against
+# `main`'s 47, interleaved (2026-10-15). Quoting the word again ("start" is
+# its opposite: a start is never this one…) sent "start it" to `none` in 11
+# of 118 replays, against 3 of 116; naming `start_new_agent` there too sent it
+# to this row in 17 of 40. With the dialog open the opener cannot run, and
+# its `unavailable_redirects` presses Start instead.
 [[commands]]
 id          = "stop_agent"
 description = """Stop one running agent on the agent dashboard — the voice form of its row's close
@@ -2010,7 +2023,7 @@ does. It never stops anything by itself: the app shows the same confirmation the
 and the user confirms by hand, so pick it whenever the user asks to stop an agent, however
 urgently. It needs a word that can only mean stopping: "close" is NOT one — "close the agent" and
 "close the tester" close the VIEW (`close`) and stop nothing, on every screen and even with nothing
-open to close, although this row's button is labelled Close. Ending a whole orchestration is
+open to close, although this row's button is labelled Close — and a start is its opposite: never this one, it is `open_new_agent`. Ending a whole orchestration is
 `close_orchestration`. Never for isolating or hiding — "get rid of everything except the tester"
 means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmStopAgent"
