@@ -42,14 +42,12 @@ mod tests {
 
     /// Names that fail `^[a-z0-9-]+$` and are deliberately retained anyway.
     ///
-    /// Issue #1061 kept both for their subject matter, accepting that a
-    /// spec-correct validator keeps reporting them. They are mirrors synced
-    /// from the `dot-ai` project, so renaming them is not available: CLAUDE.md
-    /// rule 13 records that a local edit to a mirror is reverted by the next
-    /// sync (`04a3641` narrowed one, `e94388d` reverted it byte for byte five
-    /// days later), and a rename is an edit. Deleting them is the only way off
-    /// this list, which is what [`the_allowlist_does_not_rot`] enforces.
-    const NAME_ALLOWLIST: &[&str] = &["dot-ai-manageKnowledge", "dot-ai-manageOrgData"];
+    /// Empty. Issue #1061 kept `dot-ai-manageKnowledge` and
+    /// `dot-ai-manageOrgData` here for their subject matter; PRD #1666 deleted
+    /// both skills, because Pi refuses to load a skill whose name fails the
+    /// spec. An entry added here needs the reason it is being kept, and
+    /// [`the_allowlist_does_not_rot`] fails once the skill it excuses is gone.
+    const NAME_ALLOWLIST: &[&str] = &[];
 
     fn repo_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
