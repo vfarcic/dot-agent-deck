@@ -671,3 +671,63 @@ test("pi_inbox_023_a_redelivery_that_replaces_a_lost_hand_over_is_not_held", asy
 	assert.deepEqual(acksOf(child), [id]);
 	pi.shutdown();
 });
+
+/// Scenario: Pi commits an inbox message and the extension writes its acknowledgement to the watcher, which exits before the deck records it. The deck hands the still-unacknowledged message over again on the respawned watcher; the extension does not hand it to Pi a second time and acknowledges it again instead.
+test("pi_inbox_025_a_redelivery_of_a_committed_message_is_acknowledged_not_run_again", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(); const pi = admission(f);
+	await f.emit("session_start"); const first = f.watcher();
+	const [id] = idsN(1);
+	first.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1);
+	assert.deepEqual(acksOf(first), [id], "the acknowledgement goes to the watcher");
+	first.emit("exit", 1, null);
+	t.mock.timers.tick(1000);
+	const second = f.watcher();
+	assert.notEqual(second, first, "the watcher is respawned");
+	second.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(f.sent.length, 1, "a committed message is not handed to Pi again");
+	assert.equal(commitsOf(pi.committed, id), 1, "Pi runs it once");
+	assert.deepEqual(acksOf(second), [id], "its acknowledgement is sent again");
+	pi.shutdown();
+});
+
+/// Scenario: Pi commits an inbox message after its watcher exited, so the extension acknowledges it with the deck CLI, which fails. When the deck hands the message over again on the respawned watcher, the extension acknowledges it there and does not hand it to Pi a second time.
+test("pi_inbox_026_a_failed_cli_acknowledgement_is_sent_again_on_redelivery", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(); const pi = admission(f);
+	const acksByCli: string[] = [];
+	f.pi.exec = async (_bin: string, argv: string[]) => {
+		if (argv[0] === "ack") acksByCli.push(argv[1]);
+		return { code: 1, stdout: "", stderr: "the deck did not answer", killed: false };
+	};
+	await f.emit("session_start"); const first = f.watcher();
+	const [id] = idsN(1);
+	const gate = pi.holdAfterInput();
+	first.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	first.emit("exit", 1, null);
+	gate.releaseAll();
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1);
+	assert.deepEqual(acksByCli, [id], "with no watcher the CLI acknowledges, and fails");
+	t.mock.timers.tick(1000);
+	const second = f.watcher();
+	assert.notEqual(second, first, "the watcher is respawned");
+	second.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(f.sent.length, 1, "a committed message is not handed to Pi again");
+	assert.equal(commitsOf(pi.committed, id), 1, "Pi runs it once");
+	assert.deepEqual(acksOf(second), [id], "its acknowledgement is sent again on the new watcher");
+	pi.shutdown();
+});

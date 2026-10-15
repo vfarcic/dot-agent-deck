@@ -354,13 +354,20 @@ function createPiInbox(pi: ExtensionAPI) {
 	 * hand-over limit does not use that limit up. One the deck hands over again
 	 * while its hand-over is past the `input` hook and Pi has nothing queued
 	 * replaces that hand-over, and is not a hold: the hand-over it replaces did
-	 * not reach the agent. False only when Pi threw at once.
+	 * not reach the agent. One Pi already committed is acknowledged again and
+	 * not handed over: the deck sends it again only because it never recorded
+	 * the acknowledgement. False only when Pi threw at once.
 	 */
 	const deliver = (messages: InboxMessage[]): boolean => {
 		const fresh: InboxMessage[] = [];
 		const stale = new Set<HandOver>();
 		const holding: string[] = [];
+		const committedAgain: string[] = [];
 		for (const m of messages) {
+			if (committedIds.has(m.id)) {
+				committedAgain.push(m.id);
+				continue;
+			}
 			if (isHeld(m.id)) {
 				holding.push(m.id);
 				continue;
@@ -381,6 +388,14 @@ function createPiInbox(pi: ExtensionAPI) {
 				// The deck counts the redelivery, as it does without a hold.
 			}
 		}
+		// Pi already committed these: the deck hands them over again because
+		// their acknowledgement never reached it (the watcher exited with it
+		// unforwarded, or the CLI failed). They are acknowledged again, never
+		// handed to Pi a second time.
+		for (const id of committedAgain) {
+			fromDoorbell.delete(id);
+		}
+		acknowledge(committedAgain);
 		replace([...stale]);
 		if (fresh.length === 0) {
 			return true;
@@ -413,11 +428,38 @@ function createPiInbox(pi: ExtensionAPI) {
 		flush();
 	};
 
+	/**
+	 * Acknowledge with `dot-agent-deck ack`. A failure, or a stale `pi`, leaves
+	 * the message unacknowledged: the deck hands it over again, and `deliver`
+	 * acknowledges that redelivery of a committed id instead of running it.
+	 */
 	const ackByCli = (id: string): void => {
 		try {
 			void pi.exec(deckBin, buildInboxAckArgv(id), { timeout: 5000 }).catch(() => undefined);
 		} catch {
 			// A stale `pi`: the message stays unacknowledged and is handed over again.
+		}
+	};
+
+	/** Acknowledge `ids` over the watcher's stdin, or with the CLI when no watcher takes the line. */
+	const acknowledge = (ids: string[], viaCli: string[] = []): void => {
+		const cli = [...viaCli];
+		if (ids.length > 0) {
+			let written = false;
+			if (writable(watcher)) {
+				try {
+					watcher.stdin!.write(`${JSON.stringify({ ack: ids })}\n`);
+					written = true;
+				} catch {
+					// Falls back to the CLI below.
+				}
+			}
+			if (!written) {
+				cli.push(...ids);
+			}
+		}
+		for (const id of cli) {
+			ackByCli(id);
 		}
 	};
 
@@ -558,24 +600,10 @@ function createPiInbox(pi: ExtensionAPI) {
 				return;
 			}
 			const viaCli = ids.filter((id) => fromDoorbell.delete(id));
-			const viaWatcher = ids.filter((id) => !viaCli.includes(id));
-			if (viaWatcher.length > 0) {
-				let written = false;
-				if (writable(watcher)) {
-					try {
-						watcher.stdin!.write(`${JSON.stringify({ ack: viaWatcher })}\n`);
-						written = true;
-					} catch {
-						// Falls back to the CLI below.
-					}
-				}
-				if (!written) {
-					viaCli.push(...viaWatcher);
-				}
-			}
-			for (const id of viaCli) {
-				ackByCli(id);
-			}
+			acknowledge(
+				ids.filter((id) => !viaCli.includes(id)),
+				viaCli,
+			);
 			settleCommitted(ids);
 		},
 
