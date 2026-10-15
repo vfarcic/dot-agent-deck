@@ -222,8 +222,11 @@ static OPENCODE_DOUBLE_ESC: [KeyStep; 2] = [
 /// `Ok(())` on success, `Err(message)` on a reported failure.
 pub type HookFn = fn() -> Result<(), String>;
 
-/// PRD #20 finding #15: a spawn-time materialize handler (the `Extension`
-/// strategy). Receives the spawn env so it can honor `HOME` / deck env vars.
+/// PRD #20 finding #15: a materialize handler (the `Extension` strategy).
+/// Receives an env so it can honor `HOME` / deck env vars. No production code
+/// calls it through [`AgentSpec::materialize`]: Pi's extension is materialized
+/// once at daemon startup instead (PRD #201, the #210 fix — see the note in
+/// `AgentPtyRegistry::spawn_agent_with_dir`).
 pub type MaterializeFn = fn(&[(String, String)]);
 
 /// One cohesive registry entry per agent — the single place per-agent data
@@ -261,8 +264,9 @@ pub struct AgentSpec {
     /// extension materialize; the neutral placeholder has none at all).
     pub hook_install: Option<HookFn>,
     pub hook_uninstall: Option<HookFn>,
-    /// Materialize a bundled artifact into the agent's HOME just before spawn
-    /// (the `Extension` strategy).
+    /// Materialize a bundled artifact into the agent's HOME (the `Extension`
+    /// strategy). Capability metadata: the daemon materializes Pi's extension
+    /// once at startup, and the spawn path calls no materialize (#210).
     pub materialize: Option<MaterializeFn>,
     /// PRD #20 R20-010: this agent's OWN startup auto-install action — the
     /// silent, best-effort install the TUI runs at launch for every shipped
@@ -273,7 +277,8 @@ pub struct AgentSpec {
     /// installer. With the action on the spec, `main.rs` iterates [`ALL`] and
     /// calls `spec.startup_auto_install` directly, and a new agent slots in its
     /// own installer here. `None` where the agent has no startup install step —
-    /// a spawn-time `Extension` (Pi materializes at spawn), a `Wrapper` (Codex
+    /// an `Extension` (Pi's is materialized once at daemon startup, outside
+    /// this loop), a `Wrapper` (Codex
     /// synthesizes events from stdout), or the neutral placeholder.
     ///
     /// Issue #1637: it returns what the agent's hooks are pinned to afterwards,
@@ -864,7 +869,9 @@ pub static PI: AgentSpec = AgentSpec {
     hook_install: None,
     hook_uninstall: None,
     materialize: Some(pi_materialize),
-    // Pi materializes its extension at SPAWN time, not startup.
+    // Pi's extension is materialized once at DAEMON startup
+    // (`orchestrator_ext::auto_materialize`, called by `daemon serve`), not by
+    // a startup install step and not per spawn (#210).
     startup_auto_install: None,
     configured_pins: None,
     // PRD #1541, measured on Pi 0.87.1: one ESC interrupts; one Ctrl+U per
@@ -1373,7 +1380,7 @@ mod tests {
     /// PRD #20 R20-010: startup auto-install is resolved PER SPEC, not by
     /// mapping the reusable `IntegrationStrategy` enum to a hardcoded incumbent.
     /// The two agents with a startup install step (Claude native hooks, OpenCode
-    /// plugin) carry an action; the spawn-time `Extension` (Pi), the `Wrapper`
+    /// plugin) carry an action; the `Extension` (Pi), the `Wrapper`
     /// (Codex), and the neutral placeholder carry `None` — so a future agent
     /// reusing `NativeHooks`/`Plugin` runs ITS OWN installer, never another
     /// agent's.
