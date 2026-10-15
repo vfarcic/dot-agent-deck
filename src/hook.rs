@@ -2295,9 +2295,12 @@ fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
 /// announcement, which fires from the wrapper's supervisory loop.
 ///
 /// Fire-and-forget by design: a failure is a lost interface-ready event, which
-/// leaves the card and the doorbell waiting for the agent's own hooks to report
-/// and costs nothing else, so there is no outcome for a caller on a detached
-/// thread to act on.
+/// leaves the card and the doorbell waiting for the agent's own hooks to report.
+/// For Codex, whose own `SessionStart` arrives with its first turn, that can
+/// leave an inbox task pending until a native event or manual input starts a
+/// turn (see `crate::wrap`'s `INTERFACE_READY_SEND_TIMEOUT`). A caller on a
+/// detached thread has nothing it could do about either, so there is no outcome
+/// to return.
 pub fn send_to_socket_bounded(json: &str, timeout: std::time::Duration) {
     let _ = send_to_socket_bounded_at(&client_socket_path(), json, timeout);
 }

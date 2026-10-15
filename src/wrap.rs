@@ -1934,9 +1934,13 @@ const INTERFACE_SETTLE_WINDOW: Duration = Duration::from_millis(750);
 /// session either.
 ///
 /// Five seconds, the same budget `crate::hook`'s request/response paths give a
-/// daemon that is merely busy. Losing the event costs latency and nothing else —
-/// the card and the doorbell wait for the agent's own hooks instead — so the
-/// bound is deliberately generous rather than tight.
+/// daemon that is merely busy, and deliberately generous rather than tight:
+/// losing the event is not free. The card and the doorbell then wait for the
+/// agent's own hooks, and for Codex those are first-turn-driven (its native
+/// `SessionStart` arrives with the first turn), so an inbox task delivered to a
+/// fresh Codex whose announcement was lost stays pending until a native event
+/// or someone typing into the pane starts a turn. Nothing bounds that wait: no
+/// readiness fallback stands behind this event (PRD #1666).
 #[cfg(unix)]
 const INTERFACE_READY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
