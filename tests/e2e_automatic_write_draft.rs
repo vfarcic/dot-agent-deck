@@ -17,6 +17,9 @@ fn launch() -> (TuiDeck, Pane) {
         .with_pty_size(160, 45)
         .with_env("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")
         .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
+        // The tests fetch the stand-in's mail from the test process, outside
+        // its pane; inbox/protocol/014 and /015 pin the binding itself.
+        .with_env("DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS", "1")
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     let pane = pane(&deck, "draft-worker");

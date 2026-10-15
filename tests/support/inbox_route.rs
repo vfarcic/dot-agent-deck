@@ -1,5 +1,10 @@
 //! Binary-only routing fixture. The stand-in records every input byte and
 //! answers a fixed doorbell with the real inbox CLI, using its injected identity.
+//!
+//! Its daemons let inbox components connect from the test process
+//! (`inbox::daemon_unbound`): the tests read and settle a pane's mail
+//! from outside it, standing in for that pane's agent. The binding itself is
+//! pinned by inbox/protocol/014 and /015.
 #![allow(dead_code)] // The migrated targets use different fixture operations.
 
 use crate::{common, inbox};
@@ -348,7 +353,7 @@ pub fn task_file(endpoint: &impl Endpoint) -> PathBuf {
 }
 
 pub fn undelivered(fetched: bool) {
-    let daemon = inbox::daemon(&[
+    let daemon = inbox::daemon_unbound(&[
         (UNDELIVERED_MS, "500"),
         ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "30000"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
@@ -375,7 +380,7 @@ pub fn undelivered(fetched: bool) {
 }
 
 pub fn idle_clock(case: u8) {
-    let daemon = inbox::daemon(&[
+    let daemon = inbox::daemon_unbound(&[
         (UNDELIVERED_MS, "30000"),
         ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "30000"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "600"),
@@ -431,7 +436,7 @@ pub fn idle_clock(case: u8) {
 }
 
 pub fn superseded_generation() {
-    let daemon = inbox::daemon(&[
+    let daemon = inbox::daemon_unbound(&[
         (UNDELIVERED_MS, "700"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ]);
@@ -457,7 +462,7 @@ pub fn superseded_generation() {
 }
 
 pub fn resolved_unacked(newer: bool) {
-    let daemon = inbox::daemon(&[
+    let daemon = inbox::daemon_unbound(&[
         (UNDELIVERED_MS, "700"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ]);
@@ -1001,7 +1006,7 @@ pub fn worker_report(case: u8) {
 }
 
 pub fn successor_worker_report() {
-    let daemon = inbox::daemon(&[
+    let daemon = inbox::daemon_unbound(&[
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
         (UNDELIVERED_MS, "30000"),
     ]);

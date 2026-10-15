@@ -86,7 +86,10 @@ fn offer_006_live_haiku_claims_acts_completes_and_notifies_offerer() {
         deck.workdir().join(SENTINEL).display()
     )).unwrap();
     std::fs::write(deck.workdir().join("offer-orchestrator.sh"),
-        "while [ ! -f offer.go ]; do sleep 0.05; done\ndot-agent-deck inbox offer review --file offer-job.md --claim-ttl 30m > offer-cli.log 2>&1\nprintf '%s' \"$?\" > offer-cli.exit\nexec /bin/cat\n").unwrap();
+        // The stand-in orchestrator reads its own inbox with the real CLI, from
+        // inside its pane, as an agent does: the deck refuses that from the
+        // test process (inbox/protocol/015).
+        "while [ ! -f offer.go ]; do sleep 0.05; done\ndot-agent-deck inbox offer review --file offer-job.md --claim-ttl 30m > offer-cli.log 2>&1\nprintf '%s' \"$?\" > offer-cli.exit\nwhile :; do dot-agent-deck inbox fetch >> orchestrator-inbox.log 2>&1; sleep 0.5; done\n").unwrap();
     let orchestrator = pane(
         &deck,
         "orchestrator",
@@ -165,7 +168,8 @@ fn offer_006_live_haiku_claims_acts_completes_and_notifies_offerer() {
     );
     assert!(
         common::wait_until(BUDGET, || {
-            let notices = inbox::fetch(&deck, &orchestrator, true).to_string();
+            let notices = std::fs::read_to_string(deck.workdir().join("orchestrator-inbox.log"))
+                .unwrap_or_default();
             notices.contains(&id) && notices.to_lowercase().contains("complet")
         }),
         "offerer must receive the completion notice for {id}; {}",

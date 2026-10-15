@@ -17,7 +17,6 @@ use crate::event::{
     InboxPublishRequest, InboxWaitMode, InboxWaitReply, InboxWaitRequest, InboxWaitSession,
     InboxWake,
 };
-use crate::inbox::StateName;
 use crate::inbox_hub::AGENT_FRAMING;
 
 /// The most of a hook's stdin `inbox wait` reads.
@@ -368,8 +367,9 @@ pub fn fetch(json: bool) -> ExitCode {
 /// answer and acknowledges nothing: the component acknowledges once the agent
 /// has started on the content, so a turn aborted before then is handed over
 /// again. When `id` is no longer waiting — a doorbell recalled from prompt
-/// history — it fetches nothing, so a newer message is never pulled into an
-/// old doorbell's turn.
+/// history, or a message another consumer took meanwhile — it fetches
+/// nothing, so a newer message is never pulled into an old doorbell's turn.
+/// The daemon decides that with the fetch itself, under its inbox lock.
 pub fn fetch_for_doorbell(id: &str) -> ExitCode {
     if !crate::inbox::is_valid_message_id(id) {
         eprintln!("Could not fetch messages: {id:?} is not a deck message id.");
@@ -383,27 +383,6 @@ fn fetch_as(json: bool, doorbell: Option<&str>) -> ExitCode {
         eprintln!("{NOT_IN_PANE}");
         return ExitCode::FAILURE;
     };
-    if let Some(id) = doorbell {
-        let listing = DaemonMessage::InboxList(InboxListRequest {
-            pane_id: identity.pane_id.clone(),
-            agent_id: identity.agent_id.clone(),
-            token: identity.token.clone(),
-            all: false,
-        });
-        let waiting = request(&listing)
-            .ok()
-            .and_then(|line| serde_json::from_str::<InboxListReply>(&line).ok())
-            .is_some_and(|reply| {
-                reply
-                    .messages
-                    .iter()
-                    .any(|m| m.id.as_str() == id && m.state == StateName::Queued)
-            });
-        if !waiting {
-            println!("{}", serde_json::json!({ "messages": [] }));
-            return ExitCode::SUCCESS;
-        }
-    }
     let message = DaemonMessage::InboxFetch(InboxFetchRequest {
         pane_id: identity.pane_id,
         agent_id: identity.agent_id,
@@ -416,6 +395,7 @@ fn fetch_as(json: bool, doorbell: Option<&str>) -> ExitCode {
         max_chars: None,
         max_bytes: None,
         ack: doorbell.is_none(),
+        doorbell: doorbell.map(str::to_string),
     });
     let line = match request(&message) {
         Ok(line) => line,

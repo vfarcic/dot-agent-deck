@@ -7902,6 +7902,12 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Asserts:** a stream, a once waiter and a Native announcement presenting the pane's token from outside the agent's process tree are each refused as `inbox_not_agent_process`; nothing arms and the task stays Queued.
 - **Platform coverage:** mac+linux.
 
+##### inbox/protocol/015 — A process outside the agent cannot take its mail.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on, hook-socket fetch, ack and get_seed from the test process, then the real fetch CLI inside the pane.
+- **Agent:** none (shell stand-in that waits for a fixture sentinel before fetching).
+- **Asserts:** fetch with and without ack and ack presenting the pane's token from outside the agent's process tree are refused as `inbox_not_agent_process`, get_seed answers no seed, and the task stays Queued; the in-pane fetch then prints it and it is Acknowledged.
+- **Platform coverage:** mac+linux.
+
 #### Agent CLI
 
 ##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.

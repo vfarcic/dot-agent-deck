@@ -3340,6 +3340,11 @@ pub struct InboxFetchRequest {
     /// itself the delivery.
     #[serde(default)]
     pub ack: bool,
+    /// PR #1735 review: the message a doorbell named, for a fetch the doorbell
+    /// started. Nothing is fetched unless that message is still queued for
+    /// the caller, decided under the inbox's lock with the fetch itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doorbell: Option<String>,
 }
 
 /// Payload of [`DaemonMessage::InboxList`].

@@ -5025,6 +5025,31 @@ fn admit_inbox_component(
     }
 }
 
+/// PR #1735 review: whether the connecting process `peer` may take or settle
+/// `agent_id`'s own mail — `inbox_fetch`, `ack` and the `get_seed` alias — on
+/// the same terms as the verbs that post ([`ComponentUse::Cli`]): only the
+/// agent's own process tree may use its token for them. Logs a refusal.
+fn mail_taker_admitted(
+    registry: &AgentPtyRegistry,
+    peer: Option<u32>,
+    agent_id: &str,
+    verb: &str,
+    pane_id: &str,
+) -> bool {
+    match admit_inbox_component(peer, None, registry.child_pid(agent_id), ComponentUse::Cli) {
+        Ok(_) => true,
+        Err(why) => {
+            warn!(
+                verb,
+                pane_id = %escape_id_for_log(pane_id),
+                why,
+                "hook socket: refused an inbox verb from outside the pane's agent"
+            );
+            false
+        }
+    }
+}
+
 /// Audit F3: [`admit_component_process`] for a component registering the
 /// agent's native receiver. Answers the instance the receiver is pinned by
 /// ([`receiver_instance`]), and refuses one with an agent of its own kind
@@ -5133,9 +5158,10 @@ fn nested_between(
 /// the stream is keyed by), and `root` the agent process the deck spawned.
 /// Each must be `root` or descend from it, and the claimed instance must be an
 /// ancestor of the caller (or the caller itself). Where `descends` cannot say —
-/// Windows, a Unix other than Linux or macOS, or a process that exited during
-/// the walk — the check is skipped, as before this hardening. Answers the
-/// instance to arm the stream under.
+/// a Unix other than Linux or macOS, or a process that exited during the walk
+/// — the check is skipped, as before this hardening. Windows reads parents
+/// from a process snapshot since PR #1735's review. Answers the instance to
+/// arm the stream under.
 fn admit_component_process(
     peer: Option<u32>,
     claimed: Option<u32>,
@@ -5209,12 +5235,20 @@ fn handle_inbox_fetch(
         .max_bytes
         .map(crate::event::InboxBudget::Bytes)
         .or(req.max_chars.map(crate::event::InboxBudget::Chars));
-    let messages = registry.inbox().fetch_within(
+    let doorbell = req
+        .doorbell
+        .as_deref()
+        .filter(|id| crate::inbox::is_valid_message_id(id));
+    if req.doorbell.is_some() && doorbell.is_none() {
+        return crate::event::InboxWaitReply::messages(Vec::new());
+    }
+    let messages = registry.inbox().fetch_named_within(
         &req.pane_id,
         agent_id,
         consumer,
         budget,
         req.ack.then_some(how),
+        doorbell,
     );
     info!(
         pane_id = %escape_id_for_log(&req.pane_id),
@@ -5815,7 +5849,20 @@ async fn run_hook_loop_with_limits(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
-                                    let reply = handle_inbox_fetch(&pty_registry, &req, &agent_id);
+                                    let reply = if mail_taker_admitted(
+                                        &pty_registry,
+                                        peer_pid,
+                                        &agent_id,
+                                        "inbox_fetch",
+                                        &req.pane_id,
+                                    ) {
+                                        handle_inbox_fetch(&pty_registry, &req, &agent_id)
+                                    } else {
+                                        crate::event::InboxWaitReply::refused(
+                                            INBOX_NOT_AGENT_PROCESS,
+                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                        )
+                                    };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
@@ -6226,16 +6273,32 @@ async fn run_hook_loop_with_limits(
                                         _ => None,
                                     };
                                     // PRD #1666: every id is an inbox message's,
-                                    // acknowledged for the agent the token attests.
-                                    let delivery = match attested_agent_id {
-                                        Some(agent_id) => {
-                                            handle_inbox_ack(&pty_registry, &signal, agent_id)
+                                    // acknowledged for the agent the token attests,
+                                    // and only from that agent's own process tree
+                                    // (PR #1735 review).
+                                    let ack = match attested_agent_id {
+                                        Some(agent_id)
+                                            if !mail_taker_admitted(
+                                                &pty_registry,
+                                                peer_pid,
+                                                agent_id,
+                                                "ack",
+                                                &signal.pane_id,
+                                            ) =>
+                                        {
+                                            crate::event::SignalAck::refused(
+                                                INBOX_NOT_AGENT_PROCESS,
+                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                            )
                                         }
-                                        None => crate::event::AckDelivery::Unknown,
+                                        Some(agent_id) => crate::event::SignalAck::acknowledged(
+                                            handle_inbox_ack(&pty_registry, &signal, agent_id),
+                                        ),
+                                        None => crate::event::SignalAck::acknowledged(
+                                            crate::event::AckDelivery::Unknown,
+                                        ),
                                     };
-                                    if let Ok(json) = serde_json::to_string(
-                                        &crate::event::SignalAck::acknowledged(delivery),
-                                    ) {
+                                    if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
                                         let _ = write_half.flush().await;
@@ -6254,11 +6317,24 @@ async fn run_hook_loop_with_limits(
                                     // the token attests, never for an id the
                                     // caller names or the pane's occupant
                                     // ([`get_seed_inbox_alias`]).
+                                    //
+                                    // PR #1735 review: and only from that agent's
+                                    // own process tree; a refusal answers as "no
+                                    // seed pending" does.
+                                    let attested = attested_agent.as_deref().filter(|agent| {
+                                        mail_taker_admitted(
+                                            &pty_registry,
+                                            peer_pid,
+                                            agent,
+                                            "get_seed",
+                                            &req.pane_id,
+                                        )
+                                    });
                                     let seed = get_seed_inbox_alias(
                                         pty_registry.inbox(),
                                         &req.pane_id,
                                         req.agent_id.as_deref(),
-                                        attested_agent.as_deref(),
+                                        attested,
                                         pty_registry
                                             .pane_current_agent_id(&req.pane_id)
                                             .as_deref(),

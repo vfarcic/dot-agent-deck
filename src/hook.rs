@@ -189,9 +189,9 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     let mut announce = None;
     if matches!(agent, "claude-code" | "claude_code" | "claude")
         && crate::inbox_prompt::in_deck_pane()
-        && let Some(stdout) = claude_inbox_hooks(&input, &mut event, &mut announce)
+        && let Some(output) = claude_inbox_hooks(&input, &mut event, &mut announce)
     {
-        println!("{stdout}");
+        output.print();
     }
     // PRD #1666 S7: Codex's side. A `Stop` that hands messages over keeps the
     // turn going, so it reports no Idle: the doorbell must not ring for the
@@ -199,9 +199,9 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     if agent == "codex" && crate::inbox_prompt::in_deck_pane() {
         match codex_inbox_hooks(&input, &mut event, &mut announce) {
             CodexInbox::Nothing => {}
-            CodexInbox::Print(stdout) => println!("{stdout}"),
-            CodexInbox::ContinueTurn(stdout) => {
-                println!("{stdout}");
+            CodexInbox::Print(output) => output.print(),
+            CodexInbox::ContinueTurn(output) => {
+                output.print();
                 return ExitCode::SUCCESS;
             }
         }
@@ -308,7 +308,7 @@ fn claude_inbox_hooks(
     input: &str,
     event: &mut AgentEvent,
     announce: &mut Option<String>,
-) -> Option<String> {
+) -> Option<HookOutput> {
     let payload: Value = serde_json::from_str(input).ok()?;
     let hook_event_name = payload.get("hook_event_name").and_then(Value::as_str)?;
     match hook_event_name {
@@ -321,10 +321,10 @@ fn claude_inbox_hooks(
                     crate::event::InboxWake::Native,
                 );
             }
-            Some(crate::inbox_prompt::hook_output(
+            Some(HookOutput::text(crate::inbox_prompt::hook_output(
                 "SessionStart",
                 crate::inbox_hub::SESSION_FRAMING,
-            ))
+            )))
         }
         "UserPromptSubmit" => {
             let prompt = payload.get("prompt").and_then(Value::as_str)?;
@@ -339,13 +339,74 @@ fn claude_inbox_hooks(
     }
 }
 
+/// What a hook prints for the inbox, and the messages that output hands over.
+pub struct HookOutput {
+    stdout: String,
+    /// Fetched, not yet acknowledged: acknowledged once `stdout` is written.
+    fetched: Vec<String>,
+}
+
+impl HookOutput {
+    fn text(stdout: String) -> Self {
+        Self {
+            stdout,
+            fetched: Vec::new(),
+        }
+    }
+
+    /// Write the output, then acknowledge the messages it hands over. A write
+    /// that fails acknowledges nothing, so what it carried is handed over
+    /// again after the ack-wait (PR #1735 review).
+    fn print(self) {
+        let mut out = std::io::stdout();
+        if writeln!(out, "{}", self.stdout).is_ok() && out.flush().is_ok() {
+            acknowledge_handed_over(&self.fetched);
+        }
+    }
+}
+
+/// PR #1735 review: acknowledge `ids`, which this hook fetched and has just
+/// handed to its agent, on one connection. Nothing is sent without the pane's
+/// token. A failure costs a second hand-over after the ack-wait, never the
+/// message.
+pub(crate) fn acknowledge_handed_over(ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let Some(pane_id) = std::env::var(DOT_AGENT_DECK_PANE_ID)
+        .ok()
+        .filter(|pane| !pane.is_empty())
+    else {
+        return;
+    };
+    let Some(token) = crate::hook_provenance::token_from_env() else {
+        return;
+    };
+    let agent_id = std::env::var(crate::agent_pty::DOT_AGENT_DECK_AGENT_ID)
+        .ok()
+        .filter(|agent| !agent.is_empty());
+    let lines: Vec<String> = ids
+        .iter()
+        .filter_map(|id| {
+            serde_json::to_string(&crate::event::DaemonMessage::Ack(crate::event::AckSignal {
+                pane_id: pane_id.clone(),
+                delivery_id: id.clone(),
+                agent_id: agent_id.clone(),
+                token: Some(token.clone()),
+            }))
+            .ok()
+        })
+        .collect();
+    let _ = send_lines_and_drain(&lines.join("\n"));
+}
+
 /// What the deck's Codex hook does for the inbox with one payload.
 enum CodexInbox {
     Nothing,
     /// Print this, then report the event as usual.
-    Print(String),
+    Print(HookOutput),
     /// Print this and report nothing: the turn goes on.
-    ContinueTurn(String),
+    ContinueTurn(HookOutput),
 }
 
 /// PRD #1666 S7: Codex's side of the inbox, for one hook payload in a deck
@@ -389,10 +450,11 @@ fn codex_inbox_hooks(
         Some("Stop") => crate::inbox_prompt::turn_end_hand_over(budget, framing).map_or(
             CodexInbox::Nothing,
             |hand_over| {
-                CodexInbox::ContinueTurn(
-                    serde_json::json!({"decision": "block", "reason": hand_over.context})
+                CodexInbox::ContinueTurn(HookOutput {
+                    stdout: serde_json::json!({"decision": "block", "reason": hand_over.context})
                         .to_string(),
-                )
+                    fetched: hand_over.fetched,
+                })
             },
         ),
         _ => CodexInbox::Nothing,
@@ -403,29 +465,31 @@ fn codex_inbox_hooks(
 /// every agent whose hook accepts `hookSpecificOutput.additionalContext`
 /// shares it (Claude Code now, Codex in S7), each with its own `budget` and
 /// the `framing` that heads an injection. An ordinary prompt costs a local
-/// scan and no daemon call.
+/// scan and no daemon call. A doorbell line fetches only while the message it
+/// names is queued, and what it hands over is acknowledged once the hook has
+/// printed it ([`HookOutput::print`]).
 pub fn deck_prompt_submit(
     prompt: &str,
     budget: crate::event::InboxBudget,
     framing: &str,
     event: &mut AgentEvent,
-) -> Option<String> {
+) -> Option<HookOutput> {
     let ids = crate::inbox_prompt::scan(prompt);
     if ids.is_empty() {
         return None;
     }
-    let injection = if ids.rung.is_empty() {
-        None
-    } else {
-        crate::inbox_prompt::doorbell_injection(budget, framing)
-    };
+    let injection = ids.rung.first().and_then(|rung| {
+        crate::inbox_prompt::doorbell_injection(budget, framing, Some(rung.as_str()))
+    });
     let fetched = injection
         .as_ref()
         .map(|injection| injection.fetched.clone())
         .unwrap_or_default();
     crate::inbox_prompt::mark_event(event, &ids, &fetched);
-    injection
-        .map(|injection| crate::inbox_prompt::hook_output("UserPromptSubmit", &injection.context))
+    injection.map(|injection| HookOutput {
+        stdout: crate::inbox_prompt::hook_output("UserPromptSubmit", &injection.context),
+        fetched: injection.fetched,
+    })
 }
 
 /// PRD #1666 S8: send an `inbox_announce` on its own connection, for a

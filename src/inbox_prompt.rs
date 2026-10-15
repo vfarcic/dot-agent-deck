@@ -111,7 +111,8 @@ pub fn scan(prompt: &str) -> DeckPromptIds {
 }
 
 /// What a doorbell-started prompt hands the model: the framing and the
-/// fetched blocks, and which ids the fetch acknowledged.
+/// fetched blocks, and which ids the fetch took, for the hook to acknowledge
+/// once it has printed them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Injection {
     pub context: String,
@@ -124,29 +125,42 @@ pub fn in_deck_pane() -> bool {
     std::env::var(DOT_AGENT_DECK_PANE_ID).is_ok_and(|pane| !pane.is_empty())
 }
 
-/// Fetch, and acknowledge in the same step, what is waiting for this pane's
-/// agent, within `budget` including `framing`, which heads it. `None` outside a
-/// deck pane, without a token, when the daemon does not answer, or when nothing
-/// is waiting. Bounded by the hook socket's 5 s request timeout.
-pub fn doorbell_injection(budget: InboxBudget, framing: &str) -> Option<Injection> {
-    hand_over(InboxFetchConsumer::DoorbellHook, budget, framing)
+/// Fetch what is waiting for this pane's agent, for the doorbell that named
+/// message `rung`, within `budget` including `framing`, which heads it.
+/// Nothing is fetched once `rung` is no longer queued (a doorbell recalled
+/// from prompt history, or a message another consumer took). The fetch does
+/// not acknowledge: the hook acknowledges [`Injection::fetched`] once it has
+/// printed them ([`crate::hook::acknowledge_handed_over`]), and what it never
+/// prints is handed over again after the ack-wait. `None` outside a deck pane,
+/// without a token, when the daemon does not answer, or when nothing is
+/// waiting. Bounded by the hook socket's 5 s request timeout.
+pub fn doorbell_injection(
+    budget: InboxBudget,
+    framing: &str,
+    rung: Option<&str>,
+) -> Option<Injection> {
+    hand_over(InboxFetchConsumer::DoorbellHook, budget, framing, rung)
 }
 
 /// PRD #1666 S7: [`doorbell_injection`] for a hook that hands the messages over
-/// as its turn ends (Codex's `Stop`).
+/// as its turn ends (Codex's `Stop`), with no doorbell to name one.
 pub fn turn_end_hand_over(budget: InboxBudget, framing: &str) -> Option<Injection> {
-    hand_over(InboxFetchConsumer::TurnEndHook, budget, framing)
+    hand_over(InboxFetchConsumer::TurnEndHook, budget, framing, None)
 }
 
-fn hand_over(
+/// The fetch a hook's hand-over sends for the agent `agent_id` in `pane_id`.
+/// PR #1735 review: it does not acknowledge, so a reply the hook never
+/// receives (its 5 s exchange timed out) or cannot parse leaves the messages
+/// fetched, for the ack-wait to hand over again, rather than delivered.
+fn hand_over_request(
     consumer: InboxFetchConsumer,
     budget: InboxBudget,
     framing: &str,
-) -> Option<Injection> {
-    let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
-        .ok()
-        .filter(|pane| !pane.is_empty())?;
-    let token = crate::hook_provenance::token_from_env()?;
+    rung: Option<&str>,
+    pane_id: String,
+    agent_id: Option<String>,
+    token: String,
+) -> InboxFetchRequest {
     // The daemon counts each block with its separator, so the framing is all
     // that is taken off here.
     let rest = budget.less(framing).limit().max(1);
@@ -156,17 +170,34 @@ fn hand_over(
         // bounds from above.
         InboxBudget::Bytes(_) => (rest, Some(rest)),
     };
-    let request = DaemonMessage::InboxFetch(InboxFetchRequest {
+    InboxFetchRequest {
         pane_id,
-        agent_id: std::env::var(DOT_AGENT_DECK_AGENT_ID)
-            .ok()
-            .filter(|agent| !agent.is_empty()),
+        agent_id,
         token: Some(token),
         consumer,
         max_chars: Some(max_chars),
         max_bytes,
-        ack: true,
-    });
+        ack: false,
+        doorbell: rung.map(str::to_string),
+    }
+}
+
+fn hand_over(
+    consumer: InboxFetchConsumer,
+    budget: InboxBudget,
+    framing: &str,
+    rung: Option<&str>,
+) -> Option<Injection> {
+    let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
+        .ok()
+        .filter(|pane| !pane.is_empty())?;
+    let token = crate::hook_provenance::token_from_env()?;
+    let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
+        .ok()
+        .filter(|agent| !agent.is_empty());
+    let request = DaemonMessage::InboxFetch(hand_over_request(
+        consumer, budget, framing, rung, pane_id, agent_id, token,
+    ));
     let json = serde_json::to_string(&request).ok()?;
     let line = crate::hook::request_from_socket(&json)?;
     let messages = serde_json::from_str::<InboxWaitReply>(&line)
@@ -287,6 +318,29 @@ mod tests {
 
     const ID: &str = "m-k3xzq2ab-0f3c9a71d2e4b850";
     const OTHER: &str = "m-k3xzq2ab-1111111111111111";
+
+    /// PR #1735 review: a hook's hand-over fetches without acknowledging. The
+    /// hook acknowledges once it has printed the messages, so a reply that
+    /// never reaches it leaves them to the ack-wait's redelivery instead of
+    /// marking them delivered.
+    #[test]
+    fn a_hooks_hand_over_fetches_without_acknowledging() {
+        for consumer in [
+            InboxFetchConsumer::DoorbellHook,
+            InboxFetchConsumer::TurnEndHook,
+        ] {
+            let request = hand_over_request(
+                consumer,
+                InboxBudget::Bytes(4_800),
+                "framing",
+                None,
+                "pane".to_string(),
+                Some("agent".to_string()),
+                "token".to_string(),
+            );
+            assert!(!request.ack, "{consumer:?}");
+        }
+    }
 
     #[test]
     fn an_ordinary_prompt_carries_no_ids() {

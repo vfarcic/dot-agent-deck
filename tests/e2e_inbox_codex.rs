@@ -101,7 +101,9 @@ while True:
         let path = format!("{}:/usr/bin:/bin", bin.path().display());
         let mut env = vec![("PATH", path.as_str())];
         env.extend_from_slice(extra);
-        let daemon = daemon(&env);
+        // The tests run Codex's hooks and fetch from the test process, outside
+        // the stand-in pane's agent; inbox/protocol/014 and /015 pin the binding.
+        let daemon = daemon_unbound(&env);
         let pane = Self::start(&daemon, screen_text, &program);
         Self {
             pane,

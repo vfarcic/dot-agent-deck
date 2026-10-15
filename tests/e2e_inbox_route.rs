@@ -1,4 +1,8 @@
 #![cfg(all(feature = "e2e", unix))]
+//! Synthetic routing tests. Their daemons let inbox components connect from
+//! the test process (`inbox::daemon_unbound`), which reads and settles the
+//! stand-in panes' mail from outside them; inbox/protocol/014 and /015 pin the
+//! binding itself.
 
 mod common;
 #[path = "support/inbox_doorbell.rs"]
@@ -16,7 +20,7 @@ use std::time::Duration;
 #[spec("orchestration/delegate/001")]
 #[test]
 fn delegate_001_posts_one_bound_task_and_worker_fetches() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let (orch, worker) = route::team(&daemon, false);
     let id = route::delegate(&daemon, &orch, route::TASK, false);
     assert_eq!(route::count(&daemon, &worker, 1)[0]["id"], id);
@@ -41,7 +45,7 @@ fn delegate_001_posts_one_bound_task_and_worker_fetches() {
 #[spec("orchestration/delegate/003")]
 #[test]
 fn delegate_003_work_done_posts_one_untrusted_report() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let (orch, worker) = route::team(&daemon, false);
     let id = route::delegate(&daemon, &orch, route::TASK, false);
     route::fetched(&daemon, &worker, &id, route::TASK, "the orchestrator");
@@ -73,7 +77,7 @@ fn delegate_003_work_done_posts_one_untrusted_report() {
 #[test]
 fn delegate_021_work_done_releases_only_its_own_delivery_state() {
     {
-        let daemon = daemon(&[]);
+        let daemon = daemon_unbound(&[]);
         let (orch, worker) = route::team(&daemon, false);
         let first = route::delegate(&daemon, &orch, route::TASK, false);
         route::fetched(&daemon, &worker, &first, route::TASK, "the orchestrator");
@@ -83,7 +87,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
         assert_ne!(first, second, "identical follow-up needs a fresh inbox id");
         route::fetched(&daemon, &worker, &second, route::TASK, "the orchestrator");
     }
-    let daemon = daemon(&[
+    let daemon = daemon_unbound(&[
         (route::UNDELIVERED_MS, "700"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ]);
@@ -115,7 +119,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
 #[spec("inbox/route/008")]
 #[test]
 fn route_008_refused_post_releases_the_commission_for_a_fresh_delegate() {
-    let daemon = daemon(&[
+    let daemon = daemon_unbound(&[
         ("DOT_AGENT_DECK_INBOX_MAX_PER_RECIPIENT", "1"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ]);
@@ -184,7 +188,7 @@ fn route_008_refused_post_releases_the_commission_for_a_fresh_delegate() {
 #[spec("inbox/route/001")]
 #[test]
 fn route_001_clear_posts_after_respawn_to_new_agent() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let (orch, old) = route::team(&daemon, true);
     let id = route::delegate(&daemon, &orch, route::TASK, false);
     let successor = std::cell::RefCell::new(None);
@@ -216,7 +220,7 @@ fn route_002_worker_notices_are_bound_deck_messages() {
         ("waiting_for_input", "input"),
         ("exit", "exited"),
     ] {
-        let daemon = daemon(&[("DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS", "100")]);
+        let daemon = daemon_unbound(&[("DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS", "100")]);
         let (orch, worker) = route::team(&daemon, false);
         let id = route::delegate(&daemon, &orch, route::TASK, false);
         route::fetched(&daemon, &worker, &id, route::TASK, "the orchestrator");
@@ -239,7 +243,7 @@ fn route_002_worker_notices_are_bound_deck_messages() {
 #[spec("inbox/route/003")]
 #[test]
 fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let (orch, worker) = route::team(&daemon, false);
     let id = route::delegate(&daemon, &orch, route::TASK, false);
     std::process::Command::new("kill")
@@ -276,7 +280,7 @@ fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
 #[spec("inbox/route/004")]
 #[test]
 fn route_004_start_agent_seed_is_first_message_for_every_agent_type() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let composer = daemon.home.join("codex-composer.txt");
     std::fs::write(&composer, include_str!("fixtures/codex-inbox/composer.txt")).unwrap();
     for agent_type in ["claude_code", "open_code", "pi", "codex", "devin"] {
@@ -336,7 +340,7 @@ fn route_004_start_agent_seed_is_first_message_for_every_agent_type() {
 #[spec("inbox/route/005")]
 #[test]
 fn route_005_daemon_authoring_seed_is_queued_without_readiness() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let pane = route::start(&daemon, "author", json!({"authoring_kind":"dispatcher"}));
     let messages = route::count(&daemon, &pane, 1);
     assert!(bytes(&pane).is_empty());
@@ -354,7 +358,7 @@ fn route_005_daemon_authoring_seed_is_queued_without_readiness() {
 #[spec("inbox/route/006")]
 #[test]
 fn route_006_respawn_failure_posts_daemon_notice() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let (orch, worker) = route::team(&daemon, true);
     let config = daemon.home.join(".dot-agent-deck.toml");
     let mut contents = std::fs::read_to_string(&config).unwrap();
@@ -425,7 +429,7 @@ fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane() {
 }
 
 fn assert_undelivered_notice_does_not_reach_successor_orchestrator() {
-    let daemon = daemon(&[
+    let daemon = daemon_unbound(&[
         (route::UNDELIVERED_MS, "1500"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ]);

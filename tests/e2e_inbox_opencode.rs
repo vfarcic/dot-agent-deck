@@ -990,7 +990,7 @@ fn opencode_012_cli_installs_jsonc_once() {
 #[spec("inbox/opencode/013")]
 #[test]
 fn opencode_013_cli_refusal_is_actionable_and_falls_back() {
-    let daemon = daemon(&[]);
+    let daemon = daemon_unbound(&[]);
     let root = daemon.home.join(".config/opencode");
     std::fs::create_dir_all(&root).unwrap();
     let target = daemon.home.join("user-tui.json");
