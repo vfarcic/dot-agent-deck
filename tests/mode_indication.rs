@@ -137,6 +137,7 @@ fn selected_card_fixture() -> SessionState {
         agent_id: None,
         display_name: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
         output_set_status: false,

@@ -129,6 +129,7 @@ fn card(orphaned: bool) -> SessionState {
         agent_id: Some("1".to_string()),
         display_name: Some("orchestrator".to_string()),
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: orphaned,
         subagent_wait: None,
         output_set_status: false,

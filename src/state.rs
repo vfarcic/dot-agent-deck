@@ -794,6 +794,15 @@ pub struct SessionState {
     /// synthetic (see the bottom of `apply_event`), so a real event always
     /// wins the "what set this status" question.
     pub shell_synthetic_working: bool,
+    /// PRD #1666 (MC-3): a frame from the agent's own hooks — not a wrapper
+    /// start, not output the wrapper classified, not a daemon-synthetic frame —
+    /// has reached this card. STICKY for the card's life, and deliberately not
+    /// read from the bounded [`Self::recent_events`]: the daemon's shell-activity
+    /// frames can push every native frame out of that journal while a hook-owned
+    /// turn is still running, and the late Codex wrapper start the witness
+    /// guards against would then end that turn again. A respawned agent gets a
+    /// new card, so its predecessor's hooks do not speak for it. Process-local.
+    pub native_hooks_reported: bool,
     /// Issue #770: this session's pane is an ORPHANED orchestration role pane —
     /// the daemon holds no orchestration role for it, so
     /// `dot-agent-deck delegate` from it is refused and no worker can be
@@ -7706,6 +7715,7 @@ impl AppState {
                 agent_id,
                 display_name: None,
                 shell_synthetic_working: false,
+                native_hooks_reported: false,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -12644,6 +12654,7 @@ impl AppState {
                 // redundant duplicate of that block).
                 display_name: None,
                 shell_synthetic_working: false,
+                native_hooks_reported: false,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -12922,6 +12933,12 @@ impl AppState {
         newest_before: DateTime<Utc>,
         shell_status_owned: bool,
     ) -> bool {
+        if !event.is_wrapper_session_start()
+            && !event.is_wrapper_output_classified()
+            && !event.is_daemon_synthetic()
+        {
+            session.native_hooks_reported = true;
+        }
         // Issue #714: a `Blocked` card is STICKY. The provider has refused the
         // agent, and the frames that typically trail that refusal — OpenCode's
         // `session.idle` after its `session.error`, Claude Code's `idle_prompt`
@@ -13118,18 +13135,14 @@ impl AppState {
             // machine was measured stamping it after the prompt hook's
             // Thinking), and an agent whose hooks are running is past boot. Left
             // to the arm below it ended that turn, and the doorbell then typed
-            // into a busy Codex (`inbox/codex/007`). Read from `recent_events`,
-            // so a card whose native frames have all aged out of that window
-            // takes it again; a boot observation arrives long before then.
+            // into a busy Codex (`inbox/codex/007`). Read from the card's
+            // sticky witness rather than from `recent_events`: newer shell
+            // frames can age every native frame out of that journal while the
+            // turn is still running (PRD #1666 MC-3).
             EventType::SessionStart
                 if event.agent_type == AgentType::Codex
                     && event.is_wrapper_session_start()
-                    && (event.timestamp < newest_before
-                        || session.recent_events.iter().any(|seen| {
-                            !seen.is_wrapper_session_start()
-                                && !seen.is_wrapper_output_classified()
-                                && !seen.is_daemon_synthetic()
-                        })) =>
+                    && (event.timestamp < newest_before || session.native_hooks_reported) =>
             {
                 false
             }
@@ -17179,6 +17192,7 @@ mod tests {
                 agent_id: Some("some-other-agent".to_string()),
                 display_name: None,
                 shell_synthetic_working: false,
+                native_hooks_reported: false,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -18956,6 +18970,62 @@ mod tests {
         state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
         state.apply_event(interface_start(2));
         assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+    }
+
+    /// Scenario: as above, but between the prompt hook's Thinking and the late
+    /// wrapper start the daemon's shell monitor reports enough ShellBusy /
+    /// ShellIdle frames to push every native frame out of the card's bounded
+    /// journal. The card still stays Thinking and unringable: that Codex's
+    /// hooks have reported on this card is kept outside the journal, so no
+    /// amount of newer history can make the late boot observation count again.
+    #[test]
+    fn a_late_wrapper_start_after_the_native_frames_aged_out_still_asserts_nothing() {
+        let mut interface_start = codex_status_frame(EventType::SessionStart, true, 1_000);
+        interface_start.metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN.to_string(),
+        );
+
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
+        state.apply_event(codex_status_frame(EventType::SessionStart, false, 2));
+        let mut prompt = codex_status_frame(EventType::Thinking, false, 3);
+        prompt.user_prompt = Some("busy human turn".to_string());
+        state.apply_event(prompt);
+        for i in 0..(MAX_RECENT_EVENTS as i64) {
+            let kind = if i % 2 == 0 {
+                EventType::ShellBusy
+            } else {
+                EventType::ShellIdle
+            };
+            state.apply_event(codex_status_frame(kind, false, 10 + i));
+        }
+        let card = pane_x_card(&state);
+        assert_eq!(
+            card.status,
+            SessionStatus::Thinking,
+            "the premise: shell frames leave the hook-owned Thinking alone"
+        );
+        assert!(
+            card.recent_events
+                .iter()
+                .all(|seen| seen.is_daemon_synthetic()),
+            "the premise: every native frame has aged out of the journal: {:#?}",
+            card.recent_events
+        );
+
+        state.apply_event(interface_start);
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::Thinking,
+            "a late boot observation must not end the turn the hooks reported, \
+             however much newer history pushed their frames out"
+        );
+        assert!(
+            !state.agent_doorbell_idle("agent-x", "pane-x"),
+            "nor may it make the busy agent ringable"
+        );
     }
 
     /// Scenario: Feed one deck-launched Codex card the wrapper's start and its
