@@ -3080,6 +3080,12 @@ fn admit_producer_event(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY);
+    // PRD #1666 S6: nor does a producer say a prompt is the deck's own
+    // message; the raw-event ingress stamps that after this, and no other
+    // ingress does.
+    event
+        .metadata
+        .remove(crate::inbox_prompt::DECK_MESSAGE_METADATA_KEY);
     // PRD #1631: the deck's own answered marker never comes from a producer,
     // and a question is rewritten sanitized — or dropped — so every reader of
     // the fan-out sees the question the snapshot will hold.
@@ -6480,14 +6486,6 @@ async fn run_hook_loop_with_limits(
                                 }
                                 _ => None,
                             };
-                            // PRD #1666 S6: a prompt that is the deck's own
-                            // message is acknowledged and labelled here, for the
-                            // agent the token attests, before anything reads it.
-                            crate::inbox_prompt::stamp_deck_message_prompt(
-                                &mut event,
-                                attested_agent.as_deref(),
-                                pty_registry.inbox(),
-                            );
                             // The `#[serde(other)]` catch-all on `EventType`
                             // (PRD #386, precedent PRD #201's `AgentType`
                             // retrofit) is a deliberate forward-compat win —
@@ -6516,6 +6514,16 @@ async fn run_hook_loop_with_limits(
                             // Issue #714: normalise the quota-block keys, and hand
                             // a Codex event's rollout and turn to the tailer.
                             admit_producer_event(&mut event);
+                            // PRD #1666 S6: a prompt that is the deck's own
+                            // message is acknowledged and labelled here, for the
+                            // agent the token attests, before anything reads it.
+                            // After the admission above, which discards a
+                            // producer's own marker.
+                            crate::inbox_prompt::stamp_deck_message_prompt(
+                                &mut event,
+                                attested_agent.as_deref(),
+                                pty_registry.inbox(),
+                            );
                             // PRD #1401: a pull request report is the
                             // daemon's alone — its URL is what a card's badge
                             // opens — so a producer's copy goes no further.
@@ -7161,6 +7169,44 @@ mod quota_admission_tests {
         assert_eq!(card.delivery_notice(), Some(notice));
     }
 
+    /// Scenario (PRD #1666 audit M-A1): a producer frame carries the deck's
+    /// own `deck_message` marker beside a prompt it typed. Unadmitted, the
+    /// marker would keep that prompt out of the card's prompt history; after
+    /// the hook ingress's admission the marker is gone and the prompt is
+    /// recorded like any other.
+    #[test]
+    fn a_producer_frame_cannot_label_its_prompt_as_a_deck_message() {
+        use crate::inbox_prompt::{DECK_MESSAGE_METADATA_KEY, is_deck_message};
+        use crate::state::AppState;
+        let prompt = "please fix the build";
+        let forged = || {
+            let mut event = quota_frame(crate::event::EventType::Thinking);
+            event.user_prompt = Some(prompt.to_string());
+            event
+                .metadata
+                .insert(DECK_MESSAGE_METADATA_KEY.to_string(), "1".to_string());
+            event
+        };
+        let recorded = |event: AgentEvent| {
+            let mut state = AppState::default();
+            state.register_pane("pane-1".to_string());
+            state.apply_event(event);
+            let card = &state.sessions["s"];
+            (card.last_user_prompt.clone(), card.first_prompts.clone())
+        };
+
+        // The control: unadmitted, the marker hides the prompt.
+        assert_eq!(recorded(forged()), (None, Vec::new()));
+
+        let mut admitted = forged();
+        admit_producer_event(&mut admitted);
+        assert!(!is_deck_message(&admitted), "{:?}", admitted.metadata);
+        assert_eq!(
+            recorded(admitted),
+            (Some(prompt.to_string()), vec![prompt.to_string()])
+        );
+    }
+
     /// Issue #1359: a failed Codex turn read from the rollout becomes one
     /// event for the card — `QuotaBlocked`, marked as the daemon's own, for a
     /// usage limit, and `Error`, with no quota metadata and no provider text,
@@ -7780,6 +7826,68 @@ mod hook_ingestion_tests {
             "the relayed copy must not carry the marker: {:?}",
             relayed.metadata
         );
+    }
+
+    /// Scenario (PRD #1666 audit M-A1): a producer sends an unheld `question`
+    /// envelope whose status event carries a prompt and the deck's own
+    /// `deck_message` marker, and no question. The event the daemon relays
+    /// carries no marker, and the card records the prompt in its history, as
+    /// the same event on the raw hook ingress would.
+    #[tokio::test]
+    async fn a_question_envelope_cannot_label_its_prompt_as_a_deck_message() {
+        use crate::inbox_prompt::{DECK_MESSAGE_METADATA_KEY, is_deck_message};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane("pane-1".to_string());
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let prompt = "please fix the build";
+        let mut event =
+            super::quota_admission_tests::quota_frame(crate::event::EventType::Thinking);
+        event.agent_id = None;
+        event.user_prompt = Some(prompt.to_string());
+        event
+            .metadata
+            .insert(DECK_MESSAGE_METADATA_KEY.to_string(), "1".to_string());
+        let signal = crate::event::QuestionSignal {
+            pane_id: "pane-1".to_string(),
+            token: None,
+            event,
+            hold: false,
+            ack: false,
+            confirm_hold: false,
+        };
+        let mut reader = tokio::io::BufReader::new(tokio::io::empty());
+        let mut writer = tokio::io::sink();
+        let mut slot = None;
+        let holds = Arc::new(tokio::sync::Semaphore::new(1));
+        let reply = handle_question_signal(
+            signal,
+            None,
+            false,
+            &state,
+            &event_tx,
+            &registry,
+            QuestionConnection {
+                reader: &mut reader,
+                writer: &mut writer,
+                slot: &mut slot,
+                holds: &holds,
+                hold_deadline: Duration::from_secs(5),
+            },
+        )
+        .await;
+        assert!(reply.is_some(), "an unheld question is released at once");
+        let BroadcastMsg::Event(relayed) = rx.try_recv().expect("the event is relayed") else {
+            panic!("expected an event");
+        };
+        assert!(!is_deck_message(&relayed), "{:?}", relayed.metadata);
+        let state = state.read().await;
+        let card = &state.sessions["s"];
+        assert_eq!(card.last_user_prompt.as_deref(), Some(prompt));
+        assert_eq!(card.first_prompts, vec![prompt.to_string()]);
+        drop(state);
+        registry.shutdown_all();
     }
 
     /// Issue #714 (audit N1/N2): a Codex worker stand-in and an orchestrator
