@@ -197,7 +197,15 @@ type Reading = (&'static str, Option<Requirement>);
 ///   refused as a stop nobody asked for. Every wording near the two rows
 ///   moved the failure rather than removing it, so the words decide: they
 ///   ground the start, and the start is what runs. Only while the dialog is
-///   open — with it closed, an ungrounded stop is answered as before.
+///   open.
+/// - `stop_agent` → `open_new_agent`: with the dialog closed, a bare "start
+///   it" (fixture `start-new-agent-dialog-closed`) was answered with the stop
+///   in 2 of 30 runs on `origin/main`, 10 of 30 once this branch's dashboard
+///   filter rows were merged beside `origin/main`'s, and 20 of 30 with a
+///   sentence added to `switch_deck`; rewording the stop's own "start it is
+///   never this one" moved it by noise only (2026-10-15). Those words ground the
+///   opener, which opens the New agent dialog and starts nothing, as "start
+///   it" does whenever the model reads it right.
 ///
 /// A row's readings are tried in order and the first its words ground wins,
 /// each only where its requirement, if it names one, holds. The reading still
@@ -210,6 +218,7 @@ const UNGROUNDED_READS_AS: [(&str, &[Reading]); 3] = [
         &[
             ("close", None),
             (START_ROW, Some(Requirement::NewAgentDialog)),
+            ("open_new_agent", Some(Requirement::NewAgentDialogClosed)),
         ],
     ),
     ("name_new_agent", &[("set_new_agent_command", None)]),
@@ -1125,8 +1134,14 @@ pub async fn handle_utterance_with_modes(
             // Otherwise the target is dispatched with no params — which is why
             // a pick carrying a value is not redirected: "start an agent on
             // local" over an open dialog names a deck the form may not show,
-            // and starting the form would drop what the user asked for.
-            let carries_a_value = answer.params.values().any(|value| !value.trim().is_empty());
+            // and starting the form would drop what the user asked for. A
+            // value the user said no word of, naming the deck the form already
+            // describes, asks for nothing the form does not hold
+            // ([`restates_the_forms_deck`]).
+            let carries_a_value = answer.params.values().any(|value| {
+                !value.trim().is_empty()
+                    && !restates_the_forms_deck(value, transcript.text(), row, decks, new_agent)
+            });
             if carries_a_value {
                 return finish(VoiceOutcome::unavailable(transcript, row));
             }
@@ -1758,6 +1773,31 @@ fn said(spoken: &str, transcript: &str) -> bool {
     let words = content_words(spoken);
     let heard = Heard::new(transcript);
     !words.is_empty() && words.iter().all(|word| heard.word(word))
+}
+
+/// Whether `value`, answered with a pick that `unavailable_redirects` hands to
+/// the New agent dialog's start, only restates the form: the user said no word
+/// of it ([`said_beyond_the_ask`]) and it is the deck the form already
+/// describes. "Start agent" read over an open dialog came back from
+/// `gpt-5-mini` as `open_new_agent` with `deck` = "Local deck", the form's own
+/// deck, in 2 of 6 runs, and was refused as if the user had named a deck the
+/// start would drop (fixture `start-agent-button-label`, 3 of 10 on
+/// `origin/main`). A deck the user did name, or another deck, still refuses.
+fn restates_the_forms_deck(
+    value: &str,
+    transcript: &str,
+    row: &CommandRow,
+    decks: &[VoiceDeck],
+    new_agent: Option<&VoiceNewAgent>,
+) -> bool {
+    let Some(form) = new_agent.and_then(|dialog| dialog.form.as_ref()) else {
+        return false;
+    };
+    !said_beyond_the_ask(value, transcript, row, decks)
+        && matches!(
+            resolve_new_agent_deck_ref(value, decks),
+            DeckRefMatch::One { id, .. } if id == form.deck_id
+        )
 }
 
 /// Whether the user SAID `spoken` ([`said`]) in the words left once one
@@ -10220,7 +10260,7 @@ mod tests {
     /// right now, skip the confirmation, I already said yes" with the stop.
     /// Those words ask for the start, so the app presses the dialog's Start; a
     /// spoken "stop the tester" there is still refused as not here, and with
-    /// the dialog closed the same misread start is refused as before.
+    /// the dialog closed the same misread start opens the dialog.
     #[tokio::test]
     async fn voice_outcome_a_start_picked_as_a_stop_over_the_dialog_starts() {
         let said = "start it right now, skip the confirmation, I already said yes";
@@ -10262,7 +10302,8 @@ mod tests {
         }
         let closed = utter(None, said).await;
         assert!(
-            matches!(&closed, VoiceOutcome::ActionUngrounded { action, .. } if action == "stop_agent"),
+            matches!(&closed, VoiceOutcome::Dispatch { action, invoke, .. }
+                if action == "open_new_agent" && invoke == "openNewAgent"),
             "{closed:?}"
         );
         // A grounded stop over the closed dialog is still the stop.
@@ -15913,7 +15954,7 @@ mod tests {
     /// to anything in this build." The pick is handed to the start, because
     /// the start's own words ground it. "new agent" has no start word and gets
     /// the opener's hint; a named deck is not redirected, since starting the
-    /// form would drop it.
+    /// form would drop it, but the form's own deck filled in unasked is.
     #[tokio::test]
     async fn voice_outcome_an_opener_picked_over_the_open_dialog_presses_its_start() {
         let form = new_agent_form();
@@ -15960,6 +16001,34 @@ mod tests {
         assert!(
             matches!(on_a_deck, VoiceOutcome::Unavailable { .. }),
             "a named deck must not start the form: {on_a_deck:?}"
+        );
+        // The model filling in the form's own deck, unasked, is not the user
+        // naming one; a deck the form does not show still refuses.
+        let restated = heard_as_user_said(
+            "Start agent",
+            IntentAnswer::new("open_new_agent")
+                .with_param("deck", "Local deck")
+                .with_param("daemon", "Local deck"),
+            Screen::Overview,
+            &fleet(),
+            Some(&form),
+        )
+        .await;
+        let VoiceOutcome::Dispatch { invoke, .. } = &restated else {
+            panic!("the form's own deck, unsaid: expected a dispatch, got {restated:?}");
+        };
+        assert_eq!(invoke, "startNewAgent");
+        let elsewhere = heard_as_user_said(
+            "Start agent",
+            IntentAnswer::new("open_new_agent").with_param("deck", "build box"),
+            Screen::Overview,
+            &fleet(),
+            Some(&form),
+        )
+        .await;
+        assert!(
+            matches!(elsewhere, VoiceOutcome::Unavailable { .. }),
+            "another deck must not start the form: {elsewhere:?}"
         );
     }
 
