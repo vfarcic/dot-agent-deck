@@ -58,16 +58,18 @@
 //!   is touched — a Pi pane is hook-safe by construction.
 //!
 //! ## Credentials (Design Decision #5, harness caveat)
-//! pi authenticates to Anthropic via `ANTHROPIC_API_KEY`. The harness scrubs the
-//! spawned deck's env to a pinned set, so the key + the freshly-built
-//! binary dir on PATH are threaded in explicitly via `with_env`; the deck's
-//! lazy-spawned daemon inherits them, and so does the pi child. The key is NEVER
-//! printed (only checked non-empty for the runtime-skip).
+//! pi runs on `common::pi_test_model()` — by default `openai-codex/gpt-5.6-luna`
+//! (PRD #1666), overridable with `DOT_AGENT_DECK_PI_TEST_MODEL` — and
+//! authenticates from the host's stored login for that provider, which
+//! `with_imported_pi_credentials` copies (that entry only) into the per-test
+//! HOME's `.pi/agent`; the deck's lazy-spawned daemon and the pi child inherit
+//! that HOME. The freshly-built binary dir on PATH is threaded in explicitly via
+//! `with_env`. No credential is printed.
 //!
-//! Tier: e2e (`#[cfg(feature = "e2e")]`) — spawns a real agent, hits a real
-//! model. Flaky-tolerant pre-PR tier (real LLM), run once, not looped (rule
-//! 4/5). Runtime-skipped (Decision 26) when `pi` / `ANTHROPIC_API_KEY` is
-//! absent.
+//! Tier: lane 2 — spawns a real agent, hits a real model. Flaky-tolerant (real
+//! LLM), run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when
+//! `pi` or its credential is absent; a model the credential refuses fails
+//! instead (`common::check_pi_available`).
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -78,13 +80,6 @@ use common::TuiDeck;
 use dot_agent_deck::config;
 use spec::spec;
 
-/// Cheapest tier in pi's Anthropic catalog, and enough to run a directive
-/// turn (same model `chain-smoke/pi/001` / `scheduler/pi/001` pin).
-///
-/// TEMPORARY: the pi tier runs on Anthropic Haiku while the GPT accounts are
-/// without credit. The tier itself is provider-agnostic — moving it back is
-/// this constant plus the `--provider` flag and the key name below.
-const PI_MODEL: &str = "claude-haiku-4-5";
 /// The sentinel the pi pane is directed to create. Distinctive + lands in the
 /// per-test fixture cwd, so it is unique by construction — a concrete
 /// secondary signal that the real model actually ran the directed work (the
@@ -92,27 +87,6 @@ const PI_MODEL: &str = "claude-haiku-4-5";
 /// which does not depend on the sentinel).
 const SENTINEL_NAME: &str = "pi_live_sentinel_4b1a.txt";
 const SENTINEL_CONTENT: &str = "PI_LIVE_SENTINEL_OK";
-
-/// `pi` on PATH AND a non-empty `ANTHROPIC_API_KEY`. The key is only checked
-/// for presence — never printed or logged (it is a secret). Mirrors
-/// `e2e_pi_orchestrator.rs::check_pi_available`.
-fn check_pi_available() -> Result<(), String> {
-    let ok = std::process::Command::new("pi")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        return Err("pi CLI not installed (could not invoke `pi --version`)".into());
-    }
-    match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.trim().is_empty() => Ok(()),
-        _ => Err("ANTHROPIC_API_KEY not set — real-pi live-pane e2e needs Anthropic auth".into()),
-    }
-}
 
 /// The text of the Pi card's own rectangle on `grid` — every row from the one
 /// carrying its `Pi ·` title down to its bottom border, cut at the card's
@@ -161,10 +135,10 @@ fn card_tool_count(card: &str) -> Option<u32> {
 /// WITHOUT the extension and the deck's daemon-startup auto-materialize (the real
 /// `daemon serve` entry the lazy-spawned daemon runs) puts the bundled Pi
 /// orchestrator extension into that HOME before pi boots. The pane runs `pi`
-/// (`--provider anthropic --model claude-haiku-4-5 --approve`) with a directive initial
+/// (`common::pi_test_model()`, `--approve`) with a directive initial
 /// prompt to create the uniquely-named sentinel
-/// `pi_live_sentinel_4b1a.txt`. The `ANTHROPIC_API_KEY` + the built-binary PATH
-/// are threaded into the deck (inherited by the lazy-spawned daemon and the pi
+/// `pi_live_sentinel_4b1a.txt`. Pi's login is seeded into the per-test HOME and
+/// the built-binary PATH is threaded into the deck (inherited by the lazy-spawned daemon and the pi
 /// child). The pane auto-focuses on restore (the cast captures pi booting +
 /// working live in the pane); detach to the dashboard with Ctrl+D so the Pi
 /// pane's CARD renders. Assert on the rendered vt100 grid that, driven ONLY by
@@ -186,7 +160,7 @@ fn card_tool_count(card: &str) -> Option<u32> {
 fn pi_live_001_live_pane_shows_identity_and_status() {
     // Decision 26 runtime-skip: a missing CLI / credential is an environmental
     // condition, not a broken test.
-    skip_unless!(check_pi_available());
+    skip_unless!(common::check_pi_available());
 
     // The pi child inherits the deck's env. Directive prompt: instruct pi to do
     // ONE simple, reliable task (create the distinctive sentinel) so the real
@@ -198,7 +172,10 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
          whose entire contents are exactly the text {SENTINEL_CONTENT}. Do that one task, then \
          stop."
     );
-    let pi_command = format!("pi --provider anthropic --model {PI_MODEL} --approve '{directive}'");
+    let pi_command = format!(
+        "pi {} --approve '{directive}'",
+        common::pi_test_model().cli_args()
+    );
 
     let deck = TuiDeck::builder()
         // 200 cols so the dashboard renders the card (left) AND the live pi pane
@@ -207,20 +184,10 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
         .with_pty_size(200, 50)
         // Gate ON so the first-class Pi identity renders (features::show_pi_agent).
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
-        // pi authenticates to Anthropic with this (never printed); the deck's
-        // daemon and the pi child inherit it.
-        //
-        // Issue #502/#785 made `inherit_pass` forward ANTHROPIC_API_KEY into
-        // every harness-spawned deck, so this override is now belt-and-braces
-        // rather than the only source. Kept deliberately: it states the
-        // dependency at the call site, and without it these tests would take
-        // their credential from a list they do not name and would lose it —
-        // as a PTY timeout, not a compile error — if that list were ever
-        // narrowed.
-        .with_env(
-            "ANTHROPIC_API_KEY",
-            std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available"),
-        )
+        // pi's login for `common::pi_test_model()`'s provider, seeded into the
+        // per-test HOME the deck's daemon and the pi child inherit (never
+        // printed).
+        .with_imported_pi_credentials()
         // Put the freshly-built binary's dir on PATH so the extension resolves
         // `dot-agent-deck agent-event`; preserves the host PATH so `pi` still
         // resolves. Wins over the harness env scrub. (This PATH — inherited by
@@ -462,7 +429,7 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
     // Decision 26 runtime-skip: a missing CLI / credential is an environmental
     // condition, not a broken test. Needs BOTH a real pi (orchestrator) and a
     // real claude (worker).
-    skip_unless!(check_pi_available());
+    skip_unless!(common::check_pi_available());
     skip_unless!(common::check_claude_available());
 
     // A held tempdir carrying the orchestration project dir (`.dot-agent-deck.toml`
@@ -489,7 +456,7 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
 
     // Idle role commands leave delivery to the inbox. Same real-agent tiers as
     // `chain-smoke/pi/001`.
-    let pi_command = format!("pi --provider anthropic --model {PI_MODEL} --approve");
+    let pi_command = format!("pi {} --approve", common::pi_test_model().cli_args());
     let worker_command = format!("claude --model {WORKER_MODEL} --allowedTools Bash Read Write");
 
     // The inbox directive carries literal sentinel tokens so the assertion
@@ -521,13 +488,8 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         .with_pty_size(200, 50)
         // Gate ON so the Pi first-class identity renders (features::show_pi_agent).
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
-        // pi authenticates to Anthropic with this (never printed); the deck's
-        // daemon and the pi child inherit it. Belt-and-braces since issue
-        // #502/#785 — see the note on `pi_live_001` above.
-        .with_env(
-            "ANTHROPIC_API_KEY",
-            std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available"),
-        )
+        // pi's login, as for `pi_live_001` above.
+        .with_imported_pi_credentials()
         // Put the freshly-built binary's dir on PATH so the pi extension resolves
         // `dot-agent-deck agent-event`/`delegate`/`inbox wait` and the claude worker
         // resolves `dot-agent-deck work-done`; preserves the host PATH so `pi` /

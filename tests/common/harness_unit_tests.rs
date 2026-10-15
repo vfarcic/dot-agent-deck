@@ -5729,3 +5729,43 @@ fn codex_probe_refusal_matches_only_a_refused_model() {
         );
     }
 }
+
+/// Scenario: Choose the Pi real-agent model with no override, with an empty
+/// one, and with several `<provider>/<model>` values, then with malformed ones.
+/// No override means the measured GPT default on the stored ChatGPT login
+/// (`openai-codex/gpt-5.6-luna`, PRD #1666) — never Anthropic, since the
+/// change is permanent rather than a fallback; an override is split at its
+/// first `/`; anything without both halves is refused rather than read as
+/// "skip"; and only the API-key providers name an env key.
+#[test]
+fn pi_test_model_selection_reads_provider_slash_model() {
+    let default = pi_test_model_from(None).expect("the default parses");
+    assert_eq!(default.provider, "openai-codex");
+    assert_eq!(default.model, "gpt-5.6-luna");
+    assert_eq!(default.to_string(), PI_TEST_MODEL_DEFAULT);
+    assert_eq!(
+        default.cli_args(),
+        "--provider openai-codex --model gpt-5.6-luna"
+    );
+    assert_eq!(default.env_key(), None, "the stored login authenticates it");
+    for blank in ["", "   "] {
+        assert_eq!(pi_test_model_from(Some(blank)).unwrap(), default);
+    }
+
+    let keyed = pi_test_model_from(Some(" openai/gpt-5-nano ")).unwrap();
+    assert_eq!(keyed.cli_args(), "--provider openai --model gpt-5-nano");
+    assert_eq!(keyed.env_key(), Some(OPENAI_API_KEY_ENV));
+    let routed = pi_test_model_from(Some("openrouter/openai/gpt-5.1-codex-mini")).unwrap();
+    assert_eq!(routed.provider, "openrouter");
+    assert_eq!(routed.model, "openai/gpt-5.1-codex-mini");
+
+    for bad in [
+        "gpt-5.6-luna",
+        "/gpt-5.6-luna",
+        "openai-codex/",
+        "openai codex/x",
+    ] {
+        let err = pi_test_model_from(Some(bad)).expect_err(bad);
+        assert!(err.contains(PI_TEST_MODEL_ENV), "{bad}: {err}");
+    }
+}

@@ -5,7 +5,6 @@
 //! the task through the real daemon; only the worker spends a model credential.
 //! Scratch HOME and PI_CODING_AGENT_DIR contain the bundled extension.
 
-use std::process::Stdio;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
@@ -22,44 +21,12 @@ use spec::spec;
 const ORCH_PANE: &str = "synthetic-orchestrator-pane";
 const WORKER_PANE: &str = "pi-worker-pane";
 const WORKER_ROLE: &str = "coder";
-/// Cheapest tier in pi's Anthropic catalog, and enough to run a directive
-/// turn (the same model `chain-smoke/pi/001` / `pi/live/002` pin).
-///
-/// TEMPORARY: the pi tier runs on Anthropic Haiku while the GPT accounts are
-/// without credit. The tier itself is provider-agnostic — moving it back is
-/// this constant plus the `--provider` flag and the key name below.
-const PI_MODEL: &str = "claude-haiku-4-5";
 /// The sentinel the pi worker must create. Distinctive + lands in a fresh tempdir
 /// cwd, so it is unique by construction and unambiguous. DISTINCT from the
 /// `chain-smoke/pi/001` (`7c3f`), `pi/live/001` (`4b1a`), and `pi/live/002`
 /// (`5e8c`) sentinels.
 const SENTINEL_NAME: &str = "pi_worker_sentinel_9d2e.txt";
 const SENTINEL_CONTENT: &str = "PI_WORKER_SENTINEL_OK";
-
-// ---------------------------------------------------------------------------
-// Non-polling helpers (kept in-file; all sleeping/polling is in `common`).
-// ---------------------------------------------------------------------------
-
-/// `pi` on PATH AND a non-empty `ANTHROPIC_API_KEY`. The key is only checked for
-/// presence — never printed or logged (it is a secret). Mirrors
-/// `e2e_pi_orchestrator.rs::check_pi_available`.
-fn check_pi_available() -> Result<(), String> {
-    let ok = std::process::Command::new("pi")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        return Err("pi CLI not installed (could not invoke `pi --version`)".into());
-    }
-    match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.trim().is_empty() => Ok(()),
-        _ => Err("ANTHROPIC_API_KEY not set — real-pi worker e2e needs Anthropic auth".into()),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // chain-smoke/pi/002 — real-pi WORKER receives a delegate → work-done
@@ -69,7 +36,7 @@ fn check_pi_available() -> Result<(), String> {
 #[spec("chain-smoke/pi/002")]
 #[test]
 fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done() {
-    skip_unless!(check_pi_available());
+    skip_unless!(common::check_pi_available());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -97,6 +64,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
 
     // PRD #201: a `.dot-agent-deck.toml` whose `coder` role runs the REAL `pi`
     // clear=true exercises the replacement Pi process, seeded through its inbox.
+    let pi_model = common::pi_test_model().cli_args();
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
         format!(
@@ -108,7 +76,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
              start = true\n\n\
              [[orchestrations.roles]]\n\
              name = \"{WORKER_ROLE}\"\n\
-             command = \"pi --provider anthropic --model {PI_MODEL} --approve\"\n\
+             command = \"pi {pi_model} --approve\"\n\
              clear = true\n"
         ),
     )
@@ -124,26 +92,26 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     // loads our tools (incl. the native `work_done`) + status reporting exactly
     // like a production pi pane.
     let pi_home = common::race_safe_tempdir();
+    common::import_pi_credentials(&pi_home.path().join(".pi/agent"))
+        .expect("seed the Pi login into the worker's isolated agent dir");
     dot_agent_deck::orchestrator_ext::materialize(
         &dot_agent_deck::orchestrator_ext::extension_dir_under(pi_home.path()),
     )
     .expect("stage the bundled pi extension into the worker HOME");
 
-    // CRITICAL (harness caveat), and STILL required after issue #502/#785:
-    // that change forwards ANTHROPIC_API_KEY through `TuiDeckBuilder::launch`'s
-    // `inherit_pass`, and this spawn does not go through it — it builds
-    // `SpawnOptions.env` for an in-process daemon. Do not delete this as a
-    // duplicate of that.
-    // Explicitly propagate ANTHROPIC_API_KEY + HOME
-    // (+ pane/socket/PATH) into the pi child. Never print the key. The pi worker
+    // CRITICAL (harness caveat): this spawn does not go through
+    // `TuiDeckBuilder::launch` — it builds `SpawnOptions.env` for an in-process
+    // daemon — so the pi child gets exactly this environment. Pi authenticates
+    // from the login seeded into `PI_CODING_AGENT_DIR` above, or from the
+    // provider's env key when `common::pi_test_model` names one
+    // (`common::pi_env_key`). Explicitly propagate HOME (+ pane/socket/PATH)
+    // into the pi child. Never print a key. The pi worker
     // runs `dot-agent-deck work-done` from its task-file footer (or the extension's
     // `work_done` tool), so it needs the built binary on PATH and the hook socket
     // via DOT_AGENT_DECK_SOCKET; DOT_AGENT_DECK_PANE_ID tags its work-done signal
     // with this worker pane (this is the minimal env the proven `claude` worker in
-    // `e2e_delegate_work_done_chain.rs` uses, plus pi's HOME + Anthropic key).
-    let anthropic_key =
-        std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available");
-    let pi_env = vec![
+    // `e2e_delegate_work_done_chain.rs` uses, plus pi's HOME and agent dir).
+    let mut pi_env = vec![
         (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
         (
             "DOT_AGENT_DECK_SOCKET".to_string(),
@@ -158,13 +126,13 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
             "PI_CODING_AGENT_DIR".to_string(),
             pi_home.path().join(".pi/agent").display().to_string(),
         ),
-        ("ANTHROPIC_API_KEY".to_string(), anthropic_key),
     ];
+    pi_env.extend(common::pi_env_key());
 
     // Spawn a cheap placeholder (`cat`, blocks on stdin) as the worker pane, NOT
     // pi. The `clear = true` delegate below RESPAWNS this pane into the REAL pi
     // (the toml `coder` role's command), reusing THIS spawn's captured env
-    // (ANTHROPIC_API_KEY + HOME etc.) — so the respawned pi is the one under
+    // (HOME, PI_CODING_AGENT_DIR etc.) — so the respawned pi is the one under
     // test and we pay for exactly one pi boot. The placeholder exists only to
     // give `respawn_agent_for_pane` a live target for `pane_id_env`.
     // The returned agent id is intentionally unused: the `clear = true` respawn

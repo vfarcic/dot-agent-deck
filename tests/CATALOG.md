@@ -5967,14 +5967,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### chain-smoke/pi/001 — A real Pi orchestrator receives an inbox directive and delegates a sentinel task to real Claude Haiku.
 - **Layer:** L2 lane 2 (`tests/e2e_pi_orchestrator.rs`), in-process daemon and real interactive agent PTYs; headless.
-- **Agent:** Real Pi Haiku orchestrator and Claude Haiku worker, with scratch HOMEs and Pi agent directory.
+- **Agent:** Real Pi orchestrator (GPT, `common::pi_test_model()`) and Claude Haiku worker, with scratch HOMEs and Pi agent directory.
 - **Asserts:** The inbox directive becomes Acknowledged with ExtensionConfirmed and one delivery; the worker writes the sentinel at the exact literal path specified by the Bash directive, then reports work-done; Pi reports its status through the extension. Bounded sentinel/work-done waits print phase and path evidence before the 300s nextest timeout.
 - **Does not assert:** Rendered cards or exact model phrasing.
 - **Platform coverage:** mac+linux.
 
 ##### chain-smoke/pi/002 — A clear=true real Pi worker receives an inbox delegate, writes a sentinel and reports work-done.
 - **Layer:** L2 lane 2 (`tests/e2e_pi_worker.rs`), in-process daemon, synthetic orchestrator signal and real interactive Pi worker; headless.
-- **Agent:** Real Pi Haiku worker with scratch HOME and PI_CODING_AGENT_DIR.
+- **Agent:** Real Pi worker (GPT, `common::pi_test_model()`) with scratch HOME and PI_CODING_AGENT_DIR.
 - **Asserts:** The configured worker respawn receives its native inbox task, creates the sentinel at the exact literal path specified by the shell directive, then reports work-done; bounded waits print phase and path evidence before the 300s nextest timeout; the task is Acknowledged with ExtensionConfirmed and one delivery.
 - **Does not assert:** A real orchestrator model or rendered cards.
 - **Platform coverage:** mac+linux.
@@ -6213,7 +6213,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### pi/live/001 — A REAL `pi` agent runs LIVE in a PTY-attached pane and its card renders the experimental-gated Pi identity plus a real, extension-driven status TRANSITION on the vt100 grid, with NO hook (PRD #201, CLAUDE.md rule 4 + PRD #180 reel-eligibility).
 - **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`, so it is demo-reel-eligible per PRD #180, unlike the HEADLESS `chain-smoke/pi/001` + `scheduler/pi/001`). Mirrors `e2e_issue_dispatch_real.rs` / `e2e_chain_smoke_claude.rs` and the reference `scheduler/dispatch/013`. The bundled extension is materialized into the per-test HOME BEFORE launch (`TuiDeckBuilder::with_pi_extension`) so the deck's lazy-spawned daemon — and the pi child it spawns, which inherits that HOME — auto-discovers it at boot; `ANTHROPIC_API_KEY` + the built-binary PATH are threaded into the deck via `with_env` (the key is never printed). Launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
-- **Agent:** REAL `pi` (`--provider anthropic --model claude-haiku-4-5 --approve`, the cheapest tier in pi's Anthropic catalog — TEMPORARY: the pi tier is on Anthropic Haiku while the GPT accounts are without credit; the tier is provider-agnostic and the model is a one-line change) as a single interactive pane restored from a staged saved session. Flaky-tolerant lane-2 tier (real LLM) — run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when `pi` / `ANTHROPIC_API_KEY` is absent.
+- **Agent:** REAL `pi` on `common::pi_test_model()` (`openai-codex/gpt-5.6-luna` by default on the stored ChatGPT login, PRD #1666), `--approve`, as a single interactive pane restored from a staged saved session. Flaky-tolerant lane-2 tier (real LLM) — run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when `pi` or its credential is absent; a refused model fails.
 - **Asserts (on the rendered vt100 grid):** after detaching to the dashboard, the Pi pane's card shows a REAL, extension-driven status TRANSITION with NO hook installed — `Thinking` (extension `agent_start`→running), an Idle → running transition the daemon never produces on its own for a hook-less Pi pane (a freshly-spawned pane defaults to Idle, and `session_start` now reports Idle for parity with Claude/OpenCode/Codex, so `Thinking` — not the retired `Needs Input` — is the extension-only proof), then a settle back to `Idle` (extension `agent_settled`→finished, polled on the CURRENT grid so it can only be the post-turn settled frame — this is the turn-end→Idle mapping the fix changed, so a regression to "Needs Input" fails here) — and the card title carries the experimental-flag-gated first-class Pi identity (`Pi ·`, the `AgentType` Display, which the lowercase `pi` command never produces). Issue #622: the SETTLED card, read off its own rectangle (the live pi pane prints its tool calls on the same rows), also carries `Dir:`, a `Prmt:` row, a `bash — <command>` tool line and `Tools: N` with N > 0 beside `Idle` — before the fix it kept only `Dir:` and read `Tools: 0` although pi visibly ran its shell tool. The `Thinking` step is scanned over the rolling byte history so a transient frame still matches; generous 180s ceilings sized to confidence (Design Decision #7).
 - **Does not assert:** the transient `Working` badge or the active-tool line while the tool runs (a sub-second shell call; the fast-tier `pi_agent_event_cli` tests pin both through the real CLI, and the extension's event mapping is pinned by its TS unit tests); the exact prompt text on the `Prmt:` row (it is cut to the card's width); the orchestrator→worker delegation chain (a single live Pi pane fully satisfies rule 4; the delegate route is pinned headless by `chain-smoke/pi/001` and live through the inbox by `pi/live/002`); any specific text pi prints; the directed sentinel file (`pi_live_sentinel_4b1a.txt`) is a best-effort/logged secondary signal, not a gate, since the rendered status transition already proves the pi turn ran.
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
@@ -6221,7 +6221,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### pi/live/002 — Restored real Pi receives its seed through the inbox and delegates to real Claude Haiku on the live grid. [reel]
 - **Layer:** L2 lane 2 (`tests/e2e_pi_live.rs`), real binary and PTY-attached TuiDeck; production session restore and extension installation.
-- **Agent:** Real Pi Haiku orchestrator and Claude Haiku worker with isolated configuration and imported credentials.
+- **Agent:** Real Pi orchestrator (GPT, `common::pi_test_model()`) and Claude Haiku worker with isolated configuration and imported credentials.
 - **Asserts:** The restored directive triggers delegation; the worker card labels its envelope task; the worker writes the sentinel and reports work-done.
 - **Does not assert:** Exact model phrasing or the named role card's Pi identity, covered by pi/live/001.
 - **Platform coverage:** mac+linux.
@@ -6925,8 +6925,8 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 #### scheduler/pi
 
 ##### scheduler/pi/001 — A SCHEDULED, UNATTENDED real `pi` job (no TUI client attached) boots and its bundled extension reports the Pi pane's status via `agent-event`, re-broadcast on the daemon's event stream (PRD #201 M4.2).
-- **Layer:** L2 (real `daemon serve` via the `DaemonProc` harness — no PTY, no attached TUI). The schedule's `command` is a REAL `pi` (`--provider anthropic --model claude-haiku-4-5 --approve -p ready`, a cheap non-interactive turn); the bundled extension is materialized into the daemon's HOME (via `orchestrator_ext::materialize`) so the scheduler-spawned pi (which inherits that HOME) auto-discovers it. `ANTHROPIC_API_KEY` (never printed) + the freshly-built binary dir on PATH are propagated into the daemon via `spawn_daemon_serve_with_env` and inherited by the spawned pi. The fire is driven by `RunNow`; status is observed via an unattended `SubscribeEvents` consumer.
-- **Agent:** REAL `pi` 0.80.6 (cheap Haiku `-p` turn, the cheapest tier in pi's Anthropic catalog — TEMPORARY: the pi tier is on Anthropic Haiku while the GPT accounts are without credit; the tier is provider-agnostic and the model is a one-line change). Flaky-tolerant lane-2 tier — run once, not looped. Runtime-skipped (Decision 26) when `pi`/`ANTHROPIC_API_KEY` are absent.
+- **Layer:** L2 (real `daemon serve` via the `DaemonProc` harness — no PTY, no attached TUI). The schedule's `command` is a REAL `pi` on `common::pi_test_model()` (`openai-codex/gpt-5.6-luna` by default on the stored ChatGPT login, PRD #1666) (`--approve -p ready`, a cheap non-interactive turn); the bundled extension is materialized into the daemon's HOME (via `orchestrator_ext::materialize`) so the scheduler-spawned pi (which inherits that HOME) auto-discovers it. Pi's login is seeded into the daemon's HOME (`common::import_pi_credentials`, never printed) and the freshly-built binary dir on PATH is propagated into the daemon via `spawn_daemon_serve_with_env`; the spawned pi inherits both. The fire is driven by `RunNow`; status is observed via an unattended `SubscribeEvents` consumer.
+- **Agent:** REAL `pi` (a cheap `-p` turn on `common::pi_test_model()` (`openai-codex/gpt-5.6-luna` by default on the stored ChatGPT login, PRD #1666)). Flaky-tolerant lane-2 tier — run once, not looped. Runtime-skipped (Decision 26) when `pi` or its credential is absent; a refused model fails.
 - **Asserts:** after `RunNow`, the scheduled pi boots and its real extension shells `dot-agent-deck agent-event`, which the daemon ingests and re-broadcasts as a `Pi`-typed `AgentEvent` in one of the extension's mapped states (`WaitingForInput`/`Thinking`/`Idle`) carrying the scheduler-injected pane id — proving a scheduled, unattended (no-client) real pi is status-tracked through the same `AgentEvent` contract every client consumes. The match EXCLUDES `SessionStart`: the scheduler's `surface_spawned_pane` broadcasts a synthetic `SessionStart` with the `from_command`-guessed `Pi` type the instant the pane spawns (before pi's runtime boots), so requiring a non-`SessionStart` state is what makes the pass attributable to the REAL extension rather than the daemon's spawn-time guess.
 - **Does not assert:** the delegate/work-done chain (covered by `chain-smoke/pi/001`); the exact lifecycle→state mapping across running/waiting/finished (covered synthetically by `status/agent-event/003` and the TS unit tests); a dashboard-attached Pi pane (the synthetic dashboard render is `dashboard/pane/007`; the real-agent unattended path is the M4.2 value here).
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
@@ -7645,9 +7645,9 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, either specific arrival order of hook and rollout, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Codex authentication and runs nowhere in CI.
 
-##### voice/reading-reply/006 — A REAL interactive Pi Haiku turn delivers its discovered sentinel filename exactly once through the subscribed final-reply stream. [reel]
+##### voice/reading-reply/006 — A REAL interactive Pi (GPT, `common::pi_test_model()`) turn delivers its discovered sentinel filename exactly once through the subscribed final-reply stream. [reel]
 - **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, and genuine bundled Pi extension).
-- **Agent:** REAL interactive Pi on Anthropic `claude-haiku-4-5` with `--approve`, using the `pi/live/001` startup path where the daemon materializes the bundled extension in the isolated HOME.
+- **Agent:** REAL interactive Pi on `common::pi_test_model()` (`openai-codex/gpt-5.6-luna` by default on the stored ChatGPT login, PRD #1666) with `--approve`, using the `pi/live/001` startup path where the daemon materializes the bundled extension in the isolated HOME.
 - **Asserts:** a client subscribes before submitting a directive to list fixture files; within 90 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by Pi; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
 - **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Pi and `ANTHROPIC_API_KEY` and runs nowhere in CI.
@@ -9321,21 +9321,21 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 ##### inbox/pi/001 — Real idle Pi receives and acknowledges a native delegate in its attached pane. [reel]
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), real binary and PTY-attached TuiDeck.
-- **Agent:** Real interactive Pi Haiku, isolated HOME and PI_CODING_AGENT_DIR, genuine delegate CLI from a scripted orchestrator role.
+- **Agent:** Real interactive Pi (GPT, `common::pi_test_model()`), isolated HOME and PI_CODING_AGENT_DIR, genuine delegate CLI from a scripted orchestrator role.
 - **Asserts:** The task subject labels the card, real work appears in the pane, a sentinel is written, and the message is committed once and Acknowledged with ExtensionConfirmed and one delivery; no doorbell is logged.
 - **Does not assert:** Watcher-down doorbell fallback or a real orchestrator model.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/pi/002 — Three native inbox messages during a real Pi tool run execute in order in separate turns.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), real binary and PTY-attached TuiDeck with client PostMessage and passive Pi event observation.
-- **Agent:** Real interactive Pi Haiku with isolated configuration.
+- **Agent:** Real interactive Pi (GPT, `common::pi_test_model()`) with isolated configuration.
 - **Asserts:** A running bash tool finishes before A, B and C append in order; each message commits once, has a separating assistant turn, and is Acknowledged with ExtensionConfirmed and one delivery.
 - **Does not assert:** Escape cancellation or watcher-down fallback.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/pi/003 — Pi /new replaces its native watcher and receives the next message in the new session.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), real binary, PTY-attached TuiDeck and child enumeration scoped to Pi's captured pid.
-- **Agent:** Real interactive Pi Haiku with isolated configuration.
+- **Agent:** Real interactive Pi (GPT, `common::pi_test_model()`) with isolated configuration.
 - **Asserts:** /new changes the observed session, the old watcher exits, exactly one replacement remains, and a second sentinel delegate is committed in the new session and acknowledged once.
 - **Does not assert:** Session fork, reload or watcher-backoff timing.
 - **Platform coverage:** linux (uses /proc).
@@ -9460,9 +9460,9 @@ Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when sche
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
 
-##### inbox/load/003 — Pi Haiku inbox delivery under deliberate CPU pressure. [reel]
+##### inbox/load/003 — Pi inbox delivery under deliberate CPU pressure. [reel]
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_003_pi_acknowledges_seed_idle_and_busy_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
-- **Agent:** Real interactive Pi Haiku, established inbox live fixtures, isolated HOME.
+- **Agent:** Real interactive Pi (GPT, `common::pi_test_model()`), established inbox live fixtures, isolated HOME.
 - **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn all become Acknowledged and create their unique sentinel files within a 240-second agent window. Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.

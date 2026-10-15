@@ -434,6 +434,7 @@ enum CredentialImport {
     OpenCode,
     Codex,
     Devin,
+    Pi,
 }
 
 /// Builder for [`TuiDeck`]. Use the test surface
@@ -592,6 +593,20 @@ impl TuiDeckBuilder {
     /// skip a real-Codex test instead of failing during TUI launch.
     pub fn with_imported_codex_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::Codex);
+        self
+    }
+
+    /// Seed Pi's credential for [`pi_test_model`]'s provider into the isolated
+    /// per-test HOME's `.pi/agent` ([`import_pi_credentials`]), where a pane's
+    /// `pi` — and a test that sets `PI_CODING_AGENT_DIR` to that directory —
+    /// reads it. When the provider authenticates through an environment
+    /// variable instead ([`PiTestModel::env_key`]), that variable is forwarded.
+    /// Pair with [`check_pi_available`].
+    pub fn with_imported_pi_credentials(mut self) -> Self {
+        self.credential_imports.push(CredentialImport::Pi);
+        if let Some((key, value)) = pi_env_key() {
+            self = self.with_env(key, value);
+        }
         self
     }
 
@@ -1093,6 +1108,12 @@ impl TuiDeck {
                 CredentialImport::Devin => {
                     recording_redactions
                         .extend(import_devin_credentials(&home).map_err(|e| e.to_string())?);
+                }
+                CredentialImport::Pi => {
+                    recording_redactions.extend(
+                        import_pi_credentials(&home.join(".pi").join("agent"))
+                            .map_err(|e| e.to_string())?,
+                    );
                 }
             }
         }
@@ -6522,6 +6543,262 @@ pub fn codex_test_model() -> &'static str {
 pub(crate) fn codex_probe_refused_model(lower_output: &str) -> bool {
     lower_output.contains("model is not supported when using codex")
         || lower_output.contains("model not found")
+}
+
+/// Env var that overrides [`pi_test_model`], as `<provider>/<model>` — e.g.
+/// `openai/gpt-5-nano` on a host that authenticates Pi with `OPENAI_API_KEY`
+/// rather than a stored login.
+pub const PI_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_PI_TEST_MODEL";
+
+/// The cheap model every real-agent Pi test runs on, as `<provider>/<model>`.
+/// See [`pi_test_model`].
+///
+/// Measured 2026-10-15 on pi 0.84.4 with the ChatGPT Plus/Pro (Codex) login
+/// Pi's `/login` stores as `openai-codex` in `~/.pi/agent/auth.json`, by a
+/// one-turn `pi -p` asked to run one bash command writing a sentinel:
+/// `gpt-5.6-luna` wrote it, while `gpt-5.4-mini` and `gpt-5.3-codex-spark`
+/// (the two cheaper ids `pi --list-models openai-codex` offers) were refused
+/// with "The '<id>' model is not supported when using Codex with a ChatGPT
+/// account" — the refusal `tests/common` records for Codex itself
+/// ([`CODEX_TEST_MODEL_CHATGPT_DEFAULT`] is the same model, issue #656).
+///
+/// PERMANENT, not a fallback (PRD #1666): Pi's real-agent tests ran on
+/// Anthropic Haiku (`--provider anthropic --model claude-haiku-4-5`) until this
+/// host's Anthropic account hit its monthly spend limit. There is deliberately
+/// no fallback to another provider when this one refuses: a refused model fails
+/// the test ([`check_pi_available`]), so a dead id surfaces instead of quietly
+/// moving the coverage somewhere else.
+pub(crate) const PI_TEST_MODEL_DEFAULT: &str = "openai-codex/gpt-5.6-luna";
+
+/// One Pi model choice, split into what `pi --provider … --model …` takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiTestModel {
+    pub provider: String,
+    pub model: String,
+}
+
+impl PiTestModel {
+    /// `--provider <provider> --model <model>`, for a role or pane command.
+    pub fn cli_args(&self) -> String {
+        format!("--provider {} --model {}", self.provider, self.model)
+    }
+
+    /// The environment variable that authenticates this provider when no
+    /// stored login does, or `None` for a login-only provider (`openai-codex`).
+    pub fn env_key(&self) -> Option<&'static str> {
+        match self.provider.as_str() {
+            "openai" => Some(OPENAI_API_KEY_ENV),
+            "anthropic" => Some(ANTHROPIC_API_KEY_ENV),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PiTestModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.provider, self.model)
+    }
+}
+
+/// [`pi_test_model`]'s choice from the raw override value, with no
+/// environment read — the seam the fast-tier unit test drives. Unset, empty and
+/// whitespace-only all mean "use [`PI_TEST_MODEL_DEFAULT`]"; anything else must
+/// be `<provider>/<model>` with both halves non-empty. The model half may hold
+/// further slashes (an OpenRouter id is `openrouter/openai/gpt-…`): only the
+/// first separates the provider.
+pub(crate) fn pi_test_model_from(raw: Option<&str>) -> Result<PiTestModel, String> {
+    let value = raw
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(PI_TEST_MODEL_DEFAULT);
+    match value.split_once('/') {
+        Some((provider, model))
+            if !provider.trim().is_empty()
+                && !model.trim().is_empty()
+                && !value.contains(char::is_whitespace) =>
+        {
+            Ok(PiTestModel {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            })
+        }
+        _ => Err(format!(
+            "{PI_TEST_MODEL_ENV}={value:?} is not `<provider>/<model>` (e.g. {PI_TEST_MODEL_DEFAULT:?})"
+        )),
+    }
+}
+
+/// The Pi provider and model every real-agent Pi test launches:
+/// [`PI_TEST_MODEL_ENV`] when set, otherwise [`PI_TEST_MODEL_DEFAULT`].
+///
+/// Single source of truth, the [`codex_test_model`] shape: [`check_pi_available`]
+/// probes this model and [`import_pi_credentials`] seeds this provider's login,
+/// so the gate, the credential and the command a test launches cannot disagree.
+/// A malformed override panics — it is a configuration defect, and reading it
+/// as "skip" would report a test that never ran as passed.
+pub fn pi_test_model() -> &'static PiTestModel {
+    static MODEL: std::sync::OnceLock<PiTestModel> = std::sync::OnceLock::new();
+    MODEL.get_or_init(|| {
+        pi_test_model_from(std::env::var(PI_TEST_MODEL_ENV).ok().as_deref())
+            .unwrap_or_else(|why| panic!("{why}"))
+    })
+}
+
+/// Pi's agent directory on the host: `PI_CODING_AGENT_DIR` when set, else
+/// `~/.pi/agent`, where `pi`'s `/login` stores `auth.json`. Read only.
+fn host_pi_agent_dir() -> PathBuf {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| host_home().join(".pi").join("agent"))
+}
+
+/// The host's stored Pi login for `provider`, as its JSON entry, or `None` when
+/// `auth.json` is missing, a symlink, unparsable or has no such entry. No
+/// value leaves this function except to be written into an isolated copy.
+fn host_pi_login(provider: &str) -> Option<serde_json::Value> {
+    let bytes = read_credential_file_no_symlink(
+        &host_pi_agent_dir().join("auth.json"),
+        "Pi credentials not found",
+        "~/.pi/agent/auth.json",
+    )
+    .ok()?;
+    let mut auth: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    auth.as_object_mut()?
+        .remove(provider)
+        .filter(serde_json::Value::is_object)
+}
+
+/// Seed Pi's credential for [`pi_test_model`]'s provider into the ISOLATED agent
+/// directory `agent_dir` (a scratch HOME's `.pi/agent`, or whatever a test
+/// passes as `PI_CODING_AGENT_DIR`), the shape [`import_codex_credentials`] has
+/// for Codex. Only that one provider's entry is written, mode 0600, so neither
+/// the host's other logins nor anything else in its `~/.pi/agent` reaches the
+/// test. Nothing is ever written under the host's `~/.pi`.
+///
+/// A provider authenticated through its environment variable instead
+/// ([`PiTestModel::env_key`] set and no stored login) writes nothing: the
+/// caller forwards that variable. Returns the values a recording must redact,
+/// which are also registered for diagnostic redaction here.
+///
+/// A stored OAuth login carries a refresh token. If its access token expired
+/// mid-test, Pi would refresh it into this isolated copy, and a provider that
+/// rotates refresh tokens would then leave the host's copy stale — the same
+/// exposure [`import_codex_credentials`] has always had. The login seen when
+/// this was written had ten days left on its access token.
+pub fn import_pi_credentials(agent_dir: &Path) -> std::io::Result<Vec<String>> {
+    let model = pi_test_model();
+    let Some(entry) = host_pi_login(&model.provider) else {
+        if pi_env_key().is_some() {
+            return Ok(Vec::new());
+        }
+        return Err(std::io::Error::other(format!(
+            "no stored Pi login for provider {:?} in ~/.pi/agent/auth.json — run `pi` and \
+             `/login`, or set {PI_TEST_MODEL_ENV} to a model your credentials reach",
+            model.provider
+        )));
+    };
+    let document = serde_json::json!({ model.provider.clone(): entry });
+    let mut redactions = Vec::new();
+    collect_credential_values(
+        &document,
+        None,
+        CredentialScope::AuthDocument,
+        false,
+        &mut redactions,
+    );
+    normalise_redactions(&mut redactions);
+    register_diagnostic_redactions(redactions.clone());
+    std::fs::create_dir_all(agent_dir)?;
+    let bytes = serde_json::to_vec(&document).map_err(std::io::Error::other)?;
+    write_credential_file_atomic_0o600(&agent_dir.join("auth.json"), &bytes)?;
+    Ok(redactions)
+}
+
+/// The environment variable that authenticates [`pi_test_model`]'s provider and
+/// its value, when the provider takes one and it is set — for a test that
+/// builds a Pi child's environment by hand (an in-process daemon's
+/// `SpawnOptions.env`). A secret: thread it into the child, never print it.
+pub fn pi_env_key() -> Option<(String, String)> {
+    let key = pi_test_model().env_key()?;
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| (key.to_string(), value))
+}
+
+/// Does this `pi` output say the MODEL was refused, as opposed to the
+/// credential, the network or a quota? Takes the output already lowercased.
+/// Pi relays the provider's own wording: [`codex_probe_refused_model`]'s two
+/// (measured through Pi on 2026-10-15 for the ChatGPT one), plus Pi's own
+/// unknown-model message.
+pub(crate) fn pi_probe_refused_model(lower_output: &str) -> bool {
+    codex_probe_refused_model(lower_output)
+        || (lower_output.contains("model") && lower_output.contains("not found"))
+}
+
+/// Runtime-skip helper for every real-agent Pi test: `pi` on PATH, a credential
+/// for [`pi_test_model`]'s provider (a stored login, or its env key), and one
+/// minimal `pi -p` turn on that model in an isolated agent directory seeded by
+/// [`import_pi_credentials`]. Prints the provider/model it checked, so a run's
+/// output names what it spent.
+///
+/// **A refused model panics instead of skipping** (issue #656's rule, applied to
+/// Pi by PRD #1666): Pi is installed and authenticated by then, so the model id
+/// is the one thing wrong, and a skip would be counted as a pass. A credential,
+/// network or quota failure still skips.
+pub fn check_pi_available() -> Result<(), String> {
+    install_credential_redaction();
+    let model = pi_test_model();
+    eprintln!("[e2e] real-agent Pi model: {model}");
+    if !cli_invocable("pi") {
+        return Err("pi CLI not installed (could not invoke `pi --version`)".into());
+    }
+    let probe_home = race_safe_tempdir();
+    let agent_dir = probe_home.path().join(".pi").join("agent");
+    import_pi_credentials(&agent_dir).map_err(|e| e.to_string())?;
+
+    let ceiling = load_scaled(CODEX_PREFLIGHT_BASE);
+    let mut probe = std::process::Command::new("pi");
+    probe
+        .args(["--provider", &model.provider, "--model", &model.model])
+        .args([
+            "--no-approve",
+            "-p",
+            "Reply with exactly PI_AUTH_OK and do not use tools.",
+        ])
+        .current_dir(probe_home.path())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", probe_home.path())
+        .env("PI_CODING_AGENT_DIR", &agent_dir);
+    if let Some((key, value)) = pi_env_key() {
+        probe.env(key, value);
+    }
+    let (status, output) = run_codex_preflight(&mut probe, Instant::now() + ceiling)?;
+    let Some(status) = status else {
+        return Err(format!(
+            "Pi preflight on {model} did not finish within {ceiling:?}"
+        ));
+    };
+    let lower = output.to_ascii_lowercase();
+    if !output.contains("PI_AUTH_OK") && pi_probe_refused_model(&lower) {
+        discard_previous_recording(&current_test_name());
+        panic!(
+            "Pi is installed and has a credential for provider {:?}, but it refused model \
+             {model}, so this real-agent test cannot run. Set {PI_TEST_MODEL_ENV} to a \
+             `<provider>/<model>` these credentials accept, or update PI_TEST_MODEL_DEFAULT \
+             ({PI_TEST_MODEL_DEFAULT:?}) in tests/common/mod.rs if the id was retired.",
+            model.provider
+        );
+    }
+    if !status.success() || !output.contains("PI_AUTH_OK") {
+        return Err(format!(
+            "Pi could not complete a one-turn probe on {model} (expired login, network or \
+             quota); run `pi` and `/login`, or set {PI_TEST_MODEL_ENV}"
+        ));
+    }
+    Ok(())
 }
 
 /// Compiled-in default cheap model for real-agent OpenCode e2e coverage.

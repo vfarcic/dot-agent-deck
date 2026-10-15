@@ -36,15 +36,13 @@
 //! `#[tokio::test] async fn` would misbind — same pattern as `session/live/007`).
 //!
 //! ## pi model + worker agent
-//! - **Orchestrator:** real `pi` (0.80.6) via `--provider anthropic --model
-//!   claude-haiku-4-5` — the cheapest tier in pi's Anthropic catalog, and it
-//!   tool-calls; `--approve` clears pi's project-local trust so the `delegate`
-//!   tool executes without a permission prompt (pi is YOLO/no-permission by
-//!   default). Confirmed out-of-band that claude-haiku-4-5 loads the extension
-//!   and calls `delegate`. No `--thinking` flag is passed, so thinking stays at
-//!   the model default. TEMPORARY: this tier is on Anthropic Haiku while the GPT
-//!   accounts are without credit — the tier is provider-agnostic and the model is
-//!   a one-line change (`PI_MODEL` + the `--provider` flag + the key name).
+//! - **Orchestrator:** real `pi` on `common::pi_test_model()` — by default
+//!   `--provider openai-codex --model gpt-5.6-luna`, the cheapest GPT model the
+//!   stored ChatGPT login answers on (PRD #1666; the measurement is on
+//!   `PI_TEST_MODEL_DEFAULT`), overridable with `DOT_AGENT_DECK_PI_TEST_MODEL`.
+//!   `--approve` clears pi's project-local trust so the `delegate` tool executes
+//!   without a permission prompt (pi is YOLO/no-permission by default). No
+//!   `--thinking` flag is passed, so thinking stays at the model default.
 //! - **Worker:** real `claude` Haiku (`claude-haiku-4-5-20251001`) — the proven
 //!   chain-test worker; directive-following and cheap. Chosen over OpenCode
 //!   because OpenCode's tool-permission sandbox gates `.dot-agent-deck` reads /
@@ -52,19 +50,19 @@
 //!   which would block the full work-done loop for reasons orthogonal to M4.1.
 //!
 //! ## Credentials (Design Decision #5, harness caveat)
-//! pi authenticates to Anthropic via `ANTHROPIC_API_KEY` (vals-sourced in the devbox
-//! shell). `AgentPtyRegistry::spawn_agent` inherits the parent env and
-//! overlays `opts.env`; M4.1 EXPLICITLY propagates `ANTHROPIC_API_KEY` + `HOME`
-//! (+ the pane/socket/PATH vars) into the pi child's `opts.env`, and M4.2 passes
-//! them into the daemon (which the scheduler-spawned pi inherits) — so pi starts
-//! with the key regardless of how the runner scrubs the environment. The key is
-//! NEVER printed (only checked non-empty for the runtime-skip).
+//! pi authenticates from the host's stored login for the test model's provider,
+//! which `common::import_pi_credentials` copies (that one entry only) into the
+//! scratch agent dir pi is pointed at — the host's `~/.pi` is never written. A
+//! provider that authenticates through an env key instead has it forwarded by
+//! `common::pi_env_key`. M4.1 EXPLICITLY sets `HOME` + `PI_CODING_AGENT_DIR`
+//! (+ the pane/socket/PATH vars) in the pi child's `opts.env`, and M4.2 seeds
+//! the daemon's HOME (which the scheduler-spawned pi inherits). No credential is
+//! printed.
 //!
-//! Tier: e2e (`#[cfg(feature = "e2e")]`) — spawns real agents, hits a real model.
-//! Runtime-skipped (Decision 26) when `pi`/`claude`/credentials/`ANTHROPIC_API_KEY`
-//! are absent.
+//! Tier: lane 2 — spawns real agents, hits a real model. Runtime-skipped
+//! (Decision 26) when `pi`/`claude` or their credentials are absent; a model the
+//! credentials refuse fails instead (`common::check_pi_available`).
 
-use std::process::Stdio;
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -80,13 +78,6 @@ const ORCH_PANE: &str = "pi-orchestrator-pane";
 const WORKER_PANE: &str = "worker-pane";
 const WORKER_ROLE: &str = "coder";
 const PINNED_CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
-/// Cheapest tier in pi's Anthropic catalog, and it tool-calls (verified
-/// out-of-band: loads the extension + calls `delegate`).
-///
-/// TEMPORARY: the pi tier runs on Anthropic Haiku while the GPT accounts are
-/// without credit. The tier itself is provider-agnostic — moving it back is
-/// this constant plus the `--provider` flag and the key name below.
-const PI_MODEL: &str = "claude-haiku-4-5";
 /// The sentinel the worker must create. Distinctive + lands in a fresh tempdir
 /// cwd, so it is unique by construction and unambiguous on the worker pane.
 const SENTINEL_NAME: &str = "pi_orch_sentinel_7c3f.txt";
@@ -95,29 +86,6 @@ const SENTINEL_CONTENT: &str = "PI_ORCH_SENTINEL_OK";
 // ---------------------------------------------------------------------------
 // Non-polling helpers (kept in-file; all sleeping/polling is in `common`).
 // ---------------------------------------------------------------------------
-
-/// `pi` on PATH AND a non-empty `ANTHROPIC_API_KEY`. The key is only checked
-/// for presence — never printed or logged (it is a secret; the auto-mode
-/// classifier blocks any substring of it).
-fn check_pi_available() -> Result<(), String> {
-    let ok = std::process::Command::new("pi")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        return Err("pi CLI not installed (could not invoke `pi --version`)".into());
-    }
-    match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.trim().is_empty() => Ok(()),
-        _ => {
-            Err("ANTHROPIC_API_KEY not set — real-pi orchestrator e2e needs Anthropic auth".into())
-        }
-    }
-}
 
 /// Build an isolated `HOME` for the Claude worker that (a) carries the host
 /// credentials/onboarding so auth works without a fresh login, and (b) pre-marks
@@ -162,12 +130,13 @@ fn prepare_claude_home(worker_cwd: &str) -> TempDir {
 /// (session_start → finished/Idle on boot, then agent_start → running/Thinking
 /// on the turn) fires independent of the model's decision.
 fn pi_schedule_toml(working_dir: &str) -> String {
+    let pi_model = common::pi_test_model().cli_args();
     format!(
         "[[scheduled_tasks]]\n\
          name = \"pi-unattended\"\n\
          cron = \"0 0 1 1 *\"\n\
          working_dir = \"{working_dir}\"\n\
-         command = \"pi --provider anthropic --model {PI_MODEL} --approve -p ready\"\n\
+         command = \"pi {pi_model} --approve -p ready\"\n\
          prompt = \"ready\"\n\
          enabled = true\n\n"
     )
@@ -182,7 +151,7 @@ fn pi_schedule_toml(working_dir: &str) -> String {
 #[test]
 fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker() {
     skip_unless!(common::check_claude_available());
-    skip_unless!(check_pi_available());
+    skip_unless!(common::check_pi_available());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -286,6 +255,8 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     // daemon-startup seam. `pi_home` is propagated as the pi child's HOME via
     // `opts.env` below.
     let pi_home = common::race_safe_tempdir();
+    common::import_pi_credentials(&pi_home.path().join(".pi/agent"))
+        .expect("seed the Pi login into the orchestrator's isolated agent dir");
     dot_agent_deck::orchestrator_ext::materialize(
         &dot_agent_deck::orchestrator_ext::extension_dir_under(pi_home.path()),
     )
@@ -295,16 +266,12 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     // session_start (→ finished/Idle) status report can't be missed.
     let event_log = common::BroadcastEventLog::start(&daemon.event_tx);
 
-    // CRITICAL (harness caveat), and STILL required after issue #502/#785:
-    // that change forwards ANTHROPIC_API_KEY through `TuiDeckBuilder::launch`'s
-    // `inherit_pass`, and this spawn does not go through it — it builds
-    // `SpawnOptions.env` for an in-process daemon. Do not delete this as a
-    // duplicate of that.
-    // Explicitly propagate ANTHROPIC_API_KEY + HOME
-    // (+ pane/socket/PATH) into the pi child. Never print the key.
-    let anthropic_key =
-        std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available");
-    let pi_env = vec![
+    // CRITICAL (harness caveat): this spawn does not go through
+    // `TuiDeckBuilder::launch` — it builds `SpawnOptions.env` for an in-process
+    // daemon — so the pi child gets exactly this environment. Pi authenticates
+    // from the login seeded into `PI_CODING_AGENT_DIR` above, or from the
+    // provider's env key (`common::pi_env_key`). Never print a key.
+    let mut pi_env = vec![
         (DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string()),
         (
             DOT_AGENT_DECK_AGENT_ID.to_string(),
@@ -323,8 +290,8 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
             "PI_CODING_AGENT_DIR".to_string(),
             pi_home.path().join(".pi/agent").display().to_string(),
         ),
-        ("ANTHROPIC_API_KEY".to_string(), anthropic_key),
     ];
+    pi_env.extend(common::pi_env_key());
 
     // The directive is delivered through the inbox, without CLI-arg or PTY delivery.
     let directive = format!(
@@ -336,7 +303,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
          signal completion. Do NOT do the work yourself — only call the delegate tool, then stop."
     );
     // Pi boots idle and its extension waits for inbox messages.
-    let pi_command = format!("pi --provider anthropic --model {PI_MODEL} --approve");
+    let pi_command = format!("pi {} --approve", common::pi_test_model().cli_args());
 
     let orch_agent_id = daemon
         .registry
@@ -485,8 +452,8 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
 
 /// Scenario: Start the real `daemon serve` headlessly (no TUI client attached)
 /// with a CLEAN HOME and register one enabled schedule whose command is a REAL
-/// `pi` (cheap `-p`, cheap Haiku turn). Propagate `ANTHROPIC_API_KEY` + the
-/// built-binary PATH into the daemon (which the scheduler-spawned pi inherits,
+/// `pi` (cheap `-p` turn on `common::pi_test_model()`). Seed Pi's login into the
+/// daemon's HOME and propagate the built-binary PATH into the daemon (which the scheduler-spawned pi inherits,
 /// along with `HOME` + `DOT_AGENT_DECK_SOCKET`); the daemon-startup
 /// auto-materialize puts the bundled extension into that HOME as the daemon
 /// boots — no manual setup. Subscribe as an UNATTENDED `SubscribeEvents` consumer
@@ -497,7 +464,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
 #[spec("scheduler/pi/001")]
 #[test]
 fn scheduler_pi_001_scheduled_unattended_status_via_extension() {
-    skip_unless!(check_pi_available());
+    skip_unless!(common::check_pi_available());
 
     let scratch = common::harness_tempdir().expect("scratch tempdir");
     let work = scratch.path().join("pi-work");
@@ -505,22 +472,23 @@ fn scheduler_pi_001_scheduled_unattended_status_via_extension() {
 
     let toml = pi_schedule_toml(&work.to_string_lossy());
 
-    // The scheduler-spawned pi inherits the daemon's env: propagate the Anthropic
-    // key (never printed) and prepend the freshly-built binary dir to PATH so pi's
-    // extension resolves `dot-agent-deck agent-event`. HOME + DOT_AGENT_DECK_SOCKET
-    // are set by the daemon-serve harness and inherited by the child.
-    let anthropic_key =
-        std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available");
+    // The scheduler-spawned pi inherits the daemon's env: prepend the
+    // freshly-built binary dir to PATH so pi's extension resolves `dot-agent-deck
+    // agent-event`, and forward the provider's env key when it takes one (never
+    // printed). HOME + DOT_AGENT_DECK_SOCKET are set by the daemon-serve harness
+    // and inherited by the child.
     let path_env = common::path_with_binary_dir();
+    let env_key = common::pi_env_key();
+    let mut env: Vec<(&str, &str)> = vec![("PATH", path_env.as_str())];
+    if let Some((key, value)) = env_key.as_ref() {
+        env.push((key.as_str(), value.as_str()));
+    }
 
-    let daemon = common::spawn_daemon_serve_with_env(
-        Some(&toml),
-        "0",
-        &[
-            ("ANTHROPIC_API_KEY", anthropic_key.as_str()),
-            ("PATH", path_env.as_str()),
-        ],
-    );
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    // Pi reads its login from the daemon's HOME, which the scheduled pi inherits;
+    // seeded before `RunNow`, so before pi boots.
+    common::import_pi_credentials(&daemon.home.join(".pi/agent"))
+        .expect("seed the Pi login into the daemon's HOME");
 
     // No manual `orchestrator_ext::materialize` here: this is a REAL
     // `daemon serve`, so the daemon-startup auto-materialize (PRD #201, the

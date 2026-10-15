@@ -4,26 +4,15 @@
 use crate::{common, inbox};
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 pub const BUDGET: Duration = Duration::from_secs(120);
 pub const CONTENT: &str = "PI_INBOX_OK_42c7";
 
+/// `common::check_pi_available`: Pi installed, a credential for
+/// `common::pi_test_model()`'s provider, and a one-turn probe on that model.
 pub fn available() -> Result<(), String> {
-    common::install_credential_redaction();
-    let output = Command::new("pi")
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("Pi unavailable: {e}"))?;
-    if !output.status.success() {
-        return Err("pi --version failed".into());
-    }
-    if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
-        Ok(())
-    } else {
-        Err("ANTHROPIC_API_KEY required for real Pi inbox tests".into())
-    }
+    common::check_pi_available()
 }
 
 pub struct Pi {
@@ -44,6 +33,9 @@ impl Pi {
             .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
             .with_env("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "180000")
             .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "600")
+            // Seeds `<HOME>/.pi/agent/auth.json`, the `PI_CODING_AGENT_DIR`
+            // the Pi pane below is given.
+            .with_imported_pi_credentials()
             .launch_with_fixture("minimal");
         assert!(deck.wait_for_grid_string_within("No active agents", BUDGET));
         let work = deck.workdir().join("project");
@@ -77,8 +69,8 @@ export default function(pi) {
             installed.parent().unwrap().display(),
             std::env::var("PATH").unwrap()
         );
-        let command = "exec pi --provider anthropic --model claude-haiku-4-5 --approve";
-        let role_command = common::capability_export_command(command);
+        let command = format!("exec pi {} --approve", common::pi_test_model().cli_args());
+        let role_command = common::capability_export_command(&command);
         std::fs::write(work.join(".dot-agent-deck.toml"), format!(
             "[[orchestrations]]\nname = \"pi-inbox\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"./delegate-loop.sh\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {role_command:?}\nagent = \"pi\"\nclear = false\n"
         )).unwrap();

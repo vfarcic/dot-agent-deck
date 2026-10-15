@@ -247,7 +247,7 @@ fn seeds(deck: &TuiDeck, work: &Path, kind: &str, deadline: Instant, doorbell_on
             "exec opencode --model {} --auto",
             common::opencode_test_model()
         ),
-        "pi" => "exec pi --provider anthropic --model claude-haiku-4-5 --approve".into(),
+        "pi" => format!("exec pi {} --approve", common::pi_test_model().cli_args()),
         "codex" => format!(
             "exec codex --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
             common::codex_test_model()
@@ -484,7 +484,7 @@ fn load_002_opencode_acknowledges_seed_idle_and_busy_under_cpu_pressure() {
     exercise(&op.deck, &op.pane, &op.work, "opencode", false);
 }
 
-/// Scenario: Under three busy-loop processes per CPU, run real interactive Pi Haiku through spawn seed, idle and a sleep-tool turn. All 20 messages must be acknowledged and create their unique sentinels before its deadline, leaving no deck text in its composer.
+/// Scenario: Under three busy-loop processes per CPU, run real interactive Pi through spawn seed, idle and a sleep-tool turn. All 20 messages must be acknowledged and create their unique sentinels before its deadline, leaving no deck text in its composer.
 #[spec("inbox/load/003")]
 #[test]
 fn load_003_pi_acknowledges_seed_idle_and_busy_under_cpu_pressure() {
