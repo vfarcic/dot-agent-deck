@@ -43,6 +43,11 @@ class Watcher extends EventEmitter {
 let spawned: { bin: string; argv: string[]; options: any; child: Watcher }[];
 beforeEach(() => {
 	spawned = [];
+	// What Pi committed and left unconfirmed is kept per process, across
+	// session replacements; each test here is its own process's worth.
+	const shared = (globalThis as any)[Symbol.for("dot-agent-deck.pi-inbox")];
+	shared?.committed?.clear();
+	shared?.unconfirmed?.clear();
 	mock.method(childProcess, "spawn", (bin: string, argv: string[], options: any) => {
 		const child = new Watcher(41000 + spawned.length);
 		spawned.push({ bin, argv, options, child });
@@ -797,4 +802,40 @@ test("pi_inbox_028_an_acknowledgement_that_finally_fails_is_reported", async (t)
 	for (let i = 0; i < 10; i++) { t.mock.timers.tick(60_000); await pi.quiesce(); }
 	assert.equal([...attempts.values()].reduce((a, b) => a + b, 0), before, "nothing is retried after the outcome is reported");
 	pi.shutdown();
+});
+
+/// Scenario: Pi commits an inbox message whose acknowledgement the deck has not confirmed yet, and the session is then replaced with /new before a confirmation succeeds. The next session's extension instance goes on confirming that acknowledgement with the deck CLI, and when the deck hands the message over again in the new session it is acknowledged, not handed to Pi a second time.
+test("pi_inbox_029_an_unconfirmed_acknowledgement_survives_a_session_replacement", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const old = fixture(); const pi = admission(old);
+	const [id] = idsN(1);
+	old.pi.exec = async (_bin: string, argv: string[]) =>
+		argv[0] === "ack"
+			? ackReply({ acknowledged: false, final: false, reason: "the deck is not reachable" })
+			: { code: 0, stdout: "", stderr: "", killed: false };
+	await old.emit("session_start"); const first = old.watcher();
+	first.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	if (pi.running) await pi.settle();
+	await pi.quiesce();
+	assert.equal(commitsOf(pi.committed, id), 1);
+	first.emit("exit", 1, null);
+	t.mock.timers.tick(1000); await pi.quiesce();
+	await old.emit("session_shutdown", { reason: "new" });
+
+	const current = fixture();
+	const acksByCli: string[] = [];
+	current.pi.exec = async (_bin: string, argv: string[]) => {
+		if (argv[0] !== "ack") return { code: 0, stdout: "", stderr: "", killed: false };
+		acksByCli.push(argv[argv.length - 1]);
+		return ackReply({ acknowledged: true });
+	};
+	await current.emit("session_start", { reason: "new" }); const next = current.watcher();
+	for (let i = 0; i < 4; i++) { t.mock.timers.tick(60_000); await pi.quiesce(); }
+	assert.deepEqual(acksByCli, [id], "the new session confirms the acknowledgement the old one left unconfirmed");
+	next.stdout.emit("data", Buffer.from(line(id) + "\n"));
+	await pi.quiesce();
+	assert.equal(current.sent.length, 0, "a message the old session committed is not handed to Pi again");
+	assert.deepEqual(acksOf(next), [id], "its redelivery is acknowledged instead");
+	await current.emit("session_shutdown", { reason: "quit" });
 });

@@ -128,11 +128,28 @@ interface WatcherChild {
 interface InboxShared {
 	generation: number;
 	watcher?: WatcherChild;
+	/**
+	 * The message ids Pi committed in this process, at most
+	 * `MAX_COMMITTED_IDS`. A session replacement keeps them, so the deck
+	 * handing one over again in the next session is acknowledged, not run.
+	 */
+	committed: Set<string>;
+	/**
+	 * Committed ids whose acknowledgement the deck has not confirmed, with the
+	 * confirmations asked so far. A session replacement keeps them, and the
+	 * next instance goes on confirming them.
+	 */
+	unconfirmed: Map<string, number>;
 }
 const INBOX_SHARED = Symbol.for("dot-agent-deck.pi-inbox");
 function inboxShared(): InboxShared {
-	const holder = globalThis as unknown as Record<symbol, InboxShared | undefined>;
-	return (holder[INBOX_SHARED] ??= { generation: 0 });
+	const holder = globalThis as unknown as Record<symbol, Partial<InboxShared> | undefined>;
+	// A reload of an older copy of this module may have left an object without the newer fields.
+	const shared = (holder[INBOX_SHARED] ??= {});
+	shared.generation ??= 0;
+	shared.committed ??= new Set();
+	shared.unconfirmed ??= new Map();
+	return shared as InboxShared;
 }
 
 /** Close a watcher's stdin (it exits on EOF), then SIGTERM it. */
@@ -214,7 +231,7 @@ function createPiInbox(pi: ExtensionAPI) {
 	let watcher: WatcherChild | undefined;
 	let respawn: ReturnType<typeof setTimeout> | undefined;
 	const fromDoorbell = new Set<string>();
-	const committedIds = new Set<string>();
+	const committedIds = inboxShared().committed;
 	/** The latest context Pi handed this instance, to ask whether it is idle. */
 	let context: ExtensionContext | undefined;
 	/** Runs Pi started in this session (`agent_start`), to date each hand-over. */
@@ -234,8 +251,9 @@ function createPiInbox(pi: ExtensionAPI) {
 	 * confirmations asked so far. The watcher's stdin answers nothing, and the
 	 * deck may never hand a message over again (it ran out of hand-overs, or
 	 * allows one), so each is confirmed with the CLI until the deck records it.
+	 * Shared with the instance that replaces this one ([`InboxShared`]).
 	 */
-	const unconfirmed = new Map<string, number>();
+	const unconfirmed = inboxShared().unconfirmed;
 	let confirmTimer: ReturnType<typeof setTimeout> | undefined;
 	let confirming = false;
 	let confirmAgain = false;
@@ -502,6 +520,10 @@ function createPiInbox(pi: ExtensionAPI) {
 				} catch {
 					// A stale `pi`, or the CLI did not run: not confirmed.
 				}
+				if (!current()) {
+					// Replaced meanwhile: the next instance asks again, and counts that ask.
+					return;
+				}
 				if (!unconfirmed.has(id)) {
 					continue;
 				}
@@ -662,14 +684,18 @@ function createPiInbox(pi: ExtensionAPI) {
 			shared.watcher = undefined;
 			fixedBackoff = watcherBackoffOverride(process.env);
 			spawnWatcher(fixedBackoff ?? WATCHER_BACKOFF_MIN_MS);
+			// What the session this one replaced left unconfirmed.
+			if (unconfirmed.size > 0) {
+				void confirm();
+			}
 		},
 
 		/** This instance's session ended: stop its watcher and never respawn it. */
 		stop(): void {
 			active = false;
 			clearRecheck();
+			// The unconfirmed acknowledgements stay, for the instance that replaces this one.
 			clearConfirm();
-			unconfirmed.clear();
 			outstanding = [];
 			admitting = undefined;
 			held = [];
