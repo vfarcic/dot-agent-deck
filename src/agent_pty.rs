@@ -2075,10 +2075,9 @@ impl AgentBus {
 ///
 /// Worker-exit sweep: loop exit is also the daemon's earliest, unconditional
 /// "this process is gone" signal, so — for a process that died WITHOUT the
-/// daemon's own doing — it retires any armed
-/// `OutstandingDelegation`/`SilenceWatchRecord` for this pane via
-/// [`AgentPtyRegistry::sweep_delegations_on_exit`] — instead of leaving
-/// either record armed for its full timeout window when the pane's process
+/// daemon's own doing — it retires any armed `OutstandingDelegation` for this
+/// pane via [`AgentPtyRegistry::sweep_delegations_on_exit`] — instead of
+/// leaving it armed for its full timeout window when the pane's process
 /// exited on its own, without ever calling `work-done` or going through an
 /// explicit `StopAgent` close. `pane_id_env` is `None` for a spawn that
 /// never carried one (most unit-test fixtures), in which case there is
@@ -3250,15 +3249,14 @@ where
 const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
 
 /// Issue #424 S1 (both reviewers): where one pane's user-input stream is, as far
-/// as the submit-drain needs to know.
+/// as telling a submission apart from a draft needs to know.
 ///
-/// The drain has to answer "did the user SUBMIT the input box", and the only
-/// evidence the daemon has is the bytes it forwards. Two separate things make
-/// "scan for a CR or an LF" the wrong answer, and each one produced the same
-/// unsafe outcome: the records of a box that still held our payload AND the
-/// user's fresh draft were cleared, after which the replacement no longer
-/// recognized itself as a repeat and submitted payload + draft + payload as one
-/// turn — the precise outcome the guard exists to prevent.
+/// The question is "did the user SUBMIT the input box", and the only evidence
+/// the daemon has is the bytes it forwards. Two separate things make "scan for
+/// a CR or an LF" the wrong answer: each reads a box that still holds the
+/// user's draft as submitted. (Before PRD #1666 that let the typed delivery
+/// submit payload + draft + payload as one turn; today the draft bit it clears
+/// is what the doorbell waits on — see [`AgentPtyRegistry::draft_pending`].)
 ///
 /// **Framing.** The real TUI forwards `ESC[200~…\n…ESC[201~` when the child
 /// advertises bracketed paste. Those newlines are EDITOR CONTENT, and an agent
@@ -3270,31 +3268,28 @@ const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
 /// contract, so it is asked of [`crate::ui::user_byte_submits_input_box`], which
 /// sits next to the encoder that produced the byte. `Ctrl+J` is forwarded as
 /// exactly an LF and `Alt+Enter` as exactly `ESC` `CR`, both of which are
-/// NEWLINE keys the user pressed to keep typing — reading them as submissions is
-/// how a plain draft, with no paste and no attacker anywhere near it, reached
-/// the doubled-submit above.
+/// NEWLINE keys the user pressed to keep typing — reading them as submissions
+/// would clear the draft of a box a plain draft, with no paste and no attacker
+/// anywhere near it, still holds.
 ///
 /// The state is carried ACROSS calls because a paste — and equally an
 /// `Alt+Enter` — arrives as however many writes the client happens to make; a
 /// marker or a two-byte frame split between two of them still matches.
 /// Interleaving from two attached clients can leave `in_paste` stuck true or
-/// misattribute one client's ESC to another's CR, and both of those suppress
-/// drains — that direction only refuses a later same-payload delivery (reported,
-/// and bounded by [`PAYLOAD_RECORD_TTL`]), never admits a doubled one.
+/// misattribute one client's ESC to another's CR. Both of those miss a
+/// submission rather than invent one, so the box reads as holding a draft for
+/// longer than it does, never for shorter.
 ///
 /// **One stream, both senders** (issue #544, PR #1398 finding #16). The PTY
 /// reads ONE interleaved byte stream, so this is fed all of it: the user's
 /// bytes ([`PaneInputState::note_user_bytes`]) and the exact bytes the deck
 /// writes ([`PaneInputState::note_deck_bytes`], through [`PaneWriter::daemon`])
-/// — payload, its own paste framing, its CR or LF, the erases that drain a
-/// partial write — each at the moment the writer accepts it, under the writer
+/// — today the doorbell's — each at the moment the writer accepts it, under the writer
 /// lock, so the order here is the order at the PTY. Framing and the keypress
 /// behind a byte do not care who sent it: our CR ends the user's half-sent
 /// `ESC`, a multi-line payload's `ESC[201~` closes a paste the user left open,
 /// and a user's partial marker completed by our bytes is a marker. Origin
-/// decides only the draft bit (see [`crate::draft_deferral::DraftTracker`])
-/// and nothing about the #424 payload records, which only the USER's submit
-/// drains.
+/// decides only the draft bit (see [`crate::draft_deferral::DraftTracker`]).
 #[derive(Default)]
 struct PaneInputStream {
     /// How many bytes of a paste marker have matched so far.
@@ -3841,30 +3836,9 @@ struct PtyJob {
 pub(crate) struct PtyInFlight {
     count: std::sync::atomic::AtomicUsize,
     idle: Notify,
-    /// When the thread started the job it is in now, as milliseconds since
-    /// [`pty_clock_epoch`] plus one; `0` while it is between jobs. What tells a
-    /// PTY that has stopped taking bytes apart from a writer that is merely
-    /// busy — see [`Self::stuck_for`].
-    busy_since: AtomicU64,
-}
-
-/// Issue #525: the origin of [`PtyInFlight::busy_since`]'s clock — the wall
-/// clock, for the reason [`within_real_time`] gives.
-fn pty_clock_epoch() -> Instant {
-    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    *EPOCH.get_or_init(Instant::now)
 }
 
 impl PtyInFlight {
-    fn job_started(&self) {
-        let now = pty_clock_epoch().elapsed().as_millis() as u64 + 1;
-        self.busy_since.store(now, Ordering::SeqCst);
-    }
-
-    fn job_finished(&self) {
-        self.busy_since.store(0, Ordering::SeqCst);
-    }
-
     fn leave(&self) {
         if self.count.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.idle.notify_waiters();
@@ -3968,7 +3942,6 @@ impl PtyWriterThread {
                         // Withdrawn by a caller that stopped waiting.
                         continue;
                     }
-                    thread_in_flight.job_started();
                     let done = match job.op {
                         PtyOp::Write(buf, source) => match inner.write(&buf) {
                             Ok(n) => {
@@ -4017,13 +3990,11 @@ impl PtyWriterThread {
                         },
                         #[cfg(test)]
                         PtyOp::Surrender(back) => {
-                            thread_in_flight.job_finished();
                             thread_in_flight.leave();
                             let _ = back.send((inner, recorder));
                             return;
                         }
                     };
-                    thread_in_flight.job_finished();
                     // Answered BEFORE it counts as finished, so a caller whose
                     // bound runs out in between finds the answer rather than
                     // reporting a finished write as stalled.
@@ -4315,14 +4286,12 @@ impl<W: std::io::Write + Send> PtySink for W {
 /// record.
 ///
 /// "Accepted" is the only count there is: a partial write feeds the prefix
-/// that went in, and the erases [`drain_stranded_payload`] sends are fed like
-/// any other byte. Accepted is not proven delivered — a later flush can fail —
+/// that went in. Accepted is not proven delivered — a later flush can fail —
 /// so for those bytes the stream can run ahead of the PTY. Deck bytes never set
 /// the draft bit, so what that can cost is framing or a clear: a paste our
-/// partial write opened reads as open (first writes wait, up to the cap), or a
-/// CR the writer accepted and the PTY never received reads as a submit. The
-/// second is the judgement `PayloadDelivery::Applied` already makes: nothing
-/// after `write` tells an accepted one-byte CR from a delivered one.
+/// partial write opened reads as open, or a CR the writer accepted and the PTY
+/// never received reads as a submit. Nothing after `write` tells an accepted
+/// one-byte CR from a delivered one.
 ///
 /// Issue #525: a write the PTY has not finished taking after `stall` is left
 /// to the thread and reported [`WriteProgress::Stalled`]; its bytes are
@@ -4330,8 +4299,9 @@ impl<W: std::io::Write + Send> PtySink for W {
 struct DeckSink<'a> {
     writer: &'a PaneWriter,
     stall: Duration,
-    /// Set once any write through this sink has reached the PTY — see
-    /// [`UnfinishedDelivery`].
+    /// Set once any write through this sink has reached the PTY. The one
+    /// production sink, the doorbell's, hands in a flag nothing reads since
+    /// PRD #1666 removed the typed delivery that did.
     committed: Arc<AtomicBool>,
     /// The flush the last write ran in its own job, which the next
     /// [`PtySink::flush_tracked`] reports instead of sending one of its own.
@@ -5259,8 +5229,7 @@ pub struct AgentPtyRegistry {
     /// unit's task is delivered, and `AppState::handle_work_done` resolves
     /// under the state READ lock, which cannot mutate a plain `AppState` field.
     /// This registry is already the daemon's interior-mutable home for exactly
-    /// this shape of per-pane bookkeeping (delegations, silence watches,
-    /// commissions), and it is the one thing both ends are handed.
+    /// this shape of per-pane bookkeeping (delegations, commissions), and it is the one thing both ends are handed.
     dispatch_returns: Mutex<crate::dispatch_return::DispatchReturns>,
     /// PRD #1105 — the coalescing gate every `focus-gained` request passes
     /// through before [`Self::record_focus`]; see [`Self::accept_focus_claim`].
@@ -5496,7 +5465,7 @@ struct DelegationTracker {
     /// [`WaitingNoticeRecord`].
     waiting_notices: HashMap<String, WaitingNoticeRecord>,
     /// Issue #447: when each worker pane last had a waiting-for-input notice
-    /// SUBMITTED to its orchestrator, so the next one waits out
+    /// posted to its orchestrator, so the next one waits out
     /// [`AgentPtyRegistry::arm_waiting_notice`]'s cooldown. Removed on pane
     /// close, so it is bounded by the panes alive.
     waiting_notice_sent_at: HashMap<String, Instant>,
@@ -5912,16 +5881,6 @@ pub enum WorkDoneProvenance {
     Unsolicited,
 }
 
-/// PRD #249 M3 review (finding B4/S4): handed back by
-/// [`AgentPtyRegistry::arm_silence_watch`] to the caller that spawns the watch
-/// task — the record's generation and the cancellation channel the task must
-/// select on alongside its event wait.
-#[derive(Debug)]
-pub struct ArmedSilenceWatch {
-    pub seq: u64,
-    pub cancel: oneshot::Receiver<()>,
-}
-
 /// PRD #126: one delegation the daemon is still waiting on a `work-done` for.
 /// Carries everything the watch task needs to compose, authorize and deliver
 /// the idle prompt without re-entering `AppState`.
@@ -5991,20 +5950,18 @@ pub struct OutstandingDelegation {
     pointer: PointerWrite,
     /// Issue #714: whether this delegation's worker has already been reported
     /// to the orchestrator as blocked by a provider usage limit
-    /// ([`AgentPtyRegistry::claim_worker_blocked_notice`]). Once per record, so a
+    /// ([`AgentPtyRegistry::spawn_worker_blocked_notice`]). Once per record, so a
     /// block that is lifted by a work event and reported again does not
     /// re-notify the same delegation; a new delegation is a new record. A claim
-    /// whose write was refused, with nothing written, is released
+    /// whose notice no longer applied, so nothing was posted, is released
     /// ([`AgentPtyRegistry::release_worker_blocked_notice`]), so the notice
     /// stays owed for a later block of the same delegation.
     blocked_reported: bool,
     /// Issue #714 (review): the task delivering this record's claimed
-    /// blocked-worker notice, while it may still be waiting on the
-    /// orchestrator's pane writer. Dropping it — the record superseded or
-    /// retired, or a newer notice task of this record taking its place —
-    /// cancels that task if it has not yet begun its write
-    /// ([`BlockedNoticeWaiter`]), so a stalled orchestrator writer holds at most
-    /// one queued notice per worker pane instead of one per delegation.
+    /// blocked-worker notice, until it posts. Dropping it — the record
+    /// superseded or retired, or a newer notice task of this record taking its
+    /// place — cancels that task if it has not yet begun its post
+    /// ([`BlockedNoticeWaiter`]).
     blocked_notice_waiter: Option<BlockedNoticeWaiter>,
     /// PRD #126 M1 review (finding 2) / audit (finding 3): the live end of the
     /// watch task's cancellation channel. Never *sent* on — the watch task
@@ -6037,11 +5994,12 @@ pub struct PaneOrchestration {
 /// Issue #714 (review): where a blocked-worker notice task stands, so it is
 /// cancelled only while nothing of it can have reached the orchestrator.
 ///
-/// `WAITING` until the task, holding the orchestrator's pane writer, has passed
-/// every re-check and is about to write; it then moves to `WRITING` and can no
+/// `WAITING` until the task has passed every re-check and is about to post the
+/// notice to the orchestrator's inbox (PRD #1666; the state names date from
+/// when it was typed into the pane); it then moves to `WRITING` and can no
 /// longer be cancelled. A cancel wins only from `WAITING`, and a task that finds
-/// itself cancelled at its write-time re-check refuses the write, so the two
-/// can never both proceed: either the write happens in full or none of it does.
+/// itself cancelled at its last re-check posts nothing, so the two can never
+/// both proceed.
 #[derive(Debug, Default)]
 struct BlockedNoticeGate(AtomicU8);
 
@@ -6050,8 +6008,8 @@ impl BlockedNoticeGate {
     const WRITING: u8 = 1;
     const CANCELLED: u8 = 2;
 
-    /// Called writer-held, as the last re-check before the write: `false` once
-    /// the task has been cancelled.
+    /// The last re-check before the post: `false` once the task has been
+    /// cancelled.
     fn begin_write(&self) -> bool {
         self.0
             .compare_exchange(
@@ -6078,8 +6036,8 @@ impl BlockedNoticeGate {
 
 /// Issue #714 (review): the handle an [`OutstandingDelegation`] keeps on the
 /// task delivering its blocked-worker notice. Dropping it aborts that task if
-/// it is still waiting — on the orchestrator's writer, or anywhere before its
-/// write-time re-check — and leaves it alone once it may be writing.
+/// it has not reached its last re-check, and leaves it alone once it may be
+/// posting.
 ///
 /// Nothing needs releasing on a cancel: the waiter is dropped only when its
 /// record is superseded or retired, taking the claim flag with it, or when a
@@ -6100,12 +6058,13 @@ impl Drop for BlockedNoticeWaiter {
     }
 }
 
-/// Issue #714: what [`AgentPtyRegistry::claim_worker_blocked_notice`] hands back
-/// — where the notice goes and how to authorize it, and the role for the log.
+/// Issue #714: what claiming a blocked-worker notice hands back
+/// ([`AgentPtyRegistry::spawn_worker_blocked_notice`]) — where the notice goes
+/// and how to authorize it, and the role for the log.
 #[derive(Debug, Clone)]
 pub struct WorkerBlockedNotice {
-    /// The claimed delegation record's generation, so a refused write releases
-    /// the claim on that record and never on a successor
+    /// The claimed delegation record's generation, so a notice that is not
+    /// posted releases the claim on that record and never on a successor
     /// ([`AgentPtyRegistry::release_worker_blocked_notice`]).
     pub seq: u64,
     pub role: String,
@@ -7168,9 +7127,8 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// PRD #1666: this daemon's inbox. Held here for the reason
-    /// [`Self::pending_deliveries`] is: the hook loop, the attach server and
-    /// every producer share this registry and nothing else.
+    /// PRD #1666: this daemon's inbox. Held here because the hook loop, the
+    /// attach server and every producer share this registry and nothing else.
     ///
     /// A registry the daemon has not yet [installed](Self::install_inbox) an
     /// inbox into (an in-process test) gets one under a fresh, unpersisted deck
@@ -7488,16 +7446,15 @@ impl AgentPtyRegistry {
     /// refuse because the worker still owes one for an earlier delegation.
     ///
     /// Armed for EVERY delegate the daemon dispatches, deliberately independent
-    /// of both `worker_response_timeout_minutes` (PRD #126) and
-    /// `delegate_no_event_window` (PRD #249). That independence is the whole
-    /// point: those two knobs govern whether the daemon *watches* for an answer,
+    /// of `worker_response_timeout_minutes` (PRD #126). That independence is the
+    /// whole point: the knob governs whether the daemon *watches* for an answer,
     /// while this ledger records that an answer is owed. Deriving "was this
-    /// solicited?" from either watch made a project with the idle detector turned
+    /// solicited?" from the watch made a project with the idle detector turned
     /// off indistinguishable from a worker nobody delegated to.
     ///
     /// Returns [`CommissionArm::Closing`] — nothing recorded — when either pane
     /// is mid-close ([`Self::begin_pane_close`]), the same arm-after-cancel guard
-    /// as [`Self::arm_outstanding_delegation`] and [`Self::arm_silence_watch`]:
+    /// as [`Self::arm_outstanding_delegation`]:
     /// the close sweep has already passed, so an entry armed now would never be
     /// swept, and a phantom commission makes a later unsolicited completion read
     /// as solicited. Failing to record fails safe in the other direction (a
@@ -8034,9 +7991,10 @@ impl AgentPtyRegistry {
     /// worker. Returns whether an entry was found to release. `arm_id` is that
     /// delegate's own arm id ([`CommissionDispatchInFlight::arm_id`]).
     ///
-    /// The ledger's counterpart to [`Self::cancel_silence_watch_if`], and it
-    /// exists for the same reason: the commission is armed in the synchronous
-    /// fan-out, BEFORE the guarded send that may then refuse. Without it, a
+    /// It exists because the commission is armed in the synchronous fan-out,
+    /// BEFORE the task is delivered, and the delivery may then fail — the
+    /// dispatch never posts it, or the worker exits without acknowledging it
+    /// (PRD #1666). Without it, a
     /// delegate that was never delivered leaves a debt standing forever — a
     /// worker owing a completion for work it was never given — and a later,
     /// genuinely uncommissioned `work-done` spends that phantom entry and is
@@ -8252,19 +8210,6 @@ impl AgentPtyRegistry {
     ///
     /// Reinstating oldest-first means putting a generation on the wire, not
     /// flipping this back.
-    ///
-    /// [`Self::retire_silence_watch`] keeps its own oldest-first accounting
-    /// (`SilenceWatchRetirement::KeptNewer`) and is deliberately left alone. It
-    /// is not the same exposure: that watch has a per-generation, event-driven
-    /// cancellation the idle detector has none of —
-    /// [`Self::cancel_silence_watch_if`] retires exactly the generation whose
-    /// worker emitted an agent event after delivery — so the newest record there
-    /// is normally resolved by the worker's own first event rather than by the
-    /// shared ledger, and its window is `delegate_no_event_window` rather than
-    /// two hours. It also asserts something a completion does not falsify ("no
-    /// agent event within the window"), where this one asserts the very thing a
-    /// `work-done` disproves. Narrower, not immune: if it is ever shown to
-    /// report a worker that answered, the argument above applies to it too.
     pub fn retire_outstanding_delegation(&self, worker_pane_id: &str) -> DelegationRetirement {
         let mut tracker = self.delegations.lock().unwrap();
         let Some(delegation) = tracker.records.remove(worker_pane_id) else {
@@ -8707,9 +8652,9 @@ impl AgentPtyRegistry {
     /// pane's PTY reaches EOF — the daemon's earliest, unconditional signal
     /// that the pane's process is gone, independent of whether it ever called
     /// `work-done` or went through an explicit `StopAgent` close. Retires any
-    /// armed `OutstandingDelegation`/`SilenceWatchRecord` touching this pane
-    /// (as worker OR as orchestrator target, same as [`Self::begin_pane_close`])
-    /// instead of leaving either sit armed for its full timeout window.
+    /// armed `OutstandingDelegation` touching this pane (as worker OR as
+    /// orchestrator target, same as [`Self::begin_pane_close`]) instead of
+    /// leaving it armed for its full timeout window.
     ///
     /// Deliberately does NOT call [`Self::begin_pane_close`]/
     /// [`Self::finish_pane_close`] — those also mark `closing_panes` (with no
@@ -8721,8 +8666,8 @@ impl AgentPtyRegistry {
     ///
     /// Deliberately does NOT drain [`DelegationCommission`] entries the way
     /// [`Self::begin_pane_close`]/[`Self::finish_pane_close`] do. This sweep's
-    /// scope is retiring the two TIMEOUT watches (`OutstandingDelegation`,
-    /// `SilenceWatchRecord`) so a natural exit is detected promptly instead of
+    /// scope is retiring the TIMEOUT watch (`OutstandingDelegation`) so a
+    /// natural exit is detected promptly instead of
     /// waiting out a timer, not the commission ledger's "was this solicited?"
     /// bookkeeping. For the WORKER side this is a settled decision: a worker
     /// that received its task pointer and then exited without reporting is a
@@ -9743,7 +9688,7 @@ impl AgentPtyRegistry {
         let notify_for_thread = self.change_notify.clone();
         // The reader thread needs a registry handle, its own
         // agent id, and the pane's id so its EOF branch can retire any armed
-        // OutstandingDelegation/SilenceWatchRecord — but ONLY when this
+        // OutstandingDelegation — but ONLY when this
         // agent's death is news to the registry (see `pump_reader`'s doc
         // comment on `is_agent_still_registered`). The registry handle is
         // WEAK, deliberately — see the same doc comment for why an owned
@@ -11942,7 +11887,8 @@ impl AgentPtyRegistry {
             .flatten()
     }
 
-    /// [`Self::claim_worker_blocked_notice`], restricted to the delegation of
+    /// Issue #714: claim the one blocked-worker notice owed for the outstanding
+    /// delegation on `worker_pane_id`, restricted to the delegation of
     /// generation `seq` when one is given.
     fn claim_worker_blocked_notice_of(
         &self,
@@ -11981,9 +11927,8 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #714: release a blocked-worker notice claimed by
-    /// [`Self::claim_worker_blocked_notice`] whose write was refused with
-    /// nothing written, so a later block of the SAME delegation can
-    /// still report. Only the record of generation `seq` is touched: a record
+    /// [`Self::spawn_worker_blocked_notice`] that no longer applied, so nothing
+    /// was posted, so a later block of the SAME delegation can still report. Only the record of generation `seq` is touched: a record
     /// that was retired or superseded since keeps its own flag. Returns whether
     /// the claim was released.
     pub fn release_worker_blocked_notice(&self, worker_pane_id: &str, seq: u64) -> bool {
@@ -12003,19 +11948,14 @@ impl AgentPtyRegistry {
     ///
     /// The claim is taken HERE, synchronously, so a concurrent block or bind of
     /// the same delegation finds it claimed and the one-claim-at-a-time rule of
-    /// [`Self::deliver_worker_blocked_notice`] holds unchanged. Only the write is
-    /// spawned: it waits on the orchestrator's pane writer, which an in-flight
-    /// write to that pane can hold for as long as its PTY takes, and neither
-    /// caller — the daemon's event ingestion, which every pane's hooks pass
-    /// through, nor a delegate dispatch — may be held up by another pane's PTY. Returns the
-    /// delivery's handle, `None` when nothing was owed.
+    /// [`Self::deliver_worker_blocked_notice_gated`] holds unchanged. Only the
+    /// post is spawned. Returns the delivery's handle, `None` when nothing was
+    /// owed.
     ///
     /// The task is recorded on the claimed delegation record, spawned under the
     /// same lock hold as the claim ([`BlockedNoticeWaiter`]): superseding or
     /// retiring that delegation, or a newer notice task of it, cancels this one
-    /// if it has not begun writing. Without that, a stalled orchestrator writer
-    /// would queue one waiter per delegation handed to a blocked worker, each
-    /// ahead of the current delegation's notice (issue #714 review).
+    /// if it has not begun posting (issue #714 review).
     pub fn spawn_worker_blocked_notice(
         self: &Arc<Self>,
         worker_pane_id: &str,
@@ -12109,8 +12049,8 @@ impl AgentPtyRegistry {
         .await;
     }
 
-    /// The blocked-worker report's delivery, refusing the write once `gate`
-    /// has been cancelled ([`BlockedNoticeWaiter`]).
+    /// The blocked-worker report's delivery, posting nothing once `gate` has
+    /// been cancelled ([`BlockedNoticeWaiter`]).
     async fn deliver_worker_blocked_notice_gated(
         self: &Arc<Self>,
         worker_pane_id: &str,
@@ -12155,8 +12095,9 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// One attempt of [`Self::deliver_worker_blocked_notice`]. Returns whether
-    /// the write was refused with nothing written and the claim released.
+    /// One attempt of [`Self::deliver_worker_blocked_notice_gated`]. Returns
+    /// whether the notice no longer applied, so nothing was posted and the claim
+    /// was released.
     async fn deliver_worker_blocked_notice_once(
         self: &Arc<Self>,
         worker_pane_id: &str,

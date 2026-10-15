@@ -1781,11 +1781,10 @@ pub struct AppState {
     /// id. Without this separate track, a same-agent `/clear` / thread restart
     /// (which mints a NEW hook session under the SAME `agent_id`) is remapped
     /// back onto the OLD card id, so the card's `session_id` — and thus
-    /// [`Self::pane_session_id`] — keeps reporting the OLD generation, and an old
-    /// queued prompt bound to it is wrongly accepted in the NEW conversation.
-    /// The atomic write-and-submit guard compares the caller's expected session
-    /// against [`Self::pane_hook_session_id`] (this map) instead, so a stale
-    /// generation is refused with no bytes. Cleared on `SessionEnd`.
+    /// [`Self::pane_session_id`] — keeps reporting the OLD generation. A reader
+    /// that must tell one conversation from its successor reads
+    /// [`Self::pane_hook_session_id`] (this map) instead. Cleared on
+    /// `SessionEnd`.
     ///
     /// PRD #20 Greptile finding #4 (monotonic generation): the value is a
     /// `(session_id, established_at)` pair, NOT just the id. A frame naming the
@@ -1797,9 +1796,7 @@ pub struct AppState {
     /// timestamp). An ordinary frame naming another session — a delayed
     /// straggler, or a second producer on the same pane such as the
     /// `dot-agent-deck wrap` host beside a wrapped agent's native hooks —
-    /// changes nothing. That is the rule [`latch_generation`] applies, so the
-    /// daemon's send guard and its own delivery latch agree on what the pane's
-    /// conversation is.
+    /// changes nothing. [`Self::apply_event`] applies that rule.
     ///
     /// **Rule 12: issue #532 needs no `PROTOCOL_VERSION` bump and no
     /// `CONTRACT_BREAKS` entry.** The wire is unchanged and each side computes
@@ -2594,13 +2591,15 @@ pub(crate) struct QuotedReport {
     pub(crate) truncated: bool,
 }
 
-/// Issue #433: render a worker's `work-done` summary as an inert data block for
-/// [`compose_work_done_feedback`]'s inlined paths. `None` when the worker sent no
-/// report text at all (after whitespace collapsing), so the prose can say *that*
-/// rather than present an empty frame.
+/// Issue #433: render a worker's report as an inert data block. `None` when the
+/// worker sent no report text at all (after whitespace collapsing), so the
+/// prose can say *that* rather than present an empty frame. Written for the
+/// typed `work-done` feedback, which PRD #1666 replaced with an inbox message
+/// whose renderer frames the report ([`inline_report_text`]);
+/// [`report_exceeds_inline_bound`] still reads its bound.
 ///
-/// PRD #220 Phase 2 review (finding A1): the dispatch RETURN edge is the second
-/// caller — [`crate::dispatch_return::compose_completion_report`] — and it is
+/// PRD #220 Phase 2 review (finding A1): the dispatch RETURN edge calls it —
+/// [`crate::dispatch_return::compose_completion_report`] — and it is
 /// this function's threat model one step further out again. A `work-done`
 /// summary is authored by a worker inside THIS deck; a dispatched unit's report
 /// is authored in a sibling worktree the caller chose and may be prompt-injected
@@ -2931,7 +2930,7 @@ fn quote_untrusted_pane_text(lines: &[String]) -> Option<String> {
 }
 
 /// Issue #433 + #448: how a completed worker's report is reaching the
-/// orchestrator, which is what [`compose_work_done_feedback`] has to tell it.
+/// orchestrator, which is what [`compose_work_done_message`] has to tell it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkDoneReportChannel {
     /// Solicited completion whose report the daemon really did write to
@@ -2948,7 +2947,7 @@ enum WorkDoneReportChannel {
     /// The deck holds no outstanding delegation this completion could be
     /// answering (issue #448). The canonical file is deliberately left untouched.
     /// That is a fact about the deck's record, not about who tasked the worker
-    /// (issue #505) — see [`compose_work_done_feedback`].
+    /// (issue #505) — see [`compose_work_done_message`].
     Unsolicited,
 }
 
@@ -3154,8 +3153,8 @@ impl WorkDoneDelivery {
 /// orchestrator. The report is the body — framed as UNTRUSTED when rendered,
 /// line breaks kept, cut at the inline bound — and what the deck knows about it
 /// is the preface: whether it was commissioned, where it was filed or saved,
-/// whether it was cut. The wording is [`compose_work_done_feedback`]'s, which
-/// the typed path used.
+/// whether it was cut. The wording is the one the typed `work-done` feedback
+/// used before PRD #1666.
 fn compose_work_done_message(
     worker_pane_id: &str,
     worker_agent_id: &str,
@@ -3324,15 +3323,16 @@ pub(crate) fn describe_saved_report_location(path: &std::path::Path, saved_in: &
     }
 }
 
-/// PRD #126: the single-line prompt the daemon submits into the orchestrator's
-/// pane when a delegated worker has gone quiet past its timeout.
+/// PRD #126: the single-line report the daemon posts to the orchestrator's
+/// inbox (PRD #1666) when a delegated worker has gone quiet past its timeout.
 ///
 /// Three hard constraints:
 ///
-/// * **One line.** A multi-line payload is written as bracketed paste and never
-///   auto-submits (#187), so it would sit in the agent's input box forever.
-///   Routing through [`compose_delegate_prompt`] collapses whitespace, making
-///   the invariant structural rather than a matter of author discipline.
+/// * **One line.** Routing through [`compose_delegate_prompt`] collapses
+///   whitespace, making the invariant structural rather than a matter of
+///   author discipline. The reason dates from typed delivery, where a
+///   multi-line payload was written as bracketed paste and never auto-submitted
+///   (#187).
 /// * **Self-describing.** The daemon does not notify anyone — it only *reports*
 ///   to the orchestrator, whose own instructions decide whether this warrants
 ///   pinging the user, chasing the worker, or re-delegating. The wording says
@@ -3748,9 +3748,6 @@ impl Drop for PointerQueueClock {
 /// another agent — possibly from an unrelated orchestration — later took that
 /// `pane_id_env`, an unbound delivery would reach the stranger's session, which
 /// might then act on it with tools. The bound post goes to nobody else.
-///
-/// Structured like [`crate::agent_pty::arm_seed_fallback`], the other
-/// daemon-side "sleep, then deliver only if nobody beat me to it" timer.
 fn arm_idle_worker_watch(
     registry: Arc<AgentPtyRegistry>,
     worker_pane_id: String,
@@ -3810,8 +3807,9 @@ fn arm_idle_worker_watch(
 
 /// Issue #447 test/e2e seam: overrides how long a delegated worker must stay in
 /// `WaitingForInput` before its orchestrator is told, in **milliseconds**; `0`
-/// switches the notice off. Read at use time, never cached, and parsed like
-/// [`DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS`]. It also scales the per-worker
+/// switches the notice off. Read at use time, never cached, parsed by
+/// `parse_bounded_ms_override` and capped at `MAX_WAITING_NOTICE_DEBOUNCE`. It
+/// also scales the per-worker
 /// cooldown ([`WAITING_NOTICE_COOLDOWN_FACTOR`]), so a test that shortens one
 /// shortens both.
 pub const DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS: &str =
@@ -3859,13 +3857,13 @@ fn waiting_notice_debounce() -> Option<std::time::Duration> {
     (!debounce.is_zero()).then_some(debounce)
 }
 
-/// Issue #447: the single-line notice the daemon SUBMITS into an orchestrator's
-/// pane when a worker it delegated to has stopped and is waiting for input.
+/// Issue #447: the single-line notice the daemon posts to an orchestrator's
+/// inbox (PRD #1666) when a worker it delegated to has stopped and is waiting
+/// for input.
 ///
 /// Composed in [`compose_idle_worker_prompt`]'s family, and under its three
 /// constraints for the same reasons: **one line** (routed through
-/// [`compose_delegate_prompt`], because a multi-line payload is a bracketed
-/// paste that never submits); **self-describing** (the receiving agent has no
+/// [`compose_delegate_prompt`]); **self-describing** (the receiving agent has no
 /// other context for why an unsolicited turn appeared, so it names itself as a
 /// daemon report); and **every copied value fenced**. Two are copied: the role
 /// name, as untrusted project-config metadata ([`quote_untrusted_role`]); and
@@ -3880,7 +3878,7 @@ fn waiting_notice_debounce() -> Option<std::time::Duration> {
 /// daemon knows.** The trigger is a hook-reported status, and a Claude
 /// `Notification` maps to `WaitingForInput` for a question, a permission or
 /// setup prompt, and the idle reminder after a turn that ended without
-/// `work-done` alike (see [`worker_event_proves_delivery`]); the hook forwards
+/// `work-done` alike; the hook forwards
 /// no text that would tell them apart. So the notice does not claim a question
 /// — it names the possibilities and points at the pane text.
 ///
@@ -4531,25 +4529,26 @@ fn arm_waiting_notice_watch(
     });
 }
 
-/// The single-line report the daemon SUBMITS into the orchestrator's pane
-/// when a delegated worker's PROCESS exited without ever calling `work-done` —
-/// detected by `pump_reader`'s EOF branch retiring the worker's still-armed
-/// [`crate::agent_pty::OutstandingDelegation`] via
+/// The single-line report the daemon posts to the orchestrator's inbox (PRD
+/// #1666) when a delegated worker's PROCESS exited without ever calling
+/// `work-done` — detected by `pump_reader`'s EOF branch retiring the worker's
+/// still-armed [`crate::agent_pty::OutstandingDelegation`] via
 /// [`crate::agent_pty::AgentPtyRegistry::sweep_delegations_on_exit`], rather
-/// than either timeout watch running out its own window. This is a distinct
-/// symptom from [`compose_delegate_silence_notice`]'s (a worker that received
-/// its pointer and stayed quiet while still *running*): here the process is
-/// gone, which is unambiguous, so there is nothing to wait out.
+/// than the idle-worker watch running out its window. This is a distinct
+/// symptom from the inbox's undelivered-task notice (a task the worker has not
+/// acknowledged while still *running*): here the process is gone, which is
+/// unambiguous, so there is nothing to wait out.
 ///
-/// **Issue #708: SUBMITTED, in [`compose_delegate_silence_notice`]'s family,
-/// whose doc carries the contract.** It used to be the canonical member of the
+/// **Issue #708: delivered as a turn, not left in scrollback.** It used to be
+/// the canonical member of the
 /// deferred family, on the argument that the orchestrator "cannot act on it
 /// anyway — the process is already gone". That was the wrong way round: the
 /// delegation is what failed, not the orchestrator's options, and an
 /// unsubmitted line reaches nobody in a dispatched unit, where there is no
 /// human to press Enter and dispatch has no return edge. The orchestrator can
 /// re-delegate, reassign or notify the user, and the wording says so. Where it
-/// differs from the silence notice:
+/// differs from the silent-worker notice it was modelled on (removed by PRD
+/// #1666):
 ///
 /// * **Its one interpolated value is fenced.** That is `worker_pane_id`, the
 ///   worker's own `pane_id_env`, which has passed
@@ -4592,9 +4591,9 @@ pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
     )))
 }
 
-/// The single-line report the daemon SUBMITS into the ORCHESTRATOR's pane when
-/// a `clear = true` delegate's replacement worker never became live — issue
-/// #584.
+/// The single-line report the daemon posts to the ORCHESTRATOR's inbox (PRD
+/// #1666) when a `clear = true` delegate's replacement worker never became
+/// live — issue #584.
 ///
 /// This is the gap the issue is actually about. `respawn_agent_for_pane`
 /// disposes of the previous worker BEFORE the replacement exists, so once the
@@ -4603,8 +4602,8 @@ pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
 /// and stopped. The `delegate` CLI had already exited 0, so the orchestrator was
 /// told nothing was wrong and waited for a `work-done` that could never arrive.
 ///
-/// **Issue #708: SUBMITTED, in [`compose_delegate_silence_notice`]'s family.**
-/// #584 made the failure visible; left unsubmitted it was visible only to a
+/// **Issue #708: delivered as a turn.** #584 made the failure visible; left
+/// unsubmitted it was visible only to a
 /// human watching the pane, so in a dispatched unit the orchestrator still
 /// waited forever. Composition follows [`compose_worker_exited_notice`]'s, for
 /// the same reasons: fixed daemon-authored text, one line, and the WORKER's
@@ -4656,17 +4655,17 @@ pub(crate) fn spawn_lift_replaced_quota_blocks(
     });
 }
 
-/// Issue #714: the single-line report the daemon SUBMITS into the
-/// ORCHESTRATOR's pane when a worker which still owes a `work-done` reports that
+/// Issue #714: the single-line report the daemon posts to the ORCHESTRATOR's
+/// inbox (PRD #1666) when a worker which still owes a `work-done` reports that
 /// it is blocked by its provider's usage limit or credit pool.
 ///
-/// **SUBMITTED, in [`compose_delegate_silence_notice`]'s family, whose doc
-/// carries the contract** — the same move issue #708 made for
+/// **Delivered as a turn** — the same move issue #708 made for
 /// [`compose_worker_exited_notice`], for the same reason. The report exists so
 /// the orchestrator can act (reassign the task to a role on another provider or
 /// account, or notify the user); an unsubmitted line reaches nobody in a
 /// dispatched unit, where there is no human to press Enter and dispatch has no
-/// return edge. Where it differs from the silence notice:
+/// return edge. Where it differs from the silent-worker notice it was
+/// modelled on (removed by PRD #1666):
 ///
 /// * **Its one interpolated value is fenced**, like the worker-exited report's:
 ///   the worker's `pane_id_env`, which can embed the config-supplied
@@ -4701,14 +4700,13 @@ pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
     )))
 }
 
-/// The single-line report the daemon SUBMITS into the ORCHESTRATOR's pane when
-/// a `clear = true` delegate's respawn itself returned an error
+/// The single-line report the daemon posts to the ORCHESTRATOR's inbox (PRD
+/// #1666) when a `clear = true` delegate's respawn itself returned an error
 /// (`respawn_agent_for_pane` failed outright, as opposed to
 /// [`compose_respawn_no_live_worker_notice`]'s case of a replacement that
 /// started and then died).
 ///
-/// **Issue #1337: SUBMITTED, in [`compose_delegate_silence_notice`]'s family**,
-/// the move issue #708 made for [`compose_worker_exited_notice`] and
+/// **Issue #1337: delivered as a turn**, the move issue #708 made for [`compose_worker_exited_notice`] and
 /// [`compose_respawn_no_live_worker_notice`] and missed for this one. It
 /// reports the same failure shape as the dead-replacement notice — the task
 /// pointer was never delivered, so no `work-done` can arrive — and left as an
@@ -4737,12 +4735,6 @@ pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
 ///   plain re-delegate is admitted — but it re-runs the same respawn, so the
 ///   wording says a configuration cause (a role command that cannot be
 ///   started) will fail the same way until it is fixed.
-///
-/// The deferred family's contract — what anything delivered with
-/// [`crate::agent_pty::AgentPtyRegistry::write_notice_guarded`] obeys — used to
-/// be stated here, because this was that family's last production member. With
-/// this notice moved it has none, and the contract lives on
-/// `write_notice_guarded` itself.
 pub(crate) fn compose_respawn_failed_notice(worker_pane_id: &str) -> String {
     let pane = pane_id_clause(worker_pane_id);
     compose_delegate_prompt(&format!(
@@ -5023,7 +5015,7 @@ enum SummaryWrite {
 /// and has three failure paths — no cwd recorded for the pane, the directory
 /// cannot be created, the write itself fails — but its outcome was discarded,
 /// while the feedback telling the orchestrator to go read the file was
-/// unconditional. [`compose_work_done_feedback`] consumes the outcome so the
+/// unconditional. [`compose_work_done_message`] consumes the outcome so the
 /// pointer is only ever emitted for a file the daemon really wrote.
 ///
 /// The no-cwd branch is the one that used to leave no trace anywhere: the whole
@@ -5048,9 +5040,9 @@ enum SummaryWrite {
 /// all end at the same file, and a `--task` summary over a parked report — the
 /// shape #331 was first seen in — is caught too.
 ///
-/// The exact counterpart of [`resolve_delegate_task_body`] on the other leg of
-/// the same loop, and it fails the same way on purpose: when the file cannot be
-/// written, inline the text rather than name a path that does not hold it.
+/// The counterpart of [`write_delegate_task`] on the other leg of the same
+/// loop: when the file cannot be written, neither leg's message points the
+/// reader at it.
 fn write_work_done_summary(
     cwd: Option<&str>,
     safe_role: &str,
@@ -10565,28 +10557,22 @@ impl AppState {
         // orchestrator pane can never leave a record armed and produce a bogus
         // idle prompt later. Dropping the retired record cancels its watch task
         // immediately instead of leaving it asleep for the rest of the timeout.
-        // PRD #249 M3 review (finding B4): the same reasoning for the
-        // silent-worker watch, and it matters MORE here. `work-done` is a CLI
-        // signal, not an `AgentEvent`, so the watch's event wait can never see
-        // it: a hookless worker that received its pointer and reported
-        // completion would otherwise still be accused, minutes later, of
-        // possibly never having got it. Retired first, above every early
-        // return, for the same reason as the retire below.
+        // PRD #249 M3 review (finding B4), carried over to the inbox's
+        // undelivered-task notice that replaced the silent-worker watch:
+        // `work-done` is a CLI signal, not an `AgentEvent`, so a hookless
+        // worker that received its task and reported completion would
+        // otherwise still be reported, later, as possibly never having got it.
+        // Retired first, above every early return, for the same reason as the
+        // retire below.
         //
-        // PRD #249 round-6 review (Greptile): this retires ONE watch,
-        // oldest-first — it used to be an unconditional cancel, which let a
-        // stale completion from delegation N disarm delegation N+1's watch and
-        // silently switch the undelivered-prompt detector off for exactly the
-        // case it exists to surface. See
-        // [`AgentPtyRegistry::retire_silence_watch`] for why the accounting
-        // cannot simply borrow the idle detector's generation.
         // PRD #1666 S5: a worker reporting work-done has delegated tasks it has
         // not acknowledged retired as superseded — so no undelivered notice is
         // posted about a task the worker has answered. Which ones depends on
         // whether it acknowledged a task since its previous work-done
         // (delegate_021): if it did, only the tasks it fetched are retired and
-        // a newer task never fetched stays owed and watched, for the reason
-        // above; if it did not, every unacknowledged task goes, a never-fetched
+        // a newer task never fetched stays owed and watched, so a stale
+        // completion of an older task cannot switch the notice off for a newer
+        // one (PRD #249 round-6 review); if it did not, every unacknowledged task goes, a never-fetched
         // one included. The worker chooses the branch by what it acknowledges
         // and reports, so within its own pane a repeated work-done silently
         // retires a newer task it never fetched, and acknowledging a task it
