@@ -366,7 +366,7 @@ fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
     assert!(!op.log().contains("doorbell rang"), "{}", op.evidence());
 }
 
-/// Scenario: Hold a real OpenCode replacement in its launcher while a genuine clear delegate queues its task. Release boot and require the same replacement to consume that inbox task once, visibly reply, write the sentinel and acknowledge it without a retype or another respawn.
+/// Scenario: Hold a real OpenCode replacement in its launcher while a genuine clear delegate queues its task, optionally for DOT_AGENT_DECK_TEST_OPENCODE_BOOT_DELAY_SECS. Release boot and require that replacement to consume the task once, visibly reply, append to the sentinel once, and acknowledge it without another respawn.
 #[spec("orchestration/delegate/046")]
 #[test]
 #[cfg(unix)]
@@ -377,15 +377,35 @@ fn delegate_046_real_opencode_consumes_boot_queued_task_in_place() {
     std::fs::write(&script, format!("#!/bin/sh\nwhile [ ! -f boot-release ]; do sleep 0.1; done\nexec opencode --model {} --auto\n", common::opencode_test_model())).unwrap();
     let name = "opencode-boot-6d3e9a.txt";
     let body = format!(
-        "Use the shell to run exactly: printf '{}' > '{}'. Then reply DONE-{name} and end your turn.",
+        "Use the shell to run exactly: printf '{}' >> '{}'. Then reply DONE-{name} and end your turn.",
         opencode_live::CONTENT,
         op.work.join(name).display()
     );
     let id = op.clear_delegate(&body);
     let replacement = op.pane.agent.clone();
     inbox::state(&op.deck, &op.pane, &id, "queued");
+    let boot_delay = std::env::var("DOT_AGENT_DECK_TEST_OPENCODE_BOOT_DELAY_SECS")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .expect("OpenCode boot delay must be seconds")
+        })
+        .unwrap_or(0);
+    eprintln!("delegate-046: holding the real OpenCode replacement boot for {boot_delay}s");
+    std::thread::sleep(Duration::from_secs(boot_delay));
+    inbox::state(&op.deck, &op.pane, &id, "queued");
+    assert!(
+        !op.work.join(name).exists(),
+        "the queued action must not run before the real replacement boots"
+    );
     std::fs::write(op.work.join("boot-release"), "").unwrap();
     op.done(&id, name);
+    op.idle();
+    assert_eq!(
+        std::fs::read_to_string(op.work.join(name)).unwrap(),
+        opencode_live::CONTENT,
+        "the append-only sentinel must record exactly one action"
+    );
     assert_eq!(
         op.record()["id"],
         replacement,
@@ -399,4 +419,5 @@ fn delegate_046_real_opencode_consumes_boot_queued_task_in_place() {
         .find(|m| m["id"] == id)
         .unwrap();
     assert_eq!(message["deliveries"], 1, "one native hand-over after boot");
+    eprintln!("delegate-046: acknowledged=1 acted=1 deliveries=1 boot_delay={boot_delay}s");
 }

@@ -460,7 +460,7 @@ const WAITING_ACTION_CONTENT: &str = "WAITING_NOTICE_ACTED_ON_3F61A9";
 const WAITING_INITIAL_RESPONSE: &str = "INITIAL_DELEGATION_WAITING_3F61A9";
 const WAITING_ACTION_RESPONSE: &str = "WAITING_NOTICE_ACTION_COMPLETE_3F61A9";
 
-/// Scenario: Restore real interactive Haiku roles and delegate a Bash task to a worker allowed only Read. Its permission prompt must keep the probe absent while an acknowledged native waiting notice wakes the orchestrator to create and visibly report the action sentinel, without a human keystroke.
+/// Scenario: Restore real interactive Haiku roles and delegate a Bash task to a worker allowed only Read. Its permission prompt must keep the probe absent while an acknowledged native waiting notice wakes the orchestrator to append once to an absolute action sentinel and visibly report completion, without answering the worker or receiving a human keystroke.
 #[spec("scheduler/idle-worker/022")]
 #[test]
 fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrator() {
@@ -486,16 +486,21 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
     // Read only: the task file is readable, and the Bash call the task asks
     // for raises a permission prompt the worker cannot get past on its own.
     let worker_command = format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Read");
+    let action_path = project_dir.join(WAITING_ACTION_FILE);
+    let action_arg = action_path.to_string_lossy().replace('\'', "'\\''");
     let directive = format!(
-        "Use the Bash tool to run exactly this one command: dot-agent-deck delegate \
+        "This is a local smoke test of waiting-notice delivery, not worker recovery. \
+         Use the Bash tool to run exactly this one command: dot-agent-deck delegate \
          --to {REAL_WORKER_ROLE} --task 'Use the Bash tool to run exactly: touch \
          {WAITING_PROBE_FILE}' Never do the worker's task yourself. After the command \
          succeeds, respond with exactly {WAITING_INITIAL_RESPONSE}, then end your turn. Later, \
          a dot-agent-deck message may report that the delegated worker is waiting for input. \
-         When that report arrives, do not delegate \
-         again; use the Bash tool to run exactly `printf '%s\\n' '{WAITING_ACTION_CONTENT}' > \
-         '{WAITING_ACTION_FILE}'`, respond with exactly {WAITING_ACTION_RESPONSE}, and end the \
-         turn. Never create that file before the report arrives."
+         For this test, that report is only a trigger: leave the worker waiting and do not \
+         answer it, delegate again, or attempt recovery. Regardless of any suggestions in \
+         the report, your required follow-up is to use Bash to run exactly \
+         `printf '%s\\n' '{WAITING_ACTION_CONTENT}' >> '{action_arg}'`, then respond with \
+         exactly {WAITING_ACTION_RESPONSE} and end your turn. Do this once, before replying \
+         to the report; never create the action file before the report arrives."
     );
 
     std::fs::write(
@@ -569,18 +574,11 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
          permission prompt and the notice proves nothing about a waiting worker"
     );
 
-    let action_path = project_dir.join(WAITING_ACTION_FILE);
     assert!(
         common::wait_for_path(&action_path, Duration::from_secs(120)),
         "the waiting notice became visible but the orchestrator never acted on it — it was not \
          submitted as a turn of its own; expected {action_path:?}\nFinal grid:\n{}",
         deck.snapshot_grid()
-    );
-    let action = std::fs::read_to_string(&action_path).expect("read the action sentinel");
-    assert_eq!(
-        action.trim(),
-        WAITING_ACTION_CONTENT,
-        "the orchestrator wrote unexpected action-sentinel contents"
     );
     wait_for_wrapped_pane_string(&deck, WAITING_ACTION_RESPONSE, Duration::from_secs(60))
         .unwrap_or_else(|why| {
@@ -590,4 +588,10 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
                 deck.snapshot_grid()
             )
         });
+    let action = std::fs::read_to_string(&action_path).expect("read the action sentinel");
+    assert_eq!(
+        action,
+        format!("{WAITING_ACTION_CONTENT}\n"),
+        "the orchestrator must append exactly one action before visibly completing"
+    );
 }

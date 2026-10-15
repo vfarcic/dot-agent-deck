@@ -531,8 +531,9 @@ const LIVE_UNLOCKED_SENTINEL: &str = "lock012_unlocked_5a71.txt";
 /// terminal echo/redraw variance.
 fn create_sentinel_directive(sentinel: &str) -> String {
     format!(
-        "Use the Bash tool to run exactly this one command: pwd && touch {sentinel} \
-         then stop and say nothing else.\r"
+        "This is a local input-forwarding smoke test in a disposable directory. \
+         Use the Bash tool to run exactly: `pwd && touch {sentinel}`. \
+         Then briefly confirm completion.\r"
     )
 }
 
@@ -542,15 +543,7 @@ fn tail(text: &str) -> &str {
     &text[text.len().saturating_sub(2000)..]
 }
 
-/// Scenario: Open a real orchestration tab (`cat` orchestrator, a REAL
-/// interactive Claude Haiku worker) locked by default, focus the worker, and
-/// type a create-sentinel-file directive — confirm the file is never created
-/// since the keystrokes never reach the agent. Enter command mode (`Ctrl+d`)
-/// and send `Ctrl+e` to unlock, `Ctrl+d` back into `PaneInput`, then type a
-/// second directive with a different sentinel — confirm the real agent now
-/// receives it and creates that file, proving the lock gates a genuine agent's
-/// input, not just a `cat` stub's echo. Self-skips where the CLI or
-/// credentials are absent.
+/// Scenario: Open an orchestration with a cat orchestrator and real Claude Haiku worker, focus the locked worker, and type a sentinel directive that must not execute. Unlock with Ctrl+d, Ctrl+e, Ctrl+d and type a second directive: the worker must create only the unlocked sentinel.
 #[spec("orchestration/lock/012")]
 #[test]
 fn lock_012_real_agent_gated_by_lock_state() {

@@ -3873,7 +3873,7 @@ without depending on the config struct API.
 ##### orchestration/delegate/046 — A real OpenCode replacement consumes a task queued before its launcher permits boot.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_delegate_respawn_readiness.rs`).
 - **Agent:** genuine interactive OpenCode on `opencode_test_model()`, delayed only by its scratch launcher; real delegate CLI.
-- **Asserts:** the task is queued before the replacement boots; releasing the launcher leads to visible native execution, exact sentinel and one acknowledged hand-over in that same replacement.
+- **Asserts:** the task stays queued before the replacement boots, including a configured `DOT_AGENT_DECK_TEST_OPENCODE_BOOT_DELAY_SECS` hold; releasing the launcher leads to visible native execution, one append to the exact sentinel and one acknowledged hand-over in that same replacement. The opt-in 35-second hold covers issue #1663's boot beyond the old 8-second readiness buffer.
 - **Does not assert:** recovery of typed pointers, which inbox delivery removed, or ack-wait retry after a committed-but-unacknowledged turn.
 - **Cost:** one cheap real-agent work turn.
 
@@ -4216,7 +4216,7 @@ without depending on the config struct API.
 ##### orchestration/lock/012 — A REAL Claude agent never receives a directive typed at a locked worker pane, and does receive it once unlocked.
 - **Layer:** L2 PTY-attached, real-agent tier. Runtime-skipped when the `claude` CLI or credentials are absent.
 - **Agent:** REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`, `--allowedTools Bash`) as the non-orchestrator `worker` role; the orchestrator stays `cat` (already proven never-gated) to keep the run to a single real agent turn. Fixture `tests/fixtures/orch-lock-live`.
-- **Asserts:** a create-a-sentinel-file directive typed into the locked worker pane never results in that file existing (20s); after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, a second directive with a DIFFERENT sentinel does result in its file being created (120s); and the first sentinel STILL does not exist afterwards, proving gated keystrokes are dropped outright rather than queued for delivery once unlocked. On-disk file presence is the observable, so the assertion survives LLM phrasing and terminal-redraw variance.
+- **Asserts:** a create-a-sentinel-file directive typed into the locked worker pane never results in that file existing (20s); after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, a second directive with a DIFFERENT sentinel does result in its file being created (120s); and the first sentinel STILL does not exist afterwards, proving gated keystrokes are dropped outright rather than queued for delivery once unlocked. The prompt identifies this as a local disposable-directory smoke test and allows a completion reply; a measured model refusal of the former silence instruction was unrelated to input forwarding. On-disk file presence is the observable, so the assertion survives LLM phrasing and terminal-redraw variance.
 - **Does not assert:** anything when skipped — where credentials are absent this test executes nothing, so `orchestration/lock/008`/`011` carry the CI-visible coverage.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 
@@ -5975,7 +5975,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### chain-smoke/pi/002 — A clear=true real Pi worker receives an inbox delegate, writes a sentinel and reports work-done.
 - **Layer:** L2 lane 2 (`tests/e2e_pi_worker.rs`), in-process daemon, synthetic orchestrator signal and real interactive Pi worker; headless.
 - **Agent:** Real Pi worker (GPT, `common::pi_test_model()`) with scratch HOME and PI_CODING_AGENT_DIR.
-- **Asserts:** The configured worker respawn receives its native inbox task, creates the sentinel at the exact literal path specified by the shell directive, then reports work-done; bounded waits print phase and path evidence before the 300s nextest timeout; the task is Acknowledged with ExtensionConfirmed and one delivery.
+- **Asserts:** The configured worker respawn receives its native inbox task, appends once to the sentinel at the exact literal path specified by the shell directive, then reports work-done; bounded waits print phase and path evidence before the 300s nextest timeout; the task is Acknowledged with ExtensionConfirmed and one delivery. `DOT_AGENT_DECK_TEST_PI_BOOT_DELAY_SECS=35` holds the real replacement in a scratch launch command beyond issue #1662's old 15-second seed grace, with the same assertions and unchanged timeouts.
 - **Does not assert:** A real orchestrator model or rendered cards.
 - **Platform coverage:** mac+linux.
 
@@ -7232,7 +7232,7 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 ##### scheduler/idle-worker/022 — A real permission-blocked worker wakes its orchestrator through an acknowledged inbox notice.
 - **Layer:** L2 PTY-attached, lane 2, tests/e2e_idle_worker_detector.rs.
 - **Agent:** Two real interactive Claude Haiku roles in isolated HOME; the worker allows Read only.
-- **Asserts:** The worker's Bash task remains blocked with its probe absent; the waiting notice carries the untrusted role label, is acknowledged once and prompts a visible orchestrator action plus sentinel without human input.
+- **Asserts:** The worker's Bash task remains blocked with its probe absent; the waiting notice carries the untrusted role label, is acknowledged once and prompts a visible orchestrator action plus one append to an absolute sentinel path without human input. The smoke-test directive explicitly leaves the worker waiting rather than inviting recovery, because a measured model turn attempted delegation instead of the required action.
 - **Does not assert:** Granting worker permission or completing its blocked task.
 - **Platform coverage:** mac+linux.
 

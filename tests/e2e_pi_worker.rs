@@ -5,7 +5,7 @@
 //! the task through the real daemon; only the worker spends a model credential.
 //! Scratch HOME and PI_CODING_AGENT_DIR contain the bundled extension.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::DelegateSignal;
@@ -32,7 +32,7 @@ const SENTINEL_CONTENT: &str = "PI_WORKER_SENTINEL_OK";
 // chain-smoke/pi/002 — real-pi WORKER receives a delegate → work-done
 // ---------------------------------------------------------------------------
 
-/// Scenario: Configure a clear=true Pi worker, then delegate one exact shell command writing a literal sentinel path through the real daemon from a synthetic orchestrator. The replacement real Pi worker must receive and acknowledge its inbox message through the extension, create the sentinel, and signal work-done.
+/// Scenario: Configure a clear=true Pi worker, optionally delay its replacement boot with DOT_AGENT_DECK_TEST_PI_BOOT_DELAY_SECS, and delegate an exact shell command appending to an absolute sentinel path. The real Pi worker must acknowledge one inbox delivery, append once, and signal work-done after the configured boot delay.
 #[spec("chain-smoke/pi/002")]
 #[test]
 fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done() {
@@ -59,12 +59,21 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         .to_string();
     let sentinel = cwd.path().join(SENTINEL_NAME);
     let sentinel_arg = sentinel.to_string_lossy().replace('\'', "'\\''");
-    let sentinel_command = format!("printf '%s' '{SENTINEL_CONTENT}' > '{sentinel_arg}'");
+    let sentinel_command = format!("printf '%s' '{SENTINEL_CONTENT}' >> '{sentinel_arg}'");
     let path_env = common::path_with_binary_dir();
 
     // PRD #201: a `.dot-agent-deck.toml` whose `coder` role runs the REAL `pi`
     // clear=true exercises the replacement Pi process, seeded through its inbox.
     let pi_model = common::pi_test_model().cli_args();
+    let boot_delay = std::env::var("DOT_AGENT_DECK_TEST_PI_BOOT_DELAY_SECS")
+        .map(|value| value.parse::<u64>().expect("Pi boot delay must be seconds"))
+        .unwrap_or(0);
+    let worker_command = if boot_delay == 0 {
+        format!("pi {pi_model} --approve")
+    } else {
+        format!("sleep {boot_delay}; exec pi {pi_model} --approve")
+    };
+    eprintln!("chain-smoke: real Pi replacement boot delay: {boot_delay}s");
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
         format!(
@@ -76,7 +85,8 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
              start = true\n\n\
              [[orchestrations.roles]]\n\
              name = \"{WORKER_ROLE}\"\n\
-             command = \"pi {pi_model} --approve\"\n\
+             command = {worker_command:?}\n\
+             agent = \"pi\"\n\
              clear = true\n"
         ),
     )
@@ -221,6 +231,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         timestamp: chrono::Utc::now(),
         token: None,
     };
+    let delegated_at = Instant::now();
     daemon
         .state
         .read()
@@ -315,4 +326,14 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         "{delivered:?}"
     );
     assert_eq!(delivered.deliveries, 1, "{delivered:?}");
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        SENTINEL_CONTENT,
+        "the append-only action sentinel must record exactly one execution"
+    );
+    assert!(
+        delegated_at.elapsed() >= Duration::from_secs(boot_delay),
+        "the real replacement must run after its configured boot delay"
+    );
+    eprintln!("chain-smoke: acknowledged=1 acted=1 deliveries=1 boot_delay={boot_delay}s");
 }
