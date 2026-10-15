@@ -174,10 +174,8 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "skill names must match ^[a-z0-9-]+$ (issue #1061): {offenders:?}\n\n\
-             For a project-local skill, rename the directory and its `name:` together. For a \
-             `dot-ai-*` mirror, renaming is NOT available — CLAUDE.md rule 13 records that the \
-             next sync reverts a local edit — so either delete it or add it to NAME_ALLOWLIST \
-             with the reason it is being kept."
+             Rename the directory and its `name:` together, or add it to NAME_ALLOWLIST with \
+             the reason it is being kept."
         );
     }
 
