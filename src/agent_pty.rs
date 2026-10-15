@@ -3410,35 +3410,30 @@ impl DraftTestStream {
 }
 
 /// Issue #424 F1/H1: what each pane's input box is holding, as far as this
-/// daemon can tell — the two clocks the guarded send consults, under ONE mutex.
+/// daemon can tell — the human-input sequence and each pane's input stream,
+/// under ONE mutex.
 ///
 /// They live together because the transitions that matter are joint: recording a
-/// user keystroke and dropping the payload records that keystroke invalidated is
-/// one fact about one input box, and a delivery deciding whether to write must
-/// not be able to observe half of it.
+/// user keystroke and feeding its bytes into the pane's stream is one fact about
+/// one input box, and a reader must not be able to observe half of it.
 ///
 /// Shared (`Arc`) with every agent's [`PaneWriter`], which is what makes the
-/// user-input clock ATOMIC with respect to writer handoff — see H1 on
-/// [`PaneWriter`].
+/// record ATOMIC with respect to writer handoff — see H1 on [`PaneWriter`].
 #[derive(Default)]
 struct PaneInputState {
-    /// PRD #127 M2.2: the last time a *user* keystroke reached a pane, keyed by
-    /// `pane_id_env`. Only bytes written through [`PaneWriter`]'s `Write` impl
-    /// (the attach STREAM_IN path) and the explicit
-    /// [`AgentPtyRegistry::note_user_input`] update it — daemon-initiated writes
-    /// go through [`PaneWriter::daemon`] and do not, so a scheduled delivery
-    /// never resets its own debounce clock. In-memory. Issue #542: all three
-    /// maps here drop a pane's entry when the pane is closed for good
-    /// ([`Self::forget_closed_pane`]), not when it changes hands.
-    user_input_at: HashMap<String, Instant>,
     /// PRD #1631 (audit N1): a sequence number for HUMAN input, ordering it
     /// against a question's arrival and the deck's own answer keys without a
     /// clock. [`Self::input_seq`] is the counter, global and monotonic, and
     /// moves only on a human keystroke; [`Self::human_input_seq`] holds, per
     /// pane, the counter value of that pane's last one. A voice answer's keys
-    /// ([`ByteSource::Answer`]) stamp `user_input_at` as before but never move
-    /// it, so "has a human typed since X" is `human_input_seq > X`, read under
-    /// the same lock that records the keystroke.
+    /// ([`ByteSource::Answer`]) never move it, so "has a human typed since X"
+    /// is `human_input_seq > X`, read under the same lock that records the
+    /// keystroke. Only bytes written through [`PaneWriter`]'s `Write` impl (the
+    /// attach STREAM_IN path) and the explicit
+    /// [`AgentPtyRegistry::note_user_input`] move it — daemon-initiated writes
+    /// go through [`PaneWriter::daemon`] and do not. Issue #542: both maps here
+    /// drop a pane's entry when the pane is closed for good
+    /// ([`Self::forget_closed_pane`]), not when it changes hands.
     input_seq: u64,
     human_input_seq: HashMap<String, u64>,
     /// Issue #424 S1: where each pane's user-input stream is, so that neither a
@@ -3460,17 +3455,9 @@ impl PaneInputState {
         if is_sentinel_pane_id(pane_id_env) {
             return;
         }
-        self.stamp_user_input(pane_id_env);
         self.input_seq += 1;
         self.human_input_seq
             .insert(pane_id_env.to_string(), self.input_seq);
-    }
-
-    /// Stamp the user-input clock alone — for a voice answer's keys, which are
-    /// the user's answer but not a human at the keyboard.
-    fn stamp_user_input(&mut self, pane_id_env: &str) {
-        self.user_input_at
-            .insert(pane_id_env.to_string(), Instant::now());
     }
 
     /// PRD #1631 (audit N1): the counter value of `pane_id_env`'s last human
@@ -3482,25 +3469,16 @@ impl PaneInputState {
             .unwrap_or_default()
     }
 
-    /// Record the user's actual bytes — the stamp above, plus the one thing the
-    /// bytes themselves tell us that a bare clock cannot.
-    ///
-    /// Issue #424 H3: a terminator SUBMITS the input box. Whatever we had put
-    /// there is now the agent's problem and not ours, so every payload record
-    /// for this pane stops guarding — which is what lets an ordinary later
-    /// delivery of the same fixed text (a delegate worker pointer re-sent in
-    /// place by issue #1383's retry is byte-identical) be admitted instead
-    /// of matching a finished delivery's digest and being refused before writing
-    /// a byte. The user-input clock still advances, so the blind probe stays
-    /// refused: the box the probe wanted to submit is gone either way.
+    /// Record the user's actual bytes — the human-input sequence above, plus
+    /// what the bytes themselves tell us: the pane's input stream.
     ///
     /// Issue #424 S1: "a submission" is decided by [`PaneInputStream`] — paste
     /// framing here, the keypress behind the byte in
     /// [`crate::ui::user_byte_submits_input_box`] — and never by scanning for a
     /// raw CR/LF. A multi-line paste carries newlines the agent's editor STORES,
     /// and so do the `Ctrl+J` and `Alt+Enter` the deck deliberately forwards as
-    /// newline keys; reading any of them as a submission drained the records of
-    /// a box that still held both our payload and the user's draft.
+    /// newline keys; reading any of them as a submission would clear the draft
+    /// of a box that still holds it.
     fn note_user_bytes(&mut self, pane_id_env: &str, bytes: &[u8]) {
         self.note_user_bytes_as(pane_id_env, bytes, true);
     }
@@ -3513,8 +3491,6 @@ impl PaneInputState {
         }
         if human {
             self.note_user_input(pane_id_env);
-        } else {
-            self.stamp_user_input(pane_id_env);
         }
         self.input
             .entry(pane_id_env.to_string())
@@ -3529,33 +3505,25 @@ impl PaneInputState {
         self.input.remove(pane_id_env);
     }
 
-    /// Issue #542: drop EVERY clock for `pane_id_env`, the user-input one
-    /// included — the pane has been closed and nothing in the registry names it
-    /// any more, so no input box is left for any of them to describe.
+    /// Issue #542: drop EVERYTHING recorded for `pane_id_env`, its human-input
+    /// sequence included — the pane has been closed and nothing in the registry
+    /// names it any more, so no input box is left for any of it to describe.
     ///
     /// Deliberately a separate, stronger call than [`Self::forget_pane`]. That
-    /// one runs when a pane changes hands and keeps `user_input_at`, so a user
-    /// who was typing at the pane keeps the debounce and the blind-probe refusal
-    /// across a respawn. This one runs only from
-    /// [`AgentPtyRegistry::close_agent`], under the registry lock, once no
-    /// record and no spawn reservation claims the pane — which is what keeps it
-    /// from weakening the #424 F1 guard: an absent `automatic` entry reads as
-    /// "nothing of ours is in that box", and that is only true here because the
-    /// box itself is gone.
+    /// one runs when a pane changes hands and keeps the human-input sequence,
+    /// so a user who was typing at the pane still reads as having typed across
+    /// a respawn. This one runs only from [`AgentPtyRegistry::close_agent`],
+    /// under the registry lock, once no record and no spawn reservation claims
+    /// the pane.
     fn forget_closed_pane(&mut self, pane_id_env: &str) {
-        self.user_input_at.remove(pane_id_env);
         self.human_input_seq.remove(pane_id_env);
         self.input.remove(pane_id_env);
     }
 
-    /// Issue #542 test seam: does any of the three clocks hold `pane_id_env`?
+    /// Issue #542 test seam: does anything here still hold `pane_id_env`?
     #[cfg(test)]
     fn tracks_pane(&self, pane_id_env: &str) -> bool {
-        self.user_input_at.contains_key(pane_id_env) || self.input.contains_key(pane_id_env)
-    }
-
-    fn last_user_input_at(&self, pane_id_env: &str) -> Option<Instant> {
-        self.user_input_at.get(pane_id_env).copied()
+        self.human_input_seq.contains_key(pane_id_env) || self.input.contains_key(pane_id_env)
     }
 
     /// Issue #544: has the user sent input into `pane_id_env` since their last
@@ -3580,10 +3548,8 @@ impl PaneInputState {
     /// move the agent's own; a CR of ours that submits clears the draft bit,
     /// and nothing of ours sets it.
     ///
-    /// Deliberately NOT a user keystroke: no user-input clock is stamped, and a
-    /// submit here drains no #424 payload record — those guard a delivery
-    /// against the USER having typed or submitted since, and our own CR is
-    /// neither.
+    /// Deliberately NOT a user keystroke: the human-input sequence does not
+    /// move.
     fn note_deck_bytes(&mut self, pane_id_env: &str, bytes: &[u8]) {
         if is_sentinel_pane_id(pane_id_env) || bytes.is_empty() {
             return;
@@ -3600,20 +3566,11 @@ impl PaneInputState {
 /// user input at the instant they are written — while the writer lock is still
 /// held.
 ///
-/// The attach input path used to write and flush the user's bytes under this
-/// writer, DROP it, and only then stamp the user-input clock. A guarded
-/// automatic sender queued on the same writer acquired it in that gap, read the
-/// stale clock, passed the guard, and appended its replacement + CR (or fired a
-/// blind probe CR) — submitting the very draft the guard exists to protect. No
-/// attacker required; that is ordinary concurrency between an attached client
-/// and a scheduled delivery.
-///
-/// Making the stamp part of the write closes the gap by construction: every
-/// writer of these bytes holds this mutex, so the clock a guarded send reads
-/// under the writer can no longer be older than bytes that are already in the
-/// PTY. The daemon's own writes take [`PaneWriter::daemon`], which bypasses the
-/// observation — they are not user input, and recording them as such would make
-/// every delivery refuse itself.
+/// Making the record part of the write means a reader holding this writer can
+/// never see state older than bytes that are already in the PTY: every writer
+/// of these bytes holds this mutex. The daemon's own writes take
+/// [`PaneWriter::daemon`], which records them as the deck's — they are not user
+/// input.
 ///
 /// Issue #525: the PTY itself is written by a thread of this writer's own
 /// ([`PtyWriterThread`]), never by whoever holds the lock. A `write(2)` into a
@@ -3638,7 +3595,7 @@ pub struct PaneWriter {
     /// this writer is either made before the prune (and removed by it) or finds
     /// the flag already set (and is skipped). A write or a guarded send that
     /// passed its ownership check before the close and finishes after it can no
-    /// longer bring a closed pane's clocks back.
+    /// longer bring a closed pane's record back.
     retired: Arc<AtomicBool>,
 }
 
@@ -3664,8 +3621,8 @@ impl PaneWriter {
         }
     }
 
-    /// PRD #127 M2.2: stamp `pane_id_env`'s user-input clock as this writer —
-    /// a no-op once the writer's agent has left the registry (issue #542, see
+    /// PRD #1631 (audit N1): move `pane_id_env`'s human-input sequence as this
+    /// writer — a no-op once the writer's agent has left the registry (issue #542, see
     /// [`Self::retired`]). The attach STREAM_IN path calls this while holding
     /// the writer, in place of [`AgentPtyRegistry::note_user_input`], which has
     /// no generation to check.
@@ -3677,7 +3634,7 @@ impl PaneWriter {
     }
 
     /// Write as the DAEMON: the bytes are ours, so they are not user input and
-    /// must not advance the user-input clock. Every daemon-initiated write into
+    /// must not move the human-input sequence. Every daemon-initiated write into
     /// a pane goes through here; everything that reaches the plain
     /// [`std::io::Write`] impl or [`Self::write_user`] is somebody else typing.
     ///
@@ -5207,18 +5164,15 @@ pub struct AgentPtyRegistry {
     /// publishes the agent, so no agent can join the registry after the
     /// snapshot the client confirmed. See [`Self::freeze_admission`].
     admission_frozen: AtomicBool,
-    /// PRD #127 M2.2 (deliver-on-idle) + issue #424 F1: what each pane's input
-    /// box is holding — the user-keystroke clock the scheduler's reuse path
-    /// debounces on, and the record of what THIS daemon's guarded sends put
-    /// there. Together they answer the one question a submit-only probe and the
-    /// one bounded replacement payload have to ask before they fire — "is what
-    /// the target is holding still OUR payload, or has the user typed since?" —
-    /// out of clocks the daemon owns rather than ones a producer can assert.
+    /// Issue #424 F1 + PRD #1631: what each pane's input box is holding — the
+    /// human-input sequence [`Self::user_typed_since_question`] reads, and each
+    /// pane's input stream, whose draft bit [`Self::draft_pending`] reports.
+    /// Both are recorded by the daemon from the bytes it writes, never asserted
+    /// by a producer.
     ///
     /// An `Arc` because every agent's [`PaneWriter`] holds the same state: that
-    /// is what makes the user-input stamp atomic with respect to writer handoff
-    /// (H1). See [`PaneInputState`], [`Self::user_typed_since_automatic_write`]
-    /// and [`Self::user_typed_since_writing_payload`].
+    /// is what makes the record atomic with respect to writer handoff (H1). See
+    /// [`PaneInputState`].
     pane_input: Arc<Mutex<PaneInputState>>,
     /// Issue #525: how long a guarded delivery waits on one PTY write before
     /// it stops waiting — [`PTY_WRITE_STALL_BOUND`], lowered by tests. In
@@ -5275,8 +5229,7 @@ pub struct AgentPtyRegistry {
     /// Lives here rather than on `AppState` because both hook handlers run
     /// under a `read()` guard on the shared state — putting a mutable map on
     /// `AppState` would force those hot call sites to `write()`. Same
-    /// interior-mutability shape as `dispatch_mutexes` / `user_input_at` /
-    /// `delivery_ledger`.
+    /// interior-mutability shape as `dispatch_mutexes` / `pane_input`.
     delegations: Mutex<DelegationTracker>,
     /// PRD #126: monotonic generation stamped onto each
     /// [`OutstandingDelegation`]. A re-delegation to the same worker pane
@@ -5532,7 +5485,8 @@ struct DelegationTracker {
     /// discipline as both watches' `_cancel` channels — and
     /// [`AgentPtyRegistry::begin_pane_close`] drops every sender for the pane it
     /// marks. Its production waiter, the delegate's readiness wait, was removed
-    /// by PRD #1666; only its test asks for a signal now.
+    /// by PRD #1666; what asks for a signal now is test code — see
+    /// [`AgentPtyRegistry::pane_close_signal`].
     close_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
     /// Issue #447: the open waiting episodes, keyed by the *worker's*
     /// `pane_id_env`; at most one per worker pane. Opened when the worker's hook
@@ -5546,20 +5500,6 @@ struct DelegationTracker {
     /// [`AgentPtyRegistry::arm_waiting_notice`]'s cooldown. Removed on pane
     /// close, so it is bounded by the panes alive.
     waiting_notice_sent_at: HashMap<String, Instant>,
-    /// PR #1398 finding #18: per worker pane, a value that changes every time
-    /// one of its delegations is resolved — see
-    /// [`AgentPtyRegistry::delegation_resolution_epoch`]. Inserted when a
-    /// commission is armed, so a pane never delegated to holds no entry; moved
-    /// on by every later arm, completion, release and restart retirement;
-    /// removed on pane close, so it is bounded by the panes alive.
-    resolution_epochs: HashMap<String, u64>,
-    /// Issue #1526: per worker pane, a value that changes every time one of its
-    /// task pointers is confirmed delivered — see
-    /// [`AgentPtyRegistry::pointer_delivery_epoch`]. Kept apart from
-    /// `resolution_epochs` because a delivery resolves only the silent-worker
-    /// watch it displaced, never the delegation it delivers. Removed on pane
-    /// close, so it is bounded by the panes alive.
-    pointer_delivery_epochs: HashMap<String, u64>,
 }
 
 /// Issue #447: one worker pane's pending "this delegated worker is waiting for
@@ -7712,10 +7652,6 @@ impl AgentPtyRegistry {
         // worker once it knows who that is, under this arm's id (Qodo, #1347).
         entry.worker_agent_id = None;
         entry.newest_arm_id = Some(id);
-        // A newer delegate resolves the older one's notices (a supersede).
-        tracker
-            .resolution_epochs
-            .insert(worker_pane_id.to_string(), id);
         tracker
             .commission_dispatches_in_flight
             .entry(worker_pane_id.to_string())
@@ -7980,43 +7916,6 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// PR #1398 finding #18: where `worker_pane_id`'s delegations stand, as a
-    /// value that moves on every time one of them is resolved — a new delegate
-    /// armed over it (a supersede), a `work-done` credited, an undelivered
-    /// delegate released, or the worker replaced by `pane restart` or a
-    /// `clear = true` respawn — and that is gone once the pane closes. `None`
-    /// for a pane never delegated to.
-    ///
-    /// A deck notice about a worker (idle, went quiet, waiting for input,
-    /// exited) used to capture this value when it fired and re-check it with
-    /// [`Self::delegation_resolution_epoch_is`] before its typed write, which
-    /// could wait on the orchestrator's unsent draft. Since PRD #1666 those
-    /// notices are inbox posts made as they fire, and no production code reads
-    /// this value; only its tests do.
-    pub fn delegation_resolution_epoch(&self, worker_pane_id: &str) -> Option<u64> {
-        self.delegations
-            .lock()
-            .unwrap()
-            .resolution_epochs
-            .get(worker_pane_id)
-            .copied()
-    }
-
-    /// Whether nothing has resolved one of `worker_pane_id`'s delegations since
-    /// [`Self::delegation_resolution_epoch`] returned `epoch`.
-    pub fn delegation_resolution_epoch_is(&self, worker_pane_id: &str, epoch: Option<u64>) -> bool {
-        self.delegation_resolution_epoch(worker_pane_id) == epoch
-    }
-
-    /// Move `worker_pane_id`'s [`Self::delegation_resolution_epoch`] on. A pane
-    /// with no entry was never delegated to, so no notice holds a value to
-    /// invalidate, and none is created. Caller holds the tracker lock.
-    fn note_delegation_resolved(&self, tracker: &mut DelegationTracker, worker_pane_id: &str) {
-        if let Some(epoch) = tracker.resolution_epochs.get_mut(worker_pane_id) {
-            *epoch = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
     /// Issue #448: credit a `work-done` from `worker_pane_id` against the
     /// commission ledger, and report whether the orchestrator had actually asked
     /// for anything — see [`WorkDoneProvenance`].
@@ -8042,7 +7941,6 @@ impl AgentPtyRegistry {
         // holds together with the registry's own.
         let reporting_agent = self.pane_current_agent_id(worker_pane_id);
         let mut tracker = self.delegations.lock().unwrap();
-        self.note_delegation_resolved(&mut tracker, worker_pane_id);
         Self::expire_commissions(&mut tracker, worker_pane_id, now);
         let retired = Self::retire_commissions_of_a_previous_occupant(
             &mut tracker,
@@ -8162,7 +8060,6 @@ impl AgentPtyRegistry {
     /// took it already), the oldest goes, so the count stays right either way.
     pub fn release_delegation_commission(&self, worker_pane_id: &str, arm_id: Option<u64>) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
-        self.note_delegation_resolved(&mut tracker, worker_pane_id);
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return false;
         };
@@ -8196,7 +8093,6 @@ impl AgentPtyRegistry {
     /// agent's, including when every queued dispatch armed none.
     pub fn cancel_watches_of_replaced_agent(&self, worker_pane_id: &str) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
-        self.note_delegation_resolved(&mut tracker, worker_pane_id);
         let record_seq = tracker.records.get(worker_pane_id).map(|record| record.seq);
         let owned_by_a_queued_dispatch = record_seq.is_some_and(|seq| {
             tracker
@@ -8251,7 +8147,6 @@ impl AgentPtyRegistry {
         keep_own: bool,
     ) -> u32 {
         let mut tracker = self.delegations.lock().unwrap();
-        self.note_delegation_resolved(&mut tracker, worker_pane_id);
         let in_flight = tracker
             .commission_dispatches_in_flight
             .get(worker_pane_id)
@@ -8533,8 +8428,6 @@ impl AgentPtyRegistry {
         // below, and a notice finds its recipient in that ledger.)
         tracker.waiting_notices.remove(pane_id);
         tracker.waiting_notice_sent_at.remove(pane_id);
-        tracker.resolution_epochs.remove(pane_id);
-        tracker.pointer_delivery_epochs.remove(pane_id);
         let dropped_commissions = Self::drain_commissions_touching(&mut tracker, pane_id);
         if dropped_commissions > 0 {
             tracing::debug!(
@@ -8576,8 +8469,6 @@ impl AgentPtyRegistry {
         drop(tracker.close_waiters.remove(pane_id));
         tracker.waiting_notices.remove(pane_id);
         tracker.waiting_notice_sent_at.remove(pane_id);
-        tracker.resolution_epochs.remove(pane_id);
-        tracker.pointer_delivery_epochs.remove(pane_id);
         Self::drain_commissions_touching(&mut tracker, pane_id);
         let swept = Self::drain_delegations_touching(&mut tracker, pane_id);
         if !closed {
@@ -8606,7 +8497,11 @@ impl AgentPtyRegistry {
     /// `pane_id`'s close BEGINS, so a wait already in flight can be cancelled
     /// instead of sleeping out its remainder against a target that is being
     /// torn down. No production code waits on it since PRD #1666 removed the
-    /// delegate's readiness wait; only its test does. Deliberately the same shape as the two watches'
+    /// delegate's readiness wait. It stays because tests use it as the close's
+    /// EDGE: `scheduler/idle-worker/009` and `/010` and `delegate_respawn_recovery`'s
+    /// grace-window helper aim work inside a close, and their predecessors polled
+    /// `is_pane_closing` instead and missed short closes (issue #954, PR #1307).
+    /// Deliberately the same shape as the two watches'
     /// cancellation channels — a `oneshot` the caller `select!`s on, resolved by
     /// the sender being DROPPED, never sent on.
     ///
@@ -9023,21 +8918,13 @@ impl AgentPtyRegistry {
             })
     }
 
-    /// PRD #127 M2.2: record that a user keystroke just reached the pane with
-    /// `pane_id_env` (the deliver-on-idle debounce clock). Called from the
-    /// attach-stream STREAM_IN path. Sentinel / empty pane ids are ignored.
+    /// PRD #1631 (audit N1): record that a user keystroke just reached the pane
+    /// with `pane_id_env`, moving its human-input sequence. Sentinel / empty
+    /// pane ids are ignored. The attach-stream STREAM_IN path records through
+    /// [`PaneWriter::note_user_input`] instead, which checks the writer's
+    /// generation.
     pub fn note_user_input(&self, pane_id_env: &str) {
         self.pane_input.lock().unwrap().note_user_input(pane_id_env);
-    }
-
-    /// PRD #127 M2.2: the last time a user keystroke reached `pane_id_env`, or
-    /// `None` if none has. The reuse path compares this against the debounce
-    /// window to choose deliver-now vs queue.
-    pub fn last_user_input_at(&self, pane_id_env: &str) -> Option<Instant> {
-        self.pane_input
-            .lock()
-            .unwrap()
-            .last_user_input_at(pane_id_env)
     }
 
     /// Issue #544: has the user sent input into `pane_id_env` since their last
@@ -20967,8 +20854,8 @@ mod spawn_tests {
         {
             let state = registry.pane_input.lock().unwrap();
             assert!(
-                state.user_input_at.contains_key(PANE) && state.input.contains_key(PANE),
-                "the fixture must populate both clocks"
+                state.human_input_seq.contains_key(PANE) && state.input.contains_key(PANE),
+                "the fixture must populate both records"
             );
         }
 
@@ -21320,9 +21207,9 @@ mod spawn_tests {
     }
 
     /// Issue #542: a respawn removes the old generation while the pane stays,
-    /// and so does the user-input clock a user typing at it established.
+    /// and so does the human-input sequence a user typing at it established.
     #[tokio::test]
-    async fn respawn_keeps_the_panes_user_input_clock() {
+    async fn respawn_keeps_the_panes_human_input_sequence() {
         const PANE: &str = "issue-542-respawned-pane";
         let registry = Arc::new(AgentPtyRegistry::new());
         let first = registry
@@ -21340,7 +21227,7 @@ mod spawn_tests {
             .expect("respawn");
         assert_ne!(first, second);
         assert!(
-            registry.last_user_input_at(PANE).is_some(),
+            registry.pane_input.lock().unwrap().human_input_seq(PANE) > 0,
             "a respawn is not the pane going away"
         );
 
@@ -22169,68 +22056,6 @@ mod spawn_tests {
             WorkDoneProvenance::Unsolicited,
             "the worker's own close swept its ledger entry too"
         );
-    }
-
-    /// PR #1398 finding #18: every way a worker's delegation is resolved moves
-    /// the value a waiting notice captured when it fired — a new delegate armed
-    /// over it, a `work-done`, an undelivered delegate released, and both halves
-    /// of a restart — and a pane close forgets it. A pane never delegated to has
-    /// none, and resolving it creates none.
-    #[test]
-    fn delegation_resolution_epoch_moves_on_every_resolution() {
-        let reg = Arc::new(AgentPtyRegistry::new());
-        assert_eq!(reg.delegation_resolution_epoch("worker"), None);
-        assert_eq!(
-            reg.retire_delegation_commission("worker"),
-            WorkDoneProvenance::Unsolicited
-        );
-        assert_eq!(
-            reg.delegation_resolution_epoch("worker"),
-            None,
-            "an uncommissioned completion must not start tracking the pane"
-        );
-
-        let arm = |supersede| {
-            assert!(matches!(
-                reg.arm_delegation_commission("worker", "orch", Some("orch-agent"), supersede),
-                CommissionArm::Armed { .. }
-            ));
-        };
-        arm(false);
-        let resolutions: [(&str, &dyn Fn()); 5] = [
-            ("a superseding delegate", &|| arm(true)),
-            ("a work-done", &|| {
-                reg.retire_delegation_commission("worker");
-            }),
-            ("an undelivered delegate's release", &|| {
-                reg.release_delegation_commission("worker", None);
-            }),
-            ("a restart cancelling the watches", &|| {
-                reg.cancel_watches_of_replaced_agent("worker");
-            }),
-            ("a restart retiring the commissions", &|| {
-                reg.retire_commissions_of_replaced_agent("worker", false);
-            }),
-        ];
-        for (what, resolve) in resolutions {
-            let captured = reg.delegation_resolution_epoch("worker");
-            assert!(captured.is_some(), "a delegated pane is tracked");
-            assert!(reg.delegation_resolution_epoch_is("worker", captured));
-            resolve();
-            assert!(
-                !reg.delegation_resolution_epoch_is("worker", captured),
-                "{what} did not invalidate a notice captured before it"
-            );
-        }
-
-        let captured = reg.delegation_resolution_epoch("worker");
-        reg.begin_pane_close("worker");
-        assert!(
-            !reg.delegation_resolution_epoch_is("worker", captured),
-            "a closed worker pane still read as unresolved"
-        );
-        reg.finish_pane_close("worker", true);
-        assert_eq!(reg.delegation_resolution_epoch("worker"), None);
     }
 
     /// Issue #447: the waiting-for-input notice finds its recipient in the
