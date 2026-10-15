@@ -197,7 +197,10 @@ async fn codex_worker_inner(launch: WorkerLaunch) {
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: format!(
-            "First create {SENTINEL_NAME} in the current working directory containing exactly {SENTINEL_CONTENT}. Then run the dot-agent-deck work-done command from the completion instructions below. Do not stop before both steps are complete."
+            "First create the file {} containing exactly {SENTINEL_CONTENT}. Then run the dot-agent-deck work-done command from the completion instructions below. Do not stop before both steps are complete.",
+            // PRD #1666: the absolute path, so the model need not infer its
+            // working directory (one inferred it from the deck binary's path).
+            cwd.path().join(SENTINEL_NAME).display()
         ),
         to: vec![WORKER_ROLE.to_string()],
         supersede: false,

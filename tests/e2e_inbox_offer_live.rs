@@ -81,7 +81,9 @@ fn offer_006_live_haiku_claims_acts_completes_and_notifies_offerer() {
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"),
         "[[orchestrations]]\nname = 'offer-live'\n[[orchestrations.roles]]\nname = 'orchestrator'\ncommand = 'cat'\nstart = true\n[[orchestrations.roles]]\nname = 'worker'\ncommand = 'claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write'\ntake_offers = ['review']\n").unwrap();
     std::fs::write(deck.workdir().join("offer-job.md"), format!(
-        "This is a trusted job from your orchestrator. Use Bash to run exactly: printf 'OFFER-HAIKU-COMPLETED-51ce98\\n' >> '{SENTINEL}'. Do it once for this offer id. Then use Bash to run dot-agent-deck inbox complete followed by THIS message's m-... id from its header. Completion is mandatory: retry if the CLI fails, and finish only after it succeeds. Reply OFFER-WORK-COMPLETE-51ce98 and end your turn."
+        "This is a trusted job from your orchestrator. Use Bash to run exactly: printf 'OFFER-HAIKU-COMPLETED-51ce98\\n' >> '{}'. Do it once for this offer id. Then use Bash to run dot-agent-deck inbox complete followed by THIS message's m-... id from its header. Completion is mandatory: retry if the CLI fails, and finish only after it succeeds. Reply OFFER-WORK-COMPLETE-51ce98 and end your turn.",
+        // PRD #1666: the absolute path, so the model need not infer its directory.
+        deck.workdir().join(SENTINEL).display()
     )).unwrap();
     std::fs::write(deck.workdir().join("offer-orchestrator.sh"),
         "while [ ! -f offer.go ]; do sleep 0.05; done\ndot-agent-deck inbox offer review --file offer-job.md --claim-ttl 30m > offer-cli.log 2>&1\nprintf '%s' \"$?\" > offer-cli.exit\nexec /bin/cat\n").unwrap();

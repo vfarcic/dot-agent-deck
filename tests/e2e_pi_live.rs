@@ -168,9 +168,9 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
     // command; contains no apostrophes, double-quotes, or backticks (a backtick
     // would trigger shell command substitution before pi ever saw it).
     let directive = format!(
-        "Use the shell tool to create a file named {SENTINEL_NAME} in the current directory \
-         whose entire contents are exactly the text {SENTINEL_CONTENT}. Do that one task, then \
-         stop."
+        "Use the shell tool to run pwd, then create a file named {SENTINEL_NAME} in exactly the \
+         directory it prints, whose entire contents are exactly the text {SENTINEL_CONTENT}. Do \
+         that one task, then stop."
     );
     let pi_command = format!(
         "pi {} --approve '{directive}'",

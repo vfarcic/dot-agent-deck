@@ -203,7 +203,13 @@ fn claude_012_live_busy_fold_at_stop() {
     skip_unless!(common::check_claude_available());
     let claude = Claude::new();
     let name = "native-busy-e296c1.txt";
-    let first = claude.post("Use Bash to run exactly: printf busy > busy-started-781d.txt; sleep 8; printf done > busy-finished-781d.txt. Then reply BUSY-DONE and stop.");
+    // PRD #1666: absolute paths, so the model need not infer its directory.
+    let work = claude.deck.workdir();
+    let first = claude.post(&format!(
+        "Use Bash to run exactly: printf busy > '{}'; sleep 8; printf done > '{}'. Then reply BUSY-DONE and stop.",
+        work.join("busy-started-781d.txt").display(),
+        work.join("busy-finished-781d.txt").display()
+    ));
     assert!(
         common::wait_until(BUDGET, || claude
             .deck

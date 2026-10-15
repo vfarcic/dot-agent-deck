@@ -161,7 +161,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     skip_unless!(check_codex_sandbox_can_start());
 
     let prompt = format!(
-        "Use the shell to list the current directory and confirm {SENTINEL_NAME} exists. Then write exactly {SENTINEL_NAME} followed by a newline to {INTERACTIVE_PROOF_NAME}. Do not modify any other file."
+        "Use the shell to run pwd, then list exactly the directory it prints and confirm {SENTINEL_NAME} exists. Then write exactly {SENTINEL_NAME} followed by a newline to {INTERACTIVE_PROOF_NAME} in that same directory. Do not modify any other file."
     );
     let command = format!(
         "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",

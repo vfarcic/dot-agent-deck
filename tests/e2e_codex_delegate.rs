@@ -38,7 +38,9 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
         "[[orchestrations]]\nname = \"codex-delegate\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"./delegate.sh\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )).unwrap();
     std::fs::write(deck.workdir().join("delegate-task.md"),format!(
-        "Run exactly this shell command in the current directory: printf '{CONTENT}' > '{SENTINEL}'. Then reply DONE and end your turn."
+        "Run exactly this shell command: printf '{CONTENT}' > '{}'. Then reply DONE and end your turn.",
+        // PRD #1666: the absolute path, not "the current directory".
+        deck.workdir().join(SENTINEL).display()
     )).unwrap();
     let script = deck.workdir().join("delegate.sh");
     std::fs::write(&script, "#!/bin/sh\nwhile [ ! -f delegate-now ]; do sleep 0.2; done\ndot-agent-deck delegate --to coder --task-file delegate-task.md > delegate-cli.log 2>&1\nexec cat\n").unwrap();

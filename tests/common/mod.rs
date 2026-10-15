@@ -12270,9 +12270,66 @@ fn describe_read(path: &Path, read: std::io::Result<String>) -> String {
     match read {
         Ok(contents) => format!("{} contains {contents:?}", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            format!("{} does not exist", path.display())
+            format!("{} does not exist{}", path.display(), misplaced_note(path))
         }
         Err(e) => format!("{} is unreadable: {e}", path.display()),
+    }
+}
+
+/// PRD #1666: where a file named like the missing `expected` turned up instead,
+/// so a real agent that wrote its sentinel in the wrong directory reads as
+/// MISPLACED work rather than missing work. Empty when none is found.
+///
+/// The candidates are the places an agent was measured or can be expected to
+/// mistake for its working directory: each ancestor of `expected`'s directory
+/// (one level up was the measured case: a model inferred its directory from
+/// the deck binary's path), the directory two levels above the contained deck
+/// binary, and the checkout (`CARGO_MANIFEST_DIR`). A file found there may be
+/// an earlier run's leftover, which the note's "may" leaves open; it is a
+/// diagnostic, never an assertion.
+#[allow(dead_code)]
+pub fn misplaced_note(expected: &Path) -> String {
+    let mut extra: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = contained_deck_binary().parent().and_then(Path::parent) {
+        extra.push(dir.to_path_buf());
+    }
+    extra.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    misplaced_note_among(expected, &extra)
+}
+
+/// [`misplaced_note`] with the non-ancestor candidates passed in — the seam its
+/// fast-tier unit test drives, with no deck binary to resolve.
+pub(crate) fn misplaced_note_among(expected: &Path, extra: &[PathBuf]) -> String {
+    let Some(name) = expected.file_name() else {
+        return String::new();
+    };
+    let mut dirs: Vec<PathBuf> = expected
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .skip(1)
+        .take(4)
+        .map(Path::to_path_buf)
+        .collect();
+    dirs.extend(extra.iter().cloned());
+    let mut found: Vec<String> = Vec::new();
+    for dir in dirs {
+        let candidate = dir.join(name);
+        if candidate != expected && candidate.is_file() {
+            let shown = candidate.display().to_string();
+            if !found.contains(&shown) {
+                found.push(shown);
+            }
+        }
+    }
+    if found.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; MISPLACED: a file of that name is at {} — the agent may have written it \
+             outside its working directory",
+            found.join(", ")
+        )
     }
 }
 

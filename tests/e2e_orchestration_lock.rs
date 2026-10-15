@@ -519,6 +519,10 @@ fn lock_011_waiting_carve_out_on_real_panes() {
 const LIVE_LOCKED_SENTINEL: &str = "lock012_locked_9d3f.txt";
 const LIVE_UNLOCKED_SENTINEL: &str = "lock012_unlocked_5a71.txt";
 
+/// PRD #1666: an exact Bash command rather than "create a file in the current
+/// directory", which leaves the model to choose the path (and, measured, the
+/// Write tool, whose permission prompt this pane cannot answer).
+///
 /// A directive typed straight into a pane's PTY (never `WriteAndSubmit`, which
 /// is a daemon RPC that bypasses the lock's keystroke-forwarding gate
 /// entirely) asking a real agent to create `sentinel`. Cheap and
@@ -527,8 +531,8 @@ const LIVE_UNLOCKED_SENTINEL: &str = "lock012_unlocked_5a71.txt";
 /// terminal echo/redraw variance.
 fn create_sentinel_directive(sentinel: &str) -> String {
     format!(
-        "Use the Bash tool to create an empty file named {sentinel} in the \
-         current directory, then stop and say nothing else.\r"
+        "Use the Bash tool to run exactly this one command: pwd && touch {sentinel} \
+         then stop and say nothing else.\r"
     )
 }
 

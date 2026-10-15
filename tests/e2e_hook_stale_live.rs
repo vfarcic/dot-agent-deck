@@ -225,7 +225,7 @@ sys.exit(code)
         deck.attach_socket_path(),
         PANE,
         &id,
-        "Use Bash now to run sleep 3; ls -a in the current directory. Print every filename verbatim, one per line. Do not ask questions or delegate; this is the complete task.",
+        "Use Bash now to run pwd, then sleep 3; ls -a in exactly the directory it prints. Print every filename verbatim, one per line. Do not ask questions or delegate; this is the complete task.",
     )
     .expect("post the real task");
     events.wait_for(

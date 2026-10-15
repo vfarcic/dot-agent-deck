@@ -75,7 +75,7 @@ fn codex_010_live_folder_dialog_holds_until_answered() {
 fn codex_011_live_busy_stop_hands_over_and_acks() {
     skip_unless!(common::check_codex_available());
     let codex = Codex::new(false);
-    let mut input = codex.input("Run exactly: printf busy > codex-busy-started.txt; sleep 40; printf done > codex-busy-finished.txt. Then reply BUSY-DONE and end your turn.");
+    let mut input = codex.input("Run pwd, then run exactly this in the directory it prints: printf busy > codex-busy-started.txt; sleep 40; printf done > codex-busy-finished.txt. Then reply BUSY-DONE and end your turn.");
     // A painted prompt is the positive input barrier; Codex's paste-burst
     // debounce needs to settle before the separate Enter (the draft RED pins it).
     codex.wait_screen("codex-busy-started.txt");

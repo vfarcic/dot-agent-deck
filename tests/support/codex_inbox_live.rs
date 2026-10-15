@@ -180,7 +180,9 @@ impl Codex {
             &self.deck,
             &self.pane,
             &format!(
-                "Run exactly this shell command in the current directory: printf '%s' 'codex-inbox-action' > '{name}'. Then reply DONE and end your turn."
+                "Run exactly this shell command: printf '%s' 'codex-inbox-action' > '{}'. Then reply DONE and end your turn.",
+                // PRD #1666: the absolute path, not "the current directory".
+                self.deck.workdir().join(name).display()
             ),
         )
     }

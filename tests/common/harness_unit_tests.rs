@@ -5769,3 +5769,44 @@ fn pi_test_model_selection_reads_provider_slash_model() {
         assert!(err.contains(PI_TEST_MODEL_ENV), "{bad}: {err}");
     }
 }
+
+/// Scenario: Look for a missing sentinel's name around where it was expected.
+/// With nothing of that name nearby the note is empty; with a file of that name
+/// one level up — where a real agent once wrote it after inferring its working
+/// directory from the deck binary's path (PRD #1666) — or in an extra candidate
+/// directory, the note names that place as MISPLACED.
+#[test]
+fn a_missing_sentinel_found_elsewhere_is_reported_as_misplaced() {
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("project");
+    std::fs::create_dir_all(&work).unwrap();
+    let expected = work.join("sentinel-1666.txt");
+    let other = root.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    assert_eq!(
+        misplaced_note_among(&expected, std::slice::from_ref(&other)),
+        ""
+    );
+
+    std::fs::write(root.path().join("sentinel-1666.txt"), "DONE").unwrap();
+    let note = misplaced_note_among(&expected, std::slice::from_ref(&other));
+    assert!(note.contains("MISPLACED"), "{note}");
+    assert!(
+        note.contains(&root.path().join("sentinel-1666.txt").display().to_string()),
+        "{note}"
+    );
+
+    std::fs::remove_file(root.path().join("sentinel-1666.txt")).unwrap();
+    std::fs::write(other.join("sentinel-1666.txt"), "DONE").unwrap();
+    let note = misplaced_note_among(&expected, std::slice::from_ref(&other));
+    assert!(
+        note.contains(&other.join("sentinel-1666.txt").display().to_string()),
+        "{note}"
+    );
+    std::fs::write(&expected, "DONE").unwrap();
+    assert!(
+        !misplaced_note_among(&expected, std::slice::from_ref(&work))
+            .contains(&expected.display().to_string()),
+        "the expected path itself is never reported as misplaced"
+    );
+}
