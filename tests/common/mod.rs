@@ -5237,7 +5237,10 @@ static CONTAINED_DECK: OnceLock<ContainedDeck> = OnceLock::new();
 /// back to cargo's build directory, while a hard link is reported by the name it
 /// was executed through. A copy is the fallback where the temp root is on
 /// another filesystem than the build directory; it costs the binary's size once
-/// per test process. One per process rather than per test HOME, so the
+/// per test process. Either way this changes the pathname the deck reports, and
+/// nothing else: the hard link shares the build artifact's inode, and a
+/// same-user agent is not sandboxed from the checkout by never being told its
+/// path. One per process rather than per test HOME, so the
 /// in-process daemon's process-wide override and every launch agree on one file;
 /// it goes with the harness temp root at process exit.
 ///
@@ -5315,15 +5318,25 @@ fn is_inside_checkout(path: &Path) -> bool {
 ///
 /// - cargo's build directory, which a test puts first so the branch build wins
 ///   a lookup by name, becomes [`contained_deck_path_dir`] in the same position;
-/// - any other entry inside the checkout becomes its canonical path when that
-///   lies outside — a devbox shell's `<checkout>/.devbox/nix/profile/default/bin`
-///   is a symlink into `/nix/store`, so `git`, `cargo` and every other tool it
-///   provides still resolve — and is dropped when it does not;
-/// - everything else is kept, in order.
+/// - a **relative** entry, the empty one included, is dropped: it names a
+///   directory only once the child's cwd is known, and an agent's cwd can be
+///   anywhere, the checkout included;
+/// - every other entry is judged by where it RESOLVES ([`resolved_entry`]), not
+///   by how it is spelled. One that resolves inside the checkout is dropped,
+///   whether it is spelled inside it or is an outside symlink into it (a
+///   `~/bin/project-tools` pointing at `<checkout>/scripts`). One spelled inside
+///   the checkout that resolves outside it becomes that canonical path — a
+///   devbox shell's `<checkout>/.devbox/nix/profile/default/bin` is a symlink
+///   into `/nix/store`, so `git`, `cargo` and every other tool it provides still
+///   resolve;
+/// - everything else is kept as spelled, in order.
 ///
-/// An agent that inspects its `PATH` (`which dot-agent-deck`, `echo $PATH`) then
-/// meets no checkout path either, which is the same leak as the task text by
-/// another route.
+/// **This is pathname hygiene, not isolation.** It keeps the checkout out of
+/// what an agent reads in its `PATH` (`which dot-agent-deck`, `echo $PATH`) and
+/// out of what a lookup by name reaches, as resolved when this runs — the same
+/// leak as the task text by another route. A same-user agent can still reach
+/// the checkout by any absolute path it learns some other way, and a symlink
+/// created or retargeted after this ran is not seen.
 #[allow(dead_code)]
 pub fn contain_path(path: &str) -> String {
     let cargo_dir = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -5333,17 +5346,17 @@ pub fn contain_path(path: &str) -> String {
     let deck_dir = contained_deck_path_dir();
     let mut entries: Vec<PathBuf> = Vec::new();
     for entry in std::env::split_paths(path) {
-        let is_cargo_dir = entry == cargo_dir
-            || (entry.is_absolute()
-                && cargo_canonical.is_some()
-                && std::fs::canonicalize(&entry).ok() == cargo_canonical);
+        if !entry.is_absolute() {
+            continue;
+        }
+        let resolved = resolved_entry(&entry);
+        let is_cargo_dir = entry == cargo_dir || cargo_canonical.as_ref() == Some(&resolved);
         let kept = if is_cargo_dir {
             deck_dir.to_path_buf()
+        } else if is_inside_checkout(&resolved) {
+            continue;
         } else if is_inside_checkout(&entry) {
-            match std::fs::canonicalize(&entry) {
-                Ok(canonical) if !is_inside_checkout(&canonical) => canonical,
-                _ => continue,
-            }
+            resolved
         } else {
             entry
         };
@@ -5355,6 +5368,28 @@ pub fn contain_path(path: &str) -> String {
         .expect("PATH entries rejoin")
         .to_string_lossy()
         .into_owned()
+}
+
+/// Where the absolute `entry` resolves: its deepest existing ancestor's
+/// canonical path with the rest of `entry` appended, so a directory that does
+/// not exist yet is judged by the symlinks above it. `entry` itself when not
+/// even the root canonicalizes.
+fn resolved_entry(entry: &Path) -> PathBuf {
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut existing = entry;
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            return rest
+                .iter()
+                .rev()
+                .fold(canonical, |path, part| path.join(part));
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return entry.to_path_buf();
+        };
+        rest.push(name);
+        existing = parent;
+    }
 }
 
 /// The host `PATH` with the build under test first, for an environment the test

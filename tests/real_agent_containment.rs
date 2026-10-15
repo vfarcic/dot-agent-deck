@@ -117,8 +117,9 @@ fn orchestration_dispatch_007_no_lane_two_source_routes_around_the_contained_dec
 /// Scenario: Ask the harness for the binary every launch runs and for a contained
 /// `PATH`. The binary must be the build under test at a path outside the
 /// checkout, and the `PATH` must swap cargo's build directory for the contained
-/// one in place, drop a checkout directory that resolves inside the checkout and
-/// keep every other entry.
+/// one in place, drop a checkout directory that resolves inside the checkout,
+/// an outside symlink that resolves into it and every relative entry, and keep
+/// every other entry.
 #[spec("orchestration/dispatch/008")]
 #[test]
 fn orchestration_dispatch_008_the_contained_link_and_path_keep_the_checkout_out() {
@@ -171,6 +172,53 @@ fn orchestration_dispatch_008_the_contained_link_and_path_keep_the_checkout_out(
         "cargo's directory becomes the contained one (once), a checkout directory \
          with no outside spelling is dropped, the rest is kept: {rewritten}"
     );
+
+    // A relative entry is resolved against whatever directory the child runs
+    // in, which for an agent can be the checkout, so it is dropped — the empty
+    // entry (the current directory) included.
+    let relative = std::env::join_paths([
+        Path::new("tests"),
+        Path::new("."),
+        Path::new(""),
+        Path::new("target/debug"),
+        outside.as_path(),
+    ])
+    .expect("join a PATH with relative entries");
+    let rewritten = common::contain_path(&relative.to_string_lossy());
+    assert_eq!(
+        std::env::split_paths(&rewritten).collect::<Vec<_>>(),
+        vec![outside.clone()],
+        "every relative entry is dropped and the absolute one kept: {rewritten}"
+    );
+
+    // An entry OUTSIDE the checkout that is a symlink into it — a
+    // `~/bin/project-tools` pointing at `<checkout>/scripts` — reaches the
+    // checkout as surely as its inside spelling, so it is dropped too, and so
+    // is a path below it.
+    #[cfg(unix)]
+    {
+        let aliases = tempfile::Builder::new()
+            .prefix("contain-path-alias-")
+            .tempdir_in(&outside)
+            .expect("scratch dir outside the checkout");
+        assert!(
+            !aliases.path().starts_with(checkout)
+                && !aliases.path().starts_with(&canonical_checkout),
+            "the system temp dir must lie outside the checkout for this case"
+        );
+        let alias = aliases.path().join("project-tools");
+        std::os::unix::fs::symlink(&inside, &alias).expect("link an outside alias in");
+        let below = alias.join("fixtures");
+        let missing = alias.join("no-such-dir");
+        let path = std::env::join_paths([alias.as_path(), &below, &missing, outside.as_path()])
+            .expect("join a PATH with aliases");
+        let rewritten = common::contain_path(&path.to_string_lossy());
+        assert_eq!(
+            std::env::split_paths(&rewritten).collect::<Vec<_>>(),
+            vec![outside.clone()],
+            "an outside symlink into the checkout, and a path below it, is dropped: {rewritten}"
+        );
+    }
 
     // An entry in the checkout that is a symlink to somewhere else keeps
     // working under its outside spelling — a devbox shell's
