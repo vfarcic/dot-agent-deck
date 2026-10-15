@@ -114,24 +114,6 @@ fn check_pi_available() -> Result<(), String> {
     }
 }
 
-/// PATH for the spawned deck (→ daemon → pi child) with the freshly-built
-/// `dot-agent-deck` binary's dir prepended to the host PATH, so the extension's
-/// `dot-agent-deck agent-event` resolves. Since issue #1385 the extension names
-/// the deck by the `DOT_AGENT_DECK_EXE` it is spawned with and consults PATH
-/// only without it (`pi/live/003` pins that); the prepend is kept so any other
-/// bare-name lookup in the chain also reaches the build under test.
-/// `CARGO_BIN_EXE_dot-agent-deck` is set by Cargo at integration-test build
-/// time to the binary under test.
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = std::path::Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("bin dir is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
-
 /// The text of the Pi card's own rectangle on `grid` — every row from the one
 /// carrying its `Pi ·` title down to its bottom border, cut at the card's
 /// right edge — or `None` while no complete card is drawn. Issue #622: the
@@ -245,7 +227,7 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
         // the deck's lazy-spawned daemon — is also where the daemon-startup
         // auto-materialize finds `pi`, so the detector fires; no manual
         // `with_pi_extension`.)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         // NOTE: no `with_pi_extension()` — the per-test HOME starts WITHOUT the
         // extension. The deck's lazy-spawned daemon runs the real `daemon serve`
         // entry, whose daemon-startup auto-materialize (PRD #201) writes the
@@ -550,7 +532,7 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         // `dot-agent-deck agent-event`/`delegate`/`inbox wait` and the claude worker
         // resolves `dot-agent-deck work-done`; preserves the host PATH so `pi` /
         // `claude` still resolve. Wins over the harness env scrub.
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         // Point the deck's saved-session reader at our staged orchestration
         // snapshot so the daemon-empty restore rebuilds exactly this
         // orchestration (and nothing from the developer's real session.toml).

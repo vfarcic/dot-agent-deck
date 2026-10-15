@@ -68,9 +68,9 @@ export default function(pi) {
         let installed = deck.home_dir().join(".local/bin/dot-agent-deck");
         std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
         if !installed.exists()
-            && std::fs::hard_link(env!("CARGO_BIN_EXE_dot-agent-deck"), &installed).is_err()
+            && std::fs::hard_link(common::contained_deck_binary(), &installed).is_err()
         {
-            std::fs::copy(env!("CARGO_BIN_EXE_dot-agent-deck"), &installed).unwrap();
+            std::fs::copy(common::contained_deck_binary(), &installed).unwrap();
         }
         let path = format!(
             "{}:{}",

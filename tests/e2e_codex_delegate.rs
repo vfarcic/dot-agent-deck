@@ -21,14 +21,7 @@ const CONTENT: &str = "CODEX_DELEGATE_OK";
 #[test]
 fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     skip_unless!(common::check_codex_available());
-    let path = format!(
-        "{}:{}",
-        std::path::Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-            .parent()
-            .unwrap()
-            .display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = common::path_with_binary_dir();
     let deck = TuiDeck::builder()
         .with_pty_size(180, 50)
         .with_imported_codex_credentials()

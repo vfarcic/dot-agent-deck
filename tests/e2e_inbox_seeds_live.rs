@@ -11,7 +11,7 @@ use dot_agent_deck::daemon_protocol::{AttachRequest, PostOrigin};
 use dot_agent_deck::inbox::{MessageSummary, StateName};
 use spec::spec;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -26,17 +26,6 @@ impl Drop for SiblingWorktreeGuards {
             let _ = std::fs::remove_dir_all(path);
         }
     }
-}
-
-fn path_with_binary_dir() -> String {
-    format!(
-        "{}:{}",
-        Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-            .parent()
-            .unwrap()
-            .display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
 }
 
 fn dispatch_worktree_of(deck: &TuiDeck, name: &str) -> PathBuf {
@@ -144,7 +133,7 @@ fn dispatch(deck: &TuiDeck, caller: &str, cases: &[(&str, String)]) {
     let mut children: Vec<_> = cases
         .iter()
         .map(|(name, prompt)| {
-            Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            Command::new(common::contained_deck_binary())
                 .args(["dispatch", name, "--single", "--task", prompt])
                 .env("HOME", deck.home_dir())
                 .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
@@ -230,7 +219,7 @@ while True:
         if not chunk: break
         capture.write(chunk)
 "#,
-            env!("CARGO_BIN_EXE_dot-agent-deck")
+            common::contained_deck_binary().display()
         ),
     )
     .unwrap();
@@ -238,7 +227,7 @@ while True:
     let config = configure(launcher.to_str().unwrap());
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env(
             "DOT_AGENT_DECK_CONFIG",
             config.path().join("config.toml").to_string_lossy(),
@@ -302,7 +291,7 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
         .impersonating_pane_signals()
         .with_pty_size(200, 55)
         .with_imported_claude_credentials()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env(
             "DOT_AGENT_DECK_CONFIG",
             config.path().join("config.toml").to_string_lossy(),
@@ -352,7 +341,7 @@ fn dispatch_028_prompts_with_cr_line_breaks_submit_exactly_once_on_real_claude()
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_imported_claude_credentials()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env(
             "DOT_AGENT_DECK_CONFIG",
             config.path().join("config.toml").to_string_lossy(),
@@ -366,7 +355,7 @@ fn dispatch_028_prompts_with_cr_line_breaks_submit_exactly_once_on_real_claude()
     let task_file = staging.path().join("crlf-task.md");
     let body = "This is a Windows CRLF task.\r\n\r\nUse Bash to run exactly: printf '%s\\n' first-ok >> line-break-first-91f3.txt. Then end your turn without running work-done.\r\n";
     std::fs::write(&task_file, body).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let output = Command::new(common::contained_deck_binary())
         .args(["dispatch", name, "--single", "--task-file"])
         .arg(&task_file)
         .env("HOME", deck.home_dir())

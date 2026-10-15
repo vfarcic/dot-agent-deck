@@ -140,25 +140,6 @@ impl Drop for SiblingWorktreeGuard {
     }
 }
 
-/// PATH for the spawned deck (→ daemon → agents) with the freshly-built
-/// `dot-agent-deck` binary's dir prepended to the host PATH.
-///
-/// Without this the seeded dispatcher agent runs whatever `dot-agent-deck`
-/// happens to be installed on the host, which predates the `dispatch` verb — the
-/// agent then reports "dispatch doesn't exist as a subcommand" and the test
-/// silently proves nothing about the feature. The rest of the host PATH is kept
-/// so `git` and `claude` still resolve. Mirrors
-/// `e2e_issue_dispatch_real.rs::path_with_binary_dir`.
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bindir = Path::new(bin).parent().expect("binary path has a parent");
-    format!(
-        "{}:{}",
-        bindir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
-
 /// The sibling worktree a dispatch of `unit` must create — `../<repo>-dispatch-<unit>`.
 fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
     deck.workdir()
@@ -418,7 +399,7 @@ fn run_delegate_to(
     roles: &[&str],
     task: &str,
 ) -> std::process::Output {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    let mut cmd = std::process::Command::new(common::contained_deck_binary());
     cmd.arg("delegate");
     for role in roles {
         cmd.args(["--to", role]);
@@ -555,7 +536,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
         )
         // The branch build must win over any host-installed `dot-agent-deck`, or
         // the agent cannot see the `dispatch` verb at all.
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
 
@@ -797,7 +778,7 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
 
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active agents");
 
@@ -816,7 +797,7 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     // `--orchestration=demo-orch` names the fixture's orchestration explicitly:
     // this test is about the ORCHESTRATION shape, and the flag is what a
     // dispatcher agent that picked a shape off `--list-targets` actually sends.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args([
             "dispatch",
             UNIT,
@@ -1095,7 +1076,7 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     // The worker already received a delegation above. A second delegate is
     // refused while it still owes work-done (#580), so finish that first task
     // before exercising a different partial-delivery outcome.
-    let done = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let done = std::process::Command::new(common::contained_deck_binary())
         .args(["work-done", "--task", "Dispatched delegation complete."])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &dispatched["worker"])
@@ -1207,13 +1188,8 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         // diagnostics to be readable).
         .with_pty_size(200, 55)
         .with_imported_claude_credentials()
-        // Containment: launched from cargo's build directory, the deck names
-        // itself to these agents as `<checkout>/target/…`, and the coder was
-        // measured writing its sentinel into the checkout root
-        // (`orchestration/dispatch/006`).
-        .with_binary_outside_checkout()
         // The branch build must win over any host-installed `dot-agent-deck`.
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         // Issue #663: run the PRODUCTION post-respawn readiness buffer. The
         // harness pins it to `0` for the many e2e scenarios whose workers are
         // stand-ins that accept input the instant they exist; PRD #249's own
@@ -1281,7 +1257,7 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
     // The REAL CLI, against the deck's own socket — the path an agent takes.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args([
             "dispatch",
             UNIT,
@@ -1415,9 +1391,19 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // already there is an earlier run's, and is left for whoever moves it.
     let stray = Path::new(env!("CARGO_MANIFEST_DIR")).join(SENTINEL);
     let stray_before = stray.exists();
+    // Where a coder that took the folder holding the deck's own link for its
+    // project would put it: measured once the checkout was out of the deck's
+    // path, with "the current directory" as the only directive (PRD #1666).
+    let misplaced = common::contained_deck_binary()
+        .parent()
+        .and_then(Path::parent)
+        .expect("the contained deck sits two levels below a directory")
+        .join(SENTINEL);
+    // `pwd` first, so "here" is the coder's own working directory rather than a
+    // directory it infers from a path in its task text.
     let worker_task = format!(
-        "Create a file named {SENTINEL} in the current directory containing the single \
-         word DONE. Do not ask what to do, offer numbered choices, or wait for a task to \
+        "Run `pwd` in your shell, then create a file named {SENTINEL} in exactly the \
+         directory it prints, containing the single word DONE. Do not ask what to do, offer numbered choices, or wait for a task to \
          be defined - this message IS the task and you have everything you need. If a \
          file you were pointed at looks empty or missing, create {SENTINEL} anyway \
          instead of asking about it."
@@ -1510,6 +1496,15 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         );
     }
     assert!(
+        done || !misplaced.exists(),
+        "the coder did the work but wrote {SENTINEL} to {} instead of its own worktree {} \
+         — it took the folder holding the deck's link for its project. Orchestrator pane \
+         {orchestrator_pane}, coder pane {coder_pane}.{}",
+        misplaced.display(),
+        expected_worktree.display(),
+        role_diagnostics(&deck, ORCH, &ROLES),
+    );
+    assert!(
         done,
         "the dispatched orchestration's `coder` never did the delegated work within {}s — \
          no {SENTINEL} at {}. A dispatched orchestration whose orchestrator cannot reach \
@@ -1557,132 +1552,6 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         role_diagnostics(&deck, ORCH, &ROLES),
         deck.snapshot_grid()
     );
-}
-
-/// Scenario: Launch the deck on the `orch-deck` fixture from outside the
-/// developer's checkout, dispatch its two-role orchestration through the real
-/// CLI and delegate a task to the worker. The orchestrator's context file and the
-/// worker's task, on disk and in its inbox, must name the deck by its per-test
-/// path and never by any path inside the checkout the tests were built in.
-#[spec("orchestration/dispatch/006")]
-#[test]
-fn orchestration_dispatch_006_agent_instructions_never_name_the_developer_checkout() {
-    const UNIT: &str = "contain-probe";
-    const TASK: &str = "Contained delegation.";
-    let checkout = env!("CARGO_MANIFEST_DIR");
-
-    let deck = TuiDeck::builder()
-        .impersonating_pane_signals()
-        .with_binary_outside_checkout()
-        .with_env("PATH", path_with_binary_dir())
-        .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active agents");
-    common::commit_fixture_repo(deck.workdir());
-    let caller_pane = open_cat_caller_pane(&deck);
-    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
-    let _guard = SiblingWorktreeGuard(expected_worktree.clone());
-
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args([
-            "dispatch",
-            UNIT,
-            "--task",
-            "Say hello, then stop.",
-            "--orchestration=demo-orch",
-        ])
-        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
-        .output()
-        .expect("the dispatch CLI should run");
-    assert!(
-        out.status.success(),
-        "`dispatch --orchestration demo-orch` failed: {}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    const WAIT: Duration = Duration::from_secs(90);
-    let worktree_dir = expected_worktree
-        .file_name()
-        .expect("the dispatch worktree has a basename")
-        .to_string_lossy()
-        .into_owned();
-    let is_worktree = |basename: &str| basename == worktree_dir;
-    let panes = wait_for_role_panes(
-        &deck,
-        "demo-orch",
-        "dispatched orchestration",
-        &["orchestrator", "worker"],
-        is_worktree,
-        WAIT,
-    );
-    let out = run_delegate(&deck, &panes["orchestrator"], "worker", TASK);
-    assert!(
-        out.status.success(),
-        "`delegate` from the dispatched orchestrator exited {:?}.\nstdout: {}\nstderr: {}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        wait_for_delegate_inbox(&deck, "demo-orch", is_worktree, "worker", TASK, WAIT),
-        "the dispatched worker never received the delegated task within {}s.\nFinal grid:\n{}",
-        WAIT.as_secs(),
-        deck.snapshot_grid()
-    );
-
-    // What the agents are handed: the orchestrator's context, the worker's task
-    // file, and the task as it sits in the worker's inbox.
-    let coordination = expected_worktree.join(".dot-agent-deck");
-    let context = std::fs::read_dir(&coordination)
-        .expect("list the dispatched coordination files")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("orchestrator-context-") && name.ends_with(".md")
-                })
-        })
-        .expect("the dispatched orchestration publishes a context file");
-    let inbox_task = inbox_view::messages(deck.attach_socket_path(), &panes["worker"])
-        .into_iter()
-        .filter_map(|message| message.text)
-        .find(|text| text.contains(TASK))
-        .expect("the delegated task is in the worker's inbox");
-    let handed = [
-        (
-            "the orchestrator context".to_string(),
-            std::fs::read_to_string(&context).expect("read the orchestrator context"),
-        ),
-        (
-            "the worker task file".to_string(),
-            std::fs::read_to_string(coordination.join("worker-task-worker.md"))
-                .expect("read the worker task file"),
-        ),
-        ("the worker's inbox task".to_string(), inbox_task),
-    ];
-
-    // The positive half keeps the containment claim from passing vacuously: the
-    // deck does name itself in this text, by a path under the per-test HOME.
-    let homes: Vec<String> = std::iter::once(deck.home_dir().to_path_buf())
-        .chain(deck.home_dir().canonicalize().ok())
-        .map(|home| home.to_string_lossy().into_owned())
-        .collect();
-    for (what, text) in &handed {
-        assert!(
-            !text.contains(checkout),
-            "{what} names the developer's checkout {checkout} — a real agent handed this \
-             text was measured writing its work into that checkout instead of its own \
-             directory (orchestration/dispatch/002). Text:\n{text}"
-        );
-        assert!(
-            homes.iter().any(|home| text.contains(home.as_str())),
-            "{what} does not name the deck by its per-test path under {homes:?}, so the \
-             containment above proves nothing. Text:\n{text}"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,7 +1615,7 @@ fn real_single_dispatch_round_trip(close_after_report: bool) {
         )
         // The agent's `dot-agent-deck dispatch` and `work-done` calls must use
         // the branch build, not a host-installed binary that predates the verbs.
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
 
@@ -2131,7 +2000,7 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
         .with_pty_size(200, 50)
         .with_env(
             "PATH",
-            format!("{}:{}", stub_bin.display(), path_with_binary_dir()),
+            format!("{}:{}", stub_bin.display(), common::path_with_binary_dir()),
         )
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .with_imported_claude_credentials()
@@ -2155,7 +2024,7 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     let caller_pane = open_caller_pane(&deck, b"");
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args(["dispatch", UNIT, "--task", "Wait quietly.", "--single"])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
@@ -2299,7 +2168,7 @@ fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
         // Roomy, so neither the card title nor the dialog's path line is
         // ellipsized by the terminal — the path IS the assertion.
         .with_pty_size(200, 50)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
@@ -2309,7 +2178,7 @@ fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
     let caller_pane = open_cat_caller_pane(&deck);
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args(["dispatch", UNIT, "--task", "Wait quietly.", "--single"])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
@@ -2455,7 +2324,7 @@ fn dispatch_close_003_a_worktree_cleaned_while_the_dialog_is_open_is_not_reporte
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(200, 50)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
@@ -2465,7 +2334,7 @@ fn dispatch_close_003_a_worktree_cleaned_while_the_dialog_is_open_is_not_reporte
     let caller_pane = open_cat_caller_pane(&deck);
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args(["dispatch", UNIT, "--task", "Wait quietly.", "--single"])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
@@ -2569,14 +2438,14 @@ fn orchestration_dispatch_004_list_targets_marks_the_declared_default() {
 
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .launch_with_fixture("orch-multi");
     deck.wait_for_string("No active agents");
     common::commit_fixture_repo(deck.workdir());
     let caller_pane = open_cat_caller_pane(&deck);
 
     // The READ-ONLY half: what a dispatcher agent is shown before it chooses.
-    let listed = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let listed = std::process::Command::new(common::contained_deck_binary())
         .args(["dispatch", "--list-targets"])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
@@ -2623,7 +2492,7 @@ fn orchestration_dispatch_004_list_targets_marks_the_declared_default() {
     // about, so the two are asserted in one test rather than two.
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args([
             "dispatch",
             UNIT,

@@ -451,7 +451,7 @@ pub struct TuiDeckBuilder {
     suppress_success_recording: bool,
     suppress_agent_credentials: bool,
     launch_subdir: Option<PathBuf>,
-    binary_outside_checkout: bool,
+    launch_cargo_artifact: bool,
 }
 
 impl TuiDeckBuilder {
@@ -516,22 +516,18 @@ impl TuiDeckBuilder {
         self
     }
 
-    /// Launch the deck from a link to the binary under test inside the per-test
-    /// HOME, and put that link's directory on the deck's `PATH` in place of
-    /// cargo's build directory, so nothing the deck hands an agent names the
-    /// developer's checkout.
+    /// Opt out of the checkout containment every other launch gets: run the
+    /// deck straight from cargo's `CARGO_BIN_EXE_…`, a path under the developer's
+    /// checkout, and leave cargo's build directory on `PATH` as the test put it.
     ///
-    /// The deck spells itself into agent text as its own absolute path
-    /// (`binary_name()`: the work-done footer of every delegated task, the
-    /// orchestrator context, inbox instructions). Launched from cargo's
-    /// `CARGO_BIN_EXE_…` that path is `<checkout>/target/<profile>/dot-agent-deck`,
-    /// and a real agent told to work "in the current directory" was measured
-    /// resolving that to the checkout and writing its file there
-    /// (`orchestration/dispatch/002`, PRD #1666) — a real-agent test writing into
-    /// the developer's repository. For a real-agent test, this is the
-    /// containment. A stand-in test has no use for it.
-    pub fn with_binary_outside_checkout(mut self) -> Self {
-        self.binary_outside_checkout = true;
+    /// For the tests whose subject IS a deck running as a cargo build artifact:
+    /// the durable-path resolver refuses to pin an artifact into agent config
+    /// (`hooks/install/005`), and a deck running from the contained link is not
+    /// one. Nothing that can reach a real agent may use this — the guard in
+    /// `orchestration/dispatch/007` refuses it in every `e2e-live` file — because
+    /// the deck spells its own path into agent text ([`contained_deck_binary`]).
+    pub fn launching_the_cargo_artifact(mut self) -> Self {
+        self.launch_cargo_artifact = true;
         self
     }
 
@@ -952,7 +948,7 @@ impl TuiDeck {
             suppress_success_recording: false,
             suppress_agent_credentials: false,
             launch_subdir: None,
-            binary_outside_checkout: false,
+            launch_cargo_artifact: false,
         }
     }
 
@@ -1026,16 +1022,17 @@ impl TuiDeck {
 
         let home = work.join("home");
         std::fs::create_dir_all(&home).expect("create per-test HOME");
+        // The binary this deck runs as: the contained link (PRD #1666), unless
+        // the test opted out with `launching_the_cargo_artifact`.
+        let deck_binary: PathBuf = if builder.launch_cargo_artifact {
+            PathBuf::from(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        } else {
+            contained_deck_binary().to_path_buf()
+        };
         // PRD #381: the durable-path candidate the deck's hook installers
         // resolve, pointed at the binary under test. See `seed_durable_binary`.
         #[cfg(unix)]
-        seed_durable_binary(&home);
-        // `with_binary_outside_checkout`: the deck runs from a link in this HOME.
-        let deck_binary = if builder.binary_outside_checkout {
-            Some(link_binary_outside_checkout(&home)?)
-        } else {
-            None
-        };
+        seed_durable_binary(&home, &deck_binary);
 
         // PRD #201: the per-test HOME deliberately starts WITHOUT the bundled Pi
         // extension. Because `TuiDeck` drives the REAL binary, its lazy-spawned
@@ -1199,10 +1196,10 @@ impl TuiDeck {
         // test. The `env!()` evaluates at compile time so the harness
         // always launches whatever the current test build produced
         // (debug vs. release matches the test's profile).
-        let bin = deck_binary
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_dot-agent-deck")));
-        let mut cmd = CommandBuilder::new(&bin);
+        //
+        // Run through `contained_deck_binary` rather than from that path
+        // directly, unless the test opted out: see that function.
+        let mut cmd = CommandBuilder::new(&deck_binary);
         // Default: launch at the fixture root. `with_launch_subdir` moves the
         // deck's cwd below it without moving the fixture (issue #577).
         let launch_dir = match &builder.launch_subdir {
@@ -1363,12 +1360,11 @@ impl TuiDeck {
         }
         // After the `with_env` layer, because the tests that need the branch
         // build to win `PATH` put cargo's build directory there themselves.
-        if let Some(dir) = deck_binary.as_deref().and_then(Path::parent) {
-            let cargo_dir = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-                .parent()
-                .expect("the binary under test has a parent directory");
-            let path = final_env.get("PATH").cloned().unwrap_or_default();
-            final_env.insert("PATH".into(), path_without_dir(&path, cargo_dir, dir));
+        if !builder.launch_cargo_artifact
+            && let Some(path) = final_env.get("PATH")
+        {
+            let contained = contain_path(path);
+            final_env.insert("PATH".into(), contained);
         }
         // Read AFTER the `with_env` layer, so a test that moves the state dir
         // still gets its own daemon's log dumped rather than a missing path.
@@ -5154,30 +5150,33 @@ pub(crate) fn terminal_reached(
 }
 
 /// PRD #381: seed `<home>/.local/bin/dot-agent-deck` as a **symlink to the
-/// binary under test**, so the deck's durable-path resolver lands inside the
-/// sandbox instead of on the host.
+/// binary under test** (`target`, which the deck itself runs as), so the deck's
+/// durable-path resolver lands inside the sandbox instead of on the host.
 ///
 /// Without this, every e2e test that relies on installed hooks would silently
-/// exercise the wrong binary. The resolver refuses to write a
-/// `target/{debug,release}` path into agent config, and under `cargo test-e2e`
-/// the binary under test IS one — so it falls to step 2a
-/// (`$HOME/.local/bin/dot-agent-deck`) and then step 2b (`$PATH`). This harness
-/// passes the HOST `PATH` through (`inherit_pass`, below), and a developer box
-/// commonly has a real installed deck on it: hooks would then point at the
-/// host's deck and the tier would test stale code, while a machine with no
-/// installed deck would get a refusal and no hooks at all. Seeding step 2a
-/// makes the resolution order run for real and land on this build.
+/// exercise the wrong binary. The resolver looks for an installed copy before
+/// it falls back on the running binary, and this harness passes the HOST `PATH`
+/// through (`inherit_pass`, below), where a developer box commonly has a real
+/// installed deck: hooks would then point at the host's deck and the tier would
+/// test stale code. Seeding `~/.local/bin` makes the resolution order run for
+/// real and land on this build.
 ///
 /// A **symlink**, not a copy: the resolver deliberately does not canonicalize
 /// its 2a candidate, so the durable symlink path is what gets written while the
 /// bytes executed are the freshly-built ones. A copy would go stale on the next
-/// `cargo build` and cost the binary's size per test.
+/// `cargo build` and cost the binary's size per test. Pointed at the file the
+/// deck runs as — [`contained_deck_binary`] for every launch that did not opt
+/// out — so the daemon recognises the hooks this symlink is written into as its
+/// own (`hook_binary::DeckIdentity`), as it did when both were cargo's build
+/// artifact, and the resolver pins this same `~/.local/bin` path, now through
+/// its "an installed name for the running binary" step rather than its install
+/// fallback.
 ///
 /// `#[cfg(unix)]` because the L2 tier is Unix-only, and best-effort because a
 /// failure here can only degrade a test to the pre-#381 host-`PATH` behaviour,
 /// never corrupt anything.
 #[cfg(unix)]
-fn seed_durable_binary(home: &Path) {
+fn seed_durable_binary(home: &Path, target: &Path) {
     let bin_dir = home.join(".local").join("bin");
     if std::fs::create_dir_all(&bin_dir).is_err() {
         return;
@@ -5185,54 +5184,174 @@ fn seed_durable_binary(home: &Path) {
     // `DEFAULT_BINARY_NAME`'s value, spelled out: the resolver looks for the
     // crate's package name, not whatever the test binary happens to be called.
     let link = bin_dir.join("dot-agent-deck");
-    let _ = std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dot-agent-deck"), link);
+    let _ = std::os::unix::fs::symlink(target, link);
 }
 
-/// [`TuiDeckBuilder::with_binary_outside_checkout`]'s link: the binary under
-/// test at `<home>/.deck-under-test/dot-agent-deck`, which is what the launched
-/// deck — and the daemon it lazy-spawns from its own executable — then reports
-/// as `current_exe()`.
+/// [`contained_deck_binary`] and the directory [`contain_path`] puts on `PATH`
+/// in place of cargo's build directory.
+struct ContainedDeck {
+    binary: PathBuf,
+    path_dir: PathBuf,
+}
+
+static CONTAINED_DECK: OnceLock<ContainedDeck> = OnceLock::new();
+
+/// The binary under test as every harness launch runs it (PRD #1666): a hard
+/// link at `<harness temp root>/deck-under-test/dot-agent-deck`, outside the
+/// developer's checkout. `TuiDeck`, [`spawn_daemon_serve_with_env`] and the
+/// in-process daemon's `binary_name()` override all go through it, and a test
+/// hands it — never `CARGO_BIN_EXE_…` — to anything an agent runs or reads.
 ///
-/// A **hard link**, not [`seed_durable_binary`]'s symlink: Linux's
-/// `/proc/self/exe` resolves a symlink back to cargo's build directory, which
-/// is the path this exists to keep out of agent text, while a hard link is
-/// reported by the name it was executed through. A copy is the fallback for a
-/// HOME on another filesystem than the build directory, where a hard link
-/// cannot be made; it costs the binary's size, once per launch.
-fn link_binary_outside_checkout(home: &Path) -> Result<PathBuf, String> {
-    let dir = home.join(".deck-under-test");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let link = dir.join("dot-agent-deck");
-    let built = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
-    if std::fs::hard_link(built, &link).is_err() {
-        std::fs::copy(built, &link).map_err(|e| {
-            format!(
-                "link or copy {} to {}: {e}",
-                built.display(),
-                link.display()
-            )
-        })?;
+/// **Why.** The deck spells itself into agent text as its own absolute path
+/// (`binary_name()`: the work-done footer of every delegated task, the
+/// orchestrator context, inbox instructions, dispatch prompts). Run from cargo's
+/// `CARGO_BIN_EXE_…` that path is `<checkout>/target/<profile>/dot-agent-deck`,
+/// and a real agent told to work "in the current directory" was measured
+/// resolving that to the checkout and writing its file there
+/// (`orchestration/dispatch/002`) — a real-agent test writing into the
+/// repository it was built from. `orchestration/dispatch/006` pins the text;
+/// `orchestration/dispatch/007` pins that lane-2 code cannot route around this.
+///
+/// A **hard link**, not a symlink: Linux's `/proc/self/exe` resolves a symlink
+/// back to cargo's build directory, while a hard link is reported by the name it
+/// was executed through. A copy is the fallback where the temp root is on
+/// another filesystem than the build directory; it costs the binary's size once
+/// per test process. One per process rather than per test HOME, so the
+/// in-process daemon's process-wide override and every launch agree on one file;
+/// it goes with the harness temp root at process exit.
+///
+/// A deck run from here is not a cargo build artifact, so the resolver's
+/// artifact refusal does not apply to it. The tests about that refusal opt out
+/// with [`TuiDeckBuilder::launching_the_cargo_artifact`].
+#[allow(dead_code)]
+pub fn contained_deck_binary() -> &'static Path {
+    &contained_deck().binary
+}
+
+/// The directory [`contain_path`] puts on `PATH`: it holds only a
+/// `dot-agent-deck` symlink to [`contained_deck_binary`], so a lookup by name
+/// finds the build under test.
+///
+/// Not the link's own directory, deliberately. The resolver treats a running
+/// binary whose directory is on `PATH` as installed and pins THAT path into
+/// agent config, which would move every hook command off the
+/// `~/.local/bin/dot-agent-deck` the tests assert on.
+#[allow(dead_code)]
+pub fn contained_deck_path_dir() -> &'static Path {
+    &contained_deck().path_dir
+}
+
+fn contained_deck() -> &'static ContainedDeck {
+    CONTAINED_DECK.get_or_init(|| {
+        let dir = harness_temp_root().join("deck-under-test");
+        let path_dir = dir.join("path");
+        std::fs::create_dir_all(&path_dir)
+            .unwrap_or_else(|e| panic!("create {}: {e}", path_dir.display()));
+        let name = format!("dot-agent-deck{}", std::env::consts::EXE_SUFFIX);
+        let binary = dir.join(&name);
+        let built = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        if std::fs::hard_link(built, &binary).is_err() {
+            std::fs::copy(built, &binary).unwrap_or_else(|e| {
+                panic!(
+                    "link or copy the binary under test {} to {}: {e}",
+                    built.display(),
+                    binary.display()
+                )
+            });
+        }
+        let on_path = path_dir.join(&name);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&binary, &on_path);
+        #[cfg(not(unix))]
+        let linked = std::fs::hard_link(&binary, &on_path);
+        linked
+            .unwrap_or_else(|e| panic!("link {} to {}: {e}", on_path.display(), binary.display()));
+        // A base the developer moved into the checkout (`DAD_E2E_TMPDIR`) puts
+        // every per-test directory there too, and no link can contain that.
+        if is_inside_checkout(&binary) {
+            eprintln!(
+                "[harness] WARNING: the harness temp root {} is inside the checkout {}, so \
+                 real agents run by this suite are shown paths inside it. Point \
+                 DAD_E2E_TMPDIR outside the checkout.",
+                dir.display(),
+                env!("CARGO_MANIFEST_DIR"),
+            );
+        }
+        ContainedDeck { binary, path_dir }
+    })
+}
+
+/// Whether `path` is the developer's checkout or below it, lexically or through
+/// its canonical spelling.
+fn is_inside_checkout(path: &Path) -> bool {
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
+    path.starts_with(checkout)
+        || std::fs::canonicalize(checkout).is_ok_and(|canonical| path.starts_with(canonical))
+}
+
+/// `path` (a `PATH` value) with the developer's checkout taken out of it, for an
+/// environment the harness hands a deck or an agent (PRD #1666).
+///
+/// - cargo's build directory, which a test puts first so the branch build wins
+///   a lookup by name, becomes [`contained_deck_path_dir`] in the same position;
+/// - any other entry inside the checkout becomes its canonical path when that
+///   lies outside — a devbox shell's `<checkout>/.devbox/nix/profile/default/bin`
+///   is a symlink into `/nix/store`, so `git`, `cargo` and every other tool it
+///   provides still resolve — and is dropped when it does not;
+/// - everything else is kept, in order.
+///
+/// An agent that inspects its `PATH` (`which dot-agent-deck`, `echo $PATH`) then
+/// meets no checkout path either, which is the same leak as the task text by
+/// another route.
+#[allow(dead_code)]
+pub fn contain_path(path: &str) -> String {
+    let cargo_dir = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .parent()
+        .expect("the binary under test has a parent directory");
+    let cargo_canonical = std::fs::canonicalize(cargo_dir).ok();
+    let deck_dir = contained_deck_path_dir();
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for entry in std::env::split_paths(path) {
+        let is_cargo_dir = entry == cargo_dir
+            || (entry.is_absolute()
+                && cargo_canonical.is_some()
+                && std::fs::canonicalize(&entry).ok() == cargo_canonical);
+        let kept = if is_cargo_dir {
+            deck_dir.to_path_buf()
+        } else if is_inside_checkout(&entry) {
+            match std::fs::canonicalize(&entry) {
+                Ok(canonical) if !is_inside_checkout(&canonical) => canonical,
+                _ => continue,
+            }
+        } else {
+            entry
+        };
+        if kept.as_path() != deck_dir || !entries.iter().any(|e| e.as_path() == deck_dir) {
+            entries.push(kept);
+        }
     }
-    Ok(link)
+    std::env::join_paths(entries)
+        .expect("PATH entries rejoin")
+        .to_string_lossy()
+        .into_owned()
 }
 
-/// `path` (a `PATH` value) with every entry naming `drop` removed and `first`
-/// prepended, so the binary under test still wins the lookup by name.
-fn path_without_dir(path: &str, drop: &Path, first: &Path) -> String {
-    std::iter::once(first.to_string_lossy().into_owned())
-        .chain(
-            std::env::split_paths(path)
-                .filter(|entry| entry != drop && !entry.as_os_str().is_empty())
-                .map(|entry| entry.to_string_lossy().into_owned()),
-        )
-        .collect::<Vec<_>>()
-        .join(PATH_SEPARATOR)
+/// The host `PATH` with the build under test first, for an environment the test
+/// builds itself — the deck's own `with_env("PATH", …)`, or an agent spawned
+/// into an in-process daemon — so an agent's `dot-agent-deck delegate` /
+/// `work-done` / `agent-event` resolves to this build, never to a deck
+/// installed on the host. Contained: the directory is
+/// [`contained_deck_path_dir`] and the rest went through [`contain_path`].
+#[allow(dead_code)]
+pub fn path_with_binary_dir() -> String {
+    let host = std::env::var("PATH").unwrap_or_default();
+    let joined = std::env::join_paths(
+        std::iter::once(contained_deck_path_dir().to_path_buf())
+            .chain(std::env::split_paths(&host)),
+    )
+    .expect("PATH entries join");
+    contain_path(&joined.to_string_lossy())
 }
-
-#[cfg(unix)]
-const PATH_SEPARATOR: &str = ":";
-#[cfg(not(unix))]
-const PATH_SEPARATOR: &str = ";";
 
 fn locate_fixture(name: &str) -> PathBuf {
     // CARGO_MANIFEST_DIR is the repo root for integration tests.
@@ -10106,9 +10225,12 @@ pub fn spawn_daemon_serve_with_env(
     let work = tempdir.path().to_path_buf();
     let home = work.join("home");
     std::fs::create_dir_all(&home).expect("create per-test HOME");
+    // PRD #1666: the daemon runs as the contained link, like `TuiDeck`'s deck,
+    // because it is the process that spells its own path into agent text.
+    let bin = contained_deck_binary();
     // PRD #381: same durable-path seeding as `TuiDeck` — a `daemon serve` spawns
     // wrapped agents, and `wrap` runs the Codex hook installer.
-    seed_durable_binary(&home);
+    seed_durable_binary(&home, bin);
     let state_dir = work.join("state");
     let mut hook_socket = work.join("hook.sock");
     let mut attach_socket = work.join("attach.sock");
@@ -10167,8 +10289,18 @@ pub fn spawn_daemon_serve_with_env(
         }
         env.push(((*k).to_string(), (*v).to_string()));
     }
+    // After `extra_env`, which may name cargo's build directory itself: the
+    // last `PATH` wins, as it would on the command, and goes in contained.
+    if let Some(path) = env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| contain_path(v))
+    {
+        env.retain(|(k, _)| k != "PATH");
+        env.push(("PATH".into(), path));
+    }
 
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("daemon").arg("serve");
     cmd.env_clear();
@@ -10304,8 +10436,7 @@ impl DaemonProc {
     /// Run `dot-agent-deck schedule <args…>` from an explicit `cwd` (used to
     /// prove the writer targets the global path regardless of cwd).
     pub fn run_schedule_cli_from(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
-        let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-        let mut cmd = std::process::Command::new(bin);
+        let mut cmd = std::process::Command::new(contained_deck_binary());
         cmd.arg("schedule");
         cmd.args(args);
         cmd.current_dir(cwd);
@@ -10557,8 +10688,9 @@ impl DaemonProc {
         agent_id: Option<&str>,
         state: &str,
     ) -> std::process::Output {
-        let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-        let mut cmd = std::process::Command::new(bin);
+        // The daemon's own binary, so the line's sender stamp names the file
+        // the daemon runs as, as it did when both were cargo's build artifact.
+        let mut cmd = std::process::Command::new(contained_deck_binary());
         cmd.arg("agent-event").arg("--type").arg(state);
         cmd.current_dir(&self.home);
         cmd.env_clear();
@@ -12189,16 +12321,17 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     // this libtest binary, and a generated `work-done` command would hand a
     // real worker `<libtest binary> work-done …`, which libtest reads as a
     // test-name filter rather than the deck's CLI. Inject the real built
-    // deck binary's path so `binary_name()` names it instead. `#[cfg]`'d
+    // deck binary's path so `binary_name()` names it instead — through the
+    // contained link (PRD #1666), so that path is not the checkout's either. `#[cfg]`'d
     // rather than unconditional: this file is also compiled into fast-tier
     // (non-`e2e`) test binaries such as `daemon_status.rs` and
     // `delegate_prompt_injection.rs`, where `set_test_current_exe_override`
     // does not exist in the linked library at all (CLAUDE.md rule 5 — see
     // that function's doc for why it's `e2e`-gated in the first place).
     #[cfg(feature = "e2e")]
-    dot_agent_deck::platform::paths::set_test_current_exe_override(std::path::PathBuf::from(env!(
-        "CARGO_BIN_EXE_dot-agent-deck"
-    )));
+    dot_agent_deck::platform::paths::set_test_current_exe_override(
+        contained_deck_binary().to_path_buf(),
+    );
 
     let (dir, hook_path, attach_path) = {
         let _g = INPROC_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());

@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix='old-hook-') as root:
                 outgoing.sendall(json.dumps(event).encode() + b'\n')
 sys.exit(result.returncode)
 "#,
-        binary = serde_json::to_string(env!("CARGO_BIN_EXE_dot-agent-deck")).unwrap(),
+        binary = serde_json::to_string(common::contained_deck_binary()).unwrap(),
         forwarded = serde_json::to_string(&forwarded).unwrap()
     );
     std::fs::write(&fixture.pin, script).unwrap();

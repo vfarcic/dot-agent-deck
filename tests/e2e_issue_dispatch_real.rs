@@ -81,7 +81,6 @@
 
 mod common;
 
-use std::path::Path;
 use std::time::Duration;
 
 use common::TuiDeck;
@@ -118,24 +117,6 @@ fn dispatch_schedule_toml(working_dir: &str) -> String {
          label = \"{FIXTURE_LABEL}\"\n\
          max_per_run = 1\n\
          \n"
-    )
-}
-
-/// PATH for the spawned deck (→ daemon → agents) with the freshly-built
-/// `dot-agent-deck` binary's dir prepended to the host PATH. The orchestrator
-/// role runs `dot-agent-deck delegate --to worker`, so the binary must resolve;
-/// the rest of the host PATH is preserved so `gh`, `git`, and `claude` still
-/// resolve. `CARGO_BIN_EXE_dot-agent-deck` is set by Cargo at integration-test
-/// build time to the binary under test (same value the harness launches).
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bindir = Path::new(bin)
-        .parent()
-        .expect("binary path has a parent dir");
-    format!(
-        "{}:{}",
-        bindir.display(),
-        std::env::var("PATH").unwrap_or_default()
     )
 }
 
@@ -276,7 +257,7 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
         // the freshly-built binary's dir on the PATH the deck → daemon → agents
         // inherit (this override wins over the harness's env scrub). Preserves the
         // host PATH so `gh` / `git` / `claude` still resolve.
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         // The harness scrubs the spawned deck's env to a pinned set, so thread
         // GITHUB_TOKEN explicitly — the daemon and the real `gh` it runs inherit
         // it for enumerate/clone against live GitHub.

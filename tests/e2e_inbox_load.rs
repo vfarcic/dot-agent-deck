@@ -91,7 +91,7 @@ fn remaining(deadline: Instant) -> Duration {
 }
 
 fn codex_cli_listing(deck: &TuiDeck, pane: &Pane, work: &Path, ids: &[(String, String, usize)]) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let output = std::process::Command::new(common::contained_deck_binary())
         .args(["inbox", "list", "--json"])
         .env_clear()
         .env("HOME", deck.home_dir())

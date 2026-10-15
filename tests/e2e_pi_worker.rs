@@ -5,7 +5,6 @@
 //! the task through the real daemon; only the worker spends a model credential.
 //! Scratch HOME and PI_CODING_AGENT_DIR contain the bundled extension.
 
-use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -62,20 +61,6 @@ fn check_pi_available() -> Result<(), String> {
     }
 }
 
-/// The freshly-built test binary's dir, prepended to PATH so the pi worker's
-/// `dot-agent-deck work-done` (footer CLI) / the extension's `work_done` tool
-/// resolve. `CARGO_BIN_EXE_dot-agent-deck` is set by Cargo at integration-test
-/// build time to the binary under test.
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("bin dir is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
-
 // ---------------------------------------------------------------------------
 // chain-smoke/pi/002 — real-pi WORKER receives a delegate → work-done
 // ---------------------------------------------------------------------------
@@ -108,7 +93,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     let sentinel = cwd.path().join(SENTINEL_NAME);
     let sentinel_arg = sentinel.to_string_lossy().replace('\'', "'\\''");
     let sentinel_command = format!("printf '%s' '{SENTINEL_CONTENT}' > '{sentinel_arg}'");
-    let path_env = path_with_binary_dir();
+    let path_env = common::path_with_binary_dir();
 
     // PRD #201: a `.dot-agent-deck.toml` whose `coder` role runs the REAL `pi`
     // clear=true exercises the replacement Pi process, seeded through its inbox.

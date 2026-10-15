@@ -2,7 +2,6 @@
 
 //! L2 real-Codex orchestration-worker proof for PRD #20.
 
-use std::path::Path;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
@@ -16,16 +15,6 @@ const WORKER_PANE: &str = "codex-worker-pane";
 const WORKER_ROLE: &str = "coder";
 const SENTINEL_NAME: &str = "codex_worker_sentinel_c81f2a.txt";
 const SENTINEL_CONTENT: &str = "CODEX_WORKER_SENTINEL_OK";
-
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
 
 /// Scenario: Start a real cheap-model Codex as the `coder` role through the
 /// normal wrapper spawn seam, then have a synthetic orchestrator delegate a
@@ -138,7 +127,7 @@ async fn codex_worker_inner(launch: WorkerLaunch) {
                     "DOT_AGENT_DECK_SOCKET".to_string(),
                     daemon.hook_path.display().to_string(),
                 ),
-                ("PATH".to_string(), path_with_binary_dir()),
+                ("PATH".to_string(), common::path_with_binary_dir()),
                 // This fixture owns a PTY even when the test runner's parent
                 // uses pipes and advertises TERM=dumb.
                 ("TERM".to_string(), "xterm-256color".to_string()),

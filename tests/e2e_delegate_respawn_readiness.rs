@@ -84,16 +84,6 @@ struct RealDelegateCase<'a> {
     declared_launcher: Option<&'a str>,
 }
 
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
-
 #[cfg(unix)]
 fn write_executable(path: &Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -339,7 +329,7 @@ fn delegate_014_real_claude_worker_acts_on_clear_true_delegate() {
     let worker_command = format!("claude --model {CLAUDE_MODEL} --allowedTools Bash Read Write");
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
         .launch_with_fixture("minimal");

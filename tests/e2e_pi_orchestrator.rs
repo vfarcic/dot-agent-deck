@@ -64,7 +64,6 @@
 //! Runtime-skipped (Decision 26) when `pi`/`claude`/credentials/`ANTHROPIC_API_KEY`
 //! are absent.
 
-use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -140,13 +139,13 @@ fn prepare_claude_home(worker_cwd: &str) -> TempDir {
         .expect("seed the isolated Claude worker HOME");
     // The in-process daemon skips startup installation, and credential import
     // strips host hooks. Install the worker's real inbox hooks in its scratch HOME.
-    let installed = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let installed = std::process::Command::new(common::contained_deck_binary())
         .args(["hooks", "install", "--agent", "claude-code"])
         .current_dir(worker_cwd)
         .env("HOME", home.path())
         .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
         .env("DOT_AGENT_DECK_LOG", home.path().join("hook-install.log"))
-        .env("PATH", path_with_binary_dir())
+        .env("PATH", common::path_with_binary_dir())
         .output()
         .expect("install scratch Claude inbox hooks");
     assert!(
@@ -172,18 +171,6 @@ fn pi_schedule_toml(working_dir: &str) -> String {
          prompt = \"ready\"\n\
          enabled = true\n\n"
     )
-}
-
-/// The freshly-built test binary's dir, prepended to PATH so an agent's
-/// `dot-agent-deck delegate` / `work-done` / `agent-event` resolves.
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("bin dir is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +206,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     let sentinel = cwd.path().join(SENTINEL_NAME);
     let sentinel_arg = sentinel.to_string_lossy().replace('\'', "'\\''");
     let sentinel_command = format!("printf '%s' '{SENTINEL_CONTENT}' > '{sentinel_arg}'");
-    let path_env = path_with_binary_dir();
+    let path_env = common::path_with_binary_dir();
 
     // --- WORKER: real Claude Haiku, spawned + ready before the orchestrator
     // delegates, so onboarding does not block the worker's inbox task.
@@ -230,7 +217,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
         (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
         (
             "DOT_AGENT_DECK_BIN".to_string(),
-            env!("CARGO_BIN_EXE_dot-agent-deck").to_string(),
+            common::contained_deck_binary().display().to_string(),
         ),
         (
             "DOT_AGENT_DECK_SOCKET".to_string(),
@@ -524,7 +511,7 @@ fn scheduler_pi_001_scheduled_unattended_status_via_extension() {
     // are set by the daemon-serve harness and inherited by the child.
     let anthropic_key =
         std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available");
-    let path_env = path_with_binary_dir();
+    let path_env = common::path_with_binary_dir();
 
     let daemon = common::spawn_daemon_serve_with_env(
         Some(&toml),

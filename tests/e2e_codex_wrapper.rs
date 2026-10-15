@@ -50,16 +50,6 @@ fn check_codex_sandbox_can_start() -> Result<(), String> {
     }
 }
 
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = std::path::Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
-
 /// Scenario: Restore a pane running `dot-agent-deck wrap --agent codex` around
 /// a deterministic shell stand-in that paints interactive-Codex-shaped text and
 /// ends its turn through Codex's native `Stop` hook, as real Codex does.
@@ -73,7 +63,7 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
     let command = "dot-agent-deck wrap --agent codex -- /bin/sh codex-standin.sh";
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_continue_session("", command)
         .launch_with_fixture("codex-synthetic");
 
@@ -183,7 +173,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
         .expect("write bare Codex default command");
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_imported_codex_credentials()
         .launch_with_fixture("codex-live");
@@ -299,7 +289,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
 fn codex_wrap_002_preserves_tty_resize_input_and_interrupt() {
     let command = "dot-agent-deck wrap --agent codex -- ./tty-probe.sh";
     let mut deck = TuiDeck::builder()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_continue_session("tty-probe", command)
         .launch_with_fixture("codex-tty-probe");
     deck.wait_for_string("[Command Mode Ctrl+D]");

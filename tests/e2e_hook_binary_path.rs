@@ -210,6 +210,10 @@ fn seed_agent_homes(home: &Path, stub_bin: &Path) -> String {
 /// never leaves a 50 ms idle window, so quiescence times out here (measured).
 fn launch_with_home(home: &Path, path_value: &str) -> TuiDeck {
     let deck = TuiDeck::builder()
+        // This file's subject is a deck running as a cargo build artifact, the
+        // one the resolver refuses to pin (`hooks/install/005`), so it opts out
+        // of the harness's contained link.
+        .launching_the_cargo_artifact()
         .with_env("HOME", home.to_str().expect("HOME path is UTF-8"))
         .with_env(
             "XDG_CONFIG_HOME",

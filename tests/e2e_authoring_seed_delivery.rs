@@ -136,12 +136,13 @@ fn start_cat(
 
 /// The seed the DAEMON composes for `kind` in `cwd`. Since issue #1385 a seed
 /// names the deck by `binary_name()` — the composing process's own path — and
-/// the daemon here is the built `dot-agent-deck`, not this test binary, so the
-/// expected text is composed as that binary would compose it.
+/// the daemon here is the built `dot-agent-deck`, run as the harness's
+/// contained link (PRD #1666), not this test binary, so the expected text is
+/// composed as that binary would compose it.
 fn daemon_composed_seed(kind: AuthoringKind, cwd: &Path) -> String {
-    dot_agent_deck::platform::paths::set_test_current_exe_override(std::path::PathBuf::from(env!(
-        "CARGO_BIN_EXE_dot-agent-deck"
-    )));
+    dot_agent_deck::platform::paths::set_test_current_exe_override(
+        common::contained_deck_binary().to_path_buf(),
+    );
     kind.compose_seed(cwd)
 }
 

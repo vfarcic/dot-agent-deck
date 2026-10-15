@@ -14,7 +14,6 @@ mod inbox_view;
 mod route;
 
 use std::cell::Cell;
-use std::path::Path;
 use std::time::Duration;
 
 use common::TuiDeck;
@@ -101,18 +100,6 @@ fn wait_for_wrapped_pane_string(
              of which says anything about whether the prompt arrived"
         ))
     }
-}
-
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = Path::new(bin)
-        .parent()
-        .expect("test binary has a parent directory");
-    format!(
-        "{}:{}",
-        bin_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
 }
 
 fn real_agent_orchestration_config(orchestrator_command: &str) -> String {
@@ -266,7 +253,7 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
         .with_pty_size(200, 50)
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env(
             "DOT_AGENT_DECK_SESSION",
             session_path.to_str().expect("session path is UTF-8"),
@@ -371,7 +358,7 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
         .with_pty_size(200, 50)
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env(
             "DOT_AGENT_DECK_SESSION",
             session_path.to_str().expect("session path is UTF-8"),
@@ -528,7 +515,7 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
         .with_pty_size(200, 50)
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env(
             "DOT_AGENT_DECK_SESSION",
             session_path.to_str().expect("session path is UTF-8"),

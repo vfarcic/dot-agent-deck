@@ -66,7 +66,7 @@ while True:
     common::capability_export_command(&format!(
         "exec python3 '{}' '{}'",
         quote(&script.to_string_lossy()),
-        quote(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        quote(&common::contained_deck_binary().to_string_lossy())
     ))
 }
 
@@ -576,7 +576,7 @@ pub fn client_seed(case: u8) {
     let cmd = if case == 7 {
         format!(
             "{} wrap --agent codex -- /bin/sh -c '{}'",
-            env!("CARGO_BIN_EXE_dot-agent-deck"),
+            common::contained_deck_binary().display(),
             cmd.replace('\'', "'\\''")
         )
     } else {
@@ -697,7 +697,7 @@ pub fn client_orchestration(reassert: bool) {
 }
 
 pub fn cli(endpoint: &impl Endpoint, pane: &Pane, cwd: &Path, args: &[&str]) {
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let result = std::process::Command::new(common::contained_deck_binary())
         .args(args)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")

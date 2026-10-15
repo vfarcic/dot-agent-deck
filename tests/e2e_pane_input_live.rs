@@ -112,7 +112,7 @@ fn prompt_pane_input_042_live_claude_draft_defers_delegate() {
         claude_input_contains(grid, DRAFT)
     });
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let output = std::process::Command::new(common::contained_deck_binary())
         .args([
             "delegate",
             "--to",

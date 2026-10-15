@@ -10,7 +10,7 @@ pub const BUDGET: Duration = Duration::from_secs(120);
 
 pub fn prepare(deck: &common::TuiDeck) {
     let home = deck.home_dir().join(".codex");
-    let binary = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let binary = common::contained_deck_binary();
     let installed = deck.home_dir().join(".local/bin/dot-agent-deck");
     std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
     if !installed.exists() && std::fs::hard_link(binary, &installed).is_err() {

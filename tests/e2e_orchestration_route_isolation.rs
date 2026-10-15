@@ -111,23 +111,6 @@ const FEEDBACK_REVIEWER: &str = "from reviewer (worker report";
 const TAB_NEXT: &[u8] = b"\x1b[6;5~";
 const TAB_PREV: &[u8] = b"\x1b[5;5~";
 
-/// PATH for the spawned deck (→ daemon → agents) with the freshly-built
-/// `dot-agent-deck` binary's dir prepended to the host PATH: the orchestrator
-/// panes shell `dot-agent-deck delegate` and the worker panes shell
-/// `dot-agent-deck work-done`, so the binary under test must resolve. The rest
-/// of the host PATH is preserved so `claude` still resolves.
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bindir = Path::new(bin)
-        .parent()
-        .expect("binary path has a parent dir");
-    format!(
-        "{}:{}",
-        bindir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
-
 /// One role pane of one orchestration tab, as the daemon reports it.
 #[derive(Clone, Debug)]
 struct RolePane {
@@ -308,7 +291,7 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
         // shell `dot-agent-deck work-done`, so the freshly-built binary's dir
         // must be on the PATH the deck → daemon → agents inherit (this override
         // wins over the harness's env scrub).
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .launch_with_fixture("orchestration-route");
     deck.wait_for_string("No active agents");
 

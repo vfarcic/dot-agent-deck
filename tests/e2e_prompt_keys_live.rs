@@ -438,7 +438,7 @@ fn reading_reply_005_real_codex_delivers_sentinel_once_to_subscribed_client() {
         common::codex_test_model()
     );
     let builder = TuiDeck::builder()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_imported_codex_credentials();
     let (deck, agent_id, _) = launch_agent(builder, "codex-live", &launch, &command, SENTINEL);
     exercise_reading_reply(
@@ -481,7 +481,7 @@ fn reading_reply_006_real_pi_delivers_sentinel_once_to_subscribed_client() {
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env(
             "ANTHROPIC_API_KEY",
             std::env::var("ANTHROPIC_API_KEY").expect("checked by Pi preflight"),
@@ -764,18 +764,6 @@ struct AgentLaunch {
     resubmit_until_empty: bool,
 }
 
-/// The freshly built binary's directory ahead of `PATH`, so an agent's own
-/// `dot-agent-deck` calls resolve to the build under test.
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let dir = std::path::Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
-
 /// Start `command` through the New agent dialog of a deck built by `builder`,
 /// wait for its input box, and read the keys the daemon serves for it.
 fn launch_agent(
@@ -967,7 +955,7 @@ fn prompt_voice_keys_004_codex_honours_the_served_keys() {
         common::codex_test_model()
     );
     let builder = TuiDeck::builder()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_imported_codex_credentials();
     let (deck, agent_id, keys) = launch_agent(builder, "codex-live", &launch, &command, SENTINEL);
     exercise_prompt_keys(&launch, &deck, &agent_id, &keys, SENTINEL);

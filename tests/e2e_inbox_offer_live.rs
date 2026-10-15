@@ -69,14 +69,7 @@ fn evidence(deck: &common::TuiDeck, worker: &Pane, orchestrator: &Pane) -> Strin
 #[test]
 fn offer_006_live_haiku_claims_acts_completes_and_notifies_offerer() {
     skip_unless!(common::check_claude_available());
-    let binary_dir = std::path::Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .parent()
-        .unwrap();
-    let path = format!(
-        "{}:{}",
-        binary_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = common::path_with_binary_dir();
     let deck = common::TuiDeck::builder()
         .with_pty_size(180, 50)
         .with_imported_claude_credentials()
