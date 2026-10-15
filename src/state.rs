@@ -476,9 +476,8 @@ fn loggable_env_value(raw: &str) -> String {
 /// diagnostic when the derived default was `None`. That contradicts the
 /// documented "values above the cap are capped": an absurd number is a number,
 /// and the honest reading of it is "as long as you are allowed to ask for".
-/// Every caller passes a compile-time cap of at most 600 s (the readiness
-/// buffer and no-event window at 30 s, the waiting-notice debounce and the
-/// #544 draft-defer cap at 600 s), so the clamped result always fits in `u64`.
+/// Its one caller, the waiting-notice debounce, passes a compile-time cap of
+/// 600 s, so the clamped result always fits in `u64`.
 pub(crate) fn parse_bounded_ms_override(
     var: &str,
     raw: &str,
@@ -2284,8 +2283,8 @@ fn worker_response_timeout_in(
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) -> Option<std::time::Duration> {
-    // Issue #1516: through `env_override`, for the same reason as
-    // `explicit_delegate_readiness_buffer`.
+    // Issue #1516: through `env_override`, so a test can change it while the
+    // deck's own tasks are reading it (see that module).
     if let Some(ms) = crate::env_override::var(DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS)
         .and_then(|v| v.trim().parse::<u64>().ok())
     {

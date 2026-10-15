@@ -2445,11 +2445,11 @@ fn main() -> ExitCode {
             // Issue #243: the wrapper LOGS. Until this call it did not — the
             // subcommand went straight into `run_wrap`, so the two `tracing`
             // lines the interface watch emits (which of its two facts fired, the
-            // single most useful field diagnostic the readiness mechanism
-            // produces) were dropped on the floor by the no-op global
-            // subscriber, and `crate::state::dispatch_one_owned`'s claim that
-            // the fact is "in the wrapper's log" was false. Diagnosing a Codex
-            // delegate that never got its prompt meant reading the wire.
+            // single most useful field diagnostic for a wrapped agent's boot)
+            // were dropped on the floor by the no-op global subscriber, and the
+            // daemon's claim that the fact is "in the wrapper's log" was false.
+            // Diagnosing a Codex delegate that never got its prompt meant
+            // reading the wire.
             //
             // Safe in a pane. `init_logging_from_env` installs a subscriber ONLY
             // when `DOT_AGENT_DECK_LOG` is set, and that subscriber only ever

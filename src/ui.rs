@@ -1802,25 +1802,11 @@ struct UiState {
     /// (`agent = "…"` on the role), for panes that made a declaration.
     ///
     /// Kept beside `SessionState.agent_type` rather than written into it,
-    /// because the two answer different questions and only one of them may
-    /// drive timing. `SessionState.agent_type` is the OBSERVED identity: it
-    /// stays `AgentType::None` until something running in the pane reports, and
-    /// two separate readiness gates read it — `agent_ready` in the
-    /// orchestrator-prompt and seed-prompt paths, both of which route through
-    /// [`spawn_time_agent_ready`]. Seeding a declaration into that field would
-    /// move both closer to firing at spawn and typing a prompt into a launcher
-    /// that has not started its agent yet — which is precisely the population
-    /// (`devbox run -- codex`) this key exists for, so the feature would break
-    /// delivery for exactly the users it is meant to help.
-    ///
-    /// Issue #1005: those gates now read TWO facts, not one. A resolved
-    /// `agent_type` no longer opens them on its own — the pane must also have an
-    /// announced conversation (`AppState::pane_hook_session_id`), because the
-    /// daemon's card-surfacing `SessionStart` resolves a type off the command at
-    /// spawn time and that is a card, not a reader. So a declaration seeded here
-    /// would today satisfy one half of the gate rather than all of it; the
-    /// reason to keep the two fields apart is unchanged, and the blast radius of
-    /// getting it wrong is smaller than it was.
+    /// because the two answer different questions. `SessionState.agent_type`
+    /// is the OBSERVED identity: it stays `AgentType::None` until something
+    /// running in the pane reports. Two TUI gates used to time a typed prompt
+    /// off it, which is why a declaration was never seeded into it; PRD #1666
+    /// removed them with the typed delivery.
     ///
     /// A declaration is nonetheless real knowledge, and the whole point of
     /// issue #308 is that the card should show it immediately. So it lands
@@ -4544,8 +4530,8 @@ pub struct NewPaneRequest {
     name: String,
     command: String,
     orchestration_config: Option<OrchestrationConfig>,
-    /// PRD #127: a seed prompt to deliver (gated on the agent signalling
-    /// readiness) to the spawned single-agent CARD once its pane is ready. Set
+    /// PRD #127: a seed prompt for the spawned single-agent CARD, sent with the
+    /// start so the daemon posts it as the pane's first inbox message. Set
     /// for the built-in options ([`BuiltinOption`]) — schedule authoring,
     /// issue-dispatch authoring and the dispatcher — each of which is a
     /// dashboard card carrying its seed here.
@@ -9939,9 +9925,7 @@ fn dispatch_action(
                                 // so a reconnect's hydration carries the
                                 // right type. The local placeholder stays
                                 // at `None` until each role's first
-                                // `SessionStart` hook fires — preserving
-                                // the orchestration readiness gate's
-                                // 10-second fallback (pre-M2.13 contract).
+                                // `SessionStart` hook fires.
                                 for (id, agent_id) in
                                     role_pane_ids.iter().zip(role_agent_ids.iter())
                                 {
@@ -12141,15 +12125,15 @@ pub fn run_tui(
                             // startup lands on the 34/66 default.
                             tab_manager.orchestration_split_narrow(),
                         );
-                        // Empty saved prompt → `None` so the delivery gate
-                        // writes nothing (matching the live path's "no prompt"
-                        // semantics); a non-empty prompt is replayed to the
-                        // start role once it signals readiness.
+                        // Empty saved prompt → `None` so nothing is posted
+                        // (matching the live path's "no prompt" semantics); a
+                        // non-empty prompt is posted to the start role's inbox
+                        // again.
                         let replay_prompt = (!orch_snap.orchestrator_prompt.is_empty())
                             .then(|| orch_snap.orchestrator_prompt.clone());
                         // PRD #89 review-fix F3: honor the SAVED start cursor,
                         // even when it differs from the role the config seats
-                        // now, so the prompt-delivery gate and the landing focus
+                        // now, so the prompt's post and the landing focus
                         // target the role the user left as start. Issue #523
                         // review: passed as the tab's SEAT rather than patched
                         // onto `start_role_index` afterwards, so the membership
@@ -19467,10 +19451,7 @@ fn render_session_card(
     // identifies nothing, so without the declaration this stays
     // `AgentType::None` and the card reads "No agent" — for Codex, until the
     // first delegated task, because it posts nothing before its first turn.
-    // Note this is a display decision and nothing more: the readiness gates
-    // that decide WHEN a prompt may be written still read
-    // `session.agent_type`, so a declared pane is drawn immediately and still
-    // waits for its agent to actually start before anything is typed into it.
+    // Note this is a display decision and nothing more.
     let shown_agent_type = if session.agent_type == crate::event::AgentType::None {
         declared_agent_type
             .cloned()
@@ -33293,8 +33274,6 @@ mod tests {
         let sleep = submit_debounce_duration(now, Some(last), b"hello");
         assert_eq!(sleep, std::time::Duration::ZERO);
     }
-
-    // PRD #128 Direction B-1 — spawn-time readiness buffer policy tests.
 
     // Orchestrator remit re-assertion trigger policy. Pure-data: only a
     // Compacting status observation for the start-role pane should trigger

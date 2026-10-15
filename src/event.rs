@@ -2227,8 +2227,9 @@ pub struct GetSeedRequest {
     /// older CLI omits it, which deserializes to `None`.
     ///
     /// `None` therefore means "the caller could not say", not "the caller is
-    /// nobody", and the daemon treats it as such — see
-    /// [`crate::agent_pty::AgentPtyRegistry::take_pending_seed_native_for`].
+    /// nobody", and the daemon treats it as such: it hands over a message only
+    /// for the agent the request's token attests, and refuses a request that
+    /// names a different one (`get_seed_inbox_alias` in `crate::daemon`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     /// Issue #1077: the per-spawn hook capability token from the sender's

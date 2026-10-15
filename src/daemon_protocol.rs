@@ -2004,8 +2004,8 @@ pub enum AttachRequest {
         /// PRD #1223 M7: start an AUTHORING agent — the daemon composes that
         /// kind's seed from [`crate::authoring_seeds`] (the text the TUI types
         /// into its own `schedule` / `schedule: issues` / `dispatcher` agents,
-        /// with this start's `cwd` as the directory it names) and delivers it
-        /// once the agent is ready. `None` is today's start, unchanged.
+        /// with this start's `cwd` as the directory it names) and posts it to
+        /// the agent's inbox. `None` is today's start, unchanged.
         ///
         /// **Withheld unless the daemon advertises [`CAP_AUTHORING_KIND`]**, by
         /// [`crate::daemon_client::DaemonClient::start_authoring_agent`], the one
@@ -2014,11 +2014,10 @@ pub enum AttachRequest {
         /// daemon drops an unknown key, so it would start the agent with **no
         /// seed and no error**.
         ///
-        /// Delivery goes through the paths the daemon already has rather than a
-        /// new one (#528): a Pi agent gets PRD #201's native seed (the same
-        /// stash and PTY safety net `seed` above arms); every other agent gets
-        /// [`crate::spawn`]'s readiness-gated delivery, the one `dispatch` and the
-        /// scheduler use. `command` keeps its meaning — empty is the daemon's
+        /// Delivery goes through the path the daemon already has rather than a
+        /// new one (#528): the seed becomes the pane's first inbox message, as
+        /// `seed` above does, for every agent type (PRD #1666 S5). `command`
+        /// keeps its meaning — empty is the daemon's
         /// default shell — so a client resolves a blank command for an authoring
         /// agent itself, as the TUI does. Refused, with nothing started, when it
         /// is combined with `seed`, when the start names no `cwd` or one that

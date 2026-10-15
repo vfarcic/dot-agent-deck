@@ -2173,10 +2173,10 @@ fn pump_reader(
     }
     exited.store(true, Ordering::SeqCst);
     change_notify.notify_one();
-    // Issue #584: release anyone waiting on THIS agent's liveness before the
-    // delegation sweep below, so a delegate parked on its replacement's
-    // readiness learns the replacement is gone at EOF rather than at the end of
-    // a fixed 30 s window. A dropped registry leaves nothing to wake.
+    // Issue #584: release anyone waiting on THIS agent's liveness
+    // ([`AgentPtyRegistry::agent_exit_signal`]) before the delegation sweep
+    // below, so the wait ends at EOF rather than at its own timeout. A dropped
+    // registry leaves nothing to wake.
     if let Some(registry) = registry.upgrade() {
         registry.signal_agent_exit(&agent_id);
     }
@@ -2562,7 +2562,7 @@ pub struct RunningAgent {
     /// It is what a `dispatch --single` unit reuses so it runs the way the pane
     /// that dispatched it runs (see
     /// [`AgentPtyRegistry::configured_launch_of`]). Nothing session-specific
-    /// rides in it: the deck delivers a pane's seed and task after readiness
+    /// rides in it: the deck delivers a pane's seed and task through its inbox
     /// rather than on its command line, so this holds no resume id, seed or
     /// dispatcher-mode flag. Daemon-local, like `spawn_env` — not projected
     /// onto [`AgentRecord`], so the wire is unchanged.
@@ -5526,13 +5526,13 @@ struct DelegationTracker {
     /// `AGENT_TERMINATE_GRACE` long, and a delegate landing inside it must not
     /// leave a record that nothing removes.
     closing_panes: HashSet<String>,
-    /// PRD #249 round-6 review (Greptile, the readiness buffer): live senders
-    /// handed out by [`AgentPtyRegistry::pane_close_signal`], keyed by the pane
-    /// whose close they announce. Dropping a sender IS the signal — the same
-    /// drop-to-cancel discipline as both watches' `_cancel` channels — and
+    /// PRD #249 round-6 review (Greptile): live senders handed out by
+    /// [`AgentPtyRegistry::pane_close_signal`], keyed by the pane whose close
+    /// they announce. Dropping a sender IS the signal — the same drop-to-cancel
+    /// discipline as both watches' `_cancel` channels — and
     /// [`AgentPtyRegistry::begin_pane_close`] drops every sender for the pane it
-    /// marks. Lets an in-flight wait (the M1 readiness gate) abandon promptly
-    /// instead of sleeping out its remainder against a target that is gone.
+    /// marks. Its production waiter, the delegate's readiness wait, was removed
+    /// by PRD #1666; only its test asks for a signal now.
     close_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
     /// Issue #447: the open waiting episodes, keyed by the *worker's*
     /// `pane_id_env`; at most one per worker pane. Opened when the worker's hook
@@ -6362,11 +6362,7 @@ pub(crate) const PANE_CLOSE_SETTLE_TIMEOUT: Duration = Duration::from_secs(6);
 /// `cargo test-e2e` run at default parallelism.
 ///
 /// So this constant's job is only to stop a wedged daemon parking a delegate
-/// forever, which is why it may be picked generously. Ten times the grace, and
-/// the same order as `state::SESSION_START_WAIT_TIMEOUT` (30 s) — which the
-/// delegate path already spends waiting on this very pane when the respawn
-/// SUCCEEDS. A role that is one wait away from coming back should not be given
-/// up on faster than a role that is coming back fine.
+/// forever, which is why it may be picked generously: ten times the grace.
 ///
 /// The asymmetry is what justifies the size: over-waiting costs a delayed
 /// delegate, and only on a pane that is genuinely mid-close; under-waiting costs
@@ -6630,12 +6626,10 @@ struct RegistryInner {
     /// Issue #584: one-shot waiters for "this AGENT's PTY reached EOF", keyed by
     /// registry id.
     ///
-    /// The sibling of [`DelegationTracker::close_waiters`], and it exists for the
-    /// same reason: a wait that is really about a target's liveness must not be
-    /// expressed as a poll. The delegate's post-respawn readiness wait sat on a
-    /// fixed 30 s deadline, so a replacement worker that died two seconds into
-    /// its boot still cost the full window — and the pointer was then refused by
-    /// the identity gate with `NoLiveTarget` and dropped in silence. Resolved by
+    /// The sibling of [`DelegationTracker::close_waiters`]: a wait that is
+    /// really about a target's liveness must not be expressed as a poll (issue
+    /// #584). Today's waiter is a `subscribe-turn-replies` stream, which ends
+    /// when the agent it follows exits. Resolved by
     /// [`AgentPtyRegistry::signal_agent_exit`], which `pump_reader` calls in the
     /// same breath as setting `exited`.
     ///
@@ -8608,10 +8602,11 @@ impl AgentPtyRegistry {
             .contains(pane_id)
     }
 
-    /// PRD #249 round-6 review (Greptile, the readiness buffer): a future that
-    /// resolves when `pane_id`'s close BEGINS, so a wait already in flight can be
-    /// cancelled instead of sleeping out its remainder against a target that is
-    /// being torn down. Deliberately the same shape as the two watches'
+    /// PRD #249 round-6 review (Greptile): a future that resolves when
+    /// `pane_id`'s close BEGINS, so a wait already in flight can be cancelled
+    /// instead of sleeping out its remainder against a target that is being
+    /// torn down. No production code waits on it since PRD #1666 removed the
+    /// delegate's readiness wait; only its test does. Deliberately the same shape as the two watches'
     /// cancellation channels — a `oneshot` the caller `select!`s on, resolved by
     /// the sender being DROPPED, never sent on.
     ///
@@ -9098,17 +9093,12 @@ impl AgentPtyRegistry {
     /// exec ([`SpawnOptions::agent_type`]), or `None` for a command the deck could
     /// not resolve.
     ///
-    /// Reads [`RunningAgent::spawn_agent_type`], NOT [`RunningAgent::agent_type`],
-    /// and the difference matters for the same reason it does in
-    /// [`Self::agent_spawned_as_reporting_agent`]. (Its consumer, the typed
-    /// delivery's readiness gate, was removed by PRD #1666; no production code
-    /// reads this now.) That gate used this to decide whether to SHORTEN its wait, and `agent_type` is upgradable in place
-    /// by [`Self::set_agent_type`] from a hook event. Keying off the observed badge
-    /// would let any same-user producer post one `SessionStart` claiming to be an
-    /// agent that declares no pre-prompt signal and thereby talk the gate out of
-    /// waiting — turning a producer assertion into control over when the deck
-    /// writes a prompt. `spawn_agent_type` is what the deck itself exec'd, and no
-    /// hook path can write it.
+    /// Reads [`RunningAgent::spawn_agent_type`], NOT [`RunningAgent::agent_type`]:
+    /// `agent_type` is upgradable in place by [`Self::set_agent_type`] from a
+    /// hook event, so any same-user producer can claim a type there, while
+    /// `spawn_agent_type` is what the deck itself exec'd and no hook path can
+    /// write it. Its production consumer, the typed delivery's readiness gate,
+    /// was removed by PRD #1666; tests read it now.
     pub fn spawn_agent_type(&self, agent_id: &str) -> Option<AgentType> {
         self.inner
             .lock()
@@ -9165,75 +9155,6 @@ impl AgentPtyRegistry {
             agent_type,
             shell,
         })
-    }
-
-    /// Issue #243 (audit F1): did THIS DAEMON spawn `agent_id` under
-    /// `dot-agent-deck wrap` — i.e. is the frozen launch-shape identity an agent
-    /// whose registry strategy is [`crate::agent_registry::IntegrationStrategy::Wrapper`]?
-    ///
-    /// The provenance check for the wrapper's interface-ready marker, and the
-    /// reason the marker can be trusted to select a post-readiness buffer of its
-    /// own at all.
-    /// That marker is NOT authenticated on the wire: the daemon's hook socket
-    /// accepts a raw `AgentEvent` line, `metadata` is free-form, and #243's audit
-    /// reproduced a forged `wrapper_interface_ready` `SessionStart` from a bare
-    /// `python3` with no deck environment. `crate::hook`'s refusal to forward the
-    /// value is real but is not the chokepoint, so the daemon establishes
-    /// provenance itself, at the site that acts on it.
-    ///
-    /// Being fair about the delta this closes: releasing the readiness GATE was
-    /// already forgeable before #243 — a bare unmarked `SessionStart` satisfies
-    /// `crate::state::session_start_means_ready`'s first branch — and this does not
-    /// change that. What #243's round 2 newly granted was the ability to also
-    /// SUPPRESS the buffer, which is the last protection against writing into a
-    /// still-booting agent (#199/#249/#663), and this is what took that back.
-    /// Round 3 retracted the suppression outright — the strong fact now selects a
-    /// LONGER buffer (5000 ms) rather than none — so what a forgery is left
-    /// reaching for is a mis-priced interval, not a suppressed one, and this
-    /// check is what keeps even that out of a producer's hands.
-    ///
-    /// Same field, and the same argument, as [`Self::agent_spawned_as_reporting_agent`]:
-    /// it reads [`RunningAgent::spawn_agent_type`], the launch-shape identity the
-    /// spawn site supplied, which [`Self::set_agent_type`] — the learn-from-hook
-    /// upgrade — never writes. Reading the badge instead would let a producer post
-    /// one event claiming to be Codex and buy back exactly the privilege this
-    /// removes. `false` for a pane the deck could not resolve to an agent, which
-    /// is the direction that grants nothing: the ordinary buffer applies, exactly
-    /// as it did before this issue. Note that since round 3 that is the SHORTER
-    /// of the two intervals, so refusing is no longer automatically the cautious
-    /// answer for an honest agent — see the case it refuses, below, and guard 2's
-    /// alarm in `crate::state::dispatch_one_owned`.
-    ///
-    /// It answers the LAUNCH-SHAPE question rather than the readiness-class one,
-    /// because `wrap_launch_command` keys the wrap decision on the same
-    /// `strategy` field. An agent that declares
-    /// [`crate::agent_registry::PrePromptReadiness::WrapperInterfaceReady`]
-    /// without being wrapper-hosted has no wrapper to observe it, so there is no
-    /// honest event for this to admit.
-    ///
-    /// **One honest case it refuses**, and it refuses it in the safe direction: a
-    /// role command that ALREADY names the wrapper (`dot-agent-deck wrap --agent
-    /// codex -- …`, which `wrap_launch_command` leaves alone rather than
-    /// double-wrapping). `AgentType::from_command` cannot see an agent through
-    /// that shape, so unless the pane was created with an explicit identity the
-    /// frozen record is `None` and this answers `false`. A genuine wrapper is
-    /// running and its event is genuine; it simply costs that pane the interface
-    /// buffer, so it waits the ordinary 1000 ms rather than the 5000 ms measured
-    /// against a full-screen TUI's own initialisation. The deck rewrites the
-    /// command itself on every ordinary path, so this is a hand-written shape,
-    /// and being priced like every non-wrapper agent is the right price for not
-    /// having to trust the marker.
-    pub fn agent_spawned_as_wrapper_host(&self, agent_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .agents
-            .get(agent_id)
-            .and_then(|agent| agent.spawn_agent_type.as_ref())
-            .is_some_and(|agent_type| {
-                crate::agent_registry::spec(agent_type).strategy
-                    == Some(crate::agent_registry::IntegrationStrategy::Wrapper)
-            })
     }
 
     /// PRD #127 M2.2: whether `agent_id` is still a live (non-exited) agent in
@@ -10477,15 +10398,9 @@ impl AgentPtyRegistry {
     ///
     /// The new agent comes up at a default 24×80 PTY size; the TUI's
     /// next `resize` call (sent on attach / render) corrects it to
-    /// the client's actual geometry. Deferring the post-respawn prompt
-    /// write until the freshly-spawned agent signals readiness is the
-    /// caller's responsibility — the daemon doesn't peek into the new
-    /// agent's stdout, so it can't observe "ready" directly here. The
-    /// dispatch path subscribes to the daemon-wide hook broadcast
-    /// before this call and waits for the new agent's `SessionStart`
-    /// event (with a timeout fallback) — see
-    /// [`crate::state::SESSION_START_WAIT_TIMEOUT`] for the duration and why the
-    /// fallback is load-bearing.
+    /// the client's actual geometry. Nothing is written into the new
+    /// agent here: the dispatch path posts its task to the
+    /// replacement's inbox afterwards (PRD #1666).
     pub async fn respawn_agent_for_pane(
         self: &Arc<Self>,
         pane_id_env: &str,
@@ -23054,10 +22969,9 @@ mod spawn_tests {
         assert_eq!(reg.retire_commissions_of_replaced_agent("worker", true), 0);
     }
 
-    /// PRD #249 round-6 review (Greptile): the M1 readiness buffer must be able
-    /// to abandon a pane that starts closing mid-wait instead of sleeping out the
-    /// remainder (up to the 30 s clamp) before its guarded write discovers the
-    /// target is gone.
+    /// PRD #249 round-6 review (Greptile): a pane close that begins resolves
+    /// every [`AgentPtyRegistry::pane_close_signal`] already handed out for the
+    /// pane, and one asked for mid-close is resolved at once.
     #[test]
     fn pane_close_signal_resolves_when_the_close_begins() {
         let reg = Arc::new(AgentPtyRegistry::new());

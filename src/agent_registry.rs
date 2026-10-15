@@ -1116,11 +1116,6 @@ const CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER: usize = 6;
 /// hook socket. Unlike Codex it needs neither a wrapper (its own TUI runs
 /// directly on the deck's PTY) nor a hook-trust ceremony, which makes it the
 /// cheapest possible registry addition: pure `NativeHooks` + one `hook.rs` arm.
-///
-/// `hook_install` is `Some`, which the PRD #225 readiness gate reads as the
-/// promise that a real (unmarked) `SessionStart` still arrives — Devin documents
-/// a `SessionStart` hook, and being unwrapped it emits no fork-time marked event
-/// at all, so the gate simply waits for the genuine one.
 pub static DEVIN: AgentSpec = AgentSpec {
     agent_type: AgentType::Devin,
     label: "Devin",

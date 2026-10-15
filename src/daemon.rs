@@ -5449,8 +5449,8 @@ async fn run_hook_loop_with_limits(
                         // `HOOK_CONNECTION_IDLE_TIMEOUT`. It wraps the READ and
                         // nothing else, so a connection is never reclaimed while
                         // the daemon is the one working: `dispatch`'s worktree
-                        // creation and `delegate`'s readiness wait both run in
-                        // the arms below, outside this call.
+                        // creation and `delegate`'s `clear = true` respawn both
+                        // run in the arms below, outside this call.
                         let read = crate::bounded_read::read_capped_line(
                             &mut reader,
                             crate::bounded_read::MAX_HOOK_LINE_BYTES,
@@ -5928,18 +5928,17 @@ async fn run_hook_loop_with_limits(
                                     );
                                     // PRD #93 round-5: one path for both
                                     // modes. The daemon owns the role map
-                                    // and the PTY registry, so it routes
-                                    // the prompt directly into the worker
-                                    // pane's PTY — no broadcast hop, no
-                                    // detach-window loss surface.
+                                    // and the inboxes, so it posts the task
+                                    // to the worker's inbox itself — no
+                                    // broadcast hop, no detach-window loss
+                                    // surface (PRD #1666).
                                     //
                                     // PRD #92 F9 followup-6: pass the
-                                    // daemon-wide hook-event sender too so
-                                    // per-target dispatch tasks can wait
-                                    // for the freshly-spawned agent's
-                                    // `SessionStart` event before writing
-                                    // the prompt (event-driven readiness,
-                                    // replacing the F9 250ms fixed delay).
+                                    // daemon-wide event sender too, for the
+                                    // events a per-target dispatch task
+                                    // sends about a `clear = true`
+                                    // replacement (a replaced worker's lifted
+                                    // quota block, an eviction notice).
                                     // Issue #606: `_with_state` so a `clear = true`
                                     // respawn that had to RE-CREATE the worker pane
                                     // (its record removed by a concurrent close) can
