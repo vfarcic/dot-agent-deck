@@ -232,16 +232,17 @@ fn each_single_provider_variant_launches_only_that_provider() {
     }
 }
 
-/// **The readiness guarantee (issue #1243).** Every role resolves to the agent
+/// **The agent-identity guarantee (issue #1243).** Every role resolves to the agent
 /// its `devbox run <script>` actually launches — which, because the command is a
 /// launcher, means every role DECLARES it with `agent = "…"`.
 ///
 /// `AgentType::from_command` sees `devbox` and nothing behind it, so an
 /// undeclared role is an agent the deck cannot identify, and what the deck keys
-/// on the RESOLVED type — the wrapper, the inbox component, the card — is lost.
-/// Measured before PRD #1666 on one day of this very file: 0 of 17 delegations
-/// to the Codex tester, 0 of 6 to the Pi reviewer and 0 of 6 to the OpenCode
-/// auditor saw readiness, each paying the full 30 s fallback.
+/// on the RESOLVED type at spawn — the wrapper and the card's agent — is lost.
+/// Before PRD #1666 replaced the readiness gate with the inbox it cost a wait
+/// as well: on one day of this very file, 0 of 17 delegations to the Codex
+/// tester, 0 of 6 to the Pi reviewer and 0 of 6 to the OpenCode auditor saw
+/// readiness, each paying the full 30 s fallback.
 ///
 /// Compared against what the script launches rather than against a hard-coded
 /// list so that swapping a role's commented-out alternative launcher in — the
@@ -281,8 +282,8 @@ fn every_role_declares_the_agent_its_launcher_runs() {
     }
     assert!(
         wrong.is_empty(),
-        "these roles do not resolve to the agent they launch, so every `delegate` to a Codex, Pi \
-         or OpenCode one waits the full 30 s readiness timeout (issue #1243) — declare \
+        "these roles do not resolve to the agent they launch, so their cards get no agent from \
+         the config and a Codex one runs without the deck's wrapper (issue #1243) — declare \
          `agent = \"…\"` beside the command:\n{}",
         wrong.join("\n")
     );
