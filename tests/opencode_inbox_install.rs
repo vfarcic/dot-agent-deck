@@ -278,23 +278,28 @@ fn opencode_install_unsafe_uninstall_keeps_tui_file() {
     assert_eq!(f.text(), "{broken");
 }
 
-/// Scenario: Automatically install with only the legacy OpenCode root present. Write the server plugin there, but create neither an XDG root nor a legacy TUI config or TUI plugin.
+/// Scenario: Automatically install with no OpenCode root, then with only the legacy root present. With no root nothing is created; with the legacy root the server plugin goes there and the TUI half goes to the XDG root, which OpenCode reads `tui.json` from and creates on any run, never to the legacy root.
 #[test]
 fn opencode_install_tui_half_is_xdg_only_and_not_speculative() {
     let f = Install::new();
     std::fs::remove_dir(&f.root).unwrap();
     let legacy = f.home.join(".opencode");
+    opencode_manage::auto_install();
+    assert!(
+        !f.root.exists() && !legacy.exists(),
+        "no OpenCode root: nothing is created"
+    );
     std::fs::create_dir_all(&legacy).unwrap();
     opencode_manage::auto_install();
     assert!(legacy.join("plugin/dot-agent-deck.js").exists());
     assert!(
-        !f.root.exists()
-            && !legacy.join("tui.json").exists()
-            && !legacy.join("dot-agent-deck-tui.js").exists()
+        f.plugin().exists() && f.text().contains(&f.entry()),
+        "a legacy-only OpenCode gets the TUI half in the XDG root"
     );
-    std::fs::create_dir_all(&f.root).unwrap();
-    opencode_manage::auto_install();
-    assert!(f.plugin().exists(), "existing XDG root must get TUI half");
+    assert!(
+        !legacy.join("tui.json").exists() && !legacy.join("dot-agent-deck-tui.js").exists(),
+        "and nothing of it in the legacy root"
+    );
 }
 
 /// Scenario: Restrict config writes to an unrelated owned root, then install, auto-install and uninstall. Every attempted TUI write or delete must be refused before changing the outside files.

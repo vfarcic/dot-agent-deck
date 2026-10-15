@@ -2686,18 +2686,32 @@ fn left_unchanged(config: &Path, file: &Path, why: &str) -> std::io::Error {
 }
 
 /// Silently install OpenCode plugin into every existing layout, and the TUI
-/// plugin into the XDG root when it exists (PRD #1666 S8).
+/// plugin into the XDG root whenever OpenCode is installed (PRD #1666 S8).
 /// Intended for dashboard startup — never prints to stdout, refusal included.
 pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
     let roots = candidate_roots();
     let (binary_path, pins) =
         auto_install_resolved(&roots, crate::platform::paths::durable_binary_path);
     // PRD #1666 S8: the TUI plugin, into the XDG root, from the same resolved
-    // binary the server plugin was installed with.
+    // binary the server plugin was installed with. OpenCode reads `tui.json`
+    // from the XDG root only, so a legacy-only layout gets its TUI half there
+    // too (PR #1735 review): OpenCode creates that root itself on any run
+    // (measured on 1.18.35, `opencode --version` included), so creating it for
+    // an installed OpenCode is not speculative. With no root at all nothing is
+    // created.
     if let Some(binary_path) = binary_path
-        && roots[0].exists()
+        && roots.iter().any(|root| root.exists())
     {
-        auto_install_tui(&roots[0], &binary_path);
+        let xdg = &roots[0];
+        match crate::config_write_guard::ensure_config_write_allowed(&tui_plugin_file(xdg))
+            .and_then(|()| std::fs::create_dir_all(xdg))
+        {
+            Ok(()) => auto_install_tui(xdg, &binary_path),
+            Err(e) => tracing::warn!(
+                "auto-install: could not create the OpenCode config root {} for its TUI                  plugin: {e}; deck messages will reach OpenCode by the doorbell instead",
+                xdg.display()
+            ),
+        }
     }
     // One pin per binary: the roots of one machine name the same install.
     let mut out: Vec<crate::hook_binary::HookPin> = Vec::new();
