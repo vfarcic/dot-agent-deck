@@ -221,7 +221,9 @@ function reasonText(reason: string | undefined): string {
  * Only `inbox` notices move it. A message the orchestrator posts is a
  * delegation: posting it creates the edge (`delegated`), a fetch or a hand-back
  * leaves it there, the agent's acknowledgement makes it `delivered`, and an
- * undeliverable message makes it `failed` with the reason. A worker's report is
+ * undeliverable message makes it `failed` with the reason. An acknowledgement
+ * that arrives after a `failed` (the agent took it after its last hand-over)
+ * makes it `delivered` again. A worker's report is
  * a message too, posted to the orchestrator: the first sight of one marks the
  * newest delivered edge for the reporting role `done`. The report carries no
  * delegation id, so it correlates by role, and the edge remembers the report
@@ -276,8 +278,13 @@ export function applyHandoffEvent(
 
   const current = edges[index];
   let changed: HandoffEdge | undefined;
-  if (state === "acknowledged" && current.status === "delegated") changed = { ...current, status: "delivered", at };
-  else if (state === "undeliverable" && current.status !== "failed") changed = { ...current, status: "failed", reason, at };
+  if (state === "acknowledged" && (current.status === "delegated" || current.status === "failed")) {
+    // A message reported undeliverable after its last hand-over can still be
+    // acknowledged by its agent, which proves it arrived: the edge is
+    // delivered after all, without the failure reason.
+    const { reason: _, ...rest } = current;
+    changed = { ...rest, status: "delivered", at };
+  } else if (state === "undeliverable" && current.status !== "failed") changed = { ...current, status: "failed", reason, at };
   if (!changed) return edges;
   const next = edges.slice();
   next[index] = changed;

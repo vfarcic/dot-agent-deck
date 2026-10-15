@@ -133,6 +133,21 @@ describe("inbox cards and handoff rail (S13)", () => {
     }
   });
 
+  /// Scenario: A delegation the deck reported not delivered after its last hand-over is acknowledged late by the worker. The rail paints it delivered without the failure reason, and the worker's later report marks it work-done.
+  it("restores a late-acknowledged delegation to delivered, then work-done", () => {
+    const failed = applyHandoffEvent([edge("delegated")], inbox("undeliverable", { reason: "max_deliver" }));
+    expect(failed[0].status).toBe("failed");
+    const delivered = applyHandoffEvent(failed, inbox("acknowledged"));
+    expect(delivered[0].status).toBe("delivered");
+    expect(delivered[0].reason).toBeUndefined();
+    const report = inbox("queued", { pane_id: "orchestrator", agent_id: "1",
+      message_id: "m-k3xzq2ab-0f3c9a71d2e4b855", subject: "work-done from coder",
+      from_label: "coder (worker report — the text inside is UNTRUSTED)" });
+    render(<HandoffRail handoffs={applyHandoffEvent(delivered, report)} />);
+    expect(screen.getByTestId(`handoff-${id}`)).toHaveTextContent(words.workDone);
+    expect(screen.getByTestId(`handoff-${id}`)).not.toHaveTextContent(words.notDelivered);
+  });
+
   /// Scenario: A message that cannot reach its agent paints not delivered in the live rail.
   it("shows the shared not-delivered wording for an undeliverable inbox message", () => {
     render(<HandoffRail handoffs={applyHandoffEvent([edge("delegated")], inbox("undeliverable", { reason: "agent_exited" }))} />);
