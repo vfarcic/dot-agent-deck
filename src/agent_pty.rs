@@ -3639,11 +3639,10 @@ impl PaneWriter {
     ///
     /// Issue #525: each write waits at most `stall` for the PTY to take it —
     /// see [`PtySink::write_tracked`].
-    fn daemon(&self, stall: Duration, committed: Arc<AtomicBool>) -> DeckSink<'_> {
+    fn daemon(&self, stall: Duration) -> DeckSink<'_> {
         DeckSink {
             writer: self,
             stall,
-            committed,
             flushed: None,
         }
     }
@@ -3868,18 +3867,15 @@ impl PtyInFlight {
 struct WithdrawUnlessAnswered<'a> {
     in_flight: &'a PtyInFlight,
     state: &'a AtomicU8,
-    committed: Option<&'a AtomicBool>,
     armed: bool,
 }
 
 impl Drop for WithdrawUnlessAnswered<'_> {
     fn drop(&mut self) {
-        if self.armed
-            && !self.in_flight.withdraw(self.state)
-            && let Some(committed) = self.committed
-        {
-            // Already started: its bytes are going to the PTY.
-            committed.store(true, Ordering::SeqCst);
+        if self.armed {
+            // A job the thread has already started is left to finish: its
+            // bytes are going to the PTY.
+            self.in_flight.withdraw(self.state);
         }
     }
 }
@@ -4039,7 +4035,34 @@ impl PtyWriterThread {
     /// given. Dropping the returned future withdraws the job if it has not
     /// started.
     async fn run(&self, op: PtyOp, bound: Option<Duration>) -> PtyJobOutcome {
-        self.run_committing(op, bound, None).await
+        let (tx, mut rx) = oneshot::channel();
+        let Some(state) = self.submit(op, PtyReply::Async(tx)) else {
+            return PtyJobOutcome::Gone;
+        };
+        let mut guard = WithdrawUnlessAnswered {
+            in_flight: &self.in_flight,
+            state: &state,
+            armed: true,
+        };
+        let outcome = match bound {
+            None => match (&mut rx).await {
+                Ok(done) => PtyJobOutcome::Done(done),
+                Err(_) => PtyJobOutcome::Gone,
+            },
+            Some(bound) => match within_real_time(bound, &mut rx).await {
+                Some(Ok(done)) => PtyJobOutcome::Done(done),
+                Some(Err(_)) => PtyJobOutcome::Gone,
+                None if self.in_flight.withdraw(&state) => PtyJobOutcome::Withdrawn,
+                // Started: it may have finished in the instant since the
+                // alarm rang, in which case its answer is the truth.
+                None => match rx.try_recv() {
+                    Ok(done) => PtyJobOutcome::Done(done),
+                    Err(_) => PtyJobOutcome::Stalled,
+                },
+            },
+        };
+        guard.armed = false;
+        outcome
     }
 
     /// [`Self::run`] with no bound, calling `queued` as soon as the job is in
@@ -4062,7 +4085,6 @@ impl PtyWriterThread {
         let mut guard = WithdrawUnlessAnswered {
             in_flight: &self.in_flight,
             state: &state,
-            committed: None,
             armed: true,
         };
         let outcome = match rx.await {
@@ -4070,51 +4092,6 @@ impl PtyWriterThread {
             Err(_) => PtyJobOutcome::Gone,
         };
         guard.armed = false;
-        outcome
-    }
-
-    /// [`Self::run`], setting `committed` once the thread has started the job
-    /// — whether the caller sees it finish, stall, or is dropped first. It is
-    /// left alone for a job that was withdrawn and so never written.
-    async fn run_committing(
-        &self,
-        op: PtyOp,
-        bound: Option<Duration>,
-        committed: Option<&AtomicBool>,
-    ) -> PtyJobOutcome {
-        let (tx, mut rx) = oneshot::channel();
-        let Some(state) = self.submit(op, PtyReply::Async(tx)) else {
-            return PtyJobOutcome::Gone;
-        };
-        let mut guard = WithdrawUnlessAnswered {
-            in_flight: &self.in_flight,
-            state: &state,
-            committed,
-            armed: true,
-        };
-        let outcome = match bound {
-            None => match (&mut rx).await {
-                Ok(done) => PtyJobOutcome::Done(done),
-                Err(_) => PtyJobOutcome::Gone,
-            },
-            Some(bound) => match within_real_time(bound, &mut rx).await {
-                Some(Ok(done)) => PtyJobOutcome::Done(done),
-                Some(Err(_)) => PtyJobOutcome::Gone,
-                None if self.in_flight.withdraw(&state) => PtyJobOutcome::Withdrawn,
-                // Started: it may have finished in the instant since the
-                // alarm rang, in which case its answer is the truth.
-                None => match rx.try_recv() {
-                    Ok(done) => PtyJobOutcome::Done(done),
-                    Err(_) => PtyJobOutcome::Stalled,
-                },
-            },
-        };
-        guard.armed = false;
-        if let (Some(committed), PtyJobOutcome::Done(_) | PtyJobOutcome::Stalled) =
-            (committed, &outcome)
-        {
-            committed.store(true, Ordering::SeqCst);
-        }
         outcome
     }
 
@@ -4299,10 +4276,6 @@ impl<W: std::io::Write + Send> PtySink for W {
 struct DeckSink<'a> {
     writer: &'a PaneWriter,
     stall: Duration,
-    /// Set once any write through this sink has reached the PTY. The one
-    /// production sink, the doorbell's, hands in a flag nothing reads since
-    /// PRD #1666 removed the typed delivery that did.
-    committed: Arc<AtomicBool>,
     /// The flush the last write ran in its own job, which the next
     /// [`PtySink::flush_tracked`] reports instead of sending one of its own.
     flushed: Option<std::io::Result<()>>,
@@ -4312,12 +4285,7 @@ impl PtySink for DeckSink<'_> {
     async fn write_tracked(&mut self, buf: &[u8]) -> WriteProgress {
         let op = PtyOp::WriteAll(buf.to_vec(), ByteSource::Deck, true);
         self.flushed = None;
-        match self
-            .writer
-            .pty
-            .run_committing(op, Some(self.stall), Some(&self.committed))
-            .await
-        {
+        match self.writer.pty.run(op, Some(self.stall)).await {
             PtyJobOutcome::Done(PtyJobDone {
                 accepted,
                 result,
@@ -10058,7 +10026,7 @@ impl AgentPtyRegistry {
             steps.push(payload);
             steps.push(b"\r");
         }
-        let mut sink = w.daemon(stall, Arc::new(AtomicBool::new(false)));
+        let mut sink = w.daemon(stall);
         for (n, bytes) in steps.into_iter().enumerate() {
             if n > 0 {
                 tokio::time::sleep(SUBMIT_DELAY).await;
@@ -20667,21 +20635,12 @@ mod spawn_tests {
                 retired: Arc::new(AtomicBool::new(false)),
             },
         ));
-        // Whether each job reached the PTY, as `UnfinishedDelivery` reads it.
-        let [
-            first_committed,
-            withdrawn_committed,
-            dropped_committed,
-            abandoned_committed,
-        ] = std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
         let first = {
             let pty = pty.clone();
-            let committed = first_committed.clone();
             tokio::spawn(async move {
-                pty.run_committing(
+                pty.run(
                     PtyOp::WriteAll(b"first".to_vec(), ByteSource::Deck, false),
                     None,
-                    Some(&committed),
                 )
                 .await
             })
@@ -20694,18 +20653,16 @@ mod spawn_tests {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(matches!(
-            pty.run_committing(
+            pty.run(
                 PtyOp::WriteAll(b"withdrawn".to_vec(), ByteSource::Deck, false),
                 Some(Duration::from_millis(100)),
-                Some(&withdrawn_committed),
             )
             .await,
             PtyJobOutcome::Withdrawn
         ));
-        let dropped = pty.run_committing(
+        let dropped = pty.run(
             PtyOp::WriteAll(b"dropped".to_vec(), ByteSource::Deck, false),
             None,
-            Some(&dropped_committed),
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), dropped)
@@ -20714,12 +20671,7 @@ mod spawn_tests {
             "precondition: still queued behind the gated write"
         );
         assert!(
-            !withdrawn_committed.load(Ordering::SeqCst)
-                && !dropped_committed.load(Ordering::SeqCst),
-            "a job taken back before it started reached nothing"
-        );
-        assert!(
-            !first_committed.load(Ordering::SeqCst),
+            !first.is_finished(),
             "precondition: the first job's waiter has not been answered yet"
         );
 
@@ -20735,7 +20687,6 @@ mod spawn_tests {
         tokio::time::timeout(Duration::from_secs(10), pty.until_idle())
             .await
             .expect("every job is finished or withdrawn");
-        assert!(first_committed.load(Ordering::SeqCst));
         assert!(matches!(
             pty.run(
                 PtyOp::WriteAll(b"-last".to_vec(), ByteSource::Deck, false),
@@ -20744,35 +20695,11 @@ mod spawn_tests {
             .await,
             PtyJobOutcome::Done(PtyJobDone { accepted: 5, .. })
         ));
-        assert_eq!(log.lock().unwrap().as_slice(), b"first-last");
-
-        // A job that has STARTED is committed even when its waiter is dropped
-        // before the PTY answers: its bytes are going in regardless.
-        let gate = Arc::new(WedgeGate::default());
-        let pty = PtyWriterThread::spawn(
-            Box::new(GatedWriter {
-                gate: gate.clone(),
-                log: Arc::new(Mutex::new(Vec::new())),
-            }),
-            InputRecorder {
-                pane_id_env: None,
-                state: Arc::new(Mutex::new(PaneInputState::default())),
-                retired: Arc::new(AtomicBool::new(false)),
-            },
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            b"first-last",
+            "a job taken back before it started is never written"
         );
-        let abandoned = pty.run_committing(
-            PtyOp::WriteAll(b"abandoned".to_vec(), ByteSource::Deck, false),
-            None,
-            Some(&abandoned_committed),
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), abandoned)
-                .await
-                .is_err(),
-            "precondition: the job is inside the gated write"
-        );
-        assert!(abandoned_committed.load(Ordering::SeqCst));
-        gate.release();
     }
 
     #[tokio::test]
