@@ -1033,21 +1033,14 @@ fn ack_was_refused_by_id(reply: &AckReply) -> bool {
 /// nothing). `final` is true when the deck refused the id itself, so asking
 /// again changes nothing; every other unrecorded answer may be asked again.
 fn ack_json(reply: &AckReply) -> serde_json::Value {
-    use dot_agent_deck::event::AckDelivery;
-    use dot_agent_deck::hook::SocketReply;
-    if let AckReply::Socket(SocketReply::Line(line)) = reply
-        && let Some(ack) = parse_signal_ack(line)
-        && ack.accepted
-    {
-        let refused = |reason: &str| serde_json::json!({"acknowledged": false, "final": true, "reason": reason});
-        match ack.delivery {
-            Some(delivery) if delivery.recorded() => {
-                return serde_json::json!({"acknowledged": true});
+    use dot_agent_deck::hook::{AckConfirmation, ack_confirmation};
+    if let AckReply::Socket(socket) = reply {
+        match ack_confirmation(socket) {
+            AckConfirmation::Recorded => return serde_json::json!({"acknowledged": true}),
+            AckConfirmation::Refused(reason) => {
+                return serde_json::json!({"acknowledged": false, "final": true, "reason": reason});
             }
-            Some(AckDelivery::Unknown) => return refused("unknown"),
-            Some(AckDelivery::WrongAgent) => return refused("wrong_agent"),
-            Some(AckDelivery::Undeliverable) => return refused("undeliverable"),
-            _ => {}
+            AckConfirmation::Unconfirmed => {}
         }
     }
     let (_, message) = ack_report(reply);

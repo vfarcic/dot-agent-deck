@@ -1588,10 +1588,143 @@ const inboxSpawnWatcher = (agent, deliver, exited) => {
   });
   return child;
 };
+// Whether `control` was handed to the watcher's stdin (which answers nothing).
 const inboxWrite = (child, control) => {
   try {
-    child?.stdin?.write(JSON.stringify(control) + "\n");
-  } catch (_) {}
+    if (!child?.stdin || child.stdin.writableEnded || child.stdin.destroyed) return false;
+    child.stdin.write(JSON.stringify(control) + "\n");
+    return true;
+  } catch (_) {
+    return false;
+  }
+};
+// PR #1735 third review: an acknowledgement this plugin sends — over the
+// watcher's stdin, which answers nothing, or with the CLI — is kept until
+// `dot-agent-deck ack --json` reports the deck recorded it, whether or not the
+// deck hands the message over again (it may not: it allows a message a bounded
+// number of hand-overs). The first ask comes at once when the CLI carries the
+// acknowledgement, and a second after a stdin one; later asks back off,
+// doubling to 30 s, at most INBOX_ACK_CONFIRM_ATTEMPTS asks per id. A refusal
+// by id, or running out of asks, is reported to the person.
+const INBOX_ACK_CONFIRM_DELAY_MS = 1000;
+const INBOX_ACK_CONFIRM_MAX_DELAY_MS = 30000;
+const INBOX_ACK_CONFIRM_ATTEMPTS = 8;
+// What the deck said to `ack --json`: "recorded", `{ refused }` (asking again
+// changes nothing), or "unconfirmed" (ask again).
+const inboxAckOutcome = (stdout) => {
+  if (typeof stdout !== "string") return "unconfirmed";
+  for (const line of stdout.split("\n")) {
+    let reply;
+    try {
+      reply = JSON.parse(line);
+    } catch (_) {
+      continue;
+    }
+    if (reply?.acknowledged === true) return "recorded";
+    if (reply?.acknowledged === false) {
+      return reply.final === true
+        ? { refused: typeof reply.reason === "string" ? reply.reason : "refused" }
+        : "unconfirmed";
+    }
+  }
+  return "unconfirmed";
+};
+// The CLI's stdout for `ack --json id`; a refusal exits 1 and still answers.
+const inboxAckByCli = (id) =>
+  new Promise((resolve) => {
+    try {
+      execFile(hookBinary(), ["ack", "--json", id], { timeout: 5000 }, (_error, stdout) => resolve(stdout));
+    } catch (_) {
+      resolve(undefined);
+    }
+  });
+const inboxUnconfirmedNotice = (id, why) =>
+  "dot-agent-deck could not record message " + id + " as delivered (" + why +
+  "). OpenCode received it; the deck may show it as not delivered.";
+// `report(id, why)` tells the person; `ask(id)` resolves to what `ack --json` printed.
+const inboxConfirmer = (
+  report,
+  ask = inboxAckByCli,
+  timers = { set: (fn, ms) => setTimeout(fn, ms), clear: (timer) => clearTimeout(timer) }
+) => {
+  const unconfirmed = new Map();
+  let timer;
+  let confirming = false;
+  let again = false;
+  const clear = () => {
+    if (timer !== undefined) timers.clear(timer);
+    timer = undefined;
+  };
+  const schedule = (delay) => {
+    clear();
+    if (unconfirmed.size === 0) return;
+    timer = timers.set(() => {
+      timer = undefined;
+      void confirm();
+    }, delay);
+    try {
+      timer?.unref?.();
+    } catch (_) {}
+  };
+  const settle = (id, why) => {
+    unconfirmed.delete(id);
+    try {
+      report(id, why);
+    } catch (_) {}
+  };
+  const confirm = async () => {
+    if (confirming) {
+      again = true;
+      return;
+    }
+    clear();
+    confirming = true;
+    try {
+      for (const [id, asked] of [...unconfirmed]) {
+        let stdout;
+        try {
+          stdout = await ask(id);
+        } catch (_) {}
+        if (!unconfirmed.has(id)) continue;
+        const outcome = inboxAckOutcome(stdout);
+        if (outcome === "recorded") {
+          unconfirmed.delete(id);
+        } else if (outcome !== "unconfirmed") {
+          settle(id, outcome.refused);
+        } else if (asked + 1 >= INBOX_ACK_CONFIRM_ATTEMPTS) {
+          settle(id, "the deck did not confirm it");
+        } else {
+          unconfirmed.set(id, asked + 1);
+        }
+      }
+    } finally {
+      confirming = false;
+    }
+    if (again) {
+      again = false;
+      void confirm();
+      return;
+    }
+    if (unconfirmed.size > 0) {
+      const fewest = Math.min(...unconfirmed.values());
+      schedule(Math.min(INBOX_ACK_CONFIRM_DELAY_MS * 2 ** fewest, INBOX_ACK_CONFIRM_MAX_DELAY_MS));
+    }
+  };
+  return {
+    // `ids` were acknowledged: confirm them now when `now` (the CLI carries
+    // them, or the watcher's stdin did not take them), else after a second.
+    add(ids, now) {
+      if (!ids.length) return;
+      for (const id of ids) {
+        if (!unconfirmed.has(id)) unconfirmed.set(id, 0);
+      }
+      if (now) {
+        void confirm();
+      } else if (!confirming) {
+        schedule(INBOX_ACK_CONFIRM_DELAY_MS);
+      }
+    },
+  };
 };
 const inboxStop = (child) => {
   if (!child) return;
@@ -1654,6 +1787,28 @@ let miniQueue = Promise.resolve();
 // Every mode: doorbell prompts whose content this plugin swapped in, by
 // OpenCode user message id.
 const intercepted = new Map();
+// Every mode: the deck messages OpenCode answered in this process, at most
+// INBOX_MAX_TRACKED. The deck hands one over again only because it never
+// recorded the acknowledgement, so it is acknowledged again, not run again.
+const inboxCommitted = new Map();
+// Every mode: confirms each acknowledgement with the deck, and shows the
+// person, as an OpenCode toast, one the deck could not record.
+const inboxConfirm = inboxConfirmer((id, why) => {
+  try {
+    void sessionClient?.tui
+      ?.showToast?.({ body: { message: inboxUnconfirmedNotice(id, why), variant: "warning" } })
+      ?.catch?.(() => {});
+  } catch (_) {}
+});
+// OpenCode answered `ids`: acknowledge them over the watcher's stdin, or with
+// the CLI (`viaCli`, and when the watcher does not take the line), and
+// confirm each with the deck.
+const inboxCommit = (ids, viaCli, control = {}) => {
+  for (const id of [...ids, ...viaCli]) inboxRemember(inboxCommitted, id, true);
+  const written = ids.length > 0 && inboxWrite(globalThis[INBOX_WATCHER], { ack: ids, ...control });
+  inboxConfirm.add(ids, !written);
+  inboxConfirm.add(viaCli, true);
+};
 // Every mode: the user messages this process saw (`inboxObserveUsers`).
 const inboxUsers = new Map();
 
@@ -1662,6 +1817,10 @@ const isMini = () =>
   isMainThread && process.argv.slice(2).includes("--mini") && !INBOX_SUBCOMMANDS.has(process.argv[2]);
 
 const miniDeliver = async (client, message, generation) => {
+  if (inboxCommitted.has(message.id)) {
+    inboxCommit([message.id], []);
+    return;
+  }
   if (inboxHeld(miniHolds, miniDelivered, message.id)) {
     inboxWrite(globalThis[INBOX_WATCHER], { hold: [message.id] });
     return;
@@ -1754,11 +1913,7 @@ const inboxAck = (assistant) => {
   for (const key of inboxCovered(inboxUsers, intercepted, assistant)) {
     const fromDoorbell = intercepted.get(key);
     intercepted.delete(key);
-    for (const id of fromDoorbell) {
-      try {
-        execFile(hookBinary(), ["ack", id], { timeout: 5000 }, () => {});
-      } catch (_) {}
-    }
+    inboxCommit([], fromDoorbell);
   }
   const ids = [];
   for (const key of inboxCovered(inboxUsers, miniPending, assistant)) {
@@ -1770,7 +1925,7 @@ const inboxAck = (assistant) => {
   }
   if (ids.length) {
     if (assistant.sessionID) miniTurns.add(assistant.sessionID);
-    inboxWrite(globalThis[INBOX_WATCHER], { ack: ids, repaint: true });
+    inboxCommit(ids, [], { repaint: true });
   }
 };
 
@@ -1831,8 +1986,12 @@ const interceptDoorbell = async (input, output) => {
       } catch (_) {
         return;
       }
-      const messages = Array.isArray(reply?.messages) ? reply.messages : undefined;
-      if (!messages) return;
+      const fetched = Array.isArray(reply?.messages) ? reply.messages : undefined;
+      if (!fetched) return;
+      // One OpenCode already answered is handed over again only because the
+      // deck never recorded its acknowledgement: acknowledged, not run again.
+      const messages = fetched.filter((m) => !inboxCommitted.has(m.id));
+      inboxCommit([], fetched.filter((m) => inboxCommitted.has(m.id)).map((m) => m.id));
       if (messages.length === 0) {
         part.text = part.text.replace(match[0], () => INBOX_HANDLED);
         return;
@@ -1861,7 +2020,7 @@ fn tui_plugin_template(binary_path: &str) -> String {
     format!(
         "// dot-agent-deck's OpenCode TUI plugin, generated by `dot-agent-deck hooks install`.\n\
          // Regenerated on every install; edits are overwritten.\n\
-         import {{ spawn }} from \"child_process\";\n\n\
+         import {{ execFile, spawn }} from \"child_process\";\n\n\
          const BINARY_PATH = {binary_path_json};\n\n{}{}",
         TUI_HOOK_BINARY_JS,
         inbox_js(TUI_INBOX_JS)
@@ -1882,12 +2041,23 @@ const hookBinary = () => {
 const TUI_INBOX_JS: &str = r#"// One live instance per process: a second copy of this file (another
 // spelling of its path, another tui.json) stays inert while the first runs.
 const TUI_GUARD = "__dotAgentDeckTuiLoaded";
+// The deck messages OpenCode answered in this process, at most
+// INBOX_MAX_TRACKED, and the confirmation of each acknowledgement with the
+// deck, which outlives a disposed instance: an acknowledgement stays this
+// pane's whichever instance sent it. One the deck could not record is shown
+// as a toast by the instance that is live then.
+const tuiCommitted = new Map();
+let tuiToast;
+const tuiConfirm = inboxConfirmer((id, why) => {
+  tuiToast?.({ variant: "warning", message: inboxUnconfirmedNotice(id, why) });
+});
 
 const tui = async (api) => {
   try {
     if (globalThis[TUI_GUARD]?.active || !inboxInPane()) return;
     const instance = { active: true };
     globalThis[TUI_GUARD] = instance;
+    tuiToast = (toast) => api.ui?.toast?.(toast);
     let watcher;
     let lastSeen;
     let queue = Promise.resolve();
@@ -1964,7 +2134,19 @@ const tui = async (api) => {
       api.route.navigate("session", { sessionID });
       return sessionID;
     };
+    // OpenCode answered `ids`: acknowledge them over the watcher's stdin
+    // and confirm each with the deck.
+    const commit = (ids) => {
+      for (const id of ids) inboxRemember(tuiCommitted, id, true);
+      tuiConfirm.add(ids, !inboxWrite(watcher, { ack: ids }));
+    };
     const deliver = async (message) => {
+      // The deck hands an answered message over again only because it never
+      // recorded the acknowledgement: acknowledged, not prompted again.
+      if (tuiCommitted.has(message.id)) {
+        commit([message.id]);
+        return;
+      }
       if (inboxHeld(holds, delivered, message.id)) {
         inboxWrite(watcher, { hold: [message.id] });
         return;
@@ -2009,7 +2191,7 @@ const tui = async (api) => {
           pending.delete(key);
         }
         for (const id of ids) inboxForget(holds, id);
-        if (ids.length) inboxWrite(watcher, { ack: ids });
+        if (ids.length) commit(ids);
       } catch (_) {}
     });
     api.event.on("message.removed", (event) => {
@@ -4321,6 +4503,339 @@ process.exit(0);
         assert_eq!(result["prompts"], serde_json::json!([]), "{result}");
         let written = std::fs::read_to_string(&controls).unwrap_or_default();
         assert!(written.contains("\"nack\""), "handed back: {written}");
+    }
+
+    /// The deck message id the acknowledgement-confirmation drivers below hand
+    /// over, and its framed text.
+    #[cfg(unix)]
+    const CONFIRM_ID: &str = "m-k3xzq2ab-0f3c9a71d2e4b850";
+
+    #[cfg(unix)]
+    fn confirm_message() -> serde_json::Value {
+        let id = CONFIRM_ID;
+        serde_json::json!({
+            "id": id,
+            "text": format!("[dot-agent-deck message {id} from x]\nbody\n[end of dot-agent-deck message {id}]"),
+        })
+    }
+
+    /// A recorder standing in for the deck binary for the acknowledgement
+    /// confirmation drivers: every call is logged to `calls.log`; `inbox
+    /// fetch` hands [`confirm_message`] over; `inbox wait` hands it over,
+    /// then again once `trigger` exists, then records the control lines; and
+    /// `ack` answers the line in `answers` numbered by how many acks came
+    /// before it (the last line for every later one), exiting 1 on a final
+    /// refusal as the CLI does.
+    #[cfg(unix)]
+    fn confirm_recorder(
+        dir: &std::path::Path,
+        answers: &[serde_json::Value],
+    ) -> std::path::PathBuf {
+        let recorder = dir.join("recorder.sh");
+        let answer_lines: Vec<String> = answers.iter().map(|a| a.to_string()).collect();
+        std::fs::write(dir.join("answers"), answer_lines.join("\n") + "\n").unwrap();
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                r#"#!/bin/sh
+d='{d}'
+echo "$*" >> "$d/calls.log"
+case "$1 $2" in
+  'inbox fetch') printf '%s\n' '{{"messages":[{m}]}}'; exit 0;;
+  'inbox wait')
+    printf '%s\n' '{m}'
+    n=0
+    while [ ! -f "$d/trigger" ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done
+    printf '%s\n' '{m}'
+    cat >> "$d/controls.log"
+    exit 0;;
+esac
+if [ "$1" = "ack" ]; then
+  n=$(cat "$d/acks" 2>/dev/null || echo 0)
+  echo $((n+1)) > "$d/acks"
+  total=$(wc -l < "$d/answers")
+  line=$((n+1)); [ $line -gt $total ] && line=$total
+  answer=$(sed -n "${{line}}p" "$d/answers")
+  printf '%s\n' "$answer"
+  case "$answer" in *'"final":true'*) exit 1;; esac
+fi
+exit 0
+"#,
+                d = dir.display(),
+                m = confirm_message(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        recorder
+    }
+
+    /// The `ack` calls the recorder logged, as their argument lists.
+    #[cfg(unix)]
+    fn confirm_ack_calls(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|call| call.starts_with("ack"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Drive the server plugin in `--mini` through a doorbell OpenCode
+    /// answers: the line is swapped for the waiting message, and the answer to
+    /// it acknowledges that message. The driver's last line reports the
+    /// toasts the plugin showed.
+    #[cfg(unix)]
+    fn drive_doorbell_answer(
+        dir: &std::path::Path,
+        recorder: &std::path::Path,
+        wait_ms: u64,
+    ) -> serde_json::Value {
+        let plugin = dir.join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let line_json = serde_json::to_string(&crate::doorbell::doorbell_line(CONFIRM_ID)).unwrap();
+        let driver = dir.join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"process.argv = [process.argv[0], "opencode", "--mini"];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const toasts = [];
+const client = {{ tui: {{ showToast: async (options) => {{ toasts.push(options?.body); return {{}}; }} }} }};
+const {{ default: plugin }} = await import({plugin});
+const hooks = await plugin({{ directory: "/work", client }});
+const output = {{ parts: [{{ type: "text", text: {line_json} }}] }};
+await hooks["chat.message"]({{ messageID: "u1" }}, output);
+const swapped = output.parts[0].text.includes("body");
+await hooks.event({{ event: {{ type: "message.updated", properties: {{ info: {{ role: "user", id: "u1", sessionID: "s1" }} }} }} }});
+await hooks.event({{ event: {{ type: "message.updated", properties: {{ info: {{ role: "assistant", id: "a1", parentID: "u1", sessionID: "s1" }} }} }} }});
+await sleep({wait_ms});
+console.log(JSON.stringify({{ swapped, toasts }}));
+process.exit(0);
+"#,
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        run_inbox_driver(&driver)
+    }
+
+    /// PR #1735 third review: the server plugin's acknowledgement of a
+    /// message a doorbell handed over is confirmed with `ack --json` until
+    /// the deck records it, without the deck handing the message over again;
+    /// once it is recorded the plugin asks no more.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_doorbell_acknowledgement_is_confirmed_until_the_deck_records_it() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = confirm_recorder(
+            dir.path(),
+            &[
+                serde_json::json!({"acknowledged": false, "final": false, "reason": "the deck is not reachable"}),
+                serde_json::json!({"acknowledged": true}),
+            ],
+        );
+        let result = drive_doorbell_answer(dir.path(), &recorder, 2500);
+        assert_eq!(result["swapped"], true, "{result}");
+        let ack = format!("ack --json {CONFIRM_ID}");
+        assert_eq!(
+            confirm_ack_calls(dir.path()),
+            vec![ack.clone(), ack],
+            "asked until the deck recorded it, then no more"
+        );
+        assert_eq!(result["toasts"], serde_json::json!([]), "{result}");
+    }
+
+    /// PR #1735 third review: an acknowledgement the deck refuses for good
+    /// (the message is no longer deliverable) is asked once, and the person
+    /// is told in OpenCode which message the deck could not record.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_a_finally_refused_acknowledgement_is_shown_to_the_user() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = confirm_recorder(
+            dir.path(),
+            &[serde_json::json!({"acknowledged": false, "final": true, "reason": "undeliverable"})],
+        );
+        let result = drive_doorbell_answer(dir.path(), &recorder, 1500);
+        assert_eq!(
+            confirm_ack_calls(dir.path()),
+            vec![format!("ack --json {CONFIRM_ID}")],
+            "a refusal by id is final"
+        );
+        let toasts = result["toasts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(toasts.len(), 1, "{result}");
+        assert_eq!(toasts[0]["variant"], "warning", "{result}");
+        let message = toasts[0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(CONFIRM_ID) && message.contains("undeliverable"),
+            "{result}"
+        );
+    }
+
+    /// PR #1735 third review: the TUI plugin's acknowledgement over the
+    /// watcher's stdin, which answers nothing, is confirmed with `ack --json`;
+    /// and when the deck hands a message OpenCode already answered over again,
+    /// it is acknowledged again, not prompted a second time.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_tui_acknowledgement_is_confirmed_and_a_committed_redelivery_is_not_prompted() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = confirm_recorder(dir.path(), &[serde_json::json!({"acknowledged": true})]);
+        let plugin = dir.path().join("dot-agent-deck-tui.mjs");
+        std::fs::write(&plugin, tui_plugin_template(&recorder.to_string_lossy())).unwrap();
+        let opener = format!("[dot-agent-deck message {CONFIRM_ID} from x]\nbody");
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import {{ writeFileSync }} from "fs";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const prompts = [];
+const toasts = [];
+const handlers = {{}};
+let route = {{ name: "home", params: {{}} }};
+const api = {{
+  state: {{ session: {{ get: () => ({{}}), messages: () => [] }} }},
+  ui: {{ dialog: {{ open: false }}, toast: (t) => toasts.push(t) }},
+  mode: {{ current: () => "normal" }},
+  route: {{
+    get current() {{ return route; }},
+    navigate: (name, params) => {{ route = {{ name, params }}; }},
+  }},
+  client: {{ session: {{
+    create: async () => ({{ data: {{ id: "s1" }} }}),
+    promptAsync: async (req) => {{ prompts.push(req.sessionID); return {{}}; }},
+  }} }},
+  event: {{ on: (type, cb) => {{ (handlers[type] ??= []).push(cb); }} }},
+  lifecycle: {{ onDispose: () => {{}} }},
+}};
+const emit = (type, properties) => (handlers[type] ?? []).forEach((cb) => cb({{ type, properties }}));
+const {{ default: mod }} = await import({plugin});
+await mod.tui(api);
+for (let n = 0; n < 200 && prompts.length === 0; n++) await sleep(20);
+emit("message.updated", {{ info: {{ role: "user", id: "u1", sessionID: "s1" }} }});
+emit("message.part.updated", {{ part: {{ type: "text", messageID: "u1", text: {opener} }} }});
+emit("message.updated", {{ info: {{ role: "assistant", id: "a1", parentID: "u1", sessionID: "s1" }} }});
+writeFileSync({trigger}, "");
+await sleep(2000);
+console.log(JSON.stringify({{ prompts, toasts }}));
+process.exit(0);
+"#,
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+                opener = serde_json::to_string(&opener).unwrap(),
+                trigger = serde_json::to_string(&dir.path().join("trigger").display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(
+            result["prompts"],
+            serde_json::json!(["s1"]),
+            "prompted once: {result}"
+        );
+        let controls = std::fs::read_to_string(dir.path().join("controls.log")).unwrap_or_default();
+        let acks = controls
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|c| c["ack"] == serde_json::json!([CONFIRM_ID]))
+            .count();
+        assert_eq!(
+            acks, 2,
+            "acknowledged on the answer and on the redelivery: {controls}"
+        );
+        let calls = confirm_ack_calls(dir.path());
+        assert!(
+            !calls.is_empty()
+                && calls
+                    .iter()
+                    .all(|c| *c == format!("ack --json {CONFIRM_ID}")),
+            "confirmed with the CLI: {calls:?}"
+        );
+        assert_eq!(result["toasts"], serde_json::json!([]), "{result}");
+    }
+
+    /// PR #1735 third review: the confirmation both plugins share asks a deck
+    /// that never answers a bounded number of times, backing off from 1 s to
+    /// 30 s, then reports the message; it stops at once on a record or a
+    /// final refusal.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_ack_confirmation_is_bounded_and_reports_its_outcome() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let script = format!(
+            "{}\n{}",
+            inbox_js(""),
+            r#"
+const check = (actual, expected, what) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    console.error(what + ": " + JSON.stringify(actual) + " != " + JSON.stringify(expected));
+    process.exit(1);
+  }
+};
+const run = async (answer, now) => {
+  const asks = [];
+  const delays = [];
+  const reports = [];
+  const due = [];
+  const timers = { set: (fn, ms) => { delays.push(ms); due.push(fn); return due.length; }, clear: () => {} };
+  const confirmer = inboxConfirmer((id, why) => reports.push([id, why]), async (id) => {
+    asks.push(id);
+    return JSON.stringify(answer);
+  }, timers);
+  confirmer.add(["m-1"], now);
+  for (let n = 0; n < 50; n++) {
+    await new Promise((r) => setImmediate(r));
+    const fn = due.shift();
+    if (fn) fn();
+  }
+  return { asks: asks.length, delays, reports };
+};
+const silent = await run({ acknowledged: false, final: false, reason: "no answer" }, true);
+check(silent.asks, INBOX_ACK_CONFIRM_ATTEMPTS, "asks of a deck that never answers");
+check(silent.delays, [2000, 4000, 8000, 16000, 30000, 30000, 30000], "the backoff");
+check(silent.reports, [["m-1", "the deck did not confirm it"]], "the report");
+const later = await run({ acknowledged: true }, false);
+check(later.delays, [1000], "a stdin acknowledgement is first confirmed after a second");
+check(later.asks, 1, "a recorded acknowledgement is asked once");
+check(later.reports, [], "a recorded acknowledgement reports nothing");
+const refused = await run({ acknowledged: false, final: true, reason: "wrong_agent" }, true);
+check(refused.asks, 1, "a final refusal is asked once");
+check(refused.reports, [["m-1", "wrong_agent"]], "a final refusal is reported");
+check(inboxAckOutcome("not json\n" + JSON.stringify({ acknowledged: true })), "recorded", "the JSON line is found");
+check(inboxAckOutcome(undefined), "unconfirmed", "no output is unconfirmed");
+process.exit(0);
+"#
+        );
+        let output = std::process::Command::new("node")
+            .arg("--input-type=module")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .expect("run node");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Hardening M2: the server plugin swaps a submitted doorbell line for the
