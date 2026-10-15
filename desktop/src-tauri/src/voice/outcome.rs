@@ -2684,7 +2684,9 @@ fn deck_in_the_other_slot<'a>(
 /// Switch" names it.
 ///
 /// In what is left, the daemon is named when every content word of `value` is
-/// said ([`said`]), or when a run of up to three adjacent words resolves — by
+/// said ([`said`]) on one side of the ask or the other — each side is heard on
+/// its own, so "build switch box" does not glue into `BuildBox` across the
+/// removed "switch" — or when a run of up to three adjacent words resolves — by
 /// the row's own deck resolver, with its spoken names, host aliases and glued
 /// spellings — to exactly ONE daemon, one `value` resolves to. A run several
 /// daemons share is no evidence: "build" of "build box" does not name the
@@ -2745,12 +2747,16 @@ fn names_the_daemon(value: &str, transcript: &str, row: &CommandRow, decks: &[Vo
             _ => None,
         })
         .collect();
-    let rest = segments
+    let heard: Vec<Heard> = segments
         .iter()
-        .map(|segment| segment.join(" "))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let evidence = if said(value, &rest) {
+        .map(|segment| Heard::from_words(segment.to_vec()))
+        .collect();
+    let content = content_words(value);
+    let said_in_segments = !content.is_empty()
+        && content
+            .iter()
+            .all(|word| heard.iter().any(|segment| segment.word(word)));
+    let evidence = if said_in_segments {
         spoken_words(value).len()
     } else {
         match named
@@ -7016,7 +7022,9 @@ mod tests {
     /// both observed, "switch daemon to build box" with `build cache` in the
     /// other slot is asked about too, since the shared "build" is not the
     /// user naming the build cache, and so is "switch to build box" with a
-    /// daemon labelled `build` there (PRD #1666 re-check DR-2).
+    /// daemon labelled `build` there (PRD #1666 re-check DR-2). Nor does
+    /// "build switch box" name a daemon labelled `BuildBox`: the words either
+    /// side of the removed "switch" are not one glued word.
     #[tokio::test]
     async fn voice_outcome_the_ask_is_not_a_daemon_named_for_the_other_slot() {
         let remote = |id: &str, label: &str, address: &str| VoiceDeck {
@@ -7040,6 +7048,10 @@ mod tests {
             deck("deck-local", "Local deck", true),
             deck("deck-plain", "build", false),
             deck("deck-box", "build box", false),
+        ];
+        let glued = vec![
+            deck("deck-local", "Local deck", true),
+            remote("deck-buildbox", "BuildBox", "ops@relay.example.com"),
         ];
         let outcome_for =
             |said: &'static str, value: &'static str, screen, decks: Vec<VoiceDeck>| async move {
@@ -7071,6 +7083,7 @@ mod tests {
                 builds,
             ),
             ("switch to build box", "build", Screen::Deck, build_and_box),
+            ("build switch box", "BuildBox", Screen::Deck, glued),
         ] {
             let outcome = outcome_for(said, value, screen, decks).await;
             assert!(
