@@ -5770,6 +5770,67 @@ fn pi_test_model_selection_reads_provider_slash_model() {
     }
 }
 
+/// Scenario: Turn the host's stored Pi login into the copy a scratch agent
+/// directory gets. An OAuth login with hours left loses its refresh token and
+/// keeps the rest; one about to expire, already expired, or carrying a refresh
+/// token with no expiry is refused with the remedy (log in again with `pi`)
+/// rather than copied; a login with no refresh token is copied as it is.
+#[test]
+fn a_scratch_pi_login_carries_no_refresh_token_and_a_run_margin() {
+    let now = std::time::SystemTime::now();
+    let ms = |offset: Duration, ahead: bool| {
+        let at = if ahead { now + offset } else { now - offset };
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let login = |expires: Option<u64>| {
+        let mut entry = serde_json::json!({
+            "type": "oauth",
+            "access": "ACCESS-TOKEN",
+            "refresh": "REFRESH-TOKEN",
+            "refreshToken": "REFRESH-TOKEN-2",
+            "accountId": "ACCOUNT",
+        });
+        if let Some(expires) = expires {
+            entry["expires"] = expires.into();
+        }
+        entry
+    };
+
+    let hours = ms(Duration::from_secs(3 * 3600), true);
+    let copied = pi_scratch_login(login(Some(hours)), now).expect("hours left is enough");
+    assert_eq!(
+        copied,
+        serde_json::json!({
+            "type": "oauth",
+            "access": "ACCESS-TOKEN",
+            "accountId": "ACCOUNT",
+            "expires": hours,
+        }),
+        "the copy keeps the access token and drops every refresh token"
+    );
+
+    for (expires, why) in [
+        (Some(ms(Duration::from_secs(600), true)), "ten minutes left"),
+        (Some(ms(Duration::from_secs(600), false)), "already expired"),
+        (None, "a refresh token with no expiry"),
+    ] {
+        let err = pi_scratch_login(login(expires), now).expect_err(why);
+        assert!(err.contains("/login"), "{why}: {err}");
+        assert!(
+            !err.contains("TOKEN"),
+            "{why}: the refusal must not quote a secret: {err}"
+        );
+    }
+
+    let keyed = serde_json::json!({ "type": "api_key", "key": "API-KEY" });
+    assert_eq!(
+        pi_scratch_login(keyed.clone(), now).expect("nothing to refresh"),
+        keyed
+    );
+}
+
 /// Scenario: Look for a missing sentinel's name around where it was expected.
 /// With nothing of that name nearby the note is empty; with a file of that name
 /// one level up — where a real agent once wrote it after inferring its working

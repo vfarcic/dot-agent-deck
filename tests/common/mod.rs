@@ -6669,6 +6669,71 @@ fn host_pi_login(provider: &str) -> Option<serde_json::Value> {
         .filter(serde_json::Value::is_object)
 }
 
+/// How long a Pi OAuth access token must still be valid when a scratch copy is
+/// made of it ([`pi_scratch_login`]): the copy carries no refresh token, so a
+/// test that outlives the token fails rather than refreshing. One hour covers a
+/// lane-2 Pi test with its preflight many times over.
+const PI_LOGIN_RUN_MARGIN: Duration = Duration::from_secs(3600);
+
+/// The copy of the host's stored Pi login `entry` that a scratch agent
+/// directory gets: every refresh token taken out, and refused unless its access
+/// token is still valid for [`PI_LOGIN_RUN_MARGIN`] after `now`.
+///
+/// **Why no refresh token.** A refresh run in the scratch copy writes the new
+/// tokens only there, and they go when the directory does. On a provider that
+/// rotates refresh tokens, that leaves the host's own login holding a refresh
+/// token the provider has already spent — a test run logging the developer out.
+/// With only the access token copied, the scratch Pi has nothing to refresh
+/// with, so no test run can move the provider's credential state.
+///
+/// **So the access token has to last the run.** An entry that carries a refresh
+/// token is refused when it has no numeric `expires` (milliseconds since the
+/// epoch, Pi's shape) or when that is less than the margin away, with the
+/// remedy: log in again with `pi`, which refreshes the HOST login, where a
+/// rotated token is kept. An entry with no refresh token (an API key) is copied
+/// as it is. The refusal names no value from the entry.
+pub(crate) fn pi_scratch_login(
+    mut entry: serde_json::Value,
+    now: std::time::SystemTime,
+) -> Result<serde_json::Value, String> {
+    let Some(fields) = entry.as_object_mut() else {
+        return Ok(entry);
+    };
+    let refresh_keys: Vec<String> = fields
+        .keys()
+        .filter(|key| key.to_ascii_lowercase().contains("refresh"))
+        .cloned()
+        .collect();
+    if refresh_keys.is_empty() {
+        return Ok(entry);
+    }
+    let remedy = "log in again with `pi` and `/login` to refresh the host login; the test \
+                  copy carries no refresh token, so it cannot refresh on its own";
+    let Some(expires) = fields.get("expires").and_then(serde_json::Value::as_u64) else {
+        return Err(format!(
+            "the stored Pi login has a refresh token but no `expires` time, so the harness \
+             cannot tell whether its access token lasts the run; {remedy}"
+        ));
+    };
+    let now_ms = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    let left_ms = u128::from(expires).saturating_sub(now_ms);
+    if left_ms < PI_LOGIN_RUN_MARGIN.as_millis() {
+        return Err(format!(
+            "the stored Pi login's access token expires in {} min, less than the {} min a \
+             test run needs; {remedy}",
+            left_ms / 60_000,
+            PI_LOGIN_RUN_MARGIN.as_secs() / 60
+        ));
+    }
+    for key in refresh_keys {
+        fields.remove(&key);
+    }
+    Ok(entry)
+}
+
 /// Seed Pi's credential for [`pi_test_model`]'s provider into the ISOLATED agent
 /// directory `agent_dir` (a scratch HOME's `.pi/agent`, or whatever a test
 /// passes as `PI_CODING_AGENT_DIR`), the shape [`import_codex_credentials`] has
@@ -6681,11 +6746,11 @@ fn host_pi_login(provider: &str) -> Option<serde_json::Value> {
 /// caller forwards that variable. Returns the values a recording must redact,
 /// which are also registered for diagnostic redaction here.
 ///
-/// A stored OAuth login carries a refresh token. If its access token expired
-/// mid-test, Pi would refresh it into this isolated copy, and a provider that
-/// rotates refresh tokens would then leave the host's copy stale — the same
-/// exposure [`import_codex_credentials`] has always had. The login seen when
-/// this was written had ten days left on its access token.
+/// A stored OAuth login is copied WITHOUT its refresh token, and refused when
+/// its access token would not last the run ([`pi_scratch_login`]), so a scratch
+/// Pi can never refresh, and so never rotate the host's login out from under
+/// it. The refresh token is still registered for redaction, with every other
+/// value of the host entry, before anything is written.
 pub fn import_pi_credentials(agent_dir: &Path) -> std::io::Result<Vec<String>> {
     let model = pi_test_model();
     let Some(entry) = host_pi_login(&model.provider) else {
@@ -6698,10 +6763,12 @@ pub fn import_pi_credentials(agent_dir: &Path) -> std::io::Result<Vec<String>> {
             model.provider
         )));
     };
-    let document = serde_json::json!({ model.provider.clone(): entry });
+    // Every value of the HOST entry, refresh token included, is registered
+    // before anything is written or refused, so no later diagnostic can print
+    // one in the clear.
     let mut redactions = Vec::new();
     collect_credential_values(
-        &document,
+        &serde_json::json!({ model.provider.clone(): entry.clone() }),
         None,
         CredentialScope::AuthDocument,
         false,
@@ -6709,6 +6776,10 @@ pub fn import_pi_credentials(agent_dir: &Path) -> std::io::Result<Vec<String>> {
     );
     normalise_redactions(&mut redactions);
     register_diagnostic_redactions(redactions.clone());
+    let entry = pi_scratch_login(entry, std::time::SystemTime::now()).map_err(|why| {
+        std::io::Error::other(format!("Pi login for provider {:?}: {why}", model.provider))
+    })?;
+    let document = serde_json::json!({ model.provider.clone(): entry });
     std::fs::create_dir_all(agent_dir)?;
     let bytes = serde_json::to_vec(&document).map_err(std::io::Error::other)?;
     write_credential_file_atomic_0o600(&agent_dir.join("auth.json"), &bytes)?;
