@@ -1286,7 +1286,13 @@ fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
         deck.snapshot_grid()
     );
     let second_path = second_rearm().expect("second re-arm path");
-    let content = read_announced_context(&daemon.attach_socket, &second_path, &deck);
+    let content = read_announced_context(
+        &daemon.attach_socket,
+        &pane_id,
+        &agent_id,
+        &second_path,
+        &deck,
+    );
     assert!(
         content.contains(first_brief),
         "a TUI reattached after the startup context was swept must re-arm from the file \
@@ -1431,10 +1437,14 @@ struct RearmedRun {
 /// read one that held neither brief on a starved box (`io full` 55%) in PRD
 /// #1631's broad e2e run. The announcement is the remit posted to the start
 /// role's inbox carrying `Read .dot-agent-deck/<name>` (PRD #1666 S5), so that
-/// is what is waited for, on the daemon's attach `socket`.
+/// is what is waited for, on the daemon's attach `socket` — in the inbox of the
+/// start role's `pane_id` and bound to its `agent_id` (or to no generation), so
+/// a pointer posted to any other role does not satisfy it.
 #[cfg(unix)]
 fn read_announced_context(
     socket: &std::path::Path,
+    pane_id: &str,
+    agent_id: &str,
     path: &std::path::Path,
     deck: &TuiDeck,
 ) -> String {
@@ -1444,21 +1454,26 @@ fn read_announced_context(
         .to_string_lossy();
     let pointer = format!("Read .dot-agent-deck/{name}");
     let announced = || {
-        view::all_messages(socket).iter().any(|message| {
+        view::messages(socket, pane_id).iter().any(|message| {
             message
-                .text
+                .bind_agent
                 .as_deref()
-                .is_some_and(|t| t.contains(&pointer))
+                .is_none_or(|bound| bound == agent_id)
+                && message
+                    .text
+                    .as_deref()
+                    .is_some_and(|t| t.contains(&pointer))
         })
     };
     assert!(
         common::wait_until(REASSERTION_DELIVERY_TIMEOUT, announced),
-        "the start role was never pointed at {} (no inbox message carrying `{pointer}`) \
-         within {REASSERTION_DELIVERY_TIMEOUT:?}; inbox:\n{:?}\nFinal grid:\n{}",
+        "the start role ({pane_id}, agent {agent_id}) was never pointed at {} (no message \
+         carrying `{pointer}` in its inbox) within {REASSERTION_DELIVERY_TIMEOUT:?}; every \
+         inbox, as (to, bound agent, text):\n{:?}\nFinal grid:\n{}",
         path.display(),
         view::all_messages(socket)
             .into_iter()
-            .filter_map(|message| message.text)
+            .map(|message| (message.to, message.bind_agent, message.text))
             .collect::<Vec<_>>(),
         deck.snapshot_grid()
     );
@@ -1665,7 +1680,13 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
         deck.snapshot_grid()
     );
     let rearmed_path = rearmed().expect("new context path");
-    let content = read_announced_context(&daemon.attach_socket, &rearmed_path, &deck);
+    let content = read_announced_context(
+        &daemon.attach_socket,
+        &pane_id,
+        &record.id,
+        &rearmed_path,
+        &deck,
+    );
     assert!(
         content.contains(first_brief) && !content.contains(second_brief),
         "the first tab must rearm from its own file, not the later mirror; {}: first={}, second={}",
