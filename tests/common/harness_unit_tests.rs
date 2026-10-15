@@ -5777,7 +5777,7 @@ fn pi_test_model_selection_reads_provider_slash_model() {
 /// directory, the note names that place as MISPLACED.
 #[test]
 fn a_missing_sentinel_found_elsewhere_is_reported_as_misplaced() {
-    let root = tempfile::tempdir().unwrap();
+    let root = harness_tempdir().unwrap();
     let work = root.path().join("project");
     std::fs::create_dir_all(&work).unwrap();
     let expected = work.join("sentinel-1666.txt");
