@@ -659,9 +659,9 @@ mod tests {
     /// ([`crate::pane_input::encode_pane_payload`]), so a prompt that arrived
     /// with CRLF or a bare CR comes back from the agent with LF — measured on
     /// Claude Code 2.1.294, which reports a CRLF paste as LF. Compared raw, the
-    /// two never matched: the delivery was retried, its payload typed into the
-    /// pane of an agent already working on it, and the delivery abandoned at
-    /// the deadline (`scheduler/dispatch/028`).
+    /// two never matched: the typed delivery (removed by PRD #1666) retried,
+    /// typing its payload into the pane of an agent already working on it, and
+    /// abandoned at the deadline (`scheduler/dispatch/028`).
     #[test]
     fn a_prompt_with_crlf_or_cr_line_breaks_is_confirmed_by_its_lf_report() {
         let reported = "Line one.\n\nLine two.";

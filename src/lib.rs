@@ -36,13 +36,13 @@ pub mod devin_hooks_manage;
 // PRD #1223 M1: the daemon's one-level, bounded directory listing that backs
 // the desktop's new-agent directory step.
 pub mod directory_listing;
-// Issue #544: automatic first writes wait while the user has an unsent draft.
 pub mod dispatch;
 pub mod dispatch_return;
 // PRD #1666 S4: the fixed one-line doorbell for an agent with no armed inbox component.
 pub mod doorbell;
 // PRD #1589: the record of dispatched units the `close` verb is authorized from.
 pub mod dispatched_units;
+// Issue #544: the per-pane unsent-draft bit the doorbell reads before it writes.
 pub mod draft_deferral;
 pub mod embedded_pane;
 // PRD #1419 Decision 4: the user docs embedded at build time for `docs [topic]`.

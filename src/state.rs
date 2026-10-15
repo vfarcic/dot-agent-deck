@@ -1843,12 +1843,10 @@ pub struct AppState {
     /// render pass, and `apply_event` REMOVES the ended session and its history
     /// on `SessionEnd`, so a generation that both starts and ends between two
     /// passes leaves the snapshot indistinguishable from one where it never
-    /// existed. An unbound delivery written before the burst then finds no
-    /// witness to compare against, adopts the successor, and types the revoked
-    /// task into it — the exact sequence the per-frame witness on
-    /// `PromptDelivery::observed_generation` could not see, because production
-    /// offers no guarantee of a render pass while the short-lived generation is
-    /// alive.
+    /// existed. The TUI's typed prompt delivery used this to notice that a
+    /// conversation it might have written into had ended between two passes;
+    /// PRD #1666 removed that delivery, and the counter's only reader since is
+    /// a test (`event_subscriber.rs`).
     ///
     /// A COUNTER rather than a retained id because what has to survive is the
     /// *transition*, not the identity: "a conversation this delivery could have
@@ -1889,9 +1887,9 @@ pub struct AppState {
     /// cannot say what happened while nobody was listening — whether a
     /// conversation the delivery wrote into ended, or whether the agent already
     /// reported submitting it. So a delivery that may have written before a gap
-    /// stops rather than retrying or confirming against a history with a hole in
-    /// it (`ui::delivery_outlived_event_gap`). That is the same terminal outcome a
-    /// counted closure already produces, and it never writes again.
+    /// stopped rather than retrying or confirming against a history with a hole
+    /// in it. (That typed delivery was removed by PRD #1666; the count is still
+    /// kept and read by the event-subscriber tests.)
     ///
     /// Global rather than per pane because a gap is: it drops every pane's events
     /// at once, including a pane this state had not yet heard from — the
@@ -2562,11 +2560,10 @@ fn rewrites_how_text_reads(c: char) -> bool {
 }
 
 /// Issue #433: the most report text the daemon will inline into the
-/// orchestrator's pane when the summary file could not be written.
+/// orchestrator's inbox message when the summary file could not be written.
 ///
-/// A bound exists because this text is submitted as ONE pane payload: the whole
-/// feedback line is typed into a live agent's input and then submitted, so an
-/// unbounded report means an unbounded synthetic paste. The normal path has no
+/// A bound exists because this text is the body of ONE inbox message the agent
+/// reads into its turn, so an unbounded report means an unbounded message. The normal path has no
 /// such limit — that is what the file is for — so this only ever caps the
 /// inlined paths.
 ///
@@ -2957,7 +2954,7 @@ enum WorkDoneReportChannel {
 }
 
 /// PRD #220 M2.1: a dispatched unit has reached TERMINAL completion — resolve
-/// the caller that dispatched it and submit the report into that caller's pane.
+/// the caller that dispatched it and post the report to that caller's inbox.
 ///
 /// Returns whether `signal.pane_id` was a dispatched unit's terminal pane at all,
 /// so the caller can tell "handled here" from "fall through to the ordinary
@@ -2970,32 +2967,25 @@ enum WorkDoneReportChannel {
 ///   `(name, cwd)` tuple lookup — that tuple can never match, because a dispatched unit
 ///   lives in a sibling worktree by construction, which is precisely why the return edge
 ///   needed retention rather than a lookup.
-/// * **Identity.** Delivery goes through [`crate::daemon::deliver_dispatch_result`], the
-///   same guarded seam the spawn acknowledgement already uses, so a caller pane that
-///   changed hands between the dispatch and the completion is REFUSED with no bytes
-///   written. Reusing that seam rather than writing a second delivery path is what keeps
-///   one identity policy instead of two that can drift.
-/// * **Delivery mode.** SUBMIT, not a passive notice (PRD #220 decision A). The caller
-///   asked for this work and is waiting on it, so the report is a turn in its
-///   conversation rather than bytes in its scrollback that nothing will ever read.
+/// * **Identity.** Delivery is [`PendingDispatchReturn::deliver`], an inbox post bound to
+///   the retained caller generation, the binding the spawn acknowledgement's post uses
+///   too, so a caller pane that changed hands between the dispatch and the completion
+///   is REFUSED (`inbox_hub::post_to_live` refuses a pane whose agent is not the bound
+///   one).
+/// * **Delivery mode.** A message the caller takes as a turn, not a passive notice (PRD
+///   #220 decision A). The caller asked for this work and is waiting on it.
 ///
 /// The entry is evicted as it is resolved, whatever the delivery's outcome,
-/// because NO OUTCOME IS RETRIED. That is the shared property, and it is worth
-/// stating as itself rather than as "every non-delivery is a refusal" (PRD #220
-/// Phase 2 review, finding A5): [`crate::daemon::deliver_dispatch_result`] says
-/// outright that `Ambiguous` is deliberately NOT folded in with the refusals,
-/// since bytes of ours already reached the authorized caller. A refusal is not
-/// retried because a retry could only re-target whoever now occupies the pane; an
-/// ambiguous write is not retried because re-sending would duplicate a
-/// half-written message rather than repair it. A pane that is simply GONE
+/// because NO OUTCOME IS RETRIED (PRD #220 Phase 2 review, finding A5): a refused
+/// post is not retried because a retry could only re-target whoever now occupies
+/// the pane. A pane that is simply GONE
 /// degrades to drop-and-log (PRD #220 decision B): there is deliberately no queue
 /// and no file-backed outbox here, because an outcome with no live recipient is a
 /// deck-wide attention question that belongs with issue #630.
 ///
 /// Issue #544: this half only RESOLVES the return and composes the report; the
-/// write is [`PendingDispatchReturn::deliver`], which the daemon performs after
-/// releasing its `AppState` guard because the write may wait for the caller's
-/// unsent draft. `None` is the old `false` — not a dispatched unit's terminal
+/// post is [`PendingDispatchReturn::deliver`], which the daemon performs after
+/// releasing its `AppState` guard. `None` is the old `false` — not a dispatched unit's terminal
 /// completion.
 async fn prepare_dispatch_completion(
     signal: &WorkDoneSignal,
@@ -3018,9 +3008,8 @@ async fn prepare_dispatch_completion(
     // renders it; turning the subscriber's own ANSI styling off does none of that.
     //
     // The two pane ids and the agent id are daemon-minted and stay bare. The
-    // REPORT BODY is deliberately absent from this line, and from the warnings
-    // `deliver_dispatch_result` emits when the caller is gone or the identity gate
-    // refuses — those carry pane/agent ids and the outcome only, so a report that
+    // REPORT BODY is deliberately absent from this line, and from the warning
+    // `PendingDispatchReturn::deliver` emits when the caller's inbox refuses — those carry pane/agent ids and the outcome only, so a report that
     // could not be delivered is not leaked into the log instead. That silence is
     // the auditor's reasoned negative; do not "helpfully" add the body back.
     tracing::info!(
@@ -3062,7 +3051,7 @@ async fn prepare_dispatch_completion(
 }
 
 /// Issue #544: a dispatched unit's completion report, resolved and composed
-/// under the `AppState` guard and written after it — see
+/// under the `AppState` guard and posted after it — see
 /// [`prepare_dispatch_completion`].
 struct PendingDispatchReturn {
     pane_id: String,
@@ -3094,19 +3083,11 @@ impl PendingDispatchReturn {
     }
 }
 
-/// Issue #544: the one pane write a `work-done` owes, computed by
-/// [`AppState::prepare_work_done`] and performed by [`Self::deliver`].
-///
-/// Two steps because the write is an automatic first write, and a first write
-/// now WAITS while the recipient pane holds the user's unsent draft — up to
-/// [`crate::draft_deferral::DEFAULT_DRAFT_DEFER_CAP`]. The daemon's hook loop
-/// used to await the whole of `handle_work_done` under `state.read()`, and
-/// Tokio's `RwLock` is write-preferring, so one waiting hand-off would have
-/// queued the next `state.write()` behind it and every reader behind that:
-/// hook ingestion for the whole daemon stalled on one person's draft. The
-/// guard is needed only to compute the write, so it is released before the
-/// write begins.
-#[must_use = "a work-done's feedback is only written by `deliver`"]
+/// Issue #544: the one inbox post a `work-done` owes, computed by
+/// [`AppState::prepare_work_done`] under the `AppState` guard and performed by
+/// [`Self::deliver`] after it is released. Since PRD #1666 S5 the post waits on
+/// nothing; the split keeps the guard's hold to the computation.
+#[must_use = "a work-done's feedback is only posted by `deliver`"]
 pub struct WorkDoneDelivery(WorkDoneWrite);
 
 enum WorkDoneWrite {
@@ -3121,7 +3102,7 @@ enum WorkDoneWrite {
 }
 
 impl WorkDoneDelivery {
-    /// The pane the write goes to, or `None` when there is nothing to write.
+    /// The pane the post goes to, or `None` when there is nothing to post.
     pub fn target_pane_id(&self) -> Option<&str> {
         match &self.0 {
             WorkDoneWrite::Nothing => None,
@@ -3644,14 +3625,14 @@ fn arm_idle_worker_watch_for_delegation(
 }
 
 /// Issue #544 (PR #1398 review): keep the idle-worker watch's clock off the
-/// time the delegation's task pointer spent waiting for the worker's own
-/// unsent draft. A worker cannot answer a task it has not been given, so with
-/// `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS` shorter than that wait the
-/// watch used to report a worker idle whose pointer had not been written yet.
+/// time the delegation's task spent posted but not yet acknowledged by the
+/// worker (PRD #1666; before it, the time a typed pointer waited for the
+/// worker's unsent draft). A worker cannot answer a task it has not taken, so
+/// with `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS` shorter than that wait the
+/// watch used to report a worker idle that had not been given its task yet.
 ///
 /// PR #1398 review: the same holds for the time the delegation's dispatch
-/// spent queued behind an earlier dispatch to the same pane, which is exactly
-/// when that earlier one is waiting for the draft.
+/// spent queued behind an earlier dispatch to the same pane.
 ///
 /// Called once the plain timeout has run: holds while the dispatch is queued
 /// or the pointer write is still under way, then until
@@ -3663,7 +3644,7 @@ fn arm_idle_worker_watch_for_delegation(
 /// Those two marks do not cover the whole dispatch. Between the dispatch
 /// taking both locks (the dequeue) and the pointer write beginning, the record
 /// is neither queued nor in progress — for a `clear = true` delegation that is
-/// the respawn and its `SessionStart` wait — so the due time is computed and
+/// the respawn — so the due time is computed and
 /// may already have passed. That is deliberate: respawn time counts against
 /// the worker, as it did before #544, and the watch may report during it.
 async fn wait_out_pointer_deferral(
@@ -6391,13 +6372,12 @@ impl AppState {
 
     /// PRD #20 M3: the write-semantics of the live session bound to `pane_id`.
     ///
-    /// Read to decide whether input should actually be delivered or reported as
-    /// history-only / no-live-target. Resolves the session on the
-    /// pane (newest by `last_activity` if a `/clear` restart left more than one)
-    /// and reads its [`SessionState::writable`]. A pane with no live session
-    /// defaults to [`Writable::Live`] so the historical PTY write path is
-    /// unaffected — only a session that explicitly declared a non-live
-    /// live_target (a wrapped Codex pane) reports otherwise.
+    /// Read by [`Self::doorbell_admission`]: the doorbell writes only to a pane
+    /// whose live session takes live input. Resolves the session on the pane
+    /// (newest by `last_activity` if a `/clear` restart left more than one) and
+    /// reads its [`SessionState::writable`]. A pane with no live session
+    /// defaults to [`Writable::Live`] — only a session that explicitly declared
+    /// a non-live live_target (a wrapped Codex pane) reports otherwise.
     pub fn pane_writable(&self, pane_id: &str) -> Writable {
         self.sessions
             .values()
@@ -9397,13 +9377,6 @@ impl AppState {
         // blocking the hook-loop reply on that wait was unnecessary and
         // made the CLI feel synchronous to a multi-second boot.
         //
-        // Critical race-avoidance: the subscribe-before-spawn ordering
-        // lives inside `dispatch_one_owned`. The receiver attaches to
-        // `event_tx` *before* `respawn_agent_for_pane` forks the new
-        // process, so a fast-booting agent that fires `SessionStart`
-        // immediately after exec can't race the dispatch task's
-        // subscription.
-        //
         // Cross-pane fan-out remains concurrent (different panes' tasks
         // overlap); per-pane work still serializes against itself via
         // the per-pane dispatch mutex acquired inside the task body —
@@ -9559,7 +9532,7 @@ impl AppState {
             // (and its watch task) here, in the synchronous fan-out loop
             // rather than inside `dispatch_one_owned`, for two reasons: the
             // clock starts at delegate time instead of being skewed by a
-            // `clear = true` respawn's up-to-10s `SessionStart` wait, and a
+            // `clear = true` respawn, and a
             // dispatch that bails early on a respawn failure — the most
             // literal case of a silent worker — is still covered.
             //
@@ -9942,11 +9915,9 @@ fn restart_refusal_for_crashed_pane(
 /// `recreate_identity` is built or `respawn_or_recreate_agent_for_pane` is
 /// called — by the time this second check runs, no concurrent dispatch on
 /// this pane can be mid-respawn (this function now holds the same lock
-/// they all serialize on), so its result is authoritative. A dispatch can
-/// still be PARKED here — waiting for the worker's unsent draft with the
-/// lock set down (issue #544, [`crate::agent_pty::PaneDispatchHold`]) — but
-/// it has finished its respawn by then, and this restart's replacement makes
-/// its pointer write refuse rather than land in the new agent. `--force` skips
+/// they all serialize on), so its result is authoritative. A task already
+/// posted to the replaced agent stays bound to it, so the inbox refuses it to
+/// the replacement. `--force` skips
 /// both checks identically, by design: it means "restart regardless of
 /// crash state."
 pub async fn handle_restart_role_with_state(
@@ -10551,7 +10522,7 @@ pub async fn handle_spawn_role_with_state(
 
 impl AppState {
     /// Handle a worker's work-done signal: write the per-role summary file
-    /// and inject a one-liner pointing the orchestrator pane at it.
+    /// and post the report to the orchestrator generation's inbox.
     ///
     /// PRD #93 round-5: the file write was already daemon-side (now that
     /// the daemon owns `pane_cwd_map`); the new piece is that the daemon
@@ -10563,11 +10534,10 @@ impl AppState {
     /// orchestration is complete; we log and exit without writing back a
     /// "completed" prompt to the orchestrator (it just issued it).
     ///
-    /// Issue #544: the write is an automatic first write that may wait for the
-    /// orchestrator's unsent draft, so a caller holding a lock on this
-    /// `AppState` must not use this — it takes [`Self::prepare_work_done`] under
-    /// the lock and [`WorkDoneDelivery::deliver`] after releasing it, as the
-    /// daemon's hook loop does.
+    /// Issue #544: a caller holding a lock on this `AppState` takes
+    /// [`Self::prepare_work_done`] under the lock and
+    /// [`WorkDoneDelivery::deliver`] after releasing it, as the daemon's hook
+    /// loop does.
     pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
         self.prepare_work_done(signal, registry)
             .await
@@ -10575,8 +10545,8 @@ impl AppState {
             .await;
     }
 
-    /// Issue #544: everything [`Self::handle_work_done`] does except the pane
-    /// write, which it returns. See [`WorkDoneDelivery`].
+    /// Issue #544: everything [`Self::handle_work_done`] does except the inbox
+    /// post, which it returns. See [`WorkDoneDelivery`].
     pub async fn prepare_work_done(
         &self,
         signal: WorkDoneSignal,
@@ -10705,9 +10675,10 @@ impl AppState {
             // newlines, CR, ESC, C1 and bidi characters straight into a
             // line-oriented log, and on a dispatched orchestration it is the same
             // body the return edge is about to deliver — so logging it here
-            // contradicted the deliberate silence `deliver_dispatch_result` keeps
-            // about undelivered reports. Its LENGTH is what an operator correlating
-            // a truncation actually needs; the text itself is in the caller's pane.
+            // contradicted the deliberate silence `PendingDispatchReturn::deliver`
+            // keeps about undelivered reports. Its LENGTH is what an operator
+            // correlating a truncation actually needs; the text itself is in the
+            // caller's inbox.
             tracing::info!(
                 pane_id = %signal.pane_id,
                 report_chars = signal.task.chars().count(),
@@ -16685,8 +16656,8 @@ mod tests {
     }
 
     /// Issue #686: the pane-text bound is real, and a cut screen is marked as
-    /// cut. The notice is one line typed into a live agent's input, so an
-    /// unbounded screen would be an unbounded synthetic paste.
+    /// cut. The notice is an inbox message the agent reads into its turn, so an
+    /// unbounded screen would be an unbounded message.
     #[test]
     fn quote_untrusted_pane_text_bounds_and_marks_an_oversized_screen() {
         let wide = vec!["x".repeat(MAX_INLINED_PANE_TEXT_CHARS + 50)];

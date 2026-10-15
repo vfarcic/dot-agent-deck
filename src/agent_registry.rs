@@ -325,8 +325,9 @@ pub type StrandedLineRecogniser =
     fn(&[String], crate::pane_screen_text::ScreenCursor, &str) -> bool;
 
 /// PRD #1631: one agent's per-version option tables (decision 3). The deck
-/// never reads the screen, so every option an agent draws without reporting it
-/// comes from here, keyed on the versions it was verified on; the lane-2
+/// does not read question options off the screen (the doorbell reads only the
+/// composer rows), so every option an agent draws without reporting it comes
+/// from here, keyed on the versions it was verified on; the lane-2
 /// `question/live/*` tests are what pin them.
 #[derive(Debug)]
 pub struct QuestionTables {

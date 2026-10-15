@@ -1,19 +1,19 @@
 //! The authoring agents' seed prompts, and the one composition of each that
-//! both the TUI and the daemon deliver (PRD #1223 M7).
+//! both the TUI and the daemon post (PRD #1223 M7).
 //!
 //! `schedule`, `schedule: issues` and `dispatcher` differ from a plain agent
-//! only by the seed typed into them once they are ready. These constants used
+//! only by the seed posted as their first inbox message (PRD #1666). These constants used
 //! to be private to `src/ui.rs`, which was fine while the TUI was the only
 //! thing that started one. The desktop starts them too now, and it does so by
-//! asking the DAEMON to compose and deliver the seed
+//! asking the DAEMON to compose and post the seed
 //! ([`crate::daemon_protocol::AttachRequest::StartAgent`]'s `authoring_kind`),
 //! so the text has two consumers. A second copy is exactly the drift #1043
 //! describes; this module is the one copy.
 //!
 //! **Composition lives here too, not only the constants.** Every seed the TUI
 //! delivers is the constant plus a line naming the directory the agent was
-//! started in, and the daemon has to append the same line or the two paths type
-//! different text into the same kind of agent. So both call the `compose_*`
+//! started in, and the daemon has to append the same line or the two paths would
+//! seed the same kind of agent with different text. So both call the `compose_*`
 //! functions below and neither formats a seed of its own.
 //!
 //! **The deck's command word is composed in, not baked in (issue #1385).** Each
@@ -383,9 +383,8 @@ pub(crate) fn is_safe_authoring_path(path: &str) -> bool {
 ///   and keeps accepting whatever `cwd` it accepted before;
 /// * no `pane_id` (the start's sole, validated `DOT_AGENT_DECK_PANE_ID`; the
 ///   caller passes `None` for a missing, invalid or duplicated entry — audit
-///   F7) — every delivery path routes by it, and the readiness gate matches the
-///   agent's `SessionStart` on it, so without one the seed could never be
-///   delivered.
+///   F7) — the seed is posted to that pane's inbox, so without one it has
+///   nowhere to go.
 pub(crate) fn seed_for_start(
     kind: AuthoringKind,
     cwd: Option<&str>,

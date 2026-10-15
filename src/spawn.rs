@@ -56,7 +56,7 @@ use crate::scheduler::{Notifier, NotifyEvent};
 pub const SCHEDULE_PANE_ID_PREFIX: &str = "sched-";
 
 /// Monotonic counter making each spawned pane's `DOT_AGENT_DECK_PANE_ID`
-/// unique within a daemon lifetime (the prompt-delivery write routes by it).
+/// unique within a daemon lifetime (the first prompt's inbox post is addressed by it).
 static PANE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// What a fire needs to open a tab. Owned + `Clone` so a scheduler callback can
@@ -70,7 +70,7 @@ pub struct SpawnRequest {
     /// Single-agent command; `None` falls back to `$SHELL`. Ignored when the
     /// target dir defines `[[orchestrations]]` (the role commands win).
     pub command: Option<String>,
-    /// Prompt delivered into the spawned agent / orchestrator pane.
+    /// Prompt posted as the spawned agent's / orchestrator's first inbox message.
     pub prompt: String,
     /// PRD #220: a target the CALLER already resolved, used verbatim instead of
     /// deriving one from `working_dir`'s config.
@@ -527,21 +527,11 @@ pub fn orchestrator_role_index(roles: &[RoleSpawn]) -> usize {
 /// full contract. On `working_dir` creation or spawn failure, surfaces the
 /// reason via `notifier` and returns `Err` without panicking.
 ///
-/// `detach_delivery` controls only WHEN this future returns relative to the
-/// prompt-delivery wait — never WHETHER the agent is registered: every pane is
-/// always spawned and registered synchronously before `spawn` returns, so a
-/// caller that inspects the registry immediately afterwards always sees the
-/// agents. When `false` (the #127 single-spawn path, and `dispatch`), the
-/// prompt-delivery wait (which can sit out the multi-second `SessionStart`
-/// fallback for a hook-less command) and the FIRST write are awaited before
-/// returning — but not the confirmation that the agent submitted the prompt,
-/// which [`deliver`] always hands to a detached task, and not the outcome of
-/// that first write either: a refused write still returns `Ok`, because the
-/// pane exists either way. When `true` (the PRD #120
-/// issue-dispatch path), that wait runs in a detached task so the caller — the
-/// scheduler's run-active window — is freed the instant the dispatch WORK is
-/// done; a rapid re-fire after a tab close is then not blocked behind the prior
-/// run's lingering delivery wait. The prompt is still delivered either way.
+/// `detach_delivery` no longer changes anything (PRD #1666 S5): every pane is
+/// spawned and registered, and its prompt posted to the pane's inbox
+/// ([`post_seed`]), before `spawn` returns, and nothing waits for the agent. It
+/// is kept so callers need not change. A refused post is logged and still
+/// returns `Ok`, because the pane exists either way.
 ///
 /// `state` is the daemon's [`AppState`](crate::state::AppState). It is what makes
 /// a daemon-spawned ORCHESTRATION able to delegate: the role → pane maps
@@ -747,10 +737,6 @@ async fn spawn_with_unit(
                         .then(|| crate::platform::shell::fixed_command_shell("/bin/sh")),
                 ),
             };
-            // PRD #127 readiness gate: SUBSCRIBE before spawning so a
-            // fast-booting agent's `SessionStart` can't land on the broadcast
-            // before our receiver attaches (mirrors
-            // `state.rs::dispatch_one_owned`'s subscribe-before-respawn).
             let id = spawn_one(
                 registry,
                 command.as_deref(),
@@ -948,9 +934,6 @@ async fn spawn_with_unit(
                 None => (req.prompt.clone(), None),
             };
             let mut agents = Vec::with_capacity(roles.len());
-            // PRD #127 readiness gate: SUBSCRIBE before any pane is spawned so
-            // the orchestrator pane's `SessionStart` can't be missed regardless
-            // of spawn order (the orchestrator role is not necessarily first).
             // PRD #140 M1.3: one instance token per orchestration spawn
             // request, minted before the role loop and stamped on every
             // role's membership — the daemon-initiated counterpart of the
@@ -1282,8 +1265,8 @@ async fn spawn_with_unit(
                     );
                 }
             }
-            // Deliver the prompt to the orchestrator role pane, gated on that
-            // pane's readiness (its registry agent_id is the gate's match key).
+            // The prompt goes to the orchestrator role pane's inbox, bound to
+            // that pane's registry agent_id.
             let delivery_pane_id = agents[orch_idx].pane_id.clone();
             let delivery_agent_id = agents[orch_idx].id.clone();
             // PRD #1589 D5: the unit's record, before the orchestrator's task is
@@ -1466,7 +1449,7 @@ async fn roll_back_partial_orchestration(
 }
 
 /// Spawn one pane via the existing registry path, tagging it with `pane_id` (so
-/// the prompt-delivery write can route to it) and optional orchestration
+/// the first prompt can be posted to its inbox) and optional orchestration
 /// `membership`. Surfaces a spawn failure via the notifier.
 #[allow(clippy::too_many_arguments)]
 fn spawn_one(
@@ -2012,12 +1995,12 @@ pub fn is_orchestration_role_pane_id(pane_id: &str) -> bool {
 // Tab-reuse lifecycle (PRD #127 Phase 2B, M2.2)
 // ---------------------------------------------------------------------------
 
-/// Default deliver-on-idle debounce window (PRD #127 Q6 working assumption:
-/// ~5s of no user input before a reuse prompt is delivered into a pane the
-/// user might be typing in).
+/// Default reuse debounce window (PRD #127 Q6). Since PRD #1666 S5 it delays
+/// nothing: a reuse prompt is posted to the pane's inbox at once, and the
+/// doorbell's draft guard keeps it out of a draft the user is typing.
 pub const DEFAULT_REUSE_DEBOUNCE_MS: u64 = 5000;
 
-/// The deliver-on-idle debounce window. Overridable via
+/// The reuse debounce window (see [`DEFAULT_REUSE_DEBOUNCE_MS`]). Overridable via
 /// `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` (milliseconds) so tests can shrink it
 /// without a real ~5s wait; falls back to [`DEFAULT_REUSE_DEBOUNCE_MS`].
 pub fn reuse_debounce() -> Duration {
@@ -2086,8 +2069,7 @@ pub enum ReuseDecision {
     /// Open a brand-new tab (and, for a reuse task, record it).
     SpawnFresh,
     /// Re-deliver into the existing pane, bound to the agent resolved at
-    /// DECISION time — carried through the deliver-on-idle wait so the write can
-    /// be identity-guarded rather than pane-keyed.
+    /// DECISION time, so the post is identity-guarded rather than pane-keyed.
     Reuse { pane_id: String, agent_id: String },
 }
 
@@ -2218,9 +2200,7 @@ pub async fn spawn_or_reuse(
         }
         ReuseDecision::SpawnFresh => {
             let task_name = req.task_name.clone();
-            // #127 single-spawn keeps awaiting delivery (detach_delivery = false):
-            // its callback has no rapid-refire-after-close concern and existing
-            // tests expect the prior behavior.
+            // detach_delivery = false (no effect since PRD #1666; see `spawn`).
             let handle = spawn(req, registry, notifier, event_tx, false, state).await?;
             // Record the tab for reuse only when the task opts into reuse.
             if !new_tab_per_fire {
@@ -3513,10 +3493,9 @@ mod tests {
         let mut req = unpublishable_orchestration_request(dir.path(), None);
         req.compose_orchestrator_context = None;
 
-        // `detach_delivery: true` (what the #120 issue-dispatch producer itself
-        // passes): the assertion is about the spawn being ALLOWED, and awaiting
-        // the readiness gate for two `/bin/sh` panes would buy nothing but wall
-        // clock in the fast tier.
+        // `detach_delivery: true` is what the #120 issue-dispatch producer passes
+        // (no effect since PRD #1666). The assertion is about the spawn being
+        // ALLOWED.
         let handle = spawn(req, &registry, &notifier, None, true, None)
             .await
             .expect("a producer that composes no context must still spawn");

@@ -5741,8 +5741,8 @@ async fn handle_connection(
             match spawned {
                 Ok(id) => {
                     // Issue #1496: the start is accepted, so the record says
-                    // what kind of authoring agent it is — before the seed
-                    // delivery below, which can wait on the agent's readiness.
+                    // what kind of authoring agent it is, before the seed below
+                    // is posted.
                     if let Some(kind) = authoring_kind.or(client_seeded_kind) {
                         let _ = registry.set_authoring_kind(&id, kind);
                     }

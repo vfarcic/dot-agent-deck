@@ -129,13 +129,13 @@ enum Commands {
     /// that far: no daemon was reachable, the daemon refused it (the reason is
     /// printed), or the command line itself was unusable.
     ///
-    /// What happened arrives afterwards, typed into this pane: first the
+    /// What happened arrives afterwards as messages in this agent's inbox: first the
     /// daemon's reply to the dispatch, beginning `dispatch:`. A reply beginning
     /// `dispatch: spawned isolated` names what was started and where; a reply
     /// with any other opening is a failure and says why. A spawned unit has
     /// still not been confirmed to have received its task. The report it sends
     /// later, when it finishes, beginning `dispatch: a unit you dispatched has
-    /// completed`, is the first thing delivered to this pane that indicates it
+    /// completed`, is the first message that indicates it
     /// did — an indication, not proof, since the deck does not tie that report
     /// to the task's delivery.
     ///

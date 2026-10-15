@@ -6172,35 +6172,21 @@ async fn run_hook_loop_with_limits(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    // Issue #544: the write happens AFTER the read
-                                    // guard is released. It may wait for the
-                                    // orchestrator's unsent draft, and a read guard
-                                    // held across that wait queues every
-                                    // `state.write()` — and every reader behind it —
-                                    // for as long. See `WorkDoneDelivery`.
-                                    //
-                                    // The write is also QUEUED rather than awaited
-                                    // on this connection, for the reason given on
-                                    // the `Dispatch` arm's `deliver_dispatch_result`:
-                                    // awaited inline, a deferred write holds one of
-                                    // the `MAX_CONCURRENT_HOOK_CONNECTIONS` permits
-                                    // for up to the draft cap. `deliver` logs its
-                                    // own outcome. The state changes
-                                    // `prepare_work_done` makes stay inline; only
-                                    // the PTY write moves, into the recipient
-                                    // pane's queue, behind every report already
-                                    // queued for that pane.
+                                    // The report is posted AFTER the read guard is
+                                    // released: `prepare_work_done` runs under it
+                                    // and `deliver` after it. PRD #1666 S5:
+                                    // `deliver` is an inbox post and waits on
+                                    // nothing.
                                     //
                                     // PRD #1631: the `work-done` CLI is acked
-                                    // HERE, once its report is queued, not at the
+                                    // HERE, once its report is posted, not at the
                                     // provenance gate. Acked at the gate, a
-                                    // worker's second report could be queued
-                                    // ahead of its first, which was still on its
-                                    // way to the queue, and the two reached the
-                                    // orchestrator reversed. Acked after the
-                                    // queue push, a sender that waits for its ack
-                                    // is ordered, and the wait is the state
-                                    // change and the push, never the delivery.
+                                    // worker's second report could reach the
+                                    // orchestrator ahead of its first. Acked
+                                    // after the post, a sender that waits for its
+                                    // ack is ordered, and the wait is the state
+                                    // change and the post, never the agent
+                                    // reading it.
                                     // PRD #1589 D5: the completion mark `close`
                                     // reads, bound to the attested sender. Before
                                     // the return route's own handling, which is

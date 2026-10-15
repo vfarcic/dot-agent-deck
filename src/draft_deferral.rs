@@ -15,9 +15,10 @@
 
 use std::time::Duration;
 
-/// Issue #544: how often a deferred first write re-reads the draft bit. It sets
-/// how promptly delivery follows the user's Enter, and costs one mutex read per
-/// waiting write per tick.
+/// How often the idle-worker watch re-reads a delegation whose task is still
+/// queued or not yet acknowledged (`wait_out_pointer_deferral` in
+/// `crate::state`). Issue #544 introduced it as the poll of a deferred first
+/// write; PRD #1666 removed those writes.
 pub const DRAFT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Where [`DraftTracker`] is inside an escape sequence.

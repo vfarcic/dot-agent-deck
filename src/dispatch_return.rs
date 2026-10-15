@@ -158,14 +158,9 @@ impl DispatchReturns {
     /// the acknowledgement already runs under.
     ///
     /// Stated as "no outcome is retried" rather than as "every non-delivery is a
-    /// refusal" (PRD #220 Phase 2 review, finding A5). The seam this mirrors —
-    /// [`crate::daemon::deliver_dispatch_result`] — says outright that `Ambiguous`
-    /// is deliberately NOT folded in with the refusals, because bytes of ours
-    /// already reached the authorized caller and re-sending would duplicate a
-    /// half-written message rather than repair it. The two reasons differ; the
-    /// action does not, and it is the action this eviction depends on. A refusal
-    /// is not retried because a retry could only re-target whoever now occupies
-    /// the caller's pane.
+    /// refusal" (PRD #220 Phase 2 review, finding A5). A refused post is not
+    /// retried because a retry could only re-target whoever now occupies the
+    /// caller's pane.
     pub fn take(&mut self, unit_pane_id: &str) -> Option<RetainedReturn> {
         self.by_unit_pane.remove(unit_pane_id)
     }

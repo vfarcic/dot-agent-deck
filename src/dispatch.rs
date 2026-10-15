@@ -159,7 +159,7 @@ pub fn list_targets_response(cwd: Option<&Path>) -> crate::event::ListTargetsRes
 ///
 /// `SpawnRequest.command: None` means `$SHELL` in the spawn path, so passing None
 /// here starts a **shell**, not an agent: the worktree appears, a pane appears,
-/// and the `--task` prompt is typed into a bash prompt. Before the shape selector
+/// and the `--task` prompt is posted to the inbox of a shell that never reads it. Before the shape selector
 /// this repo never took the single-agent branch (role commands win for an
 /// orchestration), which is why it went unnoticed — but any repo with no
 /// `[[orchestrations]]` already hit it.
@@ -640,17 +640,10 @@ fn next_report_nonce() -> String {
 /// interpolated as a literal, so the unit has no filename to invent — see that
 /// function for the class of defect that removes.
 ///
-/// **This whole prompt can be dropped, silently and in full** (PRD #220 Phase 2
-/// review, finding A6). It is multi-line, so
-/// [`crate::pane_input::encode_pane_payload`] wraps it in bracketed paste — and
-/// that encoder REFUSES a multi-line payload containing a literal
-/// `ESC[200~`/`ESC[201~`, because an embedded marker would close the outer paste
-/// early and let the remainder run as live keystrokes. The refusal drops the
-/// entire write with only a log line: not the completion instruction alone, but
-/// the CALLER'S OWN TASK with it, leaving a unit sitting at an empty prompt in a
-/// worktree nobody is watching. The probability of LLM-authored task text carrying
-/// those bytes is near zero and the behaviour is deliberately unchanged; what was
-/// missing was any note that the failure is total rather than partial.
+/// The prompt reaches the unit as its first inbox message
+/// ([`crate::spawn::post_seed`], PRD #1666), not as pane input, so the
+/// bracketed-paste refusal that could once drop it whole (PRD #220 Phase 2
+/// review, finding A6) no longer applies to it.
 ///
 /// `main_worktree` is `Some` only when the unit's own directory is a LINKED
 /// worktree (issue #550) — which for a dispatch it always is, since `dispatch`
@@ -716,7 +709,7 @@ fn dispatch_prompt(
 }
 
 /// How the daemon's reply to a dispatch that STARTED something opens — the
-/// message typed into the caller's pane once the spawn returns. Every refusal
+/// message posted to the caller's inbox once the spawn returns. Every refusal
 /// or failure [`handle_dispatch`] reports opens `dispatch:` with anything else.
 ///
 /// Issue #530: a constant because callers are taught to branch on it. The CLI's
@@ -726,10 +719,9 @@ fn dispatch_prompt(
 /// Tests pin both quotes against this value, so rewording the reply cannot leave
 /// them teaching an opening nothing sends.
 ///
-/// It says a unit was spawned, not that its task arrived: the prompt's first
-/// write can still be refused, and its confirmation runs in a detached task
-/// that can run for up to a minute after this message is sent (see
-/// [`crate::spawn::spawn`]).
+/// It says a unit was spawned, not that its task was taken: the task is posted
+/// to the unit's inbox before this message (a refused post is only logged, see
+/// [`crate::spawn::post_seed`]), and nothing confirms the agent read it.
 pub const SPAWNED_OPENING: &str = "dispatch: spawned isolated";
 
 pub async fn handle_dispatch(
@@ -2218,9 +2210,8 @@ mod tests {
     ///
     /// Roles run `cat` (alive on stdin, no LLM tokens), mirroring the `orch-deck`
     /// fixture.
-    // Gated to the e2e tier: this spawns REAL PTYs and awaits the prompt-delivery
-    // readiness gate, so it costs ~30s — too slow for the per-task fast gate, and
-    // not a unit test by any honest reading.
+    // Gated to the e2e tier: this spawns REAL PTYs, which puts it outside the
+    // per-task fast gate and outside what a unit test is by any honest reading.
     #[cfg(feature = "e2e")]
     #[tokio::test]
     async fn an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task() {

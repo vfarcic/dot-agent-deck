@@ -63,13 +63,13 @@ use crate::worktree_owner::Creator;
 
 /// Daemon-owned, in-memory map: per-issue worktree dir → the clone that owns it
 /// (preserved on cleanup). Shared between the fire-time dispatch flow (records
-/// the worktree the moment it is created — BEFORE the spawn's prompt-delivery
-/// wait returns) and the `StopAgent` handler (removes it on close).
+/// the worktree the moment it is created, before the spawn) and the `StopAgent`
+/// handler (removes it on close).
 ///
 /// Keyed by the **worktree path**, not the spawned agent id, on purpose: the
-/// spawn primitive only returns the registry id AFTER its readiness/delivery
-/// wait, so a tab closed promptly after the agent appears would race a
-/// per-agent-id record. The closing agent is instead matched to its worktree via
+/// spawn primitive only returns the registry id after the agent is registered
+/// and visible to a `StopAgent`, so a tab closed promptly after the agent
+/// appears would race a per-agent-id record. The closing agent is instead matched to its worktree via
 /// its [`AgentRecord`] (orchestration cwd / single-agent cwd) — available the
 /// instant the agent is registered. Wiped on daemon restart; a post-restart
 /// close finds no entry and leaves the worktree in place (reclaimed by the
@@ -969,8 +969,8 @@ async fn dispatch_one_issue(
         }
     }
 
-    // M2.4 — record the worktree for tab-close cleanup NOW, before the spawn's
-    // prompt-delivery wait. `spawn` registers the agent (visible to a `StopAgent`
+    // M2.4 — record the worktree for tab-close cleanup NOW, before the spawn.
+    // `spawn` registers the agent (visible to a `StopAgent`
     // from a fast client) well before it returns, so recording after the spawn
     // would race a prompt close. The close watcher matches the agent to this
     // worktree by its record's cwd, not by an agent id we don't have yet.
@@ -988,14 +988,11 @@ async fn dispatch_one_issue(
     // M2.3 — spawn one agent into the worktree, delivering the substituted
     // prompt. `spawn` branches on the worktree's `.dot-agent-deck.toml`.
     //
-    // `detach_delivery = true`: the agent is still registered synchronously (so
-    // the idempotency/worktree state is consistent the moment this returns), but
-    // the prompt-delivery wait — which can sit out the multi-second `SessionStart`
-    // fallback for a hook-less command — runs in the background. This frees the
-    // scheduler's run-active window as soon as the dispatch WORK is done, so a
-    // re-fire right after a tab close (PRD #120 B1 / dispatch/008) isn't skipped
-    // behind the prior run's lingering delivery wait. The worktree-on-disk
-    // idempotency signal still serializes overlapping fires safely.
+    // `detach_delivery = true` has no effect since PRD #1666: the agent is
+    // registered and its prompt posted to the inbox before `spawn` returns, and
+    // nothing waits on the agent, so the scheduler's run-active window is freed
+    // as soon as the dispatch WORK is done. The worktree-on-disk idempotency
+    // signal still serializes overlapping fires safely.
     let req = SpawnRequest {
         task_name: task_name.to_string(),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),

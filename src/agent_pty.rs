@@ -6187,7 +6187,8 @@ struct PointerWrite {
     queued_for: Duration,
     /// The write has begun and not yet returned.
     in_progress: bool,
-    /// How long the finished write waited for the worker's unsent draft.
+    /// How long the posted task waited for the worker to acknowledge it
+    /// (PRD #1666; before it, how long a typed pointer waited for a draft).
     deferred: Duration,
 }
 
@@ -6201,7 +6202,7 @@ impl PointerWrite {
 }
 
 /// Issue #544: what the idle-worker watch needs to keep its clock off the time
-/// a delegation's task pointer spent waiting for the worker's unsent draft.
+/// a delegation's task spent queued or posted but not yet acknowledged.
 /// See [`AgentPtyRegistry::delegation_idle_clock`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegationIdleClock {
@@ -6213,11 +6214,11 @@ pub struct DelegationIdleClock {
     /// How long the dispatch was queued before it went on towards its write.
     /// The idle clock runs that much later.
     pub pointer_queued_for: Duration,
-    /// The pointer write is still under way, so how long it waited is not
-    /// known yet.
+    /// The task is posted and the worker has not acknowledged it yet, so how
+    /// long it waited is not known yet.
     pub pointer_in_progress: bool,
-    /// How long the finished pointer write waited for the draft. The idle
-    /// clock runs that much later.
+    /// How long the posted task waited for the worker's acknowledgement. The
+    /// idle clock runs that much later.
     pub pointer_deferred: Duration,
 }
 
@@ -7486,8 +7487,8 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// Issue #544: the delegation `seq` on `worker_pane_id` is about to write
-    /// its task pointer, which may wait for the worker's unsent draft. Until
+    /// Issue #544: the delegation `seq` on `worker_pane_id` is about to post
+    /// its task, which the worker then has to acknowledge. Until
     /// [`Self::finish_delegation_pointer_write`], the idle-worker watch holds
     /// its report. A no-op if the record is gone or a newer one replaced it.
     pub fn begin_delegation_pointer_write(&self, worker_pane_id: &str, seq: u64) {
@@ -7501,8 +7502,8 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// Issue #544: the pointer write [`Self::begin_delegation_pointer_write`]
-    /// announced has returned, after waiting `deferred` for the draft.
+    /// Issue #544: the post [`Self::begin_delegation_pointer_write`] announced
+    /// has ended — acknowledged after `deferred`, or refused (zero).
     pub fn finish_delegation_pointer_write(
         &self,
         worker_pane_id: &str,
@@ -7524,11 +7525,11 @@ impl AgentPtyRegistry {
     /// `None` when the record is gone or superseded — the watch's own
     /// seq-conditional take then finds nothing either.
     ///
-    /// A worker cannot answer a task it has not been given, so the time its
-    /// pointer spent waiting for the worker's own unsent draft is not time
-    /// the worker failed to respond: the watch reports at
+    /// A worker cannot answer a task it has not taken, so the time its posted
+    /// task spent unacknowledged is not time the worker failed to respond: the
+    /// watch reports at
     /// `armed_at + timeout + pointer_queued_for + pointer_deferred`, and not at
-    /// all while the dispatch is still queued or the write is in progress.
+    /// all while the dispatch is still queued or the task is unacknowledged.
     pub fn delegation_idle_clock(
         &self,
         worker_pane_id: &str,
@@ -7993,15 +7994,11 @@ impl AgentPtyRegistry {
     /// for a pane never delegated to.
     ///
     /// A deck notice about a worker (idle, went quiet, waiting for input,
-    /// exited) is composed when its watch fires and may then wait up to the
-    /// draft cap on the orchestrator's unsent draft. Its record is consumed
-    /// before that wait, so nothing is left for a completion to cancel: the
-    /// notice captures this value when it fires, BEFORE it consumes its
-    /// record, and its write-time re-check refuses the write unless
-    /// [`Self::delegation_resolution_epoch_is`] still holds. Capturing before
-    /// the take is what makes it airtight: a resolution earlier than the
-    /// capture has already taken the record (or replaced it), and one after it
-    /// moves the value.
+    /// exited) used to capture this value when it fired and re-check it with
+    /// [`Self::delegation_resolution_epoch_is`] before its typed write, which
+    /// could wait on the orchestrator's unsent draft. Since PRD #1666 those
+    /// notices are inbox posts made as they fire, and no production code reads
+    /// this value; only its tests do.
     pub fn delegation_resolution_epoch(&self, worker_pane_id: &str) -> Option<u64> {
         self.delegations
             .lock()
@@ -8234,11 +8231,7 @@ impl AgentPtyRegistry {
     ///
     /// 1. **In flight** — armed, but their dispatch task has not taken the lock
     ///    yet ([`CommissionDispatchInFlight`]). Their pointer will be written to
-    ///    the replacement, so the replacement owes them. Kept. A dispatch parked
-    ///    on the worker's draft with the lock set down ([`PaneDispatchHold`]) is
-    ///    counted here too: its write will be refused, and it then releases its
-    ///    own commission, so keeping it is what stops that release consuming a
-    ///    queued dispatch's.
+    ///    the replacement, so the replacement owes them. Kept.
     /// 2. **The caller's own**, when the caller is a `clear = true` dispatch
     ///    (`keep_own`): it holds the lock and will deliver to the replacement
     ///    it just spawned. Kept — sweeping it is exactly what the respawn path's
@@ -8945,10 +8938,10 @@ impl AgentPtyRegistry {
     /// A racing `work-done` finds no `OutstandingDelegation` (this sweep took
     /// it) and goes on to retire the worker's COMMISSION
     /// (`AppState::handle_work_done`'s order: silence watch, delegation,
-    /// commission), so the revalidation below also refuses once
+    /// commission), so the check at the top refuses once
     /// [`Self::owes_delegation_commission`] says nothing is owed any more. That
-    /// closes everything up to the moment the writer is taken; a `work-done`
-    /// processed after it still arrives as a turn of its own, credited as
+    /// closes everything up to the post; a `work-done` processed after it still
+    /// arrives as a message of its own, credited as
     /// solicited because the commission was standing, and the report's wording
     /// tells the orchestrator to trust that completion over this report.
     ///
@@ -8959,10 +8952,8 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         delegation: OutstandingDelegation,
     ) -> ExitedNotice {
-        // PR #1398 finding #18: a completion that lands while this notice waits
-        // on the orchestrator's draft moves the value, and the re-check below
-        // refuses. One that lands between the EOF sweep and this line is left to
-        // the commission check beside it.
+        // A completion that lands between the EOF sweep and this line is caught
+        // by the commission check here; one after it arrives as its own message.
         // Issue #708: a `work-done` credited since the sweep means the
         // delegation did NOT fail — see this function's doc.
         if !self.owes_delegation_commission(worker_pane_id) {
@@ -9109,8 +9100,9 @@ impl AgentPtyRegistry {
     ///
     /// Reads [`RunningAgent::spawn_agent_type`], NOT [`RunningAgent::agent_type`],
     /// and the difference matters for the same reason it does in
-    /// [`Self::agent_spawned_as_reporting_agent`]: the readiness gate uses this to
-    /// decide whether to SHORTEN its wait, and `agent_type` is upgradable in place
+    /// [`Self::agent_spawned_as_reporting_agent`]. (Its consumer, the typed
+    /// delivery's readiness gate, was removed by PRD #1666; no production code
+    /// reads this now.) That gate used this to decide whether to SHORTEN its wait, and `agent_type` is upgradable in place
     /// by [`Self::set_agent_type`] from a hook event. Keying off the observed badge
     /// would let any same-user producer post one `SessionStart` claiming to be an
     /// agent that declares no pre-prompt signal and thereby talk the gate out of
@@ -9311,12 +9303,8 @@ impl AgentPtyRegistry {
     ///
     /// A delegate dispatch takes this before [`Self::pane_dispatch_lock`] and
     /// holds it to the end, so dispatches to one pane still run strictly one
-    /// after another in the order they queued — including across the stretch
-    /// where the dispatch sets the dispatch lock down to wait for the worker's
-    /// unsent draft ([`PaneDispatchHold`]). Nothing else takes it: `pane
-    /// restart` takes only the dispatch lock, which is what lets a restart
-    /// proceed while a delegate waits on a draft instead of queueing behind
-    /// the whole draft-deferral cap.
+    /// after another in the order they queued. Nothing else takes it: `pane
+    /// restart` takes only the dispatch lock.
     ///
     /// Lock order is always this one first, then the dispatch lock; nothing
     /// takes them the other way round.
