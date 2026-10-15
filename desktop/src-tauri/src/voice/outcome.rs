@@ -1839,6 +1839,12 @@ const BARE_START_WORDS: [&str; 11] = [
 /// the user named. Every other word counts against it as said, including words
 /// a [`content_words`] reading would drop, so "on Run" and "on New deck" stay
 /// a target.
+///
+/// So echo recovery covers a BARE start only. Advertised start wording with a
+/// word outside the list — "activate orchestration", "start the run", "spin it
+/// up now" — is refused when the model echoes the form's deck, though it starts
+/// the form when the model does not (PRD #1666 review RR-1). Wider coverage
+/// belongs to PRD #1733's meaning-based reading, not to a longer list.
 fn asks_for_the_start_alone(transcript: &str, rows: &[&CommandRow]) -> bool {
     let mut rest = spoken_words(transcript);
     let Some((at, width)) = the_action_occurrence(&rest, rows) else {
@@ -16541,6 +16547,38 @@ mod tests {
             panic!("Start agent among start-word labels: expected a dispatch, got {unasked:?}");
         };
         assert_eq!(invoke, "startNewAgent");
+        // Pinned, not endorsed (PRD #1666 review RR-1): the echo is forgiven
+        // only for a BARE start, so advertised start wording with a word
+        // outside `BARE_START_WORDS` is refused when the model echoes the
+        // form's deck, though the same words start the form when it does not.
+        // Wider recovery is PRD #1733's meaning-based reading; the word list is
+        // not to be grown for it.
+        for said in ["activate orchestration", "start the run", "spin it up now"] {
+            let echoed = heard_as_user_said(
+                said,
+                IntentAnswer::new("open_new_agent").with_param("deck", "Local deck"),
+                Screen::Overview,
+                &fleet(),
+                Some(&form),
+            )
+            .await;
+            assert!(
+                matches!(echoed, VoiceOutcome::Unavailable { .. }),
+                "{said:?} with Local deck echoed: {echoed:?}"
+            );
+            let plain = heard_as_user_said(
+                said,
+                IntentAnswer::new("open_new_agent"),
+                Screen::Overview,
+                &fleet(),
+                Some(&form),
+            )
+            .await;
+            assert!(
+                matches!(&plain, VoiceOutcome::Dispatch { invoke, .. } if invoke == "startNewAgent"),
+                "{said:?} with nothing echoed: {plain:?}"
+            );
+        }
     }
 
     /// PRD #1497 — one utterance through the reading intercept: the panel's
