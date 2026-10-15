@@ -5333,10 +5333,15 @@ fn is_inside_checkout(path: &Path) -> bool {
 /// - when nothing is kept, the result is [`contained_deck_path_dir`] alone,
 ///   never the empty string: an empty `PATH` on unix is one zero-length entry,
 ///   which searches the child's current directory — the relative lookup this
-///   function drops. The contained directory is absolute and holds only the
-///   build under test, which every caller wants reachable by name anyway
-///   ([`path_with_binary_dir`] puts it first), so a lookup of anything else
-///   fails instead of reaching whatever the child's cwd holds.
+///   function drops. The contained directory is absolute and, as this harness
+///   initialises it, holds the build under test, which every caller wants
+///   reachable by name anyway ([`path_with_binary_dir`] puts it first), so a
+///   unix `PATH` search for another name finds nothing in it instead of
+///   reaching whatever the child's cwd holds. That is a statement about
+///   `PATH` search on unix only: Windows also looks in the application's and
+///   the current directory whatever `PATH` says, and the directory is the
+///   same user's to write, so what it holds once a child has run is not
+///   guaranteed.
 ///
 /// **This is pathname hygiene, not isolation.** It keeps the checkout out of
 /// what an agent reads in its `PATH` (`which dot-agent-deck`, `echo $PATH`) and
