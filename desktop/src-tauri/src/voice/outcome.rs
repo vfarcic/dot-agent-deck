@@ -1190,7 +1190,7 @@ pub async fn handle_utterance_with_modes(
             .get(&spec.name)
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
-            .or_else(|| deck_in_the_other_slot(table, row, spec, &answer))
+            .or_else(|| deck_in_the_other_slot(table, row, spec, &answer, transcript.text(), decks))
             // A REQUIRED deck made only of category words — "daemon", the
             // dialog's field heading, or "the deck" — names no deck, so it is
             // asked for exactly as an absent one is (issue #1045); unless it
@@ -2612,11 +2612,25 @@ fn local_intercept(
 /// and a value the model filled in elsewhere does not change that. Never when
 /// the row declares the other name itself, since that value is then the row's
 /// answer to a different param.
+///
+/// And only when the user's words name the daemon the value stands for
+/// ([`names_the_daemon`]); otherwise the slot stays empty and the user is
+/// asked which daemon they meant, as before this recovery existed. A reply
+/// that left `deck` empty and carried "build box" under `daemon` for "select
+/// the tester" — what a steered answer looks like — is not the user naming
+/// the build box (PRD #1666 security re-check). This is narrower than the
+/// rest of `switch_deck`, on purpose: a value in the row's OWN slot is the
+/// model's answer and is trusted as one, without being held against the
+/// transcript (issue #1491, `docs/develop/voice-first-design.md`); a value in
+/// a slot the row does not have is the model answering a different question,
+/// and reading it as this row's needs evidence the user asked for it.
 fn deck_in_the_other_slot<'a>(
     table: &CommandTable,
     row: &CommandRow,
     spec: &super::table::ParamSpec,
     answer: &'a super::resolver::IntentAnswer,
+    transcript: &str,
+    decks: &[VoiceDeck],
 ) -> Option<&'a str> {
     if spec.optional || spec.kind != ParamKind::DeckRef {
         return None;
@@ -2636,6 +2650,45 @@ fn deck_in_the_other_slot<'a>(
         .filter_map(|name| answer.params.get(name))
         .map(|value| value.trim())
         .find(|value| !value.is_empty())
+        .filter(|value| names_the_daemon(value, transcript, row, decks))
+}
+
+/// Whether `transcript` names the daemon `value` stands for: every content
+/// word of `value` is said ([`said`]), or a run of up to three of the
+/// transcript's words resolves — by the row's own deck resolver, with its
+/// spoken names, host aliases and glued spellings — to a daemon `value`
+/// resolves to. Read only by [`deck_in_the_other_slot`].
+fn names_the_daemon(value: &str, transcript: &str, row: &CommandRow, decks: &[VoiceDeck]) -> bool {
+    if said(value, transcript) {
+        return true;
+    }
+    let resolve = |spoken: &str| -> Vec<String> {
+        let matched = if row.id == SWITCH_DECK_ROW {
+            resolve_deck_ref(spoken, decks)
+        } else {
+            resolve_new_agent_deck_ref(spoken, decks)
+        };
+        match matched {
+            DeckRefMatch::One { id, .. } => vec![id],
+            DeckRefMatch::Ambiguous(candidates) => candidates
+                .into_iter()
+                .map(|candidate| candidate.value)
+                .collect(),
+            DeckRefMatch::None => Vec::new(),
+        }
+    };
+    let meant = resolve(value);
+    if meant.is_empty() {
+        return false;
+    }
+    let words = spoken_words(transcript);
+    (1..=3).any(|width| {
+        words.windows(width).any(|window| {
+            resolve(&window.join(" "))
+                .iter()
+                .any(|id| meant.contains(id))
+        })
+    })
 }
 
 /// Whether the whole utterance, less an edge politeness word, is one of
@@ -6826,6 +6879,34 @@ mod tests {
             "{outcome:?}"
         );
         let said = "switch deck to the build box";
+        let outcome = run(
+            &in_daemon_slot(said, "build box"),
+            Screen::Deck,
+            &fleet(),
+            said,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                if action == "switch_deck" && params[0].value == "deck-build"),
+            "{outcome:?}"
+        );
+        // The daemon is read from the other slot only when the user's words
+        // name it (PRD #1666 re-check): a steered reply carrying a daemon
+        // nobody said is asked about, as an empty `deck` always was, while the
+        // resolver's glued spelling of the one they did say still counts.
+        for (said, screen) in [
+            ("select the tester", Screen::Overview),
+            ("switch daemon", Screen::Deck),
+        ] {
+            let outcome = run(&in_daemon_slot(said, "build box"), screen, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamMissing { action, .. }
+                    if action == "switch_deck"),
+                "{said:?} with an unsaid daemon in the other slot: {outcome:?}"
+            );
+        }
+        let said = "switch deck to BuildBoxDeck";
         let outcome = run(
             &in_daemon_slot(said, "build box"),
             Screen::Deck,
