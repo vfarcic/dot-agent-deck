@@ -5769,11 +5769,41 @@ async fn handle_connection(
                     // doorbell names it, and a Pi extension that still pulls
                     // with `get-seed` is served it from the inbox.
                     let seed = authoring_seed.or(seed);
-                    if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref()) {
-                        // Admitted before the spawn above; a refusal now (the
-                        // deck filled up meanwhile, or the long seed could not
-                        // be saved) is logged by `post_seed`.
-                        let _ = crate::spawn::post_seed(&registry, pane_id, &id, "seed", seed);
+                    if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref())
+                        && let Err(error) =
+                            crate::spawn::post_seed(&registry, pane_id, &id, "seed", seed)
+                    {
+                        // PR #1735 second review: admitted before the spawn
+                        // above, and refused now all the same (the deck filled
+                        // up meanwhile, or the long seed could not be saved).
+                        // An agent without the task it was started for is a
+                        // failed start: it is closed before anything registers
+                        // or announces it, and the start answers the refusal.
+                        crate::spawn::close_started_agents(
+                            &registry,
+                            None,
+                            &[crate::spawn::SpawnedAgent {
+                                id: id.clone(),
+                                pane_id: pane_id.to_string(),
+                                role_name: None,
+                            }],
+                        )
+                        .await;
+                        if let Some(identity) = title_claim.as_ref() {
+                            state
+                                .write()
+                                .await
+                                .release_orchestration_title_claim(identity);
+                        }
+                        write_resp(
+                            &mut stream,
+                            &AttachResponse::err(format!(
+                                "start-agent: the agent's inbox refused its first prompt: \
+                                 {error}. The agent was closed."
+                            )),
+                        )
+                        .await?;
+                        return Ok(());
                     }
                     // Issue #454: NOTHING is registered in the daemon's
                     // `AppState` here, deliberately.

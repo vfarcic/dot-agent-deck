@@ -330,6 +330,14 @@ pub(crate) struct ConfigLock {
     _file: Option<std::fs::File>,
 }
 
+impl ConfigLock {
+    /// Whether a lock is actually held: `false` on a filesystem that cannot
+    /// lock, where [`lock_config`] lets the caller go on unlocked.
+    pub(crate) fn is_held(&self) -> bool {
+        self._file.is_some()
+    }
+}
+
 /// Serialise a read-modify-write of `dest` — an agent config the deck merges
 /// its entries into — across PROCESSES (issue #1493's follow-up).
 ///

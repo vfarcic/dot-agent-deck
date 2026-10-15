@@ -162,6 +162,13 @@ pub use windows::{
     terminate_child_with_grace_and_wait, terminate_pid,
 };
 
+/// PR #1735 second review: whether [`parent_pid_of`] reads parents on this
+/// platform: Linux (`/proc`), macOS (`proc_pidinfo`) and Windows (a Toolhelp
+/// snapshot). Elsewhere it always answers `None`, so [`descends_from`] can
+/// never give positive evidence and a check that requires it would refuse
+/// every caller.
+pub const ANCESTRY_LOOKUP: bool = cfg!(any(target_os = "linux", target_os = "macos", windows));
+
 /// PRD #1666 hardening M2: whether process `pid` is `root` or descends from
 /// it, walking parents with [`parent_pid_of`]. `None` when the walk cannot be
 /// completed — the platform cannot read a parent, or a process on the way

@@ -4994,14 +4994,32 @@ enum ComponentUse {
     Receiver,
 }
 
+/// How much a component's ancestry must prove for an inbox verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// Refused only on a positive "not the agent's"; a walk that cannot say
+    /// admits. For the verbs that post, settle a job or announce a wake.
+    BestEffort,
+    /// PR #1735 second review: admitted only on a positive "the agent's". For
+    /// the verbs that take or settle the agent's own mail — fetch, ack,
+    /// get-seed and arming a waiter — since a caller can make its ancestry
+    /// unreadable on purpose: a connection whose creator exited still reports
+    /// that creator as its peer.
+    Required,
+}
+
 /// [`admit_component_process`] — or [`admit_receiver_process`] for a
 /// receiver — on this platform's process table, unless the `e2e`-only
-/// [`ENV_TEST_UNBOUND_COMPONENTS`] knob is set.
+/// [`ENV_TEST_UNBOUND_COMPONENTS`] knob is set. [`Evidence::Required`] falls
+/// back to [`Evidence::BestEffort`] on a platform without
+/// [`crate::platform::proc::ANCESTRY_LOOKUP`], where no caller could prove
+/// anything.
 fn admit_inbox_component(
     peer: Option<u32>,
     claimed: Option<u32>,
     root: Option<u32>,
     used_as: ComponentUse,
+    evidence: Evidence,
 ) -> Result<Option<u32>, &'static str> {
     #[cfg(feature = "e2e")]
     if std::env::var(ENV_TEST_UNBOUND_COMPONENTS)
@@ -5012,8 +5030,13 @@ fn admit_inbox_component(
     #[cfg(not(feature = "e2e"))]
     let _ = ENV_TEST_UNBOUND_COMPONENTS;
     let descends = crate::platform::proc::descends_from;
+    let evidence = if crate::platform::proc::ANCESTRY_LOOKUP {
+        evidence
+    } else {
+        Evidence::BestEffort
+    };
     match used_as {
-        ComponentUse::Cli => admit_component_process(peer, claimed, root, descends),
+        ComponentUse::Cli => admit_component_process(peer, claimed, root, descends, evidence),
         ComponentUse::Receiver => admit_receiver_process(
             peer,
             claimed,
@@ -5021,6 +5044,7 @@ fn admit_inbox_component(
             descends,
             crate::platform::proc::parent_pid_of,
             crate::platform::proc::executable_of,
+            evidence,
         ),
     }
 }
@@ -5028,7 +5052,8 @@ fn admit_inbox_component(
 /// PR #1735 review: whether the connecting process `peer` may take or settle
 /// `agent_id`'s own mail — `inbox_fetch`, `ack` and the `get_seed` alias — on
 /// the same terms as the verbs that post ([`ComponentUse::Cli`]): only the
-/// agent's own process tree may use its token for them. Logs a refusal.
+/// agent's own process tree may use its token for them, and only on positive
+/// evidence that the caller is in it ([`Evidence::Required`]). Logs a refusal.
 fn mail_taker_admitted(
     registry: &AgentPtyRegistry,
     peer: Option<u32>,
@@ -5036,7 +5061,13 @@ fn mail_taker_admitted(
     verb: &str,
     pane_id: &str,
 ) -> bool {
-    match admit_inbox_component(peer, None, registry.child_pid(agent_id), ComponentUse::Cli) {
+    match admit_inbox_component(
+        peer,
+        None,
+        registry.child_pid(agent_id),
+        ComponentUse::Cli,
+        Evidence::Required,
+    ) {
         Ok(_) => true,
         Err(why) => {
             warn!(
@@ -5067,8 +5098,9 @@ fn admit_receiver_process(
     descends: impl Fn(u32, u32) -> Option<bool>,
     parent_of: impl Fn(u32) -> Option<u32> + Copy,
     executable_of: impl Fn(u32) -> Option<std::path::PathBuf> + Copy,
+    evidence: Evidence,
 ) -> Result<Option<u32>, &'static str> {
-    let instance = admit_component_process(peer, claimed, root, descends)?
+    let instance = admit_component_process(peer, claimed, root, descends, evidence)?
         .map(|claimed| receiver_instance(claimed, root, parent_of, executable_of));
     if let (Some(peer), Some(instance)) = (peer, instance)
         && nested_between(peer, instance, parent_of, executable_of) == Some(true)
@@ -5157,33 +5189,64 @@ fn nested_between(
 /// the component instance it names (the process that runs its watcher, which
 /// the stream is keyed by), and `root` the agent process the deck spawned.
 /// Each must be `root` or descend from it, and the claimed instance must be an
-/// ancestor of the caller (or the caller itself). Where `descends` cannot say —
-/// a Unix other than Linux or macOS, or a process that exited during the walk
-/// — the check is skipped, as before this hardening. Windows reads parents
-/// from a process snapshot since PR #1735's review. Answers the instance to
-/// arm the stream under.
+/// ancestor of the caller (or the caller itself). Under
+/// [`Evidence::BestEffort`], where `descends` cannot say — a Unix other than
+/// Linux or macOS, or a process that exited during the walk — the check is
+/// skipped, as it is without a `peer` or a `root`. Under
+/// [`Evidence::Required`] each of those refuses. Windows reads parents from a
+/// process snapshot since PR #1735's review. Answers the instance to arm the
+/// stream under.
 fn admit_component_process(
     peer: Option<u32>,
     claimed: Option<u32>,
     root: Option<u32>,
     descends: impl Fn(u32, u32) -> Option<bool>,
+    evidence: Evidence,
 ) -> Result<Option<u32>, &'static str> {
+    let required = evidence == Evidence::Required;
     let Some(root) = root else {
-        return Ok(claimed);
+        return if required {
+            Err("the pane has no agent process to bind the caller to")
+        } else {
+            Ok(claimed)
+        };
     };
-    if let Some(peer) = peer
-        && descends(peer, root) == Some(false)
-    {
-        return Err("the connecting process is not the agent's");
+    // `Err(true)` for a positive "no", `Err(false)` for "cannot say" where
+    // the evidence must be positive.
+    let check = |pid: u32, ancestor: u32| match descends(pid, ancestor) {
+        Some(true) => Ok(()),
+        Some(false) => Err(true),
+        None if required => Err(false),
+        None => Ok(()),
+    };
+    const UNREADABLE: &str = "the caller's process ancestry cannot be read";
+    match peer {
+        Some(peer) => check(peer, root).map_err(|not| {
+            if not {
+                "the connecting process is not the agent's"
+            } else {
+                UNREADABLE
+            }
+        })?,
+        None if required => return Err("the connecting process cannot be identified"),
+        None => {}
     }
     if let Some(claimed) = claimed {
-        if descends(claimed, root) == Some(false) {
-            return Err("the named component process is not the agent's");
-        }
-        if let Some(peer) = peer
-            && descends(peer, claimed) == Some(false)
-        {
-            return Err("the named component process is not the caller's");
+        check(claimed, root).map_err(|not| {
+            if not {
+                "the named component process is not the agent's"
+            } else {
+                UNREADABLE
+            }
+        })?;
+        if let Some(peer) = peer {
+            check(peer, claimed).map_err(|not| {
+                if not {
+                    "the named component process is not the caller's"
+                } else {
+                    UNREADABLE
+                }
+            })?;
         }
     }
     Ok(claimed)
@@ -5573,6 +5636,11 @@ async fn run_hook_loop_with_limits(
                                 msg.presented_token(),
                                 &*pty_registry,
                             );
+                            // PR #1735 second review: the room a dispatch's
+                            // result will need, held from the moment the
+                            // dispatch is accepted (below) until the result is
+                            // posted in the `Dispatch` arm.
+                            let mut dispatch_result_room = None;
                             match crate::hook_provenance::admits(
                                 &provenance,
                                 crate::hook_provenance::policy(),
@@ -5630,6 +5698,39 @@ async fn run_hook_loop_with_limits(
                                     // returns `None` here and answers in its own
                                     // arm, which is what keeps "exactly one line
                                     // per message" true.
+                                    // PR #1735 second review: a dispatch is
+                                    // accepted only with room held for its
+                                    // result, so a deck that fills up while it
+                                    // runs cannot lose the answer; with no
+                                    // room now the caller is told so and
+                                    // nothing is dispatched.
+                                    if matches!(msg, DaemonMessage::Dispatch(_)) {
+                                        match pty_registry.inbox().reserve_reply() {
+                                            Ok(room) => dispatch_result_room = Some(room),
+                                            Err(error) => {
+                                                warn!(
+                                                    claimed_pane = %escape_id_for_log(msg.claimed_pane()),
+                                                    %error,
+                                                    "hook socket: refused a dispatch; the deck \
+                                                     has no room for its result"
+                                                );
+                                                let refusal = crate::event::SignalAck::refused(
+                                                    "deck_full",
+                                                    &format!(
+                                                        "{error}, so it could not take the result \
+                                                         of this dispatch; nothing was dispatched"
+                                                    ),
+                                                );
+                                                if let Ok(json) = serde_json::to_string(&refusal) {
+                                                    let line = format!("{json}\n");
+                                                    let _ =
+                                                        write_half.write_all(line.as_bytes()).await;
+                                                    let _ = write_half.flush().await;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     if let Some(json) = msg.provenance_ack_reply() {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
@@ -5737,6 +5838,8 @@ async fn run_hook_loop_with_limits(
                                         req.pid,
                                         pty_registry.child_pid(&agent_id),
                                         ComponentUse::Receiver,
+                                        // A waiter is handed the agent's mail.
+                                        Evidence::Required,
                                     ) {
                                         Ok(instance) => instance,
                                         Err(why) => {
@@ -5794,6 +5897,7 @@ async fn run_hook_loop_with_limits(
                                         req.pid,
                                         pty_registry.child_pid(&agent_id),
                                         ComponentUse::Receiver,
+                                        Evidence::BestEffort,
                                     ) {
                                         Ok(instance) => instance,
                                         Err(why) => {
@@ -5906,6 +6010,7 @@ async fn run_hook_loop_with_limits(
                                         None,
                                         pty_registry.child_pid(&agent_id),
                                         ComponentUse::Cli,
+                                        Evidence::BestEffort,
                                     ) {
                                         warn!(
                                             verb = msg.verb(),
@@ -6204,8 +6309,12 @@ async fn run_hook_loop_with_limits(
                                     // PRD #1666 S5: the acknowledgement goes to the
                                     // caller's inbox, bound to the caller generation
                                     // captured before the dispatch ran.
+                                    let Some(room) = dispatch_result_room.take() else {
+                                        continue;
+                                    };
                                     crate::dispatch_return::post_dispatch_result(
                                         &pty_registry,
+                                        room,
                                         &signal.pane_id,
                                         &caller_agent_id,
                                         &signal.name,
@@ -11327,26 +11436,72 @@ mod hook_ingestion_tests {
         };
         let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
         assert_eq!(
-            admit_component_process(Some(12), Some(11), Some(10), descends),
+            admit_component_process(Some(12), Some(11), Some(10), descends, Evidence::BestEffort),
             Ok(Some(11))
         );
         assert_eq!(
-            admit_component_process(Some(12), None, Some(10), descends),
+            admit_component_process(Some(12), None, Some(10), descends, Evidence::BestEffort),
             Ok(None)
         );
-        assert!(admit_component_process(Some(21), Some(20), Some(10), descends).is_err());
-        assert!(admit_component_process(Some(12), Some(20), Some(10), descends).is_err());
-        assert!(admit_component_process(Some(11), Some(12), Some(10), descends).is_err());
-        assert!(admit_component_process(Some(12), Some(10), Some(10), descends).is_ok());
+        assert!(
+            admit_component_process(Some(21), Some(20), Some(10), descends, Evidence::BestEffort)
+                .is_err()
+        );
+        assert!(
+            admit_component_process(Some(12), Some(20), Some(10), descends, Evidence::BestEffort)
+                .is_err()
+        );
+        assert!(
+            admit_component_process(Some(11), Some(12), Some(10), descends, Evidence::BestEffort)
+                .is_err()
+        );
+        assert!(
+            admit_component_process(Some(12), Some(10), Some(10), descends, Evidence::BestEffort)
+                .is_ok()
+        );
         // Cannot say: unknown pids, or no agent process to check against.
         assert_eq!(
-            admit_component_process(Some(99), Some(98), Some(10), descends),
+            admit_component_process(Some(99), Some(98), Some(10), descends, Evidence::BestEffort),
             Ok(Some(98))
         );
         assert_eq!(
-            admit_component_process(Some(21), Some(20), None, descends),
+            admit_component_process(Some(21), Some(20), None, descends, Evidence::BestEffort),
             Ok(Some(20))
         );
+    }
+
+    /// PR #1735 second review: a verb that takes the agent's mail is admitted
+    /// only on positive evidence. A peer whose ancestry cannot be read — it
+    /// exited, as a connection's creator can on purpose — is refused, and so
+    /// are a missing peer and a pane with no agent process; the agent's own
+    /// tree is still admitted.
+    #[test]
+    fn a_mail_taker_must_prove_it_is_the_agents() {
+        // 1 ── 10 (agent) ── 11 (hook shell) ── 12 (hook CLI); 99 exited.
+        let parents = |pid: u32| match pid {
+            10 => Some(1),
+            11 => Some(10),
+            12 => Some(11),
+            _ => None,
+        };
+        let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        let required = |peer, claimed, root| {
+            admit_component_process(peer, claimed, root, descends, Evidence::Required)
+        };
+        assert_eq!(required(Some(12), None, Some(10)), Ok(None));
+        assert_eq!(required(Some(12), Some(11), Some(10)), Ok(Some(11)));
+        assert_eq!(required(Some(10), None, Some(10)), Ok(None));
+        assert!(required(Some(99), None, Some(10)).is_err());
+        assert!(required(None, None, Some(10)).is_err());
+        assert!(required(Some(12), None, None).is_err());
+        assert!(required(Some(12), Some(98), Some(10)).is_err());
+        // The same callers under best effort, as the posting verbs see them.
+        let best_effort = |peer, claimed, root| {
+            admit_component_process(peer, claimed, root, descends, Evidence::BestEffort)
+        };
+        assert!(best_effort(Some(99), None, Some(10)).is_ok());
+        assert!(best_effort(None, None, Some(10)).is_ok());
+        assert!(best_effort(Some(12), None, None).is_ok());
     }
 
     /// Audit F3 (b): a component registering the agent's native receiver is
@@ -11391,7 +11546,15 @@ mod hook_ingestion_tests {
         };
         let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
         let admit = |peer, claimed, root| {
-            admit_receiver_process(peer, claimed, root, descends, parents, executables)
+            admit_receiver_process(
+                peer,
+                claimed,
+                root,
+                descends,
+                parents,
+                executables,
+                Evidence::BestEffort,
+            )
         };
 
         // The outer agent's hooks, each through its own shell, naming the
@@ -11414,11 +11577,27 @@ mod hook_ingestion_tests {
         assert_eq!(admit(Some(19), Some(11), Some(10)), Ok(Some(10)));
         // A walk that cannot say does not refuse, and pins what was named.
         assert_eq!(
-            admit_receiver_process(Some(14), Some(10), Some(10), descends, parents, |_| None),
+            admit_receiver_process(
+                Some(14),
+                Some(10),
+                Some(10),
+                descends,
+                parents,
+                |_| None,
+                Evidence::BestEffort
+            ),
             Ok(Some(10))
         );
         assert_eq!(
-            admit_receiver_process(Some(16), Some(15), Some(10), descends, parents, |_| None),
+            admit_receiver_process(
+                Some(16),
+                Some(15),
+                Some(10),
+                descends,
+                parents,
+                |_| None,
+                Evidence::BestEffort
+            ),
             Ok(Some(15))
         );
     }

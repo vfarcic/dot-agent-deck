@@ -66,42 +66,62 @@ impl DeckId {
     /// PR #1735 review: every step after the first read runs under a lock on
     /// a sidecar beside the file (`.deck-id.lock`), so two daemons sharing the
     /// state directory that start at once agree on one id: the second waits,
-    /// reads what the first published and adopts it. That holds whether the
-    /// filesystem can hard-link (the `CreateNew` publish below) or not, in
-    /// which case the publish is a rename that could replace the other's id.
-    /// Where the filesystem cannot lock at all the steps run unlocked, as
-    /// [`crate::agent_hook_config::lock_config`] describes.
+    /// reads what the first published and adopts it. A new id is published
+    /// with a hard link, which fails rather than replaces an id published
+    /// meanwhile; a filesystem without hard links publishes by rename, which
+    /// could replace one, so it is used only while the lock is held. PR #1735
+    /// second review: on a filesystem that can neither lock nor hard-link, or
+    /// that cannot lock while the file needs replacing, the start fails with
+    /// an error saying so rather than risk two daemons holding different ids.
     pub fn load_or_create(state_dir: &Path) -> Result<Self, String> {
+        Self::load_or_create_with(state_dir, &|| {})
+    }
+
+    /// [`Self::load_or_create`], running `before_lock` once the first read
+    /// found no deck id, just before the lock is taken.
+    fn load_or_create_with(state_dir: &Path, before_lock: &dyn Fn()) -> Result<Self, String> {
         let path = deck_id_path(state_dir);
         if let FileState::Valid(id) = read_deck_id_file(&path)? {
             return Ok(id);
         }
         crate::platform::fsperm::create_owner_only_dir(state_dir)
             .map_err(|e| format!("failed to create {}: {e}", state_dir.display()))?;
-        let _lock = crate::agent_hook_config::lock_config(&path)
+        before_lock();
+        let lock = crate::agent_hook_config::lock_config(&path)
             .map_err(|e| format!("failed to lock {}: {e}", path.display()))?;
+        let locked = lock.is_held();
+        let unlocked_replace = || {
+            format!(
+                "{} does not hold a deck id, and this filesystem cannot lock it, so it cannot be \
+                 replaced without risking a second daemon holding a different deck id; remove \
+                 the file and start the daemon again",
+                path.display()
+            )
+        };
         match read_deck_id_file(&path)? {
             FileState::Valid(id) => return Ok(id),
+            FileState::Invalid if !locked => return Err(unlocked_replace()),
             FileState::Invalid => {
                 tracing::warn!(
                     path = %path.display(),
                     "the deck-id file does not hold a deck id; replacing it"
                 );
                 let id = Self::generate();
-                write_deck_id(&path, &id, Publish::Replace)?;
+                write_deck_id(&path, &id, Publish::Replace, locked)?;
                 return Ok(id);
             }
             FileState::Missing => {}
         }
         let id = Self::generate();
-        match write_deck_id(&path, &id, Publish::CreateNew)? {
+        match write_deck_id(&path, &id, Publish::CreateNew, locked)? {
             Published::Ours => Ok(id),
             // Another daemon sharing this state directory published first; its
             // id is the deck's.
             Published::Theirs => match read_deck_id_file(&path)? {
                 FileState::Valid(theirs) => Ok(theirs),
+                _ if !locked => Err(unlocked_replace()),
                 _ => {
-                    write_deck_id(&path, &id, Publish::Replace)?;
+                    write_deck_id(&path, &id, Publish::Replace, locked)?;
                     Ok(id)
                 }
             },
@@ -183,8 +203,14 @@ enum Published {
     Theirs,
 }
 
-/// Write `id` to a fresh owner-only temp file beside `path`, then publish it.
-fn write_deck_id(path: &Path, id: &DeckId, publish: Publish) -> Result<Published, String> {
+/// Write `id` to a fresh owner-only temp file beside `path`, then publish it
+/// ([`publish_temp`]). `locked`: whether the caller holds the deck-id lock.
+fn write_deck_id(
+    path: &Path,
+    id: &DeckId,
+    publish: Publish,
+    locked: bool,
+) -> Result<Published, String> {
     use std::io::Write;
 
     let parent = match path.parent() {
@@ -233,21 +259,41 @@ fn write_deck_id(path: &Path, id: &DeckId, publish: Publish) -> Result<Published
         return Err(format!("failed to write {}: {e}", tmp_path.display()));
     }
 
-    let result = match publish {
-        // A hard link publishes the complete file under its final name, and
-        // fails rather than overwrites when that name is taken.
-        Publish::CreateNew => match std::fs::hard_link(&tmp_path, path) {
-            Ok(()) => Ok(Published::Ours),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Published::Theirs),
-            // A filesystem without hard links: an atomic rename instead, which
-            // could replace another start's id; `load_or_create` holds the
-            // lock that keeps a simultaneous first start out.
-            Err(_) => rename(&tmp_path, path),
-        },
-        Publish::Replace => rename(&tmp_path, path),
-    };
+    let result = publish_temp(&tmp_path, path, publish, locked, &|from, to| {
+        std::fs::hard_link(from, to)
+    });
     let _ = std::fs::remove_file(&tmp_path);
     result
+}
+
+/// Publish the complete temp file `tmp_path` as `path`. A new id is published
+/// with `link` (a hard link), which publishes the whole file under its final
+/// name and fails rather than overwrites when that name is taken. Where the
+/// filesystem has no hard links, an atomic rename is the fallback; it could
+/// replace an id another start published, so it is used only when `locked`
+/// says the caller holds the deck-id lock that keeps every other start out.
+fn publish_temp(
+    tmp_path: &Path,
+    path: &Path,
+    publish: Publish,
+    locked: bool,
+    link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Published, String> {
+    match publish {
+        Publish::CreateNew => match link(tmp_path, path) {
+            Ok(()) => Ok(Published::Ours),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Published::Theirs),
+            Err(_) if locked => rename(tmp_path, path),
+            Err(e) => Err(format!(
+                "cannot publish the deck id at {}: this filesystem supports neither file \
+                 locking nor hard links ({e}), so a daemon starting at the same moment could \
+                 publish a different one; put the deck's state directory \
+                 (DOT_AGENT_DECK_STATE_DIR) on a local filesystem",
+                path.display()
+            )),
+        },
+        Publish::Replace => rename(tmp_path, path),
+    }
 }
 
 fn rename(tmp_path: &Path, path: &Path) -> Result<Published, String> {
@@ -342,7 +388,9 @@ mod tests {
 
     /// PR #1735 review: a daemon creating the deck id while another one is
     /// still publishing its own waits for it, and adopts the id that was
-    /// published, whatever the filesystem's support for hard links.
+    /// published. The loader signals once its first read found no id, just
+    /// before it takes the lock, so the other id is published after that read
+    /// and before the loader could publish its own.
     #[test]
     fn a_first_start_waits_for_a_concurrent_one_and_adopts_its_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -351,14 +399,23 @@ mod tests {
         let path = deck_id_path(&state_dir);
         let theirs = DeckId::generate();
         let publishing = crate::agent_hook_config::lock_config(&path).unwrap();
+        assert!(
+            publishing.is_held(),
+            "this test needs a filesystem that locks"
+        );
+        let (read_nothing, reached) = std::sync::mpsc::channel();
         let loader = {
             let state_dir = state_dir.clone();
-            std::thread::spawn(move || DeckId::load_or_create(&state_dir))
+            std::thread::spawn(move || {
+                DeckId::load_or_create_with(&state_dir, &|| {
+                    let _ = read_nothing.send(());
+                })
+            })
         };
-        // Long enough for a loader that does not wait to publish an id of its
-        // own; one that waits publishes nothing until the lock is released.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        write_deck_id(&path, &theirs, Publish::Replace).unwrap();
+        reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the loader reads no deck id and goes for the lock");
+        write_deck_id(&path, &theirs, Publish::Replace, true).unwrap();
         drop(publishing);
         let adopted = loader.join().unwrap().unwrap();
         assert_eq!(adopted, theirs);
@@ -366,5 +423,30 @@ mod tests {
             std::fs::read_to_string(&path).unwrap().trim(),
             theirs.as_str()
         );
+    }
+
+    /// PR #1735 second review: without the deck-id lock and without hard
+    /// links, publishing a new id would be a rename that could replace one
+    /// another start published meanwhile, so it fails instead and the
+    /// published id stays. Holding the lock, the rename is safe.
+    #[test]
+    fn without_a_lock_or_hard_links_a_new_id_never_replaces_a_published_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DECK_ID_FILE);
+        let theirs = DeckId::generate();
+        std::fs::write(&path, format!("{theirs}\n")).unwrap();
+        let no_links =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        let ours = dir.path().join("ours.tmp");
+        std::fs::write(&ours, format!("{}\n", DeckId::generate())).unwrap();
+        let unlocked = publish_temp(&ours, &path, Publish::CreateNew, false, &no_links);
+        assert!(unlocked.is_err(), "an unlocked publish must not rename");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            theirs.as_str(),
+            "the published id stays"
+        );
+        let locked = publish_temp(&ours, &path, Publish::CreateNew, true, &no_links);
+        assert!(matches!(locked, Ok(Published::Ours)));
     }
 }

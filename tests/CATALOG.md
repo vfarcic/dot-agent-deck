@@ -7908,6 +7908,24 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Asserts:** fetch with and without ack and ack presenting the pane's token from outside the agent's process tree are refused as `inbox_not_agent_process`, get_seed answers no seed, and the task stays Queued; the in-pane fetch then prints it and it is Acknowledged.
 - **Platform coverage:** mac+linux.
 
+##### inbox/protocol/016 — A raw event from outside the agent acknowledges nothing.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on, a raw hook event from the test process, then the real Claude hook inside the pane.
+- **Agent:** none (shell stand-in that waits for a fixture sentinel before running the hook).
+- **Asserts:** a raw event presenting the pane's token from outside the agent's process tree, naming the queued task as observed and acknowledged, leaves it Queued; the in-pane `hook --agent claude-code` for a prompt carrying the task's block then acknowledges it.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/017 — A connection of unknown ancestry cannot take mail.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on; each request goes over a connection a forked child made and then exited from, so its ancestry cannot be read.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** fetch, ack and a once waiter are refused as `inbox_not_agent_process`, get_seed answers no seed, and the task stays Queued.
+- **Platform coverage:** mac+linux.
+
+##### inbox/protocol/018 — A dispatch the deck has no room to answer is refused.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with `DOT_AGENT_DECK_INBOX_MAX_MESSAGES=1` and one queued message; hook-socket `dispatch` with the pane's token.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** the dispatch is answered `accepted: false` with reason `deck_full`, and `list-agents` names no unit for it.
+- **Platform coverage:** mac+linux.
+
 #### Agent CLI
 
 ##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.
@@ -7932,6 +7950,12 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real CLI against a scripted hook endpoint.
 - **Agent:** none.
 - **Asserts:** Superseded, NotInDeck, Refused, invalid JSON and EOF each produce exit zero and empty output; request carries Once mode and the hook's session source.
+- **Platform coverage:** mac+linux.
+
+##### inbox/cli/005 — A doorbell fetch names its message in the one request.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real `inbox fetch --json --doorbell <id>` CLI and the real `hook --agent claude-code` for a doorbell-line prompt, each against a synthetic hook endpoint that records every request and lists the message as queued.
+- **Agent:** none (`cat` stand-in supplies the pane identity).
+- **Asserts:** the CLI sends exactly one `inbox_fetch`, naming the doorbell's message and not acknowledging; the hook sends one `inbox_fetch` naming it and no `inbox_list`, and prints the fetched block.
 - **Platform coverage:** mac+linux.
 #### Fixed doorbell
 
@@ -8278,6 +8302,12 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** scripted stand-ins; a stream component (`pi_extension`) armed from the test process that does not answer the redeliveries until it acknowledges.
 - **Asserts:** the orchestrator is told the task has not reached the worker; the component's ack makes it acknowledged and the orchestrator receives one correction naming the task and the worker's role, and no second one.
 - **Does not assert:** the correction after "is undeliverable" (inbox/route/010) or the told-both case (the `inbox_hub` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### inbox/route/012 — A start whose seed cannot be posted leaves no agent.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon; attach `start-agent` with a 64 KiB seed while a file stands where each spill directory's `.dot-agent-deck/` would go.
+- **Agent:** none (`cat` stand-in).
+- **Asserts:** the start answers an error naming the first prompt, and `list-agents` shows no agent for the pane.
 - **Platform coverage:** mac+linux.
 
 #### inbox/codex

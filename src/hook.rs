@@ -467,7 +467,8 @@ fn codex_inbox_hooks(
 /// the `framing` that heads an injection. An ordinary prompt costs a local
 /// scan and no daemon call. A doorbell line fetches only while the message it
 /// names is queued, and what it hands over is acknowledged once the hook has
-/// printed it ([`HookOutput::print`]).
+/// printed it ([`HookOutput::print`]). A message whose block the prompt itself
+/// opens (a native wake) is acknowledged before this returns.
 pub fn deck_prompt_submit(
     prompt: &str,
     budget: crate::event::InboxBudget,
@@ -485,7 +486,10 @@ pub fn deck_prompt_submit(
         .as_ref()
         .map(|injection| injection.fetched.clone())
         .unwrap_or_default();
-    crate::inbox_prompt::mark_event(event, &ids, &fetched);
+    // PR #1735 second review: the content of the blocks the prompt opens is
+    // already in the model's context, so they are acknowledged here, with the
+    // `ack` verb the daemon admits only from the agent's own process tree.
+    acknowledge_handed_over(&crate::inbox_prompt::mark_event(event, &ids, &fetched));
     injection.map(|injection| HookOutput {
         stdout: crate::inbox_prompt::hook_output("UserPromptSubmit", &injection.context),
         fetched: injection.fetched,
@@ -2063,7 +2067,7 @@ pub fn build_agent_event_cli(
         let ids = crate::inbox_prompt::scan(prompt);
         if !ids.is_empty() {
             let handed_over: Vec<String> = ids.opened.clone();
-            crate::inbox_prompt::mark_event(&mut event, &ids, &handed_over);
+            let _ = crate::inbox_prompt::mark_event(&mut event, &ids, &handed_over);
         }
     }
     event

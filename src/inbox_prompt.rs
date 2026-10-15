@@ -12,13 +12,15 @@
 //!   `additionalContext`, so the model is never asked to fetch. Codex trims the
 //!   line's leading space, so the scan does not anchor on it.
 //!
-//! Either way the prompt is the deck's, not the user's: it acknowledges the
-//! message (the content is in the model's context), and the card shows
-//! `✉ <subject>` instead of the raw prompt and keeps it out of the user's
-//! prompt history. The hook names the ids in the event's metadata; the daemon
-//! acknowledges them for the agent the event's token attests and stamps the
-//! card label ([`stamp_deck_message_prompt`]), because only the daemon can
-//! attest the agent and knows the subject.
+//! Either way the prompt is the deck's, not the user's: the message's content
+//! is in the model's context, and the card shows `✉ <subject>` instead of the
+//! raw prompt and keeps it out of the user's prompt history. The hook
+//! acknowledges the ids whose content the prompt carries with the `ack` verb
+//! ([`crate::hook::acknowledge_handed_over`]), which the daemon admits only
+//! from the agent's own process tree, and names every id in the event's
+//! metadata so the daemon can stamp the card label
+//! ([`stamp_deck_message_prompt`]), because only the daemon can attest the
+//! agent and knows the subject.
 //!
 //! Agent-neutral: Claude Code uses it in S6, and Codex, whose hooks take the
 //! same `additionalContext` shape, reuses it in S7 with its own budget.
@@ -36,8 +38,11 @@ use crate::event::{
 /// comma-separated. The daemon reads it to label the card and removes it.
 pub const DECK_MESSAGE_IDS_METADATA_KEY: &str = "deck_message_ids";
 
-/// Event metadata, set by the hook: the ids whose content the prompt itself
-/// carries, which the daemon acknowledges as observed. Removed by the daemon.
+/// Event metadata a hook from before PR #1735's second review set: the ids
+/// whose content the prompt carried, for the daemon to acknowledge. The daemon
+/// now discards it unread: a raw event is not admitted by process, so
+/// acknowledging from it would let any holder of the pane's token settle the
+/// agent's mail. The hook acknowledges with the `ack` verb instead.
 pub const DECK_MESSAGE_ACK_IDS_METADATA_KEY: &str = "deck_message_ack_ids";
 
 /// Event metadata, set ONLY by the daemon (an incoming value is discarded):
@@ -228,8 +233,11 @@ pub fn hook_output(hook_event_name: &str, context: &str) -> String {
 }
 
 /// Mark `event` as carrying the deck's prompt: the raw prompt is dropped, and
-/// the ids go to the daemon to acknowledge and label ([`stamp_deck_message_prompt`]).
-pub fn mark_event(event: &mut AgentEvent, ids: &DeckPromptIds, fetched: &[String]) {
+/// the ids go to the daemon to label the card ([`stamp_deck_message_prompt`]).
+/// Answers the opened ids `fetched` does not already account for: their
+/// content is in the prompt, so the caller acknowledges them
+/// ([`crate::hook::acknowledge_handed_over`]).
+pub fn mark_event(event: &mut AgentEvent, ids: &DeckPromptIds, fetched: &[String]) -> Vec<String> {
     event.user_prompt = None;
     let mut all: Vec<&str> = Vec::new();
     for id in fetched.iter().chain(&ids.opened).chain(&ids.rung) {
@@ -237,21 +245,14 @@ pub fn mark_event(event: &mut AgentEvent, ids: &DeckPromptIds, fetched: &[String
             all.push(id);
         }
     }
-    let acks: Vec<&str> = ids
-        .opened
-        .iter()
-        .map(String::as_str)
-        .filter(|id| !fetched.iter().any(|done| done == id))
-        .collect();
     event
         .metadata
         .insert(DECK_MESSAGE_IDS_METADATA_KEY.to_string(), all.join(","));
-    if !acks.is_empty() {
-        event.metadata.insert(
-            DECK_MESSAGE_ACK_IDS_METADATA_KEY.to_string(),
-            acks.join(","),
-        );
-    }
+    ids.opened
+        .iter()
+        .filter(|id| !fetched.iter().any(|done| done == *id))
+        .cloned()
+        .collect()
 }
 
 /// Whether `event`'s prompt is a deck message's label rather than the user's
@@ -260,23 +261,24 @@ pub fn is_deck_message(event: &AgentEvent) -> bool {
     event.metadata.contains_key(DECK_MESSAGE_METADATA_KEY)
 }
 
-/// Daemon side, at hook ingestion: act on the ids [`mark_event`] named, for
-/// `attested_agent` only. Each opened id is acknowledged as observed, and the
-/// event's prompt becomes `✉ <subject>` with [`DECK_MESSAGE_METADATA_KEY`] set.
-/// The keys are removed whatever happens, and an incoming marker is discarded,
-/// so a hook cannot label a prompt the deck did not send.
+/// Daemon side, at hook ingestion: label the card for the ids [`mark_event`]
+/// named, for `attested_agent` only. The event's prompt becomes
+/// `✉ <subject>` with [`DECK_MESSAGE_METADATA_KEY`] set. The keys are removed
+/// whatever happens, an incoming marker is discarded, so a hook cannot label a
+/// prompt the deck did not send, and [`DECK_MESSAGE_ACK_IDS_METADATA_KEY`] is
+/// discarded unread: nothing is acknowledged from a raw event.
 pub fn stamp_deck_message_prompt(
     event: &mut AgentEvent,
     attested_agent: Option<&str>,
     hub: &crate::inbox_hub::InboxHub,
 ) {
     event.metadata.remove(DECK_MESSAGE_METADATA_KEY);
+    event.metadata.remove(DECK_MESSAGE_ACK_IDS_METADATA_KEY);
     let ids = event.metadata.remove(DECK_MESSAGE_IDS_METADATA_KEY);
-    let acks = event.metadata.remove(DECK_MESSAGE_ACK_IDS_METADATA_KEY);
     let Some(ids) = ids else {
         return;
     };
-    let (Some(agent_id), Some(pane_id)) = (attested_agent, event.pane_id.clone()) else {
+    let (Some(_), Some(pane_id)) = (attested_agent, event.pane_id.clone()) else {
         return;
     };
     let valid = |list: &str| -> Vec<String> {
@@ -286,14 +288,6 @@ pub fn stamp_deck_message_prompt(
             .map(str::to_string)
             .collect()
     };
-    for id in acks.as_deref().map(valid).unwrap_or_default() {
-        hub.ack(
-            &id,
-            &pane_id,
-            agent_id,
-            crate::inbox::AckHow::PromptObserved,
-        );
-    }
     let ids = valid(&ids);
     let listed = hub.list(&pane_id);
     let subject = ids.iter().find_map(|id| {
@@ -401,6 +395,41 @@ mod tests {
         }
     }
 
+    /// PR #1735 second review: a raw event is not admitted by process, so an
+    /// acknowledgement named in its metadata settles nothing. The label still
+    /// comes from the ids it names.
+    #[test]
+    fn a_raw_events_acknowledgement_ids_settle_nothing() {
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::parse("k3xzq2ab").unwrap(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        let id = hub
+            .post_direct(
+                crate::inbox::Recipient::bound("p", "a"),
+                crate::inbox::Content::from_deck("seed", "task", "body"),
+            )
+            .unwrap();
+        let mut event = event_with(
+            &[
+                (DECK_MESSAGE_IDS_METADATA_KEY, id.as_str()),
+                (DECK_MESSAGE_ACK_IDS_METADATA_KEY, id.as_str()),
+            ],
+            "p",
+        );
+        stamp_deck_message_prompt(&mut event, Some("a"), &hub);
+        assert_eq!(event.user_prompt.as_deref(), Some("✉ task"));
+        assert!(
+            !event
+                .metadata
+                .contains_key(DECK_MESSAGE_ACK_IDS_METADATA_KEY)
+        );
+        let listed = hub.list("p");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, crate::inbox::StateName::Queued);
+    }
+
     /// Hardening L1: the card label `✉ <subject>` carries no control, bidi or
     /// invisible character from the subject.
     #[test]
@@ -456,12 +485,17 @@ mod tests {
             opened: vec![ID.into(), OTHER.into()],
             rung: vec![],
         };
-        mark_event(&mut event, &ids, &[OTHER.to_string()]);
+        let to_ack = mark_event(&mut event, &ids, &[OTHER.to_string()]);
         assert_eq!(event.user_prompt, None);
         assert_eq!(
             event.metadata[DECK_MESSAGE_IDS_METADATA_KEY],
             format!("{OTHER},{ID}")
         );
-        assert_eq!(event.metadata[DECK_MESSAGE_ACK_IDS_METADATA_KEY], ID);
+        assert_eq!(to_ack, vec![ID.to_string()]);
+        assert!(
+            !event
+                .metadata
+                .contains_key(DECK_MESSAGE_ACK_IDS_METADATA_KEY)
+        );
     }
 }

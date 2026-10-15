@@ -948,6 +948,9 @@ pub struct Inbox {
     /// Publish and offer times per sending agent, inside the rate window.
     rate: HashMap<String, VecDeque<Instant>>,
     events: Vec<InboxEvent>,
+    /// PR #1735 second review: room held for answers the deck has promised
+    /// ([`Self::reserve_reply`]), which every other post counts as taken.
+    reserved_replies: usize,
 }
 
 impl Inbox {
@@ -960,6 +963,7 @@ impl Inbox {
             dedup_state: HashMap::new(),
             rate: HashMap::new(),
             events: Vec::new(),
+            reserved_replies: 0,
         }
     }
 
@@ -990,8 +994,9 @@ impl Inbox {
         Ok(())
     }
 
-    /// The refusal [`Self::post_reply`] would give `content` now, without
-    /// posting it.
+    /// The refusal a post of `content` would get now whoever it is for: its
+    /// body, its id and the deck's room. A new agent's first prompt is
+    /// admitted with it before the agent starts ([`crate::spawn::admit_seed`]).
     pub fn admit_reply(&mut self, now: Instant, content: &Content) -> Result<(), PostError> {
         self.expire_dedup(now);
         self.check_body(content)?;
@@ -1010,18 +1015,46 @@ impl Inbox {
         Ok(self.insert_direct(now, to, content))
     }
 
-    /// PR #1735 review: post the deck's answer to a request `to` made itself
-    /// (a dispatch's result). It is admitted as [`Self::post_direct`] admits a
-    /// message, except that the recipient's own backlog does not refuse it:
-    /// one answer per request the recipient sent is bounded by its requests,
-    /// and the deck-wide bound still applies.
-    pub fn post_reply(
+    /// PR #1735 second review: hold room for one answer the deck owes a
+    /// request it is accepting (a dispatch's result), so posts that arrive
+    /// while the request runs cannot take it. Refused when the deck has no
+    /// room now. Given back by [`Self::post_reserved_reply`] or
+    /// [`Self::release_reply`].
+    pub fn reserve_reply(&mut self) -> Result<(), PostError> {
+        self.check_room(1)?;
+        self.reserved_replies += 1;
+        Ok(())
+    }
+
+    /// Give back one reservation [`Self::reserve_reply`] made, unused.
+    pub fn release_reply(&mut self) {
+        self.reserved_replies = self.reserved_replies.saturating_sub(1);
+    }
+
+    /// The refusal [`Self::post_reserved_reply`] would give `content` now: its
+    /// body and id only, since the reservation is its room.
+    pub fn admit_reserved_reply(
+        &mut self,
+        now: Instant,
+        content: &Content,
+    ) -> Result<(), PostError> {
+        self.expire_dedup(now);
+        self.check_body(content)?;
+        self.check_id(content.id.as_ref())
+    }
+
+    /// Post the answer one [`Self::reserve_reply`] held room for, to `to`,
+    /// using that reservation. Neither the recipient's own backlog nor the
+    /// deck-wide bound refuses it; its body and id are checked as any post's
+    /// are, and a refusal leaves the reservation held.
+    pub fn post_reserved_reply(
         &mut self,
         now: Instant,
         to: Recipient,
         content: Content,
     ) -> Result<MessageId, PostError> {
-        self.admit_reply(now, &content)?;
+        self.admit_reserved_reply(now, &content)?;
+        self.release_reply();
         Ok(self.insert_direct(now, to, content))
     }
 
@@ -1685,7 +1718,7 @@ impl Inbox {
     }
 
     fn check_room(&self, needed: usize) -> Result<(), PostError> {
-        if self.live_count() + needed > self.limits.max_messages {
+        if self.live_count() + self.reserved_replies + needed > self.limits.max_messages {
             return Err(PostError::DeckFull {
                 limit: self.limits.max_messages,
             });

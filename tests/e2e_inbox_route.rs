@@ -655,3 +655,39 @@ fn route_011_an_ack_after_the_not_reached_notice_corrects_the_orchestrator_once(
     );
     assert_eq!(corrections(), 1);
 }
+
+/// Scenario: Start an agent with a seed too long to hand over whole while neither the agent's directory nor the deck's state directory can take the file the deck saves it to. The start must answer an error saying the first prompt was refused, and no agent may be left running without its task.
+#[spec("inbox/route/012")]
+#[test]
+fn route_012_a_start_whose_seed_cannot_be_posted_leaves_no_agent() {
+    let daemon = daemon_unbound(&[]);
+    let cwd = daemon.home.join("unsavable");
+    std::fs::create_dir_all(&cwd).unwrap();
+    // A file where each spill directory's `.dot-agent-deck/` would go, so the
+    // seed passes admission (its size and the deck's room) and then cannot be
+    // saved once the agent has started.
+    std::fs::write(cwd.join(".dot-agent-deck"), b"not a directory").unwrap();
+    let state_dir = daemon.schedules_path.parent().unwrap().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(state_dir.join(".dot-agent-deck"), b"not a directory").unwrap();
+    let seed = format!("ROUTE-012-UNSAVABLE-SEED {}", "x".repeat(64 * 1024));
+    let reply = attach(
+        &daemon,
+        json!({"op":"start-agent", "command":"exec /bin/cat", "cwd":cwd, "rows":24,
+        "cols":100, "env":[["DOT_AGENT_DECK_PANE_ID","unsavable"]],
+        "display_name":"unsavable", "seed":seed}),
+    );
+    assert_eq!(reply["ok"], false, "a start that lost its seed: {reply}");
+    assert!(
+        reply.to_string().contains("first prompt"),
+        "the refusal names the first prompt: {reply}"
+    );
+    let agents = || attach(&daemon, json!({"op":"list-agents"}));
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            !agents().to_string().contains("unsavable")
+        }),
+        "no agent may stay without its task: {}",
+        agents()
+    );
+}

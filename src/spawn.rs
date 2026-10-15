@@ -1421,7 +1421,7 @@ async fn roll_back_partial_orchestration(
 /// The teardown [`roll_back_partial_orchestration`] runs, for any agents a
 /// spawn started and must not leave running: the `StopAgent` close protocol
 /// for each of `started`. Best-effort, as that function describes.
-async fn close_started_agents(
+pub(crate) async fn close_started_agents(
     registry: &Arc<AgentPtyRegistry>,
     state: Option<&crate::state::SharedState>,
     started: &[SpawnedAgent],

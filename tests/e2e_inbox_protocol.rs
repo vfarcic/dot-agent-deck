@@ -777,6 +777,170 @@ fn inbox_protocol_015_a_process_outside_the_agent_cannot_take_its_mail() {
     state(&daemon, &pane, &id, "acknowledged");
 }
 
+/// Scenario: With the daemon binding inbox components to the pane's agent, a process outside the pane sends a raw hook event with the pane's own token that names the agent's queued task as a prompt it observed. The task must stay Queued; the real Claude hook, run inside the pane for a prompt carrying that task's block, then acknowledges it.
+#[spec("inbox/protocol/016")]
+#[test]
+fn inbox_protocol_016_a_raw_event_from_outside_the_agent_acknowledges_nothing() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let script = daemon.home.join("hook.sh");
+    std::fs::write(&script, "#!/bin/sh\nwhile [ ! -f hook-go ]; do sleep 0.05; done\n\"$INBOX_TEST_BIN\" hook --agent claude-code < prompt.json > hook.stdout 2> hook.stderr\nprintf '%s' \"$?\" > hook.exit\nexec /bin/cat\n").unwrap();
+    // Quote only fixture-owned paths; the binary path contains no shell code.
+    let command = format!(
+        "INBOX_TEST_BIN='{}' /bin/sh '{}'",
+        env!("CARGO_BIN_EXE_dot-agent-deck").replace('\'', "'\\''"),
+        script.display()
+    );
+    let pane = pane(&daemon, "bound-event", &command);
+    let id = enqueue(&daemon, &pane);
+    let event = json!({"session_id":"outside", "agent_type":"claude_code",
+        "event_type":"thinking", "timestamp":chrono::Utc::now(), "pane_id":pane.id,
+        "agent_id":pane.agent, "token":pane.token,
+        "metadata":{"deck_message_ids":id, "deck_message_ack_ids":id}});
+    // One connection reads its lines in order, so the listing that follows the
+    // event on the same connection answers after the event was ingested.
+    let mut socket = connect(&daemon, &event);
+    let mut list = request(&pane, "inbox_list");
+    list["all"] = json!(false);
+    writeln!(socket.get_mut(), "{list}").unwrap();
+    let after_event = line(&mut socket);
+    assert!(after_event["messages"].is_array(), "{after_event}");
+    state(&daemon, &pane, &id, "queued");
+    let prompt = format!(
+        "<task-notification>[dot-agent-deck message {id} from deck]\n{BODY}\n[end of dot-agent-deck message {id}]</task-notification>"
+    );
+    std::fs::write(
+        daemon.home.join("prompt.json"),
+        json!({"session_id":"in-pane", "hook_event_name":"UserPromptSubmit",
+            "prompt":prompt, "cwd":daemon.home})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(daemon.home.join("hook-go"), b"go").unwrap();
+    assert!(
+        common::wait_until(WAIT, || std::fs::read_to_string(
+            daemon.home.join("hook.exit")
+        )
+        .is_ok_and(|text| !text.is_empty())),
+        "the in-pane hook must complete"
+    );
+    let stderr = std::fs::read_to_string(daemon.home.join("hook.stderr")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(daemon.home.join("hook.exit")).unwrap(),
+        "0",
+        "in-pane hook stderr: {stderr}"
+    );
+    let latest = RefCell::new(Value::Null);
+    assert!(
+        common::wait_until(WAIT, || {
+            *latest.borrow_mut() = listing(&daemon, &pane);
+            latest.borrow()["messages"]
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("acknowledged")
+        }),
+        "the in-pane hook must acknowledge the observed task: {}",
+        latest.borrow()
+    );
+    state(&daemon, &pane, &id, "acknowledged");
+}
+
+/// A hook-socket connection made by a process that has exited and been reaped
+/// by the time the daemon reads it: a child of this test process connects a
+/// socket this process created, then exits, and this process keeps using it.
+/// The kernel still reports the child as the peer, and its ancestry can no
+/// longer be read.
+fn connect_from_an_exited_process(path: &Path) -> BufReader<UnixStream> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: plain syscalls on values this function owns. The forked child
+    // calls only `connect` and `_exit`, both async-signal-safe.
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() < addr.sun_path.len(), "socket path too long");
+        for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+            *dst = *src as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let child = libc::fork();
+        if child == 0 {
+            let rc = libc::connect(fd, &addr as *const _ as *const libc::sockaddr, len);
+            libc::_exit(if rc == 0 { 0 } else { 1 });
+        }
+        assert!(child > 0, "fork: {}", std::io::Error::last_os_error());
+        let mut status = 0;
+        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the child's connect failed"
+        );
+        let socket = UnixStream::from_raw_fd(fd);
+        socket.set_read_timeout(Some(WAIT)).unwrap();
+        socket.set_write_timeout(Some(WAIT)).unwrap();
+        BufReader::new(socket)
+    }
+}
+
+/// Scenario: With the daemon binding inbox components to the pane's agent, a connection whose creator exited before it is used presents the pane's own token and tries to fetch, acknowledge and get-seed the agent's queued task. The daemon can no longer read who made the connection, so each is refused and the task stays Queued.
+#[spec("inbox/protocol/017")]
+#[test]
+fn inbox_protocol_017_a_connection_of_unknown_ancestry_cannot_take_mail() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let pane = pane(&daemon, "bound-unknown", "exec /bin/cat");
+    let id = enqueue(&daemon, &pane);
+    let send = |request: &Value| -> Value {
+        let mut socket = connect_from_an_exited_process(&daemon.hook_socket);
+        writeln!(socket.get_mut(), "{request}").unwrap();
+        line(&mut socket)
+    };
+    let mut fetch = request(&pane, "inbox_fetch");
+    fetch["consumer"] = json!("cli");
+    fetch["ack"] = json!(true);
+    let reply = send(&fetch);
+    assert_eq!(
+        reply["refused"], "inbox_not_agent_process",
+        "fetch: {reply}"
+    );
+    assert!(reply.get("messages").is_none_or(Value::is_null), "{reply}");
+    let mut ack = request(&pane, "ack");
+    ack["delivery_id"] = json!(id);
+    let reply = send(&ack);
+    assert_eq!(reply["reason"], "inbox_not_agent_process", "ack: {reply}");
+    let mut wait = request(&pane, "inbox_wait");
+    wait["component"] = json!("pi_extension");
+    wait["component_version"] = json!("synthetic");
+    wait["mode"] = json!("once");
+    let reply = send(&wait);
+    assert_eq!(reply["refused"], "inbox_not_agent_process", "wait: {reply}");
+    let reply = send(&request(&pane, "get_seed"));
+    assert!(reply["seed"].is_null(), "get_seed: {reply}");
+    state(&daemon, &pane, &id, "queued");
+}
+
+/// Scenario: Fill a deck that may hold one message, then have an agent pane ask it to dispatch a unit. The deck has no room for the dispatch's result, so it refuses the dispatch with deck_full instead of accepting it, and no unit is started.
+#[spec("inbox/protocol/018")]
+#[test]
+fn inbox_protocol_018_a_dispatch_the_deck_has_no_room_to_answer_is_refused() {
+    let daemon = daemon_with(&[("DOT_AGENT_DECK_INBOX_MAX_MESSAGES", "1")]);
+    let pane = pane(&daemon, "dispatcher", "exec /bin/cat");
+    enqueue(&daemon, &pane);
+    let mut dispatch = request(&pane, "dispatch");
+    dispatch["name"] = json!("no-room-unit");
+    dispatch["task"] = json!("must not start");
+    dispatch["timestamp"] = json!(chrono::Utc::now());
+    let reply = hook(&daemon, dispatch);
+    assert_eq!(reply["accepted"], false, "{reply}");
+    assert_eq!(reply["reason"], "deck_full", "{reply}");
+    let agents = attach(&daemon, json!({"op":"list-agents"}));
+    assert!(
+        !agents.to_string().contains("no-room-unit"),
+        "nothing may be dispatched: {agents}"
+    );
+}
+
 /// Scenario: Enqueue a task for a scripted agent pane and release it to run the real inbox fetch command using its injected identity. Its captured output must contain the session framing and complete message block; both the wire listing and inbox list CLI must show Acknowledged.
 #[spec("inbox/cli/001")]
 #[test]
@@ -964,4 +1128,107 @@ fn inbox_cli_004_non_delivery_replies_never_wake() {
             "non-delivery {reply:?} must stay quiet"
         );
     }
+}
+
+/// Run `cmd` against a synthetic hook endpoint at `path` and record every
+/// request line it sends, answering each with `reply` (no answer for `None`).
+fn record_requests(
+    cmd: &mut Command,
+    stdin: &[u8],
+    path: &Path,
+    reply: impl Fn(&Value) -> Option<Value>,
+) -> (Output, Vec<Value>) {
+    let listener = UnixListener::bind(path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let child = BoundedChild::start(cmd.env("DOT_AGENT_DECK_SOCKET", path), stdin);
+    let requests = RefCell::new(Vec::new());
+    let serve = |socket: UnixStream| {
+        socket.set_nonblocking(false).unwrap();
+        socket.set_read_timeout(Some(WAIT)).unwrap();
+        let mut socket = BufReader::new(socket);
+        loop {
+            let mut text = String::new();
+            match socket.read_line(&mut text) {
+                Ok(n) if n > 0 => {}
+                _ => break,
+            }
+            let request: Value = serde_json::from_str(&text).expect("a JSON request line");
+            if let Some(answer) = reply(&request) {
+                let _ = writeln!(socket.get_mut(), "{answer}");
+            }
+            requests.borrow_mut().push(request);
+        }
+    };
+    assert!(common::wait_until(WAIT, || {
+        while let Ok((socket, _)) = listener.accept() {
+            serve(socket);
+        }
+        child.finished()
+    }));
+    while let Ok((socket, _)) = listener.accept() {
+        serve(socket);
+    }
+    (child.output(), requests.into_inner())
+}
+
+/// Scenario: Point the doorbell fetch an agent-side component runs (`inbox fetch --json --doorbell <id>`), and the Claude hook a doorbell-started prompt runs, at a synthetic hook endpoint that lists the named message as queued. Each must ask the deck for the fetch in one request that names the doorbell's message, never list the inbox and then fetch without that restriction.
+#[spec("inbox/cli/005")]
+#[test]
+fn inbox_cli_005_a_doorbell_fetch_names_its_message_in_the_one_request() {
+    let daemon = daemon();
+    let pane = pane(&daemon, "doorbell-bound", "exec /bin/cat");
+    let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+    let block = format!(
+        "[dot-agent-deck message {id} from the orchestrator]\nwork\n[end of dot-agent-deck message {id}]"
+    );
+    let reply = |request: &Value| match request["message_type"].as_str() {
+        Some("inbox_fetch") => Some(json!({"messages":[{"id":id, "subject":"task",
+            "from":"the orchestrator", "text":block}]})),
+        Some("inbox_list") => Some(json!({"messages":[{"id":id, "state":"queued",
+            "subject":"task"}], "armed":0})),
+        Some("ack") => Some(json!({"kind":"signal_ack", "accepted":true,
+            "delivery":"acknowledged"})),
+        _ => None,
+    };
+    let (output, requests) = record_requests(
+        &mut cli(
+            &daemon,
+            Some(&pane),
+            &["inbox", "fetch", "--json", "--doorbell", id],
+        ),
+        b"",
+        &daemon.home.join("doorbell-cli.sock"),
+        reply,
+    );
+    success(&output);
+    assert_eq!(requests.len(), 1, "one request: {requests:?}");
+    assert_eq!(requests[0]["message_type"], "inbox_fetch", "{requests:?}");
+    assert_eq!(requests[0]["doorbell"], id, "{requests:?}");
+    assert_eq!(requests[0]["ack"], false, "{requests:?}");
+    let line = format!(" dot-agent-deck: message {id} waiting, run: dot-agent-deck inbox fetch");
+    let prompt = json!({"session_id":"doorbell-hook", "hook_event_name":"UserPromptSubmit",
+        "prompt":line, "cwd":daemon.home})
+    .to_string();
+    let (output, requests) = record_requests(
+        &mut cli(&daemon, Some(&pane), &["hook", "--agent", "claude-code"]),
+        prompt.as_bytes(),
+        &daemon.home.join("doorbell-hook.sock"),
+        reply,
+    );
+    success(&output);
+    let fetches: Vec<&Value> = requests
+        .iter()
+        .filter(|r| r["message_type"] == "inbox_fetch")
+        .collect();
+    assert_eq!(fetches.len(), 1, "{requests:?}");
+    assert_eq!(fetches[0]["doorbell"], id, "{requests:?}");
+    assert!(
+        !requests.iter().any(|r| r["message_type"] == "inbox_list"),
+        "{requests:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("work"),
+        "the hook hands the fetched block over: {:?}",
+        output
+    );
 }

@@ -397,6 +397,29 @@ struct LateAck {
     at: Instant,
 }
 
+/// PR #1735 second review: room [`InboxHub::reserve_reply`] holds in the
+/// deck for one answer it owes. Dropped unused, it gives the room back.
+#[must_use = "the room is given back as soon as the reservation drops"]
+pub struct ReplyReservation {
+    hub: Option<Arc<InboxHub>>,
+}
+
+impl Drop for ReplyReservation {
+    fn drop(&mut self) {
+        if let Some(hub) = self.hub.take() {
+            hub.lock().inbox.release_reply();
+        }
+    }
+}
+
+impl std::fmt::Debug for ReplyReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplyReservation")
+            .field("held", &self.hub.is_some())
+            .finish()
+    }
+}
+
 /// The daemon's inbox and the components armed on it. See the module docs.
 pub struct InboxHub {
     state: Mutex<HubState>,
@@ -567,6 +590,11 @@ impl InboxHub {
         self.lock().inbox.deck().clone()
     }
 
+    /// The bounds this inbox applies.
+    pub fn limits(&self) -> crate::inbox::InboxLimits {
+        self.lock().inbox.limits().clone()
+    }
+
     pub fn keepalive(&self) -> Duration {
         self.keepalive
     }
@@ -577,7 +605,8 @@ impl InboxHub {
         self.lock().inbox.admit_direct(Instant::now(), to, content)
     }
 
-    /// The refusal [`Self::post_reply`] would give `content` now.
+    /// [`Inbox::admit_reply`]: the refusal a post of `content` would get now
+    /// whoever it is for.
     pub fn admit_reply(&self, content: &Content) -> Result<(), PostError> {
         self.lock().inbox.admit_reply(Instant::now(), content)
     }
@@ -614,11 +643,38 @@ impl InboxHub {
         self.post_with(to, content, Inbox::post_direct)
     }
 
-    /// [`Inbox::post_reply`]: the deck's answer to a request `to` made, which
-    /// the recipient's own backlog does not refuse. Handed to an armed waiter
-    /// as [`Self::post_direct`] hands a message.
-    pub fn post_reply(&self, to: Recipient, content: Content) -> Result<MessageId, PostError> {
-        self.post_with(to, content, Inbox::post_reply)
+    /// PR #1735 second review: [`Inbox::reserve_reply`], held until the
+    /// answer is posted with [`Self::post_reserved_reply`] or the returned
+    /// reservation is dropped.
+    pub fn reserve_reply(self: &Arc<Self>) -> Result<ReplyReservation, PostError> {
+        self.lock().inbox.reserve_reply()?;
+        Ok(ReplyReservation {
+            hub: Some(Arc::clone(self)),
+        })
+    }
+
+    /// [`Inbox::admit_reserved_reply`]: the refusal posting `content` under a
+    /// reservation would get now. Run before anything is saved for the post.
+    pub fn admit_reserved_reply(&self, content: &Content) -> Result<(), PostError> {
+        self.lock()
+            .inbox
+            .admit_reserved_reply(Instant::now(), content)
+    }
+
+    /// [`Inbox::post_reserved_reply`]: the deck's answer to a request `to`
+    /// made, posted into the room `reservation` held. Handed to an armed
+    /// waiter as [`Self::post_direct`] hands a message. A refusal gives the
+    /// room back when `reservation` drops.
+    pub fn post_reserved_reply(
+        &self,
+        mut reservation: ReplyReservation,
+        to: Recipient,
+        content: Content,
+    ) -> Result<MessageId, PostError> {
+        let id = self.post_with(to, content, Inbox::post_reserved_reply)?;
+        // The post used the reservation's room.
+        reservation.hub = None;
+        Ok(id)
     }
 
     fn post_with(
@@ -2446,25 +2502,27 @@ pub fn post_to_live(
     to: Recipient,
     content: Content,
 ) -> Result<MessageId, String> {
-    post_live(registry, to, content, false)
+    post_live(registry, to, content, None)
 }
 
-/// PR #1735 review: [`post_to_live`] for the deck's answer to a request the
-/// agent made itself ([`InboxHub::post_reply`]), which the agent's own backlog
-/// does not refuse.
-pub fn post_reply_to_live(
+/// PR #1735 second review: [`post_to_live`] for the deck's answer to a
+/// request the agent made itself, into the room `reservation` held for it
+/// ([`InboxHub::post_reserved_reply`]): neither the agent's own backlog nor
+/// the deck-wide bound refuses it.
+pub fn post_reserved_reply_to_live(
     registry: &crate::agent_pty::AgentPtyRegistry,
+    reservation: ReplyReservation,
     to: Recipient,
     content: Content,
 ) -> Result<MessageId, String> {
-    post_live(registry, to, content, true)
+    post_live(registry, to, content, Some(reservation))
 }
 
 fn post_live(
     registry: &crate::agent_pty::AgentPtyRegistry,
     to: Recipient,
     content: Content,
-    reply: bool,
+    reservation: Option<ReplyReservation>,
 ) -> Result<MessageId, String> {
     if let Some(agent) = to.agent_id.as_deref()
         && registry.pane_current_agent_id(&to.pane_id).as_deref() != Some(agent)
@@ -2478,18 +2536,17 @@ fn post_live(
     // Audit F2: refused before the body is saved, and the saved body removed
     // again if the post is refused after all.
     let hub = registry.inbox();
-    if reply {
-        hub.admit_reply(&content)
+    if reservation.is_some() {
+        hub.admit_reserved_reply(&content)
     } else {
         hub.admit_direct(&to, &content)
     }
     .map_err(|error| error.to_string())?;
     let dirs = spill_dirs(registry, &to.pane_id, to.agent_id.as_deref());
     let spill = retain_full_body_minted(&hub.deck(), &to.pane_id, &mut content, &dirs)?;
-    let id = if reply {
-        hub.post_reply(to, content)
-    } else {
-        hub.post_direct(to, content)
+    let id = match reservation {
+        Some(reservation) => hub.post_reserved_reply(reservation, to, content),
+        None => hub.post_direct(to, content),
     }
     .map_err(|error| error.to_string())?;
     spill.keep();
@@ -2959,6 +3016,44 @@ mod tests {
             .is_ok(),
             "a successor generation pins its own receiver"
         );
+    }
+
+    /// PR #1735 second review: a reserved answer's room is the deck's last
+    /// slot as far as every other post can tell, the answer goes into it, and
+    /// a reservation dropped unused gives it back.
+    #[test]
+    fn a_reserved_answer_keeps_its_room_until_posted_or_dropped() {
+        let limits = InboxLimits {
+            max_messages: 3,
+            ..InboxLimits::default()
+        };
+        let hub = Arc::new(InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE));
+        let full = |result: Result<MessageId, PostError>| {
+            matches!(result, Err(PostError::DeckFull { .. }))
+        };
+        hub.post_direct(Recipient::bound("p", "a"), content("first"))
+            .unwrap();
+        let answer_room = hub.reserve_reply().unwrap();
+        let spare_room = hub.reserve_reply().unwrap();
+        assert!(full(
+            hub.post_direct(Recipient::bound("q", "b"), content("taken"))
+        ));
+        assert!(matches!(
+            hub.reserve_reply(),
+            Err(PostError::DeckFull { .. })
+        ));
+        drop(spare_room);
+        hub.post_direct(Recipient::bound("q", "b"), content("second"))
+            .unwrap();
+        assert!(full(
+            hub.post_direct(Recipient::bound("q", "b"), content("third"))
+        ));
+        hub.post_reserved_reply(answer_room, Recipient::bound("p", "a"), content("answer"))
+            .unwrap();
+        assert_eq!(hub.list("p").len(), 2);
+        assert!(full(
+            hub.post_direct(Recipient::bound("q", "b"), content("fourth"))
+        ));
     }
 
     /// PRD #1666 §2.8: a message handed over the most times allowed, none

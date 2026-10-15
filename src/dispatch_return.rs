@@ -357,13 +357,15 @@ pub fn dispatch_reason(unit_name: &str) -> String {
 
 /// PRD #1666 S5: post a dispatch's acknowledgement to the inbox of the caller
 /// generation that asked for it, under a subject that says whether the
-/// dispatch started a unit. It answers the caller's own request, so a backlog
-/// in the caller's inbox does not refuse it (PR #1735 review,
-/// [`crate::inbox_hub::post_reply_to_live`]). A refusal — the caller has
-/// exited, the deck holds the most messages it may — stays in the daemon log:
-/// nothing is retried into whoever holds the pane now.
+/// dispatch started a unit, into the room `reservation` held for it since the
+/// daemon accepted the dispatch (PR #1735 second review,
+/// [`crate::inbox_hub::post_reserved_reply_to_live`]): neither a backlog in the
+/// caller's inbox nor a deck that filled up while the dispatch ran refuses it.
+/// A refusal — the caller has exited, so nobody is left to tell — stays in the
+/// daemon log: nothing is retried into whoever holds the pane now.
 pub fn post_dispatch_result(
     registry: &crate::agent_pty::AgentPtyRegistry,
+    reservation: crate::inbox_hub::ReplyReservation,
     caller_pane_id: &str,
     caller_agent_id: &str,
     unit_name: &str,
@@ -376,8 +378,9 @@ pub fn post_dispatch_result(
         "dispatch failed"
     };
     let content = crate::inbox::Content::from_deck(dispatch_reason(unit_name), subject, message);
-    match crate::inbox_hub::post_reply_to_live(
+    match crate::inbox_hub::post_reserved_reply_to_live(
         registry,
+        reservation,
         crate::inbox::Recipient::bound(caller_pane_id, caller_agent_id),
         content,
     ) {
@@ -926,8 +929,13 @@ mod tests {
                 )
                 .expect("fill the caller's inbox");
         }
+        let reservation = registry
+            .inbox()
+            .reserve_reply()
+            .expect("room for the result");
         post_dispatch_result(
             &registry,
+            reservation,
             "full-caller",
             &agent,
             "probe-unit",
@@ -940,6 +948,75 @@ mod tests {
             "the dispatch result must be queued for its caller"
         );
         registry.shutdown_all();
+    }
+
+    /// PR #1735 second review: a dispatch's result reaches its caller even
+    /// when the whole deck filled up while the dispatch ran.
+    #[cfg(unix)]
+    #[test]
+    fn a_dispatch_result_reaches_its_caller_when_the_deck_filled_meanwhile() {
+        use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+        let registry = std::sync::Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "deck-full-caller".to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        // The daemon holds the result's room when it accepts the dispatch.
+        let reservation = registry
+            .inbox()
+            .reserve_reply()
+            .expect("room for the result");
+        let limits = registry.inbox().limits();
+        let mut posted = 0;
+        'fill: for pane in 0.. {
+            let to = crate::inbox::Recipient::bound(format!("filler-{pane}"), "filler");
+            for n in 0..limits.max_per_recipient {
+                if posted + 1 == limits.max_messages {
+                    break 'fill;
+                }
+                registry
+                    .inbox()
+                    .post_direct(
+                        to.clone(),
+                        crate::inbox::Content::from_deck("test", format!("filler {n}"), "x"),
+                    )
+                    .expect("fill the deck");
+                posted += 1;
+            }
+        }
+        assert!(
+            registry
+                .inbox()
+                .post_direct(
+                    crate::inbox::Recipient::bound("one-more", "filler"),
+                    crate::inbox::Content::from_deck("test", "one more", "x"),
+                )
+                .is_err(),
+            "the deck is full, the reserved room included"
+        );
+        post_dispatch_result(
+            &registry,
+            reservation,
+            "deck-full-caller",
+            &agent,
+            "probe-unit",
+            true,
+            "dispatched probe-unit",
+        );
+        let subjects: Vec<String> = registry
+            .inbox()
+            .list("deck-full-caller")
+            .into_iter()
+            .map(|m| m.subject)
+            .collect();
+        registry.shutdown_all();
+        assert_eq!(subjects, vec!["dispatch started".to_string()]);
     }
 
     /// PR #1735 review: a dispatch that started nothing is posted under a
@@ -959,8 +1036,13 @@ mod tests {
                 ..SpawnOptions::default()
             })
             .expect("spawn stand-in");
+        let reservation = registry
+            .inbox()
+            .reserve_reply()
+            .expect("room for the result");
         post_dispatch_result(
             &registry,
+            reservation,
             "failed-caller",
             &agent,
             "probe-unit",
