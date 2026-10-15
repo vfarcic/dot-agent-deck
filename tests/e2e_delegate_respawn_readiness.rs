@@ -366,7 +366,7 @@ fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
     assert!(!op.log().contains("doorbell rang"), "{}", op.evidence());
 }
 
-/// Scenario: Hold a real OpenCode replacement in its launcher while a genuine clear delegate queues its task, optionally for DOT_AGENT_DECK_TEST_OPENCODE_BOOT_DELAY_SECS. Release boot and require that replacement to consume the task once, visibly reply, append to the sentinel once, and acknowledge it without another respawn.
+/// Scenario: Hold a real OpenCode replacement in its launcher while a genuine clear delegate queues its task, optionally for DOT_AGENT_DECK_TEST_OPENCODE_BOOT_DELAY_SECS, checking that the task stays queued and its sentinel stays absent during the hold. Release boot and require that replacement to consume the task once, visibly reply, append to the sentinel once, and acknowledge it without another respawn.
 #[spec("orchestration/delegate/046")]
 #[test]
 #[cfg(unix)]
@@ -392,11 +392,20 @@ fn delegate_046_real_opencode_consumes_boot_queued_task_in_place() {
         })
         .unwrap_or(0);
     eprintln!("delegate-046: holding the real OpenCode replacement boot for {boot_delay}s");
-    std::thread::sleep(Duration::from_secs(boot_delay));
-    inbox::state(&op.deck, &op.pane, &id, "queued");
+    // Like inbox::unchanged, observe a forbidden change through the harness's
+    // bounded waiter. The scratch launcher stays gated until this hold ends.
     assert!(
-        !op.work.join(name).exists(),
-        "the queued action must not run before the real replacement boots"
+        !common::wait_until(Duration::from_secs(boot_delay), || {
+            let listing = inbox::listing(&op.deck, &op.pane);
+            let queued = listing["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["id"] == id && message["state"] == "queued");
+            !queued || op.work.join(name).exists()
+        }),
+        "the task must stay queued and its sentinel absent while replacement boot is held: {}",
+        inbox::listing(&op.deck, &op.pane)
     );
     std::fs::write(op.work.join("boot-release"), "").unwrap();
     op.done(&id, name);
