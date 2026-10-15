@@ -53,6 +53,53 @@ fn offer_message(deck: &common::TuiDeck, worker: &Pane) -> Option<Value> {
         .cloned()
 }
 
+/// Whether the orchestrator fetched the completion notice for offer `id`: a
+/// message whose subject is "job completed" and whose text names the job. Each
+/// line of `log` is one `inbox fetch --json` answer. The claim notice also names
+/// the job and asks the worker to "complete" it, so only the parsed subject
+/// tells the two apart.
+fn has_completion_notice(log: &str, id: &str) -> bool {
+    let job = format!("Job {id} ");
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|reply| reply["messages"].as_array().cloned())
+        .flatten()
+        .any(|m| {
+            m["subject"] == "job completed" && m["text"].as_str().is_some_and(|t| t.contains(&job))
+        })
+}
+
+/// The negative for offer/006's completion assertion: a log holding only the
+/// claim notice for the job, or a completion notice for another job, is not a
+/// completion notice for this one.
+#[test]
+fn offer_006_only_a_completion_notice_for_the_job_counts() {
+    let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+    let other = "m-k3xzq2ab-1111111111111111";
+    let notice = |subject: &str, job: &str, body: &str| {
+        json!({"messages":[{"id":"m-k3xzq2ab-2222222222222222", "subject":subject,
+            "from":"dot-agent-deck (daemon notice)",
+            "text":format!("[dot-agent-deck message m-k3xzq2ab-2222222222222222 from dot-agent-deck]\nJob {job} from pool \"review\" {body}\n[end of dot-agent-deck message m-k3xzq2ab-2222222222222222]")}]})
+        .to_string()
+    };
+    let claimed = notice(
+        "job claimed",
+        id,
+        "was claimed by a worker. It is theirs until they complete or release it, or the claim expires.",
+    );
+    assert!(!has_completion_notice(&claimed, id));
+    let elsewhere = notice("job completed", other, "was completed by a worker.");
+    assert!(!has_completion_notice(
+        &format!("{claimed}\n{elsewhere}"),
+        id
+    ));
+    let completed = notice("job completed", id, "was completed by a worker.");
+    assert!(has_completion_notice(
+        &format!("{claimed}\n{{\"messages\":[]}}\n{completed}"),
+        id
+    ));
+}
+
 fn evidence(deck: &common::TuiDeck, worker: &Pane, orchestrator: &Pane) -> String {
     format!(
         "worker={}\nofferer={}\nPane:\n{}\nGrid:\n{}\nOffer CLI: {:?}",
@@ -89,7 +136,7 @@ fn offer_006_live_haiku_claims_acts_completes_and_notifies_offerer() {
         // The stand-in orchestrator reads its own inbox with the real CLI, from
         // inside its pane, as an agent does: the deck refuses that from the
         // test process (inbox/protocol/015).
-        "while [ ! -f offer.go ]; do sleep 0.05; done\ndot-agent-deck inbox offer review --file offer-job.md --claim-ttl 30m > offer-cli.log 2>&1\nprintf '%s' \"$?\" > offer-cli.exit\nwhile :; do dot-agent-deck inbox fetch >> orchestrator-inbox.log 2>&1; sleep 0.5; done\n").unwrap();
+        "while [ ! -f offer.go ]; do sleep 0.05; done\ndot-agent-deck inbox offer review --file offer-job.md --claim-ttl 30m > offer-cli.log 2>&1\nprintf '%s' \"$?\" > offer-cli.exit\nwhile :; do dot-agent-deck inbox fetch --json >> orchestrator-inbox.jsonl 2>> orchestrator-inbox.err; sleep 0.5; done\n").unwrap();
     let orchestrator = pane(
         &deck,
         "orchestrator",
@@ -167,12 +214,13 @@ fn offer_006_live_haiku_claims_acts_completes_and_notifies_offerer() {
         evidence(&deck, &worker, &orchestrator)
     );
     assert!(
-        common::wait_until(BUDGET, || {
-            let notices = std::fs::read_to_string(deck.workdir().join("orchestrator-inbox.log"))
-                .unwrap_or_default();
-            notices.contains(&id) && notices.to_lowercase().contains("complet")
-        }),
-        "offerer must receive the completion notice for {id}; {}",
+        common::wait_until(BUDGET, || has_completion_notice(
+            &std::fs::read_to_string(deck.workdir().join("orchestrator-inbox.jsonl"))
+                .unwrap_or_default(),
+            &id
+        )),
+        "offerer must receive the completion notice for {id}; fetched: {:?}; {}",
+        std::fs::read_to_string(deck.workdir().join("orchestrator-inbox.jsonl")),
         evidence(&deck, &worker, &orchestrator)
     );
     assert!(

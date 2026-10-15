@@ -319,8 +319,56 @@ export default {id:'deck-test-route',tui:async(api)=>{
     }
     pub fn prior(&self) {
         self.prompt("Reply with only the number equal to 900 plus 27. Do not use tools.");
+        self.wait_answered("900 plus 27", "927");
         self.wait_screen("927");
         self.idle();
+        assert!(
+            common::wait_until(BUDGET, || self.route()["route"]["params"]["sessionID"]
+                .is_string()),
+            "OpenCode must show the prompt's session; {}",
+            self.evidence()
+        );
+    }
+    /// Wait until [`Self::answered`].
+    pub fn wait_answered(&self, asked: &str, answer: &str) {
+        assert!(
+            common::wait_until(BUDGET, || self.answered(asked, answer)),
+            "OpenCode must answer {answer:?} to the prompt asking {asked:?}; {}",
+            self.evidence()
+        );
+    }
+    /// Whether OpenCode's own transcript holds a completed reply containing
+    /// `answer` to a user prompt containing `asked`. A short answer on the
+    /// screen proves nothing on its own: OpenCode's footer shows the work
+    /// directory, whose name carries the test process's pid, and inbox/opencode/015
+    /// once found `927` there (`dad-tests-892758-…`) before its prompt had run.
+    pub fn answered(&self, asked: &str, answer: &str) -> bool {
+        let transcript = self.transcript();
+        let (Some(messages), Some(parts)) = (
+            transcript["message"].as_array(),
+            transcript["part"].as_array(),
+        ) else {
+            return false;
+        };
+        let text_of = |id: &Value| {
+            parts
+                .iter()
+                .filter(|p| p["message_id"] == *id && p["data"]["type"] == "text")
+                .filter_map(|p| p["data"]["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        messages
+            .iter()
+            .filter(|m| m["data"]["role"] == "user" && text_of(&m["id"]).contains(asked))
+            .any(|user| {
+                messages.iter().any(|m| {
+                    m["data"]["role"] == "assistant"
+                        && m["data"]["parentID"] == user["id"]
+                        && m["data"]["finish"] == "stop"
+                        && text_of(&m["id"]).contains(answer)
+                })
+            })
     }
     pub fn idle(&self) {
         assert!(

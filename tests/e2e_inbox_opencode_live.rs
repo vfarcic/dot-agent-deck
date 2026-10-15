@@ -132,6 +132,7 @@ fn opencode_019_live_child_view_navigates_to_root_for_delegate() {
     let mut input=op.input("Use the task tool once with subagent_type general and prompt: Reply with only the number equal to 700 plus 31, without tools. After it returns, reply with only the number equal to 900 plus 42.");
     op.wait_screen("subagent_type general");
     input.write("\r");
+    op.wait_answered("900 plus 42", "942");
     op.wait_screen("942");
     op.idle();
     let child = op.transcript()["session"]
