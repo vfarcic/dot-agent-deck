@@ -118,8 +118,9 @@ fn orchestration_dispatch_007_no_lane_two_source_routes_around_the_contained_dec
 /// `PATH`. The binary must be the build under test at a path outside the
 /// checkout, and the `PATH` must swap cargo's build directory for the contained
 /// one in place, drop a checkout directory that resolves inside the checkout,
-/// an outside symlink that resolves into it and every relative entry, and keep
-/// every other entry.
+/// an outside symlink that resolves into it and every relative entry, keep
+/// every other entry, and become the contained directory, never an empty
+/// `PATH`, when nothing is left.
 #[spec("orchestration/dispatch/008")]
 #[test]
 fn orchestration_dispatch_008_the_contained_link_and_path_keep_the_checkout_out() {
@@ -190,6 +191,23 @@ fn orchestration_dispatch_008_the_contained_link_and_path_keep_the_checkout_out(
         vec![outside.clone()],
         "every relative entry is dropped and the absolute one kept: {rewritten}"
     );
+
+    // When every entry is dropped the result is not the empty string: an
+    // empty `PATH` on unix searches the child's current directory, the very
+    // lookup dropping relative entries took away. It is the contained deck's
+    // directory instead, an absolute one holding nothing but the build under
+    // test.
+    let all_dropped = std::env::join_paths([inside.as_path(), Path::new("."), Path::new("bin")])
+        .expect("join a PATH with nothing to keep");
+    for path in [".".to_string(), all_dropped.to_string_lossy().into_owned()] {
+        let rewritten = common::contain_path(&path);
+        assert_eq!(
+            std::env::split_paths(&rewritten).collect::<Vec<_>>(),
+            vec![common::contained_deck_path_dir().to_path_buf()],
+            "{path:?} keeps no entry, so it becomes the contained deck's directory, \
+             never an empty PATH: {rewritten:?}"
+        );
+    }
 
     // An entry OUTSIDE the checkout that is a symlink into it — a
     // `~/bin/project-tools` pointing at `<checkout>/scripts` — reaches the

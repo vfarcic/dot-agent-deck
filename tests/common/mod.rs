@@ -5329,7 +5329,14 @@ fn is_inside_checkout(path: &Path) -> bool {
 ///   devbox shell's `<checkout>/.devbox/nix/profile/default/bin` is a symlink
 ///   into `/nix/store`, so `git`, `cargo` and every other tool it provides still
 ///   resolve;
-/// - everything else is kept as spelled, in order.
+/// - everything else is kept as spelled, in order;
+/// - when nothing is kept, the result is [`contained_deck_path_dir`] alone,
+///   never the empty string: an empty `PATH` on unix is one zero-length entry,
+///   which searches the child's current directory — the relative lookup this
+///   function drops. The contained directory is absolute and holds only the
+///   build under test, which every caller wants reachable by name anyway
+///   ([`path_with_binary_dir`] puts it first), so a lookup of anything else
+///   fails instead of reaching whatever the child's cwd holds.
 ///
 /// **This is pathname hygiene, not isolation.** It keeps the checkout out of
 /// what an agent reads in its `PATH` (`which dot-agent-deck`, `echo $PATH`) and
@@ -5363,6 +5370,9 @@ pub fn contain_path(path: &str) -> String {
         if kept.as_path() != deck_dir || !entries.iter().any(|e| e.as_path() == deck_dir) {
             entries.push(kept);
         }
+    }
+    if entries.is_empty() {
+        entries.push(deck_dir.to_path_buf());
     }
     std::env::join_paths(entries)
         .expect("PATH entries rejoin")
