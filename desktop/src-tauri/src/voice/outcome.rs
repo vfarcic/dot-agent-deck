@@ -1841,6 +1841,20 @@ const BARE_START_WORDS: [&str; 11] = [
 /// a target.
 fn asks_for_the_start_alone(transcript: &str, rows: &[&CommandRow]) -> bool {
     let mut rest = spoken_words(transcript);
+    let Some((at, width)) = the_action_occurrence(&rest, rows) else {
+        return false;
+    };
+    rest.drain(at..at + width);
+    rest.iter()
+        .all(|word| BARE_START_WORDS.contains(&word.as_str()))
+}
+
+/// Where in `words` the action is said, as `(start, width)`: the earliest
+/// occurrence of any of `rows`' `heard_as` entries, the longest of those
+/// starting there on a tie. ONE occurrence, so a second one — "Launch" in
+/// "start an agent on Launch" — is left to be read as what it names. `None`
+/// when no entry is heard, or a row grounds some other way.
+fn the_action_occurrence(words: &[String], rows: &[&CommandRow]) -> Option<(usize, usize)> {
     let mut action: Option<(usize, usize)> = None;
     for row in rows {
         let ActionGrounding::HeardAs(entries) = &row.grounding else {
@@ -1851,7 +1865,7 @@ fn asks_for_the_start_alone(transcript: &str, rows: &[&CommandRow]) -> bool {
             if wanted.is_empty() {
                 continue;
             }
-            let found = rest.windows(wanted.len()).position(|window| {
+            let found = words.windows(wanted.len()).position(|window| {
                 window
                     .iter()
                     .zip(&wanted)
@@ -1866,12 +1880,7 @@ fn asks_for_the_start_alone(transcript: &str, rows: &[&CommandRow]) -> bool {
             }
         }
     }
-    let Some((at, width)) = action else {
-        return false;
-    };
-    rest.drain(at..at + width);
-    rest.iter()
-        .all(|word| BARE_START_WORDS.contains(&word.as_str()))
+    action
 }
 
 /// Whether the user SAID `spoken` ([`said`]) in the words left once one
@@ -2613,12 +2622,16 @@ fn local_intercept(
 /// the row declares the other name itself, since that value is then the row's
 /// answer to a different param.
 ///
-/// And only when the user's words name the daemon the value stands for
+/// And only when the words beyond the ask carry lexical evidence for the
+/// daemon the value stands for, as the deck resolver reads them
 /// ([`names_the_daemon`]); otherwise the slot stays empty and the user is
 /// asked which daemon they meant, as before this recovery existed. A reply
 /// that left `deck` empty and carried "build box" under `daemon` for "select
-/// the tester" — what a steered answer looks like — is not the user naming
-/// the build box (PRD #1666 security re-check). This is narrower than the
+/// the tester" — what a steered answer looks like — has none (PRD #1666
+/// security re-check), and neither has "switch daemon" for a daemon labelled
+/// `Switch`. The evidence is words, not proof the user asked for that daemon:
+/// a name made of words the user said for another reason still passes
+/// ([`names_the_daemon`] lists what it does not tell apart). This is narrower than the
 /// rest of `switch_deck`, on purpose: a value in the row's OWN slot is the
 /// model's answer and is trusted as one, without being held against the
 /// transcript (issue #1491, `docs/develop/voice-first-design.md`); a value in
@@ -2653,42 +2666,100 @@ fn deck_in_the_other_slot<'a>(
         .filter(|value| names_the_daemon(value, transcript, row, decks))
 }
 
-/// Whether `transcript` names the daemon `value` stands for: every content
-/// word of `value` is said ([`said`]), or a run of up to three of the
-/// transcript's words resolves — by the row's own deck resolver, with its
-/// spoken names, host aliases and glued spellings — to a daemon `value`
-/// resolves to. Read only by [`deck_in_the_other_slot`].
+/// Whether the words beyond the ask name the daemon `value` stands for — the
+/// lexical and resolver evidence [`deck_in_the_other_slot`] requires, read
+/// only by it.
+///
+/// The ask is ONE occurrence of the row's action ([`the_action_occurrence`]),
+/// with a category word that follows it as the request's noun — "daemon" in
+/// "switch daemon", "the deck" in "change the deck" — so a daemon labelled
+/// `Switch` or `Select`, or one whose host is `daemon`, is not named by the
+/// words that asked for the switch. A second occurrence is left in: "switch to
+/// Switch" names it.
+///
+/// In what is left, the daemon is named when every content word of `value` is
+/// said ([`said`]), or when a run of up to three adjacent words resolves — by
+/// the row's own deck resolver, with its spoken names, host aliases and glued
+/// spellings — to exactly ONE daemon, one `value` resolves to. A run several
+/// daemons share is no evidence: "build" of "build box" does not name the
+/// build cache. And a WIDER run resolving to one other daemon outweighs it:
+/// "switch to build box" with a daemon labelled `build` and one `build box`
+/// does not name the first.
+///
+/// What it checks is words, not meaning. A daemon whose names are made of the
+/// utterance's other words — a label `To`, or one sharing a word the user said
+/// for another reason — can still be read as named, and a name the resolver
+/// does not reach (one said in a way none of its spellings match) is not.
 fn names_the_daemon(value: &str, transcript: &str, row: &CommandRow, decks: &[VoiceDeck]) -> bool {
-    if said(value, transcript) {
-        return true;
-    }
-    let resolve = |spoken: &str| -> Vec<String> {
-        let matched = if row.id == SWITCH_DECK_ROW {
+    let words = spoken_words(transcript);
+    let segments: Vec<&[String]> = match the_action_occurrence(&words, &[row]) {
+        Some((at, width)) => {
+            let mut end = at + width;
+            let nouns = ["daemon", "daemons", "deck", "decks", "demon", "demons"];
+            let articles = words[end..]
+                .iter()
+                .take_while(|word| ["the", "a", "an"].contains(&word.as_str()))
+                .count();
+            if words
+                .get(end + articles)
+                .is_some_and(|word| nouns.contains(&word.as_str()))
+            {
+                end += articles + 1;
+            }
+            vec![&words[..at], &words[end..]]
+        }
+        None => vec![&words[..]],
+    };
+    let resolve = |spoken: &str| -> DeckRefMatch {
+        if row.id == SWITCH_DECK_ROW {
             resolve_deck_ref(spoken, decks)
         } else {
             resolve_new_agent_deck_ref(spoken, decks)
-        };
-        match matched {
-            DeckRefMatch::One { id, .. } => vec![id],
-            DeckRefMatch::Ambiguous(candidates) => candidates
-                .into_iter()
-                .map(|candidate| candidate.value)
-                .collect(),
-            DeckRefMatch::None => Vec::new(),
         }
     };
-    let meant = resolve(value);
-    if meant.is_empty() {
-        return false;
-    }
-    let words = spoken_words(transcript);
-    (1..=3).any(|width| {
-        words.windows(width).any(|window| {
-            resolve(&window.join(" "))
-                .iter()
-                .any(|id| meant.contains(id))
+    let meant: Vec<String> = match resolve(value) {
+        DeckRefMatch::One { id, .. } => vec![id],
+        DeckRefMatch::Ambiguous(candidates) => candidates
+            .into_iter()
+            .map(|candidate| candidate.value)
+            .collect(),
+        DeckRefMatch::None => Vec::new(),
+    };
+    let named: Vec<(usize, String)> = segments
+        .iter()
+        .flat_map(|segment| {
+            (1..=3).flat_map(move |width| {
+                segment
+                    .windows(width)
+                    .map(move |window| (width, window.join(" ")))
+            })
         })
-    })
+        .filter_map(|(width, run)| match resolve(&run) {
+            DeckRefMatch::One { id, .. } => Some((width, id)),
+            _ => None,
+        })
+        .collect();
+    let rest = segments
+        .iter()
+        .map(|segment| segment.join(" "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let evidence = if said(value, &rest) {
+        spoken_words(value).len()
+    } else {
+        match named
+            .iter()
+            .filter(|(_, id)| meant.contains(id))
+            .map(|(width, _)| *width)
+            .max()
+        {
+            Some(width) => width,
+            None => return false,
+        }
+    };
+    !named
+        .iter()
+        .any(|(width, id)| *width > evidence && !meant.contains(id))
 }
 
 /// Whether the whole utterance, less an edge politeness word, is one of
@@ -6926,6 +6997,86 @@ mod tests {
         let outcome = run(&optional, Screen::Overview, &fleet(), "new agent").await;
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: with a daemon labelled `Switch` or `Select`, or one whose host
+    /// is `daemon`, the user says "switch daemon" or "select the tester" and
+    /// the model leaves `deck` empty with that daemon under `daemon`. The word
+    /// that asked for the switch is not the user naming a daemon, so the user
+    /// is asked which daemon they meant; "switch to Switch", which says the
+    /// name a second time, switches to it. With `build box` and `build cache`
+    /// both observed, "switch daemon to build box" with `build cache` in the
+    /// other slot is asked about too, since the shared "build" is not the
+    /// user naming the build cache, and so is "switch to build box" with a
+    /// daemon labelled `build` there (PRD #1666 re-check DR-2).
+    #[tokio::test]
+    async fn voice_outcome_the_ask_is_not_a_daemon_named_for_the_other_slot() {
+        let remote = |id: &str, label: &str, address: &str| VoiceDeck {
+            address: Some(address.to_string()),
+            ..deck(id, label, false)
+        };
+        let with = |extra: VoiceDeck| {
+            let mut decks = decks();
+            decks.push(extra);
+            decks
+        };
+        let switch = with(remote("deck-switch", "Switch", "ops@relay.example.com"));
+        let select = with(remote("deck-select", "Select", "ops@relay.example.com"));
+        let host_daemon = with(deck("deck-daemon", "ops@daemon", false));
+        let builds = vec![
+            deck("deck-local", "Local deck", true),
+            deck("deck-box", "build box", false),
+            deck("deck-cache", "build cache", false),
+        ];
+        let build_and_box = vec![
+            deck("deck-local", "Local deck", true),
+            deck("deck-plain", "build", false),
+            deck("deck-box", "build box", false),
+        ];
+        let outcome_for =
+            |said: &'static str, value: &'static str, screen, decks: Vec<VoiceDeck>| async move {
+                let resolver = StubResolver::new().answering(
+                    said,
+                    IntentAnswer::new("switch_deck").with_param("daemon", value),
+                );
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    screen,
+                    &fleet(),
+                    &decks,
+                    None,
+                    None,
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            };
+        for (said, value, screen, decks) in [
+            ("switch daemon", "Switch", Screen::Deck, switch.clone()),
+            ("select the tester", "Select", Screen::Overview, select),
+            ("switch daemon", "daemon", Screen::Deck, host_daemon),
+            (
+                "switch daemon to build box",
+                "build cache",
+                Screen::Deck,
+                builds,
+            ),
+            ("switch to build box", "build", Screen::Deck, build_and_box),
+        ] {
+            let outcome = outcome_for(said, value, screen, decks).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamMissing { action, .. }
+                    if action == "switch_deck"),
+                "{said:?} with {value:?} in the other slot: {outcome:?}"
+            );
+        }
+        let outcome = outcome_for("switch to Switch", "Switch", Screen::Deck, switch).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                if action == "switch_deck" && params[0].value == "deck-switch"),
             "{outcome:?}"
         );
     }
