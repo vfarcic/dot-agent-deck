@@ -1136,11 +1136,18 @@ pub async fn handle_utterance_with_modes(
             // local" over an open dialog names a deck the form may not show,
             // and starting the form would drop what the user asked for. A
             // value naming the deck the form already describes, answered to a
-            // start that names no daemon at all, asks for nothing the form
-            // does not hold ([`restates_the_forms_deck`]).
+            // request for the start and nothing more, asks for nothing the
+            // form does not hold ([`restates_the_forms_deck`]).
             let carries_a_value = answer.params.values().any(|value| {
                 !value.trim().is_empty()
-                    && !restates_the_forms_deck(value, transcript.text(), row, decks, new_agent)
+                    && !restates_the_forms_deck(
+                        value,
+                        transcript.text(),
+                        row,
+                        target,
+                        decks,
+                        new_agent,
+                    )
             });
             if carries_a_value {
                 return finish(VoiceOutcome::unavailable(transcript, row));
@@ -1777,63 +1784,94 @@ fn said(spoken: &str, transcript: &str) -> bool {
 }
 
 /// Whether `value`, answered with a pick that `unavailable_redirects` hands to
-/// the New agent dialog's start, only restates the form: it is the deck the
-/// form already describes, and the start it answers names no daemon at all
-/// ([`refers_to_a_daemon`]). "Start agent" read over an open dialog came back
-/// from `gpt-5-mini` as `open_new_agent` with `deck` = "Local deck", the
-/// form's own deck, in 2 of 6 runs, and was refused as if the user had named a
-/// deck the start would drop (fixture `start-agent-button-label`, 3 of 10 on
-/// `origin/main`).
+/// `target`, the New agent dialog's start, only restates the form: it is the
+/// deck the form already describes, and the utterance asks for the start and
+/// nothing else ([`asks_for_the_start_alone`]). "Start agent" read over an open
+/// dialog came back from `gpt-5-mini` as `open_new_agent` with `deck` = "Local
+/// deck", the form's own deck, in 2 of 6 runs, and was refused as if the user
+/// had named a deck the start would drop (fixture `start-agent-button-label`,
+/// 3 of 10 on `origin/main`).
 ///
-/// The test is what the USER said, not whether the model's value was said: "start
-/// an agent on build box" answered with the form's "Local deck" names a deck the
-/// value does not, and a host alias such as `build-box.example.com` is said in
-/// part by "build box" though not every word of it is. So any daemon in the
-/// transcript — a deck's name or a word of one, or a category such as "remote"
-/// or "daemon" — refuses the redirect, whichever deck the value resolves to.
+/// The test is what the USER said, not whether the model's value was said:
+/// "start an agent on build box" answered with the form's "Local deck" asks
+/// for a deck the value does not name. Any word left beyond the start refuses,
+/// rather than any word recognised as a daemon's, because a target can be
+/// spelled in ways a check built from the fleet's names misses — a daemon
+/// labelled `Launch` or `Run`, which are start words; the glued "BuildBoxDeck"
+/// [`resolve_deck_ref`] accepts; a name no daemon has, such as "Atlantis"
+/// (PRD #1666 re-check F2-1, review DR-1). It only ever refuses: a value that
+/// is forgiven still needs the model's pick, the redirect and the start's own
+/// grounding.
 fn restates_the_forms_deck(
     value: &str,
     transcript: &str,
     row: &CommandRow,
+    target: &CommandRow,
     decks: &[VoiceDeck],
     new_agent: Option<&VoiceNewAgent>,
 ) -> bool {
     let Some(form) = new_agent.and_then(|dialog| dialog.form.as_ref()) else {
         return false;
     };
-    !refers_to_a_daemon(transcript, row, decks)
+    asks_for_the_start_alone(transcript, &[row, target])
         && matches!(
             resolve_new_agent_deck_ref(value, decks),
             DeckRefMatch::One { id, .. } if id == form.deck_id
         )
 }
 
-/// Words that refer to a daemon without naming one — "on the remote daemon",
-/// "on another machine" — read by [`refers_to_a_daemon`], with [`Heard`]'s
-/// trailing-`s` allowance. Broader than [`DECK_CATEGORY_WORDS`] on purpose: a
-/// word read here that named no daemon costs a refusal, never a start on a
-/// daemon the user did not ask for.
-const DAEMON_REFERENCE_WORDS: [&str; 9] = [
-    "daemon", "demon", "deck", "remote", "local", "machine", "host", "server", "computer",
+/// The words a bare request to start an agent carries besides its start word —
+/// "start the agent", "start a new one", "start it, please" — read by
+/// [`asks_for_the_start_alone`]. No preposition is here on purpose: "on",
+/// "in" and "to" introduce a target, so a start that has one is not bare,
+/// whatever follows it. A word missing here costs a refusal, never a start on
+/// a daemon the user did not ask for.
+const BARE_START_WORDS: [&str; 11] = [
+    "a", "an", "the", "agent", "agents", "one", "new", "it", "please", "now", "just",
 ];
 
-/// Whether `transcript`, less the words that asked for `row`
-/// ([`beyond_the_ask`]), names or refers to any daemon: a content word
-/// ([`content_words`]) of any of a deck's spoken names ([`deck_spoken_names`] —
-/// its label, its host and the host's first component, "local", "this
-/// machine"), or one of [`DAEMON_REFERENCE_WORDS`]. Any one word is enough, so
-/// "build" of `build-box` refers to a daemon, ambiguous or not.
-fn refers_to_a_daemon(transcript: &str, row: &CommandRow, decks: &[VoiceDeck]) -> bool {
-    let heard = Heard::from_words(beyond_the_ask(transcript, row));
-    DAEMON_REFERENCE_WORDS.iter().any(|word| heard.word(word))
-        || decks
-            .iter()
-            // All daemons is the Daemon selector's selection, not a daemon
-            // (#1491): "all" names none.
-            .filter(|deck| deck.id != super::ALL_DECKS_ID)
-            .flat_map(deck_spoken_names)
-            .flat_map(|name| content_words(&name))
-            .any(|word| heard.word(&word))
+/// Whether `transcript` is a request for the start and nothing more: once ONE
+/// occurrence of the action — the earliest of `rows`' `heard_as` entries heard
+/// in it — is taken out, every word left is one of [`BARE_START_WORDS`].
+///
+/// One occurrence, not one of each entry: in "start an agent on Launch" the
+/// action is "start", and "Launch", though also a start word, is the target
+/// the user named. Every other word counts against it as said, including words
+/// a [`content_words`] reading would drop, so "on Run" and "on New deck" stay
+/// a target.
+fn asks_for_the_start_alone(transcript: &str, rows: &[&CommandRow]) -> bool {
+    let mut rest = spoken_words(transcript);
+    let mut action: Option<(usize, usize)> = None;
+    for row in rows {
+        let ActionGrounding::HeardAs(entries) = &row.grounding else {
+            continue;
+        };
+        for entry in entries.iter().chain(&row.grounding_also) {
+            let wanted = spoken_words(entry);
+            if wanted.is_empty() {
+                continue;
+            }
+            let found = rest.windows(wanted.len()).position(|window| {
+                window
+                    .iter()
+                    .zip(&wanted)
+                    .all(|(heard, wanted)| same_word(heard, wanted))
+            });
+            if let Some(at) = found
+                && action.is_none_or(|(earliest, width)| {
+                    at < earliest || (at == earliest && wanted.len() > width)
+                })
+            {
+                action = Some((at, wanted.len()));
+            }
+        }
+    }
+    let Some((at, width)) = action else {
+        return false;
+    };
+    rest.drain(at..at + width);
+    rest.iter()
+        .all(|word| BARE_START_WORDS.contains(&word.as_str()))
 }
 
 /// Whether the user SAID `spoken` ([`said`]) in the words left once one
@@ -16169,9 +16207,10 @@ mod tests {
             matches!(elsewhere, VoiceOutcome::Unavailable { .. }),
             "another deck must not start the form: {elsewhere:?}"
         );
-        // The echo is forgiven only for a start that names no daemon (final
-        // review FR-1): a user who asked for the build box, or for a daemon by
-        // category, is not starting the Local form whatever the model echoed.
+        // The echo is forgiven only for a start with nothing beyond the ask
+        // (final review FR-1): a user who asked for the build box, or for a
+        // daemon by category, is not starting the Local form whatever the
+        // model echoed.
         for (said, value) in [
             ("start an agent on build box", "Local deck"),
             ("start an agent on the remote daemon", "Local deck"),
@@ -16210,6 +16249,66 @@ mod tests {
             matches!(alias, VoiceOutcome::Unavailable { .. }),
             "a host alias the user said must not count as unsaid: {alias:?}"
         );
+        // A target the user names after the start word refuses the echo
+        // however it is spelled (PRD #1666 re-check F2-1, DR-1): a daemon
+        // labelled with a start word, the resolver's glued spelling, or a
+        // name no daemon in the fleet has. Only a start with nothing beyond
+        // the ask is forgiven the form's own deck.
+        let labelled = |id: &str, label: &str, address: &str| VoiceDeck {
+            address: Some(address.to_string()),
+            ..deck(id, label, false)
+        };
+        let mut start_words_fleet = decks();
+        start_words_fleet.extend([
+            labelled("deck-launch", "Launch", "ops@runner.example.net"),
+            labelled("deck-run", "Run", "ops@worker.example.org"),
+            labelled("deck-new", "New deck", "ops@gpu.example.io"),
+        ]);
+        for (said, fleet_decks) in [
+            ("start an agent on Launch", &start_words_fleet),
+            ("start an agent on Run", &start_words_fleet),
+            ("launch an agent on Run", &start_words_fleet),
+            ("start an agent on New deck", &start_words_fleet),
+            ("start an agent on BuildBoxDeck", &decks()),
+            ("start an agent on Atlantis", &decks()),
+        ] {
+            let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
+            let resolver = StubResolver::new().answering(said, answer);
+            let named = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                fleet_decks,
+                None,
+                Some(&form),
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
+            assert!(
+                matches!(named, VoiceOutcome::Unavailable { .. }),
+                "{said:?} with Local deck echoed must not start the form: {named:?}"
+            );
+        }
+        let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
+        let resolver = StubResolver::new().answering("Start agent", answer);
+        let unasked = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &start_words_fleet,
+            None,
+            Some(&form),
+            Transcript::new("Start agent"),
+        )
+        .await
+        .outcome;
+        let VoiceOutcome::Dispatch { invoke, .. } = &unasked else {
+            panic!("Start agent among start-word labels: expected a dispatch, got {unasked:?}");
+        };
+        assert_eq!(invoke, "startNewAgent");
     }
 
     /// PRD #1497 — one utterance through the reading intercept: the panel's
