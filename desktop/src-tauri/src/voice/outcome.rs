@@ -116,6 +116,9 @@ pub const TYPING_MODE_FIRST_HINT: &str = "say “typing on” first — interrup
 /// The New agent dialog's Start — the one row a spoken command line keeps
 /// from grounding at all, wherever its start word is ([`heard_outside_command`]).
 const START_ROW: &str = "start_new_agent";
+/// The row that opens the New agent dialog, which a start said with the
+/// dialog closed means ([`bare_start`]).
+const OPEN_NEW_AGENT_ROW: &str = "open_new_agent";
 /// PRD #1195 M3 — the Deck selector's row, and the one `deck_ref` row that is
 /// not about the New agent dialog.
 ///
@@ -205,7 +208,9 @@ type Reading = (&'static str, Option<Requirement>);
 ///   sentence added to `switch_deck`; rewording the stop's own "start it is
 ///   never this one" moved it by noise only (2026-10-15). Those words ground the
 ///   opener, which opens the New agent dialog and starts nothing, as "start
-///   it" does whenever the model reads it right.
+///   it" does whenever the model reads it right. A bare start said on its own
+///   no longer reaches the model at all ([`bare_start`]); this reading still
+///   answers a start said with more words.
 ///
 /// A row's readings are tried in order and the first its words ground wins,
 /// each only where its requirement, if it names one, holds. The reading still
@@ -941,31 +946,39 @@ pub async fn handle_utterance_with_modes(
         return finish(outcome, None);
     }
 
-    let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
-    // Every deck, including the ones a new agent cannot start on (issue
-    // #1491): the Daemon selector switches to any of them, so the model has
-    // to see them all to answer `switch_deck` with the one the user meant.
-    // The state marks the ones a new agent cannot start on
-    // (`decks_without_new_agent`, [`super::prompt::state`]), and a pick of one
-    // for the New agent dialog is still answered with its short reason, never
-    // preselected ([`deck_unavailable`]).
-    let started = std::time::Instant::now();
-    // With labels withheld the backend is shown none of them — see this
-    // function's doc comment.
-    let answered = resolver
-        .resolve(IntentRequest {
-            transcript: &transcript,
-            commands: &commands,
-            agents: if withheld { &[] } else { agents },
-            decks: if withheld { &[] } else { decks },
-            directories: directories.filter(|_| !withheld),
-            new_agent: new_agent.filter(|_| !withheld),
-        })
-        .await;
-    // Taken before anything is rendered: what the user waited for is the
-    // backend, and the table lookups after it are microseconds this must not
-    // fold in.
-    let resolve_ms = Some(millis(started.elapsed()));
+    // A bare start with the New agent dialog closed is answered as the model's
+    // right pick would be, without asking it ([`bare_start`]), and then goes
+    // through every check below exactly as that pick would.
+    let (answered, resolve_ms) =
+        if let Some(answer) = bare_start(table, screen, directories, new_agent, &transcript) {
+            (Ok(answer), None)
+        } else {
+            let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
+            // Every deck, including the ones a new agent cannot start on (issue
+            // #1491): the Daemon selector switches to any of them, so the model has
+            // to see them all to answer `switch_deck` with the one the user meant.
+            // The state marks the ones a new agent cannot start on
+            // (`decks_without_new_agent`, [`super::prompt::state`]), and a pick of one
+            // for the New agent dialog is still answered with its short reason, never
+            // preselected ([`deck_unavailable`]).
+            let started = std::time::Instant::now();
+            // With labels withheld the backend is shown none of them — see this
+            // function's doc comment.
+            let answered = resolver
+                .resolve(IntentRequest {
+                    transcript: &transcript,
+                    commands: &commands,
+                    agents: if withheld { &[] } else { agents },
+                    decks: if withheld { &[] } else { decks },
+                    directories: directories.filter(|_| !withheld),
+                    new_agent: new_agent.filter(|_| !withheld),
+                })
+                .await;
+            // Taken before anything is rendered: what the user waited for is the
+            // backend, and the table lookups after it are microseconds this must not
+            // fold in.
+            (answered, Some(millis(started.elapsed())))
+        };
     let finish = move |outcome| finish(outcome, resolve_ms);
 
     let answer = match answered {
@@ -1183,6 +1196,7 @@ pub async fn handle_utterance_with_modes(
             .get(&spec.name)
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
+            .or_else(|| deck_in_the_other_slot(table, row, spec, &answer))
             // A REQUIRED deck made only of category words — "daemon", the
             // dialog's field heading, or "the deck" — names no deck, so it is
             // asked for exactly as an absent one is (issue #1045); unless it
@@ -2553,6 +2567,96 @@ fn local_intercept(
             names: Vec::new(),
         }],
     ))
+}
+
+/// The value the model put under another row's name for a daemon, for a
+/// REQUIRED `deck_ref` it left empty.
+///
+/// The reply's schema lists every param of every row in one object, so it
+/// offers two slots for a daemon: `deck` (`switch_deck`, `choose_deck`) and
+/// `daemon` (`filter_dashboard`'s). The model answered "switch deck to the
+/// ghost box" (fixture `switch-deck-unknown`, `gpt-5-mini`) with "ghost box"
+/// under `daemon` and `deck` empty in 1 of 90 runs on 2026-10-15, and in one
+/// full-manifest run before that, and the user was then told they had named
+/// no daemon. The value is the daemon the user meant, in the
+/// wrong slot, so it is read as the row's own and goes through every check the
+/// row's own value would.
+///
+/// Only for a required one, where the alternative is asking the user which
+/// daemon they meant. An optional one left empty means the user named none,
+/// and a value the model filled in elsewhere does not change that. Never when
+/// the row declares the other name itself, since that value is then the row's
+/// answer to a different param.
+fn deck_in_the_other_slot<'a>(
+    table: &CommandTable,
+    row: &CommandRow,
+    spec: &super::table::ParamSpec,
+    answer: &'a super::resolver::IntentAnswer,
+) -> Option<&'a str> {
+    if spec.optional || spec.kind != ParamKind::DeckRef {
+        return None;
+    }
+    let mut others: Vec<&str> = table
+        .rows()
+        .iter()
+        .flat_map(|other| &other.params)
+        .filter(|other| other.kind == ParamKind::DeckRef && other.name != spec.name)
+        .map(|other| other.name.as_str())
+        .filter(|name| row.params.iter().all(|declared| declared.name != *name))
+        .collect();
+    others.sort_unstable();
+    others.dedup();
+    others
+        .into_iter()
+        .filter_map(|name| answer.params.get(name))
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+}
+
+/// The whole utterances that ask to start an agent and name nothing else
+/// ([`bare_start`]).
+const BARE_START_PHRASES: [&str; 7] = [
+    "start it",
+    "start agent",
+    "start the agent",
+    "start an agent",
+    "start new agent",
+    "start a new agent",
+    "start the new agent",
+];
+
+/// `open_new_agent`'s pick, for a [`BARE_START_PHRASES`] utterance said where
+/// that row can run: on the agent dashboard with the New agent dialog closed.
+///
+/// There the utterance has one answer. The dialog's own Start
+/// (`start_new_agent`) cannot run and hands its pick to `open_new_agent`
+/// (`unavailable_redirects`), and a stop is the start's opposite, which
+/// [`UNGROUNDED_READS_AS`] already answers as the opener. Asking the model was
+/// a coin toss all the same: over 30 runs of a bare "start it" (fixture
+/// `start-new-agent-dialog-closed`, `gpt-5-mini`, 2026-10-15) it never
+/// answered `open_new_agent`. It answered `start_new_agent` 12 times and
+/// `stop_agent` 17 times, both read as the opener, and `none` once, which
+/// heard nothing.
+///
+/// It returns the PICK rather than an outcome, so the answer still passes
+/// grounding, the screen, `requires` and the params as a model's pick of the
+/// row would, an implied deck included. Words beyond the list, such as "start
+/// an agent on local", still reach the model, which then sets the deck. So
+/// does the same list said anywhere else: over the open dialog it means the
+/// dialog's Start, and off the dashboard the model's pick gets the start's own
+/// hint.
+fn bare_start(
+    table: &CommandTable,
+    screen: Screen,
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
+    transcript: &Transcript,
+) -> Option<super::resolver::IntentAnswer> {
+    table
+        .row(OPEN_NEW_AGENT_ROW)
+        .filter(|row| row.callable(screen, directories, new_agent))
+        .filter(|_| said_whole(transcript.text(), BARE_START_PHRASES))
+        .map(|row| super::resolver::IntentAnswer::new(row.id.clone()))
 }
 
 /// Whether the whole utterance, less an edge politeness word, is one of
@@ -6713,6 +6817,59 @@ mod tests {
         }
     }
 
+    /// Scenario: the user says "switch deck to the ghost box" or "switch deck
+    /// to the build box", and the model puts the daemon under `daemon`, the
+    /// dashboard filter's name for it, leaving `deck` empty. The daemon is read
+    /// all the same: the ghost box is reported as matching no daemon and the
+    /// build box is switched to, rather than the user being asked which daemon
+    /// they meant. An optional deck left empty, as in "new agent", stays
+    /// unnamed.
+    #[tokio::test]
+    async fn voice_outcome_a_required_deck_in_the_daemon_slot_is_read() {
+        let in_daemon_slot = |said: &str, value: &str| {
+            StubResolver::new().answering(
+                said,
+                IntentAnswer::new("switch_deck").with_param("daemon", value),
+            )
+        };
+        let said = "switch deck to the ghost box";
+        let outcome = run(
+            &in_daemon_slot(said, "ghost box"),
+            Screen::Deck,
+            &fleet(),
+            said,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { action, spoken, sentence, .. }
+                if action == "switch_deck" && spoken == "ghost box"
+                    && sentence.contains("no daemon matches")),
+            "{outcome:?}"
+        );
+        let said = "switch deck to the build box";
+        let outcome = run(
+            &in_daemon_slot(said, "build box"),
+            Screen::Deck,
+            &fleet(),
+            said,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                if action == "switch_deck" && params[0].value == "deck-build"),
+            "{outcome:?}"
+        );
+        let optional = StubResolver::new().answering(
+            "new agent",
+            IntentAnswer::new("open_new_agent").with_param("daemon", "build box"),
+        );
+        let outcome = run(&optional, Screen::Overview, &fleet(), "new agent").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+    }
+
     /// Scenario (issue #1491): speech-to-text writes "daemon" as "demon". A
     /// model that echoes the user's words — with Names withheld, or when
     /// nothing it was shown fits — hands over "all demons" or a bare "demon",
@@ -6855,6 +7012,101 @@ mod tests {
                 then_submit: false,
             }
         );
+    }
+
+    /// Scenario: on the agent dashboard with the New agent dialog closed, the
+    /// user says a bare start such as "start it" while the command backend is
+    /// failing. The dialog opens anyway, with the daemon preselected when only
+    /// one can take a new agent, and no backend call is made. Said over the
+    /// open dialog, or with a daemon named, the words still go to the backend.
+    #[tokio::test]
+    async fn voice_outcome_a_bare_start_with_the_dialog_closed_opens_it_without_the_model() {
+        let failing = StubResolver::failing(IntentError::Backend("unreachable".into()));
+        let open =
+            |params: Vec<ResolvedParam>, said: &str, sentence: &str| VoiceOutcome::Dispatch {
+                transcript: Transcript::new(said),
+                action: "open_new_agent".to_string(),
+                invoke: "openNewAgent".to_string(),
+                params,
+                sentence: sentence.to_string(),
+                then_submit: false,
+            };
+        for said in BARE_START_PHRASES.into_iter().chain(["Start it, please."]) {
+            let answered = handle_utterance(
+                &failing,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks(),
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert_eq!(answered.resolve_ms, None, "{said:?} asked the backend");
+            assert_eq!(
+                answered.outcome,
+                open(Vec::new(), said, "Opening the New agent dialog."),
+                "{said:?}"
+            );
+        }
+        // The one daemon that can take a new agent is preselected, as it is
+        // for the model's own pick of the row.
+        let only_local = [deck("deck-local", "Local deck", true)];
+        let answered = handle_utterance(
+            &failing,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &only_local,
+            None,
+            None,
+            Transcript::new("start it"),
+        )
+        .await;
+        assert_eq!(
+            answered.outcome,
+            open(
+                vec![ResolvedParam {
+                    name: "deck".to_string(),
+                    kind: ParamKind::DeckRef,
+                    spoken: String::new(),
+                    value: "deck-local".to_string(),
+                    label: "Local deck".to_string(),
+                    deck_identity: None,
+                    names: Vec::new(),
+                }],
+                "start it",
+                "Opening the New agent dialog.",
+            )
+        );
+        // Over the open dialog, and with a daemon named, the backend is asked.
+        let asked = |said: &'static str, new_agent: Option<VoiceNewAgent>| {
+            let failing = failing.clone();
+            async move {
+                handle_utterance(
+                    &failing,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks(),
+                    None,
+                    new_agent.as_ref(),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        for outcome in [
+            asked("start it", Some(VoiceNewAgent { form: None })).await,
+            asked("start an agent on local", None).await,
+        ] {
+            assert!(
+                matches!(outcome, VoiceOutcome::ResolutionFailed { .. }),
+                "{outcome:?}"
+            );
+        }
     }
 
     /// Scenario: with a fleet on the overview the user says "Create a new
