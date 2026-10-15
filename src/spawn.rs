@@ -717,6 +717,12 @@ async fn spawn_with_unit(
     // 3. Spawn + deliver.
     match target {
         SpawnTarget::SingleAgent { command, inherited } => {
+            // PR #1735 review: a first prompt the inbox would refuse fails the
+            // spawn before anything is started.
+            let reason = seed_reason(&req);
+            if let Err(error) = admit_seed(registry, &reason, &req.prompt) {
+                return Err(seed_refused(notifier, &req.task_name, &error));
+            }
             let pane_id = next_pane_id(&req.task_name, None);
             // PRD #127 C2: only pin the `-c` wrapper shell to a deterministic
             // `/bin/sh` when the command ACTUALLY needs shell-wrapping (it has
@@ -830,7 +836,15 @@ async fn spawn_with_unit(
             // now and bound to the agent just spawned. Nothing waits for it to
             // start a session; nothing is typed.
             let _ = detach_delivery;
-            post_seed(registry, &pane_id, &id, &seed_reason(&req), &req.prompt);
+            if let Err(error) = post_seed(registry, &pane_id, &id, &reason, &req.prompt) {
+                let started = [SpawnedAgent {
+                    id: id.clone(),
+                    pane_id: pane_id.clone(),
+                    role_name: None,
+                }];
+                close_started_agents(registry, state, &started).await;
+                return Err(seed_refused(notifier, &req.task_name, &error));
+            }
             Ok(SpawnHandle {
                 task_name: req.task_name,
                 kind: SpawnKind::SingleAgent,
@@ -933,6 +947,12 @@ async fn spawn_with_unit(
                 // `compose_orchestrator_context` for why this is not flipped here.
                 None => (req.prompt.clone(), None),
             };
+            // PR #1735 review: the composed prompt is what the orchestrator's
+            // inbox is posted, so it is what is admitted, before any role starts.
+            let reason = seed_reason(&req);
+            if let Err(error) = admit_seed(registry, &reason, &prompt) {
+                return Err(seed_refused(notifier, &req.task_name, &error));
+            }
             let mut agents = Vec::with_capacity(roles.len());
             // PRD #140 M1.3: one instance token per orchestration spawn
             // request, minted before the role loop and stamped on every
@@ -1287,13 +1307,22 @@ async fn spawn_with_unit(
             );
             drop(publish_guard);
             // PRD #1666 S5: posted to the orchestrator role's inbox, as above.
-            post_seed(
+            if let Err(error) = post_seed(
                 registry,
                 &delivery_pane_id,
                 &delivery_agent_id,
-                &seed_reason(&req),
+                &reason,
                 &prompt,
-            );
+            ) {
+                close_started_agents(registry, state, &agents).await;
+                if let Some(state) = state {
+                    state
+                        .write()
+                        .await
+                        .release_orchestration_title_claim(&identity);
+                }
+                return Err(seed_refused(notifier, &req.task_name, &error));
+            }
             Ok(SpawnHandle {
                 task_name: req.task_name,
                 kind: SpawnKind::Orchestration { name },
@@ -1386,6 +1415,20 @@ async fn roll_back_partial_orchestration(
         rolling_back = started.len(),
         "spawn: a later orchestration role failed; tearing down the roles that already started"
     );
+    close_started_agents(registry, state, started).await;
+}
+
+/// The teardown [`roll_back_partial_orchestration`] runs, for any agents a
+/// spawn started and must not leave running: the `StopAgent` close protocol
+/// for each of `started`. Best-effort, as that function describes.
+async fn close_started_agents(
+    registry: &Arc<AgentPtyRegistry>,
+    state: Option<&crate::state::SharedState>,
+    started: &[SpawnedAgent],
+) {
+    if started.is_empty() {
+        return;
+    }
 
     // Refuse new delegations to every one of these panes BEFORE the first child
     // is terminated, so the teardown cannot race one in against a pane whose
@@ -1426,9 +1469,8 @@ async fn roll_back_partial_orchestration(
         Err(join_err) => {
             tracing::warn!(
                 error = %join_err,
-                orchestration = %orchestration,
                 "spawn rollback: the close task panicked or was cancelled; \
-                 already-started roles may still be running"
+                 already-started agents may still be running"
             );
         }
     }
@@ -1535,16 +1577,17 @@ pub(crate) fn pane_env(pane_id: &str, pin_sh: bool) -> Vec<(String, String)> {
 
 /// PRD #1666 S5: post `prompt` as the first inbox message of the agent
 /// `agent_id` just spawned in `pane_id`, from the deck under `reason`. An empty
-/// prompt posts nothing. A refusal is logged: the pane is already open.
+/// prompt posts nothing. A refusal is logged and answered: a spawn that cannot
+/// give its agent the task it was started for has failed (PR #1735 review).
 pub(crate) fn post_seed(
     registry: &AgentPtyRegistry,
     pane_id: &str,
     agent_id: &str,
     reason: &str,
     prompt: &str,
-) -> Option<crate::inbox::MessageId> {
+) -> Result<Option<crate::inbox::MessageId>, String> {
     if prompt.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     match crate::inbox_hub::post_to_live(
         registry,
@@ -1553,13 +1596,47 @@ pub(crate) fn post_seed(
     ) {
         Ok(id) => {
             tracing::info!(pane_id, agent_id, message_id = %id, "spawn: first prompt posted");
-            Some(id)
+            Ok(Some(id))
         }
         Err(error) => {
             tracing::warn!(pane_id, agent_id, %error, "spawn: the agent's inbox refused its first prompt");
-            None
+            Err(error)
         }
     }
+}
+
+/// PR #1735 review: the refusal the inbox would give `prompt` as a first
+/// prompt now, asked before a spawn starts anything, so a task the inbox would
+/// refuse costs no agent. A just-spawned pane's inbox is empty, so only the
+/// checks that do not depend on the recipient apply: the body's size and the
+/// deck's room. An empty prompt posts nothing and is never refused.
+pub(crate) fn admit_seed(
+    registry: &AgentPtyRegistry,
+    reason: &str,
+    prompt: &str,
+) -> Result<(), String> {
+    if prompt.trim().is_empty() {
+        return Ok(());
+    }
+    registry
+        .inbox()
+        .admit_reply(&crate::inbox::Content::from_deck(
+            reason,
+            "first prompt",
+            prompt,
+        ))
+        .map_err(|error| error.to_string())
+}
+
+/// The spawn error, announced as a failed spawn, for a first prompt the inbox
+/// refused.
+fn seed_refused(notifier: &dyn Notifier, task: &str, error: &str) -> SpawnError {
+    let message = format!("the agent's inbox refused its first prompt: {error}");
+    notifier.notify(NotifyEvent::SpawnFailed {
+        task: task.to_string(),
+        message: message.clone(),
+    });
+    SpawnError::Agent(message)
 }
 
 /// PRD #1666 S5: the sender `reason` a spawn's first prompt is posted under —
@@ -2195,7 +2272,8 @@ pub async fn spawn_or_reuse(
                 &agent_id,
                 &seed_reason(&req),
                 &req.prompt,
-            );
+            )
+            .map_err(|error| seed_refused(notifier, &req.task_name, &error))?;
             Ok(())
         }
         ReuseDecision::SpawnFresh => {
@@ -3208,6 +3286,41 @@ mod tests {
         fn notify(&self, event: NotifyEvent) {
             self.0.lock().expect("notifier mutex").push(event);
         }
+    }
+
+    /// PR #1735 review: a fire whose first prompt the agent's inbox would
+    /// refuse — here, one over the inbox's body limit — is a failed spawn:
+    /// `SpawnFailed` is announced, the spawn answers `Err`, and no agent is
+    /// left running without its task.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_prompt_the_inbox_refuses_fails_the_spawn() {
+        let dir = crate::test_temp::tempdir().expect("tempdir for the fire's cwd");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notifier = RecordingNotifier::default();
+        let request = SpawnRequest {
+            task_name: "seed-refused".to_string(),
+            working_dir: dir.path().to_string_lossy().into_owned(),
+            command: Some("cat".to_string()),
+            prompt: "x".repeat(crate::inbox::DEFAULT_MAX_BODY_BYTES + 1),
+            resolved_target: Some(SpawnTarget::SingleAgent {
+                command: Some("cat".to_string()),
+                inherited: None,
+            }),
+            compose_orchestrator_context: None,
+            seed_reason: None,
+        };
+        let outcome = spawn(request, &registry, &notifier, None, true, None).await;
+        let seen = notifier.0.lock().expect("notifier mutex").clone();
+        let records = registry.agent_records().len();
+        registry.shutdown_all();
+        assert!(outcome.is_err(), "a spawn whose task was refused must fail");
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, NotifyEvent::SpawnFailed { .. })),
+            "and say so: {seen:?}"
+        );
+        assert_eq!(records, 0, "no agent is left running without its task");
     }
 
     /// Scenario: a scheduled single-agent fire lands while a daemon restart

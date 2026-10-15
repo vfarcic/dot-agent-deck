@@ -6162,6 +6162,7 @@ async fn run_hook_loop_with_limits(
                                         &signal.pane_id,
                                         &caller_agent_id,
                                         &signal.name,
+                                        result.success,
                                         &result.message,
                                     );
                                 }

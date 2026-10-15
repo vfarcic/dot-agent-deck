@@ -275,14 +275,39 @@ fn is_live(registry: &AgentPtyRegistry, pane_id: &str, agent_id: &str) -> bool {
 ///
 /// Call it only once the inbox has admitted the post (audit F2), and keep the
 /// answered spill only once the post is in: dropped, it removes the file.
-fn retain(
+///
+/// PR #1735 review: the file is written on the blocking pool, never on the
+/// thread running the request's handler. A body that fits every hand-over
+/// saves nothing and costs no thread hop.
+async fn retain(
     registry: &AgentPtyRegistry,
     pane_id: &str,
     agent_id: &str,
     content: &mut Content,
 ) -> Result<crate::inbox_hub::MintedSpill, String> {
+    let deck = registry.inbox().deck();
+    if !crate::inbox_hub::body_needs_saving(&deck, pane_id, content) {
+        return Ok(crate::inbox_hub::MintedSpill::default());
+    }
     let dirs = crate::inbox_hub::spill_dirs(registry, pane_id, Some(agent_id));
-    crate::inbox_hub::retain_full_body_minted(&registry.inbox().deck(), pane_id, content, &dirs)
+    let pane = pane_id.to_string();
+    let mut work = content.clone();
+    let (work, saved) = tokio::task::spawn_blocking(move || {
+        let saved = crate::inbox_hub::retain_full_body_minted(&deck, &pane, &mut work, &dirs);
+        (work, saved)
+    })
+    .await
+    .map_err(|error| format!("the save did not finish: {error}"))?;
+    *content = work;
+    saved
+}
+
+/// Remove the saved body of a post that was not accepted, on the blocking
+/// pool, as [`retain`] wrote it.
+async fn discard(saved: Option<MintedSpill>) {
+    if let Some(spill) = saved {
+        let _ = tokio::task::spawn_blocking(move || drop(spill)).await;
+    }
 }
 
 /// The refusal for a long body [`retain`] could not save.
@@ -322,7 +347,7 @@ fn revalidator<'a>(
 
 /// [`retain`] once per post: a body an earlier try already saved is named
 /// again rather than saved twice. The refusal to answer when it cannot be.
-fn save_once(
+async fn save_once(
     registry: &AgentPtyRegistry,
     pane_id: &str,
     agent_id: &str,
@@ -336,7 +361,7 @@ fn save_once(
     if content.spill_path.is_some() {
         return None;
     }
-    match retain(registry, pane_id, agent_id, content) {
+    match retain(registry, pane_id, agent_id, content).await {
         Ok(spill) => {
             if spill.path().is_some() {
                 *saved = Some(spill);
@@ -378,19 +403,22 @@ pub async fn handle_publish(
         return InboxPostReply::refused(NOT_LIVE, NOT_LIVE_MESSAGE);
     }
     let mut saved = None;
+    let mut reply = InboxPostReply::refused(SCOPE_CHANGED, SCOPE_CHANGED_MESSAGE);
     for _ in 0..MAX_RESOLVE_ATTEMPTS {
         let view = ScopeView::gather(state, registry).await;
-        if let Attempt::Done(reply) = publish_in(registry, req, agent_id, &view, &mut saved) {
-            return reply;
+        if let Attempt::Done(done) = publish_in(registry, req, agent_id, &view, &mut saved).await {
+            reply = done;
+            break;
         }
         debug!(pane_id = %req.pane_id, "inbox: the scope changed under a publish; reading it again");
     }
-    InboxPostReply::refused(SCOPE_CHANGED, SCOPE_CHANGED_MESSAGE)
+    discard(saved).await;
+    reply
 }
 
 /// One try at `req` against the facts in `view`. `saved` is the body an
 /// earlier try saved, kept once a try is accepted.
-fn publish_in(
+async fn publish_in(
     registry: &AgentPtyRegistry,
     req: &InboxPublishRequest,
     agent_id: &str,
@@ -418,7 +446,7 @@ fn publish_in(
         info!(pane_id = %req.pane_id, %error, "inbox: publish refused");
         return Attempt::Done(refused_post(&error));
     }
-    if let Some(refusal) = save_once(registry, &req.pane_id, agent_id, &mut content, saved) {
+    if let Some(refusal) = save_once(registry, &req.pane_id, agent_id, &mut content, saved).await {
         return Attempt::Done(refusal);
     }
     let sender = Recipient::bound(req.pane_id.clone(), agent_id.to_string());
@@ -493,18 +521,21 @@ pub async fn handle_offer(
         return InboxPostReply::refused(NOT_LIVE, NOT_LIVE_MESSAGE);
     }
     let mut saved = None;
+    let mut reply = InboxPostReply::refused(SCOPE_CHANGED, SCOPE_CHANGED_MESSAGE);
     for _ in 0..MAX_RESOLVE_ATTEMPTS {
         let view = ScopeView::gather(state, registry).await;
-        if let Attempt::Done(reply) = offer_in(registry, req, agent_id, &view, &mut saved) {
-            return reply;
+        if let Attempt::Done(done) = offer_in(registry, req, agent_id, &view, &mut saved).await {
+            reply = done;
+            break;
         }
         debug!(pane_id = %req.pane_id, "inbox: the scope changed under an offer; reading it again");
     }
-    InboxPostReply::refused(SCOPE_CHANGED, SCOPE_CHANGED_MESSAGE)
+    discard(saved).await;
+    reply
 }
 
 /// One try at `req` against the facts in `view`, as [`publish_in`].
-fn offer_in(
+async fn offer_in(
     registry: &AgentPtyRegistry,
     req: &InboxOfferRequest,
     agent_id: &str,
@@ -544,7 +575,7 @@ fn offer_in(
         info!(pane_id = %req.pane_id, %error, "inbox: offer refused");
         return Attempt::Done(refused_post(&error));
     }
-    if let Some(refusal) = save_once(registry, &req.pane_id, agent_id, &mut content, saved) {
+    if let Some(refusal) = save_once(registry, &req.pane_id, agent_id, &mut content, saved).await {
         return Attempt::Done(refusal);
     }
     let offerer = Recipient::bound(req.pane_id.clone(), agent_id.to_string());
@@ -602,6 +633,10 @@ pub fn handle_claim(
             outcome: Some("released".to_string()),
             ..InboxClaimReply::default()
         },
+        ClaimOutcome::Expired => InboxClaimReply::refused(
+            "claim_expired",
+            "this job's claim ran out before it was settled, so it went back to its pool",
+        ),
         ClaimOutcome::NotClaimant => InboxClaimReply::refused(
             "not_claimant",
             "this job is not claimed by this agent: only its claimant may complete or release it",
@@ -926,6 +961,48 @@ mod tests {
         registry.shutdown_all();
     }
 
+    /// PR #1735 review: a long publish or offer saves its body off the thread
+    /// that runs the request's async handler, so a slow filesystem holds no
+    /// runtime worker.
+    #[tokio::test]
+    async fn a_long_post_saves_its_body_off_the_handlers_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let caller = spawn_in(&registry, "t3-caller", Some(cwd));
+        let unit = spawn_in(&registry, "t3-unit", Some(cwd));
+        dispatched(&registry, ("t3-unit", &unit), ("t3-caller", &caller));
+        let state = shared();
+        let publish = InboxPublishRequest {
+            pane_id: "t3-unit".to_string(),
+            agent_id: Some(unit.clone()),
+            token: None,
+            topic: "news".to_string(),
+            body: long_body(),
+        };
+        let reply = handle_publish(&registry, &state, &publish, &unit).await;
+        assert!(reply.refused.is_none(), "{reply:?}");
+        let mut offer = offer_from("t3-caller", &caller);
+        offer.body = long_body();
+        let reply = handle_offer(&registry, &state, &offer, &caller).await;
+        assert!(reply.refused.is_none(), "{reply:?}");
+        assert_eq!(saved_bodies(dir.path()), 2, "both long bodies are saved");
+        let handler = std::thread::current().id();
+        let writers: Vec<std::thread::ThreadId> = crate::inbox_hub::SPILL_WRITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(pane, _)| pane == "t3-unit" || pane == "t3-caller")
+            .map(|(_, thread)| *thread)
+            .collect();
+        assert_eq!(writers.len(), 2);
+        assert!(
+            writers.iter().all(|thread| *thread != handler),
+            "a body was saved on the handler's own thread"
+        );
+        registry.shutdown_all();
+    }
+
     /// Audit F5: an offer whose offerer is replaced after its scope was read —
     /// the reads a request awaits on — is refused when it is posted, and
     /// nothing is queued. The offerer leaving is not a change to retry.
@@ -948,7 +1025,8 @@ mod tests {
             &caller,
             &view,
             &mut None,
-        );
+        )
+        .await;
         let Attempt::Done(reply) = attempt else {
             panic!("the offerer itself left: that is a refusal, not a scope to read again");
         };
@@ -998,7 +1076,7 @@ mod tests {
             topic: "news".to_string(),
             body: "the build is green".to_string(),
         };
-        let attempt = publish_in(&registry, &publish, &unit, &view, &mut None);
+        let attempt = publish_in(&registry, &publish, &unit, &view, &mut None).await;
         assert!(
             registry
                 .inbox()

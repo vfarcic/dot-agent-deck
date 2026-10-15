@@ -553,7 +553,7 @@ dot-agent-deck inbox complete <id>
 dot-agent-deck inbox release <id>
 ```
 
-The default claim lasts 30 minutes; `--claim-ttl` accepts durations from one minute to 24 hours, such as `90s` or `1h30m`. If the worker releases the job, its claim expires, or it exits, the job returns to the pool for another worker. A worker that never picks up its assigned job also loses that assignment after five minutes by default. The offerer receives notices when a job is claimed, completed, its claim expires or delivery attempts are exhausted without completion.
+The default claim lasts 30 minutes; `--claim-ttl` accepts durations from one minute to 24 hours, such as `90s` or `1h30m`. If the worker releases the job, its claim expires, or it exits, the job returns to the pool for another worker. Once a claim has expired, `inbox complete` and `inbox release` for that job are refused with `claim_expired`, because the job is already back in the pool. A worker that never picks up its assigned job also loses that assignment after five minutes by default. The offerer receives notices when a job is claimed, completed, its claim expires or delivery attempts are exhausted without completion.
 
 In both the TUI and the desktop app, if OpenCode or Pi is busy with a long turn when a job arrives, the job waits for that agent and is not offered to another worker during that wait, preventing duplicate work. It can wait for up to the job's claim time or one hour, whichever is shorter. For Claude Code, a job not claimed within the deck's wait still goes to the next worker.
 

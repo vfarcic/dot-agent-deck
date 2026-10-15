@@ -5644,6 +5644,22 @@ async fn handle_connection(
                     }
                 },
             };
+            // PR #1735 review: a seed the agent's inbox would refuse starts
+            // nothing, rather than an agent without the task it was started for.
+            if pane_id_env.is_some()
+                && let Some(first) = authoring_seed.as_deref().or(seed.as_deref())
+                && let Err(error) = crate::spawn::admit_seed(&registry, "seed", first)
+            {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!(
+                        "start-agent: the agent's inbox would refuse its first prompt: {error}. \
+                         Nothing was started."
+                    )),
+                )
+                .await?;
+                return Ok(());
+            }
 
             // Issue #555: the orchestration run title is decided HERE, by the
             // daemon, and not by the form. The `Ctrl+n` form refuses a title a
@@ -5754,7 +5770,10 @@ async fn handle_connection(
                     // with `get-seed` is served it from the inbox.
                     let seed = authoring_seed.or(seed);
                     if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref()) {
-                        crate::spawn::post_seed(&registry, pane_id, &id, "seed", seed);
+                        // Admitted before the spawn above; a refusal now (the
+                        // deck filled up meanwhile, or the long seed could not
+                        // be saved) is logged by `post_seed`.
+                        let _ = crate::spawn::post_seed(&registry, pane_id, &id, "seed", seed);
                     }
                     // Issue #454: NOTHING is registered in the daemon's
                     // `AppState` here, deliberately.

@@ -62,8 +62,24 @@ impl DeckId {
 
     /// Read the deck id under `state_dir`, creating it when it is missing and
     /// replacing it when the file does not hold one.
+    ///
+    /// PR #1735 review: every step after the first read runs under a lock on
+    /// a sidecar beside the file (`.deck-id.lock`), so two daemons sharing the
+    /// state directory that start at once agree on one id: the second waits,
+    /// reads what the first published and adopts it. That holds whether the
+    /// filesystem can hard-link (the `CreateNew` publish below) or not, in
+    /// which case the publish is a rename that could replace the other's id.
+    /// Where the filesystem cannot lock at all the steps run unlocked, as
+    /// [`crate::agent_hook_config::lock_config`] describes.
     pub fn load_or_create(state_dir: &Path) -> Result<Self, String> {
         let path = deck_id_path(state_dir);
+        if let FileState::Valid(id) = read_deck_id_file(&path)? {
+            return Ok(id);
+        }
+        crate::platform::fsperm::create_owner_only_dir(state_dir)
+            .map_err(|e| format!("failed to create {}: {e}", state_dir.display()))?;
+        let _lock = crate::agent_hook_config::lock_config(&path)
+            .map_err(|e| format!("failed to lock {}: {e}", path.display()))?;
         match read_deck_id_file(&path)? {
             FileState::Valid(id) => return Ok(id),
             FileState::Invalid => {
@@ -224,7 +240,8 @@ fn write_deck_id(path: &Path, id: &DeckId, publish: Publish) -> Result<Published
             Ok(()) => Ok(Published::Ours),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Published::Theirs),
             // A filesystem without hard links: an atomic rename instead, which
-            // a simultaneous first start can overwrite.
+            // could replace another start's id; `load_or_create` holds the
+            // lock that keeps a simultaneous first start out.
             Err(_) => rename(&tmp_path, path),
         },
         Publish::Replace => rename(&tmp_path, path),
@@ -267,12 +284,22 @@ mod tests {
             assert_eq!(mode, 0o600, "deck-id must be owner-only");
         }
         assert_eq!(DeckId::load_or_create(&state_dir).unwrap(), first);
+        // The lock sidecar stays by design (deleting a lock file others may be
+        // waiting on is unsafe); it is empty and owner-only.
+        let sidecar = format!(".{DECK_ID_FILE}.lock");
         let leftovers: Vec<_> = std::fs::read_dir(&state_dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
-            .filter(|n| n != DECK_ID_FILE)
+            .filter(|n| n != DECK_ID_FILE && *n != *sidecar)
             .collect();
         assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let lock = std::fs::metadata(state_dir.join(&sidecar)).unwrap();
+            assert_eq!(lock.permissions().mode() & 0o777, 0o600);
+            assert_eq!(lock.len(), 0);
+        }
 
         std::fs::write(&path, "not a deck id\n").unwrap();
         let replaced = DeckId::load_or_create(&state_dir).unwrap();
@@ -311,5 +338,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(deck_id_path(dir.path())).unwrap();
         assert!(DeckId::load_or_create(dir.path()).is_err());
+    }
+
+    /// PR #1735 review: a daemon creating the deck id while another one is
+    /// still publishing its own waits for it, and adopts the id that was
+    /// published, whatever the filesystem's support for hard links.
+    #[test]
+    fn a_first_start_waits_for_a_concurrent_one_and_adopts_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let path = deck_id_path(&state_dir);
+        let theirs = DeckId::generate();
+        let publishing = crate::agent_hook_config::lock_config(&path).unwrap();
+        let loader = {
+            let state_dir = state_dir.clone();
+            std::thread::spawn(move || DeckId::load_or_create(&state_dir))
+        };
+        // Long enough for a loader that does not wait to publish an id of its
+        // own; one that waits publishes nothing until the lock is released.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        write_deck_id(&path, &theirs, Publish::Replace).unwrap();
+        drop(publishing);
+        let adopted = loader.join().unwrap().unwrap();
+        assert_eq!(adopted, theirs);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            theirs.as_str()
+        );
     }
 }

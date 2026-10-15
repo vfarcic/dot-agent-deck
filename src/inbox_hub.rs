@@ -577,6 +577,11 @@ impl InboxHub {
         self.lock().inbox.admit_direct(Instant::now(), to, content)
     }
 
+    /// The refusal [`Self::post_reply`] would give `content` now.
+    pub fn admit_reply(&self, content: &Content) -> Result<(), PostError> {
+        self.lock().inbox.admit_reply(Instant::now(), content)
+    }
+
     /// Audit F2: the refusal [`Self::publish`] would give `content` for
     /// `recipients` now. Run before anything is saved for the post.
     pub fn admit_publish(
@@ -606,9 +611,25 @@ impl InboxHub {
     /// Post one direct message and hand it straight to an armed waiter if the
     /// recipient has one.
     pub fn post_direct(&self, to: Recipient, content: Content) -> Result<MessageId, PostError> {
+        self.post_with(to, content, Inbox::post_direct)
+    }
+
+    /// [`Inbox::post_reply`]: the deck's answer to a request `to` made, which
+    /// the recipient's own backlog does not refuse. Handed to an armed waiter
+    /// as [`Self::post_direct`] hands a message.
+    pub fn post_reply(&self, to: Recipient, content: Content) -> Result<MessageId, PostError> {
+        self.post_with(to, content, Inbox::post_reply)
+    }
+
+    fn post_with(
+        &self,
+        to: Recipient,
+        content: Content,
+        post: fn(&mut Inbox, Instant, Recipient, Content) -> Result<MessageId, PostError>,
+    ) -> Result<MessageId, PostError> {
         let id = {
             let mut st = self.lock();
-            let id = st.inbox.post_direct(Instant::now(), to.clone(), content)?;
+            let id = post(&mut st.inbox, Instant::now(), to.clone(), content)?;
             drain_events(&mut st);
             id
         };
@@ -898,6 +919,8 @@ impl InboxHub {
             drain_events(&mut st);
             outcome
         };
+        // An expired claim returned its offer to the pool.
+        self.changed.notify_one();
         self.post_owed_notices();
         outcome
     }
@@ -1287,6 +1310,13 @@ impl InboxHub {
         st.announced.remove(&key);
         st.receivers.remove(&key);
         st.rings.remove(&key);
+        // A waiter can outlive its agent (a hook process the agent left
+        // behind). It is told it was superseded, and dropping its sender
+        // closes its channel even when that signal finds it full, so its
+        // connection ends and gives its slot of the waiter pool back.
+        for waiter in st.waiters.remove(&key).unwrap_or_default() {
+            let _ = waiter.tx.try_send(WaiterSignal::Superseded);
+        }
         st.received_since_done.remove(pane_id);
         drain_events(&mut st);
         let ledgers = std::mem::take(&mut st.exited_ledgers);
@@ -1376,9 +1406,30 @@ impl InboxHub {
         budget: Option<InboxBudget>,
         ack: Option<AckHow>,
     ) -> Vec<InboxDelivery> {
+        self.fetch_named_within(pane_id, agent_id, consumer, budget, ack, None)
+    }
+
+    /// [`Self::fetch_within`] for a fetch a doorbell started: with `named`,
+    /// nothing is fetched unless message `named` is still queued for the
+    /// agent, decided under the same lock as the fetch, so a doorbell whose
+    /// message another consumer took never pulls newer mail into its turn.
+    pub fn fetch_named_within(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        consumer: Consumer,
+        budget: Option<InboxBudget>,
+        ack: Option<AckHow>,
+        named: Option<&str>,
+    ) -> Vec<InboxDelivery> {
         let deliveries = {
             let mut st = self.lock();
             let now = Instant::now();
+            if let Some(id) = named
+                && !queued_for(&st.inbox, pane_id, agent_id).any(|m| m.id.as_str() == id)
+            {
+                return Vec::new();
+            }
             let count = fitting(&st.inbox, pane_id, agent_id, budget);
             if count == 0 {
                 return Vec::new();
@@ -1703,13 +1754,23 @@ pub const BLOCK_SEPARATOR: &str = "\n\n";
 /// so a caller that heads the blocks with framing asks for its budget less the
 /// framing and stays within the whole. At least one when any is queued: a
 /// single message too big for the budget is rendered with its head only.
-fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBudget>) -> usize {
-    let queued = inbox.list(pane_id).into_iter().filter(|m| {
+/// The messages queued for `agent_id` in `pane_id` that it may take, oldest
+/// first.
+fn queued_for<'a>(
+    inbox: &'a Inbox,
+    pane_id: &'a str,
+    agent_id: &'a str,
+) -> impl Iterator<Item = &'a Message> + 'a {
+    inbox.list(pane_id).into_iter().filter(move |m| {
         m.state == MessageState::Queued
             && m.recipient
                 .as_ref()
                 .is_some_and(|r| r.admits(pane_id, agent_id))
-    });
+    })
+}
+
+fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBudget>) -> usize {
+    let queued = queued_for(inbox, pane_id, agent_id);
     let Some(budget) = budget else {
         return queued.count();
     };
@@ -2190,6 +2251,13 @@ pub fn tightest_hand_over() -> InboxBudget {
         .less(AGENT_FRAMING)
 }
 
+/// Whether [`retain_full_body_minted`] would save `content` for `pane_id`: it
+/// names no saved file of its own and would not render whole within
+/// [`tightest_hand_over`].
+pub fn body_needs_saving(deck: &DeckId, pane_id: &str, content: &Content) -> bool {
+    content.spill_path.is_none() && !fits_every_hand_over(deck, pane_id, content)
+}
+
 /// Whether `content` addressed to `pane_id` renders within
 /// [`tightest_hand_over`], so no agent would see only its head.
 fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool {
@@ -2304,7 +2372,7 @@ pub fn retain_full_body_minted(
     /// How many taken names to step past in one directory before the next.
     const MAX_NAME_ATTEMPTS: usize = 8;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if content.spill_path.is_some() || fits_every_hand_over(deck, pane_id, content) {
+    if !body_needs_saving(deck, pane_id, content) {
         return Ok(MintedSpill::default());
     }
     let text = match content.body_trust {
@@ -2321,6 +2389,11 @@ pub fn retain_full_body_minted(
             let name = format!("inbox-message-{millis}-{seq}.md");
             match crate::orchestrator_context::write_new_coordination_file(dir, &name, &text) {
                 Ok(path) => {
+                    #[cfg(test)]
+                    SPILL_WRITERS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((pane_id.to_string(), std::thread::current().id()));
                     content.spill_path = Some(path.clone());
                     return Ok(MintedSpill(Some(path)));
                 }
@@ -2338,6 +2411,11 @@ pub fn retain_full_body_minted(
         content.body.len()
     ))
 }
+
+/// TEST record of the thread each saved body was written on, by pane.
+#[cfg(test)]
+pub(crate) static SPILL_WRITERS: Mutex<Vec<(String, std::thread::ThreadId)>> =
+    Mutex::new(Vec::new());
 
 /// Where [`retain_full_body`] may save a long message for the agent in
 /// `pane_id`: that agent's working directory, then the deck's state directory.
@@ -2368,6 +2446,26 @@ pub fn post_to_live(
     to: Recipient,
     content: Content,
 ) -> Result<MessageId, String> {
+    post_live(registry, to, content, false)
+}
+
+/// PR #1735 review: [`post_to_live`] for the deck's answer to a request the
+/// agent made itself ([`InboxHub::post_reply`]), which the agent's own backlog
+/// does not refuse.
+pub fn post_reply_to_live(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    to: Recipient,
+    content: Content,
+) -> Result<MessageId, String> {
+    post_live(registry, to, content, true)
+}
+
+fn post_live(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    to: Recipient,
+    content: Content,
+    reply: bool,
+) -> Result<MessageId, String> {
     if let Some(agent) = to.agent_id.as_deref()
         && registry.pane_current_agent_id(&to.pane_id).as_deref() != Some(agent)
     {
@@ -2379,17 +2477,21 @@ pub fn post_to_live(
     let mut content = content;
     // Audit F2: refused before the body is saved, and the saved body removed
     // again if the post is refused after all.
-    registry
-        .inbox()
-        .admit_direct(&to, &content)
-        .map_err(|error| error.to_string())?;
+    let hub = registry.inbox();
+    if reply {
+        hub.admit_reply(&content)
+    } else {
+        hub.admit_direct(&to, &content)
+    }
+    .map_err(|error| error.to_string())?;
     let dirs = spill_dirs(registry, &to.pane_id, to.agent_id.as_deref());
-    let spill =
-        retain_full_body_minted(&registry.inbox().deck(), &to.pane_id, &mut content, &dirs)?;
-    let id = registry
-        .inbox()
-        .post_direct(to, content)
-        .map_err(|error| error.to_string())?;
+    let spill = retain_full_body_minted(&hub.deck(), &to.pane_id, &mut content, &dirs)?;
+    let id = if reply {
+        hub.post_reply(to, content)
+    } else {
+        hub.post_direct(to, content)
+    }
+    .map_err(|error| error.to_string())?;
     spill.keep();
     Ok(id)
 }
@@ -3130,6 +3232,75 @@ mod tests {
             Ok(WaiterSignal::Superseded)
         ));
         assert_eq!(hub.armed("p", "a"), MAX_WAITERS_PER_AGENT);
+    }
+
+    /// PR #1735 review: a fetch a doorbell started takes nothing once the
+    /// message that doorbell named is no longer queued — another consumer took
+    /// it — even while newer mail waits; while it is queued, the fetch takes
+    /// what is waiting as any fetch does.
+    #[test]
+    fn a_doorbell_fetch_takes_nothing_once_its_message_is_gone() {
+        let hub = hub();
+        let named = hub
+            .post_direct(Recipient::bound("p", "a"), content("named"))
+            .unwrap();
+        let taken = hub.fetch("p", "a", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        assert_eq!(taken.len(), 1);
+        let newer = hub
+            .post_direct(Recipient::bound("p", "a"), content("newer"))
+            .unwrap();
+        let stale = hub.fetch_named_within(
+            "p",
+            "a",
+            Consumer::DoorbellHook,
+            None,
+            None,
+            Some(named.as_str()),
+        );
+        assert!(stale.is_empty(), "{stale:?}");
+        let current = hub.fetch_named_within(
+            "p",
+            "a",
+            Consumer::DoorbellHook,
+            None,
+            None,
+            Some(newer.as_str()),
+        );
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, newer.to_string());
+    }
+
+    /// PR #1735 review: a waiter whose agent exited is told it was superseded,
+    /// so its connection ends and gives back its slot of the deck-wide waiter
+    /// pool, even while the process that armed it keeps the connection open.
+    #[tokio::test]
+    async fn an_exited_agents_waiters_end_and_release_their_slots() {
+        let hub = Arc::new(hub());
+        let (client, server) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(server);
+        let serve = tokio::spawn(serve_waiter(
+            Arc::clone(&hub),
+            "p".to_string(),
+            "a".to_string(),
+            InboxWaitMode::Stream,
+            InboxComponent::PiExtension,
+            None,
+            tokio::io::BufReader::new(read),
+            write,
+            |_: &str| {},
+        ));
+        while hub.armed("p", "a") == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(hub.waiter_slots.available_permits(), MAX_INBOX_WAITERS - 1);
+        hub.agent_exited("p", "a");
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("the exited agent's waiter ends although its peer stays connected")
+            .unwrap();
+        assert_eq!(hub.armed("p", "a"), 0);
+        assert_eq!(hub.waiter_slots.available_permits(), MAX_INBOX_WAITERS);
+        drop(client);
     }
 
     #[test]

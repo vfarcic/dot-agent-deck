@@ -356,19 +356,27 @@ pub fn dispatch_reason(unit_name: &str) -> String {
 }
 
 /// PRD #1666 S5: post a dispatch's acknowledgement to the inbox of the caller
-/// generation that asked for it. A refusal (the caller has exited, its inbox is
-/// full) stays in the daemon log: nothing is retried into whoever holds the
-/// pane now.
+/// generation that asked for it, under a subject that says whether the
+/// dispatch started a unit. It answers the caller's own request, so a backlog
+/// in the caller's inbox does not refuse it (PR #1735 review,
+/// [`crate::inbox_hub::post_reply_to_live`]). A refusal — the caller has
+/// exited, the deck holds the most messages it may — stays in the daemon log:
+/// nothing is retried into whoever holds the pane now.
 pub fn post_dispatch_result(
     registry: &crate::agent_pty::AgentPtyRegistry,
     caller_pane_id: &str,
     caller_agent_id: &str,
     unit_name: &str,
+    started: bool,
     message: &str,
 ) {
-    let content =
-        crate::inbox::Content::from_deck(dispatch_reason(unit_name), "dispatch started", message);
-    match crate::inbox_hub::post_to_live(
+    let subject = if started {
+        "dispatch started"
+    } else {
+        "dispatch failed"
+    };
+    let content = crate::inbox::Content::from_deck(dispatch_reason(unit_name), subject, message);
+    match crate::inbox_hub::post_reply_to_live(
         registry,
         crate::inbox::Recipient::bound(caller_pane_id, caller_agent_id),
         content,
@@ -376,6 +384,7 @@ pub fn post_dispatch_result(
         Ok(id) => tracing::info!(
             pane_id = %caller_pane_id,
             message_id = %id,
+            started,
             "dispatch: result posted to the caller's inbox"
         ),
         Err(error) => tracing::warn!(
@@ -886,5 +895,85 @@ mod tests {
             !msg.contains("cut off at"),
             "an untruncated report must not be described as truncated: {msg}"
         );
+    }
+
+    /// PR #1735 review: a dispatch's result reaches its caller even when the
+    /// caller's inbox already holds as many messages as one recipient may
+    /// queue. It answers the caller's own request, so the caller's backlog
+    /// does not refuse it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dispatch_result_reaches_a_caller_whose_inbox_is_full() {
+        use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+        let registry = std::sync::Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "full-caller".to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let to = crate::inbox::Recipient::bound("full-caller", agent.clone());
+        for n in 0..crate::inbox::DEFAULT_MAX_PER_RECIPIENT {
+            registry
+                .inbox()
+                .post_direct(
+                    to.clone(),
+                    crate::inbox::Content::from_deck("test", format!("filler {n}"), "x"),
+                )
+                .expect("fill the caller's inbox");
+        }
+        post_dispatch_result(
+            &registry,
+            "full-caller",
+            &agent,
+            "probe-unit",
+            true,
+            "dispatched probe-unit",
+        );
+        let listed = registry.inbox().list("full-caller");
+        assert!(
+            listed.iter().any(|m| m.subject == "dispatch started"),
+            "the dispatch result must be queued for its caller"
+        );
+        registry.shutdown_all();
+    }
+
+    /// PR #1735 review: a dispatch that started nothing is posted under a
+    /// subject that says it failed, never "dispatch started".
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_dispatch_is_posted_as_failed() {
+        use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+        let registry = std::sync::Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "failed-caller".to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        post_dispatch_result(
+            &registry,
+            "failed-caller",
+            &agent,
+            "probe-unit",
+            false,
+            "could not dispatch probe-unit",
+        );
+        let subjects: Vec<String> = registry
+            .inbox()
+            .list("failed-caller")
+            .into_iter()
+            .map(|m| m.subject)
+            .collect();
+        registry.shutdown_all();
+        assert_eq!(subjects, vec!["dispatch failed".to_string()]);
     }
 }

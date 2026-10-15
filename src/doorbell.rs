@@ -279,16 +279,11 @@ pub fn decide(bell: &Bell, facts: &Facts, config: &DoorbellConfig, now: Instant)
     if !facts.idle || facts.draft {
         return Action::Nothing;
     }
-    let grace_passed = facts
-        .inbox
-        .native_announced_at
-        .is_none_or(|at| now >= at + config.arm_grace);
     let due = bell
         .last_ring
         .is_none_or(|last| now >= last + config.delay_after(bell.rings));
     if let Some(id) = facts.inbox.queued.first()
-        && facts.inbox.armed == 0
-        && grace_passed
+        && ring_still_admitted(&facts.inbox, config, now)
         && due
     {
         return Action::Ring {
@@ -300,6 +295,18 @@ pub fn decide(bell: &Bell, facts: &Facts, config: &DoorbellConfig, now: Instant)
         return Action::Cleanup;
     }
     Action::Nothing
+}
+
+/// Whether a native component leaves the doorbell to ring for this agent at
+/// `now`: none is armed, and none announced `Native` within the last
+/// [`DoorbellConfig::arm_grace`]. [`decide`] asks it, and a write asks it
+/// again under the writer before each byte of a ring, so a component that
+/// arms or announces while the ring waits for the writer stops it.
+pub fn ring_still_admitted(inbox: &DoorbellFacts, config: &DoorbellConfig, now: Instant) -> bool {
+    inbox.armed == 0
+        && inbox
+            .native_announced_at
+            .is_none_or(|at| now >= at + config.arm_grace)
 }
 
 type AgentKey = (String, String);
@@ -394,6 +401,7 @@ async fn run_tick(
         let registry = Arc::clone(registry);
         let slots = Arc::clone(slots);
         let state = Arc::clone(state);
+        let config = config.clone();
         let queued = facts.inbox.queued;
         tokio::spawn(async move {
             let (pre_cr, line) = match &action {
@@ -402,16 +410,23 @@ async fn run_tick(
             };
             // PRD #1666 hardening H3: re-asked under the writer before every
             // byte. The same admission (nothing happened to the pane since
-            // this tick) and, for a ring, still no native component armed.
+            // this tick) and, for a ring, still no native component armed or
+            // inside the arm grace of an announcement.
             let ring = matches!(action, Action::Ring { .. });
             let still_admitted = || {
                 let state = Arc::clone(&state);
                 let registry = Arc::clone(&registry);
                 let (pane, agent) = (pane.clone(), agent.clone());
+                let config = config.clone();
                 async move {
                     admission.is_some()
                         && state.read().await.doorbell_admission(&agent, &pane) == admission
-                        && (!ring || registry.inbox().doorbell_facts(&pane, &agent).armed == 0)
+                        && (!ring
+                            || ring_still_admitted(
+                                &registry.inbox().doorbell_facts(&pane, &agent),
+                                &config,
+                                Instant::now(),
+                            ))
                 }
             };
             let outcome = registry
@@ -677,6 +692,26 @@ mod tests {
         assert_eq!(step(&mut bell, &empty, &config, at(3001)), Action::Cleanup);
         assert_eq!(bell.unsubmitted, None, "the cleanup CR drops the record");
         assert_eq!(step(&mut bell, &empty, &config, at(9000)), Action::Nothing);
+    }
+
+    /// PR #1735 review: a native component that announces while a ring waits
+    /// for the writer stops it, as an armed waiter does, until its arm grace
+    /// has passed.
+    #[test]
+    fn a_ring_waiting_for_the_writer_yields_to_a_native_announcement() {
+        let config = DoorbellConfig::default();
+        let now = Instant::now();
+        let mut inbox = facts(&["m1"]).inbox;
+        assert!(ring_still_admitted(&inbox, &config, now));
+        inbox.native_announced_at = Some(now);
+        assert!(!ring_still_admitted(&inbox, &config, now));
+        assert!(ring_still_admitted(&inbox, &config, now + config.arm_grace));
+        inbox.armed = 1;
+        assert!(!ring_still_admitted(
+            &inbox,
+            &config,
+            now + config.arm_grace
+        ));
     }
 
     /// Scenario: Parse the doorbell's environment overrides, including bad

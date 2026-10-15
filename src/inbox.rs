@@ -921,6 +921,9 @@ pub enum AckOutcome {
 pub enum ClaimOutcome {
     Completed,
     Released,
+    /// The caller's claim ran out before it settled it: the offer went back
+    /// to its pool, as it does when the ticker finds the claim expired.
+    Expired,
     /// The offer is not claimed by this caller.
     NotClaimant,
     /// Not an open offer.
@@ -977,10 +980,7 @@ impl Inbox {
         to: &Recipient,
         content: &Content,
     ) -> Result<(), PostError> {
-        self.expire_dedup(now);
-        self.check_body(content)?;
-        self.check_id(content.id.as_ref())?;
-        self.check_room(1)?;
+        self.admit_reply(now, content)?;
         if !self.has_room_for(&to.pane_id) {
             return Err(PostError::InboxFull {
                 pane_id: to.pane_id.clone(),
@@ -988,6 +988,15 @@ impl Inbox {
             });
         }
         Ok(())
+    }
+
+    /// The refusal [`Self::post_reply`] would give `content` now, without
+    /// posting it.
+    pub fn admit_reply(&mut self, now: Instant, content: &Content) -> Result<(), PostError> {
+        self.expire_dedup(now);
+        self.check_body(content)?;
+        self.check_id(content.id.as_ref())?;
+        self.check_room(1)
     }
 
     /// Post one direct message to `to`.
@@ -998,6 +1007,25 @@ impl Inbox {
         content: Content,
     ) -> Result<MessageId, PostError> {
         self.admit_direct(now, &to, &content)?;
+        Ok(self.insert_direct(now, to, content))
+    }
+
+    /// PR #1735 review: post the deck's answer to a request `to` made itself
+    /// (a dispatch's result). It is admitted as [`Self::post_direct`] admits a
+    /// message, except that the recipient's own backlog does not refuse it:
+    /// one answer per request the recipient sent is bounded by its requests,
+    /// and the deck-wide bound still applies.
+    pub fn post_reply(
+        &mut self,
+        now: Instant,
+        to: Recipient,
+        content: Content,
+    ) -> Result<MessageId, PostError> {
+        self.admit_reply(now, &content)?;
+        Ok(self.insert_direct(now, to, content))
+    }
+
+    fn insert_direct(&mut self, now: Instant, to: Recipient, content: Content) -> MessageId {
         let id = self.register_id(now, content.id.clone());
         let address = Address::Direct {
             deck: self.deck.clone(),
@@ -1014,7 +1042,7 @@ impl Inbox {
             body,
         );
         self.trim_history(now);
-        Ok(id)
+        id
     }
 
     /// Audit F2: the refusal [`Self::publish`] would give `content` for
@@ -1426,6 +1454,7 @@ impl Inbox {
         agent_id: &str,
     ) -> ClaimOutcome {
         match self.claimed_by(id, pane_id, agent_id) {
+            Ok(index) if self.expire_claim_if_due(index, now) => ClaimOutcome::Expired,
             Ok(index) => {
                 self.transition(
                     index,
@@ -1452,6 +1481,7 @@ impl Inbox {
         agent_id: &str,
     ) -> ClaimOutcome {
         match self.claimed_by(id, pane_id, agent_id) {
+            Ok(index) if self.expire_claim_if_due(index, now) => ClaimOutcome::Expired,
             Ok(index) => {
                 self.return_offer(index, now, ReturnCause::Released);
                 self.trim_history(now);
@@ -1819,6 +1849,22 @@ impl Inbox {
             MessageState::Claimed { by, .. } if by.admits(pane_id, agent_id) => Ok(index),
             _ => Err(ClaimOutcome::NotClaimant),
         }
+    }
+
+    /// The claim on offer `index` ran out by `now` and the ticker has not
+    /// returned the offer yet: return it now, as [`Inbox::tick`] would. A
+    /// claim is honoured only until it expires, whichever of the two gets to
+    /// the inbox first.
+    fn expire_claim_if_due(&mut self, index: usize, now: Instant) -> bool {
+        let due = matches!(
+            &self.messages[index].state,
+            MessageState::Claimed { expires, .. } if *expires <= now
+        );
+        if due {
+            self.return_offer(index, now, ReturnCause::ClaimExpired);
+            self.trim_history(now);
+        }
+        due
     }
 
     /// A fetched message that was not acknowledged goes back to the queue, or
@@ -3038,6 +3084,42 @@ mod tests {
                 max_ms: 86_400_000,
             })
         );
+    }
+
+    /// PR #1735 review: a claim settled after it expired, but before the
+    /// ticker returned the offer, is not honoured. Completing or releasing it
+    /// then returns the offer to its pool, as the ticker would have.
+    #[test]
+    fn a_claim_settled_after_its_expiry_returns_the_offer_to_its_pool() {
+        for complete in [true, false] {
+            let t0 = Instant::now();
+            let mut inbox = inbox();
+            let alice = Recipient::bound("5", "agent-a");
+            let ttl = Duration::from_secs(120);
+            let offered = inbox
+                .offer(
+                    t0,
+                    scope(),
+                    "review",
+                    Some(ttl),
+                    from_agent("1", "agent-o"),
+                    std::slice::from_ref(&alice),
+                )
+                .unwrap();
+            inbox.fetch(t0, "5", "agent-a", Consumer::FetchCli, None);
+            inbox.ack(t0, offered.id.as_str(), "5", "agent-a", AckHow::Explicit);
+            let late = t0 + ttl + SECOND;
+            let outcome = if complete {
+                inbox.complete(late, offered.id.as_str(), "5", "agent-a")
+            } else {
+                inbox.release(late, offered.id.as_str(), "5", "agent-a")
+            };
+            assert_eq!(outcome, ClaimOutcome::Expired, "complete={complete}");
+            assert!(
+                inbox.unassigned_offers().contains(&offered.id),
+                "the expired claim's offer is back in its pool (complete={complete})"
+            );
+        }
     }
 
     /// Scenario: Let a claimed offer's claim expire, then release the next
