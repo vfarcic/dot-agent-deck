@@ -4714,6 +4714,66 @@ async fn refuse_restart_for_stop(stream: &mut IpcStream) -> io::Result<()> {
     write_resp(stream, &resp).await
 }
 
+/// PRD #1589 D5: end the dispatched unit `record` belonged to, once its agent
+/// is closed and no pane of the unit remains — for an orchestration, once
+/// neither the registry nor the role maps in `state` hold any pane of its
+/// instance.
+pub(crate) async fn end_unit_if_last_pane(
+    record: &AgentRecord,
+    registry: &Arc<AgentPtyRegistry>,
+    state: Option<&SharedState>,
+    end_reason: crate::dispatched_units::EndReason,
+) {
+    let instance = match &record.tab_membership {
+        Some(crate::agent_pty::TabMembership::Orchestration {
+            orchestration_id: Some(id),
+            ..
+        }) => Some(id.clone()),
+        _ => None,
+    };
+    let in_state = match (instance.as_deref(), state) {
+        (Some(instance), Some(state)) => state
+            .read()
+            .await
+            .pane_orchestration_map
+            .values()
+            .any(|identity| identity.id == instance),
+        _ => false,
+    };
+    if let Some(unit_id) = registry.note_unit_member_removed(record, in_state, end_reason) {
+        tracing::info!(
+            unit_id = %unit_id,
+            agent_id = %record.id,
+            "dispatch: the unit's last pane closed; the unit has ended"
+        );
+    }
+}
+
+/// TEST: a `StartAgent` for a pane named here pauses between its spawn and its
+/// seed post — signalling the first `Notify` and waiting on the second — so a
+/// test can land the agent's own hook, or fill the deck, in that window. Each
+/// entry is taken by the one start that reaches it.
+#[cfg(test)]
+pub(crate) type SeedPostPause = (String, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+#[cfg(test)]
+pub(crate) static SEED_POST_PAUSES: std::sync::Mutex<Vec<SeedPostPause>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+async fn pause_before_seed_post(pane_id: &str) {
+    let pause = {
+        let mut pauses = SEED_POST_PAUSES.lock().unwrap_or_else(|e| e.into_inner());
+        pauses
+            .iter()
+            .position(|(pane, _, _)| pane == pane_id)
+            .map(|at| pauses.remove(at))
+    };
+    if let Some((_, reached, resume)) = pause {
+        reached.notify_one();
+        resume.notified().await;
+    }
+}
+
 /// PRD #1589: the teardown `StopAgent` performs on one agent, shared with
 /// `CloseAgents` so the two cannot drift: everything between taking the
 /// pane-cleanup hold and answering, minus the dispatched-worktree cleanup —
@@ -4820,34 +4880,9 @@ pub(crate) async fn stop_agent_steps(
                 }
             }
             // PRD #1589 D5: the unit this agent belonged to ends once no pane
-            // of it remains — for an orchestration, once neither this registry
-            // nor the role maps hold any pane of its instance.
+            // of it remains.
             if let Some(record) = stopping_record {
-                let instance = match &record.tab_membership {
-                    Some(crate::agent_pty::TabMembership::Orchestration {
-                        orchestration_id: Some(id),
-                        ..
-                    }) => Some(id.clone()),
-                    _ => None,
-                };
-                let in_state = match instance.as_deref() {
-                    Some(instance) => state
-                        .read()
-                        .await
-                        .pane_orchestration_map
-                        .values()
-                        .any(|identity| identity.id == instance),
-                    None => false,
-                };
-                if let Some(unit_id) =
-                    registry.note_unit_member_removed(record, in_state, end_reason)
-                {
-                    tracing::info!(
-                        unit_id = %unit_id,
-                        agent_id = %record.id,
-                        "dispatch: the unit's last pane closed; the unit has ended"
-                    );
-                }
+                end_unit_if_last_pane(record, registry, Some(state), end_reason).await;
             }
             Ok(())
         }
@@ -5769,6 +5804,10 @@ async fn handle_connection(
                     // doorbell names it, and a Pi extension that still pulls
                     // with `get-seed` is served it from the inbox.
                     let seed = authoring_seed.or(seed);
+                    #[cfg(test)]
+                    if let Some(pane_id) = pane_id_env.as_deref() {
+                        pause_before_seed_post(pane_id).await;
+                    }
                     if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref())
                         && let Err(error) =
                             crate::spawn::post_seed(&registry, pane_id, &id, "seed", seed)
@@ -5777,11 +5816,18 @@ async fn handle_connection(
                         // above, and refused now all the same (the deck filled
                         // up meanwhile, or the long seed could not be saved).
                         // An agent without the task it was started for is a
-                        // failed start: it is closed before anything registers
-                        // or announces it, and the start answers the refusal.
+                        // failed start, and the start answers the refusal.
+                        //
+                        // Third review: this handler has registered nothing
+                        // yet, but the agent itself may have — its
+                        // `SessionStart` hook can land, and be broadcast as a
+                        // card, before the seed is refused. So the rollback
+                        // closes it as `StopAgent` would, generation-safely,
+                        // taking its sessions and announcing the pane closed.
                         crate::spawn::close_started_agents(
                             &registry,
-                            None,
+                            Some(&state),
+                            Some(&event_tx),
                             &[crate::spawn::SpawnedAgent {
                                 id: id.clone(),
                                 pane_id: pane_id.to_string(),
@@ -9590,6 +9636,163 @@ mod tests {
             registry.pane_current_agent_id(pane_id).as_deref(),
             Some(new_id.as_str())
         );
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// PR #1735 third review, finding 1: a start whose seed is refused after
+    /// the agent's own `SessionStart` hook already surfaced its card. The hook
+    /// lands while the start is paused between its spawn and its seed post,
+    /// and the deck fills in the same window, so the post is refused. The
+    /// failed start must take the card back off every attached client — one
+    /// pane-closed announcement naming the agent — and leave nothing of the
+    /// pane registered in the daemon, the session the hook created included.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_whose_seed_is_refused_after_its_hook_surfaced_it_announces_the_pane_closed() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, mut rx) = broadcast::channel(4096);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "seed-refused-after-hook";
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        SEED_POST_PAUSES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((pane_id.to_string(), reached.clone(), resume.clone()));
+        let start = {
+            let client = DaemonClient::new(sock.clone());
+            let cwd = dir.path().to_string_lossy().into_owned();
+            tokio::spawn(async move {
+                client
+                    .start_agent(StartAgentOptions {
+                        command: Some("/bin/cat".to_string()),
+                        cwd: Some(cwd),
+                        env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                        seed: Some("the task this agent was started for".to_string()),
+                        ..StartAgentOptions::default()
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), reached.notified())
+            .await
+            .expect("the start reaches its seed post");
+        let agent_id = registry
+            .pane_current_agent_id(pane_id)
+            .expect("the agent is live while its start is paused");
+
+        // The agent's own SessionStart lands first, and is broadcast as a card.
+        let hook = crate::event::AgentEvent {
+            session_id: "seed-refused-session".to_string(),
+            event_type: crate::event::EventType::SessionStart,
+            agent_type: crate::event::AgentType::ClaudeCode,
+            ..thinking_event_454(pane_id, &agent_id)
+        };
+        crate::daemon::ingest_event(&state, &event_tx, &registry, hook).await;
+        let surfaced = std::iter::from_fn(|| rx.try_recv().ok()).any(|msg| {
+            matches!(msg, BroadcastMsg::Event(ref e)
+                if e.event_type == crate::event::EventType::SessionStart
+                    && e.pane_id.as_deref() == Some(pane_id))
+        });
+        assert!(surfaced, "the hook surfaced the pane to attached clients");
+        let sessions_on_pane = |guard: &crate::state::AppState| {
+            guard
+                .sessions
+                .values()
+                .filter(|s| s.pane_id.as_deref() == Some(pane_id))
+                .count()
+        };
+        assert_eq!(
+            sessions_on_pane(&*state.read().await),
+            1,
+            "the hook created the pane's session in the daemon"
+        );
+
+        // Then the deck fills, so the seed post is refused.
+        let limits = registry.inbox().limits();
+        'fill: for pane in 0.. {
+            let to = crate::inbox::Recipient::bound(format!("filler-{pane}"), "filler");
+            for n in 0..limits.max_per_recipient {
+                if registry
+                    .inbox()
+                    .post_direct(
+                        to.clone(),
+                        crate::inbox::Content::from_deck("test", format!("filler {n}"), "x"),
+                    )
+                    .is_err()
+                {
+                    break 'fill;
+                }
+            }
+        }
+        resume.notify_one();
+        let refused = tokio::time::timeout(Duration::from_secs(15), start)
+            .await
+            .expect("the start answers")
+            .expect("the start task");
+        let error = refused.expect_err("a start that lost its seed fails");
+        assert!(
+            error.to_string().contains("first prompt"),
+            "the refusal names the first prompt: {error}"
+        );
+
+        let closures: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                BroadcastMsg::Event(e) if e.is_daemon_pane_closed() => Some(e),
+                _ => None,
+            })
+            .collect();
+        let [closure] = closures.as_slice() else {
+            panic!("expected exactly one pane-closed announcement, got {closures:#?}");
+        };
+        assert_eq!(closure.pane_id.as_deref(), Some(pane_id));
+        assert_eq!(closure.agent_id.as_deref(), Some(agent_id.as_str()));
+        let guard = state.read().await;
+        assert!(
+            !guard.managed_pane_ids.contains(pane_id),
+            "the failed start leaves the pane unregistered"
+        );
+        assert_eq!(
+            sessions_on_pane(&guard),
+            0,
+            "nor any session of the start that failed"
+        );
+        drop(guard);
+        assert_eq!(registry.pane_current_agent_id(pane_id), None);
 
         registry.shutdown_all();
         server.abort();
