@@ -1031,6 +1031,38 @@ impl Inbox {
         Ok(())
     }
 
+    /// PR #1735 fifth review (B-01, B-02): hold room for a delegated task to
+    /// `pane_id` that replaces `replacing` older tasks still live there, as
+    /// [`Self::reserve_reply`] holds it for an answer. Its body and id are
+    /// checked now, before anything is retired or restarted for it. The older
+    /// tasks give their room back as the task goes in, so a deck or an inbox
+    /// they fill is no refusal. The reservation counts against every other
+    /// post's deck-wide room at once, so the room those tasks free stays taken
+    /// by it; posted with [`Self::post_reserved_reply`], it is not checked
+    /// against the recipient's backlog again.
+    pub fn reserve_delegate(
+        &mut self,
+        now: Instant,
+        pane_id: &str,
+        content: &Content,
+        replacing: usize,
+    ) -> Result<(), PostError> {
+        self.admit_reserved_reply(now, content)?;
+        if self.live_count() + self.reserved_replies + 1 > self.limits.max_messages + replacing {
+            return Err(PostError::DeckFull {
+                limit: self.limits.max_messages,
+            });
+        }
+        if self.live_for_pane(pane_id) >= self.limits.max_per_recipient + replacing {
+            return Err(PostError::InboxFull {
+                pane_id: pane_id.to_string(),
+                limit: self.limits.max_per_recipient,
+            });
+        }
+        self.reserved_replies += 1;
+        Ok(())
+    }
+
     /// Give back one reservation [`Self::reserve_reply`] made, unused.
     pub fn release_reply(&mut self) {
         self.reserved_replies = self.reserved_replies.saturating_sub(1);

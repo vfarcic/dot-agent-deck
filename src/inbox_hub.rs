@@ -836,6 +836,27 @@ impl InboxHub {
         self.post_direct(to, Content::from_deck(NOTICE_REASON, subject, body))
     }
 
+    /// PR #1735 fifth review (B-01, B-02): [`Inbox::reserve_delegate`] for a
+    /// task to `pane_id`, counting the older tasks still owed there — which
+    /// [`Self::post_reserved_delegate`] retires as the task goes in — as room
+    /// it replaces. Run before anything is saved, retired or restarted for the
+    /// task, so a task the inbox would refuse is refused while the worker's
+    /// older task is still as it was. The room is held until the task is
+    /// posted under it or the reservation drops.
+    pub fn reserve_delegate(
+        self: &Arc<Self>,
+        pane_id: &str,
+        content: &Content,
+    ) -> Result<ReplyReservation, PostError> {
+        let mut st = self.lock();
+        let replacing = live_delegates_locked(&st, pane_id);
+        st.inbox
+            .reserve_delegate(Instant::now(), pane_id, content, replacing)?;
+        Ok(ReplyReservation {
+            hub: Some(Arc::clone(self)),
+        })
+    }
+
     /// PRD #1666 S5: post a delegated task to `worker` and watch it. If it is
     /// still unacknowledged after [`ENV_UNDELIVERED_NOTICE_AFTER_MS`], or turns
     /// undeliverable for any reason but being superseded, `orchestrator` is
@@ -844,7 +865,8 @@ impl InboxHub {
     ///
     /// Every older task to the same pane still owed is superseded: a newer
     /// delegation replaces it. The new task is admitted first, so one the
-    /// inbox refuses supersedes nothing.
+    /// inbox refuses supersedes nothing; the room the older tasks free counts
+    /// as its own ([`Self::reserve_delegate`]).
     ///
     /// `worker_holds` is asked, under this hub's lock and before anything is
     /// superseded, whether the worker's agent still holds its pane, as
@@ -854,6 +876,52 @@ impl InboxHub {
     /// superseded left as they were.
     pub fn post_delegate(
         &self,
+        worker: Recipient,
+        role: &str,
+        orchestrator: Option<Recipient>,
+        ledger: DelegateLedger,
+        content: Content,
+        worker_holds: &dyn Fn() -> bool,
+    ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
+        self.post_delegate_with(
+            None,
+            worker,
+            role,
+            orchestrator,
+            ledger,
+            content,
+            worker_holds,
+        )
+    }
+
+    /// [`Self::post_delegate`] into the room `reservation` held for the task
+    /// ([`Self::reserve_delegate`]); a refusal gives the room back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn post_reserved_delegate(
+        &self,
+        reservation: ReplyReservation,
+        worker: Recipient,
+        role: &str,
+        orchestrator: Option<Recipient>,
+        ledger: DelegateLedger,
+        content: Content,
+        worker_holds: &dyn Fn() -> bool,
+    ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
+        self.post_delegate_with(
+            Some(reservation),
+            worker,
+            role,
+            orchestrator,
+            ledger,
+            content,
+            worker_holds,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn post_delegate_with(
+        &self,
+        mut reservation: Option<ReplyReservation>,
         worker: Recipient,
         role: &str,
         orchestrator: Option<Recipient>,
@@ -873,26 +941,31 @@ impl InboxHub {
             }
             // PR #1735 fifth review (N8): admitted before anything is
             // superseded, so a task the inbox refuses leaves the worker's older
-            // task as it was. A full inbox is no refusal while an older task is
-            // there to supersede: superseding it makes the room, and only frees
-            // room, so the post below cannot then be refused.
-            match st.inbox.admit_direct(now, &worker, &content) {
-                Ok(()) => {}
-                Err(PostError::InboxFull { .. })
-                    if st.delegates.iter().any(|(id, watch)| {
-                        watch.worker.pane_id == worker.pane_id
-                            && st
-                                .inbox
-                                .get(id, &worker.pane_id)
-                                .is_some_and(|message| !message.state.is_terminal())
-                    }) => {}
-                Err(error) => return Err(PostRefusal::Refused(error)),
+            // task as it was. Without a reservation the room is reserved here,
+            // under the same lock as the post.
+            match reservation.as_ref() {
+                Some(_) => st.inbox.admit_reserved_reply(now, &content),
+                None => {
+                    let replacing = live_delegates_locked(&st, &worker.pane_id);
+                    st.inbox
+                        .reserve_delegate(now, &worker.pane_id, &content, replacing)
+                }
             }
+            .map_err(PostRefusal::Refused)?;
             let superseded = retire_delegates_locked(&mut st, now, &worker.pane_id, |_| true);
-            let id = st
-                .inbox
-                .post_direct(now, worker.clone(), content)
-                .map_err(PostRefusal::Refused)?;
+            let id = match st.inbox.post_reserved_reply(now, worker.clone(), content) {
+                Ok(id) => id,
+                Err(error) => {
+                    if reservation.is_none() {
+                        st.inbox.release_reply();
+                    }
+                    return Err(PostRefusal::Refused(error));
+                }
+            };
+            // The post used the reservation's room.
+            if let Some(reservation) = reservation.as_mut() {
+                reservation.hub = None;
+            }
             drain_events(&mut st);
             st.delegates.insert(
                 id.to_string(),
@@ -2036,6 +2109,21 @@ fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBud
     count
 }
 
+/// How many watched tasks to `pane_id` are still live: those a newer
+/// delegation to the pane retires as it goes in.
+fn live_delegates_locked(st: &HubState, pane_id: &str) -> usize {
+    st.delegates
+        .iter()
+        .filter(|(id, watch)| {
+            watch.worker.pane_id == pane_id
+                && st
+                    .inbox
+                    .get(id, pane_id)
+                    .is_some_and(|message| !message.state.is_terminal())
+        })
+        .count()
+}
+
 /// [`InboxHub::retire_delegates_to`] under a lock already held.
 fn retire_delegates_locked(
     st: &mut HubState,
@@ -2660,6 +2748,17 @@ pub fn retain_full_body_minted(
     };
     #[cfg(test)]
     spill_gate_pass();
+    #[cfg(test)]
+    let dirs = if SPILL_REFUSALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|pane| pane == pane_id)
+    {
+        &[]
+    } else {
+        dirs
+    };
     let millis = chrono::Utc::now().timestamp_millis();
     for dir in dirs {
         if let Err(error) = crate::orchestrator_context::ensure_git_excludes_context_dir(dir) {
@@ -2717,6 +2816,10 @@ fn spill_gate_pass() {
             .store(released, std::sync::atomic::Ordering::SeqCst);
     }
 }
+
+/// TEST: panes whose long bodies no directory takes, so their saving fails.
+#[cfg(test)]
+pub(crate) static SPILL_REFUSALS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// TEST record of the thread each saved body was written on, by pane.
 #[cfg(test)]

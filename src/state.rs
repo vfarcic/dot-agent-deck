@@ -5561,10 +5561,36 @@ async fn dispatch_one_owned(
             ),
         );
     };
-    if let Err(error) = registry.inbox().admit_reply(&content) {
-        refuse(orchestrator.clone(), &error);
-        return;
+    // PR #1735 fifth review (B-01, B-02): the task's room is reserved, and a
+    // long body saved, before anything is retired or restarted for it, so the
+    // `clear = true` restart below cannot be followed by a refusal of the task
+    // it was for: posts that arrive during the restart cannot take its room.
+    // The room the worker's older tasks free counts as its own. A refusal
+    // returns the room, and the saved file is removed unless the post goes in.
+    let reservation = match registry.inbox().reserve_delegate(&pane_id, &content) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            refuse(orchestrator.clone(), &error);
+            return;
+        }
+    };
+    let mut dirs = crate::inbox_hub::spill_dirs(&registry, &pane_id, None);
+    if let Some(cwd) = cwd.as_deref()
+        && registry.pane_current_agent_id(&pane_id).is_none()
+    {
+        // A pane re-created below starts its agent in `cwd`.
+        dirs.insert(0, std::path::PathBuf::from(cwd));
     }
+    let deck = registry.inbox().deck();
+    let spill = match crate::inbox_hub::off_the_executor(|| {
+        crate::inbox_hub::retain_full_body_minted(&deck, &pane_id, &mut content, &dirs)
+    }) {
+        Ok(spill) => spill,
+        Err(error) => {
+            refuse(orchestrator.clone(), &error);
+            return;
+        }
+    };
 
     // The worker generation the task is for: the replacement on a `clear = true`
     // respawn, whoever holds the pane otherwise.
@@ -5619,8 +5645,11 @@ async fn dispatch_one_owned(
         // A restart retires every older task to this pane, as superseded —
         // BEFORE the respawn retires the generation they were bound to, so they
         // end as superseded rather than reported undeliverable. The new task
-        // was admitted above, so a refusal cannot follow for its content.
+        // was admitted, its room reserved and its body saved above, so no
+        // refusal of its content can follow.
         registry.inbox().supersede_delegates_to(&pane_id);
+        #[cfg(test)]
+        clear_respawn_gate_pass(&pane_id).await;
         match registry
             .respawn_or_recreate_agent_for_pane(&pane_id, &role.command, &recreate_identity)
             .await
@@ -5794,25 +5823,6 @@ async fn dispatch_one_owned(
         .await;
     }
     let worker = crate::inbox::Recipient::bound(&pane_id, &worker_agent_id);
-    // Admitted again for this worker's own backlog, then the long body saved —
-    // or the task refused, never posted as an excerpt of a body nobody kept
-    // (PR #1735 fifth review, 7d). The saved file is removed again unless the
-    // post goes in.
-    if let Err(error) = registry.inbox().admit_direct(&worker, &content) {
-        refuse(orchestrator.clone(), &error);
-        return;
-    }
-    let dirs = crate::inbox_hub::spill_dirs(&registry, &pane_id, Some(&worker_agent_id));
-    let deck = registry.inbox().deck();
-    let spill = match crate::inbox_hub::off_the_executor(|| {
-        crate::inbox_hub::retain_full_body_minted(&deck, &pane_id, &mut content, &dirs)
-    }) {
-        Ok(spill) => spill,
-        Err(error) => {
-            refuse(orchestrator.clone(), &error);
-            return;
-        }
-    };
     // The idle-worker clock is held from the post until the task is
     // acknowledged: a worker cannot answer a task that has not reached it.
     if let Some(seq) = delegation_seq {
@@ -5831,7 +5841,8 @@ async fn dispatch_one_owned(
             .iter()
             .any(|(pane, agent)| *pane == pane_id && *agent == worker_agent_id)
     };
-    match registry.inbox().post_delegate(
+    match registry.inbox().post_reserved_delegate(
+        reservation,
         worker,
         &target_role,
         orchestrator.clone(),
@@ -5882,6 +5893,37 @@ async fn dispatch_one_owned(
             }
             refuse(orchestrator, &error);
         }
+    }
+}
+
+/// TEST holds on a `clear = true` dispatch to a pane, between retiring its
+/// older tasks and restarting its worker: the dispatch says it has reached the
+/// hold, then waits for the test to let it go.
+#[cfg(test)]
+type ClearRespawnGate = (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+static CLEAR_RESPAWN_GATES: std::sync::Mutex<Vec<ClearRespawnGate>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+async fn clear_respawn_gate_pass(pane_id: &str) {
+    let gate = {
+        let mut gates = CLEAR_RESPAWN_GATES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        gates
+            .iter()
+            .position(|(pane, ..)| pane == pane_id)
+            .map(|at| gates.remove(at))
+    };
+    if let Some((_, reached, go)) = gate {
+        let _ = reached.send(());
+        let _ = go.await;
     }
 }
 
@@ -16943,6 +16985,263 @@ mod tests {
             saved.contains("TASK-A-5d1e") && !saved.contains("TASK-B-77c0"),
             "worker A's message names {} which holds another task",
             spill.display()
+        );
+        registry.shutdown_all();
+    }
+
+    /// A project directory whose orchestration `orch` has a `clear = true`
+    /// role `fresh` that restarts its worker for every task.
+    fn clear_role_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"orch\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"fresh\"\ncommand = \"cat\"\nclear = true\n",
+        )
+        .expect("write project config");
+        dir
+    }
+
+    /// [`dispatch_task`] to the `clear = true` role of [`clear_role_dir`].
+    async fn dispatch_clear_task(
+        registry: Arc<AgentPtyRegistry>,
+        orch_pane: String,
+        orch: String,
+        worker_pane: String,
+        task: String,
+        cwd: String,
+    ) -> crate::inbox::MessageId {
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let id = registry.inbox().mint_id();
+        dispatch_one_owned(
+            registry.clone(),
+            event_tx,
+            Some(OrchestrationIdentity {
+                id: "tab-1".to_string(),
+                name: "orch".to_string(),
+            }),
+            orch_pane,
+            Some(orch),
+            "fresh".to_string(),
+            worker_pane.clone(),
+            task,
+            Some(cwd),
+            id.clone(),
+            PointerQueueClock::new(registry.clone(), worker_pane, None),
+            None,
+            None,
+            None,
+        )
+        .await;
+        id
+    }
+
+    fn listed_state(
+        registry: &AgentPtyRegistry,
+        pane: &str,
+        id: &crate::inbox::MessageId,
+    ) -> Option<crate::inbox::StateName> {
+        registry
+            .inbox()
+            .list(pane)
+            .into_iter()
+            .find(|m| &m.id == id)
+            .map(|m| m.state)
+    }
+
+    /// PR #1735 fifth review (B-01): a `clear = true` delegation holds its
+    /// task's room from before it retires the worker's older task, so posts
+    /// that fill the deck while the replacement worker starts cannot leave the
+    /// older task superseded and the new one refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clear_restart_keeps_its_tasks_room_while_other_posts_fill_the_deck() {
+        let dir = clear_role_dir();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.install_inbox(Arc::new(crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::generate(),
+            crate::inbox::InboxLimits {
+                max_messages: 3,
+                ..crate::inbox::InboxLimits::default()
+            },
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        )));
+        let orch = stand_in_in(&registry, "b01-orch", Some(&cwd));
+        let _worker = stand_in_in(&registry, "b01-worker", Some(&cwd));
+        let older = dispatch_clear_task(
+            registry.clone(),
+            "b01-orch".into(),
+            orch.clone(),
+            "b01-worker".into(),
+            "the older task".into(),
+            cwd.clone(),
+        )
+        .await;
+        assert_eq!(
+            listed_state(&registry, "b01-worker", &older),
+            Some(crate::inbox::StateName::Queued),
+            "precondition: the older task is posted"
+        );
+
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (go, go_rx) = tokio::sync::oneshot::channel();
+        CLEAR_RESPAWN_GATES
+            .lock()
+            .unwrap()
+            .push(("b01-worker".to_string(), reached_tx, go_rx));
+        let newer = tokio::spawn(dispatch_clear_task(
+            registry.clone(),
+            "b01-orch".into(),
+            orch.clone(),
+            "b01-worker".into(),
+            "the newer task".into(),
+            cwd.clone(),
+        ));
+        reached.await.expect("the dispatch reaches the restart");
+        // Other panes fill the deck while the replacement worker starts.
+        let to_orch = crate::inbox::Recipient::bound("b01-orch", &orch);
+        let mut filled = 0;
+        while registry
+            .inbox()
+            .post_notice(to_orch.clone(), "filler", "x")
+            .is_ok()
+        {
+            filled += 1;
+            assert!(filled < 10, "the deck never filled");
+        }
+        go.send(()).unwrap();
+        let newer = newer.await.unwrap();
+
+        assert_eq!(
+            listed_state(&registry, "b01-worker", &newer),
+            Some(crate::inbox::StateName::Queued),
+            "the replacement task must be posted into the room it reserved"
+        );
+        assert_eq!(
+            listed_state(&registry, "b01-worker", &older),
+            Some(crate::inbox::StateName::Undeliverable),
+            "the older task is superseded by the replacement"
+        );
+        assert!(
+            !registry
+                .inbox()
+                .list("b01-orch")
+                .iter()
+                .any(|m| m.subject == "task refused"),
+            "the orchestrator was told its task was refused"
+        );
+        registry.shutdown_all();
+    }
+
+    /// PR #1735 fifth review (B-01): a `clear = true` task whose long body the
+    /// deck cannot save is refused before the worker's older task is retired
+    /// or its worker restarted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clear_task_refused_in_preparation_retires_and_restarts_nothing() {
+        let dir = clear_role_dir();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let orch = stand_in_in(&registry, "b01p-orch", Some(&cwd));
+        let _worker = stand_in_in(&registry, "b01p-worker", Some(&cwd));
+        let older = dispatch_clear_task(
+            registry.clone(),
+            "b01p-orch".into(),
+            orch.clone(),
+            "b01p-worker".into(),
+            "the older task".into(),
+            cwd.clone(),
+        )
+        .await;
+        let generation = registry.pane_current_agent_id("b01p-worker");
+        assert!(generation.is_some(), "precondition: the worker is live");
+
+        crate::inbox_hub::SPILL_REFUSALS
+            .lock()
+            .unwrap()
+            .push("b01p-worker".to_string());
+        let refused = dispatch_clear_task(
+            registry.clone(),
+            "b01p-orch".into(),
+            orch.clone(),
+            "b01p-worker".into(),
+            format!("LONG {}", "a long task line. ".repeat(1_000)),
+            cwd.clone(),
+        )
+        .await;
+
+        assert_eq!(listed_state(&registry, "b01p-worker", &refused), None);
+        assert_eq!(
+            listed_state(&registry, "b01p-worker", &older),
+            Some(crate::inbox::StateName::Queued),
+            "a task refused in preparation must leave the older task as it was"
+        );
+        assert_eq!(
+            registry.pane_current_agent_id("b01p-worker"),
+            generation,
+            "a task refused in preparation must not restart the worker"
+        );
+        assert!(
+            registry
+                .inbox()
+                .list("b01p-orch")
+                .iter()
+                .any(|m| m.subject == "task refused"),
+            "the orchestrator is told the task was refused"
+        );
+        registry.shutdown_all();
+    }
+
+    /// PR #1735 fifth review (B-02): a newer task to a worker whose inbox is
+    /// full — its backlog holds the older task it replaces — is posted, and
+    /// the older task superseded.
+    #[tokio::test]
+    async fn a_newer_delegation_replaces_the_older_task_in_a_full_inbox() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.install_inbox(Arc::new(crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::generate(),
+            crate::inbox::InboxLimits {
+                max_per_recipient: 2,
+                ..crate::inbox::InboxLimits::default()
+            },
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        )));
+        let orch = stand_in_in(&registry, "b02-orch", None);
+        let worker = stand_in_in(&registry, "b02-worker", None);
+        let older = dispatch_task(
+            &registry,
+            "b02-orch",
+            &orch,
+            "b02-worker",
+            "the older task",
+            None,
+        )
+        .await;
+        registry
+            .inbox()
+            .post_notice(
+                crate::inbox::Recipient::bound("b02-worker", &worker),
+                "filler",
+                "x",
+            )
+            .expect("the worker's inbox has room for one more");
+        let newer = dispatch_task(
+            &registry,
+            "b02-orch",
+            &orch,
+            "b02-worker",
+            "the newer task",
+            None,
+        )
+        .await;
+        assert_eq!(
+            listed_state(&registry, "b02-worker", &newer),
+            Some(crate::inbox::StateName::Queued),
+            "the newer task replaces the older one in a full inbox"
+        );
+        assert_eq!(
+            listed_state(&registry, "b02-worker", &older),
+            Some(crate::inbox::StateName::Undeliverable)
         );
         registry.shutdown_all();
     }
