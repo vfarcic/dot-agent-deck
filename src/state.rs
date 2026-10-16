@@ -5843,7 +5843,7 @@ async fn dispatch_one_owned(
     };
     match registry.inbox().post_reserved_delegate(
         reservation,
-        worker,
+        worker.clone(),
         &target_role,
         orchestrator.clone(),
         ledger,
@@ -5851,7 +5851,7 @@ async fn dispatch_one_owned(
         &still_live,
     ) {
         Ok((id, ended)) => {
-            registry.inbox().own_spill(spill, &id);
+            registry.inbox().own_task_spill(spill, &id, &worker);
             tracing::info!(
                 role = %target_role,
                 pane_id = %pane_id,

@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
@@ -1587,6 +1587,11 @@ impl InboxHub {
             let _ = waiter.tx.try_send(WaiterSignal::Superseded);
         }
         st.received_since_done.remove(pane_id);
+        // PR #1735 sixth review (B2-02): the exited worker's tasks are retired,
+        // so their saved bodies are held no longer.
+        st.spills.release_tasks(pane_id, |_, agent| {
+            agent.is_none_or(|agent| agent == agent_id)
+        });
         if let Some(id) = st.wake_stalled.remove(&key) {
             broadcast_wake_stall(&st, pane_id, agent_id, &id, false);
         }
@@ -1912,7 +1917,7 @@ impl InboxHub {
     /// Apply every deadline that has passed, then hand what came back to the
     /// queue to any armed waiter.
     pub fn tick(&self) {
-        let (deck, reclaimed) = {
+        let (deck, reclaim) = {
             let mut st = self.lock();
             let now = Instant::now();
             st.inbox.tick(now);
@@ -1926,15 +1931,26 @@ impl InboxHub {
                 .filter(|m| !m.state.is_terminal())
                 .map(|m| m.id.as_str())
                 .collect();
-            let reclaimed = state.spills.reclaim(now, &live);
-            let deck = st.inbox.deck().clone();
-            if !reclaimed.is_empty() {
-                self.record_spills(st);
-            }
-            (deck, reclaimed)
+            let reclaim = state.spills.reclaim(now, SystemTime::now(), &live);
+            (st.inbox.deck().clone(), reclaim)
         };
-        for path in reclaimed {
-            crate::inbox_spills::remove_spill(&path, &deck);
+        if reclaim.changed {
+            // PR #1735 sixth review (B2-04): a removal that failed stays
+            // tracked, to be tried again at a later tick.
+            let mut failed = Vec::new();
+            for mut spill in reclaim.removed {
+                if let crate::inbox_spills::Removal::Failed(error) =
+                    crate::inbox_spills::remove_spill(spill.path(), &deck)
+                {
+                    if spill.failed() {
+                        warn!(path = %spill.path().display(), %error, "inbox: could not remove a saved body; it is tried again");
+                    }
+                    failed.push(spill);
+                }
+            }
+            let mut st = self.lock();
+            st.spills.restore(failed);
+            self.record_spills(st);
         }
         self.post_owed_notices();
         self.dispatch_all();
@@ -1952,11 +1968,28 @@ impl InboxHub {
         }
     }
 
+    /// PR #1735 sixth review (B2-02): [`Self::own_spill`] for a delegated
+    /// task posted to `worker`, whose body is kept until the task is retired —
+    /// its worker's `work-done`, a newer task superseding it, or the worker
+    /// exiting — since the worker may still be working from it after
+    /// acknowledging the excerpt.
+    pub fn own_task_spill(&self, spill: MintedSpill, id: &MessageId, worker: &Recipient) {
+        if let Some((path, bytes)) = spill.take() {
+            let mut st = self.lock();
+            st.spills.own_task(path, id.as_str(), bytes, worker);
+            self.record_spills(st);
+        }
+    }
+
     /// Write what `st`'s ledger tracks to this run's manifest, once `st` is
     /// released. The hub's lock is never held while the manifest's is waited
     /// for (PR #1735 review, Qodo 4295418152); a write that a newer one
     /// overtook is skipped, so the manifest ends on the latest ledger.
-    fn record_spills(&self, mut st: MutexGuard<'_, HubState>) {
+    ///
+    /// Answers whether the manifest now holds this revision or a newer one. A
+    /// failed write is logged: it costs only the cleanup of those bodies after
+    /// this run ends, and the next record writes the whole ledger again.
+    fn record_spills(&self, mut st: MutexGuard<'_, HubState>) -> bool {
         st.spills_revision += 1;
         let revision = st.spills_revision;
         let text = st.spills.manifest_text();
@@ -1965,12 +1998,18 @@ impl InboxHub {
             .spill_manifest
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some((manifest, written)) = manifest.as_mut()
-            && revision > *written
-        {
-            manifest.write(&text);
-            *written = revision;
+        let Some((manifest, written)) = manifest.as_mut() else {
+            return false;
+        };
+        if revision > *written {
+            match manifest.write(&text) {
+                Ok(()) => *written = revision,
+                Err(error) => {
+                    warn!(%error, "inbox: could not record the saved bodies in this run's inventory");
+                }
+            }
         }
+        *written >= revision
     }
 
     /// PR #1735 fifth review (B-05): keep this run's list of saved bodies
@@ -1982,16 +2021,25 @@ impl InboxHub {
             let st = self.lock();
             (st.inbox.deck().clone(), st.spills.retention)
         };
-        match crate::inbox_spills::SpillManifest::open(state_dir, &deck, retention, Instant::now())
-        {
+        match crate::inbox_spills::SpillManifest::open(
+            state_dir,
+            &deck,
+            retention,
+            Instant::now(),
+            SystemTime::now(),
+        ) {
             Ok((manifest, taken)) => {
                 *self
                     .spill_manifest
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some((manifest, 0));
                 let mut st = self.lock();
-                st.spills.adopt(taken);
-                self.record_spills(st);
+                let sources = st.spills.adopt(taken);
+                // PR #1735 sixth review (B2-04): the ended runs' inventories
+                // go only once this run's records what they held.
+                if self.record_spills(st) {
+                    sources.release();
+                }
             }
             Err(error) => {
                 warn!(%error, "inbox: could not keep a list of the saved bodies of long messages");
@@ -2240,6 +2288,15 @@ fn retire_delegates_locked(
         }
     }
     drain_events(st);
+    // PR #1735 sixth review (B2-02): a supersession or a `work-done` retires
+    // the pane's tasks no longer live — acknowledged ones included — so their
+    // saved bodies are held no longer. A newer task still queued keeps its own.
+    let HubState { inbox, spills, .. } = st;
+    spills.release_tasks(pane_id, |message, _| {
+        inbox
+            .get(message, pane_id)
+            .is_none_or(|message| message.state.is_terminal())
+    });
     retired
 }
 
@@ -4555,6 +4612,219 @@ mod tests {
         assert!(hub.owned_spills().is_empty());
     }
 
+    /// PR #1735 sixth review (B2-01): a message that waited longer than the
+    /// retention and settled just before the deck restarted keeps its saved
+    /// body for the full retention from settling, not from when the file was
+    /// written.
+    #[test]
+    fn a_body_settled_just_before_a_restart_keeps_its_full_retention() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let before = hub();
+        before.open_spill_ledger(state.path());
+        let (c, spill) = saved_long(&before, dir.path(), "LATE");
+        let path = spill.path().unwrap().to_path_buf();
+        let id = before.post_direct(Recipient::bound("w", "wa"), c).unwrap();
+        before.own_spill(spill, &id);
+        // It waited two days in the inbox.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
+            .unwrap();
+        let taken = before.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        assert_eq!(taken.len(), 1);
+        before.tick();
+        drop(before);
+
+        let after = hub();
+        after.open_spill_ledger(state.path());
+        assert!(path.exists(), "the body settled moments ago");
+        assert_eq!(after.owned_spills(), vec![path.clone()]);
+        after.tick();
+        assert!(path.exists(), "and is kept after the restart");
+    }
+
+    /// PR #1735 sixth review (B2-02): a worker that acknowledged its task and
+    /// is still working keeps the task's saved body, however many bytes of
+    /// other settled bodies the byte bound reclaims; its `work-done` gives it
+    /// up.
+    #[test]
+    fn an_acknowledged_task_still_running_keeps_its_body_under_byte_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub();
+        let worker = Recipient::bound("w", "wa");
+        let (c, spill) = saved_long(&hub, dir.path(), "TASK");
+        let task_path = spill.path().unwrap().to_path_buf();
+        let (task, _end) = hub
+            .post_delegate(
+                worker.clone(),
+                "coder",
+                None,
+                DelegateLedger::default(),
+                c,
+                &|| true,
+            )
+            .unwrap();
+        hub.own_task_spill(spill, &task, &worker);
+        let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        assert_eq!(taken.len(), 1, "the worker acknowledged its task");
+
+        // Other agents' long reports settle, well past the byte bound and
+        // past their own protection.
+        {
+            let mut st = hub.lock();
+            st.spills.max_settled_bytes = 1;
+            st.spills.protected_grace = Duration::ZERO;
+        }
+        let mut reports = Vec::new();
+        for marker in ["REPORT-1", "REPORT-2"] {
+            let (c, spill) = saved_long(&hub, dir.path(), marker);
+            reports.push(spill.path().unwrap().to_path_buf());
+            let id = hub.post_direct(Recipient::bound("o", "oa"), c).unwrap();
+            hub.own_spill(spill, &id);
+        }
+        hub.fetch("o", "oa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.tick();
+        assert!(
+            task_path.exists(),
+            "the worker is still working from its task"
+        );
+        assert!(
+            reports.iter().all(|path| !path.exists()),
+            "the byte bound reclaimed the reports"
+        );
+
+        hub.retire_answered_delegates_to("w");
+        hub.tick();
+        assert!(!task_path.exists(), "its work-done retired the task");
+    }
+
+    /// PR #1735 sixth review (B2-02): a worker that exits retires its task,
+    /// so the task's saved body is held no longer.
+    #[test]
+    fn a_task_body_is_released_when_its_worker_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub();
+        hub.lock().spills.retention = Duration::ZERO;
+        let worker = Recipient::bound("w", "wa");
+        let (c, spill) = saved_long(&hub, dir.path(), "TASK");
+        let path = spill.path().unwrap().to_path_buf();
+        let (task, _end) = hub
+            .post_delegate(
+                worker.clone(),
+                "coder",
+                None,
+                DelegateLedger::default(),
+                c,
+                &|| true,
+            )
+            .unwrap();
+        hub.own_task_spill(spill, &task, &worker);
+        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.tick();
+        assert!(path.exists(), "held while the worker works");
+        hub.agent_exited("w", "another-agent");
+        hub.tick();
+        assert!(path.exists(), "another agent's exit retires nothing");
+        hub.agent_exited("w", "wa");
+        hub.tick();
+        assert!(!path.exists(), "the worker's exit retired its task");
+    }
+
+    /// PR #1735 sixth review (B2-04): a saved body whose removal fails stays
+    /// tracked and is removed at a later tick.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_removal_is_tried_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub();
+        let (c, spill) = saved_long(&hub, dir.path(), "STUCK");
+        let path = spill.path().unwrap().to_path_buf();
+        let id = hub.post_direct(Recipient::bound("w", "wa"), c).unwrap();
+        hub.own_spill(spill, &id);
+        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.lock().spills.retention = Duration::ZERO;
+        let context = path.parent().unwrap().to_path_buf();
+        let mode = |m| std::fs::set_permissions(&context, std::fs::Permissions::from_mode(m));
+        mode(0o500).unwrap();
+        hub.tick();
+        let stuck = path.exists();
+        mode(0o700).unwrap();
+        if !stuck {
+            // Privileged: the directory's mode does not stop the removal.
+            return;
+        }
+        assert_eq!(hub.owned_spills(), vec![path.clone()], "still tracked");
+        hub.tick();
+        assert!(!path.exists(), "removed once it can be");
+        assert!(hub.owned_spills().is_empty());
+    }
+
+    /// PR #1735 sixth review (B2-02): a message acknowledged moments ago keeps
+    /// its saved body for its protected grace, even past the byte bound: the
+    /// bound is exceeded rather than an agent's fresh file removed.
+    #[test]
+    fn a_just_acknowledged_body_is_protected_from_the_byte_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub();
+        hub.lock().spills.max_settled_bytes = 1;
+        let (c, spill) = saved_long(&hub, dir.path(), "FRESH");
+        let path = spill.path().unwrap().to_path_buf();
+        let id = hub.post_direct(Recipient::bound("w", "wa"), c).unwrap();
+        hub.own_spill(spill, &id);
+        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.tick();
+        assert!(path.exists(), "within its grace, the bound spares it");
+        assert_eq!(hub.owned_spills(), vec![path]);
+    }
+
+    /// PR #1735 sixth review (reservation caveat): a delegated task posts into
+    /// the room it reserved even when ordinary messages filled its worker's
+    /// inbox while it was being prepared. The inbox then holds more than its
+    /// limit, and further ordinary posts to it are refused as full until
+    /// enough of its messages settle.
+    #[test]
+    fn a_reserved_task_goes_in_over_an_inbox_filled_while_it_was_prepared() {
+        let limits = InboxLimits {
+            max_per_recipient: 2,
+            ..InboxLimits::default()
+        };
+        let hub = Arc::new(InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE));
+        let worker = Recipient::bound("w", "a");
+        hub.post_direct(worker.clone(), content("already waiting"))
+            .unwrap();
+        let room = hub.reserve_delegate("w", &content("task")).unwrap();
+        hub.post_direct(worker.clone(), content("posted while the task saved"))
+            .unwrap();
+        let (task, _end) = hub
+            .post_reserved_delegate(
+                room,
+                worker.clone(),
+                "coder",
+                None,
+                DelegateLedger::default(),
+                content("task"),
+                &|| true,
+            )
+            .unwrap();
+        assert_eq!(state_in(&hub, "w", &task), StateName::Queued);
+        assert_eq!(hub.list("w").len(), 3, "one over the limit of two");
+        let refused = hub.post_direct(worker.clone(), content("one more"));
+        assert!(
+            matches!(refused, Err(PostError::InboxFull { .. })),
+            "{refused:?}"
+        );
+        hub.fetch("w", "a", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        assert!(
+            hub.post_direct(worker, content("after they settled"))
+                .is_ok(),
+            "room comes back as its messages settle"
+        );
+    }
+
     /// PR #1735 fifth review (B-05): a delegated task superseded by a newer
     /// one, and a message dropped from the pane's history, give their files
     /// up once the retention passes; the newer, live task keeps its own.
@@ -4566,9 +4836,10 @@ mod tests {
         let delegate_long = |marker: &str| {
             let (c, spill) = saved_long(&hub, dir.path(), marker);
             let path = spill.path().unwrap().to_path_buf();
+            let worker = Recipient::bound("w", "wa");
             let (id, _end) = hub
                 .post_delegate(
-                    Recipient::bound("w", "wa"),
+                    worker.clone(),
                     "coder",
                     None,
                     DelegateLedger::default(),
@@ -4576,7 +4847,7 @@ mod tests {
                     &|| true,
                 )
                 .unwrap();
-            hub.own_spill(spill, &id);
+            hub.own_task_spill(spill, &id, &worker);
             (id, path)
         };
         let (older, older_path) = delegate_long("OLDER");
