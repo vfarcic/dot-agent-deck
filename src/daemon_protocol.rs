@@ -6998,7 +6998,7 @@ fn post_message(
     let still_live = || registry.pane_current_agent_id(pane_id).as_deref() == Some(live.as_str());
     match registry.inbox().post_direct_where(to, content, &still_live) {
         Ok(id) => {
-            spill.keep();
+            registry.inbox().own_spill(spill, &id);
             AttachResponse::with_id(id.to_string())
         }
         Err(error) => AttachResponse::err(format!("post-message: {error}")),

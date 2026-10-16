@@ -344,6 +344,9 @@ pub struct PooledOffer {
 
 struct HubState {
     inbox: Inbox,
+    /// PR #1735 fifth review (B-05): the bodies the deck saved to files for its
+    /// messages, and how long each is kept.
+    spills: crate::inbox_spills::SpillLedger,
     /// Oldest first, so the newest is `last()`.
     waiters: HashMap<AgentKey, Vec<Waiter>>,
     announced: HashMap<AgentKey, Announcement>,
@@ -442,6 +445,10 @@ impl std::fmt::Debug for ReplyReservation {
 /// The daemon's inbox and the components armed on it. See the module docs.
 pub struct InboxHub {
     state: Mutex<HubState>,
+    /// PR #1735 fifth review (B-05): this run's list of the saved bodies
+    /// [`HubState::spills`] tracks, written outside the hub's lock. Taken
+    /// only after that lock, never before it.
+    spill_manifest: Mutex<Option<crate::inbox_spills::SpillManifest>>,
     /// Woken whenever a deadline may have moved, so the ticker re-plans.
     changed: Arc<Notify>,
     keepalive: Duration,
@@ -534,6 +541,7 @@ impl InboxHub {
     pub fn new(deck: DeckId, limits: InboxLimits, keepalive: Duration) -> Self {
         Self {
             state: Mutex::new(HubState {
+                spills: crate::inbox_spills::SpillLedger::default(),
                 inbox: Inbox::new(deck, limits),
                 waiters: HashMap::new(),
                 announced: HashMap::new(),
@@ -555,6 +563,7 @@ impl InboxHub {
                 owed_card_notices: Vec::new(),
                 late_acks: HashMap::new(),
             }),
+            spill_manifest: Mutex::new(None),
             changed: Arc::new(Notify::new()),
             keepalive,
             waiter_slots: Arc::new(Semaphore::new(MAX_INBOX_WAITERS)),
@@ -1898,15 +1907,90 @@ impl InboxHub {
     /// Apply every deadline that has passed, then hand what came back to the
     /// queue to any armed waiter.
     pub fn tick(&self) {
-        {
+        let (deck, reclaimed) = {
             let mut st = self.lock();
             let now = Instant::now();
             st.inbox.tick(now);
             drain_events(&mut st);
             Self::notify_overdue_delegates(&mut st, now);
+            let state = &mut *st;
+            let live: std::collections::HashSet<&str> = state
+                .inbox
+                .all()
+                .iter()
+                .filter(|m| !m.state.is_terminal())
+                .map(|m| m.id.as_str())
+                .collect();
+            let reclaimed = state.spills.reclaim(now, &live);
+            let deck = st.inbox.deck().clone();
+            if !reclaimed.is_empty() {
+                self.record_spills(st);
+            }
+            (deck, reclaimed)
+        };
+        for path in reclaimed {
+            crate::inbox_spills::remove_spill(&path, &deck);
         }
         self.post_owed_notices();
         self.dispatch_all();
+    }
+
+    /// PR #1735 fifth review (B-05): track `spill`, the body saved for
+    /// message `id` that was accepted, so it is removed once it can no longer
+    /// be needed ([`crate::inbox_spills`]). A spill that saved nothing tracks
+    /// nothing.
+    pub fn own_spill(&self, spill: MintedSpill, id: &MessageId) {
+        if let Some((path, bytes)) = spill.take() {
+            let mut st = self.lock();
+            st.spills.own(path, id.as_str(), bytes);
+            self.record_spills(st);
+        }
+    }
+
+    /// Write what `st`'s ledger tracks to this run's manifest, once `st` is
+    /// released: the manifest's lock is taken first, so writes land in the
+    /// order the ledger changed.
+    fn record_spills(&self, st: MutexGuard<'_, HubState>) {
+        let text = st.spills.manifest_text();
+        let mut manifest = self
+            .spill_manifest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        drop(st);
+        if let Some(manifest) = manifest.as_mut() {
+            manifest.write(&text);
+        }
+    }
+
+    /// PR #1735 fifth review (B-05): keep this run's list of saved bodies
+    /// under `state_dir`, and take over those of daemon runs that ended
+    /// ([`crate::inbox_spills::SpillManifest::open`]). A failure costs only the
+    /// cleanup of this run's bodies after it ends.
+    pub fn open_spill_ledger(&self, state_dir: &std::path::Path) {
+        let (deck, retention) = {
+            let st = self.lock();
+            (st.inbox.deck().clone(), st.spills.retention)
+        };
+        match crate::inbox_spills::SpillManifest::open(state_dir, &deck, retention, Instant::now())
+        {
+            Ok((manifest, taken)) => {
+                *self
+                    .spill_manifest
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(manifest);
+                let mut st = self.lock();
+                st.spills.adopt(taken);
+                self.record_spills(st);
+            }
+            Err(error) => {
+                warn!(%error, "inbox: could not keep a list of the saved bodies of long messages");
+            }
+        }
+    }
+
+    /// The saved bodies this hub tracks now.
+    pub fn owned_spills(&self) -> Vec<std::path::PathBuf> {
+        self.lock().spills.paths()
     }
 
     /// Run [`Self::tick`] at every ack deadline or claim expiry, for as long as
@@ -2681,28 +2765,28 @@ pub enum PostRefusal {
 
 /// Audit F2: the file [`retain_full_body_minted`] saved for one post, if it
 /// saved one. Dropping it removes the file, so a post the inbox then refuses
-/// leaves nothing behind; [`Self::keep`] leaves it for an accepted post. A
-/// `spill_path` the caller supplied is never held here: the deck removes only
-/// what it wrote itself.
+/// leaves nothing behind; [`InboxHub::own_spill`] keeps it for an accepted post
+/// for as long as it can be needed. A `spill_path` the caller supplied is never
+/// held here: the deck removes only what it wrote itself.
 #[must_use = "a saved body is removed again unless it is kept"]
 #[derive(Debug, Default)]
-pub struct MintedSpill(Option<std::path::PathBuf>);
+pub struct MintedSpill(Option<(std::path::PathBuf, u64)>);
 
 impl MintedSpill {
     /// The file, if one was saved.
     pub fn path(&self) -> Option<&std::path::Path> {
-        self.0.as_deref()
+        self.0.as_ref().map(|(path, _)| path.as_path())
     }
 
-    /// The post was accepted: its saved body stays.
-    pub fn keep(mut self) {
-        self.0 = None;
+    /// The file and its size, which stays.
+    fn take(mut self) -> Option<(std::path::PathBuf, u64)> {
+        self.0.take()
     }
 }
 
 impl Drop for MintedSpill {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take()
+        if let Some((path, _)) = self.0.take()
             && let Err(error) = std::fs::remove_file(&path)
         {
             warn!(path = %path.display(), %error, "inbox: could not remove the saved body of a refused post");
@@ -2727,15 +2811,15 @@ pub fn off_the_executor<T>(save: impl FnOnce() -> T) -> T {
     }
 }
 
-/// [`retain_full_body_minted`] for a post that cannot be refused afterwards:
-/// a body it saves stays.
-pub fn retain_full_body(
+/// TEST: [`retain_full_body_minted`], leaving a body it saves in place.
+#[cfg(test)]
+fn retain_full_body(
     deck: &DeckId,
     pane_id: &str,
     content: &mut Content,
     dirs: &[std::path::PathBuf],
 ) -> Result<(), String> {
-    retain_full_body_minted(deck, pane_id, content, dirs).map(MintedSpill::keep)
+    retain_full_body_minted(deck, pane_id, content, dirs).map(|spill| drop(spill.take()))
 }
 
 /// PRD #1666 hardening H4: make sure the whole of `content` stays reachable
@@ -2750,7 +2834,8 @@ pub fn retain_full_body(
 ///
 /// The file it saves is answered as a [`MintedSpill`], removed unless the post
 /// is accepted (audit F2): check the post's admission before calling this, and
-/// keep the spill only once the post is in.
+/// hand the spill to [`InboxHub::own_spill`] only once the post is in, which
+/// removes it once it can no longer be needed (B-05).
 pub fn retain_full_body_minted(
     deck: &DeckId,
     pane_id: &str,
@@ -2787,7 +2872,7 @@ pub fn retain_full_body_minted(
         }
         for _ in 0..MAX_NAME_ATTEMPTS {
             let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let name = format!("inbox-message-{millis}-{seq}.md");
+            let name = crate::inbox_spills::spill_file_name(deck, &format!("{millis}-{seq}"));
             match crate::orchestrator_context::write_new_coordination_file(dir, &name, &text) {
                 Ok(path) => {
                     #[cfg(test)]
@@ -2796,7 +2881,7 @@ pub fn retain_full_body_minted(
                         .unwrap_or_else(|e| e.into_inner())
                         .push((pane_id.to_string(), std::thread::current().id()));
                     content.spill_path = Some(path.clone());
-                    return Ok(MintedSpill(Some(path)));
+                    return Ok(MintedSpill(Some((path, text.len() as u64))));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
@@ -2847,7 +2932,7 @@ pub(crate) static SPILL_REFUSALS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub(crate) static SPILL_WRITERS: Mutex<Vec<(String, std::thread::ThreadId)>> =
     Mutex::new(Vec::new());
 
-/// Where [`retain_full_body`] may save a long message for the agent in
+/// Where [`retain_full_body_minted`] may save a long message for the agent in
 /// `pane_id`: that agent's working directory, then the deck's state directory.
 pub fn spill_dirs(
     registry: &crate::agent_pty::AgentPtyRegistry,
@@ -2963,7 +3048,7 @@ fn post_live_keeping(
         None => hub.post_direct_where(to.clone(), content, &live),
     }
     .map_err(|error| (error.to_string(), None))?;
-    spill.keep();
+    hub.own_spill(spill, &id);
     Ok(id)
 }
 
@@ -4323,6 +4408,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A long body for `w`, saved under `dir`: its content and the spill.
+    fn saved_long(hub: &InboxHub, dir: &std::path::Path, marker: &str) -> (Content, MintedSpill) {
+        let mut c = content(&format!("{marker} {}", "background ".repeat(2_000)));
+        let spill =
+            retain_full_body_minted(&hub.deck(), "w", &mut c, &[dir.to_path_buf()]).unwrap();
+        assert!(spill.path().is_some(), "the body was saved");
+        (c, spill)
+    }
+
+    /// PR #1735 fifth review (B-05): the file an accepted long message names
+    /// is the deck's to remove: kept while the message is live and after its
+    /// acknowledgement — the agent may still be reading it — and removed by
+    /// the hub's tick once the retention after it settled has passed.
+    #[test]
+    fn a_saved_body_is_kept_past_its_ack_and_reclaimed_after_the_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub();
+        let (c, spill) = saved_long(&hub, dir.path(), "LONG-A");
+        let path = spill.path().unwrap().to_path_buf();
+        let id = hub.post_direct(Recipient::bound("w", "wa"), c).unwrap();
+        hub.own_spill(spill, &id);
+        assert_eq!(hub.owned_spills(), vec![path.clone()]);
+        hub.tick();
+        assert!(path.exists(), "a live message keeps its file");
+        let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        assert_eq!(taken.len(), 1);
+        hub.tick();
+        assert!(path.exists(), "an acknowledgement alone removes nothing");
+        hub.lock().spills.retention = Duration::ZERO;
+        hub.tick();
+        assert!(
+            !path.exists(),
+            "the retention passed, so the file is removed"
+        );
+        assert!(hub.owned_spills().is_empty());
+    }
+
+    /// PR #1735 fifth review (B-05): a delegated task superseded by a newer
+    /// one, and a message dropped from the pane's history, give their files
+    /// up once the retention passes; the newer, live task keeps its own.
+    #[test]
+    fn superseded_and_evicted_messages_give_their_saved_bodies_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub();
+        hub.lock().spills.retention = Duration::ZERO;
+        let delegate_long = |marker: &str| {
+            let (c, spill) = saved_long(&hub, dir.path(), marker);
+            let path = spill.path().unwrap().to_path_buf();
+            let (id, _end) = hub
+                .post_delegate(
+                    Recipient::bound("w", "wa"),
+                    "coder",
+                    None,
+                    DelegateLedger::default(),
+                    c,
+                    &|| true,
+                )
+                .unwrap();
+            hub.own_spill(spill, &id);
+            (id, path)
+        };
+        let (older, older_path) = delegate_long("OLDER");
+        let (newer, newer_path) = delegate_long("NEWER");
+        assert_eq!(state_in(&hub, "w", &older), StateName::Undeliverable);
+        hub.tick();
+        assert!(
+            !older_path.exists(),
+            "the superseded task's file is reclaimed"
+        );
+        assert!(newer_path.exists(), "the live task keeps its file");
+
+        // A message the pane's history no longer holds.
+        let (c, spill) = saved_long(&hub, dir.path(), "REPORT");
+        let report_path = spill.path().unwrap().to_path_buf();
+        let report = hub.post_direct(Recipient::bound("w2", "wa2"), c).unwrap();
+        hub.own_spill(spill, &report);
+        hub.fetch(
+            "w2",
+            "wa2",
+            Consumer::FetchCli,
+            None,
+            Some(AckHow::Explicit),
+        );
+        hub.lock().spills.retention = Duration::from_secs(3600);
+        hub.tick();
+        hub.forget_pane_history("w2");
+        assert!(hub.list("w2").is_empty(), "precondition: evicted");
+        hub.lock().spills.retention = Duration::ZERO;
+        hub.tick();
+        assert!(
+            !report_path.exists(),
+            "an evicted message's file is reclaimed"
+        );
+        assert!(newer_path.exists());
+        assert_eq!(hub.owned_spills(), vec![newer_path]);
+        let _ = newer;
     }
 
     /// Hardening H4: a body too long for the tightest hand-over is saved

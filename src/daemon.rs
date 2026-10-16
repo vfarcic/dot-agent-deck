@@ -916,7 +916,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
             warn!(%error, "could not load or create the deck id; using one for this run only");
             crate::inbox::DeckId::generate()
         });
-        pty_registry.install_inbox(Arc::new(crate::inbox_hub::InboxHub::from_env(deck)));
+        let hub = Arc::new(crate::inbox_hub::InboxHub::from_env(deck));
+        // PR #1735 fifth review (B-05): the saved bodies of long messages are
+        // listed for this run, and those earlier runs left are taken over.
+        hub.open_spill_ledger(&state_dir);
+        pty_registry.install_inbox(hub);
     }
     let inbox_ticker = pty_registry.inbox().spawn_ticker();
     // PRD #1589 D8: and which attach endpoint, so an agent's `close` (and every

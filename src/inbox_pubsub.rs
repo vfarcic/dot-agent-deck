@@ -460,7 +460,7 @@ async fn publish_in(
     ) {
         Ok(published) => {
             if let Some(spill) = saved.take() {
-                spill.keep();
+                registry.inbox().own_spill(spill, &published.id);
             }
             Attempt::Done(InboxPostReply {
                 id: Some(published.id.to_string()),
@@ -591,7 +591,7 @@ async fn offer_in(
     ) {
         Ok(offered) => {
             if let Some(spill) = saved.take() {
-                spill.keep();
+                registry.inbox().own_spill(spill, &offered.id);
             }
             Attempt::Done(InboxPostReply {
                 id: Some(offered.id.to_string()),

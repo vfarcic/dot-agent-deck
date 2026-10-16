@@ -5851,7 +5851,7 @@ async fn dispatch_one_owned(
         &still_live,
     ) {
         Ok((id, ended)) => {
-            spill.keep();
+            registry.inbox().own_spill(spill, &id);
             tracing::info!(
                 role = %target_role,
                 pane_id = %pane_id,
