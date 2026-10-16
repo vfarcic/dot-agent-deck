@@ -188,6 +188,11 @@ pub struct InboxSummary {
     /// one is armed or announced.
     #[serde(default)]
     pub component: Option<String>,
+    /// PR #1735 fifth review (R5): nothing has woken the agent for its
+    /// waiting messages ([`InboxHub::set_wake_stalled`]). Absent from an older
+    /// daemon's answer, and while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake_stalled: bool,
 }
 
 /// The wire spelling of `component`, for [`InboxSummary::component`].
@@ -359,6 +364,10 @@ struct HubState {
     /// When owed notices a full inbox refused are next tried, so the ticker
     /// wakes for them even when nothing else is due.
     owed_retry_at: Option<Instant>,
+    /// PR #1735 fifth review (R5): agent generations nothing has woken for
+    /// their waiting messages, with the oldest of those messages
+    /// ([`InboxHub::set_wake_stalled`]). Gone once that message is taken.
+    wake_stalled: HashMap<AgentKey, String>,
     /// Whether a bound recipient's agent still holds its pane, asked under
     /// this lock right before a message for it goes in
     /// ([`InboxHub::set_live_agent_check`]); unset, every post is taken as
@@ -534,6 +543,7 @@ impl InboxHub {
                 delegates: HashMap::new(),
                 owed_notices: Vec::new(),
                 owed_retry_at: None,
+                wake_stalled: HashMap::new(),
                 live_agent: None,
                 offers: HashMap::new(),
                 pooled: Arc::new(Notify::new()),
@@ -1433,6 +1443,7 @@ impl InboxHub {
             last_acked_at: None,
             wake: WakePath::Doorbell,
             component: None,
+            wake_stalled: st.wake_stalled.contains_key(&key),
         };
         let mut last_acked: Option<Instant> = None;
         for m in st.inbox.list(pane_id).into_iter().filter(|m| {
@@ -1489,11 +1500,68 @@ impl InboxHub {
             let _ = waiter.tx.try_send(WaiterSignal::Superseded);
         }
         st.received_since_done.remove(pane_id);
+        st.wake_stalled.remove(&key);
         drain_events(&mut st);
         let ledgers = std::mem::take(&mut st.exited_ledgers);
         drop(st);
         self.changed.notify_one();
         ledgers
+    }
+
+    /// PR #1735 fifth review (R5): the doorbell's verdict that nothing has
+    /// woken `agent_id` in `pane_id` for its waiting messages (`stalled`), or
+    /// that this no longer holds. Recorded against the oldest message queued
+    /// for it, shown in its summary, and broadcast as a notice for that
+    /// message, so both clients show the waiting messages as waiting to wake.
+    /// Cleared by the doorbell, by that message being taken or settling, or
+    /// by the agent exiting.
+    pub fn set_wake_stalled(&self, pane_id: &str, agent_id: &str, stalled: bool) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        let id = if stalled {
+            let Some(oldest) = queued_for(&st.inbox, pane_id, agent_id)
+                .next()
+                .map(|m| m.id.to_string())
+            else {
+                return;
+            };
+            if st.wake_stalled.get(&key) == Some(&oldest) {
+                return;
+            }
+            st.wake_stalled.insert(key, oldest.clone());
+            oldest
+        } else {
+            match st.wake_stalled.remove(&key) {
+                Some(id) => id,
+                None => return,
+            }
+        };
+        info!(pane_id, agent_id, message_id = %id, stalled, "inbox: wake stalled");
+        let Some(message) = st.inbox.get(&id, pane_id) else {
+            return;
+        };
+        let notice = InboxNotice {
+            pane_id: pane_id.to_string(),
+            agent_id: Some(agent_id.to_string()),
+            message_id: id.clone(),
+            subject: message.subject.clone(),
+            from_label: kind_sender_label(message.kind.name(), &message.from, message.body_trust),
+            state: message.state.name(),
+            reason: None,
+            returned: false,
+            wake_stalled: stalled,
+        };
+        if let Some(tx) = st.broadcast.as_ref() {
+            let _ = tx.send(BroadcastMsg::Inbox(notice));
+        }
+    }
+
+    /// Whether `agent_id` in `pane_id` is recorded as waiting to wake
+    /// ([`Self::set_wake_stalled`]).
+    pub fn wake_stalled(&self, pane_id: &str, agent_id: &str) -> bool {
+        self.lock()
+            .wake_stalled
+            .contains_key(&(pane_id.to_string(), agent_id.to_string()))
     }
 
     /// What `agent_id` in `pane_id` last announced, if anything.
@@ -2010,6 +2078,18 @@ fn retire_delegates_locked(
 /// An offer back in its pool has no pane to show it on, so it is only logged.
 fn drain_events(st: &mut HubState) {
     for event in st.inbox.drain_events() {
+        // PR #1735 fifth review (R5): the message a stalled wake was recorded
+        // against left the queue, so something took it. Clients clear their
+        // own copy from this event's notice.
+        if event.state != StateName::Queued
+            && let Some(recipient) = event.recipient.as_ref()
+            && let Some(agent) = recipient.agent_id.as_ref()
+        {
+            let key = (recipient.pane_id.clone(), agent.clone());
+            if st.wake_stalled.get(&key).map(String::as_str) == Some(event.message_id.as_str()) {
+                st.wake_stalled.remove(&key);
+            }
+        }
         settle_late_ack(st, &event);
         settle_delegate(st, &event);
         remember_max_deliver(st, &event);
@@ -2036,6 +2116,7 @@ fn drain_events(st: &mut HubState) {
                 state: event.state,
                 reason: event.undeliverable_reason,
                 returned: true,
+                wake_stalled: false,
             }));
         }
         let Some(recipient) = event.recipient else {
@@ -2051,6 +2132,7 @@ fn drain_events(st: &mut HubState) {
             state: event.state,
             reason: event.undeliverable_reason,
             returned: false,
+            wake_stalled: false,
         }));
     }
 }
@@ -3603,6 +3685,45 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// PR #1735 fifth review (R5): a stalled wake is recorded against the
+    /// oldest queued message, shown in the summary and broadcast as a notice
+    /// for that message; it ends when that message is taken, and the
+    /// doorbell clearing it broadcasts the notice without the flag.
+    #[test]
+    fn a_stalled_wake_is_shown_until_its_message_is_taken() {
+        let hub = hub();
+        let (tx, mut rx) = broadcast::channel(16);
+        hub.set_broadcast(tx);
+        let oldest = hub
+            .post_direct(Recipient::bound("p", "a"), content("first"))
+            .unwrap();
+        hub.post_direct(Recipient::bound("p", "a"), content("second"))
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+        hub.set_wake_stalled("p", "a", true);
+        assert!(hub.summary("p", "a").wake_stalled);
+        match rx.try_recv() {
+            Ok(BroadcastMsg::Inbox(notice)) => {
+                assert!(notice.wake_stalled);
+                assert_eq!(notice.message_id, oldest.to_string());
+            }
+            other => panic!("a stalled wake is broadcast: {other:?}"),
+        }
+        hub.set_wake_stalled("p", "a", false);
+        match rx.try_recv() {
+            Ok(BroadcastMsg::Inbox(notice)) => assert!(!notice.wake_stalled),
+            other => panic!("its end is broadcast: {other:?}"),
+        }
+        assert!(!hub.summary("p", "a").wake_stalled);
+        hub.set_wake_stalled("p", "a", true);
+        let taken = hub.fetch("p", "a", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        assert!(!taken.is_empty());
+        assert!(
+            !hub.summary("p", "a").wake_stalled,
+            "taking the message ends the stall"
+        );
     }
 
     /// PR #1735 fifth review (N8): a newer task the inbox refuses supersedes

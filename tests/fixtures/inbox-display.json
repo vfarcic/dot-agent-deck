@@ -3,5 +3,7 @@
   "queued": "queued",
   "delivered": "delivered",
   "notDelivered": "not delivered",
-  "workDone": "work-done"
+  "workDone": "work-done",
+  "wakeStalled": "waiting to wake",
+  "wakeStalledHint": "send it a prompt"
 }

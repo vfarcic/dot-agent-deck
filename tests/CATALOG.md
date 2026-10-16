@@ -7926,6 +7926,13 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Asserts:** the dispatch is answered `accepted: false` with reason `deck_full`, and `list-agents` names no unit for it.
 - **Platform coverage:** mac+linux.
 
+##### inbox/protocol/019 — Two transient hook shells in a pane reach one receiver through the platform's process identity.
+- **Layer:** Fast tier (`tests/inbox_process_identity.rs`), the real binary as `daemon serve` with its production binding on; the pane's agent is `xargs`, a program that is not a shell as a real agent is not, running two `/bin/sh -c` hook children, each running the real CLI.
+- **Agent:** none (`xargs` stand-in).
+- **Asserts:** the first hook shell's `inbox announce --agent pi` is accepted (`inbox_list` reports `wake: native`), and the second hook shell's `inbox wait --agent pi --stream` is admitted as the same receiver and takes the queued task. Peer discovery, the parent walk, start times and shell resolution are the platform's own.
+- **Does not assert:** a real agent, Windows, or the refusals of an outside or exited peer (`inbox/protocol/015`–`017`).
+- **Platform coverage:** mac+linux; the reason it is in the fast tier is that CI's `build-macos` runs the fast tier.
+
 #### Agent CLI
 
 ##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.
@@ -8165,6 +8172,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Asserts:** A foreign pane notice leaves the card alone; queued and duplicate queued count once; fetched stays pending; acknowledgement replaces the pending badge with delivered. Ordinary tool events form ordered ingestion barriers.
 - **Does not assert:** daemon notice generation or real agent wake-up.
 - **Platform coverage:** mac+linux.
+
+##### inbox/status/012 — A card whose agent nothing has woken says its messages are waiting to wake, and what to do.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's existing record/resync seam.
+- **Agent:** none.
+- **Asserts:** an inbox summary with `wake_stalled` renders `✉1 waiting to wake: send it a prompt`, built from the shared `tests/fixtures/inbox-display.json` words the desktop reads.
+- **Does not assert:** when the daemon decides a wake has stalled (`doorbell::tests`), or the desktop tile (`desktop/src/lib/inboxWords.test.ts`).
+- **Platform coverage:** all.
 
 #### inbox/claude
 

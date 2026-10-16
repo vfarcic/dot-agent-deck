@@ -2988,6 +2988,13 @@ pub struct InboxNotice {
     /// know it reads the job as still queued here, as before it existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub returned: bool,
+    /// PR #1735 fifth review (R5): nothing has woken this pane's agent for
+    /// its waiting messages; `message_id` is the oldest of them, and the
+    /// card shows them as waiting to wake until that message is taken, or
+    /// a notice for it arrives without this flag. Additive: a client that
+    /// does not know it shows them as queued.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake_stalled: bool,
 }
 
 /// PRD #120: the structural membership of a daemon-spawned orchestration,

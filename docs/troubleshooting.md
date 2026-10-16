@@ -218,7 +218,7 @@ A line such as `dot-agent-deck: message m-… waiting, run: dot-agent-deck inbox
 
 Run `dot-agent-deck hooks install` after upgrading, then restart the agent; for OpenCode you can use `dot-agent-deck hooks install --agent opencode`. Run those commands on the remote host when the agent runs there. If installation says it cannot edit OpenCode's `tui.json`, add the exact path it prints to that file's `plugin` list, preserve the other entries and restart OpenCode.
 
-The doorbell waits while the agent is busy, a permission or dialog answer is needed, or you have an unsent draft. Send or clear the draft and answer the prompt. Codex also waits for a recognised empty input box; if a future Codex UI is not recognised, send the first prompt yourself so messages can arrive at turn end. With untrusted Codex hooks, the model must run `inbox fetch` and its sandbox needs `network_access = true`, as described below.
+The doorbell waits while the agent is busy, a permission or dialog answer is needed, or you have an unsent draft. Send or clear the draft and answer the prompt. When messages have waited a couple of minutes while the agent is not working, the TUI card and the desktop tile both say `waiting to wake: send it a prompt`: send the agent any prompt and it takes its messages at that turn. Codex also waits for a recognised empty input box; if a future Codex UI is not recognised, send the first prompt yourself so messages can arrive at turn end. With untrusted Codex hooks, the model must run `inbox fetch` and its sandbox needs `network_access = true`, as described below.
 
 ### An inbox integration is refused with `inbox_not_agent_process`
 

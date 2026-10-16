@@ -366,6 +366,8 @@ export interface DesktopAgentDto {
     lastAckedAt?: string;
     wake: string;
     component?: string;
+    /** PR #1735 fifth review (R5): nothing has woken the agent for its waiting messages. */
+    wakeStalled?: boolean;
   };
   /**
    * PRD #1666 — the deck's notice explaining an `error` status (a message the
@@ -2306,6 +2308,7 @@ function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox 
     ...(inbox.lastAckedAt ? { lastAckedAt: inbox.lastAckedAt } : {}),
     wake: inbox.wake,
     ...(inbox.component ? { component: inbox.component } : {}),
+    ...(inbox.wakeStalled === true ? { wakeStalled: true } : {}),
   };
 }
 

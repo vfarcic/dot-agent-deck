@@ -6321,6 +6321,11 @@ struct PaneInbox {
     seen: HashMap<String, SeenMessage>,
     /// The agent has acknowledged a message.
     delivered: bool,
+    /// PR #1735 fifth review (R5): the deck reports that nothing has woken the
+    /// agent for its waiting messages, from the oldest of them — `Some("")`
+    /// when a summary said so without naming it. Cleared once that message is
+    /// taken or settles, or a notice for it no longer says so.
+    stalled: Option<String>,
 }
 
 impl PaneInbox {
@@ -6340,6 +6345,22 @@ impl PaneInbox {
         crate::inbox_display::CardInbox {
             pending: self.baseline + new,
             delivered: self.delivered,
+            stalled: self.stalled.is_some(),
+        }
+    }
+
+    /// Follow [`InboxNotice::wake_stalled`](crate::event::InboxNotice::wake_stalled)
+    /// for message `id`, now in `state`.
+    fn follow_stall(&mut self, id: &str, state: crate::inbox::StateName, stalled: bool) {
+        if stalled {
+            self.stalled = Some(id.to_string());
+            return;
+        }
+        let named = self.stalled.as_deref() == Some(id);
+        let unnamed_settled =
+            self.stalled.as_deref() == Some("") && state != crate::inbox::StateName::Queued;
+        if named || unnamed_settled {
+            self.stalled = None;
         }
     }
 
@@ -8227,6 +8248,7 @@ impl AppState {
                     .saturating_add(summary.claimed),
                 seen: HashMap::new(),
                 delivered: summary.last_acked_at.is_some(),
+                stalled: summary.wake_stalled.then(String::new),
             },
         );
         self.refresh_card_inbox(pane_id);
@@ -8260,6 +8282,7 @@ impl AppState {
             notice.state
         };
         inbox.apply(&notice.message_id, state);
+        inbox.follow_stall(&notice.message_id, state, notice.wake_stalled);
         self.refresh_card_inbox(&notice.pane_id);
     }
 
@@ -18714,6 +18737,7 @@ mod tests {
             state,
             reason: None,
             returned: false,
+            wake_stalled: false,
         }
     }
 
@@ -18730,7 +18754,13 @@ mod tests {
         fn card(state: &AppState) -> Option<CardInbox> {
             state.sessions["gen-q"].card_inbox()
         }
-        let pending = |pending, delivered| Some(CardInbox { pending, delivered });
+        let pending = |pending, delivered| {
+            Some(CardInbox {
+                pending,
+                delivered,
+                stalled: false,
+            })
+        };
         let mut state = AppState::default();
         state.register_pane("pane-q".to_string());
         state.apply_event(quota_event(EventType::SessionStart, 1));
@@ -18746,6 +18776,7 @@ mod tests {
                 last_acked_at: None,
                 wake: crate::inbox_hub::WakePath::Doorbell,
                 component: None,
+                wake_stalled: false,
             },
         );
         assert_eq!(card(&state), pending(2, false));
@@ -18801,6 +18832,7 @@ mod tests {
                 last_acked_at: None,
                 wake: crate::inbox_hub::WakePath::Native,
                 component: None,
+                wake_stalled: false,
             },
         );
         let card = |state: &AppState| state.sessions["gen-q"].card_inbox();
@@ -18808,6 +18840,7 @@ mod tests {
             Some(CardInbox {
                 pending,
                 delivered: false,
+                stalled: false,
             })
         };
         assert_eq!(
@@ -18825,6 +18858,64 @@ mod tests {
             None,
             "the job went back to its pool, not to this card, and was not delivered: no badge"
         );
+    }
+
+    /// PR #1735 fifth review (R5): a card shows its waiting messages as
+    /// waiting to wake while the deck says nothing has woken the agent for
+    /// them, and as queued again once the oldest of them is taken, or the
+    /// deck stops saying so. A summary that says so is followed too.
+    #[test]
+    fn a_cards_waiting_messages_show_a_stalled_wake_until_taken() {
+        use crate::inbox::StateName::{Fetched, Queued};
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::SessionStart, 1));
+        let line = |state: &AppState| {
+            state.sessions["gen-q"]
+                .card_inbox()
+                .and_then(crate::inbox_display::CardInbox::full_text)
+        };
+        let stalled = |id: &str| {
+            let mut notice = inbox_notice("pane-q", id, Queued);
+            notice.wake_stalled = true;
+            notice
+        };
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-a", Queued));
+        assert_eq!(line(&state).as_deref(), Some("✉1 queued"));
+        state.apply_inbox_notice(&stalled("m-a"));
+        assert_eq!(
+            line(&state).as_deref(),
+            Some("✉1 waiting to wake: send it a prompt")
+        );
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-a", Fetched));
+        assert_eq!(line(&state).as_deref(), Some("✉1 queued"));
+        state.apply_inbox_notice(&stalled("m-a"));
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-a", Queued));
+        assert_eq!(
+            line(&state).as_deref(),
+            Some("✉1 queued"),
+            "a notice for the stalled message without the flag clears it"
+        );
+        state.apply_inbox_summary(
+            "pane-q",
+            "agent-q",
+            &crate::inbox_hub::InboxSummary {
+                queued: 1,
+                fetched: 0,
+                claimed: 0,
+                undeliverable: 0,
+                last_acked_at: None,
+                wake: crate::inbox_hub::WakePath::Doorbell,
+                component: None,
+                wake_stalled: true,
+            },
+        );
+        assert_eq!(
+            line(&state).as_deref(),
+            Some("✉1 waiting to wake: send it a prompt")
+        );
+        state.apply_inbox_notice(&inbox_notice("pane-q", "m-z", Fetched));
+        assert_eq!(line(&state).as_deref(), Some("✉1 queued"));
     }
 
     /// PRD #1666 §2.8: the deck's not-delivered notice explains the card's

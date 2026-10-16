@@ -97,7 +97,7 @@ Type your request into the orchestrator's pane, for example *"Add input validati
 
 **Check each hand-off:**
 
-- When the orchestrator delegates, the `coder` card (TUI) or row (desktop) changes to a working status, and the coder's pane shows a line of the form `Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-…]`. The task is in `.dot-agent-deck/worker-task-coder.md` in the project directory.
+- When the orchestrator delegates, the `coder` card (TUI) or tile (desktop) shows `✉1 queued` until the coder takes the task, then `✉ delivered`, and its status changes to a working one. The task reaches the coder's pane as a deck message whose `Sent by:` line names the orchestrator; see [Delivery in the TUI and desktop app](#delivery-in-the-tui-and-desktop-app) for how each agent shows it. In the desktop app, the handoff rail shows `delegated · queued`, then `delivered · working`. A copy of the task is also saved to `.dot-agent-deck/worker-task-coder.md` in the project directory.
 - When the coder finishes, it runs `dot-agent-deck work-done`. Its report appears in the orchestrator's pane and is saved to `.dot-agent-deck/work-done-coder.md`.
 - The orchestrator then delegates to `reviewer`, and the same two signs appear for it.
 
@@ -460,7 +460,7 @@ If the replacement cannot start, or exits before taking the task, the orchestrat
 
 Tasks, worker reports, dispatch results, scheduled prompts and deck notices wait in the recipient's inbox. The installed hooks, plugin or extension hand them to the agent and acknowledge receipt. A successful `delegate` means the task was accepted; delivery and finishing the work are separate steps.
 
-Both clients show `✉N queued` while messages await acknowledgement and `✉ delivered` after receipt when nothing remains pending. A narrow TUI card shortens the badge to `✉N`. If a message cannot be delivered, the recipient shows **Error** (desktop **error**) and a `not delivered: …` notice. Delivered means the agent received the message; read its `work-done` report to judge the result.
+Both clients show `✉N queued` while messages await acknowledgement and `✉ delivered` after receipt when nothing remains pending. A narrow TUI card shortens the badge to `✉N`. If messages wait longer than a wake-up normally takes while the agent is not working, both clients show `✉N waiting to wake: send it a prompt`. That happens when nothing the deck can do wakes the agent, for example when a doorbell is held by a draft you left in the input box or by a screen the deck does not recognise. Send the agent any prompt, or clear your draft: the agent takes its messages at the start or end of its next turn, and the badge goes back to `✉N queued` or `✉ delivered`. If a message cannot be delivered, the recipient shows **Error** (desktop **error**) and a `not delivered: …` notice. Delivered means the agent received the message; read its `work-done` report to judge the result.
 
 Long turns affect delivery the same way in the TUI and the desktop app:
 
@@ -492,7 +492,7 @@ The delivery behavior is the same whether you watch the pane in the TUI or the d
 | Agent | What happens when a message arrives | Fallback or limitation |
 |---|---|---|
 | Claude Code | Native wake is enabled from version 2.1.296 after installing the integration. | A message waiting behind a long turn can be reported not delivered before it arrives; the orchestrator is then told it arrived. Claude Code cannot confirm that it is keeping a queued message during the turn, so a job not claimed within the deck's wait can go to the next worker while the Claude worker is still busy. Older or unrecognised versions get the doorbell line without a native-wake delay. Upgrade Claude Code and re-run `hooks install`, then restart Claude Code to enable native wake. |
-| Codex | The doorbell wakes an idle agent; hooks hand messages over at turn end when it is busy. | With untrusted hooks, the model runs `inbox fetch` itself and needs `network_access = true`. If a future Codex UI is not recognised, the idle doorbell waits; send the first prompt yourself so turn-end hand-over can take over. |
+| Codex | The doorbell wakes an idle agent; hooks hand messages over at turn end when it is busy. | With untrusted hooks, the model runs `inbox fetch` itself and needs `network_access = true`. If a future Codex UI is not recognised, the idle doorbell waits and the card shows `waiting to wake`; send the first prompt yourself so turn-end hand-over can take over. |
 | OpenCode | The full TUI receives messages through its TUI plugin. `--mini` receives messages natively and gets a redraw so they become visible; a partial frame can remain briefly. | If the deck cannot update `tui.json`, it uses the doorbell; add the plugin entry by hand as described below. A `/models` choice before the first prompt is not readable by the integration; launch with `--model` to choose that first message's model. `attach`, `acp`, `web`, `pr` and `github` have not been measured for this delivery path; expect the doorbell. |
 | Pi | Native delivery works while idle and queues follow-ups while busy. | The extension stops trying to connect when Pi runs outside a deck pane. Restart Pi inside the deck to receive deck messages. |
 | Devin | Uses the doorbell. | No native inbox wake integration is provided. |

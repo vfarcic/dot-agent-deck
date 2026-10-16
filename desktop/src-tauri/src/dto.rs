@@ -802,6 +802,10 @@ pub struct DesktopInbox {
     pub wake: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub component: Option<String>,
+    /// PR #1735 fifth review (R5): nothing has woken the agent for its waiting
+    /// messages, so the tile shows them as waiting to wake.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub wake_stalled: bool,
 }
 
 /// PRD #1541: the webview's view of `agent_registry::PromptKeys` — the keys
@@ -2201,6 +2205,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             .and_then(|value| value.as_str().map(str::to_string))
             .unwrap_or_else(|| "none".to_string()),
         component: summary.component.as_deref().map(safe_display_text),
+        wake_stalled: summary.wake_stalled,
     });
     let delivery_notice = live
         .filter(|snapshot| snapshot.status == SessionStatus::Error)
@@ -4001,6 +4006,7 @@ mod tests {
             last_acked_at: None,
             wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
             component: None,
+            wake_stalled: false,
         });
         let value = serde_json::to_value(map_agent(record)).unwrap();
         assert_eq!(

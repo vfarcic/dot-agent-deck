@@ -20597,6 +20597,7 @@ mod spawn_tests {
             tick: Duration::from_millis(20),
             schedule: vec![Duration::from_secs(60)],
             arm_grace: Duration::from_millis(1),
+            ..crate::doorbell::DoorbellConfig::default()
         };
         let bell = crate::doorbell::spawn(registry.clone(), state.clone(), config);
         // Several ticks: the ring is decided on the Idle pane and its write is

@@ -68,6 +68,8 @@ export type AgentInbox = {
   /** How a new message would reach the agent: `native`, `turn_end`, `doorbell` or `none`. */
   wake: string;
   component?: string;
+  /** PR #1735 fifth review (R5): nothing has woken the agent for its waiting messages. */
+  wakeStalled?: boolean;
 };
 /**
  * Issue #1678: the background work an agent left running after its turn ended,

@@ -100,6 +100,16 @@ pub const DEFAULT_SCHEDULE: [Duration; 4] = [
 /// See [`ENV_ARM_GRACE_MS`].
 pub const DEFAULT_ARM_GRACE: Duration = Duration::from_secs(10);
 
+/// PR #1735 fifth review (R5): how long, in milliseconds, the oldest message
+/// queued for an agent that is not working may wait before both clients show
+/// its messages as waiting to wake ([`StallClock`]).
+pub const ENV_WAKE_STALL_AFTER_MS: &str = "DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS";
+
+/// See [`ENV_WAKE_STALL_AFTER_MS`]: past the first two rings of
+/// [`DEFAULT_SCHEDULE`] and the native arm grace, so an ordinary wake-up —
+/// native, at a turn's end, or by a doorbell the agent answers — never shows.
+pub const DEFAULT_WAKE_STALL_AFTER: Duration = Duration::from_secs(120);
+
 /// The fixed line, before its id.
 pub const LINE_PREFIX: &str = " dot-agent-deck: message ";
 
@@ -118,6 +128,8 @@ pub struct DoorbellConfig {
     /// Never empty.
     pub schedule: Vec<Duration>,
     pub arm_grace: Duration,
+    /// See [`ENV_WAKE_STALL_AFTER_MS`].
+    pub wake_stall_after: Duration,
 }
 
 impl Default for DoorbellConfig {
@@ -126,6 +138,7 @@ impl Default for DoorbellConfig {
             tick: DEFAULT_TICK,
             schedule: DEFAULT_SCHEDULE.to_vec(),
             arm_grace: DEFAULT_ARM_GRACE,
+            wake_stall_after: DEFAULT_WAKE_STALL_AFTER,
         }
     }
 }
@@ -160,6 +173,12 @@ impl DoorbellConfig {
             match parse_ms(&raw) {
                 Some(ms) => config.arm_grace = ms,
                 None => ignored(ENV_ARM_GRACE_MS),
+            }
+        }
+        if let Some(raw) = lookup(ENV_WAKE_STALL_AFTER_MS) {
+            match parse_ms(&raw) {
+                Some(ms) if !ms.is_zero() => config.wake_stall_after = ms,
+                _ => ignored(ENV_WAKE_STALL_AFTER_MS),
             }
         }
         config
@@ -309,6 +328,96 @@ pub fn ring_still_admitted(inbox: &DoorbellFacts, config: &DoorbellConfig, now: 
             .is_none_or(|at| now >= at + config.arm_grace)
 }
 
+/// PR #1735 fifth review (R5): whether an agent generation's waiting
+/// messages have waited past [`DoorbellConfig::wake_stall_after`] with
+/// nothing waking the agent for them.
+///
+/// The clock runs while messages are queued, no native component is armed
+/// and the agent is not working — idle, in an error, or with no status at all
+/// (a start dialog it never got past, an integration that never reported).
+/// It starts again whenever the oldest queued message changes (something took
+/// it), and stands still while the agent works, answers a question or is
+/// blocked, which is waiting the user can already see. It is decided from
+/// what the inbox and the agent report, not from why a ring was held, so it
+/// covers every wake path: a doorbell that cannot ring (an unrecognised
+/// composer, a draft left in the box), one rung and never answered, and a
+/// native or turn-end hand-over that never came.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StallClock {
+    oldest: Option<String>,
+    since: Option<Instant>,
+    raised: bool,
+}
+
+/// What [`StallClock::observe`] asks the inbox to record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallChange {
+    Raise,
+    Clear,
+    Nothing,
+}
+
+impl StallClock {
+    /// One tick: `oldest` is the oldest message queued for the agent,
+    /// `waiting` whether nothing is working on the agent's side (no armed
+    /// component, the agent not working).
+    pub fn observe(
+        &mut self,
+        oldest: Option<&str>,
+        waiting: bool,
+        now: Instant,
+        after: Duration,
+    ) -> StallChange {
+        let Some(oldest) = oldest else {
+            let raised = self.raised;
+            *self = Self::default();
+            return if raised {
+                StallChange::Clear
+            } else {
+                StallChange::Nothing
+            };
+        };
+        let mut change = StallChange::Nothing;
+        if self.oldest.as_deref() != Some(oldest) {
+            self.oldest = Some(oldest.to_string());
+            self.since = None;
+            if std::mem::take(&mut self.raised) {
+                change = StallChange::Clear;
+            }
+        }
+        if !waiting {
+            self.since = None;
+            if std::mem::take(&mut self.raised) {
+                change = StallChange::Clear;
+            }
+            return change;
+        }
+        let since = *self.since.get_or_insert(now);
+        if !self.raised && now >= since + after {
+            self.raised = true;
+            return StallChange::Raise;
+        }
+        change
+    }
+}
+
+/// Whether an agent in `status` is doing something the user can already see,
+/// so its messages waiting is not a stalled wake: working, compacting,
+/// waiting on the user's answer, or blocked by a usage limit.
+fn status_explains_waiting(status: Option<&crate::state::SessionStatus>) -> bool {
+    use crate::state::SessionStatus;
+    matches!(
+        status,
+        Some(
+            SessionStatus::Thinking
+                | SessionStatus::Working
+                | SessionStatus::Compacting
+                | SessionStatus::WaitingForInput
+                | SessionStatus::Blocked
+        )
+    )
+}
+
 type AgentKey = (String, String);
 
 #[derive(Default)]
@@ -316,6 +425,8 @@ struct Slot {
     bell: Bell,
     /// A write for this agent is in flight.
     busy: bool,
+    /// PR #1735 fifth review (R5).
+    stall: StallClock,
 }
 
 /// Run the doorbell for as long as the returned task lives.
@@ -368,14 +479,19 @@ async fn run_tick(
     // PRD #1666 S5: a pane whose session declared it cannot take input
     // (history-only or view-only) is never rung, whatever its status says —
     // the line would land in no live conversation.
-    let admissions: Vec<Option<crate::state::DoorbellAdmission>> = {
+    let admissions: Vec<(Option<crate::state::DoorbellAdmission>, bool)> = {
         let state = state.read().await;
         keys.iter()
-            .map(|(pane, agent)| state.doorbell_admission(agent, pane))
+            .map(|(pane, agent)| {
+                (
+                    state.doorbell_admission(agent, pane),
+                    status_explains_waiting(state.agent_status(agent, pane).as_ref()),
+                )
+            })
             .collect()
     };
     let now = Instant::now();
-    for ((pane, agent), admission) in keys.into_iter().zip(admissions) {
+    for ((pane, agent), (admission, explained)) in keys.into_iter().zip(admissions) {
         let facts = Facts {
             inbox: hub.doorbell_facts(&pane, &agent),
             idle: admission.is_some(),
@@ -384,6 +500,17 @@ async fn run_tick(
         let (action, stranded) = {
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
             let slot = slots.entry((pane.clone(), agent.clone())).or_default();
+            let waiting = facts.inbox.armed == 0 && !explained;
+            match slot.stall.observe(
+                facts.inbox.queued.first().map(String::as_str),
+                waiting,
+                now,
+                config.wake_stall_after,
+            ) {
+                StallChange::Raise => hub.set_wake_stalled(&pane, &agent, true),
+                StallChange::Clear => hub.set_wake_stalled(&pane, &agent, false),
+                StallChange::Nothing => {}
+            }
             if slot.busy {
                 continue;
             }
@@ -492,6 +619,110 @@ async fn run_tick(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// PR #1735 fifth review (R5): the stall clock raises once, after the
+    /// oldest queued message has waited past the window with nothing working
+    /// on the agent's side; stands still while the agent works; starts again
+    /// when something takes the oldest message; and clears when the queue
+    /// empties or the agent starts working.
+    #[test]
+    fn a_wake_stalls_only_past_its_window_for_an_agent_not_working() {
+        let after = Duration::from_secs(120);
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut clock = StallClock::default();
+        assert_eq!(
+            clock.observe(Some("m1"), true, at(0), after),
+            StallChange::Nothing
+        );
+        assert_eq!(
+            clock.observe(Some("m1"), true, at(119), after),
+            StallChange::Nothing
+        );
+        assert_eq!(
+            clock.observe(Some("m1"), true, at(120), after),
+            StallChange::Raise
+        );
+        assert_eq!(
+            clock.observe(Some("m1"), true, at(500), after),
+            StallChange::Nothing,
+            "raised once"
+        );
+        assert_eq!(
+            clock.observe(Some("m1"), false, at(501), after),
+            StallChange::Clear,
+            "the agent started working"
+        );
+        assert_eq!(
+            clock.observe(Some("m1"), true, at(502), after),
+            StallChange::Nothing
+        );
+        assert_eq!(
+            clock.observe(Some("m1"), true, at(621), after),
+            StallChange::Nothing,
+            "the window starts again once the agent stops working"
+        );
+        assert_eq!(
+            clock.observe(Some("m1"), true, at(622), after),
+            StallChange::Raise
+        );
+        assert_eq!(
+            clock.observe(Some("m2"), true, at(623), after),
+            StallChange::Clear,
+            "something took the oldest message"
+        );
+        assert_eq!(
+            clock.observe(Some("m2"), true, at(743), after),
+            StallChange::Raise
+        );
+        assert_eq!(
+            clock.observe(None, true, at(744), after),
+            StallChange::Clear
+        );
+        assert_eq!(
+            clock.observe(None, true, at(745), after),
+            StallChange::Nothing
+        );
+        let mut working = StallClock::default();
+        for s in [0, 200, 400] {
+            assert_eq!(
+                working.observe(Some("m1"), false, at(s), after),
+                StallChange::Nothing,
+                "an agent at work is never shown as waiting to wake"
+            );
+        }
+    }
+
+    /// A working, compacting, asking or blocked agent explains its waiting
+    /// messages; an idle one, one in an error and one with no status do not.
+    #[test]
+    fn only_a_visible_occupation_explains_waiting_messages() {
+        use crate::state::SessionStatus;
+        for status in [
+            SessionStatus::Thinking,
+            SessionStatus::Working,
+            SessionStatus::Compacting,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Blocked,
+        ] {
+            assert!(status_explains_waiting(Some(&status)), "{status:?}");
+        }
+        for status in [Some(SessionStatus::Idle), Some(SessionStatus::Error), None] {
+            assert!(!status_explains_waiting(status.as_ref()), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn the_wake_stall_window_reads_from_the_environment() {
+        let config = DoorbellConfig::from_lookup(|name| {
+            (name == ENV_WAKE_STALL_AFTER_MS).then(|| "1500".to_string())
+        });
+        assert_eq!(config.wake_stall_after, Duration::from_millis(1500));
+        let zero = DoorbellConfig::from_lookup(|name| {
+            (name == ENV_WAKE_STALL_AFTER_MS).then(|| "0".to_string())
+        });
+        assert_eq!(zero.wake_stall_after, DEFAULT_WAKE_STALL_AFTER);
+    }
 
     fn facts(queued: &[&str]) -> Facts {
         Facts {

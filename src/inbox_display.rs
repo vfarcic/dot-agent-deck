@@ -2,9 +2,10 @@
 //! uses.
 //!
 //! The TUI's card and the desktop app's tile say the same thing about the same
-//! state (CLAUDE.md rule 22): `✉2 queued` while messages wait, `✉ delivered`
-//! once the agent has acknowledged one and nothing is pending, and `not
-//! delivered` for a message that could not reach it. The desktop's copy of the
+//! state (CLAUDE.md rule 22): `✉2 queued` while messages wait, `✉2 waiting to
+//! wake: send it a prompt` once they have waited too long for an agent that is
+//! not working, `✉ delivered` once the agent has acknowledged one and nothing
+//! is pending, and `not delivered` for a message that could not reach it. The desktop's copy of the
 //! words is `desktop/src/lib/inboxWords.ts`; `tests/fixtures/inbox-display.json`
 //! pins both to the same values, so a word changes in all three places at once.
 
@@ -18,6 +19,12 @@ pub const DELIVERED: &str = "delivered";
 pub const NOT_DELIVERED: &str = "not delivered";
 /// The worker reported back on a delegated task.
 pub const WORK_DONE: &str = "work-done";
+/// PR #1735 fifth review (R5): messages have waited longer than a wake-up
+/// takes while the agent was not working, so nothing has woken it for them.
+pub const WAKE_STALLED: &str = "waiting to wake";
+/// What the user can do about [`WAKE_STALLED`]: a prompt starts a turn, and
+/// every agent takes its messages at a turn's start or end.
+pub const WAKE_STALLED_HINT: &str = "send it a prompt";
 
 /// The card notice for a message handed to the agent the most times allowed,
 /// none acknowledged. Fixed text, as every delivery notice is
@@ -46,12 +53,21 @@ pub struct CardInbox {
     pub pending: usize,
     /// The agent has acknowledged a message.
     pub delivered: bool,
+    /// PR #1735 fifth review (R5): the deck reports that nothing has woken
+    /// the agent for its waiting messages ([`WAKE_STALLED`]).
+    pub stalled: bool,
 }
 
 impl CardInbox {
-    /// The card's inbox line: `✉2 queued`, `✉ delivered`, or nothing.
+    /// The card's inbox line: `✉2 queued`, `✉2 waiting to wake: send it a
+    /// prompt`, `✉ delivered`, or nothing.
     pub fn full_text(self) -> Option<String> {
-        if self.pending > 0 {
+        if self.pending > 0 && self.stalled {
+            Some(format!(
+                "{GLYPH}{} {WAKE_STALLED}: {WAKE_STALLED_HINT}",
+                self.pending
+            ))
+        } else if self.pending > 0 {
             Some(format!("{GLYPH}{} {QUEUED}", self.pending))
         } else if self.delivered {
             Some(format!("{GLYPH} {DELIVERED}"))
@@ -68,19 +84,36 @@ impl CardInbox {
 
     /// The journal entry's metadata value.
     pub fn encode(self) -> String {
-        format!("{},{}", self.pending, u8::from(self.delivered))
+        format!(
+            "{},{},{}",
+            self.pending,
+            u8::from(self.delivered),
+            u8::from(self.stalled)
+        )
     }
 
-    /// Reads [`Self::encode`]'s value; `None` for anything else.
+    /// Reads [`Self::encode`]'s value, and the two-field value written before
+    /// `stalled` existed; `None` for anything else.
     pub fn decode(value: &str) -> Option<Self> {
-        let (pending, delivered) = value.split_once(',')?;
+        let flag = |text: &str| match text {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        };
+        let mut parts = value.split(',');
+        let pending = parts.next()?.parse().ok()?;
+        let delivered = flag(parts.next()?)?;
+        let stalled = match parts.next() {
+            None => false,
+            Some(text) => flag(text)?,
+        };
+        if parts.next().is_some() {
+            return None;
+        }
         Some(Self {
-            pending: pending.parse().ok()?,
-            delivered: match delivered {
-                "0" => false,
-                "1" => true,
-                _ => return None,
-            },
+            pending,
+            delivered,
+            stalled,
         })
     }
 }
@@ -99,6 +132,8 @@ mod tests {
         assert_eq!(words["delivered"], DELIVERED);
         assert_eq!(words["notDelivered"], NOT_DELIVERED);
         assert_eq!(words["workDone"], WORK_DONE);
+        assert_eq!(words["wakeStalled"], WAKE_STALLED);
+        assert_eq!(words["wakeStalledHint"], WAKE_STALLED_HINT);
         for notice in [NOTICE_MAX_DELIVER, NOTICE_AGENT_EXITED] {
             assert!(notice.starts_with(NOT_DELIVERED), "{notice}");
         }
@@ -109,16 +144,34 @@ mod tests {
         let pending = CardInbox {
             pending: 2,
             delivered: true,
+            stalled: false,
         };
         assert_eq!(pending.full_text().as_deref(), Some("✉2 queued"));
         assert_eq!(pending.short_text().as_deref(), Some("✉2"));
         let done = CardInbox {
             pending: 0,
             delivered: true,
+            stalled: false,
         };
         assert_eq!(done.full_text().as_deref(), Some("✉ delivered"));
         assert_eq!(done.short_text(), None);
         assert_eq!(CardInbox::default().full_text(), None);
+        let stalled = CardInbox {
+            pending: 1,
+            delivered: false,
+            stalled: true,
+        };
+        assert_eq!(
+            stalled.full_text().as_deref(),
+            Some("✉1 waiting to wake: send it a prompt")
+        );
+        assert_eq!(stalled.short_text().as_deref(), Some("✉1"));
+        let settled = CardInbox {
+            pending: 0,
+            delivered: true,
+            stalled: true,
+        };
+        assert_eq!(settled.full_text().as_deref(), Some("✉ delivered"));
     }
 
     #[test]
@@ -128,11 +181,26 @@ mod tests {
             CardInbox {
                 pending: 7,
                 delivered: true,
+                stalled: false,
+            },
+            CardInbox {
+                pending: 2,
+                delivered: false,
+                stalled: true,
             },
         ] {
             assert_eq!(CardInbox::decode(&inbox.encode()), Some(inbox));
         }
-        for bad in ["", "1", "x,0", "1,2", "-1,0"] {
+        assert_eq!(
+            CardInbox::decode("3,1"),
+            Some(CardInbox {
+                pending: 3,
+                delivered: true,
+                stalled: false,
+            }),
+            "a value written before `stalled` existed still reads"
+        );
+        for bad in ["", "1", "x,0", "1,2", "-1,0", "1,0,2", "1,0,1,0"] {
             assert_eq!(CardInbox::decode(bad), None, "{bad}");
         }
     }

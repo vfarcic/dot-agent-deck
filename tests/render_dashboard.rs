@@ -517,6 +517,15 @@ fn card_stats_session(cwd: &str) -> SessionState {
 /// Feed the daemon's existing record/resync seam before rendering the card.
 /// No invented card-only inbox field: ListAgents already carries this data.
 fn inbox_card_session(queued: usize, fetched: usize, acknowledged: bool) -> SessionState {
+    inbox_card_session_with(queued, fetched, acknowledged, false)
+}
+
+fn inbox_card_session_with(
+    queued: usize,
+    fetched: usize,
+    acknowledged: bool,
+    wake_stalled: bool,
+) -> SessionState {
     let session = card_stats_session("/home/dev/api-svc");
     let record: dot_agent_deck::agent_pty::AgentRecord =
         serde_json::from_value(serde_json::json!({
@@ -525,7 +534,8 @@ fn inbox_card_session(queued: usize, fetched: usize, acknowledged: bool) -> Sess
             "inbox": {
                 "queued": queued, "fetched": fetched, "undeliverable": 0,
                 "last_acked_at": acknowledged.then_some(render_now()),
-                "wake": "doorbell", "component": null
+                "wake": "doorbell", "component": null,
+                "wake_stalled": wake_stalled
             }
         }))
         .expect("the daemon's existing AgentRecord wire shape");
@@ -569,6 +579,39 @@ fn status_006_card_counts_queued_and_fetched_messages() {
             "pending inbox must use the shared queued wording:\n{rendered}"
         );
     }
+}
+
+/// Scenario: The daemon reports that nothing has woken an agent for its one waiting message. Its card must say the message is waiting to wake and what to do, in the words the desktop uses, instead of only counting it as queued.
+#[spec("inbox/status/012")]
+#[test]
+fn status_012_card_says_a_stalled_wake_and_what_to_do() {
+    let words = inbox_display_words();
+    // The deck says so only of an agent that is not working.
+    let mut session = inbox_card_session_with(1, 0, false, true);
+    session.status = SessionStatus::Idle;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let line = format!(
+        "{}1 {}: {}",
+        words["glyph"].as_str().unwrap(),
+        words["wakeStalled"].as_str().unwrap(),
+        words["wakeStalledHint"].as_str().unwrap()
+    );
+    assert!(
+        rendered.contains(&line),
+        "a stalled wake must say {line:?}:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
 }
 
 /// Scenario: Render a pending-message card at the existing 20-column Compact snapshot budget. The envelope count must fit beside Thinking without removing the tools counter or overrunning either border.

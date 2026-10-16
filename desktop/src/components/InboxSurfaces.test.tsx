@@ -20,13 +20,14 @@ vi.mock("./TerminalViewport", () => ({ TerminalViewport: () => <pre>terminal</pr
 
 // Handwritten from AgentRecord.inbox / InboxNotice: no generated TS inbox
 // bindings exist yet. Structural assignment keeps these REDs behavioural.
-function snapshot(queued = 0, fetched = 0): DesktopSnapshotDto {
+function snapshot(queued = 0, fetched = 0, wakeStalled = false): DesktopSnapshotDto {
   const agent = {
     id: "7", paneId: "worker", displayName: "Coder", agentType: "codex" as const,
     rows: 24, cols: 80, status: "idle" as const, toolCount: 14,
     lastUserPrompt: "inspect the human fixture",
     tab: { kind: "orchestration" as const, name: "test", roleIndex: 1, roleName: "coder", isStartRole: false },
-    inbox: { queued, fetched, undeliverable: 0, wake: "doorbell", component: undefined },
+    inbox: { queued, fetched, undeliverable: 0, wake: "doorbell", component: undefined,
+      ...(wakeStalled ? { wakeStalled } : {}) },
   };
   return {
     connection: { status: "connected", deckId: "deck-0000000000001666", socketPath: "/tmp/test.sock",
@@ -57,6 +58,14 @@ describe("inbox cards and handoff rail (S13)", () => {
     const mapped = mapDesktopSnapshot(snapshot(queued, fetched));
     render(card(mapped.agents[0]));
     expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(`${words.glyph}2`);
+  });
+
+  /// Scenario: The daemon reports that nothing has woken the agent for its waiting message; the card says it is waiting to wake and what to do, in the words the TUI uses.
+  it("shows a stalled wake and what to do on the agent card", () => {
+    render(card(mapDesktopSnapshot(snapshot(1, 0, true)).agents[0]));
+    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(
+      `${words.glyph}1 ${words.wakeStalled}: ${words.wakeStalledHint}`,
+    );
   });
 
   /// Scenario: Acknowledged messages leave no pending badge on the card.
