@@ -7932,6 +7932,73 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Does not assert:** the daemon's exit detection.
 - **Platform coverage:** mac+linux+windows.
 
+#### inbox/receipt
+
+The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.1 §3, §5): the daemon's locked instance namespace under `<state_dir>/inbox-spool`, trusted one-component-at-a-time traversal, immutable stage records, bounded resumable scans and the cap-based evidence store, plus `platform::lock::try_lock_file`. In this slice the spool sits beside the current ack: records are published and read, nothing is pruned and no suppression decision is drawn from them, and nothing in the daemon calls it yet.
+
+##### inbox/receipt/001 — A non-blocking file lock refuses a held lock without waiting.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** with a lock taken through one handle, `try_lock_file` on a second handle of the same file answers not taken at once; after the first handle closes, the second takes it.
+- **Does not assert:** locks across processes (std's lock is per open file, which this covers within one process).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/002 — Concurrent starts never reap a live spool.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir state directory, eight threads.
+- **Agent:** none.
+- **Asserts:** eight spools started at once on one state directory all keep their instance directory and lock file and can publish; after three are stopped, a ninth start removes exactly those three instances and their lock files, leaves every live one, and skips an instance directory that has no lock file.
+- **Does not assert:** two daemon processes (threads hold separate lock handles, which is the same contention); a reap interrupted by its entry budget.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/003 — FIFO, symlink and directory entries are skipped unopened.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** beside one genuine record, a FIFO, a symlink to a valid record body outside the spool and a directory, all named like records, do not block the scan, are not returned, are not followed and are left in place.
+- **Does not assert:** Windows reparse points other than what `symlink_metadata` reports.
+- **Platform coverage:** mac+linux.
+
+##### inbox/receipt/004 — A record temp is owner-only before any byte.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** the temp a record is written through is empty and already mode 0600 on Unix; on Windows it is owned by the current user, its owner-only DACL having been set on the handle before any write.
+- **Does not assert:** the Windows DACL's contents (only its owner is read back).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/005 — An intermediate symlink is refused, not followed.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** a generation's `rec` directory, a pane directory or the spool root replaced by a symlink to a decoy directory makes opening the generation (daemon and component side) or starting the spool fail with permission denied; a handle anchored before the swap writes nothing into the decoy, and every decoy stays empty.
+- **Does not assert:** Windows junctions (the Windows traversal refuses reparse points by attribute, not exercised here).
+- **Platform coverage:** mac+linux.
+
+##### inbox/receipt/006 — An unsafe pre-existing root is refused, not repaired.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** a pre-existing spool root at mode 0777 or 0750 makes the start fail with permission denied and keeps its mode; at 0700 it is used; a pane directory made group-readable is refused the same way.
+- **Does not assert:** a directory owned by another user (needs a second account).
+- **Platform coverage:** mac+linux.
+
+##### inbox/receipt/007 — A bounded scan resumes and is never read as absence.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** with 3,000 unrecognised entries and one record, no pass examines more than 2,048 entries; a record never published reads unknown while the scan is incomplete and absent only once a pass completes it, when the genuine record reads found.
+- **Does not assert:** a scan run off the executor (the daemon does not call it yet).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/008 — Record bytes, temps and mismatches are bounded.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** 300 near-4 KiB records take more than one pass, split by the 1 MiB byte bound rather than the entry bound, and all 300 are returned; an oversized record file and one whose body names another message are removed and never returned; a fresh temp is kept; temps more than a minute old are removed only when a later pass sees them again, at most 256 per pass.
+- **Does not assert:** a publisher racing the removal of its own temp (fresh temps are never removed).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/009 — Records are admitted on their own stage's cap and never pruned.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** each attempt's caps file is found by its exact attempt, not the newest; publishing a record twice is refused; genuine handed and committed records are admitted once and then answer duplicate; a commit on the hand-out cap, a never-issued attempt and a random cap are refused; a revoke marker names only its attempt; after scanning and admitting, both record files are still there.
+- **Does not assert:** caps kept out of frames, hook output or `inbox fetch --json` (no hand-out writes caps yet).
+- **Platform coverage:** mac+linux+windows.
+
 #### Protocol and waiter lifecycle
 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.
