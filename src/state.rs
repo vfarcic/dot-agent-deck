@@ -16834,17 +16834,9 @@ mod tests {
         );
     }
 
-    /// Issue #714 (review): a notice is attempted only when a block is
-    /// reported, and a blocked agent reports nothing more until its next attempt
-    /// — so a task delegated to a worker that ALREADY reads Blocked must be
-    /// reported by the dispatch that delivers it. Latch a block on a worker, then
-    /// delegate to it twice: each delegation posts exactly one notice to the
-    /// orchestrator's inbox, a repeat report of the same delegation adds none,
-    /// and once work evidence lifts the block a further delegation reports
-    /// nothing.
-    #[cfg(unix)]
     /// Run one `dispatch_one_owned` of `task` from `orch` (in `orch_pane`) to
     /// role `coder` in `worker_pane`, in `cwd`, with no orchestration config.
+    #[cfg(unix)]
     async fn dispatch_task(
         registry: &Arc<AgentPtyRegistry>,
         orch_pane: &str,
@@ -16875,6 +16867,7 @@ mod tests {
         id
     }
 
+    #[cfg(unix)]
     fn stand_in_in(registry: &Arc<AgentPtyRegistry>, pane: &str, cwd: Option<&str>) -> String {
         registry
             .spawn_agent(crate::agent_pty::SpawnOptions {
@@ -16892,6 +16885,7 @@ mod tests {
     /// PR #1735 fifth review (N8): a newer delegation the worker's inbox
     /// refuses — here, a task over the body limit — leaves the worker's older
     /// task as it was: queued, not superseded.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_refused_delegation_leaves_the_workers_older_task() {
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -16935,6 +16929,7 @@ mod tests {
     /// point at a saved copy of their own task. The shared
     /// `worker-task-coder.md` is rewritten by the second, so it cannot be
     /// what the first message names.
+    #[cfg(unix)]
     #[tokio::test]
     async fn each_long_delegated_task_names_its_own_saved_copy() {
         let dir = tempfile::tempdir().unwrap();
@@ -16980,6 +16975,7 @@ mod tests {
 
     /// A project directory whose orchestration `orch` has a `clear = true`
     /// role `fresh` that restarts its worker for every task.
+    #[cfg(unix)]
     fn clear_role_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -16993,6 +16989,7 @@ mod tests {
     }
 
     /// [`dispatch_task`] to the `clear = true` role of [`clear_role_dir`].
+    #[cfg(unix)]
     async fn dispatch_clear_task(
         registry: Arc<AgentPtyRegistry>,
         orch_pane: String,
@@ -17026,6 +17023,7 @@ mod tests {
         id
     }
 
+    #[cfg(unix)]
     fn listed_state(
         registry: &AgentPtyRegistry,
         pane: &str,
@@ -17043,6 +17041,7 @@ mod tests {
     /// task's room from before it retires the worker's older task, so posts
     /// that fill the deck while the replacement worker starts cannot leave the
     /// older task superseded and the new one refused.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_clear_restart_keeps_its_tasks_room_while_other_posts_fill_the_deck() {
         let dir = clear_role_dir();
@@ -17126,6 +17125,7 @@ mod tests {
     /// PR #1735 fifth review (B-01): a `clear = true` task whose long body the
     /// deck cannot save is refused before the worker's older task is retired
     /// or its worker restarted.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_clear_task_refused_in_preparation_retires_and_restarts_nothing() {
         let dir = clear_role_dir();
@@ -17184,6 +17184,7 @@ mod tests {
     /// PR #1735 fifth review (B-02): a newer task to a worker whose inbox is
     /// full — its backlog holds the older task it replaces — is posted, and
     /// the older task superseded.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_newer_delegation_replaces_the_older_task_in_a_full_inbox() {
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -17235,6 +17236,15 @@ mod tests {
         registry.shutdown_all();
     }
 
+    /// Issue #714 (review): a notice is attempted only when a block is
+    /// reported, and a blocked agent reports nothing more until its next attempt
+    /// — so a task delegated to a worker that ALREADY reads Blocked must be
+    /// reported by the dispatch that delivers it. Latch a block on a worker, then
+    /// delegate to it twice: each delegation posts exactly one notice to the
+    /// orchestrator's inbox, a repeat report of the same delegation adds none,
+    /// and once work evidence lifts the block a further delegation reports
+    /// nothing.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_one_owned_reports_an_already_published_block_to_the_new_delegation() {
         const ORCH_PANE: &str = "published-block-orch";
