@@ -7816,6 +7816,122 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** the stream wire (inbox/offer/007) or the consumers that answer hold (inbox/opencode/027, the Pi extension's node tests).
 - **Platform coverage:** mac+linux+windows.
 
+#### inbox/attempts
+
+The pure state model of a deck message's delivery attempts (`src/inbox_attempts.rs`, PRD #1666 design v3.1 §2, §4, §6, §7, §9): attempt stages, the one finalizer and its nine transition rows, receiver slots and incarnations, possession, the attempt and evidence budgets, and task-bound work-done. Nothing drives delivery from it yet; the hub's current path is unchanged until the migration boundary. Time is passed in as an `Instant`, so no test sleeps.
+
+##### inbox/attempts/001 — Stages are monotonic, and an attempt that may have been handed blocks reassignment.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** an offer whose first attempt is fenced by a context reload and whose marked repeat refuses safely stays with its worker (no pool return, same assignment); the first attempt's late commit settles it; a late `Handed` and a duplicate `Committed` after a commit are no-ops that leave the revision unchanged.
+- **Does not assert:** the hub's offer pool (the model only emits the pool-return effect).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/002 — A late commit dominates every other final stage.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a genuine commit overrides `Fenced` (settling the message and revoking the open repeat), `HandedInert` after Cancel (the message stays cancelled and the sender is corrected exactly once), and `NotHanded` (settles and reports a witness violation); a commit for an earlier offer assignment is recorded without settling and reports that the task also reached the old worker.
+- **Does not assert:** how the corrections are worded or delivered.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/003 — Cancel holds until every attempt is final.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** Cancel then commit settles with a despite-Cancel correction; commit then Cancel answers already settled; a lost revoke answer keeps the message cancel-held across lapse ticks with no repeat and no hand-out, and the delayed revoked_ack makes it undeliverable as cancelled.
+- **Does not assert:** the attach verbs that carry Cancel.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/004 — A scheduled repeat is revalidated at hand-out.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a repeat scheduled by a lapse is refused once a commit settles the message; fresh possession returning before the hand-out withdraws it with no repeat counted; running the finalizer and the tick several times before the hand-out issues one repeat, counted once.
+- **Does not assert:** the stream emit that performs the hand-out.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/005 — Snapshots, watermarks, issue grace and the possession TTL.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** the default possession TTL is 90 seconds (three 30-second keepalives); stale and replayed snapshots are dropped; an attempt above the watermark is held by issue grace, an omitted one at or below it is not; fresh snapshots that keep omitting an attempt end its grace at the TTL; a receiver paused past the TTL lapses its attempt into one marked repeat, and after recovery the first commit settles and revokes the repeat.
+- **Does not assert:** the watcher's keepalive timer or the snapshot wire.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/006 — The watermark is a contiguous observed prefix.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** observing delivery numbers 2, 1, 4, 3 advances the watermark only over a contiguous prefix (0, 2, 2, 4), and a repeated observation changes nothing.
+- **Does not assert:** the JavaScript receivers that will report it.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/007 — A registration retires only its own receiver slot.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** with the OpenCode server and TUI contexts registered side by side, a new TUI registration asks to resume only the TUI's attempt; the server context's snapshots and hand-over approvals still apply while the old TUI incarnation's are refused.
+- **Does not assert:** the OpenCode plugin's registration calls.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/008 — Retirement waits for the resume answer.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a retired incarnation's controls are refused at once while its attempt keeps the message attempting; `retained` rebinds the same attempt with its stage unchanged, no repeat, and the old incarnation unable to release it; `unknown` and silence past the ack-wait fence it and take a marked repeat; `not_handed` counts only from a context whose callback queue survived.
+- **Does not assert:** the resume wire.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/009 — Evidence reclamation waits for callback quiescence.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a callback guard rebound to a new incarnation refuses an approval granted under the old one, and refuses a revoked attempt; a settled message's older attempt keeps its evidence while an approval under its live incarnation is outstanding, and releases it once retirement voids the approval; a late commit after a newer issue lands on exactly the attempt that made it.
+- **Does not assert:** the component-side guard in the Pi and OpenCode adapters.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/010 — A handed-inert attempt keeps its late-commit verifier.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a once-waiter's handed attempt is inert at once; Cancel makes the message undeliverable as cancelled without a repeat, while its evidence is kept hours later; the delayed prompt-hook commit corrects the sender once and releases the evidence.
+- **Does not assert:** the Claude prompt hook itself.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/011 — User actions compare on the revision and are idempotent.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a repeated Retry or Cancel at the same revision gets the same answer; an action at a stale revision gets the current state and revision; an action naming another generation is refused.
+- **Does not assert:** the clients' buttons.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/012 — One attempt budget spans every issuance path.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** four positively refused hand-outs plus two lapses end uncertain as out of attempts with no seventh hand-out; Retry is refused, Cancel is accepted and a late commit still settles; a held_long Retry is issued while the attempt is still possessed and counts; five refusals make a message undeliverable for max_deliver.
+- **Does not assert:** the words the clients show.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/013 — held_long is attention, once per revision, with no replay.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** an attempt freshly possessed for over two hours without a commit raises one held_long notice, schedules no repeat and is handed out once.
+- **Does not assert:** the card notice.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/014 — The evidence budget pauses hand-outs, not cleanup.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a normal success releases its evidence; with the store full of retained evidence and a taken message, a queued message is refused and stays queued with a paused notice; a late revoke answer and a commit still run and make room, after which it is handed out.
+- **Does not assert:** the spool files the entries stand for.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/015 — A report without a task id retires nothing.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a report naming its task retires it once and then answers already reported; reports with no task id are uncorrelated and leave a newer delegated task open; an unknown task id, or one from another pane or generation, is refused.
+- **Does not assert:** the `work-done --task-id` CLI or the rail.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/016 — Generation exit fences and releases everything.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** open attempts are fenced; possessed, queued and offered messages become undeliverable for exit; the offer returns to its pool; all evidence is released; nothing is handed out or committed afterwards.
+- **Does not assert:** the daemon's exit detection.
+- **Platform coverage:** mac+linux+windows.
+
 #### Protocol and waiter lifecycle
 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.
