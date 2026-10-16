@@ -152,6 +152,9 @@ function inboxShared(): InboxShared {
 	return shared as InboxShared;
 }
 
+/** The first of `set`, in insertion order. */
+const first = <T>(set: Set<T>): T | undefined => set.values().next().value;
+
 /** Close a watcher's stdin (it exits on EOF), then SIGTERM it. */
 function stopWatcher(child: WatcherChild | undefined): void {
 	if (!child) {
@@ -254,9 +257,14 @@ function createPiInbox(pi: ExtensionAPI) {
 	 * Shared with the instance that replaces this one ([`InboxShared`]).
 	 */
 	const unconfirmed = inboxShared().unconfirmed;
-	let confirmTimer: ReturnType<typeof setTimeout> | undefined;
+	/**
+	 * Each unconfirmed id's own confirmation timer, so its asks follow its own
+	 * schedule: a new acknowledgement never moves another id's due time.
+	 */
+	const confirmTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	/** The ids whose confirmation is due, asked one at a time by [`confirm`]. */
+	const confirmDue = new Set<string>();
 	let confirming = false;
-	let confirmAgain = false;
 
 	const current = () => active && generation === inboxShared().generation;
 
@@ -461,27 +469,47 @@ function createPiInbox(pi: ExtensionAPI) {
 	};
 
 	const clearConfirm = (): void => {
-		if (confirmTimer !== undefined) {
-			clearTimeout(confirmTimer);
-			confirmTimer = undefined;
+		for (const timer of confirmTimers.values()) {
+			clearTimeout(timer);
 		}
+		confirmTimers.clear();
+		confirmDue.clear();
 	};
 
-	/** Confirm the unconfirmed acknowledgements after `delay`, replacing any confirmation already due. */
-	const scheduleConfirm = (delay: number): void => {
-		clearConfirm();
-		if (!current() || unconfirmed.size === 0) {
+	/**
+	 * Confirm `id` after `delay`. One already scheduled or due for it is kept:
+	 * an id's next ask is set only by its own previous one.
+	 */
+	const scheduleConfirm = (id: string, delay: number): void => {
+		if (!current() || !unconfirmed.has(id) || confirmTimers.has(id) || confirmDue.has(id)) {
 			return;
 		}
-		confirmTimer = setTimeout(() => {
-			confirmTimer = undefined;
+		const timer = setTimeout(() => {
+			confirmTimers.delete(id);
+			confirmDue.add(id);
 			void confirm();
 		}, delay);
 		try {
-			(confirmTimer as { unref?: () => void }).unref?.();
+			(timer as { unref?: () => void }).unref?.();
 		} catch {
 			// A timer without unref.
 		}
+		confirmTimers.set(id, timer);
+	};
+
+	/** Confirm `ids` now, ahead of any confirmation scheduled for them. */
+	const confirmNow = (ids: Iterable<string>): void => {
+		for (const id of ids) {
+			const timer = confirmTimers.get(id);
+			if (timer !== undefined) {
+				clearTimeout(timer);
+				confirmTimers.delete(id);
+			}
+			if (unconfirmed.has(id)) {
+				confirmDue.add(id);
+			}
+		}
+		void confirm();
 	};
 
 	/** Tell the user in Pi that the deck could not record message `id` as delivered. */
@@ -497,22 +525,23 @@ function createPiInbox(pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Acknowledge every unconfirmed id with `dot-agent-deck ack --json`, one at
+	 * Ask the deck about each due id with `dot-agent-deck ack --json`, one at
 	 * a time. An id is done once the deck records it, or refuses it for good,
 	 * or after `INBOX_ACK_CONFIRM_ATTEMPTS` unanswered asks; the last two are
-	 * reported to the user. The rest are asked again after a backoff.
+	 * reported to the user. Any other is asked again after its own backoff.
 	 */
 	const confirm = async (): Promise<void> => {
 		if (confirming) {
-			confirmAgain = true;
+			// The running pass takes the ids that fell due meanwhile.
 			return;
 		}
-		clearConfirm();
 		confirming = true;
 		try {
-			for (const [id, asked] of [...unconfirmed]) {
-				if (!current()) {
-					return;
+			for (let id = first(confirmDue); id !== undefined && current(); id = first(confirmDue)) {
+				confirmDue.delete(id);
+				const asked = unconfirmed.get(id);
+				if (asked === undefined) {
+					continue;
 				}
 				let stdout: unknown;
 				try {
@@ -538,19 +567,11 @@ function createPiInbox(pi: ExtensionAPI) {
 					reportUnconfirmed(id, "the deck did not confirm it");
 				} else {
 					unconfirmed.set(id, asked + 1);
+					scheduleConfirm(id, Math.min(INBOX_ACK_CONFIRM_DELAY_MS * 2 ** (asked + 1), INBOX_ACK_CONFIRM_MAX_DELAY_MS));
 				}
 			}
 		} finally {
 			confirming = false;
-		}
-		if (confirmAgain) {
-			confirmAgain = false;
-			void confirm();
-			return;
-		}
-		if (unconfirmed.size > 0) {
-			const fewest = Math.min(...unconfirmed.values());
-			scheduleConfirm(Math.min(INBOX_ACK_CONFIRM_DELAY_MS * 2 ** fewest, INBOX_ACK_CONFIRM_MAX_DELAY_MS));
 		}
 	};
 
@@ -558,7 +579,8 @@ function createPiInbox(pi: ExtensionAPI) {
 	 * Acknowledge `ids` over the watcher's stdin, or with the CLI for `viaCli`
 	 * and when no watcher takes the line, and keep each until the deck confirms
 	 * it ([`confirm`]): at once when the CLI carries it, else after
-	 * `INBOX_ACK_CONFIRM_DELAY_MS`.
+	 * `INBOX_ACK_CONFIRM_DELAY_MS`, unless that id's confirmation is already
+	 * scheduled.
 	 */
 	const acknowledge = (ids: string[], viaCli: string[] = []): void => {
 		let written = false;
@@ -575,10 +597,14 @@ function createPiInbox(pi: ExtensionAPI) {
 				unconfirmed.set(id, 0);
 			}
 		}
-		if (viaCli.length > 0 || (ids.length > 0 && !written)) {
-			void confirm();
-		} else if (ids.length > 0) {
-			scheduleConfirm(INBOX_ACK_CONFIRM_DELAY_MS);
+		if (written) {
+			for (const id of ids) {
+				scheduleConfirm(id, INBOX_ACK_CONFIRM_DELAY_MS);
+			}
+		}
+		const now = written ? viaCli : [...ids, ...viaCli];
+		if (now.length > 0) {
+			confirmNow(now);
 		}
 	};
 
@@ -686,7 +712,7 @@ function createPiInbox(pi: ExtensionAPI) {
 			spawnWatcher(fixedBackoff ?? WATCHER_BACKOFF_MIN_MS);
 			// What the session this one replaced left unconfirmed.
 			if (unconfirmed.size > 0) {
-				void confirm();
+				confirmNow(unconfirmed.keys());
 			}
 		},
 

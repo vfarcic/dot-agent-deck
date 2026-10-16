@@ -1648,23 +1648,23 @@ const inboxConfirmer = (
   timers = { set: (fn, ms) => setTimeout(fn, ms), clear: (timer) => clearTimeout(timer) }
 ) => {
   const unconfirmed = new Map();
-  let timer;
+  // Each id's own timer, so its asks follow its own schedule: a new
+  // acknowledgement never moves another id's due time.
+  const pending = new Map();
+  // The ids whose confirmation is due, asked one at a time.
+  const due = new Set();
   let confirming = false;
-  let again = false;
-  const clear = () => {
-    if (timer !== undefined) timers.clear(timer);
-    timer = undefined;
-  };
-  const schedule = (delay) => {
-    clear();
-    if (unconfirmed.size === 0) return;
-    timer = timers.set(() => {
-      timer = undefined;
+  const schedule = (id, delay) => {
+    if (!unconfirmed.has(id) || pending.has(id) || due.has(id)) return;
+    const timer = timers.set(() => {
+      pending.delete(id);
+      due.add(id);
       void confirm();
     }, delay);
     try {
       timer?.unref?.();
     } catch (_) {}
+    pending.set(id, timer);
   };
   const settle = (id, why) => {
     unconfirmed.delete(id);
@@ -1673,14 +1673,14 @@ const inboxConfirmer = (
     } catch (_) {}
   };
   const confirm = async () => {
-    if (confirming) {
-      again = true;
-      return;
-    }
-    clear();
+    // A running pass takes the ids that fell due meanwhile.
+    if (confirming) return;
     confirming = true;
     try {
-      for (const [id, asked] of [...unconfirmed]) {
+      for (let id = due.values().next().value; id !== undefined; id = due.values().next().value) {
+        due.delete(id);
+        const asked = unconfirmed.get(id);
+        if (asked === undefined) continue;
         let stdout;
         try {
           stdout = await ask(id);
@@ -1695,34 +1695,31 @@ const inboxConfirmer = (
           settle(id, "the deck did not confirm it");
         } else {
           unconfirmed.set(id, asked + 1);
+          schedule(id, Math.min(INBOX_ACK_CONFIRM_DELAY_MS * 2 ** (asked + 1), INBOX_ACK_CONFIRM_MAX_DELAY_MS));
         }
       }
     } finally {
       confirming = false;
     }
-    if (again) {
-      again = false;
-      void confirm();
-      return;
-    }
-    if (unconfirmed.size > 0) {
-      const fewest = Math.min(...unconfirmed.values());
-      schedule(Math.min(INBOX_ACK_CONFIRM_DELAY_MS * 2 ** fewest, INBOX_ACK_CONFIRM_MAX_DELAY_MS));
-    }
   };
   return {
     // `ids` were acknowledged: confirm them now when `now` (the CLI carries
-    // them, or the watcher's stdin did not take them), else after a second.
+    // them, or the watcher's stdin did not take them), else after a second,
+    // unless an id's confirmation is already scheduled.
     add(ids, now) {
       if (!ids.length) return;
       for (const id of ids) {
         if (!unconfirmed.has(id)) unconfirmed.set(id, 0);
+        if (now) {
+          const timer = pending.get(id);
+          if (timer !== undefined) timers.clear(timer);
+          pending.delete(id);
+          due.add(id);
+        } else {
+          schedule(id, INBOX_ACK_CONFIRM_DELAY_MS);
+        }
       }
-      if (now) {
-        void confirm();
-      } else if (!confirming) {
-        schedule(INBOX_ACK_CONFIRM_DELAY_MS);
-      }
+      if (now) void confirm();
     },
   };
 };
@@ -4822,6 +4819,79 @@ check(refused.asks, 1, "a final refusal is asked once");
 check(refused.reports, [["m-1", "wrong_agent"]], "a final refusal is reported");
 check(inboxAckOutcome("not json\n" + JSON.stringify({ acknowledged: true })), "recorded", "the JSON line is found");
 check(inboxAckOutcome(undefined), "unconfirmed", "no output is unconfirmed");
+process.exit(0);
+"#
+        );
+        let output = std::process::Command::new("node")
+            .arg("--input-type=module")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .expect("run node");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// PR #1735 third review, finding 2: a new acknowledgement never postpones
+    /// an older one's confirmation. One id is acknowledged, then a fresh one
+    /// every 500 ms for four seconds; the first is still asked at 1 s and,
+    /// unanswered there, again at its 2 s backoff, and each fresh id is asked
+    /// once on its own schedule.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_fresh_acknowledgements_do_not_postpone_an_older_confirmation() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let script = format!(
+            "{}\n{}",
+            inbox_js(""),
+            r#"
+const check = (actual, expected, what) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    console.error(what + ": " + JSON.stringify(actual) + " != " + JSON.stringify(expected));
+    process.exit(1);
+  }
+};
+let now = 0;
+let seq = 0;
+const pending = new Map();
+const timers = {
+  set: (fn, ms) => { seq += 1; pending.set(seq, { at: now + ms, fn }); return seq; },
+  clear: (t) => { pending.delete(t); },
+};
+const asks = [];
+const confirmer = inboxConfirmer(() => {}, async (id) => {
+  asks.push([id, now]);
+  const unanswered = id === "m-old" && asks.filter(([a]) => a === "m-old").length === 1;
+  return JSON.stringify(unanswered ? { acknowledged: false, final: false, reason: "no answer" } : { acknowledged: true });
+}, timers);
+const settle = async () => { for (let n = 0; n < 8; n++) await new Promise((r) => setImmediate(r)); };
+const advanceTo = async (t) => {
+  for (;;) {
+    const due = [...pending].filter(([, v]) => v.at <= t).sort((a, b) => a[1].at - b[1].at)[0];
+    if (!due) break;
+    pending.delete(due[0]);
+    now = due[1].at;
+    due[1].fn();
+    await settle();
+  }
+  now = t;
+};
+confirmer.add(["m-old"], false);
+for (let i = 1; i <= 8; i++) {
+  await advanceTo(i * 500);
+  confirmer.add(["m-new-" + i], false);
+}
+await advanceTo(60000);
+check(asks.filter(([a]) => a === "m-old").map(([, t]) => t), [1000, 3000], "the older id's asks");
+for (let i = 1; i <= 8; i++) {
+  check(asks.filter(([a]) => a === "m-new-" + i).map(([, t]) => t), [i * 500 + 1000], "m-new-" + i + "'s asks");
+}
 process.exit(0);
 "#
         );

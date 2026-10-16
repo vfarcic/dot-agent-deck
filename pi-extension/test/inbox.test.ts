@@ -839,3 +839,42 @@ test("pi_inbox_029_an_unconfirmed_acknowledgement_survives_a_session_replacement
 	assert.deepEqual(acksOf(next), [id], "its redelivery is acknowledged instead");
 	await current.emit("session_shutdown", { reason: "quit" });
 });
+
+/// Scenario: Pi commits an inbox message whose acknowledgement the deck does not record at first, and then goes on committing a new message every half second. The first message is still confirmed with the deck CLI on its own schedule — asked at one second and again at its backoff — while the new ones keep arriving: fresh commits never push an older confirmation back.
+test("pi_inbox_030_fresh_commits_do_not_postpone_an_older_confirmation", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(); const pi = admission(f);
+	const [old, ...fresh] = idsN(9);
+	const asked: string[] = [];
+	f.pi.exec = async (_bin: string, argv: string[]) => {
+		if (argv[0] !== "ack") return { code: 0, stdout: "", stderr: "", killed: false };
+		const id = argv[argv.length - 1];
+		asked.push(id);
+		return id === old && asked.filter(a => a === old).length === 1
+			? ackReply({ acknowledged: false, final: false, reason: "the deck is not reachable" })
+			: ackReply({ acknowledged: true });
+	};
+	await f.emit("session_start"); const watcher = f.watcher();
+	const commitOne = async (id: string) => {
+		watcher.stdout.emit("data", Buffer.from(line(id) + "\n"));
+		await pi.quiesce();
+		if (pi.running) await pi.settle();
+		await pi.quiesce();
+		assert.equal(commitsOf(pi.committed, id), 1);
+	};
+	await commitOne(old);
+	const askedOld = () => asked.filter(a => a === old).length;
+	// A fresh commit every 500 ms for four seconds.
+	for (const [i, id] of fresh.entries()) {
+		t.mock.timers.tick(500); await pi.quiesce();
+		const elapsed = (i + 1) * 500;
+		if (elapsed === 1000) assert.equal(askedOld(), 1, `confirmed at one second, while new commits arrive: ${asked}`);
+		if (elapsed === 3000) assert.equal(askedOld(), 2, `asked again at its two-second backoff: ${asked}`);
+		await commitOne(id);
+	}
+	assert.equal(askedOld(), 2, "recorded on the second ask, and not asked again");
+	for (let i = 0; i < 10; i++) { t.mock.timers.tick(60_000); await pi.quiesce(); }
+	for (const id of fresh) assert.equal(asked.filter(a => a === id).length, 1, `each fresh id is confirmed once: ${asked}`);
+	assert.equal(f.sent.length, 1 + fresh.length, "each message is handed to Pi once");
+	pi.shutdown();
+});
