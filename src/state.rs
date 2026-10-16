@@ -6364,10 +6364,9 @@ struct PaneInbox {
     /// The agent has acknowledged a message.
     delivered: bool,
     /// PR #1735 fifth review (R5): the deck reports that nothing has woken the
-    /// agent for its waiting messages, from the oldest of them — `Some("")`
-    /// when a summary said so without naming it. Cleared once that message is
-    /// taken or settles, or a notice for it no longer says so.
-    stalled: Option<String>,
+    /// agent for its waiting messages. Set from the summary and from the deck's
+    /// wake-stall notices alone (B-03, B-04), which report its end as well.
+    stalled: bool,
 }
 
 impl PaneInbox {
@@ -6387,22 +6386,7 @@ impl PaneInbox {
         crate::inbox_display::CardInbox {
             pending: self.baseline + new,
             delivered: self.delivered,
-            stalled: self.stalled.is_some(),
-        }
-    }
-
-    /// Follow [`InboxNotice::wake_stalled`](crate::event::InboxNotice::wake_stalled)
-    /// for message `id`, now in `state`.
-    fn follow_stall(&mut self, id: &str, state: crate::inbox::StateName, stalled: bool) {
-        if stalled {
-            self.stalled = Some(id.to_string());
-            return;
-        }
-        let named = self.stalled.as_deref() == Some(id);
-        let unnamed_settled =
-            self.stalled.as_deref() == Some("") && state != crate::inbox::StateName::Queued;
-        if named || unnamed_settled {
-            self.stalled = None;
+            stalled: self.stalled,
         }
     }
 
@@ -8290,7 +8274,7 @@ impl AppState {
                     .saturating_add(summary.claimed),
                 seen: HashMap::new(),
                 delivered: summary.last_acked_at.is_some(),
-                stalled: summary.wake_stalled.then(String::new),
+                stalled: summary.wake_stalled,
             },
         );
         self.refresh_card_inbox(pane_id);
@@ -8316,15 +8300,20 @@ impl AppState {
             (None, Some(named)) => inbox.agent_id = Some(named.clone()),
             _ => {}
         }
-        // PRD #1666 S11: an offered job that left this pane is settled here
-        // without having been delivered; `state` is the job's, not the pane's.
-        let state = if notice.returned {
-            crate::inbox::StateName::Undeliverable
+        if notice.wake_update {
+            // PR #1735 fifth review (B-03): the agent's wake stall changed and
+            // the message it names did not, so nothing is counted.
+            inbox.stalled = notice.wake_stalled;
         } else {
-            notice.state
-        };
-        inbox.apply(&notice.message_id, state);
-        inbox.follow_stall(&notice.message_id, state, notice.wake_stalled);
+            // PRD #1666 S11: an offered job that left this pane is settled here
+            // without having been delivered; `state` is the job's, not the pane's.
+            let state = if notice.returned {
+                crate::inbox::StateName::Undeliverable
+            } else {
+                notice.state
+            };
+            inbox.apply(&notice.message_id, state);
+        }
         self.refresh_card_inbox(&notice.pane_id);
     }
 
@@ -19037,6 +19026,7 @@ mod tests {
             reason: None,
             returned: false,
             wake_stalled: false,
+            wake_update: false,
         }
     }
 
@@ -19159,12 +19149,14 @@ mod tests {
         );
     }
 
-    /// PR #1735 fifth review (R5): a card shows its waiting messages as
-    /// waiting to wake while the deck says nothing has woken the agent for
-    /// them, and as queued again once the oldest of them is taken, or the
-    /// deck stops saying so. A summary that says so is followed too.
+    /// PR #1735 fifth review (R5, B-03): a card shows its waiting messages as
+    /// waiting to wake while the deck's wake-stall notices say nothing has
+    /// woken the agent for them, and as queued again once one says the stall
+    /// ended. A state notice changes the counts and not the stall, and a
+    /// wake-stall notice changes the stall and not the counts. A summary that
+    /// says so is followed too.
     #[test]
-    fn a_cards_waiting_messages_show_a_stalled_wake_until_taken() {
+    fn a_cards_waiting_messages_show_a_stalled_wake_while_the_deck_says_so() {
         use crate::inbox::StateName::{Fetched, Queued};
         let mut state = AppState::default();
         state.register_pane("pane-q".to_string());
@@ -19174,27 +19166,27 @@ mod tests {
                 .card_inbox()
                 .and_then(crate::inbox_display::CardInbox::full_text)
         };
-        let stalled = |id: &str| {
+        let wake = |id: &str, stalled: bool| {
             let mut notice = inbox_notice("pane-q", id, Queued);
-            notice.wake_stalled = true;
+            notice.wake_update = true;
+            notice.wake_stalled = stalled;
             notice
         };
         state.apply_inbox_notice(&inbox_notice("pane-q", "m-a", Queued));
         assert_eq!(line(&state).as_deref(), Some("✉1 queued"));
-        state.apply_inbox_notice(&stalled("m-a"));
+        state.apply_inbox_notice(&wake("m-a", true));
         assert_eq!(
             line(&state).as_deref(),
             Some("✉1 waiting to wake: send it a prompt")
         );
         state.apply_inbox_notice(&inbox_notice("pane-q", "m-a", Fetched));
-        assert_eq!(line(&state).as_deref(), Some("✉1 queued"));
-        state.apply_inbox_notice(&stalled("m-a"));
-        state.apply_inbox_notice(&inbox_notice("pane-q", "m-a", Queued));
         assert_eq!(
             line(&state).as_deref(),
-            Some("✉1 queued"),
-            "a notice for the stalled message without the flag clears it"
+            Some("✉1 waiting to wake: send it a prompt"),
+            "a state notice leaves the stall to the deck's own notice"
         );
+        state.apply_inbox_notice(&wake("m-a", false));
+        assert_eq!(line(&state).as_deref(), Some("✉1 queued"));
         state.apply_inbox_summary(
             "pane-q",
             "agent-q",
@@ -19213,8 +19205,105 @@ mod tests {
             line(&state).as_deref(),
             Some("✉1 waiting to wake: send it a prompt")
         );
-        state.apply_inbox_notice(&inbox_notice("pane-q", "m-z", Fetched));
+        state.apply_inbox_notice(&wake("m-z", false));
         assert_eq!(line(&state).as_deref(), Some("✉1 queued"));
+    }
+
+    /// A client of `hub` attached after its first message was posted: a card
+    /// for agent `agent-q` in pane `pane-q`, seeded from the hub's summary, and
+    /// the hub's broadcasts from then on.
+    fn attached_card(
+        hub: &crate::inbox_hub::InboxHub,
+    ) -> (AppState, broadcast::Receiver<BroadcastMsg>) {
+        let (tx, rx) = broadcast::channel(64);
+        hub.set_broadcast(tx);
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::SessionStart, 1));
+        state.apply_inbox_summary("pane-q", "agent-q", &hub.summary("pane-q", "agent-q"));
+        (state, rx)
+    }
+
+    /// Apply every inbox notice `rx` holds to `state`, as the TUI does.
+    fn follow_notices(state: &mut AppState, rx: &mut broadcast::Receiver<BroadcastMsg>) {
+        while let Ok(msg) = rx.try_recv() {
+            if let BroadcastMsg::Inbox(notice) = msg {
+                state.apply_inbox_notice(&notice);
+            }
+        }
+    }
+
+    /// PR #1735 fifth review (B-03): a client that attached with one message
+    /// already queued counts it once through the deck's stall notice for it,
+    /// its fetch and its acknowledgement — 1, 1, 1, 0 — and ends delivered.
+    #[test]
+    fn a_stall_notice_for_a_message_the_summary_counted_counts_nothing() {
+        use crate::inbox::{AckHow, Consumer, Recipient};
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::generate(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        let id = hub
+            .post_notice(Recipient::bound("pane-q", "agent-q"), "a task", "do it")
+            .unwrap();
+        let (mut state, mut rx) = attached_card(&hub);
+        let card = |state: &AppState| state.sessions["gen-q"].card_inbox().unwrap();
+        assert_eq!((card(&state).pending, card(&state).stalled), (1, false));
+
+        hub.set_wake_stalled("pane-q", "agent-q", true);
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(
+            (card(&state).pending, card(&state).stalled),
+            (1, true),
+            "the stall notice for the queued message must not count it again"
+        );
+
+        let taken = hub.fetch("pane-q", "agent-q", Consumer::FetchCli, None, None);
+        assert_eq!(taken.len(), 1);
+        follow_notices(&mut state, &mut rx);
+        assert_eq!((card(&state).pending, card(&state).stalled), (1, false));
+
+        hub.ack(id.as_str(), "pane-q", "agent-q", AckHow::Explicit);
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(card(&state).pending, 0, "no phantom message is left queued");
+        assert!(card(&state).delivered);
+        assert_eq!(card(&state).full_text().as_deref(), Some("✉ delivered"));
+    }
+
+    /// PR #1735 fifth review (B-04): a client that attached while the deck
+    /// held a stall follows the deck's clear of it — here, with the message
+    /// still queued, as when the agent starts a long turn — and stops showing
+    /// the waiting-to-wake line.
+    #[test]
+    fn a_stall_seeded_from_the_summary_ends_with_the_decks_clear() {
+        use crate::inbox::Recipient;
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::generate(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        hub.post_notice(Recipient::bound("pane-q", "agent-q"), "a task", "do it")
+            .unwrap();
+        hub.set_wake_stalled("pane-q", "agent-q", true);
+        let (mut state, mut rx) = attached_card(&hub);
+        let line = |state: &AppState| {
+            state.sessions["gen-q"]
+                .card_inbox()
+                .and_then(crate::inbox_display::CardInbox::full_text)
+        };
+        assert_eq!(
+            line(&state).as_deref(),
+            Some("✉1 waiting to wake: send it a prompt")
+        );
+        hub.set_wake_stalled("pane-q", "agent-q", false);
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(
+            line(&state).as_deref(),
+            Some("✉1 queued"),
+            "the deck cleared the stall; the card must stop showing it"
+        );
+        assert!(!hub.summary("pane-q", "agent-q").wake_stalled);
     }
 
     /// PRD #1666 §2.8: the deck's not-delivered notice explains the card's

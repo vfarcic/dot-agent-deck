@@ -11595,6 +11595,7 @@ mod tests {
             reason: Some(crate::inbox::UndeliverableReason::AgentExited),
             returned: false,
             wake_stalled: false,
+            wake_update: false,
         });
         let value = serde_json::to_value(&msg).unwrap();
         assert_eq!(

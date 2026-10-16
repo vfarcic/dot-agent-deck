@@ -1573,7 +1573,9 @@ impl InboxHub {
             let _ = waiter.tx.try_send(WaiterSignal::Superseded);
         }
         st.received_since_done.remove(pane_id);
-        st.wake_stalled.remove(&key);
+        if let Some(id) = st.wake_stalled.remove(&key) {
+            broadcast_wake_stall(&st, pane_id, agent_id, &id, false);
+        }
         drain_events(&mut st);
         let ledgers = std::mem::take(&mut st.exited_ledgers);
         drop(st);
@@ -1610,23 +1612,7 @@ impl InboxHub {
             }
         };
         info!(pane_id, agent_id, message_id = %id, stalled, "inbox: wake stalled");
-        let Some(message) = st.inbox.get(&id, pane_id) else {
-            return;
-        };
-        let notice = InboxNotice {
-            pane_id: pane_id.to_string(),
-            agent_id: Some(agent_id.to_string()),
-            message_id: id.clone(),
-            subject: message.subject.clone(),
-            from_label: kind_sender_label(message.kind.name(), &message.from, message.body_trust),
-            state: message.state.name(),
-            reason: None,
-            returned: false,
-            wake_stalled: stalled,
-        };
-        if let Some(tx) = st.broadcast.as_ref() {
-            let _ = tx.send(BroadcastMsg::Inbox(notice));
-        }
+        broadcast_wake_stall(&st, pane_id, agent_id, &id, stalled);
     }
 
     /// Whether `agent_id` in `pane_id` is recorded as waiting to wake
@@ -2167,8 +2153,8 @@ fn retire_delegates_locked(
 fn drain_events(st: &mut HubState) {
     for event in st.inbox.drain_events() {
         // PR #1735 fifth review (R5): the message a stalled wake was recorded
-        // against left the queue, so something took it. Clients clear their
-        // own copy from this event's notice.
+        // against left the queue, so something took it, and clients are told
+        // the stall ended.
         if event.state != StateName::Queued
             && let Some(recipient) = event.recipient.as_ref()
             && let Some(agent) = recipient.agent_id.as_ref()
@@ -2176,6 +2162,13 @@ fn drain_events(st: &mut HubState) {
             let key = (recipient.pane_id.clone(), agent.clone());
             if st.wake_stalled.get(&key).map(String::as_str) == Some(event.message_id.as_str()) {
                 st.wake_stalled.remove(&key);
+                broadcast_wake_stall(
+                    st,
+                    &recipient.pane_id,
+                    agent,
+                    event.message_id.as_str(),
+                    false,
+                );
             }
         }
         settle_late_ack(st, &event);
@@ -2205,6 +2198,7 @@ fn drain_events(st: &mut HubState) {
                 reason: event.undeliverable_reason,
                 returned: true,
                 wake_stalled: false,
+                wake_update: false,
             }));
         }
         let Some(recipient) = event.recipient else {
@@ -2221,8 +2215,35 @@ fn drain_events(st: &mut HubState) {
             reason: event.undeliverable_reason,
             returned: false,
             wake_stalled: false,
+            wake_update: false,
         }));
     }
+}
+
+/// PR #1735 fifth review (B-03, B-04): tell attached clients that `agent_id`'s
+/// wake stall in `pane_id` is now `stalled`, in a notice that names `id`, the
+/// message it was recorded against, and changes nothing else
+/// ([`InboxNotice::wake_update`]).
+fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, stalled: bool) {
+    let Some(tx) = st.broadcast.as_ref() else {
+        return;
+    };
+    let message = st.inbox.get(id, pane_id);
+    let _ = tx.send(BroadcastMsg::Inbox(InboxNotice {
+        pane_id: pane_id.to_string(),
+        agent_id: Some(agent_id.to_string()),
+        message_id: id.to_string(),
+        subject: message.map(|m| m.subject.clone()).unwrap_or_default(),
+        from_label: message
+            .map(|m| kind_sender_label(m.kind.name(), &m.from, m.body_trust))
+            .unwrap_or_default(),
+        // A message no longer held is gone from the queue.
+        state: message.map_or(StateName::Undeliverable, |m| m.state.name()),
+        reason: None,
+        returned: false,
+        wake_stalled: stalled,
+        wake_update: true,
+    }));
 }
 
 /// The subject of a notice that a delegated task did not reach its worker.
@@ -3791,9 +3812,10 @@ mod tests {
     }
 
     /// PR #1735 fifth review (R5): a stalled wake is recorded against the
-    /// oldest queued message, shown in the summary and broadcast as a notice
-    /// for that message; it ends when that message is taken, and the
-    /// doorbell clearing it broadcasts the notice without the flag.
+    /// oldest queued message, shown in the summary and broadcast as a
+    /// wake-stall notice for that message; it ends when that message is taken
+    /// or the doorbell clears it, and either end is broadcast as a wake-stall
+    /// notice without the flag (B-04).
     #[test]
     fn a_stalled_wake_is_shown_until_its_message_is_taken() {
         let hub = hub();
@@ -3809,23 +3831,38 @@ mod tests {
         assert!(hub.summary("p", "a").wake_stalled);
         match rx.try_recv() {
             Ok(BroadcastMsg::Inbox(notice)) => {
-                assert!(notice.wake_stalled);
+                assert!(notice.wake_stalled && notice.wake_update);
                 assert_eq!(notice.message_id, oldest.to_string());
+                assert_eq!(notice.state, StateName::Queued);
             }
             other => panic!("a stalled wake is broadcast: {other:?}"),
         }
         hub.set_wake_stalled("p", "a", false);
         match rx.try_recv() {
-            Ok(BroadcastMsg::Inbox(notice)) => assert!(!notice.wake_stalled),
+            Ok(BroadcastMsg::Inbox(notice)) => assert!(!notice.wake_stalled && notice.wake_update),
             other => panic!("its end is broadcast: {other:?}"),
         }
         assert!(!hub.summary("p", "a").wake_stalled);
         hub.set_wake_stalled("p", "a", true);
+        while rx.try_recv().is_ok() {}
         let taken = hub.fetch("p", "a", Consumer::FetchCli, None, Some(AckHow::Explicit));
         assert!(!taken.is_empty());
         assert!(
             !hub.summary("p", "a").wake_stalled,
             "taking the message ends the stall"
+        );
+        let mut ends = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if let BroadcastMsg::Inbox(notice) = msg
+                && notice.wake_update
+            {
+                assert!(!notice.wake_stalled);
+                ends += 1;
+            }
+        }
+        assert_eq!(
+            ends, 1,
+            "taking the message broadcasts the stall's end once"
         );
     }
 
