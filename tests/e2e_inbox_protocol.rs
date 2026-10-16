@@ -902,10 +902,25 @@ fn inbox_protocol_017_a_connection_of_unknown_ancestry_cannot_take_mail() {
     );
     let pane = pane(&daemon, "bound-unknown", &command);
     let id = enqueue(&daemon, &pane);
+    // A failure names the verb, the endpoint and the raw reply, so a daemon
+    // that drops the connection or answers something malformed says which
+    // request it was (Qodo, PR #1735).
     let send = |request: &Value| -> Value {
+        let verb = request["message_type"].as_str().unwrap_or("?").to_string();
+        let endpoint = daemon.hook_socket.display();
         let (mut socket, _) = connect_from_an_exited_process(&daemon.hook_socket);
-        writeln!(socket.get_mut(), "{request}").unwrap();
-        line(&mut socket)
+        writeln!(socket.get_mut(), "{request}").unwrap_or_else(|error| {
+            panic!("{verb}: could not write the request to {endpoint}: {error}")
+        });
+        let mut raw = String::new();
+        let read = socket.read_line(&mut raw);
+        assert!(
+            matches!(read, Ok(n) if n > 0),
+            "{verb}: {endpoint} sent no reply line ({read:?}); raw reply: {raw:?}"
+        );
+        serde_json::from_str(&raw).unwrap_or_else(|error| {
+            panic!("{verb}: {endpoint} answered with something other than JSON ({error}): {raw:?}")
+        })
     };
     let mut fetch = request(&pane, "inbox_fetch");
     fetch["consumer"] = json!("cli");
