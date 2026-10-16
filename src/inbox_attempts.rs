@@ -11,8 +11,11 @@
 //! # The nine rows
 //!
 //! Every row runs under the caller's lock and ends in [`AttemptModel::finalize`]
-//! for the messages it touched; `finalize` is the only code that changes a
-//! message's state.
+//! for the messages it touched. `finalize` changes a message's state, with two
+//! named exceptions: T5 Retry moves `Uncertain` to `Attempting` with a manual
+//! token (the user's decision, not a rule), and T9 exit makes every live
+//! message `Undeliverable(exited)` (the generation is gone, so no rule runs
+//! after it).
 //!
 //! | # | Event | Method |
 //! |---|---|---|
@@ -86,14 +89,6 @@ pub enum Slot {
     Pi,
     OnceWaiter,
     Hook,
-}
-
-impl Slot {
-    /// Stream receivers prove possession with snapshots; the one-shot ones by
-    /// a busy interval or an open fetch connection.
-    fn streams(self) -> bool {
-        matches!(self, Slot::OpencodeServer | Slot::OpencodeTui | Slot::Pi)
-    }
 }
 
 /// An attempt's stage (§2). `Committed`, `NotHanded`, `HandedInert` and
@@ -190,8 +185,6 @@ pub struct Attempt {
     pub reclaimed: bool,
     issued_at: Instant,
     resume_deadline: Option<Instant>,
-    /// The epoch of an outstanding `may_hand_over` approval.
-    grant: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,8 +441,12 @@ struct Receiver {
     seen: u64,
     fresh_at: Instant,
     held: BTreeSet<(String, u32, u32)>,
+    /// A once-waiter's busy interval: busy from hand-out until Idle or an
+    /// error stop, then one ack-wait of grace from the first idle report.
     busy: bool,
     idle_since: Option<Instant>,
+    /// A hook or `inbox fetch` receiver's open connection.
+    connected: bool,
     queue_survived: bool,
     next_d: u64,
 }
@@ -522,8 +519,9 @@ impl AttemptModel {
                 seen: 0,
                 fresh_at: now,
                 held: BTreeSet::new(),
-                busy: !slot.streams(),
+                busy: slot == Slot::OnceWaiter,
                 idle_since: None,
+                connected: slot == Slot::Hook,
                 queue_survived,
                 next_d: 0,
             },
@@ -543,7 +541,6 @@ impl AttemptModel {
                     if !in_slot {
                         continue;
                     }
-                    at.grant = None;
                     if !at.stage.is_final() {
                         at.resume_pending = true;
                         at.resume_deadline = Some(deadline);
@@ -635,7 +632,6 @@ impl AttemptModel {
             reclaimed: false,
             issued_at: now,
             resume_deadline: None,
-            grant: None,
         });
         msg.issued += 1;
         if kind == IssueKind::AutoRepeat {
@@ -682,7 +678,6 @@ impl AttemptModel {
             at.resume_pending = false;
             at.resume_deadline = None;
             at.verifier = false;
-            at.grant = None;
             if contradicted {
                 self.effects.push(Effect::WitnessViolation {
                     id: id.to_string(),
@@ -719,7 +714,6 @@ impl AttemptModel {
             stage
         };
         at.stage = stage;
-        at.grant = None;
         if stage == Stage::HandedInert {
             at.verifier = true;
         }
@@ -738,6 +732,22 @@ impl AttemptModel {
         seen: u64,
         held: &[(&str, u32, u32)],
     ) -> SnapshotOutcome {
+        let outcome = self.apply_snapshot(now, rx, seq, seen, held);
+        if outcome == SnapshotOutcome::Applied {
+            self.finalize_bound_to(now, rx);
+        }
+        outcome
+    }
+
+    /// Record a snapshot's possession without running the finalizer.
+    fn apply_snapshot(
+        &mut self,
+        now: Instant,
+        rx: Rx,
+        seq: u64,
+        seen: u64,
+        held: &[(&str, u32, u32)],
+    ) -> SnapshotOutcome {
         let Some(r) = self.receivers.get_mut(&rx) else {
             return SnapshotOutcome::Dropped;
         };
@@ -745,22 +755,41 @@ impl AttemptModel {
             return SnapshotOutcome::Dropped;
         }
         r.last_seq = Some(seq);
-        r.seen = seen;
+        // Monotone at admission: a lower watermark never revives the issue
+        // grace an earlier covering omission ended.
+        r.seen = r.seen.max(seen);
         r.fresh_at = now;
         r.held = held
             .iter()
             .map(|(id, a, e)| (id.to_string(), *a, *e))
             .collect();
-        self.finalize_bound_to(now, rx);
         SnapshotOutcome::Applied
     }
 
-    /// A one-shot receiver's busy interval (§4): busy from `Handed`, idle
-    /// starts one ack-wait of grace.
+    /// A once-waiter's busy interval (§4): busy from `Handed`; Idle or an
+    /// error stop starts one ack-wait of grace. A repeated idle report keeps
+    /// the first idle time, and only a resumed busy interval restarts it.
+    /// Other slots ignore it: a hook's possession is its connection.
     pub fn busy(&mut self, now: Instant, rx: Rx, busy: bool) {
+        if let Some(r) = self.receivers.get_mut(&rx)
+            && r.slot == Slot::OnceWaiter
+        {
+            if busy {
+                r.busy = true;
+                r.idle_since = None;
+            } else if r.busy || r.idle_since.is_none() {
+                r.busy = false;
+                r.idle_since = Some(now);
+            }
+        }
+        self.finalize_bound_to(now, rx);
+    }
+
+    /// A hook or `inbox fetch` receiver's connection closed (§4): its
+    /// possession ends.
+    pub fn connection_closed(&mut self, now: Instant, rx: Rx) {
         if let Some(r) = self.receivers.get_mut(&rx) {
-            r.busy = busy;
-            r.idle_since = (!busy).then_some(now);
+            r.connected = false;
         }
         self.finalize_bound_to(now, rx);
     }
@@ -805,16 +834,12 @@ impl AttemptModel {
             self.stage(now, id, a, e, Stage::NotHanded, Some(rx));
             return Err(refusal);
         }
-        let epoch = rx.0;
-        if let Some(at) = self.messages.get_mut(id).and_then(|m| m.attempt_mut(a, e)) {
-            at.grant = Some(epoch);
-        }
         Ok(Grant {
             id: id.to_string(),
             a,
             e,
             rx,
-            epoch,
+            epoch: rx.0,
         })
     }
 
@@ -861,7 +886,6 @@ impl AttemptModel {
                 at.d = r.next_d;
                 at.issued_at = now;
                 at.lapsed = false;
-                at.grant = None;
             }
             ResumeAnswer::NotHanded if survived => at.stage = Stage::NotHanded,
             _ => at.stage = Stage::Fenced,
@@ -1020,8 +1044,11 @@ impl AttemptModel {
         };
         if let ActionOutcome::Applied { revision: r } = &mut outcome {
             *r = msg.revision;
+            // Only an applied action is remembered: an unsuccessful one at a
+            // newer revision must not turn a retransmission of the applied
+            // one into `Stale`.
+            msg.last_action = Some((revision, verb, outcome));
         }
-        msg.last_action = Some((revision, verb, outcome));
         outcome
     }
 
@@ -1038,7 +1065,6 @@ impl AttemptModel {
                     at.resume_deadline = None;
                 }
                 at.verifier = false;
-                at.grant = None;
                 at.reclaimed = true;
             }
             msg.token = None;
@@ -1055,8 +1081,8 @@ impl AttemptModel {
         self.evidence_reserved = 0;
     }
 
-    /// The one finalizer (§2): the only code that changes a message's state.
-    /// First matching rule wins.
+    /// The one finalizer (§2): every message state change except T5 Retry
+    /// and T9 exit (module docs). First matching rule wins.
     pub fn finalize(&mut self, now: Instant, id: &str) {
         if self.exited {
             return;
@@ -1218,9 +1244,18 @@ impl AttemptModel {
     }
 
     /// Return an attempt's evidence reservation once it is quiescent (§7):
-    /// its message is terminal, it is final with no resume answer owed, no
-    /// approval under a live incarnation is outstanding, and it keeps no
-    /// late-commit verifier (kept while the message is not settled).
+    /// its message is terminal, it is final with no resume answer owed, and
+    /// it keeps no late-commit verifier (kept while the message is not
+    /// settled).
+    ///
+    /// Finality already implies that no approval under a current epoch is
+    /// outstanding, so the model carries no separate approval predicate:
+    /// every path to a final stage is either the approved incarnation
+    /// reporting what its callback did (the approval is spent), a resume
+    /// answer or its silence (the incarnation was retired, which bumps the
+    /// epoch), or exit. That the epoch bump reaches a surviving old JS
+    /// context before its approved callback resumes is the adapter's
+    /// obligation, proven in the §13 step 4 migration, not here.
     fn reclaim(&mut self, id: &str) {
         let Some(msg) = self.messages.get_mut(id) else {
             return;
@@ -1231,10 +1266,7 @@ impl AttemptModel {
             if settled {
                 at.verifier = false;
             }
-            let live_grant =
-                at.grant.is_some() && self.receivers.get(&at.rx).is_some_and(|r| !r.retired);
-            if terminal && at.stage.is_final() && !at.resume_pending && !live_grant && !at.verifier
-            {
+            if terminal && at.stage.is_final() && !at.resume_pending && !at.verifier {
                 at.reclaimed = true;
                 self.evidence_reserved =
                     self.evidence_reserved.saturating_sub(EVIDENCE_PER_ATTEMPT);
@@ -1246,8 +1278,8 @@ impl AttemptModel {
 /// Whether `at` is possessed right now (§4). A stream attempt is possessed
 /// while its live incarnation's fresh snapshot holds it, or while it is in
 /// issue grace (`d` above the watermark, less than one TTL since issue). A
-/// one-shot attempt is possessed while its receiver is busy, or within one
-/// ack-wait of going idle.
+/// once-waiter attempt is possessed while its receiver is busy, or within one
+/// ack-wait of going idle; a hook attempt while its connection is open.
 fn possessed(
     receivers: &BTreeMap<Rx, Receiver>,
     limits: &Limits,
@@ -1269,16 +1301,20 @@ fn possessed(
     if r.retired {
         return false;
     }
-    if r.slot.streams() {
-        let fresh = now < r.fresh_at + limits.possess_ttl;
-        if fresh && r.held.contains(&(id.to_string(), at.a, at.e)) {
-            return true;
+    match r.slot {
+        Slot::OpencodeServer | Slot::OpencodeTui | Slot::Pi => {
+            let fresh = now < r.fresh_at + limits.possess_ttl;
+            if fresh && r.held.contains(&(id.to_string(), at.a, at.e)) {
+                return true;
+            }
+            at.d > r.seen && now < at.issued_at + limits.possess_ttl
         }
-        at.d > r.seen && now < at.issued_at + limits.possess_ttl
-    } else {
-        r.busy
-            || r.idle_since
-                .is_some_and(|since| now < since + limits.ack_wait)
+        Slot::OnceWaiter => {
+            r.busy
+                || r.idle_since
+                    .is_some_and(|since| now < since + limits.ack_wait)
+        }
+        Slot::Hook => r.connected,
     }
 }
 
@@ -1299,7 +1335,10 @@ struct TaskEntry {
     reported: bool,
 }
 
-/// `tasks: id → worker pane + generation` (§9).
+/// `tasks: id → worker pane + generation` (§9): a no-inference prototype
+/// until §13 step 5, which adds the instance and orchestration binding, the
+/// commission/notice transaction, worker-exit cleanup and the bound on
+/// reported tombstones. It has none of those yet and evicts nothing.
 #[derive(Debug, Clone, Default)]
 pub struct TaskIndex {
     tasks: BTreeMap<String, TaskEntry>,
@@ -1668,6 +1707,51 @@ mod tests {
         let d = m.delivery("twice").unwrap();
         assert_eq!((d.auto_repeats, d.issued), (1, 2));
         assert_eq!(m.issue(t3, "twice", rx3), Err(IssueRefusal::NothingToIssue));
+
+        // The hand-out's own check, reached with a token whose admissibility
+        // changed while nothing withdrew it: possession recorded without the
+        // finalizer, the revision moved, the assignment moved.
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeServer, false).rx;
+        for id in ["held", "revised", "moved"] {
+            m.post(id, false);
+        }
+        let h = m.issue(t, "held", rx).unwrap();
+        let v = m.issue(t, "revised", rx).unwrap();
+        let mv = m.issue(t, "moved", rx).unwrap();
+        m.snapshot(
+            t,
+            rx,
+            1,
+            mv.d,
+            &[("held", 1, h.e), ("revised", 1, v.e), ("moved", 1, mv.e)],
+        );
+        let t1 = past_ttl(t);
+        m.tick(t1);
+        for id in ["held", "revised", "moved"] {
+            assert!(m.delivery(id).unwrap().repeat_scheduled(), "{id}");
+        }
+        assert_eq!(
+            m.apply_snapshot(t1, rx, 2, mv.d, &[("held", 1, h.e)]),
+            SnapshotOutcome::Applied
+        );
+        assert!(
+            m.delivery("held").unwrap().repeat_scheduled(),
+            "not withdrawn yet"
+        );
+        m.messages.get_mut("revised").unwrap().revision += 1;
+        m.messages.get_mut("moved").unwrap().a += 1;
+        for id in ["held", "revised", "moved"] {
+            assert_eq!(m.issue(t1, id, rx), Err(IssueRefusal::StaleRepeat), "{id}");
+            let d = m.delivery(id).unwrap();
+            assert_eq!((d.issued, d.auto_repeats), (1, 0), "{id}");
+        }
+        assert!(!m.delivery("held").unwrap().repeat_scheduled());
+        assert_eq!(m.state("moved"), Some(MessageState::Queued));
+        let again = m
+            .issue(t1, "revised", rx)
+            .expect("rescheduled at the new revision");
+        assert_eq!(again.kind, IssueKind::AutoRepeat);
     }
 
     /// Scenario: Feed a stream receiver stale and replayed snapshots, a
@@ -1742,6 +1826,21 @@ mod tests {
             a: 1,
             e: rep.e
         }));
+
+        // A later snapshot reporting a lower watermark does not revive the
+        // issue grace an earlier covering omission ended.
+        let rx2 = m.register(paused, Slot::OpencodeServer, false).rx;
+        m.post("w1", false);
+        m.post("w2", false);
+        let w1 = m.issue(paused, "w1", rx2).unwrap();
+        let w2 = m.issue(paused, "w2", rx2).unwrap();
+        m.snapshot(paused, rx2, 1, w2.d, &[("w1", 1, w1.e)]);
+        assert!(m.delivery("w2").unwrap().repeat_scheduled());
+        m.snapshot(paused, rx2, 2, 0, &[("w1", 1, w1.e)]);
+        assert!(
+            m.delivery("w2").unwrap().repeat_scheduled(),
+            "a regressed watermark does not revive issue grace"
+        );
     }
 
     /// Scenario: A receiver observes delivery numbers out of order (2, then
@@ -1900,16 +1999,17 @@ mod tests {
         assert_eq!(m.state("kept-queue"), Some(MessageState::Queued));
     }
 
-    /// Scenario: Approve a Pi attempt's hand-over, then retire the context
-    /// while the approval is outstanding; separately settle a message by a
-    /// newer attempt while an older attempt still holds a live approval, and
-    /// commit an older attempt after a newer one was issued. A rebound
-    /// context's callback refuses the stale approval, evidence is not
-    /// reclaimed while an approval under a current epoch is outstanding, and
-    /// the late commit lands on exactly the attempt that made it.
+    /// Scenario: Approve a Pi attempt's hand-over, retire the context and
+    /// rebind its callback guard; separately settle a message by a newer
+    /// attempt while an older, approved attempt still owes its revoke answer,
+    /// and commit an older attempt after a newer one was issued. The rebound
+    /// guard refuses the earlier approval, the older attempt keeps its
+    /// evidence until it is final, and the late commit lands on exactly the
+    /// attempt that made it. That retirement reaches a surviving old context
+    /// is the adapters' to prove (step 4), not this model's.
     #[spec("inbox/attempts/009")]
     #[test]
-    fn attempts_009_reclamation_waits_for_callback_quiescence() {
+    fn attempts_009_reclamation_waits_for_finality_and_a_rebound_guard_refuses_old_approvals() {
         let (mut m, t) = model();
         let rx1 = m.register(t, Slot::Pi, true).rx;
         m.post("g", false);
@@ -1947,17 +2047,25 @@ mod tests {
         let q2 = m.issue(t1, "q", tui).expect("repeat on the other context");
         m.stage(t1, "q", 1, q2.e, Stage::Committed, None);
         assert_eq!(m.state("q"), Some(MessageState::Settled));
+        assert!(
+            !m.delivery("q")
+                .unwrap()
+                .attempt(1, q1.e)
+                .unwrap()
+                .stage
+                .is_final()
+        );
         assert_eq!(
             m.evidence_reserved(),
             before + EVIDENCE_PER_ATTEMPT,
-            "the attempt with a live approval keeps its evidence"
+            "an attempt that is not final keeps its evidence after settlement"
         );
         let server2 = m.register(t1, Slot::OpencodeServer, false).rx;
         m.resume_answer(t1, server2, "q", 1, q1.e, ResumeAnswer::Unknown);
         assert_eq!(
             m.evidence_reserved(),
             before,
-            "retirement voided the approval"
+            "fenced by an unknown resume, it is final and quiescent"
         );
 
         m.post("old", false);
@@ -2051,6 +2159,28 @@ mod tests {
         assert_eq!(
             m.retry(now, "u", GEN + 1, cur),
             ActionOutcome::WrongGeneration
+        );
+
+        // An unsuccessful action at the new revision does not replace the
+        // last applied one: the original client's retransmitted Retry still
+        // gets its own answer.
+        let rx2 = m.register(now, Slot::OpencodeServer, false).rx;
+        m.post("v", false);
+        let now = drive_to_uncertain(&mut m, now, "v", rx2);
+        let r = m.delivery("v").unwrap().revision;
+        let applied = m.retry(now, "v", GEN, r);
+        assert!(matches!(applied, ActionOutcome::Applied { .. }));
+        let r2 = m.delivery("v").unwrap().revision;
+        assert_eq!(
+            m.retry(now, "v", GEN, r2),
+            ActionOutcome::NotApplicable {
+                state: MessageState::Attempting
+            }
+        );
+        assert_eq!(
+            m.retry(now, "v", GEN, r),
+            applied,
+            "the retransmitted Retry gets its original answer"
         );
     }
 
@@ -2276,6 +2406,66 @@ mod tests {
         assert_eq!(
             m.stage(t, "live", 1, l.e, Stage::Committed, None),
             StageOutcome::Exited
+        );
+    }
+
+    /// Scenario: A Claude once-waiter's attempt is handed over and Claude
+    /// reports an error stop and then Idle within one ack-wait; separately it
+    /// goes busy, idle, busy again and idle; and a hook receiver's fetch
+    /// connection closes while it is reported busy. A repeated idle report
+    /// does not extend the one idle grace, a resumed busy interval restarts
+    /// it, and a hook's possession is its open connection, not a busy
+    /// interval.
+    #[spec("inbox/attempts/017")]
+    #[test]
+    fn attempts_017_one_idle_grace_and_the_hook_connection() {
+        let (mut m, t) = model();
+        let wait = Limits::default().ack_wait;
+        let s = Duration::from_secs(1);
+        let rx = m.register(t, Slot::OnceWaiter, false).rx;
+        m.post("dup", false);
+        let d = m.issue(t, "dup", rx).unwrap();
+        m.stage(t, "dup", 1, d.e, Stage::Handed, Some(rx));
+        m.busy(t, rx, false);
+        m.busy(t + wait - s, rx, false);
+        m.tick(t + wait - s);
+        assert!(!m.delivery("dup").unwrap().repeat_scheduled());
+        let t0 = t + wait + s;
+        m.tick(t0);
+        assert!(
+            m.delivery("dup").unwrap().repeat_scheduled(),
+            "a repeated idle report does not extend the grace"
+        );
+
+        let rx2 = m.register(t0, Slot::OnceWaiter, false).rx;
+        m.post("cycle", false);
+        let c = m.issue(t0, "cycle", rx2).unwrap();
+        m.stage(t0, "cycle", 1, c.e, Stage::Handed, Some(rx2));
+        m.busy(t0, rx2, true);
+        m.busy(t0 + s, rx2, false);
+        m.busy(t0 + 3 * s, rx2, true);
+        m.busy(t0 + 5 * s, rx2, false);
+        m.tick(t0 + 5 * s + wait - s);
+        assert!(
+            !m.delivery("cycle").unwrap().repeat_scheduled(),
+            "a resumed busy interval restarts the grace"
+        );
+        m.tick(t0 + 5 * s + wait + s);
+        assert!(m.delivery("cycle").unwrap().repeat_scheduled());
+
+        let hook = m.register(t0, Slot::Hook, false).rx;
+        m.post("hook", false);
+        m.issue(t0, "hook", hook).unwrap();
+        let later = t0 + 4 * wait;
+        m.tick(later);
+        assert_eq!(m.state("hook"), Some(MessageState::Attempting));
+        assert!(!m.delivery("hook").unwrap().repeat_scheduled());
+        m.busy(later, hook, true);
+        m.connection_closed(later, hook);
+        m.tick(later);
+        assert!(
+            m.delivery("hook").unwrap().repeat_scheduled(),
+            "a closed fetch connection holds nothing, whatever the status"
         );
     }
 }

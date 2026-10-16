@@ -7818,7 +7818,7 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 
 #### inbox/attempts
 
-The pure state model of a deck message's delivery attempts (`src/inbox_attempts.rs`, PRD #1666 design v3.1 §2, §4, §6, §7, §9): attempt stages, the one finalizer and its nine transition rows, receiver slots and incarnations, possession, the attempt and evidence budgets, and task-bound work-done. Nothing drives delivery from it yet; the hub's current path is unchanged until the migration boundary. Time is passed in as an `Instant`, so no test sleeps.
+The pure state model of a deck message's delivery attempts (`src/inbox_attempts.rs`, PRD #1666 design v3.1 §2, §4, §6, §7, §9): attempt stages, the one finalizer and its nine transition rows, receiver slots and incarnations, possession, the attempt and evidence budgets, and task-bound work-done. Nothing drives delivery from it yet; the hub's current path is unchanged until the migration boundary. Its task index is a no-inference prototype until §13 step 5. Time is passed in as an `Instant`, so no test sleeps.
 
 ##### inbox/attempts/001 — Stages are monotonic, and an attempt that may have been handed blocks reassignment.
 - **Layer:** L1 unit (src/inbox_attempts.rs).
@@ -7844,14 +7844,14 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 ##### inbox/attempts/004 — A scheduled repeat is revalidated at hand-out.
 - **Layer:** L1 unit (src/inbox_attempts.rs).
 - **Agent:** none.
-- **Asserts:** a repeat scheduled by a lapse is refused once a commit settles the message; fresh possession returning before the hand-out withdraws it with no repeat counted; running the finalizer and the tick several times before the hand-out issues one repeat, counted once.
-- **Does not assert:** the stream emit that performs the hand-out.
+- **Asserts:** a repeat scheduled by a lapse is refused once a commit settles the message; fresh possession returning before the hand-out withdraws it with no repeat counted; running the finalizer and the tick several times before the hand-out issues one repeat, counted once; the hand-out itself refuses a token whose admissibility changed while nothing withdrew it (possession recorded without the finalizer, the revision moved, the assignment moved), counting nothing.
+- **Does not assert:** the stream emit that performs the hand-out. Every public event that changes admissibility already runs the finalizer, so the last case reaches the hand-out's check through the model's internal snapshot step and direct state changes.
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/attempts/005 — Snapshots, watermarks, issue grace and the possession TTL.
 - **Layer:** L1 unit (src/inbox_attempts.rs).
 - **Agent:** none.
-- **Asserts:** the default possession TTL is 90 seconds (three 30-second keepalives); stale and replayed snapshots are dropped; an attempt above the watermark is held by issue grace, an omitted one at or below it is not; fresh snapshots that keep omitting an attempt end its grace at the TTL; a receiver paused past the TTL lapses its attempt into one marked repeat, and after recovery the first commit settles and revokes the repeat.
+- **Asserts:** the default possession TTL is 90 seconds (three 30-second keepalives); stale and replayed snapshots are dropped; an attempt above the watermark is held by issue grace, an omitted one at or below it is not; fresh snapshots that keep omitting an attempt end its grace at the TTL; a receiver paused past the TTL lapses its attempt into one marked repeat, and after recovery the first commit settles and revokes the repeat; a later snapshot with a lower watermark does not revive issue grace (the watermark is monotone at admission).
 - **Does not assert:** the watcher's keepalive timer or the snapshot wire.
 - **Platform coverage:** mac+linux+windows.
 
@@ -7876,11 +7876,11 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Does not assert:** the resume wire.
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/attempts/009 — Evidence reclamation waits for callback quiescence.
+##### inbox/attempts/009 — Evidence reclamation waits for finality, and a rebound guard refuses old approvals.
 - **Layer:** L1 unit (src/inbox_attempts.rs).
 - **Agent:** none.
-- **Asserts:** a callback guard rebound to a new incarnation refuses an approval granted under the old one, and refuses a revoked attempt; a settled message's older attempt keeps its evidence while an approval under its live incarnation is outstanding, and releases it once retirement voids the approval; a late commit after a newer issue lands on exactly the attempt that made it.
-- **Does not assert:** the component-side guard in the Pi and OpenCode adapters.
+- **Asserts:** a callback guard, once rebound, refuses an approval granted before the rebind, and refuses a revoked attempt; a settled message's older, approved attempt keeps its evidence while it is not final and releases it once an unknown resume fences it; a late commit after a newer issue lands on exactly the attempt that made it.
+- **Does not assert:** that retiring an incarnation reaches a surviving old JS context before its approved callback resumes (the adapters' race, §13 step 4), or a final attempt with an outstanding approval, which the model makes unreachable (every path to a final stage spends or voids the approval).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/attempts/010 — A handed-inert attempt keeps its late-commit verifier.
@@ -7893,7 +7893,7 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 ##### inbox/attempts/011 — User actions compare on the revision and are idempotent.
 - **Layer:** L1 unit (src/inbox_attempts.rs).
 - **Agent:** none.
-- **Asserts:** a repeated Retry or Cancel at the same revision gets the same answer; an action at a stale revision gets the current state and revision; an action naming another generation is refused.
+- **Asserts:** a repeated Retry or Cancel at the same revision gets the same answer; an action at a stale revision gets the current state and revision; an action naming another generation is refused; an unsuccessful action at a newer revision does not replace the last applied one, so a retransmitted Retry still gets its original answer.
 - **Does not assert:** the clients' buttons.
 - **Platform coverage:** mac+linux+windows.
 
@@ -7930,6 +7930,13 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Agent:** none.
 - **Asserts:** open attempts are fenced; possessed, queued and offered messages become undeliverable for exit; the offer returns to its pool; all evidence is released; nothing is handed out or committed afterwards.
 - **Does not assert:** the daemon's exit detection.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/017 — One idle grace for a once-waiter, and a hook holds by its connection.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a once-waiter's handed attempt lapses one ack-wait after the first idle report even when an error stop and an Idle are both reported; a busy, idle, busy, idle cycle restarts the grace at the last idle; a hook receiver's attempt is possessed while its fetch connection is open, a busy report does not hold it, and it lapses once the connection closes.
+- **Does not assert:** the Claude status events or hook connections that will drive these calls.
 - **Platform coverage:** mac+linux+windows.
 
 #### inbox/receipt
