@@ -2951,8 +2951,14 @@ pub struct SweepReport {
 /// Every other dotfile is excluded, which is what keeps the sweep out of
 /// anything a user or another tool parks there under a leading dot, and nothing
 /// without an `.md` extension is touched at all.
+///
+/// The deck's saved message bodies, `inbox-message-<deck>-<unique>.md`, are
+/// excluded by name too (PR #1735, RB2-02): the deck that saved one keeps it
+/// while its message is waiting or its task is running, whatever its age, and
+/// removes it on its own schedule ([`crate::inbox_spills`]). An age sweep here
+/// would delete the full body of a message still queued.
 pub(crate) fn is_sweepable_coordination_name(name: &str) -> bool {
-    if name == CONTEXT_FILE_NAME {
+    if name == CONTEXT_FILE_NAME || crate::inbox_spills::is_spill_file_name(name) {
         return false;
     }
     if let Some(rest) = name.strip_prefix('.') {
@@ -5547,6 +5553,8 @@ mod hygiene_tests {
             ".hidden.md",
             "README",
             "archive.md.bak",
+            // PR #1735 (RB2-02): a deck's saved message body is the deck's.
+            "inbox-message-0123abcd-1700000000000-1.md",
         ] {
             assert!(
                 !is_sweepable_coordination_name(name),

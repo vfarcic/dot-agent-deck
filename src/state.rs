@@ -5530,7 +5530,13 @@ async fn dispatch_one_owned(
     // PR #1735 fifth review (N8): a task the inbox would refuse is refused
     // before anything is retired or restarted for it, so the worker's older
     // task stays as it was.
-    let refuse = |orchestrator: Option<crate::inbox::Recipient>, error: &dyn std::fmt::Display| {
+    //
+    // RB2-01: every notice that the task was not posted goes into the room
+    // reserved for the task, when one is held, so posts that filled the deck
+    // while the task was prepared cannot refuse the notice too.
+    let refuse = |orchestrator: Option<crate::inbox::Recipient>,
+                  reservation: Option<crate::inbox_hub::ReplyReservation>,
+                  error: &dyn std::fmt::Display| {
         warn!(
             role = %target_role,
             pane_id = %pane_id,
@@ -5550,8 +5556,9 @@ async fn dispatch_one_owned(
             delegation_seq,
             "the worker's inbox refused the task",
         );
-        post_orchestrator_notice(
+        post_orchestrator_notice_in(
             &registry,
+            reservation,
             orchestrator,
             "task refused",
             format!(
@@ -5567,10 +5574,10 @@ async fn dispatch_one_owned(
     // it was for: posts that arrive during the restart cannot take its room.
     // The room the worker's older tasks free counts as its own. A refusal
     // returns the room, and the saved file is removed unless the post goes in.
-    let reservation = match registry.inbox().reserve_delegate(&pane_id, &content) {
+    let mut reservation = match registry.inbox().reserve_delegate(&pane_id, &content) {
         Ok(reservation) => reservation,
         Err(error) => {
-            refuse(orchestrator.clone(), &error);
+            refuse(orchestrator.clone(), None, &error);
             return;
         }
     };
@@ -5587,7 +5594,7 @@ async fn dispatch_one_owned(
     }) {
         Ok(spill) => spill,
         Err(error) => {
-            refuse(orchestrator.clone(), &error);
+            refuse(orchestrator.clone(), Some(reservation), &error);
             return;
         }
     };
@@ -5649,7 +5656,7 @@ async fn dispatch_one_owned(
         // refusal of its content can follow.
         registry.inbox().supersede_delegates_to(&pane_id);
         #[cfg(test)]
-        clear_respawn_gate_pass(&pane_id).await;
+        gate_pass(&CLEAR_RESPAWN_GATES, &pane_id).await;
         match registry
             .respawn_or_recreate_agent_for_pane(&pane_id, &role.command, &recreate_identity)
             .await
@@ -5760,8 +5767,9 @@ async fn dispatch_one_owned(
                     delegation_seq,
                     "respawn failed for clear=true",
                 );
-                post_orchestrator_notice(
+                post_orchestrator_notice_in(
                     &registry,
+                    Some(reservation),
                     orchestrator.clone(),
                     "worker respawn failed",
                     compose_respawn_failed_notice(&pane_id),
@@ -5770,6 +5778,8 @@ async fn dispatch_one_owned(
             }
         }
     }
+    #[cfg(test)]
+    gate_pass(&CLEAR_RESPAWNED_GATES, &pane_id).await;
     // The task is bound to a generation that holds the pane right now: one that
     // has already gone (a replacement that died at once) would hold the task
     // forever, so it is reported like a pane with no live agent.
@@ -5778,35 +5788,38 @@ async fn dispatch_one_owned(
         Some(agent) => (live.as_deref() == Some(agent.as_str())).then_some(agent),
         None => live,
     };
-    let no_live_worker = |orchestrator: Option<crate::inbox::Recipient>| {
-        warn!(
-            role = %target_role,
-            pane_id = %pane_id,
-            "delegate: the worker pane has no live agent (a clear=true replacement worker is no \
-             longer the pane's live agent, or nothing holds the pane); no task posted"
-        );
-        release_undelivered_commission(
-            &registry,
-            &pane_id,
-            commission_arm_id,
-            &target_role,
-            "the worker pane has no live agent",
-        );
-        retire_undelivered_idle_worker_record(
-            &registry,
-            &pane_id,
-            delegation_seq,
-            "the worker pane has no live agent",
-        );
-        post_orchestrator_notice(
-            &registry,
-            orchestrator,
-            "worker not live",
-            compose_respawn_no_live_worker_notice(&pane_id),
-        );
-    };
+    let no_live_worker =
+        |orchestrator: Option<crate::inbox::Recipient>,
+         reservation: crate::inbox_hub::ReplyReservation| {
+            warn!(
+                role = %target_role,
+                pane_id = %pane_id,
+                "delegate: the worker pane has no live agent (a clear=true replacement worker is no \
+                 longer the pane's live agent, or nothing holds the pane); no task posted"
+            );
+            release_undelivered_commission(
+                &registry,
+                &pane_id,
+                commission_arm_id,
+                &target_role,
+                "the worker pane has no live agent",
+            );
+            retire_undelivered_idle_worker_record(
+                &registry,
+                &pane_id,
+                delegation_seq,
+                "the worker pane has no live agent",
+            );
+            post_orchestrator_notice_in(
+                &registry,
+                Some(reservation),
+                orchestrator,
+                "worker not live",
+                compose_respawn_no_live_worker_notice(&pane_id),
+            );
+        };
     let Some(worker_agent_id) = worker_agent_id else {
-        no_live_worker(orchestrator.clone());
+        no_live_worker(orchestrator.clone(), reservation);
         return;
     };
     if let Some(seq) = delegation_seq {
@@ -5842,7 +5855,7 @@ async fn dispatch_one_owned(
             .any(|(pane, agent)| *pane == pane_id && *agent == worker_agent_id)
     };
     match registry.inbox().post_reserved_delegate(
-        reservation,
+        &mut reservation,
         worker.clone(),
         &target_role,
         orchestrator.clone(),
@@ -5885,13 +5898,13 @@ async fn dispatch_one_owned(
             if let Some(seq) = delegation_seq {
                 registry.finish_delegation_pointer_write(&pane_id, seq, Default::default());
             }
-            no_live_worker(orchestrator);
+            no_live_worker(orchestrator, reservation);
         }
         Err(crate::inbox_hub::PostRefusal::Refused(error)) => {
             if let Some(seq) = delegation_seq {
                 registry.finish_delegation_pointer_write(&pane_id, seq, Default::default());
             }
-            refuse(orchestrator, &error);
+            refuse(orchestrator, Some(reservation), &error);
         }
     }
 }
@@ -5910,12 +5923,16 @@ type ClearRespawnGate = (
 static CLEAR_RESPAWN_GATES: std::sync::Mutex<Vec<ClearRespawnGate>> =
     std::sync::Mutex::new(Vec::new());
 
+/// TEST holds on a dispatch to a pane after any `clear = true` restart and
+/// before the worker's liveness is checked for the post.
 #[cfg(test)]
-async fn clear_respawn_gate_pass(pane_id: &str) {
+static CLEAR_RESPAWNED_GATES: std::sync::Mutex<Vec<ClearRespawnGate>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+async fn gate_pass(gates: &std::sync::Mutex<Vec<ClearRespawnGate>>, pane_id: &str) {
     let gate = {
-        let mut gates = CLEAR_RESPAWN_GATES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut gates = gates.lock().unwrap_or_else(|e| e.into_inner());
         gates
             .iter()
             .position(|(pane, ..)| pane == pane_id)
@@ -5955,6 +5972,20 @@ pub(crate) fn post_orchestrator_notice(
     subject: &str,
     body: String,
 ) {
+    post_orchestrator_notice_in(registry, None, orchestrator, subject, body);
+}
+
+/// PR #1735 fifth review (RB2-01): [`post_orchestrator_notice`] into the room
+/// `reservation` held for the task the notice reports was not posted
+/// ([`crate::inbox_hub::post_reserved_notice_to_live`]), when there is one.
+/// The room is given back whenever the notice does not spend it.
+fn post_orchestrator_notice_in(
+    registry: &AgentPtyRegistry,
+    reservation: Option<crate::inbox_hub::ReplyReservation>,
+    orchestrator: Option<crate::inbox::Recipient>,
+    subject: &str,
+    body: String,
+) {
     let Some(to) = orchestrator else {
         warn!(
             subject,
@@ -5963,7 +5994,13 @@ pub(crate) fn post_orchestrator_notice(
         return;
     };
     let pane_id = to.pane_id.clone();
-    if let Err(error) = crate::inbox_hub::post_notice_to_live(registry, to, subject, body) {
+    let posted = match reservation {
+        Some(reservation) => {
+            crate::inbox_hub::post_reserved_notice_to_live(registry, reservation, to, subject, body)
+        }
+        None => crate::inbox_hub::post_notice_to_live(registry, to, subject, body),
+    };
+    if let Err(error) = posted {
         warn!(pane_id = %pane_id, subject, %error, "could not post a daemon notice");
     }
 }
@@ -17122,6 +17159,79 @@ mod tests {
         registry.shutdown_all();
     }
 
+    /// PR #1735 fifth review (RB2-01): a `clear = true` dispatch whose
+    /// replacement worker is gone before the post tells the orchestrator in the
+    /// room it reserved for the task, so a deck that filled meanwhile cannot
+    /// refuse the notice, and the reservation is not left held.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_clear_dispatch_tells_the_orchestrator_in_its_reserved_room() {
+        let dir = clear_role_dir();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.install_inbox(Arc::new(crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::generate(),
+            crate::inbox::InboxLimits {
+                max_messages: 3,
+                ..crate::inbox::InboxLimits::default()
+            },
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        )));
+        let orch = stand_in_in(&registry, "rb201-orch", Some(&cwd));
+        let _worker = stand_in_in(&registry, "rb201-worker", Some(&cwd));
+
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (go, go_rx) = tokio::sync::oneshot::channel();
+        CLEAR_RESPAWNED_GATES
+            .lock()
+            .unwrap()
+            .push(("rb201-worker".to_string(), reached_tx, go_rx));
+        let dispatch = tokio::spawn(dispatch_clear_task(
+            registry.clone(),
+            "rb201-orch".into(),
+            orch.clone(),
+            "rb201-worker".into(),
+            "the task".into(),
+            cwd.clone(),
+        ));
+        reached.await.expect("the dispatch restarts the worker");
+        assert_eq!(registry.inbox().reserved_replies(), 1, "precondition");
+        // The deck fills, and the replacement worker goes, before the post.
+        let to_orch = crate::inbox::Recipient::bound("rb201-orch", &orch);
+        let mut filled = 0;
+        while registry
+            .inbox()
+            .post_notice(to_orch.clone(), "filler", "x")
+            .is_ok()
+        {
+            filled += 1;
+            assert!(filled < 10, "the deck never filled");
+        }
+        let replacement = registry
+            .pane_current_agent_id("rb201-worker")
+            .expect("the replacement holds the pane");
+        registry
+            .close_agent(&replacement)
+            .expect("close replacement");
+        go.send(()).unwrap();
+        dispatch.await.unwrap();
+
+        assert!(
+            registry
+                .inbox()
+                .list("rb201-orch")
+                .iter()
+                .any(|m| m.subject == "worker not live"),
+            "the orchestrator must be told no task was posted, in the room the task reserved"
+        );
+        assert_eq!(
+            registry.inbox().reserved_replies(),
+            0,
+            "the task's reservation is consumed or released"
+        );
+        registry.shutdown_all();
+    }
+
     /// PR #1735 fifth review (B-01): a `clear = true` task whose long body the
     /// deck cannot save is refused before the worker's older task is retired
     /// or its worker restarted.
@@ -17177,6 +17287,11 @@ mod tests {
                 .iter()
                 .any(|m| m.subject == "task refused"),
             "the orchestrator is told the task was refused"
+        );
+        assert_eq!(
+            registry.inbox().reserved_replies(),
+            0,
+            "the refused task's reservation is not left held"
         );
         registry.shutdown_all();
     }

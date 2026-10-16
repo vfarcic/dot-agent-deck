@@ -600,7 +600,7 @@ The deck keeps its hand-off files in `.dot-agent-deck/` inside the orchestration
 | `work-done-<role>.md` | each `work-done` for a delegated task | The worker's last report. |
 | other `*.md` files | when an agent writes them | Longer context an orchestrator passes by file. |
 
-When it writes an orchestrator context, the deck deletes `.md` files in this directory, other than `orchestrator-context.md`, that were last modified more than 14 days ago. `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` changes the number of days, and `0` turns the clean-up off. Do not keep your own files there.
+When it writes an orchestrator context, the deck deletes `.md` files in this directory, other than `orchestrator-context.md` and the saved copies of long messages (`inbox-message-*.md`), that were last modified more than 14 days ago. The saved copies follow their own schedule, described in [Delivery in the TUI and desktop app](#delivery-in-the-tui-and-desktop-app). `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` changes the number of days, and `0` turns the clean-up off. Do not keep your own files there.
 
 ## More than one orchestration
 

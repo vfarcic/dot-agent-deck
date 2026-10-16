@@ -1063,6 +1063,12 @@ impl Inbox {
         Ok(())
     }
 
+    /// TEST: how many reservations are held.
+    #[cfg(test)]
+    pub fn reserved_replies(&self) -> usize {
+        self.reserved_replies
+    }
+
     /// Give back one reservation [`Self::reserve_reply`] made, unused.
     pub fn release_reply(&mut self) {
         self.reserved_replies = self.reserved_replies.saturating_sub(1);

@@ -714,6 +714,12 @@ impl InboxHub {
         })
     }
 
+    /// TEST: how many reservations the inbox holds.
+    #[cfg(test)]
+    pub fn reserved_replies(&self) -> usize {
+        self.lock().inbox.reserved_replies()
+    }
+
     /// [`Inbox::admit_reserved_reply`]: the refusal posting `content` under a
     /// reservation would get now. Run before anything is saved for the post.
     pub fn admit_reserved_reply(&self, content: &Content) -> Result<(), PostError> {
@@ -909,11 +915,13 @@ impl InboxHub {
     }
 
     /// [`Self::post_delegate`] into the room `reservation` held for the task
-    /// ([`Self::reserve_delegate`]); a refusal gives the room back.
+    /// ([`Self::reserve_delegate`]). The post spends the reservation; a
+    /// refusal leaves it held, so the caller can post the notice of the
+    /// refusal into it ([`post_reserved_notice_to_live`]) or drop it.
     #[allow(clippy::too_many_arguments)]
     pub fn post_reserved_delegate(
         &self,
-        reservation: ReplyReservation,
+        reservation: &mut ReplyReservation,
         worker: Recipient,
         role: &str,
         orchestrator: Option<Recipient>,
@@ -935,7 +943,7 @@ impl InboxHub {
     #[allow(clippy::too_many_arguments)]
     fn post_delegate_with(
         &self,
-        mut reservation: Option<ReplyReservation>,
+        mut reservation: Option<&mut ReplyReservation>,
         worker: Recipient,
         role: &str,
         orchestrator: Option<Recipient>,
@@ -1937,17 +1945,20 @@ impl InboxHub {
         if reclaim.changed {
             // PR #1735 sixth review (B2-04): a removal that failed stays
             // tracked, to be tried again at a later tick.
-            let mut failed = Vec::new();
-            for mut spill in reclaim.removed {
-                if let crate::inbox_spills::Removal::Failed(error) =
-                    crate::inbox_spills::remove_spill(spill.path(), &deck)
-                {
-                    if spill.failed() {
-                        warn!(path = %spill.path().display(), %error, "inbox: could not remove a saved body; it is tried again");
+            let failed = off_the_executor(|| {
+                let mut failed = Vec::new();
+                for mut spill in reclaim.removed {
+                    if let crate::inbox_spills::Removal::Failed(error) =
+                        crate::inbox_spills::remove_spill(spill.path(), &deck)
+                    {
+                        if spill.failed() {
+                            warn!(path = %spill.path().display(), %error, "inbox: could not remove a saved body; it is tried again");
+                        }
+                        failed.push(spill);
                     }
-                    failed.push(spill);
                 }
-            }
+                failed
+            });
             let mut st = self.lock();
             st.spills.restore(failed);
             self.record_spills(st);
@@ -1994,22 +2005,26 @@ impl InboxHub {
         let revision = st.spills_revision;
         let text = st.spills.manifest_text();
         drop(st);
-        let mut manifest = self
-            .spill_manifest
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let Some((manifest, written)) = manifest.as_mut() else {
-            return false;
-        };
-        if revision > *written {
-            match manifest.write(&text) {
-                Ok(()) => *written = revision,
-                Err(error) => {
-                    warn!(%error, "inbox: could not record the saved bodies in this run's inventory");
+        // PR #1735 review (Qodo 4296692518): the wait and the write are file
+        // IO, and this runs on the attach handlers' runtime.
+        off_the_executor(|| {
+            let mut manifest = self
+                .spill_manifest
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some((manifest, written)) = manifest.as_mut() else {
+                return false;
+            };
+            if revision > *written {
+                match manifest.write(&text) {
+                    Ok(()) => *written = revision,
+                    Err(error) => {
+                        warn!(%error, "inbox: could not record the saved bodies in this run's inventory");
+                    }
                 }
             }
-        }
-        *written >= revision
+            *written >= revision
+        })
     }
 
     /// PR #1735 fifth review (B-05): keep this run's list of saved bodies
@@ -3118,6 +3133,25 @@ fn post_live_keeping(
     .map_err(|error| (error.to_string(), None))?;
     hub.own_spill(spill, &id);
     Ok(id)
+}
+
+/// PR #1735 fifth review (RB2-01): [`post_notice_to_live`] into the room
+/// `reservation` held for something the notice reports did not go in (a
+/// delegated task), so posts that filled the deck meanwhile cannot refuse it.
+/// The notice spends the reservation; a refusal gives the room back.
+pub fn post_reserved_notice_to_live(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    reservation: ReplyReservation,
+    to: Recipient,
+    subject: &str,
+    body: impl Into<String>,
+) -> Result<MessageId, String> {
+    post_live(
+        registry,
+        to,
+        Content::from_deck(NOTICE_REASON, subject, body),
+        Some(reservation),
+    )
 }
 
 /// PRD #1666 S5: [`post_to_live`] for a notice from the deck, labelled
@@ -4584,6 +4618,45 @@ mod tests {
         );
     }
 
+    /// PR #1735 review (Qodo 4296692518): recording a saved body writes this
+    /// run's inventory off the async runtime's worker, so a slow write — here,
+    /// one held up behind another — stalls no other task on that worker.
+    #[test]
+    fn recording_a_saved_body_stalls_no_runtime_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "x").unwrap();
+        let hub = Arc::new(hub());
+        let id = hub.mint_id();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let writing = hub.spill_manifest.lock().unwrap();
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let recorder = {
+            let hub = Arc::clone(&hub);
+            runtime.spawn(async move {
+                let _ = started_tx.send(());
+                hub.own_spill(MintedSpill(Some((path, 1))), &id)
+            })
+        };
+        started.recv().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let _ = tx.send(());
+        });
+        let other = rx.recv_timeout(Duration::from_secs(5));
+        drop(writing);
+        runtime.block_on(recorder).unwrap();
+        assert_eq!(
+            other,
+            Ok(()),
+            "another task on the runtime must run while the inventory is written"
+        );
+    }
+
     /// PR #1735 fifth review (B-05): the file an accepted long message names
     /// is the deck's to remove: kept while the message is live and after its
     /// acknowledgement — the agent may still be reading it — and removed by
@@ -4644,6 +4717,56 @@ mod tests {
         assert_eq!(after.owned_spills(), vec![path.clone()]);
         after.tick();
         assert!(path.exists(), "and is kept after the restart");
+    }
+
+    /// PR #1735 sixth review (RB2-02): the saved body of a task still queued
+    /// is the deck's to keep, whatever its age: publishing an orchestrator
+    /// context in the same project sweeps the coordination files past their
+    /// retention, and leaves the deck's saved bodies to the deck.
+    #[test]
+    fn a_queued_tasks_old_body_survives_a_coordination_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub();
+        let worker = Recipient::bound("w", "wa");
+        let (c, spill) = saved_long(&hub, dir.path(), "QUEUED");
+        let path = spill.path().unwrap().to_path_buf();
+        let (task, _end) = hub
+            .post_delegate(
+                worker.clone(),
+                "coder",
+                None,
+                DelegateLedger::default(),
+                c,
+                &|| true,
+            )
+            .unwrap();
+        hub.own_task_spill(spill, &task, &worker);
+        let context_dir = path.parent().unwrap().to_path_buf();
+        let notes = context_dir.join("notes.md");
+        std::fs::write(&notes, "an old coordination file").unwrap();
+        let month_ago = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        for old in [&path, &notes] {
+            std::fs::File::options()
+                .write(true)
+                .open(old)
+                .unwrap()
+                .set_modified(month_ago)
+                .unwrap();
+        }
+
+        let published =
+            crate::orchestrator_context::publish_orchestrator_context(dir.path(), "context")
+                .expect("publish an orchestrator context");
+        assert!(
+            !notes.exists(),
+            "precondition: the publish swept coordination files past their retention"
+        );
+        assert!(
+            path.exists(),
+            "the queued task's saved body must survive the coordination sweep"
+        );
+        assert_eq!(hub.list("w").len(), 1, "the task is still queued");
+        drop(published);
     }
 
     /// PR #1735 sixth review (B2-02): a worker that acknowledged its task and
@@ -4799,9 +4922,10 @@ mod tests {
         let room = hub.reserve_delegate("w", &content("task")).unwrap();
         hub.post_direct(worker.clone(), content("posted while the task saved"))
             .unwrap();
+        let mut room = room;
         let (task, _end) = hub
             .post_reserved_delegate(
-                room,
+                &mut room,
                 worker.clone(),
                 "coder",
                 None,

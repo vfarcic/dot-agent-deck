@@ -73,6 +73,14 @@ pub fn spill_file_name(deck: &DeckId, unique: &str) -> String {
     format!("{SPILL_PREFIX}{deck}-{unique}.md")
 }
 
+/// `name` is named as a saved body of any deck ([`spill_file_name`]). The
+/// coordination sweep leaves such files to the deck that saved them
+/// ([`crate::orchestrator_context::is_sweepable_coordination_name`]), whose
+/// ledger alone knows whether their messages still need them.
+pub fn is_spill_file_name(name: &str) -> bool {
+    name.starts_with(SPILL_PREFIX) && name.ends_with(".md")
+}
+
 /// `path` matches this deck's naming for a saved body: a regular file — not a
 /// symlink — named by [`spill_file_name`] for `deck`, directly inside a
 /// `.dot-agent-deck` directory that is not a symlink. Checked by path now;
@@ -268,15 +276,15 @@ impl SpillLedger {
     }
 
     /// What this run's inventory records: every body tracked now, with when
-    /// it settled. A path that is not UTF-8 cannot be recorded, and is not
-    /// cleaned up after this run ends.
+    /// it settled. A path that is not UTF-8 is recorded by its raw form
+    /// ([`PathRecord`]), so it is cleaned up after this run ends too.
     pub fn manifest_text(&self) -> String {
         let spills = self
             .owned
             .iter()
             .filter_map(|spill| {
                 Some(ManifestEntry {
-                    path: spill.path.to_str()?.to_string(),
+                    path: PathRecord::of(&spill.path)?,
                     bytes: spill.bytes,
                     settled_unix_ms: spill
                         .settled_wall
@@ -372,12 +380,102 @@ struct ManifestDoc {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ManifestEntry {
-    path: String,
+    #[serde(flatten)]
+    path: PathRecord,
     bytes: u64,
     /// When its message settled, by the wall clock; `None` while it had not,
     /// or a task held it.
     #[serde(default)]
     settled_unix_ms: Option<u64>,
+}
+
+/// A saved body's path as an inventory records it: `path` when it is UTF-8,
+/// and otherwise `path_raw`, the hex of its bytes on Unix or of its UTF-16
+/// code units on Windows, so no path the deck saved a body at is left out
+/// (PR #1735 review, Qodo 4296692542).
+#[derive(Debug, Serialize, Deserialize)]
+struct PathRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path_raw: Option<String>,
+}
+
+impl PathRecord {
+    fn of(path: &Path) -> Option<Self> {
+        if let Some(text) = path.to_str() {
+            return Some(Self {
+                path: Some(text.to_string()),
+                path_raw: None,
+            });
+        }
+        let raw = raw_path_hex(path)?;
+        Some(Self {
+            path: None,
+            path_raw: Some(raw),
+        })
+    }
+
+    fn path(&self) -> Option<PathBuf> {
+        match (&self.path, &self.path_raw) {
+            (Some(text), _) => Some(PathBuf::from(text)),
+            (None, Some(raw)) => path_from_raw_hex(raw),
+            (None, None) => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn raw_path_hex(path: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    Some(
+        path.as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+
+#[cfg(unix)]
+fn path_from_raw_hex(raw: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let bytes = (0..raw.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(raw.get(at..at + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(windows)]
+fn raw_path_hex(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt as _;
+    Some(
+        path.as_os_str()
+            .encode_wide()
+            .map(|unit| format!("{unit:04x}"))
+            .collect(),
+    )
+}
+
+#[cfg(windows)]
+fn path_from_raw_hex(raw: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    let units = (0..raw.len())
+        .step_by(4)
+        .map(|at| u16::from_str_radix(raw.get(at..at + 4)?, 16).ok())
+        .collect::<Option<Vec<u16>>>()?;
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&units)))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn raw_path_hex(_: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_from_raw_hex(_: &str) -> Option<PathBuf> {
+    None
 }
 
 /// The saved bodies [`SpillManifest::open`] took over from ended runs, for
@@ -451,7 +549,7 @@ impl SpillManifest {
         let (unique, lock) = create_locked_run(&dir)?;
         let (entries, sources) = take_over_orphans(&dir, deck);
         let mut spills = Vec::new();
-        for entry in entries {
+        for (path, entry) in entries {
             let recorded = entry
                 .settled_unix_ms
                 .map(|ms| UNIX_EPOCH + Duration::from_millis(ms));
@@ -460,7 +558,7 @@ impl SpillManifest {
                 None => (wall, Duration::ZERO),
             };
             let mut spill = OwnedSpill {
-                path: PathBuf::from(entry.path),
+                path,
                 message: None,
                 bytes: entry.bytes,
                 task: None,
@@ -620,36 +718,23 @@ fn read_inventory(path: &Path) -> std::io::Result<Option<Vec<ManifestEntry>>> {
 /// naming answered, with the inventory itself to release once they are
 /// recorded elsewhere. An inventory some running daemon holds is left alone,
 /// and so is one that cannot be read, still locked by nobody.
-fn take_over_orphans(dir: &Path, deck: &DeckId) -> (Vec<ManifestEntry>, Vec<TakenSource>) {
+fn take_over_orphans(
+    dir: &Path,
+    deck: &DeckId,
+) -> (Vec<(PathBuf, ManifestEntry)>, Vec<TakenSource>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Default::default();
     };
     let mut found = Vec::new();
     let mut sources = Vec::new();
+    let mut pending = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name.starts_with(".pending-") {
-            // A run's lock file before it was in place, or an inventory being
-            // written: a run just starting holds its lock within moments of
-            // creating it, and a write renames its file away within moments.
-            let Ok(file) = open_regular(&path) else {
-                continue;
-            };
-            if file.try_lock().is_err() {
-                continue;
-            }
-            let stale = file
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|at| SystemTime::now().duration_since(at).ok())
-                .is_some_and(|age| age >= Duration::from_secs(60));
-            if stale {
-                let _ = std::fs::remove_file(&path);
-            }
+        if let Some(rest) = name.strip_prefix(".pending-") {
+            pending.push((rest.to_string(), path));
             continue;
         }
         let Some(unique) = name
@@ -675,7 +760,8 @@ fn take_over_orphans(dir: &Path, deck: &DeckId) -> (Vec<ManifestEntry>, Vec<Take
         found.extend(
             listed
                 .into_iter()
-                .filter(|entry| is_own_spill(Path::new(&entry.path), deck)),
+                .filter_map(|entry| Some((entry.path.path()?, entry)))
+                .filter(|(path, _)| is_own_spill(path, deck)),
         );
         sources.push(TakenSource {
             _lock: lock,
@@ -683,7 +769,55 @@ fn take_over_orphans(dir: &Path, deck: &DeckId) -> (Vec<ManifestEntry>, Vec<Take
             list_path: list,
         });
     }
+    for (rest, path) in pending {
+        remove_stale_pending(dir, &rest, &path, &sources);
+    }
     (found, sources)
+}
+
+/// A `.pending-<rest>` file left in `dir` is removed once it is a minute old
+/// and no running daemon is still using it. A run just starting holds its lock
+/// file within moments of creating it, and a write renames its inventory away
+/// within moments.
+///
+/// PR #1735 review (Qodo 4296692551): an inventory being written,
+/// `.pending-<unique>.list`, is never opened or locked here. On Windows a lock
+/// is mandatory, so a lock taken on it would fail its writer's next write; its
+/// run's lock file says instead whether that run is still going. A lock file
+/// before it was renamed into place, `.pending-<unique>`, is only ever locked,
+/// never read or written, so locking it here blocks nothing.
+fn remove_stale_pending(dir: &Path, rest: &str, path: &Path, taken: &[TakenSource]) {
+    let stale = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.file_type().is_file())
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|at| SystemTime::now().duration_since(at).ok())
+        .is_some_and(|age| age >= Duration::from_secs(60));
+    if !stale {
+        return;
+    }
+    match rest.strip_suffix(".list") {
+        Some(unique) => {
+            let lock = lock_path(dir, unique);
+            let ended = taken.iter().any(|source| source.lock_path == lock)
+                || match open_regular(&lock) {
+                    Ok(file) => file.try_lock().is_ok(),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                };
+            if !ended {
+                return;
+            }
+        }
+        None => {
+            let Ok(file) = open_regular(path) else {
+                return;
+            };
+            if file.try_lock().is_err() {
+                return;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 #[cfg(test)]
@@ -1048,6 +1182,76 @@ mod tests {
         let mut ledger = SpillLedger::default();
         ledger.adopt(taken).release();
         assert_eq!(ledger.paths(), vec![body]);
+    }
+
+    /// PR #1735 review (Qodo 4296692542): a saved body under a directory
+    /// whose name is not UTF-8 is recorded losslessly, so a later run still
+    /// removes it once its retention has passed.
+    #[cfg(unix)]
+    #[test]
+    fn a_body_under_a_non_utf8_directory_is_cleaned_up_after_its_run() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let odd = work
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"caf\xe9-project"));
+        std::fs::create_dir(&odd).unwrap();
+        let path = spill_in(&odd, "odd");
+        assert!(path.to_str().is_none(), "precondition: not UTF-8");
+        let wall = SystemTime::now();
+        let hour = Duration::from_secs(60 * 60);
+
+        let mut ended = SpillLedger::default();
+        let (mut manifest, _) = open(state.path(), DEFAULT_SPILL_RETENTION, wall);
+        ended.own(path.clone(), "m-odd", 1);
+        ended.reclaim(Instant::now(), wall - 2 * hour, &HashSet::new());
+        manifest.write(&ended.manifest_text()).unwrap();
+        drop(manifest);
+
+        let (_next, taken) = open(state.path(), hour, wall);
+        let _ = SpillLedger::default().adopt(taken);
+        assert!(
+            !path.exists(),
+            "the next run removes a body past its retention, whatever its path's encoding"
+        );
+    }
+
+    /// PR #1735 review (Qodo 4296692551): a starting daemon neither locks nor
+    /// removes the inventory a running daemon is writing, however old it
+    /// looks. On Windows a lock taken on it would fail that daemon's write.
+    /// A stale one an ended run left is removed.
+    #[test]
+    fn a_running_daemons_inventory_in_progress_is_left_alone() {
+        let state = tempfile::tempdir().unwrap();
+        let wall = SystemTime::now();
+        let (running, _) = open(state.path(), DEFAULT_SPILL_RETENTION, wall);
+        let (ended, _) = open(state.path(), DEFAULT_SPILL_RETENTION, wall);
+        let pending = |manifest: &SpillManifest| {
+            let path = manifest
+                .dir
+                .join(format!(".pending-{}.list", manifest.unique));
+            std::fs::write(&path, "{").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(10 * 60))
+                .unwrap();
+            path
+        };
+        let in_progress = pending(&running);
+        let left_behind = pending(&ended);
+        drop(ended);
+
+        let (_started, taken) = open(state.path(), DEFAULT_SPILL_RETENTION, wall);
+        let _ = SpillLedger::default().adopt(taken);
+        assert!(
+            in_progress.exists(),
+            "a running daemon's inventory in progress must be left alone"
+        );
+        assert!(!left_behind.exists(), "an ended run's stale one is removed");
+        drop(running);
     }
 
     /// PR #1735 sixth review (B2-04): the inventory is replaced whole beside a
