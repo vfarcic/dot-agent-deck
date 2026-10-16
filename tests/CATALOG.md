@@ -7941,7 +7941,7 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 
 #### inbox/receipt
 
-The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.1 §3, §5): the daemon's locked instance namespace under `<state_dir>/inbox-spool`, trusted one-component-at-a-time traversal, immutable stage records, bounded resumable scans and the cap-based evidence store, plus `platform::lock::try_lock_file`. In this slice the spool sits beside the current ack: records are published and read, nothing is pruned and no suppression decision is drawn from them, and nothing in the daemon calls it yet.
+The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the daemon's locked instance namespace under `<state_dir>/inbox-spool`, trusted one-component-at-a-time traversal from the state-directory anchor, immutable `Handed`/`Committed` bearer records, bounded resumable scans streamed to the cap-based evidence store, the exact lookup before absence, and the resumable sibling reaper, plus `platform::lock::try_lock_file`. It is library-only: nothing in the daemon calls it yet, records are published and read, nothing is pruned and no suppression decision is drawn from them.
 
 ##### inbox/receipt/001 — A non-blocking file lock refuses a held lock without waiting.
 - **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
@@ -7954,57 +7954,106 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.1 §3, §5): the 
 - **Layer:** L1 unit (src/inbox_receipt.rs), tempdir state directory, eight threads.
 - **Agent:** none.
 - **Asserts:** eight spools started at once on one state directory all keep their instance directory and lock file and can publish; after three are stopped, a ninth start removes exactly those three instances and their lock files, leaves every live one, and skips an instance directory that has no lock file.
-- **Does not assert:** two daemon processes (threads hold separate lock handles, which is the same contention); a reap interrupted by its entry budget.
+- **Does not assert:** two daemon processes (threads hold separate lock handles, which is the same contention); a reap interrupted by its entry budget (inbox/receipt/014).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/receipt/003 — FIFO, symlink and directory entries are skipped unopened.
 - **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
 - **Agent:** none.
-- **Asserts:** beside one genuine record, a FIFO, a symlink to a valid record body outside the spool and a directory, all named like records, do not block the scan, are not returned, are not followed and are left in place.
+- **Asserts:** beside one genuine record, a FIFO, a symlink to a record body outside the spool that carries a genuinely issued cap, and a directory, all named like records, do not block the scan, are not admitted, are not followed and are left in place; only the genuine record is admitted.
 - **Does not assert:** Windows reparse points other than what `symlink_metadata` reports.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/receipt/004 — A record temp is owner-only before any byte.
 - **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
 - **Agent:** none.
-- **Asserts:** the temp a record is written through is empty and already mode 0600 on Unix; on Windows it is owned by the current user, its owner-only DACL having been set on the handle before any write.
-- **Does not assert:** the Windows DACL's contents (only its owner is read back).
+- **Asserts:** the temp a record is written through is empty and already mode 0600 on Unix; on Windows its stored DACL, read back from the kernel, is protected and holds one allow ACE, for the current user, before any write.
+- **Does not assert:** the ordering inside one Windows open (the DACL is applied on the handle immediately after creation, so an empty file briefly exists under the inherited ACL).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/receipt/005 — An intermediate symlink is refused, not followed.
 - **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
 - **Agent:** none.
-- **Asserts:** a generation's `rec` directory, a pane directory or the spool root replaced by a symlink to a decoy directory makes opening the generation (daemon and component side) or starting the spool fail with permission denied; a handle anchored before the swap writes nothing into the decoy, and every decoy stays empty.
-- **Does not assert:** Windows junctions (the Windows traversal refuses reparse points by attribute, not exercised here).
+- **Asserts:** a generation's `rec` directory, a pane directory or the spool root replaced by a symlink to a decoy directory makes opening the generation (daemon and component side) or starting the spool fail with permission denied; `GenerationSpool::open` refuses an instance replaced by a symlink and a spool root that is a symlink above an owner-only instance tree, and refuses a relative pinned path as invalid input; every decoy stays empty; a generation handle anchored before its `rec` is renamed aside and replaced by a symlink still publishes successfully into the renamed directory.
+- **Does not assert:** Windows junctions (inbox/receipt/016 covers the Windows hold); ancestors of the state-directory anchor, which are trusted as the OS resolves them.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/receipt/006 — An unsafe pre-existing root is refused, not repaired.
 - **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
 - **Agent:** none.
-- **Asserts:** a pre-existing spool root at mode 0777 or 0750 makes the start fail with permission denied and keeps its mode; at 0700 it is used; a pane directory made group-readable is refused the same way.
+- **Asserts:** a pre-existing spool root at mode 0777 or 0750 makes the start fail with permission denied and keeps its mode; at 0700 it is used; a pane directory made group-readable is refused the same way; an instance made group-readable is refused by `GenerationSpool::open` and keeps its mode, and opens once owner-only again.
 - **Does not assert:** a directory owned by another user (needs a second account).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/receipt/007 — A bounded scan resumes and is never read as absence.
 - **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
 - **Agent:** none.
-- **Asserts:** with 3,000 unrecognised entries and one record, no pass examines more than 2,048 entries; a record never published reads unknown while the scan is incomplete and absent only once a pass completes it, when the genuine record reads found.
+- **Asserts:** with 3,000 unrecognised entries and one record, no pass examines more than 2,048 entries; an issued attempt that never published reads unknown while the cycle is incomplete and absent only once a pass completes it, when the genuine record reads found and is admitted.
 - **Does not assert:** a scan run off the executor (the daemon does not call it yet).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/receipt/008 — Record bytes, temps and mismatches are bounded.
+##### inbox/receipt/008 — Record bytes and mismatches are bounded.
 - **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
 - **Agent:** none.
-- **Asserts:** 300 near-4 KiB records take more than one pass, split by the 1 MiB byte bound rather than the entry bound, and all 300 are returned; an oversized record file and one whose body names another message are removed and never returned; a fresh temp is kept; temps more than a minute old are removed only when a later pass sees them again, at most 256 per pass.
-- **Does not assert:** a publisher racing the removal of its own temp (fresh temps are never removed).
+- **Asserts:** 300 near-4 KiB records whose caps nobody issued take more than one pass, split by the 1 MiB byte bound rather than the entry bound, no pass reads more than 1 MiB, and all 300 are refused admission; an oversized record file and one whose body names another message are removed; a temp survives several complete cycles.
+- **Does not assert:** a publisher paused between write and link (inbox/receipt/011).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/receipt/009 — Records are admitted on their own stage's cap and never pruned.
 - **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
 - **Agent:** none.
-- **Asserts:** each attempt's caps file is found by its exact attempt, not the newest; publishing a record twice is refused; genuine handed and committed records are admitted once and then answer duplicate; a commit on the hand-out cap, a never-issued attempt and a random cap are refused; a revoke marker names only its attempt; after scanning and admitting, both record files are still there.
+- **Asserts:** each attempt's caps file is found by its exact attempt, not the newest; publishing a record twice is refused; genuine handed and committed records are admitted by the first cycle and by no later one; a commit on the hand-out cap, a never-issued attempt and a random cap are refused; a revoke marker names only its attempt; after scanning and admitting, both record files are still there.
 - **Does not assert:** caps kept out of frames, hook output or `inbox fetch --json` (no hand-out writes caps yet).
 - **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/010 — A record linked behind the scan cursor is found by the exact lookup.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** after a scan cycle completes over an empty generation, a genuine commit record linked afterwards (as a publisher racing a scan does behind its cursor) was never seen by the scan, yet `presence` finds and admits it through an exact lookup of the attempt's two record names, so it never reads absent; an attempt that never published reads absent.
+- **Does not assert:** a lapse driven by it (the model and the spool are not wired together yet).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/011 — A publisher paused between write and link still publishes.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** a record temp written and aged ten minutes, and an aged caps temp, survive three complete scan cycles; the paused publisher's link then succeeds and the next scan admits its record.
+- **Does not assert:** reclamation of temps under a dead instance's lock (inbox/receipt/014 removes whole dead instances).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/012 — Scan errors never certify absence.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir, injected faults.
+- **Agent:** none.
+- **Asserts:** an injected enumeration error (`EILSEQ` on Unix), a failed rewind and a record read failing after 10 bytes each keep their cycle from completing; the errored entry and the failed read's bytes are charged to the pass; an attempt that never published reads unknown rather than absent after each; the scanner reports itself degraded from the first error on; a later clean cycle completes and the attempt then reads absent.
+- **Does not assert:** a real `readdir` errno or a real Windows per-entry error (both injected at the scanner's IO seam; the errno handling in the Unix iterator is not exercised by a filesystem fault).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/013 — Growing files and forged records stay within bounds.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir, injected hook.
+- **Agent:** none.
+- **Asserts:** 600 empty record-named files that each grow to 4,097 bytes between the scanner's stat and its read take several passes, none reading more than 1 MiB, and are all removed as oversized; across 64 complete cycles each over 32 fresh forged records nobody issued, all 2,048 are refused, every cycle ends with nothing carried over, and the evidence store holds only the one issued attempt and its admitted record.
+- **Does not assert:** process memory (the scanner keeps no per-record collection; what is pinned is the store's size and the cursor).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/014 — A dead spool over the reap budget is reaped across starts.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** a stopped spool holding 2,548 files (on Linux one with a non-UTF-8 name) loses entries at every later start while its lock file stays, and is gone with its lock file after a few starts; a second, small stopped spool is reaped too; a pending lock file nobody holds is removed under its own lock, and one still held is left alone; every live spool survives.
+- **Does not assert:** an entry the reaper cannot remove (it is left in place and the rest still go).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/015 — A retired receiver cannot release an attempt through the spool.
+- **Layer:** L1 unit (src/inbox_receipt.rs with src/inbox_attempts.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** after a Pi context is retired and its attempt is rebound by a retained resume, `not_handed` and `handed_inert` records the old incarnation writes with the attempt's genuine hand-out cap are neither admitted nor refused as records (the spool carries only `Handed` and `Committed`), so nothing reaches the model, and the attempt stays bound to the new incarnation with the message attempting.
+- **Does not assert:** the control path those answers do travel on (inbox/attempts/008 pins that a retired incarnation's direct release is refused).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/016 — Windows spool directories are owner-only and held against replacement.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** the stored DACL of the spool root, the instance and every generation directory is protected with one allow ACE for the current user; a spool root pre-created under the temp directory's inherited ACL is refused and its DACL is unchanged; renaming a held generation's `rec` aside (the first step of a junction swap) fails while the generation is open and succeeds once it is dropped, and a publish in between lands in the original directory.
+- **Does not assert:** creating a junction (renaming or deleting the held directory is the step a swap needs, and that is what fails); ancestors of the state-directory anchor.
+- **Platform coverage:** windows only (runs on the `build-windows` CI job, never on a Linux or macOS host).
 
 #### Protocol and waiter lifecycle
 

@@ -1,17 +1,25 @@
-//! PRD #1666 design v3.1 §3 and §5: the receipt spool, its trusted traversal
+//! PRD #1666 design v3.2 §3 and §5: the receipt spool, its trusted traversal
 //! and bounded scans, and the suppression-evidence store.
 //!
 //! A receiver component publishes an immutable stage record for a delivery
 //! attempt (`<msg>.<A>.<e>.<stage>`) into its agent generation's spool before
-//! the daemon is asked anything, and the daemon reads it back. **In this slice
-//! the spool sits beside the current ack** (§13 step 3): records are published
-//! and read, nothing is pruned, and no suppression decision is drawn from them.
+//! the daemon is asked anything, and the daemon reads it back. **This module is
+//! library-only** (§13 step 3): nothing in the daemon calls it yet, records are
+//! published and read, nothing is pruned, and no suppression decision is drawn
+//! from them.
+//!
+//! A spool record is bearer evidence: whoever holds an attempt's cap can
+//! publish it. So it carries only the stages whose meaning holds whoever bears
+//! the cap, `Handed` and `Committed`. `NotHanded`, `HandedInert` and revoke
+//! answers release or close an attempt for one receiver, so they travel only
+//! on the authenticated current-incarnation control path, where a retired
+//! receiver is refused.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,14 +31,24 @@ pub const SPOOL_DIR_NAME: &str = "inbox-spool";
 pub const ENV_INBOX_SPOOL: &str = "DOT_AGENT_DECK_INBOX_SPOOL";
 /// A record's largest body.
 pub const MAX_RECORD_BYTES: u64 = 4096;
-/// Directory entries one scan pass examines.
+/// Directory entries one scan pass examines, and entries one sibling reap
+/// visits.
 pub const SCAN_MAX_ENTRIES: usize = 2048;
 /// Record bytes one scan pass reads.
 pub const SCAN_MAX_BYTES: u64 = 1024 * 1024;
-/// Abandoned temps one scan pass removes.
-pub const SCAN_MAX_TEMPS: usize = 256;
-/// How old a temp must be, seen on a later pass, before it is removed.
-pub const TEMP_MIN_AGE: Duration = Duration::from_secs(60);
+
+/// What one record read may consume: a whole record plus the byte that proves
+/// a file oversized. A pass opens a record only while this much budget is left,
+/// so no read can take it past [`SCAN_MAX_BYTES`].
+const READ_RESERVE: u64 = MAX_RECORD_BYTES + 1;
+/// Names one sibling reap lists in the spool root.
+const ROOT_LIST_MAX: usize = 4 * SCAN_MAX_ENTRIES;
+/// How deep below an instance a reap descends: pane, agent, `rec`/`caps`/
+/// `revoked`.
+const REAP_DEPTH: usize = 3;
+/// New instances one start mints before giving up, when a reaper took the
+/// pending lock of the one before.
+const START_ATTEMPTS: usize = 4;
 
 const TEMP_PREFIX: &str = ".tmp-";
 const PENDING_LOCK_PREFIX: &str = ".pending-";
@@ -45,14 +63,13 @@ pub fn valid_component(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// The stage a record states (§2).
+/// The stage a spool record states: only the two whose evidence holds whoever
+/// bears the cap (module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordStage {
     Handed,
     Committed,
-    NotHanded,
-    HandedInert,
 }
 
 impl RecordStage {
@@ -60,8 +77,6 @@ impl RecordStage {
         match self {
             RecordStage::Handed => "handed",
             RecordStage::Committed => "committed",
-            RecordStage::NotHanded => "not_handed",
-            RecordStage::HandedInert => "handed_inert",
         }
     }
 
@@ -69,14 +84,12 @@ impl RecordStage {
         Some(match s {
             "handed" => RecordStage::Handed,
             "committed" => RecordStage::Committed,
-            "not_handed" => RecordStage::NotHanded,
-            "handed_inert" => RecordStage::HandedInert,
             _ => return None,
         })
     }
 
-    /// `Committed` is proven by the commit cap; every other stage by the
-    /// hand-out cap, so a `Handed` cap can never become a commit (§5).
+    /// `Committed` is proven by the commit cap, `Handed` by the hand-out cap,
+    /// so a hand-out cap can never become a commit (§5).
     fn needs_commit_cap(self) -> bool {
         self == RecordStage::Committed
     }
@@ -178,8 +191,20 @@ fn random_hex(len: usize) -> io::Result<String> {
     Ok(hex(&bytes))
 }
 
+fn random_index(len: usize) -> usize {
+    let mut bytes = [0u8; 8];
+    if len == 0 || getrandom::fill(&mut bytes).is_err() {
+        return 0;
+    }
+    (u64::from_le_bytes(bytes) % len as u64) as usize
+}
+
 fn refused(what: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, what.to_string())
+}
+
+fn invalid(what: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, what.to_string())
 }
 
 fn lock_name(instance: &str) -> String {
@@ -195,10 +220,7 @@ fn is_instance(name: &str) -> bool {
 
 fn attempt_name(msg: &str, a: u32, e: u32) -> io::Result<String> {
     if !valid_component(msg) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a message id must be one spool path component",
-        ));
+        return Err(invalid("a message id must be one spool path component"));
     }
     Ok(format!("{msg}.{a}.{e}"))
 }
@@ -215,39 +237,42 @@ pub struct Spool {
 
 impl Spool {
     /// Create or open `<state_dir>/inbox-spool`, mint and lock this run's
-    /// instance, and reap every sibling instance no running daemon holds.
+    /// instance, and reap sibling instances no running daemon holds.
     ///
-    /// The root and every directory below it are opened one component at a
-    /// time and verified: a symlink is refused rather than followed, and a
+    /// `state_dir` is the trust anchor: an absolute path to a directory owned
+    /// by this user, whose ancestors are trusted as the OS resolves them. The
+    /// root and every directory below it are opened one component at a time
+    /// and verified: a symlink is refused rather than followed, and a
     /// pre-existing directory open to other users is refused rather than
-    /// repaired. The lock file is locked under a temporary name and only then
+    /// repaired. The lock file is locked under a pending name and only then
     /// renamed into place, so a reaper never sees an instance's lock free
     /// while its daemon runs; an instance directory with no lock file is
     /// never reaped.
     pub fn start(state_dir: &Path) -> io::Result<Spool> {
-        let anchor = fsdir::TrustedDir::anchor(state_dir)?;
-        let root = anchor.child(SPOOL_DIR_NAME, true)?;
-        let instance = random_hex(16)?;
-        let pending = format!("{PENDING_LOCK_PREFIX}{instance}");
-        let lock = root.create_new_owner_only(&pending)?;
-        if !crate::platform::lock::try_lock_file(&lock)? {
-            let _ = root.remove_file(&pending);
-            return Err(io::Error::other(
-                "could not lock a new inbox spool instance",
+        if !state_dir.is_absolute() {
+            return Err(invalid(
+                "the inbox spool's state directory must be absolute",
             ));
         }
-        if let Err(error) = root.rename(&pending, &lock_name(&instance)) {
-            let _ = root.remove_file(&pending);
-            return Err(error);
+        let anchor = fsdir::TrustedDir::anchor(state_dir)?;
+        let root = anchor.child(SPOOL_DIR_NAME, true)?;
+        let mut last = None;
+        for _ in 0..START_ATTEMPTS {
+            match mint(&root) {
+                Ok((instance, lock)) => {
+                    let dir = root.child(&instance, true)?;
+                    reap_siblings(&root, &instance);
+                    return Ok(Spool {
+                        root_path: state_dir.join(SPOOL_DIR_NAME),
+                        instance,
+                        dir,
+                        _lock: lock,
+                    });
+                }
+                Err(error) => last = Some(error),
+            }
         }
-        let dir = root.child(&instance, true)?;
-        reap_siblings(&root, &instance);
-        Ok(Spool {
-            root_path: state_dir.join(SPOOL_DIR_NAME),
-            instance,
-            dir,
-            _lock: lock,
-        })
+        Err(last.unwrap_or_else(|| io::Error::other("could not start an inbox spool")))
     }
 
     pub fn instance(&self) -> &str {
@@ -265,84 +290,149 @@ impl Spool {
     }
 }
 
-/// Reap every sibling instance whose lock no running daemon holds: try-lock
-/// its lock file and keep holding it while the instance directory is removed,
-/// unlinking the lock file last. A busy lock is skipped, and so is a
-/// directory with no lock file. A reap that runs out of its entry budget keeps
-/// the lock file, so the next start resumes it.
+/// Mint an instance and lock it under its pending name, then rename the lock
+/// into place. A reaper that took the pending lock first makes the lock or
+/// the rename fail, and the caller mints another.
+fn mint(root: &fsdir::TrustedDir) -> io::Result<(String, File)> {
+    let instance = random_hex(16)?;
+    let pending = format!("{PENDING_LOCK_PREFIX}{instance}");
+    let lock = root.create_new_owner_only(&pending)?;
+    if !crate::platform::lock::try_lock_file(&lock)? {
+        let _ = root.remove_file(&pending);
+        return Err(io::Error::other(
+            "could not lock a new inbox spool instance",
+        ));
+    }
+    if let Err(error) = root.rename(&pending, &lock_name(&instance)) {
+        let _ = root.remove_file(&pending);
+        return Err(error);
+    }
+    Ok((instance, lock))
+}
+
+/// A sibling the reaper may claim.
+enum Sibling {
+    /// `<instance>.lock`: the instance directory is reaped under its lock.
+    Instance(String),
+    /// `.pending-<instance>`: a start that died before its rename.
+    Pending(String),
+}
+
+impl Sibling {
+    fn of(name: &OsStr, own: &str) -> Option<Sibling> {
+        let name = name.to_str()?;
+        if let Some(stem) = name.strip_suffix(LOCK_SUFFIX) {
+            return (stem != own && is_instance(stem)).then(|| Sibling::Instance(stem.into()));
+        }
+        let stem = name.strip_prefix(PENDING_LOCK_PREFIX)?;
+        (stem != own && is_instance(stem)).then(|| Sibling::Pending(name.into()))
+    }
+}
+
+/// Reap sibling instances no running daemon holds, within one shared budget
+/// of [`SCAN_MAX_ENTRIES`] entries: try-lock each lock file and keep holding
+/// it while its instance is removed, unlinking the lock file last; a busy
+/// lock, or a directory with no lock file, is skipped. A pending lock a start
+/// left behind is removed under its own lock, never by age. Removal deletes
+/// as it enumerates, so a reap cut short by the budget still makes progress
+/// and keeps the lock file for the next start. Siblings are visited from a
+/// random rotation, so a large one cannot starve the ones listed after it.
 fn reap_siblings(root: &fsdir::TrustedDir, own: &str) {
     let Ok(mut stream) = root.stream() else {
         return;
     };
-    let mut stems = Vec::new();
-    for _ in 0..SCAN_MAX_ENTRIES {
-        let Some(name) = stream.next_name() else {
-            break;
-        };
-        if let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(LOCK_SUFFIX))
-            && stem != own
-            && is_instance(stem)
-        {
-            stems.push(stem.to_string());
+    let mut siblings = Vec::new();
+    for _ in 0..ROOT_LIST_MAX {
+        match stream.next_name() {
+            None => break,
+            Some(Err(_)) => continue,
+            Some(Ok(name)) => siblings.extend(Sibling::of(&name, own)),
         }
     }
     drop(stream);
+    let start = random_index(siblings.len());
+    siblings.rotate_left(start);
     let mut budget = SCAN_MAX_ENTRIES;
-    for stem in stems {
-        let name = lock_name(&stem);
-        let Ok(lock) = root.open_regular(&name) else {
-            continue;
-        };
-        if !matches!(crate::platform::lock::try_lock_file(&lock), Ok(true)) {
-            continue;
+    for sibling in siblings {
+        if budget == 0 {
+            break;
         }
-        if let Ok(true) = remove_tree(root, &stem, 0, &mut budget) {
-            let _ = root.remove_file(&name);
+        match sibling {
+            Sibling::Instance(stem) => {
+                let name = lock_name(&stem);
+                let Ok(lock) = root.open_regular(&name) else {
+                    continue;
+                };
+                if !matches!(crate::platform::lock::try_lock_file(&lock), Ok(true)) {
+                    continue;
+                }
+                if let Ok(true) = remove_tree(root, OsStr::new(&stem), 0, &mut budget) {
+                    let _ = root.remove_file(&name);
+                }
+                drop(lock);
+            }
+            Sibling::Pending(name) => {
+                budget -= 1;
+                let Ok(lock) = root.open_regular(&name) else {
+                    continue;
+                };
+                if matches!(crate::platform::lock::try_lock_file(&lock), Ok(true)) {
+                    let _ = root.remove_file(&name);
+                }
+                drop(lock);
+            }
         }
-        drop(lock);
     }
 }
 
-/// Remove `parent/name` and everything below it without following a link:
-/// `Ok(false)` when the entry budget ran out first.
+/// Remove `parent/name` and everything below it without following a link,
+/// charging every entry it visits to `budget`. It deletes as it enumerates,
+/// so a reap cut short still leaves less behind; an entry it cannot remove is
+/// left in place while the others are still removed. `Ok(true)` once the
+/// directory is gone.
 fn remove_tree(
     parent: &fsdir::TrustedDir,
-    name: &str,
+    name: &OsStr,
     depth: usize,
     budget: &mut usize,
 ) -> io::Result<bool> {
-    let dir = match parent.child(name, false) {
-        Ok(dir) => dir,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(error),
-    };
-    let mut stream = dir.stream()?;
-    let mut names = Vec::new();
-    while let Some(entry) = stream.next_name() {
-        if *budget == 0 {
-            return Ok(false);
-        }
-        *budget -= 1;
-        let Some(entry) = entry.to_str() else {
-            return Ok(false);
+    loop {
+        let dir = match parent.child_for_removal(name) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
         };
-        names.push(entry.to_string());
-    }
-    drop(stream);
-    for entry in names {
-        match dir.entry(&entry)?.kind {
-            fsdir::EntryKind::Dir if depth < 3 => {
-                if !remove_tree(&dir, &entry, depth + 1, budget)? {
-                    return Ok(false);
-                }
+        let mut removed_any = false;
+        let mut stream = dir.stream()?;
+        while let Some(entry) = stream.next_name() {
+            if *budget == 0 {
+                return Ok(false);
             }
-            fsdir::EntryKind::Dir => return Ok(false),
-            _ => dir.remove_file(&entry)?,
+            *budget -= 1;
+            let entry = entry?;
+            match dir.entry(&entry) {
+                Ok(info) if info.kind == fsdir::EntryKind::Dir => {
+                    if depth < REAP_DEPTH && remove_tree(&dir, &entry, depth + 1, budget)? {
+                        removed_any = true;
+                    } else if *budget == 0 {
+                        return Ok(false);
+                    }
+                }
+                Ok(_) => removed_any |= dir.remove_file(&entry).is_ok(),
+                Err(_) => {}
+            }
+        }
+        drop(stream);
+        drop(dir);
+        match parent.remove_dir(name) {
+            Ok(()) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            // Entries deleted while enumerating can make a stream skip some on
+            // a few filesystems; go round again while that still deletes.
+            Err(_) if removed_any && *budget > 0 => continue,
+            Err(_) => return Ok(false),
         }
     }
-    drop(dir);
-    parent.remove_dir(name)?;
-    Ok(true)
 }
 
 /// One agent generation's `rec`, `caps` and `revoked` directories, each an
@@ -356,9 +446,33 @@ pub struct GenerationSpool {
 
 impl GenerationSpool {
     /// A component's side: open an existing generation spool under the
-    /// pinned instance path, creating nothing.
+    /// absolute pinned `<state-dir>/inbox-spool/<instance>` path, creating
+    /// nothing. The walk starts again from the state directory, the trust
+    /// anchor, and verifies the root and the instance one component at a time
+    /// exactly as the daemon does, so a symlink or a wider mode at either is
+    /// refused rather than followed.
     pub fn open(instance_path: &Path, pane: &str, agent: &str) -> io::Result<GenerationSpool> {
-        let base = fsdir::TrustedDir::anchor(instance_path)?;
+        let shown = instance_path.display();
+        if !instance_path.is_absolute() {
+            return Err(invalid(format!(
+                "{shown}: the pinned spool path must be absolute"
+            )));
+        }
+        let instance = instance_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .filter(|name| is_instance(name))
+            .ok_or_else(|| invalid(format!("{shown} does not name a spool instance")))?;
+        let root = instance_path
+            .parent()
+            .filter(|root| root.file_name() == Some(OsStr::new(SPOOL_DIR_NAME)))
+            .ok_or_else(|| invalid(format!("{shown} is not under an {SPOOL_DIR_NAME} root")))?;
+        let state = root
+            .parent()
+            .ok_or_else(|| invalid(format!("{shown} has no state directory")))?;
+        let base = fsdir::TrustedDir::anchor(state)?
+            .child(SPOOL_DIR_NAME, false)?
+            .child(instance, false)?;
         GenerationSpool::at(&base, pane, agent, false)
     }
 
@@ -388,10 +502,7 @@ impl GenerationSpool {
     /// linked to its final name (refused when that exists), temp removed.
     pub fn publish(&self, key: &RecordKey, cap: &Cap) -> io::Result<()> {
         if !valid_component(&key.msg) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a message id must be one spool path component",
-            ));
+            return Err(invalid("a message id must be one spool path component"));
         }
         let body = serde_json::to_vec(&RecordBody {
             msg: key.msg.clone(),
@@ -451,9 +562,11 @@ impl GenerationSpool {
             rec: self.rec.try_clone()?,
             stream: None,
             carry: None,
-            found: BTreeMap::new(),
+            ended: false,
+            errored: false,
             complete: false,
-            sighted: BTreeSet::new(),
+            degraded: None,
+            faults: Faults::default(),
         })
     }
 }
@@ -462,10 +575,7 @@ impl GenerationSpool {
 /// must not exist yet; the temp is removed either way.
 fn write_linked(dir: &fsdir::TrustedDir, name: &str, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a spool record is at most 4 KiB",
-        ));
+        return Err(invalid("a spool record is at most 4 KiB"));
     }
     let temp = format!("{TEMP_PREFIX}{}", random_hex(8)?);
     let mut file = dir.create_new_owner_only(&temp)?;
@@ -476,167 +586,380 @@ fn write_linked(dir: &fsdir::TrustedDir, name: &str, bytes: &[u8]) -> io::Result
     linked
 }
 
-/// One scan pass's result. An incomplete pass is never absence.
+/// One scan pass's result. Only an error-free cycle that reached the end of
+/// the directory is complete, and nothing short of that is absence.
 #[derive(Debug, Default)]
 pub struct ScanPass {
-    pub records: Vec<RecordBody>,
+    /// Records this pass admitted for the first time.
+    pub admitted: Vec<RecordKey>,
+    /// Well-formed records the evidence store refused (never issued, or the
+    /// wrong cap).
+    pub refused: usize,
+    /// This pass reached the end of the directory, ending the cycle.
+    pub ended: bool,
+    /// It ended a cycle that met no error.
     pub complete: bool,
-    /// Entries this pass examined.
+    /// Entries this pass examined, failed ones included.
     pub examined: usize,
-    /// Invalid record files and aged temps this pass removed.
+    /// Record bytes this pass consumed, failed reads included.
+    pub bytes: u64,
+    /// Invalid record files this pass removed.
     pub removed: usize,
+    /// The first error this pass met.
+    pub error: Option<String>,
 }
 
-/// Whether a record is known to be in the spool.
+/// Whether an attempt's receipt is known to be in the spool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presence {
     Found,
-    /// The latest complete scan did not find it.
+    /// The latest cycle completed without error and an exact lookup of the
+    /// attempt's record names found neither.
     Absent,
-    /// No complete scan has answered since the current one began.
+    /// Neither can be said yet.
     Unknown,
 }
 
-/// Reads a generation's records in passes bounded by [`SCAN_MAX_ENTRIES`],
-/// [`SCAN_MAX_BYTES`] and [`SCAN_MAX_TEMPS`], resuming where the last pass
-/// stopped.
+/// What reading one record-named file found.
+enum Fetched {
+    Body(RecordBody),
+    /// Oversized, unparseable or naming another record: never a receipt.
+    Invalid,
+    /// Not a regular file: never opened.
+    NotRegular,
+    Missing,
+}
+
+/// Read the record-named file `name` of `dir`, never following a link and
+/// never opening a non-regular file, through at most [`READ_RESERVE`] bytes.
+/// Bytes it consumed are added to `consumed` even when the read fails.
+fn fetch(
+    dir: &fsdir::TrustedDir,
+    name: &str,
+    key: &RecordKey,
+    consumed: &mut u64,
+    faults: &mut Faults,
+) -> io::Result<Fetched> {
+    let info = match dir.entry(name) {
+        Ok(info) => info,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Fetched::Missing),
+        Err(error) => return Err(error),
+    };
+    if info.kind != fsdir::EntryKind::File {
+        return Ok(Fetched::NotRegular);
+    }
+    if info.len > MAX_RECORD_BYTES {
+        return Ok(Fetched::Invalid);
+    }
+    faults.before_open(name);
+    let file = dir.open_regular(name)?;
+    let mut buf = Vec::new();
+    let read = faults.read_to_end(file.take(READ_RESERVE), &mut buf);
+    *consumed += buf.len() as u64;
+    read?;
+    if buf.len() as u64 > MAX_RECORD_BYTES {
+        return Ok(Fetched::Invalid);
+    }
+    match serde_json::from_slice::<RecordBody>(&buf) {
+        Ok(body) if body.key() == *key => Ok(Fetched::Body(body)),
+        _ => Ok(Fetched::Invalid),
+    }
+}
+
+/// Reads a generation's records in passes bounded by [`SCAN_MAX_ENTRIES`]
+/// and [`SCAN_MAX_BYTES`], resuming where the last pass stopped, and streams
+/// each one to the evidence store: it keeps no record, body or name of its
+/// own between passes beyond the one record a byte-bounded pass defers.
 ///
 /// Entries that are not regular files (a FIFO, a symlink, a directory) are
 /// skipped without being opened; a regular file is opened without following a
 /// link and without blocking. A record-named file larger than
-/// [`MAX_RECORD_BYTES`], or whose body does not match its name, is removed; a
-/// temp is removed once a later pass sees it again more than [`TEMP_MIN_AGE`]
-/// old; any other name is left alone. A valid record is never removed.
+/// [`MAX_RECORD_BYTES`], or whose body does not match its name, is removed;
+/// temps and any other name are left alone, so a publisher paused between
+/// write and link still links. A valid record is never removed.
+///
+/// An enumeration error, a failed rewind, or a failed stat, open or read of a
+/// record-named file is charged to the pass, keeps the cycle from completing
+/// and marks the scanner degraded, sticky for its life.
 #[derive(Debug)]
 pub struct RecordScanner {
     rec: fsdir::TrustedDir,
     stream: Option<fsdir::DirStream>,
+    /// A record name a byte-bounded pass left for the next one.
     carry: Option<String>,
-    found: BTreeMap<RecordKey, RecordBody>,
+    /// The current cycle reached the end of the directory.
+    ended: bool,
+    /// The current cycle met an error.
+    errored: bool,
+    /// The latest cycle ended without error and no new one has begun.
     complete: bool,
-    sighted: BTreeSet<String>,
+    degraded: Option<String>,
+    faults: Faults,
 }
 
 impl RecordScanner {
-    pub fn pass(&mut self) -> io::Result<ScanPass> {
+    pub fn pass(&mut self, store: &mut EvidenceStore) -> ScanPass {
         let mut pass = ScanPass::default();
-        if self.complete {
-            if let Some(stream) = self.stream.as_mut() {
-                stream.rewind();
-            }
+        if self.ended {
+            self.ended = false;
+            self.errored = false;
             self.complete = false;
+            if let Some(stream) = self.stream.as_mut() {
+                let rewound = match self.faults.rewind() {
+                    Some(error) => Err(error),
+                    None => stream.rewind(),
+                };
+                if let Err(error) = rewound {
+                    self.stream = None;
+                    self.fail(&mut pass, error);
+                    return pass;
+                }
+            }
         }
         if self.stream.is_none() {
-            self.stream = Some(self.rec.stream()?);
-        }
-        let mut bytes = 0u64;
-        let mut temps_removed = 0usize;
-        loop {
-            if pass.examined >= SCAN_MAX_ENTRIES {
-                return Ok(pass);
+            match self.rec.stream() {
+                Ok(stream) => self.stream = Some(stream),
+                Err(error) => {
+                    self.fail(&mut pass, error);
+                    return pass;
+                }
             }
+        }
+        while pass.examined < SCAN_MAX_ENTRIES {
             let name = match self.carry.take() {
                 Some(name) => name,
                 None => {
-                    let Some(stream) = self.stream.as_mut() else {
-                        return Ok(pass);
+                    let next = match self.faults.enumerate() {
+                        Some(error) => Some(Err(error)),
+                        None => self.stream.as_mut().and_then(|s| s.next_name()),
                     };
-                    match stream.next_name() {
-                        Some(name) => match name.into_string() {
+                    match next {
+                        None => {
+                            self.ended = true;
+                            self.complete = !self.errored;
+                            pass.ended = true;
+                            pass.complete = self.complete;
+                            break;
+                        }
+                        Some(Err(error)) => {
+                            pass.examined += 1;
+                            self.fail(&mut pass, error);
+                            continue;
+                        }
+                        Some(Ok(name)) => match name.into_string() {
                             Ok(name) => name,
                             Err(_) => {
                                 pass.examined += 1;
                                 continue;
                             }
                         },
-                        None => {
-                            self.complete = true;
-                            pass.complete = true;
-                            return Ok(pass);
-                        }
                     }
                 }
             };
-            if name.starts_with(TEMP_PREFIX) {
-                pass.examined += 1;
-                let Ok(info) = self.rec.entry(&name) else {
-                    continue;
-                };
-                let aged = info
-                    .modified
-                    .and_then(|at| std::time::SystemTime::now().duration_since(at).ok())
-                    .is_some_and(|age| age >= TEMP_MIN_AGE);
-                if self.sighted.contains(&name) && aged && temps_removed < SCAN_MAX_TEMPS {
-                    if info.kind == fsdir::EntryKind::File && self.rec.remove_file(&name).is_ok() {
-                        temps_removed += 1;
-                        pass.removed += 1;
-                    }
-                    self.sighted.remove(&name);
-                } else {
-                    self.sighted.insert(name);
-                }
-                continue;
-            }
             let Some(key) = RecordKey::parse(&name) else {
                 pass.examined += 1;
                 continue;
             };
-            let Ok(info) = self.rec.entry(&name) else {
-                pass.examined += 1;
-                continue;
-            };
-            if info.kind != fsdir::EntryKind::File {
-                pass.examined += 1;
-                continue;
-            }
-            if info.len > MAX_RECORD_BYTES {
-                pass.examined += 1;
-                if self.rec.remove_file(&name).is_ok() {
-                    pass.removed += 1;
-                }
-                continue;
-            }
-            if bytes > 0 && bytes + info.len > SCAN_MAX_BYTES {
+            if SCAN_MAX_BYTES.saturating_sub(pass.bytes) < READ_RESERVE {
                 self.carry = Some(name);
-                return Ok(pass);
+                break;
             }
             pass.examined += 1;
-            let Ok(file) = self.rec.open_regular(&name) else {
-                continue;
-            };
-            let mut buf = Vec::new();
-            if file
-                .take(MAX_RECORD_BYTES + 1)
-                .read_to_end(&mut buf)
-                .is_err()
-            {
-                continue;
-            }
-            bytes += buf.len() as u64;
-            match serde_json::from_slice::<RecordBody>(&buf) {
-                Ok(body) if buf.len() as u64 <= MAX_RECORD_BYTES && body.key() == key => {
-                    self.found.insert(key, body.clone());
-                    pass.records.push(body);
-                }
-                _ => {
+            match fetch(&self.rec, &name, &key, &mut pass.bytes, &mut self.faults) {
+                Ok(Fetched::Body(body)) => match store.admit(&body) {
+                    Admission::Admitted => pass.admitted.push(key),
+                    Admission::Duplicate => {}
+                    Admission::NotIssued | Admission::WrongCap => pass.refused += 1,
+                },
+                Ok(Fetched::Invalid) => {
                     if self.rec.remove_file(&name).is_ok() {
                         pass.removed += 1;
                     }
                 }
+                Ok(Fetched::NotRegular) => {}
+                Ok(Fetched::Missing) => self.fail(
+                    &mut pass,
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{name} vanished during a scan"),
+                    ),
+                ),
+                Err(error) => self.fail(&mut pass, error),
             }
+        }
+        pass
+    }
+
+    fn fail(&mut self, pass: &mut ScanPass, error: io::Error) {
+        self.errored = true;
+        self.complete = false;
+        let text = error.to_string();
+        if self.degraded.is_none() {
+            self.degraded = Some(text.clone());
+        }
+        pass.error.get_or_insert(text);
+    }
+
+    /// Whether the latest cycle ended without error and no new one has begun.
+    pub fn complete(&self) -> bool {
+        self.complete
+    }
+
+    /// The first spool error this scanner met, if any: the generation's
+    /// `receipts_degraded` reason (§3), sticky for the scanner's life.
+    pub fn degraded(&self) -> Option<&str> {
+        self.degraded.as_deref()
+    }
+
+    /// The point-in-time check before a lapse may treat `(msg, A, e)` as
+    /// receipt-less (§3): found when the store already admitted one of its
+    /// records or an exact anchored lookup of its two immutable names finds
+    /// one the store admits; absent only when the latest cycle completed
+    /// without error **and** that lookup finds neither name; unknown
+    /// otherwise. Directory enumeration is not a snapshot, so the lookup, not
+    /// the scan, is what sees a record linked behind the cursor.
+    pub fn presence(&mut self, store: &mut EvidenceStore, msg: &str, a: u32, e: u32) -> Presence {
+        if !valid_component(msg) {
+            return Presence::Unknown;
+        }
+        let mut unknown = !self.complete;
+        for stage in [RecordStage::Handed, RecordStage::Committed] {
+            let key = RecordKey {
+                msg: msg.to_string(),
+                a,
+                e,
+                stage,
+            };
+            if store.admitted(&key) {
+                return Presence::Found;
+            }
+            let mut consumed = 0;
+            match fetch(
+                &self.rec,
+                &key.file_name(),
+                &key,
+                &mut consumed,
+                &mut self.faults,
+            ) {
+                Ok(Fetched::Missing) => {}
+                Ok(Fetched::Body(body))
+                    if matches!(
+                        store.admit(&body),
+                        Admission::Admitted | Admission::Duplicate
+                    ) =>
+                {
+                    return Presence::Found;
+                }
+                Ok(_) => unknown = true,
+                Err(error) => {
+                    unknown = true;
+                    if self.degraded.is_none() {
+                        self.degraded = Some(error.to_string());
+                    }
+                }
+            }
+        }
+        if unknown {
+            Presence::Unknown
+        } else {
+            Presence::Absent
+        }
+    }
+}
+
+/// Test-only fault injection at the scanner's IO seams; empty and inert in
+/// every other build.
+#[derive(Default)]
+struct Faults {
+    /// Errors the next enumerations return, in order.
+    #[cfg(test)]
+    enumerate: std::collections::VecDeque<io::Error>,
+    /// The error the next rewind returns.
+    #[cfg(test)]
+    rewind: Option<io::Error>,
+    /// The next record read fails after this many bytes.
+    #[cfg(test)]
+    read_error_after: Option<usize>,
+    /// Called with a record's name between its stat and its open.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    before_open: Option<Box<dyn FnMut(&str) + Send>>,
+}
+
+impl std::fmt::Debug for Faults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Faults")
+    }
+}
+
+#[cfg(not(test))]
+impl Faults {
+    fn enumerate(&mut self) -> Option<io::Error> {
+        None
+    }
+
+    fn rewind(&mut self) -> Option<io::Error> {
+        None
+    }
+
+    fn before_open(&mut self, _name: &str) {}
+
+    fn read_to_end(&mut self, mut reader: impl Read, buf: &mut Vec<u8>) -> io::Result<usize> {
+        reader.read_to_end(buf)
+    }
+}
+
+#[cfg(test)]
+impl Faults {
+    fn enumerate(&mut self) -> Option<io::Error> {
+        self.enumerate.pop_front()
+    }
+
+    fn rewind(&mut self) -> Option<io::Error> {
+        self.rewind.take()
+    }
+
+    fn before_open(&mut self, name: &str) {
+        if let Some(hook) = self.before_open.as_mut() {
+            hook(name);
         }
     }
 
-    /// Records are immutable and never pruned, so one seen stays found; a
-    /// record not seen is absent only while the latest pass completed a scan.
-    pub fn presence(&self, key: &RecordKey) -> Presence {
-        if self.found.contains_key(key) {
-            Presence::Found
-        } else if self.complete {
-            Presence::Absent
-        } else {
-            Presence::Unknown
+    fn read_to_end(&mut self, reader: impl Read, buf: &mut Vec<u8>) -> io::Result<usize> {
+        match self.read_error_after.take() {
+            Some(left) => FailAfter {
+                inner: reader,
+                left,
+            }
+            .read_to_end(buf),
+            None => {
+                let mut reader = reader;
+                reader.read_to_end(buf)
+            }
         }
+    }
+}
+
+/// A reader that fails once `left` bytes have been read through it.
+#[cfg(test)]
+struct FailAfter<R> {
+    inner: R,
+    left: usize,
+}
+
+#[cfg(test)]
+impl<R: Read> Read for FailAfter<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.left == 0 {
+            return Err(io::Error::other("injected read failure"));
+        }
+        let n = buf.len().min(self.left);
+        let got = self.inner.read(&mut buf[..n])?;
+        if got == 0 {
+            return Err(io::Error::other("injected read failure"));
+        }
+        self.left -= got;
+        Ok(got)
     }
 }
 
@@ -656,8 +979,12 @@ struct IssuedCaps {
 }
 
 /// The daemon's per-generation suppression evidence (§7): the hashes of every
-/// issued attempt's caps and the records admitted on them. In this slice it
-/// only records; nothing is pruned and nothing is suppressed from it.
+/// issued attempt's caps and the records admitted on them. It holds keys only
+/// for issued attempts, at most two records each, so its size follows the
+/// attempts issued. In this slice it only records: nothing is pruned, nothing
+/// is suppressed from it, and it does not yet coordinate with the attempt
+/// model's evidence reservations, which return without removing any file;
+/// §13 step 4 connects a reservation's return to the removal of its files.
 #[derive(Debug, Default)]
 pub struct EvidenceStore {
     issued: BTreeMap<(String, u32, u32), IssuedCaps>,
@@ -683,7 +1010,7 @@ impl EvidenceStore {
 
     /// Admit a record on bearer authority (§5): an issued `(msg, A, e)` and
     /// that stage's cap — the commit cap for `Committed`, the hand-out cap for
-    /// every other stage, so a hand-out cap never proves a commit.
+    /// `Handed`, so a hand-out cap never proves a commit.
     pub fn admit(&mut self, body: &RecordBody) -> Admission {
         let Some(issued) = self.issued.get(&(body.msg.clone(), body.a, body.e)) else {
             return Admission::NotIssued;
@@ -705,12 +1032,17 @@ impl EvidenceStore {
     pub fn admitted(&self, key: &RecordKey) -> bool {
         self.admitted.contains(key)
     }
+
+    /// Keys held: issued attempts plus admitted records.
+    pub fn entries(&self) -> usize {
+        self.issued.len() + self.admitted.len()
+    }
 }
 
 /// Directory handles the spool trusts, one verified component at a time.
 mod fsdir {
+    use std::ffi::OsStr;
     use std::io;
-    use std::time::SystemTime;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum EntryKind {
@@ -724,12 +1056,31 @@ mod fsdir {
     pub(super) struct EntryInfo {
         pub(super) kind: EntryKind,
         pub(super) len: u64,
-        pub(super) modified: Option<SystemTime>,
     }
 
     /// A file name inside one directory: no separator, not `.` or `..`.
-    pub(super) fn plain(name: &str) -> io::Result<()> {
-        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+    pub(super) fn plain(name: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        let bad = {
+            use std::os::unix::ffi::OsStrExt as _;
+            let bytes = name.as_bytes();
+            bytes.is_empty()
+                || bytes == b"."
+                || bytes == b".."
+                || bytes.iter().any(|b| matches!(b, b'/' | b'\0'))
+        };
+        #[cfg(windows)]
+        let bad = {
+            use std::os::windows::ffi::OsStrExt as _;
+            let wide: Vec<u16> = name.encode_wide().collect();
+            wide.is_empty()
+                || name == OsStr::new(".")
+                || name == OsStr::new("..")
+                || wide
+                    .iter()
+                    .any(|&c| c == u16::from(b'/') || c == u16::from(b'\\') || c == 0)
+        };
+        if bad {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{name:?} is not a plain file name"),
@@ -745,20 +1096,19 @@ mod fsdir {
 
     #[cfg(unix)]
     mod unix {
-        use std::ffi::{CStr, CString, OsString};
+        use std::ffi::{CStr, CString, OsStr, OsString};
         use std::fs::File;
         use std::io;
         use std::mem::MaybeUninit;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
         use std::path::Path;
-        use std::time::{Duration, SystemTime};
 
         use super::super::{refused, valid_component};
         use super::{EntryInfo, EntryKind, plain};
 
-        fn cstr(name: &str) -> io::Result<CString> {
-            CString::new(name)
+        fn cstr(name: &OsStr) -> io::Result<CString> {
+            CString::new(name.as_bytes())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in a name"))
         }
 
@@ -767,6 +1117,31 @@ mod fsdir {
                 Err(io::Error::last_os_error())
             } else {
                 Ok(rc)
+            }
+        }
+
+        /// Clear `errno`, so a null `readdir` can tell the end of the
+        /// directory from an error.
+        fn clear_errno() {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            // SAFETY: returns this thread's own `errno` slot, always writable.
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "dragonfly"
+            ))]
+            // SAFETY: returns this thread's own `errno` slot, always writable.
+            unsafe {
+                *libc::__error() = 0;
+            }
+            #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+            // SAFETY: returns this thread's own `errno` slot, always writable.
+            unsafe {
+                *libc::__errno() = 0;
             }
         }
 
@@ -808,10 +1183,10 @@ mod fsdir {
         }
 
         impl TrustedDir {
-            /// The trusted starting point, opened by path: owned by this user.
+            /// The trust anchor, opened by path: a directory owned by this
+            /// user. Its ancestors are trusted as the OS resolves them.
             pub(in super::super) fn anchor(path: &Path) -> io::Result<Self> {
-                let c = CString::new(path.as_os_str().as_bytes())
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in a path"))?;
+                let c = cstr(path.as_os_str())?;
                 // SAFETY: a valid NUL-terminated path; the descriptor is owned
                 // below.
                 let fd = cvt(unsafe {
@@ -826,27 +1201,11 @@ mod fsdir {
                 Ok(TrustedDir { fd })
             }
 
-            /// One component below: created owner-only when `create`, opened
-            /// without following a link, and verified owner-only.
-            pub(in super::super) fn child(&self, name: &str, create: bool) -> io::Result<Self> {
-                if !valid_component(name) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("{name:?} is not a spool path component"),
-                    ));
-                }
+            /// Open the directory `name` below without following a link.
+            fn open_dir(&self, name: &OsStr) -> io::Result<OwnedFd> {
                 let c = cstr(name)?;
-                if create {
-                    // SAFETY: a live directory descriptor and a valid name.
-                    let rc = unsafe { libc::mkdirat(self.fd.as_raw_fd(), c.as_ptr(), 0o700) };
-                    if rc < 0 {
-                        let error = io::Error::last_os_error();
-                        if error.kind() != io::ErrorKind::AlreadyExists {
-                            return Err(error);
-                        }
-                    }
-                }
-                // SAFETY: as above; the descriptor is owned below.
+                // SAFETY: a live directory descriptor and a valid name; the
+                // descriptor is owned below.
                 let fd = unsafe {
                     libc::openat(
                         self.fd.as_raw_fd(),
@@ -857,13 +1216,45 @@ mod fsdir {
                 if fd < 0 {
                     let error = io::Error::last_os_error();
                     if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
-                        return Err(refused(format!("{name} is not a plain directory")));
+                        return Err(refused(format!("{name:?} is not a plain directory")));
                     }
                     return Err(error);
                 }
                 // SAFETY: just opened, owned by nobody else.
-                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            }
+
+            /// One component below: created owner-only when `create`, opened
+            /// without following a link, and verified owner-only.
+            pub(in super::super) fn child(&self, name: &str, create: bool) -> io::Result<Self> {
+                if !valid_component(name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{name:?} is not a spool path component"),
+                    ));
+                }
+                if create {
+                    let c = cstr(OsStr::new(name))?;
+                    // SAFETY: a live directory descriptor and a valid name.
+                    let rc = unsafe { libc::mkdirat(self.fd.as_raw_fd(), c.as_ptr(), 0o700) };
+                    if rc < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() != io::ErrorKind::AlreadyExists {
+                            return Err(error);
+                        }
+                    }
+                }
+                let fd = self.open_dir(OsStr::new(name))?;
                 verify(fd.as_raw_fd(), name, true)?;
+                Ok(TrustedDir { fd })
+            }
+
+            /// A directory below that is about to be removed: opened without
+            /// following a link and owned by this user, any mode.
+            pub(in super::super) fn child_for_removal(&self, name: &OsStr) -> io::Result<Self> {
+                plain(name)?;
+                let fd = self.open_dir(name)?;
+                verify(fd.as_raw_fd(), &format!("{name:?}"), false)?;
                 Ok(TrustedDir { fd })
             }
 
@@ -875,8 +1266,8 @@ mod fsdir {
 
             /// A new owner-only file, refused when the name exists or is a link.
             pub(in super::super) fn create_new_owner_only(&self, name: &str) -> io::Result<File> {
-                plain(name)?;
-                let c = cstr(name)?;
+                plain(OsStr::new(name))?;
+                let c = cstr(OsStr::new(name))?;
                 let mode: libc::c_uint = 0o600;
                 // SAFETY: a live directory descriptor, a valid name and a mode;
                 // the descriptor is owned below.
@@ -899,6 +1290,7 @@ mod fsdir {
             }
 
             pub(in super::super) fn link(&self, from: &str, to: &str) -> io::Result<()> {
+                let (from, to) = (OsStr::new(from), OsStr::new(to));
                 plain(from)?;
                 plain(to)?;
                 let (f, t) = (cstr(from)?, cstr(to)?);
@@ -909,6 +1301,7 @@ mod fsdir {
             }
 
             pub(in super::super) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+                let (from, to) = (OsStr::new(from), OsStr::new(to));
                 plain(from)?;
                 plain(to)?;
                 let (f, t) = (cstr(from)?, cstr(to)?);
@@ -918,7 +1311,8 @@ mod fsdir {
                 Ok(())
             }
 
-            pub(in super::super) fn remove_file(&self, name: &str) -> io::Result<()> {
+            pub(in super::super) fn remove_file(&self, name: impl AsRef<OsStr>) -> io::Result<()> {
+                let name = name.as_ref();
                 plain(name)?;
                 let c = cstr(name)?;
                 // SAFETY: a live descriptor and a valid name; a link is
@@ -927,7 +1321,8 @@ mod fsdir {
                 Ok(())
             }
 
-            pub(in super::super) fn remove_dir(&self, name: &str) -> io::Result<()> {
+            pub(in super::super) fn remove_dir(&self, name: impl AsRef<OsStr>) -> io::Result<()> {
+                let name = name.as_ref();
                 plain(name)?;
                 let c = cstr(name)?;
                 // SAFETY: as above.
@@ -938,7 +1333,8 @@ mod fsdir {
             }
 
             /// What `name` is, without following a link or opening it.
-            pub(in super::super) fn entry(&self, name: &str) -> io::Result<EntryInfo> {
+            pub(in super::super) fn entry(&self, name: impl AsRef<OsStr>) -> io::Result<EntryInfo> {
+                let name = name.as_ref();
                 plain(name)?;
                 let c = cstr(name)?;
                 let mut st = MaybeUninit::<libc::stat>::uninit();
@@ -962,15 +1358,16 @@ mod fsdir {
                 Ok(EntryInfo {
                     kind,
                     len: u64::try_from(st.st_size).unwrap_or(0),
-                    modified: u64::try_from(st.st_mtime)
-                        .ok()
-                        .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
                 })
             }
 
             /// Open a regular file for reading: no link followed, no open that
             /// blocks on a FIFO, and refused when it is not a regular file.
-            pub(in super::super) fn open_regular(&self, name: &str) -> io::Result<File> {
+            pub(in super::super) fn open_regular(
+                &self,
+                name: impl AsRef<OsStr>,
+            ) -> io::Result<File> {
+                let name = name.as_ref();
                 plain(name)?;
                 let c = cstr(name)?;
                 // SAFETY: a live descriptor and a valid name; owned below.
@@ -995,7 +1392,7 @@ mod fsdir {
             /// A directory stream over a fresh open of this directory, so two
             /// streams never share a read position.
             pub(in super::super) fn stream(&self) -> io::Result<DirStream> {
-                let dot = cstr(".")?;
+                let dot = cstr(OsStr::new("."))?;
                 // SAFETY: a live descriptor and a valid name.
                 let fd = cvt(unsafe {
                     libc::openat(
@@ -1026,12 +1423,20 @@ mod fsdir {
         unsafe impl Send for DirStream {}
 
         impl DirStream {
-            pub(in super::super) fn next_name(&mut self) -> Option<OsString> {
+            /// The next name as bytes, `None` at the end of the directory, or
+            /// the error `readdir` reported (`EILSEQ` included): an error is
+            /// never mistaken for the end.
+            pub(in super::super) fn next_name(&mut self) -> Option<io::Result<OsString>> {
                 loop {
+                    clear_errno();
                     // SAFETY: `dir` is a live stream owned by self.
                     let entry = unsafe { libc::readdir(self.dir) };
                     if entry.is_null() {
-                        return None;
+                        let error = io::Error::last_os_error();
+                        return match error.raw_os_error() {
+                            None | Some(0) => None,
+                            Some(_) => Some(Err(error)),
+                        };
                     }
                     // SAFETY: readdir returned a valid entry whose name is
                     // NUL-terminated and lives until the next readdir.
@@ -1039,13 +1444,14 @@ mod fsdir {
                     if name == b"." || name == b".." {
                         continue;
                     }
-                    return Some(OsString::from_vec(name.to_vec()));
+                    return Some(Ok(OsString::from_vec(name.to_vec())));
                 }
             }
 
-            pub(in super::super) fn rewind(&mut self) {
+            pub(in super::super) fn rewind(&mut self) -> io::Result<()> {
                 // SAFETY: `dir` is a live stream owned by self.
                 unsafe { libc::rewinddir(self.dir) };
+                Ok(())
             }
         }
 
@@ -1059,61 +1465,110 @@ mod fsdir {
 
     #[cfg(windows)]
     mod windows {
-        use std::ffi::OsString;
+        use std::ffi::{OsStr, OsString};
         use std::fs::{File, OpenOptions};
         use std::io;
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         use std::os::windows::io::AsRawHandle;
         use std::path::{Path, PathBuf};
+        use std::sync::Arc;
 
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
 
         use super::super::{refused, valid_component};
         use super::{EntryInfo, EntryKind, plain};
 
-        /// A directory with no reparse point (no symlink or junction) whose
-        /// owner is this user.
-        fn verify(path: &Path, what: &str) -> io::Result<()> {
-            let meta = std::fs::symlink_metadata(path)?;
-            if meta.file_type().is_symlink()
-                || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            {
-                return Err(refused(format!("{what} is a reparse point")));
-            }
-            if !meta.is_dir() {
-                return Err(refused(format!("{what} is not a directory")));
-            }
-            let handle = OpenOptions::new()
-                .read(true)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(path)?;
-            crate::platform::fsperm::verify_file_owner_is_current_user(
-                handle.as_raw_handle() as HANDLE
-            )
-            .map_err(|why| refused(format!("{what}: {why}")))
+        /// An open directory handle and the handles of every component above
+        /// it, back to the anchor. Each is opened **without**
+        /// `FILE_SHARE_DELETE`, so while it is held no component of the chain
+        /// can be renamed, deleted or replaced by a junction.
+        #[derive(Debug)]
+        struct Held {
+            _dir: File,
+            _parent: Option<Arc<Held>>,
         }
 
-        /// A verified directory, held by path: Windows has no `openat`, so
-        /// each component is re-verified as a non-reparse directory owned by
-        /// this user when it is opened.
+        fn open_dir(path: &Path, follow: bool) -> io::Result<File> {
+            let flags = if follow {
+                FILE_FLAG_BACKUP_SEMANTICS
+            } else {
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+            };
+            OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(flags)
+                .open(path)
+        }
+
+        fn handle(file: &File) -> HANDLE {
+            file.as_raw_handle() as HANDLE
+        }
+
+        /// The opened handle itself is a directory and not a reparse point,
+        /// and its owner is this user.
+        fn verify_dir(file: &File, what: &str) -> io::Result<()> {
+            let attributes = file.metadata()?.file_attributes();
+            if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(refused(format!("{what} is a reparse point")));
+            }
+            if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+                return Err(refused(format!("{what} is not a directory")));
+            }
+            crate::platform::fsperm::verify_file_owner_is_current_user(handle(file))
+                .map_err(|why| refused(format!("{what}: {why}")))
+        }
+
+        /// A verified directory, held as a handle chain back to the anchor.
+        /// Windows has no `openat`, so operations go by path, but every
+        /// component of that path is held open without delete sharing, so the
+        /// path keeps resolving to the directories that were verified.
         #[derive(Debug)]
         pub(in super::super) struct TrustedDir {
             path: PathBuf,
+            held: Arc<Held>,
         }
 
         impl TrustedDir {
+            /// The trust anchor: a directory owned by this user, opened by
+            /// path (its ancestors are trusted as the OS resolves them) and
+            /// held.
             pub(in super::super) fn anchor(path: &Path) -> io::Result<Self> {
-                if !std::fs::metadata(path)?.is_dir() {
+                let dir = open_dir(path, true)?;
+                if dir.metadata()?.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0 {
                     return Err(refused(format!("{} is not a directory", path.display())));
                 }
+                crate::platform::fsperm::verify_file_owner_is_current_user(handle(&dir))
+                    .map_err(|why| refused(format!("{}: {why}", path.display())))?;
                 Ok(TrustedDir {
                     path: path.to_path_buf(),
+                    held: Arc::new(Held {
+                        _dir: dir,
+                        _parent: None,
+                    }),
                 })
             }
 
+            fn below(&self, path: PathBuf, dir: File) -> Self {
+                TrustedDir {
+                    path,
+                    held: Arc::new(Held {
+                        _dir: dir,
+                        _parent: Some(self.held.clone()),
+                    }),
+                }
+            }
+
+            /// One component below: created with a protected owner-only DACL
+            /// in the same call when `create`, then opened without following
+            /// a reparse point and held; refused unless the handle is a
+            /// directory owned by this user whose stored DACL is protected and
+            /// owner-only. A pre-existing directory that fails is refused,
+            /// never repaired.
             pub(in super::super) fn child(&self, name: &str, create: bool) -> io::Result<Self> {
                 if !valid_component(name) {
                     return Err(io::Error::new(
@@ -1123,26 +1578,36 @@ mod fsdir {
                 }
                 let path = self.path.join(name);
                 if create {
-                    match std::fs::create_dir(&path) {
-                        Ok(()) => crate::platform::fsperm::ensure_owner_only_dir(&path)?,
-                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                        Err(error) => return Err(error),
-                    }
+                    crate::platform::fsperm::create_dir_owner_only(&path)?;
                 }
-                verify(&path, name)?;
-                Ok(TrustedDir { path })
+                let dir = open_dir(&path, false)?;
+                verify_dir(&dir, name)?;
+                crate::platform::fsperm::verify_dacl_owner_only(handle(&dir))
+                    .map_err(|why| refused(format!("{name}: {why}")))?;
+                Ok(self.below(path, dir))
+            }
+
+            /// A directory below that is about to be removed: not a reparse
+            /// point and owned by this user, any DACL.
+            pub(in super::super) fn child_for_removal(&self, name: &OsStr) -> io::Result<Self> {
+                plain(name)?;
+                let path = self.path.join(name);
+                let dir = open_dir(&path, false)?;
+                verify_dir(&dir, &format!("{name:?}"))?;
+                Ok(self.below(path, dir))
             }
 
             pub(in super::super) fn try_clone(&self) -> io::Result<Self> {
                 Ok(TrustedDir {
                     path: self.path.clone(),
+                    held: self.held.clone(),
                 })
             }
 
             /// A new file whose owner-only DACL is set on its handle before
             /// anything is written.
             pub(in super::super) fn create_new_owner_only(&self, name: &str) -> io::Result<File> {
-                plain(name)?;
+                plain(OsStr::new(name))?;
                 let mut options = OpenOptions::new();
                 options.write(true).create_new(true);
                 crate::platform::fsperm::set_create_mode_owner_only(&mut options);
@@ -1153,30 +1618,30 @@ mod fsdir {
             }
 
             pub(in super::super) fn link(&self, from: &str, to: &str) -> io::Result<()> {
-                plain(from)?;
-                plain(to)?;
+                plain(OsStr::new(from))?;
+                plain(OsStr::new(to))?;
                 std::fs::hard_link(self.path.join(from), self.path.join(to))
             }
 
             pub(in super::super) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-                plain(from)?;
-                plain(to)?;
+                plain(OsStr::new(from))?;
+                plain(OsStr::new(to))?;
                 std::fs::rename(self.path.join(from), self.path.join(to))
             }
 
-            pub(in super::super) fn remove_file(&self, name: &str) -> io::Result<()> {
-                plain(name)?;
-                std::fs::remove_file(self.path.join(name))
+            pub(in super::super) fn remove_file(&self, name: impl AsRef<OsStr>) -> io::Result<()> {
+                plain(name.as_ref())?;
+                std::fs::remove_file(self.path.join(name.as_ref()))
             }
 
-            pub(in super::super) fn remove_dir(&self, name: &str) -> io::Result<()> {
-                plain(name)?;
-                std::fs::remove_dir(self.path.join(name))
+            pub(in super::super) fn remove_dir(&self, name: impl AsRef<OsStr>) -> io::Result<()> {
+                plain(name.as_ref())?;
+                std::fs::remove_dir(self.path.join(name.as_ref()))
             }
 
-            pub(in super::super) fn entry(&self, name: &str) -> io::Result<EntryInfo> {
-                plain(name)?;
-                let meta = std::fs::symlink_metadata(self.path.join(name))?;
+            pub(in super::super) fn entry(&self, name: impl AsRef<OsStr>) -> io::Result<EntryInfo> {
+                plain(name.as_ref())?;
+                let meta = std::fs::symlink_metadata(self.path.join(name.as_ref()))?;
                 let reparse = meta.file_type().is_symlink()
                     || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
                 let kind = if reparse {
@@ -1191,11 +1656,14 @@ mod fsdir {
                 Ok(EntryInfo {
                     kind,
                     len: meta.len(),
-                    modified: meta.modified().ok(),
                 })
             }
 
-            pub(in super::super) fn open_regular(&self, name: &str) -> io::Result<File> {
+            pub(in super::super) fn open_regular(
+                &self,
+                name: impl AsRef<OsStr>,
+            ) -> io::Result<File> {
+                let name = name.as_ref();
                 if self.entry(name)?.kind != EntryKind::File {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -1206,7 +1674,8 @@ mod fsdir {
                     .read(true)
                     .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                     .open(self.path.join(name))?;
-                if !file.metadata()?.is_file() {
+                let meta = file.metadata()?;
+                if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "it is not a regular file",
@@ -1230,17 +1699,22 @@ mod fsdir {
         }
 
         impl DirStream {
-            pub(in super::super) fn next_name(&mut self) -> Option<OsString> {
-                loop {
-                    match self.iter.as_mut()?.next()? {
-                        Ok(entry) => return Some(entry.file_name()),
-                        Err(_) => continue,
-                    }
-                }
+            /// The next name, `None` at the end of the directory, or a
+            /// per-entry error: an error is never mistaken for the end, and a
+            /// stream a failed rewind lost reports an error, not the end.
+            pub(in super::super) fn next_name(&mut self) -> Option<io::Result<OsString>> {
+                let Some(iter) = self.iter.as_mut() else {
+                    return Some(Err(io::Error::other(
+                        "the directory stream was lost by a failed rewind",
+                    )));
+                };
+                Some(iter.next()?.map(|entry| entry.file_name()))
             }
 
-            pub(in super::super) fn rewind(&mut self) {
-                self.iter = std::fs::read_dir(&self.path).ok();
+            pub(in super::super) fn rewind(&mut self) -> io::Result<()> {
+                self.iter = None;
+                self.iter = Some(std::fs::read_dir(&self.path)?);
+                Ok(())
             }
         }
     }
@@ -1250,6 +1724,7 @@ mod fsdir {
 mod tests {
     use super::*;
     use spec::spec;
+    use std::time::Duration;
 
     fn key(msg: &str, e: u32, stage: RecordStage) -> RecordKey {
         RecordKey {
@@ -1264,27 +1739,37 @@ mod tests {
         spool.instance_path().join(pane).join(agent).join("rec")
     }
 
-    /// Run passes until one completes, collecting every record; at most
-    /// `limit` passes.
-    fn scan_cycle(scanner: &mut RecordScanner, limit: usize) -> (Vec<RecordBody>, Vec<ScanPass>) {
-        let mut records = Vec::new();
+    /// Run passes until one ends a cycle, collecting every admitted key; at
+    /// most `limit` passes.
+    fn scan_cycle(
+        scanner: &mut RecordScanner,
+        store: &mut EvidenceStore,
+        limit: usize,
+    ) -> (Vec<RecordKey>, Vec<ScanPass>) {
+        let mut admitted = Vec::new();
         let mut passes = Vec::new();
         for _ in 0..limit {
-            let pass = scanner.pass().expect("scan pass");
-            records.extend(pass.records.iter().cloned());
-            let complete = pass.complete;
+            let pass = scanner.pass(store);
+            admitted.extend(pass.admitted.iter().cloned());
+            let ended = pass.ended;
             passes.push(pass);
-            if complete {
+            if ended {
                 break;
             }
         }
-        (records, passes)
+        (admitted, passes)
     }
 
     #[cfg(unix)]
     fn chmod(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Write a record file by hand (as a forger or a stale component would).
+    fn write_record(rec: &Path, name: &str, msg: &str, e: u32, stage: &str, cap: &str) {
+        let body = format!(r#"{{"msg":"{msg}","a":1,"e":{e},"stage":"{stage}","cap":"{cap}"}}"#);
+        std::fs::write(rec.join(name), body).unwrap();
     }
 
     /// Scenario: Open one lock file through two handles, take the lock on the
@@ -1367,10 +1852,10 @@ mod tests {
     }
 
     /// Scenario: Next to one genuine record, put a FIFO, a symlink to a valid
-    /// record body outside the spool and a directory, each named like a
-    /// record, then scan. The scan finishes without blocking, returns only the
-    /// genuine record, never follows the symlink, and leaves all three entries
-    /// where they are.
+    /// record body (carrying a genuinely issued cap) outside the spool and a
+    /// directory, each named like a record, then scan. The scan finishes
+    /// without blocking, admits only the genuine record, never follows the
+    /// symlink, and leaves all three entries where they are.
     #[cfg(unix)]
     #[spec("inbox/receipt/003")]
     #[test]
@@ -1380,35 +1865,33 @@ mod tests {
         let spool = Spool::start(state.path()).unwrap();
         let generation = spool.generation("2", "agent-a").unwrap();
         let rec = rec_dir(&spool, "2", "agent-a");
-        generation
-            .publish(
-                &key("m-good", 1, RecordStage::Handed),
-                &Cap::random().unwrap(),
-            )
-            .unwrap();
+        let mut store = EvidenceStore::default();
+        let good = store.issue("m-good", 1, 1).unwrap();
+        let linked = store.issue("m-link", 1, 1).unwrap();
+        let good_key = key("m-good", 1, RecordStage::Handed);
+        generation.publish(&good_key, &good.handed).unwrap();
         let fifo = rec.join(key("m-fifo", 1, RecordStage::Handed).file_name());
         let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: a valid NUL-terminated path and a mode.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         let outside = state.path().join("outside-record");
-        let body = RecordBody {
-            msg: "m-link".into(),
-            a: 1,
-            e: 1,
-            stage: RecordStage::Handed,
-            cap: Cap::random().unwrap().hex(),
-        };
-        std::fs::write(&outside, serde_json::to_vec(&body).unwrap()).unwrap();
+        write_record(
+            state.path(),
+            "outside-record",
+            "m-link",
+            1,
+            "handed",
+            &linked.handed.hex(),
+        );
         let link = rec.join(key("m-link", 1, RecordStage::Handed).file_name());
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let dir = rec.join(key("m-dir", 1, RecordStage::Handed).file_name());
         std::fs::create_dir(&dir).unwrap();
 
         let mut scanner = generation.scanner().unwrap();
-        let (records, passes) = scan_cycle(&mut scanner, 4);
+        let (admitted, passes) = scan_cycle(&mut scanner, &mut store, 4);
         assert!(passes.last().unwrap().complete);
-        let msgs: Vec<&str> = records.iter().map(|r| r.msg.as_str()).collect();
-        assert_eq!(msgs, vec!["m-good"]);
+        assert_eq!(admitted, vec![good_key]);
         assert!(std::fs::symlink_metadata(&fifo).is_ok());
         assert!(std::fs::symlink_metadata(&link).is_ok());
         assert!(dir.is_dir());
@@ -1416,9 +1899,10 @@ mod tests {
     }
 
     /// Scenario: Create a record temp and inspect it before writing anything.
-    /// The empty temp is already owner-only: mode 0600 on Unix, owned by the
-    /// current user on Windows, so no record byte is ever written under a
-    /// wider permission.
+    /// The empty temp is already owner-only: mode 0600 on Unix; on Windows
+    /// its stored DACL, read back from the kernel, is protected and grants
+    /// access to the current user alone, so no record byte is ever written
+    /// under a wider permission.
     #[spec("inbox/receipt/004")]
     #[test]
     fn receipt_004_a_record_temp_is_owner_only_before_any_byte() {
@@ -1437,25 +1921,30 @@ mod tests {
         {
             use std::os::windows::io::AsRawHandle as _;
             let reopened = File::open(rec_dir(&spool, "2", "agent-a").join(&name)).unwrap();
-            crate::platform::fsperm::verify_file_owner_is_current_user(
-                reopened.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
-            )
-            .unwrap();
+            let handle = reopened.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            let stored = crate::platform::fsperm::read_dacl(handle).unwrap();
+            let ours = crate::platform::paths::current_user_sid().unwrap();
+            crate::platform::fsperm::dacl_is_owner_only(&stored, &ours)
+                .unwrap_or_else(|why| panic!("{why}: {stored:?}"));
+            assert_eq!(stored.aces.len(), 1, "{stored:?}");
         }
     }
 
     /// Scenario: Swap a generation's `rec` directory, then a pane directory,
-    /// then the spool root itself for a symlink to a decoy directory, and open
-    /// or publish through each. Every open is refused, a handle anchored
-    /// before the swap does not write into the decoy, and every decoy stays
-    /// empty.
+    /// then the spool root itself for a symlink to a decoy directory; open the
+    /// component side through an instance symlink and through a symlinked
+    /// root above the instance; and rename a live generation's `rec` aside
+    /// with a symlink to a decoy in its place. Every open is refused, a
+    /// relative pinned path is refused, every decoy stays empty, and a handle
+    /// anchored before the rename still publishes successfully into the
+    /// renamed directory.
     #[cfg(unix)]
     #[spec("inbox/receipt/005")]
     #[test]
     fn receipt_005_an_intermediate_symlink_is_refused_not_followed() {
         let state = crate::test_temp::tempdir().unwrap();
         let spool = Spool::start(state.path()).unwrap();
-        let generation = spool.generation("2", "agent-a").unwrap();
+        spool.generation("2", "agent-a").unwrap();
         let agent = spool.instance_path().join("2").join("agent-a");
         let decoy = state.path().join("decoy");
         std::fs::create_dir(&decoy).unwrap();
@@ -1466,7 +1955,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         let err = spool.generation("2", "agent-a").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
-        let _ = generation.publish(&key("m-1", 1, RecordStage::Handed), &Cap::random().unwrap());
         assert_eq!(std::fs::read_dir(&decoy).unwrap().count(), 0);
 
         let decoy_pane = state.path().join("decoy-pane");
@@ -1485,18 +1973,68 @@ mod tests {
         let err = Spool::start(state2.path()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+
+        // The component side, through an instance symlink.
+        let live = Spool::start(state.path()).unwrap();
+        live.generation("4", "agent-c").unwrap();
+        let instance = live.instance_path();
+        let moved = state.path().join("moved-instance");
+        std::fs::rename(&instance, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &instance).unwrap();
+        let err = GenerationSpool::open(&instance, "4", "agent-c").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+
+        // …and through a symlinked root above an owner-only instance tree.
+        let state3 = crate::test_temp::tempdir().unwrap();
+        let elsewhere = state3.path().join("elsewhere");
+        let inst = "0123456789abcdef0123456789abcdef";
+        for dir in ["", inst, "5", "agent-d", "rec", "caps", "revoked"] {
+            let path = match dir {
+                "" => elsewhere.clone(),
+                d if d == inst => elsewhere.join(inst),
+                "5" => elsewhere.join(inst).join("5"),
+                "agent-d" => elsewhere.join(inst).join("5").join("agent-d"),
+                leaf => elsewhere.join(inst).join("5").join("agent-d").join(leaf),
+            };
+            std::fs::create_dir(&path).unwrap();
+            chmod(&path, 0o700);
+        }
+        std::os::unix::fs::symlink(&elsewhere, state3.path().join(SPOOL_DIR_NAME)).unwrap();
+        let pinned = state3.path().join(SPOOL_DIR_NAME).join(inst);
+        let err = GenerationSpool::open(&pinned, "5", "agent-d").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        let relative = Path::new(SPOOL_DIR_NAME).join(inst);
+        let err = GenerationSpool::open(&relative, "5", "agent-d").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+
+        // A handle anchored before a swap publishes into the inode it holds.
+        let generation = live.generation("6", "agent-e").unwrap();
+        let agent = moved.join("6").join("agent-e");
+        std::fs::rename(agent.join("rec"), agent.join("rec-moved")).unwrap();
+        let decoy_rec = state.path().join("decoy-rec");
+        std::fs::create_dir(&decoy_rec).unwrap();
+        chmod(&decoy_rec, 0o700);
+        std::os::unix::fs::symlink(&decoy_rec, agent.join("rec")).unwrap();
+        let anchored = key("m-anchored", 1, RecordStage::Handed);
+        generation
+            .publish(&anchored, &Cap::random().unwrap())
+            .expect("the anchored handle still publishes");
+        assert!(agent.join("rec-moved").join(anchored.file_name()).is_file());
+        assert_eq!(std::fs::read_dir(&decoy_rec).unwrap().count(), 0);
     }
 
     /// Scenario: Pre-create the spool root world-writable, then
     /// group-readable, then owner-only, starting a spool each time; then make
-    /// one pane directory group-readable. The unsafe root and pane are
-    /// refused and left as they were, never repaired; the owner-only root is
-    /// used.
+    /// one pane directory group-readable; then make a live instance
+    /// group-readable and open it from the component side. The unsafe root,
+    /// pane and instance are refused and left as they were, never repaired;
+    /// the owner-only root is used.
     #[cfg(unix)]
     #[spec("inbox/receipt/006")]
     #[test]
     fn receipt_006_an_unsafe_pre_existing_root_is_refused_not_repaired() {
         use std::os::unix::fs::PermissionsExt as _;
+        let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         let state = crate::test_temp::tempdir().unwrap();
         let root = state.path().join(SPOOL_DIR_NAME);
         std::fs::create_dir(&root).unwrap();
@@ -1504,8 +2042,7 @@ mod tests {
             chmod(&root, mode);
             let err = Spool::start(state.path()).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
-            let now = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
-            assert_eq!(now, mode, "the root is refused, not repaired");
+            assert_eq!(mode_of(&root), mode, "the root is refused, not repaired");
         }
         chmod(&root, 0o700);
         let spool = Spool::start(state.path()).unwrap();
@@ -1513,14 +2050,22 @@ mod tests {
         chmod(&spool.instance_path().join("2"), 0o755);
         let err = spool.generation("2", "agent-a").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+
+        chmod(&spool.instance_path().join("2"), 0o700);
+        chmod(&spool.instance_path(), 0o750);
+        let err = GenerationSpool::open(&spool.instance_path(), "2", "agent-a").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(mode_of(&spool.instance_path()), 0o750, "not repaired");
+        chmod(&spool.instance_path(), 0o700);
+        GenerationSpool::open(&spool.instance_path(), "2", "agent-a").expect("owner-only opens");
     }
 
     /// Scenario: Fill a generation's record directory with 3,000 entries the
     /// spool does not recognise plus one genuine record, then scan pass by
     /// pass while asking about the record and about one that was never
     /// published. No pass examines more than the entry bound, the missing
-    /// record reads unknown, never absent, until a pass completes, and then
-    /// it reads absent while the genuine one reads found.
+    /// record reads unknown, never absent, until a pass completes the cycle,
+    /// and then it reads absent while the genuine one reads found.
     #[spec("inbox/receipt/007")]
     #[test]
     fn receipt_007_a_bounded_scan_resumes_and_is_never_read_as_absence() {
@@ -1531,65 +2076,61 @@ mod tests {
         for i in 0..3000 {
             std::fs::write(rec.join(format!("junk-{i}")), b"").unwrap();
         }
+        let mut store = EvidenceStore::default();
+        let caps = store.issue("m-real", 1, 1).unwrap();
+        store.issue("m-missing", 1, 1).unwrap();
         let real = key("m-real", 1, RecordStage::Committed);
-        let missing = key("m-missing", 1, RecordStage::Committed);
-        generation.publish(&real, &Cap::random().unwrap()).unwrap();
+        generation.publish(&real, &caps.commit).unwrap();
         let mut scanner = generation.scanner().unwrap();
-        let first = scanner.pass().unwrap();
-        assert!(!first.complete, "3,001 entries take more than one pass");
+        let first = scanner.pass(&mut store);
+        assert!(!first.ended, "3,001 entries take more than one pass");
         assert!(first.examined <= SCAN_MAX_ENTRIES);
-        assert_eq!(scanner.presence(&missing), Presence::Unknown);
-        let (_, rest) = scan_cycle(&mut scanner, 8);
+        assert_eq!(
+            scanner.presence(&mut store, "m-missing", 1, 1),
+            Presence::Unknown
+        );
+        let (_, rest) = scan_cycle(&mut scanner, &mut store, 8);
         assert!(rest.iter().all(|p| p.examined <= SCAN_MAX_ENTRIES));
         assert!(rest.last().unwrap().complete);
-        assert_eq!(scanner.presence(&missing), Presence::Absent);
-        assert_eq!(scanner.presence(&real), Presence::Found);
+        assert_eq!(
+            scanner.presence(&mut store, "m-missing", 1, 1),
+            Presence::Absent
+        );
+        assert_eq!(
+            scanner.presence(&mut store, "m-real", 1, 1),
+            Presence::Found
+        );
+        assert!(store.admitted(&real));
     }
 
-    /// Scenario: Put 300 large record-named files, an oversized one, one whose
-    /// body names another message, a fresh temp, and (in a second generation)
-    /// 300 temps more than a minute old into spools, then scan through
-    /// several complete cycles. The byte bound splits the first cycle, the
-    /// oversized and mismatched files are removed and never returned, the
-    /// fresh temp stays, and aged temps go only when a later pass sees them
-    /// again, at most 256 per pass.
+    /// Scenario: Put 300 large record-named files with uncertified caps, an
+    /// oversized one, one whose body names another message, and a fresh
+    /// temp into a spool, then scan through several complete cycles. The
+    /// byte bound splits the first cycle and no pass reads more than 1 MiB,
+    /// all 300 are refused admission, the oversized and mismatched files are
+    /// removed, and the temp stays.
     #[spec("inbox/receipt/008")]
     #[test]
-    fn receipt_008_record_bytes_temps_and_mismatches_are_bounded() {
+    fn receipt_008_record_bytes_and_mismatches_are_bounded() {
         let state = crate::test_temp::tempdir().unwrap();
         let spool = Spool::start(state.path()).unwrap();
         let generation = spool.generation("2", "agent-a").unwrap();
         let rec = rec_dir(&spool, "2", "agent-a");
         for i in 0..300 {
-            let body = RecordBody {
-                msg: format!("m-big{i}"),
-                a: 1,
-                e: 1,
-                stage: RecordStage::Handed,
-                cap: "f".repeat(3900),
-            };
-            std::fs::write(
-                rec.join(body.key().file_name()),
-                serde_json::to_vec(&body).unwrap(),
-            )
-            .unwrap();
+            let msg = format!("m-big{i}");
+            let name = key(&msg, 1, RecordStage::Handed).file_name();
+            write_record(&rec, &name, &msg, 1, "handed", &"f".repeat(3900));
         }
         let oversized = rec.join(key("m-over", 1, RecordStage::Handed).file_name());
         std::fs::write(&oversized, vec![b' '; 5000]).unwrap();
-        let mismatch = rec.join(key("m-x", 1, RecordStage::Handed).file_name());
-        let other = RecordBody {
-            msg: "m-y".into(),
-            a: 1,
-            e: 1,
-            stage: RecordStage::Handed,
-            cap: "00".into(),
-        };
-        std::fs::write(&mismatch, serde_json::to_vec(&other).unwrap()).unwrap();
-        let fresh_temp = rec.join(format!("{TEMP_PREFIX}fresh"));
-        std::fs::write(&fresh_temp, b"partial").unwrap();
+        let mismatch = key("m-x", 1, RecordStage::Handed).file_name();
+        write_record(&rec, &mismatch, "m-y", 1, "handed", "00");
+        let temp = rec.join(format!("{TEMP_PREFIX}fresh"));
+        std::fs::write(&temp, b"partial").unwrap();
 
+        let mut store = EvidenceStore::default();
         let mut scanner = generation.scanner().unwrap();
-        let (records, passes) = scan_cycle(&mut scanner, 8);
+        let (admitted, passes) = scan_cycle(&mut scanner, &mut store, 8);
         assert!(
             passes.len() >= 2,
             "1.2 MB of records takes more than one pass"
@@ -1598,46 +2139,28 @@ mod tests {
             passes[0].examined < SCAN_MAX_ENTRIES,
             "split by bytes, not entries"
         );
-        assert_eq!(records.len(), 300);
-        assert!(records.iter().all(|r| r.msg.starts_with("m-big")));
+        assert!(passes.iter().all(|p| p.bytes <= SCAN_MAX_BYTES));
+        assert!(admitted.is_empty());
+        assert_eq!(passes.iter().map(|p| p.refused).sum::<usize>(), 300);
         assert!(!oversized.exists());
-        assert!(!mismatch.exists());
-        let _ = scan_cycle(&mut scanner, 8);
-        assert!(
-            fresh_temp.exists(),
-            "a fresh temp may be a publish in flight"
-        );
-
-        let aged_gen = spool.generation("3", "agent-b").unwrap();
-        let aged_rec = rec_dir(&spool, "3", "agent-b");
-        let old = std::time::SystemTime::now() - Duration::from_secs(120);
-        for i in 0..300 {
-            let f = File::create(aged_rec.join(format!("{TEMP_PREFIX}old{i}"))).unwrap();
-            f.set_modified(old).unwrap();
+        assert!(!rec.join(&mismatch).exists());
+        for _ in 0..3 {
+            let _ = scan_cycle(&mut scanner, &mut store, 8);
         }
-        let mut scanner = aged_gen.scanner().unwrap();
-        let (_, first) = scan_cycle(&mut scanner, 4);
-        assert_eq!(
-            first.iter().map(|p| p.removed).sum::<usize>(),
-            0,
-            "first sighting"
+        assert!(
+            temp.exists(),
+            "a temp in a live generation is never removed"
         );
-        let second = scanner.pass().unwrap();
-        assert_eq!(second.removed, SCAN_MAX_TEMPS);
-        let (_, third) = scan_cycle(&mut scanner, 4);
-        let left: usize = third.iter().map(|p| p.removed).sum();
-        assert_eq!(left, 300 - SCAN_MAX_TEMPS);
-        assert_eq!(std::fs::read_dir(&aged_rec).unwrap().count(), 0);
     }
 
     /// Scenario: Mint caps for two attempts, write the first's caps file,
     /// publish its handed and committed records (and the handed one twice),
-    /// scan and admit what was read, then offer forged records: a commit on
-    /// the hand-out cap, an attempt never issued, and a random cap; mark the
-    /// second attempt revoked. Each attempt's caps are found by its exact
-    /// name, the duplicate publish is refused, genuine records are admitted
-    /// once, every forgery is refused, the revoke marker names only its
-    /// attempt, and no record is pruned.
+    /// scan, then offer forged records: a commit on the hand-out cap, an
+    /// attempt never issued, and a random cap; mark the second attempt
+    /// revoked. Each attempt's caps are found by its exact name, the
+    /// duplicate publish is refused, genuine records are admitted once and
+    /// then answer duplicate, every forgery is refused, the revoke marker
+    /// names only its attempt, and no record is pruned.
     #[spec("inbox/receipt/009")]
     #[test]
     fn receipt_009_records_are_admitted_on_their_own_stage_cap_and_never_pruned() {
@@ -1663,13 +2186,11 @@ mod tests {
         generation.publish(&committed, &caps.commit).unwrap();
 
         let mut scanner = generation.scanner().unwrap();
-        let (records, _) = scan_cycle(&mut scanner, 4);
-        assert_eq!(records.len(), 2);
-        for body in &records {
-            assert_eq!(store.admit(body), Admission::Admitted);
-            assert_eq!(store.admit(body), Admission::Duplicate);
-        }
-        assert!(store.admitted(&committed));
+        let (mut admitted, _) = scan_cycle(&mut scanner, &mut store, 4);
+        admitted.sort();
+        assert_eq!(admitted, vec![handed.clone(), committed.clone()]);
+        let (again, _) = scan_cycle(&mut scanner, &mut store, 4);
+        assert!(again.is_empty(), "a second cycle admits nothing twice");
 
         let forged_commit = RecordBody {
             msg: "m-1".into(),
@@ -1696,7 +2217,6 @@ mod tests {
         assert!(generation.revoked("m-1", 1, 2));
         assert!(!generation.revoked("m-1", 1, 1));
 
-        let _ = scan_cycle(&mut scanner, 4);
         let rec = rec_dir(&spool, "2", "agent-a");
         let mut names: Vec<String> = std::fs::read_dir(&rec)
             .unwrap()
@@ -1705,5 +2225,445 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec![committed.file_name(), handed.file_name()]);
+    }
+
+    /// Scenario: Complete a scan cycle over an empty generation, then link a
+    /// genuine commit record for an issued attempt (as a publisher racing a
+    /// scan does behind its cursor), and ask about that attempt and about one
+    /// that never published. The completed cycle never saw the late record,
+    /// yet the exact lookup finds it, so it is never read as absent; the
+    /// never-published attempt reads absent.
+    #[spec("inbox/receipt/010")]
+    #[test]
+    fn receipt_010_a_record_linked_behind_the_cursor_is_found_by_the_exact_lookup() {
+        let state = crate::test_temp::tempdir().unwrap();
+        let spool = Spool::start(state.path()).unwrap();
+        let generation = spool.generation("2", "agent-a").unwrap();
+        let mut store = EvidenceStore::default();
+        let late = store.issue("m-late", 1, 1).unwrap();
+        store.issue("m-never", 1, 1).unwrap();
+        let mut scanner = generation.scanner().unwrap();
+        let (admitted, passes) = scan_cycle(&mut scanner, &mut store, 4);
+        assert!(passes.last().unwrap().complete && admitted.is_empty());
+        let record = key("m-late", 1, RecordStage::Committed);
+        generation.publish(&record, &late.commit).unwrap();
+        assert!(scanner.complete(), "no new cycle has begun");
+        assert!(!store.admitted(&record), "the scan never saw it");
+        assert_eq!(
+            scanner.presence(&mut store, "m-late", 1, 1),
+            Presence::Found
+        );
+        assert!(store.admitted(&record));
+        assert_eq!(
+            scanner.presence(&mut store, "m-never", 1, 1),
+            Presence::Absent
+        );
+    }
+
+    /// Scenario: A publisher writes a record temp, then pauses for ten
+    /// minutes of file age across three complete scan cycles before linking
+    /// it; an abandoned-looking caps temp sits beside it. The scans leave
+    /// both temps alone, the paused publisher's link succeeds, and the next
+    /// scan admits its record.
+    #[spec("inbox/receipt/011")]
+    #[test]
+    fn receipt_011_a_publisher_paused_between_write_and_link_still_publishes() {
+        let state = crate::test_temp::tempdir().unwrap();
+        let spool = Spool::start(state.path()).unwrap();
+        let generation = spool.generation("2", "agent-a").unwrap();
+        let mut store = EvidenceStore::default();
+        let caps = store.issue("m-slow", 1, 1).unwrap();
+        let record = key("m-slow", 1, RecordStage::Handed);
+        let body = serde_json::to_vec(&RecordBody {
+            msg: "m-slow".into(),
+            a: 1,
+            e: 1,
+            stage: RecordStage::Handed,
+            cap: caps.handed.hex(),
+        })
+        .unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(600);
+        let (temp, mut file) = generation.create_record_temp().unwrap();
+        file.write_all(&body).unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+        let caps_temp = format!("{TEMP_PREFIX}caps");
+        let file = generation.caps.create_new_owner_only(&caps_temp).unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+
+        let mut scanner = generation.scanner().unwrap();
+        for _ in 0..3 {
+            let (admitted, _) = scan_cycle(&mut scanner, &mut store, 4);
+            assert!(admitted.is_empty());
+        }
+        generation
+            .rec
+            .link(&temp, &record.file_name())
+            .expect("the paused publisher links");
+        generation.rec.remove_file(&temp).unwrap();
+        let (admitted, _) = scan_cycle(&mut scanner, &mut store, 4);
+        assert_eq!(admitted, vec![record]);
+        assert!(generation.caps.entry(&caps_temp).is_ok());
+    }
+
+    /// Scenario: Scan a generation holding one genuine record while
+    /// injecting, in turn, an enumeration error mid-cycle (an `EILSEQ` on
+    /// Unix), a failed rewind at the start of the next cycle, and a record
+    /// read that fails after 10 bytes. Each errored entry is charged to its
+    /// pass, the failed read's bytes are charged, no errored cycle is
+    /// complete, an attempt that never published reads unknown rather than
+    /// absent, the scanner reports itself degraded from the first error on,
+    /// and a later clean cycle completes again.
+    #[spec("inbox/receipt/012")]
+    #[test]
+    fn receipt_012_scan_errors_never_certify_absence() {
+        let state = crate::test_temp::tempdir().unwrap();
+        let spool = Spool::start(state.path()).unwrap();
+        let generation = spool.generation("2", "agent-a").unwrap();
+        let mut store = EvidenceStore::default();
+        let caps = store.issue("m-real", 1, 1).unwrap();
+        store.issue("m-missing", 1, 1).unwrap();
+        generation
+            .publish(&key("m-real", 1, RecordStage::Committed), &caps.commit)
+            .unwrap();
+        let mut scanner = generation.scanner().unwrap();
+
+        #[cfg(unix)]
+        let injected = io::Error::from_raw_os_error(libc::EILSEQ);
+        #[cfg(windows)]
+        let injected = io::Error::other("injected enumeration failure");
+        scanner.faults.enumerate.push_back(injected);
+        let first = scanner.pass(&mut store);
+        assert!(first.error.is_some());
+        assert!(
+            first.ended && !first.complete,
+            "an errored cycle is not complete"
+        );
+        assert!(first.examined >= 2, "the errored entry is charged");
+        assert!(!scanner.complete());
+        assert!(scanner.degraded().is_some());
+        assert_eq!(
+            scanner.presence(&mut store, "m-missing", 1, 1),
+            Presence::Unknown
+        );
+
+        let (_, clean) = scan_cycle(&mut scanner, &mut store, 4);
+        assert!(clean.last().unwrap().complete);
+        assert_eq!(
+            scanner.presence(&mut store, "m-missing", 1, 1),
+            Presence::Absent
+        );
+
+        scanner.faults.rewind = Some(io::Error::other("injected rewind failure"));
+        let rewound = scanner.pass(&mut store);
+        assert!(rewound.error.is_some() && !rewound.complete);
+        assert_eq!(
+            scanner.presence(&mut store, "m-missing", 1, 1),
+            Presence::Unknown
+        );
+        let (_, after) = scan_cycle(&mut scanner, &mut store, 4);
+        assert!(
+            !after.last().unwrap().complete,
+            "the cycle met the rewind error"
+        );
+        let (_, clean) = scan_cycle(&mut scanner, &mut store, 4);
+        assert!(clean.last().unwrap().complete);
+
+        let lone = spool.generation("3", "agent-b").unwrap();
+        let mut fresh = EvidenceStore::default();
+        let caps2 = fresh.issue("m-two", 1, 1).unwrap();
+        fresh.issue("m-missing", 1, 1).unwrap();
+        lone.publish(&key("m-two", 1, RecordStage::Handed), &caps2.handed)
+            .unwrap();
+        let mut scanner = lone.scanner().unwrap();
+        scanner.faults.read_error_after = Some(10);
+        let (admitted, passes) = scan_cycle(&mut scanner, &mut fresh, 4);
+        let failed = &passes[0];
+        assert!(failed.error.is_some());
+        assert!(admitted.is_empty());
+        assert_eq!(failed.bytes, 10, "a failed read's bytes are charged");
+        assert!(!passes.last().unwrap().complete);
+        assert_eq!(
+            scanner.presence(&mut fresh, "m-missing", 1, 1),
+            Presence::Unknown
+        );
+        assert!(scanner.degraded().is_some());
+    }
+
+    /// Scenario: Fill a generation with 600 empty record-named files that
+    /// each grow to 4,097 bytes between the scanner's stat and its read, then
+    /// scan; separately run 64 complete cycles, each over 32 fresh forged
+    /// records nobody issued beside one genuine record. No pass reads more
+    /// than 1 MiB however the files grew, so the first cycle takes several
+    /// passes; across the 64 cycles the evidence store holds only the issued
+    /// attempt and its one admitted record, and every cycle ends with nothing
+    /// carried over.
+    #[spec("inbox/receipt/013")]
+    #[test]
+    fn receipt_013_growing_files_and_forged_records_stay_within_bounds() {
+        let state = crate::test_temp::tempdir().unwrap();
+        let spool = Spool::start(state.path()).unwrap();
+        let generation = spool.generation("2", "agent-a").unwrap();
+        let rec = rec_dir(&spool, "2", "agent-a");
+        for i in 0..600 {
+            std::fs::write(
+                rec.join(key(&format!("m-grow{i}"), 1, RecordStage::Handed).file_name()),
+                b"",
+            )
+            .unwrap();
+        }
+        let mut store = EvidenceStore::default();
+        let mut scanner = generation.scanner().unwrap();
+        let grow = rec.clone();
+        scanner.faults.before_open = Some(Box::new(move |name: &str| {
+            if name.starts_with("m-grow") {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(grow.join(name))
+                    .unwrap();
+                file.write_all(&[b'x'; READ_RESERVE as usize]).unwrap();
+            }
+        }));
+        let (_, passes) = scan_cycle(&mut scanner, &mut store, 8);
+        assert!(passes.len() >= 3, "{} passes", passes.len());
+        for pass in &passes {
+            assert!(pass.bytes <= SCAN_MAX_BYTES, "{} bytes", pass.bytes);
+        }
+        assert_eq!(passes.iter().map(|p| p.removed).sum::<usize>(), 600);
+
+        let generation = spool.generation("3", "agent-b").unwrap();
+        let rec = rec_dir(&spool, "3", "agent-b");
+        let mut store = EvidenceStore::default();
+        let caps = store.issue("m-real", 1, 1).unwrap();
+        generation
+            .publish(&key("m-real", 1, RecordStage::Handed), &caps.handed)
+            .unwrap();
+        let mut scanner = generation.scanner().unwrap();
+        let mut refused = 0;
+        for cycle in 0..64 {
+            let names: Vec<String> = (0..32)
+                .map(|i| {
+                    let msg = format!("m-fake{cycle}x{i}");
+                    let name = key(&msg, 1, RecordStage::Committed).file_name();
+                    let forged = Cap::random().unwrap().hex();
+                    write_record(&rec, &name, &msg, 1, "committed", &forged);
+                    name
+                })
+                .collect();
+            let (_, passes) = scan_cycle(&mut scanner, &mut store, 4);
+            assert!(passes.last().unwrap().complete);
+            assert!(scanner.carry.is_none(), "nothing carried past a cycle");
+            refused += passes.iter().map(|p| p.refused).sum::<usize>();
+            for name in names {
+                std::fs::remove_file(rec.join(name)).unwrap();
+            }
+        }
+        assert_eq!(refused, 64 * 32);
+        assert_eq!(
+            store.entries(),
+            2,
+            "one issued attempt, one admitted record"
+        );
+    }
+
+    /// Scenario: Stop a spool whose record directory holds 2,548 files (on
+    /// Linux, one with a name that is not UTF-8), stop a second, small one,
+    /// leave a pending lock file nobody holds and one a live start still
+    /// holds, then start spools one after another. Each start removes more of
+    /// the large dead spool while keeping its lock file, the small one is
+    /// reaped too, both are gone after a few starts with their lock files,
+    /// the unheld pending file goes, and the held one stays.
+    #[spec("inbox/receipt/014")]
+    #[test]
+    fn receipt_014_a_dead_spool_over_the_budget_is_reaped_across_starts() {
+        let state = crate::test_temp::tempdir().unwrap();
+        let root = state.path().join(SPOOL_DIR_NAME);
+        let big = Spool::start(state.path()).unwrap();
+        big.generation("2", "agent-a").unwrap();
+        let rec = rec_dir(&big, "2", "agent-a");
+        for i in 0..(SCAN_MAX_ENTRIES + 500) {
+            std::fs::write(rec.join(format!("junk-{i}")), b"").unwrap();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::fs::write(rec.join(OsStr::from_bytes(b"bad-\xff-name")), b"").unwrap();
+        }
+        let small = Spool::start(state.path()).unwrap();
+        small
+            .generation("3", "agent-b")
+            .unwrap()
+            .publish(&key("m-1", 1, RecordStage::Handed), &Cap::random().unwrap())
+            .unwrap();
+        let dead = [
+            (big.instance_path(), root.join(lock_name(big.instance()))),
+            (
+                small.instance_path(),
+                root.join(lock_name(small.instance())),
+            ),
+        ];
+        drop(big);
+        drop(small);
+        let unheld = root.join(format!("{PENDING_LOCK_PREFIX}{}", "a".repeat(32)));
+        std::fs::write(&unheld, b"").unwrap();
+        let held_path = root.join(format!("{PENDING_LOCK_PREFIX}{}", "b".repeat(32)));
+        let held = File::create(&held_path).unwrap();
+        assert!(crate::platform::lock::try_lock_file(&held).unwrap());
+
+        let count = || std::fs::read_dir(&rec).map(|d| d.count()).unwrap_or(0);
+        let mut last = count();
+        let mut live = Vec::new();
+        for _ in 0..8 {
+            live.push(Spool::start(state.path()).unwrap());
+            if !dead[0].0.exists() {
+                break;
+            }
+            let now = count();
+            assert!(now < last, "each start makes progress: {now} after {last}");
+            assert!(dead[0].1.exists(), "the lock file stays while work remains");
+            last = now;
+        }
+        for _ in 0..8 {
+            if !dead[1].0.exists() {
+                break;
+            }
+            live.push(Spool::start(state.path()).unwrap());
+        }
+        for (dir, lock) in &dead {
+            assert!(!dir.exists(), "{} was not reaped", dir.display());
+            assert!(!lock.exists());
+        }
+        assert!(!unheld.exists(), "an unheld pending lock is reaped");
+        assert!(held_path.exists(), "a held pending lock is never reaped");
+        for spool in &live {
+            assert!(spool.instance_path().is_dir());
+        }
+    }
+
+    /// Scenario: A Pi context takes an attempt and is retired; its watcher
+    /// reconnects with the callback queue intact and answers retained, so
+    /// the attempt is rebound to the new incarnation. The old incarnation,
+    /// still holding the attempt's hand-out cap, then writes not_handed and
+    /// handed_inert records into the spool. The scan admits neither, so
+    /// nothing reaches the model, which keeps the attempt bound to the new
+    /// incarnation and the message attempting.
+    #[spec("inbox/receipt/015")]
+    #[test]
+    fn receipt_015_a_retired_receiver_cannot_release_an_attempt_through_the_spool() {
+        use crate::inbox_attempts::{
+            AttemptModel, Limits, MessageState, ResumeAnswer, Slot, Stage,
+        };
+        let state = crate::test_temp::tempdir().unwrap();
+        let spool = Spool::start(state.path()).unwrap();
+        let generation = spool.generation("2", "agent-a").unwrap();
+        let rec = rec_dir(&spool, "2", "agent-a");
+        let t = std::time::Instant::now();
+        let mut model = AttemptModel::new(Limits::default(), 1);
+        let mut store = EvidenceStore::default();
+        let rx1 = model.register(t, Slot::Pi, true).rx;
+        model.post("m-1", false);
+        let issued = model.issue(t, "m-1", rx1).unwrap();
+        model.snapshot(t, rx1, 1, issued.d, &[("m-1", issued.a, issued.e)]);
+        let caps = store.issue("m-1", issued.a, issued.e).unwrap();
+        let rx2 = model.register(t, Slot::Pi, true).rx;
+        model.resume_answer(t, rx2, "m-1", issued.a, issued.e, ResumeAnswer::Retained);
+
+        for stage in ["not_handed", "handed_inert"] {
+            let name = format!("m-1.{}.{}.{stage}", issued.a, issued.e);
+            write_record(&rec, &name, "m-1", issued.e, stage, &caps.handed.hex());
+        }
+        let mut scanner = generation.scanner().unwrap();
+        let (admitted, passes) = scan_cycle(&mut scanner, &mut store, 4);
+        assert!(admitted.is_empty(), "{admitted:?}");
+        assert_eq!(passes.iter().map(|p| p.refused).sum::<usize>(), 0);
+        for key in &admitted {
+            let stage = match key.stage {
+                RecordStage::Handed => Stage::Handed,
+                RecordStage::Committed => Stage::Committed,
+            };
+            model.stage(t, &key.msg, key.a, key.e, stage, None);
+        }
+        let attempt = model
+            .delivery("m-1")
+            .unwrap()
+            .attempt(issued.a, issued.e)
+            .unwrap()
+            .clone();
+        assert_eq!((attempt.rx, attempt.stage), (rx2, Stage::Issued));
+        assert_eq!(model.state("m-1"), Some(MessageState::Attempting));
+    }
+
+    /// Scenario: On Windows, start a spool and open a generation, then read
+    /// back the stored DACL of the root, the instance and every generation
+    /// directory; pre-create a spool root under the temp directory's
+    /// inherited ACL and start a spool on it; and try to rename a held
+    /// generation's `rec` directory aside (the first step of a junction swap)
+    /// before and after the generation is dropped. Every created directory's
+    /// DACL is protected with one owner ACE; the permissive root is refused
+    /// with its DACL unchanged; the rename fails while the generation holds
+    /// the directory and succeeds once it is released. Runs only on Windows
+    /// CI.
+    #[cfg(windows)]
+    #[spec("inbox/receipt/016")]
+    #[test]
+    fn receipt_016_windows_directories_are_owner_only_and_held_against_replacement() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        let stored = |path: &Path| {
+            let dir = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .unwrap();
+            crate::platform::fsperm::read_dacl(
+                dir.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+            )
+            .unwrap()
+        };
+        let ours = crate::platform::paths::current_user_sid().unwrap();
+        let state = crate::test_temp::tempdir().unwrap();
+        let spool = Spool::start(state.path()).unwrap();
+        let generation = spool.generation("2", "agent-a").unwrap();
+        let agent = spool.instance_path().join("2").join("agent-a");
+        for path in [
+            state.path().join(SPOOL_DIR_NAME),
+            spool.instance_path(),
+            spool.instance_path().join("2"),
+            agent.clone(),
+            agent.join("rec"),
+            agent.join("caps"),
+            agent.join("revoked"),
+        ] {
+            let dacl = stored(&path);
+            crate::platform::fsperm::dacl_is_owner_only(&dacl, &ours)
+                .unwrap_or_else(|why| panic!("{}: {why}: {dacl:?}", path.display()));
+            assert_eq!(dacl.aces.len(), 1, "{}: {dacl:?}", path.display());
+        }
+
+        let state2 = crate::test_temp::tempdir().unwrap();
+        let root = state2.path().join(SPOOL_DIR_NAME);
+        std::fs::create_dir(&root).unwrap();
+        let before = stored(&root);
+        let err = Spool::start(state2.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(stored(&root), before, "refused, not repaired");
+
+        let moved = agent.join("rec-moved");
+        assert!(
+            std::fs::rename(agent.join("rec"), &moved).is_err(),
+            "a held component cannot be renamed for a swap"
+        );
+        generation
+            .publish(&key("m-1", 1, RecordStage::Handed), &Cap::random().unwrap())
+            .unwrap();
+        drop(generation);
+        std::fs::rename(agent.join("rec"), &moved).expect("released once dropped");
+        assert!(
+            moved
+                .join(key("m-1", 1, RecordStage::Handed).file_name())
+                .is_file()
+        );
     }
 }
