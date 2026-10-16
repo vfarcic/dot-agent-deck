@@ -2509,13 +2509,28 @@ pub fn post_to_live(
 /// request the agent made itself, into the room `reservation` held for it
 /// ([`InboxHub::post_reserved_reply`]): neither the agent's own backlog nor
 /// the deck-wide bound refuses it.
-pub fn post_reserved_reply_to_live(
+///
+/// Third review: when the answer itself is refused while its recipient is
+/// still live — its body over the limit, or a long body the deck could not
+/// save for it — `notice(error)` is posted into the same room instead, so the
+/// agent that asked is told something rather than nothing. `notice` should
+/// answer a short body: it is refused on the same terms as any reserved
+/// answer.
+pub fn post_reserved_reply_or_notice_to_live(
     registry: &crate::agent_pty::AgentPtyRegistry,
     reservation: ReplyReservation,
     to: Recipient,
     content: Content,
+    notice: impl FnOnce(&str) -> Content,
 ) -> Result<MessageId, String> {
-    post_live(registry, to, content, Some(reservation))
+    match post_live_keeping(registry, to.clone(), content, Some(reservation)) {
+        Ok(id) => Ok(id),
+        Err((error, Some(reservation))) => {
+            post_live(registry, to, notice(&error), Some(reservation))
+                .map_err(|refused| format!("{error}; the notice of it was refused too: {refused}"))
+        }
+        Err((error, None)) => Err(error),
+    }
 }
 
 fn post_live(
@@ -2524,31 +2539,49 @@ fn post_live(
     content: Content,
     reservation: Option<ReplyReservation>,
 ) -> Result<MessageId, String> {
+    post_live_keeping(registry, to, content, reservation).map_err(|(error, _)| error)
+}
+
+/// [`post_live`], answering a refusal of a post its recipient could still take
+/// together with the reservation it did not use.
+fn post_live_keeping(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    to: Recipient,
+    content: Content,
+    reservation: Option<ReplyReservation>,
+) -> Result<MessageId, (String, Option<ReplyReservation>)> {
     if let Some(agent) = to.agent_id.as_deref()
         && registry.pane_current_agent_id(&to.pane_id).as_deref() != Some(agent)
     {
-        return Err(format!(
-            "agent {agent} is no longer the live agent of pane {}",
-            to.pane_id
+        return Err((
+            format!(
+                "agent {agent} is no longer the live agent of pane {}",
+                to.pane_id
+            ),
+            None,
         ));
     }
     let mut content = content;
     // Audit F2: refused before the body is saved, and the saved body removed
     // again if the post is refused after all.
     let hub = registry.inbox();
-    if reservation.is_some() {
+    if let Err(error) = if reservation.is_some() {
         hub.admit_reserved_reply(&content)
     } else {
         hub.admit_direct(&to, &content)
+    } {
+        return Err((error.to_string(), reservation));
     }
-    .map_err(|error| error.to_string())?;
     let dirs = spill_dirs(registry, &to.pane_id, to.agent_id.as_deref());
-    let spill = retain_full_body_minted(&hub.deck(), &to.pane_id, &mut content, &dirs)?;
+    let spill = match retain_full_body_minted(&hub.deck(), &to.pane_id, &mut content, &dirs) {
+        Ok(spill) => spill,
+        Err(error) => return Err((error, reservation)),
+    };
     let id = match reservation {
         Some(reservation) => hub.post_reserved_reply(reservation, to, content),
         None => hub.post_direct(to, content),
     }
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| (error.to_string(), None))?;
     spill.keep();
     Ok(id)
 }

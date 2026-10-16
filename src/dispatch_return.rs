@@ -359,10 +359,17 @@ pub fn dispatch_reason(unit_name: &str) -> String {
 /// generation that asked for it, under a subject that says whether the
 /// dispatch started a unit, into the room `reservation` held for it since the
 /// daemon accepted the dispatch (PR #1735 second review,
-/// [`crate::inbox_hub::post_reserved_reply_to_live`]): neither a backlog in the
-/// caller's inbox nor a deck that filled up while the dispatch ran refuses it.
-/// A refusal — the caller has exited, so nobody is left to tell — stays in the
-/// daemon log: nothing is retried into whoever holds the pane now.
+/// [`crate::inbox_hub::post_reserved_reply_or_notice_to_live`]): neither a
+/// backlog in the caller's inbox nor a deck that filled up while the dispatch
+/// ran refuses it.
+///
+/// PR #1735 third review: when the inbox refuses the result itself — its text
+/// is over the body limit, or too long to hand over whole and the deck could
+/// not save it — a short notice is posted into the same room instead, under
+/// the same subject, saying the outcome could not be delivered in full and
+/// whether the dispatch started a unit. What stays in the daemon log alone is
+/// a result for a caller that has exited (nobody is left to tell; nothing is
+/// posted into whoever holds the pane now), or a notice the inbox refuses too.
 pub fn post_dispatch_result(
     registry: &crate::agent_pty::AgentPtyRegistry,
     reservation: crate::inbox_hub::ReplyReservation,
@@ -377,12 +384,22 @@ pub fn post_dispatch_result(
     } else {
         "dispatch failed"
     };
-    let content = crate::inbox::Content::from_deck(dispatch_reason(unit_name), subject, message);
-    match crate::inbox_hub::post_reserved_reply_to_live(
+    let reason = dispatch_reason(unit_name);
+    let content = crate::inbox::Content::from_deck(reason.clone(), subject, message);
+    let max_body = registry.inbox().limits().max_body_bytes;
+    let notice = |error: &str| {
+        crate::inbox::Content::from_deck(
+            reason.clone(),
+            subject,
+            undelivered_result_notice(started, error, max_body),
+        )
+    };
+    match crate::inbox_hub::post_reserved_reply_or_notice_to_live(
         registry,
         reservation,
         crate::inbox::Recipient::bound(caller_pane_id, caller_agent_id),
         content,
+        notice,
     ) {
         Ok(id) => tracing::info!(
             pane_id = %caller_pane_id,
@@ -397,6 +414,30 @@ pub fn post_dispatch_result(
             "dispatch: the caller's inbox refused the result; nothing posted"
         ),
     }
+}
+
+/// How long the inbox's refusal may run in [`undelivered_result_notice`].
+const MAX_NOTICE_REFUSAL_CHARS: usize = 300;
+
+/// The body of the notice [`post_dispatch_result`] posts when the inbox
+/// refused the dispatch's result: what the dispatch did, and that its full
+/// result could not be delivered, cut to `max_body` bytes so the inbox's body
+/// limit cannot refuse it as well. Composed by the deck alone: the unit's name
+/// and the result's text are left out, since either may be long.
+fn undelivered_result_notice(started: bool, error: &str, max_body: usize) -> String {
+    let outcome = if started {
+        "The dispatch started its unit"
+    } else {
+        "The dispatch failed and started nothing"
+    };
+    let refusal: String = error.chars().take(MAX_NOTICE_REFUSAL_CHARS).collect();
+    let body =
+        format!("{outcome}. dot-agent-deck could not deliver its full result to you: {refusal}.");
+    let mut cut = body.len().min(max_body);
+    while !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    body[..cut].to_string()
 }
 
 /// PRD #1666 S5: a unit's completion report as an inbox message for the caller
@@ -1017,6 +1058,139 @@ mod tests {
             .collect();
         registry.shutdown_all();
         assert_eq!(subjects, vec!["dispatch started".to_string()]);
+    }
+
+    /// PR #1735 third review, finding 3: an accepted dispatch fails with a
+    /// result too long to hand over whole, and neither the caller's directory
+    /// nor the deck's state directory can take the file the deck would save it
+    /// to. The caller still receives an outcome: a short notice under
+    /// "dispatch failed", saying the dispatch failed and its full result could
+    /// not be delivered, and nothing saved anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_long_failure_the_deck_cannot_save_still_reaches_its_caller() {
+        use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+        let _env = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `.dot-agent-deck` occupied by a regular file in both spill
+        // directories: the save fails, for root too (ENOTDIR).
+        let cwd = tempfile::tempdir().expect("caller cwd");
+        std::fs::write(cwd.path().join(".dot-agent-deck"), b"not a directory").unwrap();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        std::fs::write(state_dir.path().join(".dot-agent-deck"), b"not a directory").unwrap();
+        let previous = std::env::var_os("DOT_AGENT_DECK_STATE_DIR");
+        // SAFETY: `STATE_DIR_ENV_LOCK` is held; restored below.
+        unsafe { std::env::set_var("DOT_AGENT_DECK_STATE_DIR", state_dir.path()) };
+
+        let registry = std::sync::Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(cwd.path().to_str().expect("a UTF-8 tempdir")),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "unsavable-caller".to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let reservation = registry
+            .inbox()
+            .reserve_reply()
+            .expect("room for the result");
+        let failure = format!(
+            "no orchestration named `{}` is configured here",
+            "x".repeat(64 * 1024)
+        );
+        post_dispatch_result(
+            &registry,
+            reservation,
+            "unsavable-caller",
+            &agent,
+            "probe-unit",
+            false,
+            &failure,
+        );
+        let posted = registry.inbox().list_with_bodies(Some("unsavable-caller"));
+        registry.shutdown_all();
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", value),
+                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+            }
+        }
+        let [notice] = posted.as_slice() else {
+            panic!("the caller gets exactly one outcome: {posted:#?}");
+        };
+        assert_eq!(notice.subject, "dispatch failed");
+        assert_eq!(notice.spill_path, None, "nothing was saved");
+        let text = notice.text.as_deref().unwrap_or_default();
+        assert!(
+            text.contains("The dispatch failed and started nothing")
+                && text.contains("could not deliver its full result"),
+            "the notice says what happened: {text}"
+        );
+    }
+
+    /// PR #1735 third review, finding 3: a dispatch's result over the deck's
+    /// configured body limit still gives its caller an outcome — the notice,
+    /// cut to that limit, under the subject that says the dispatch started.
+    #[cfg(unix)]
+    #[test]
+    fn a_result_over_the_body_limit_still_reaches_its_caller() {
+        use crate::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+        const LIMIT: usize = 48;
+        let registry = std::sync::Arc::new(AgentPtyRegistry::new());
+        registry.install_inbox(std::sync::Arc::new(crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::generate(),
+            crate::inbox::InboxLimits {
+                max_body_bytes: LIMIT,
+                ..crate::inbox::InboxLimits::default()
+            },
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        )));
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "limited-caller".to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let reservation = registry
+            .inbox()
+            .reserve_reply()
+            .expect("room for the result");
+        post_dispatch_result(
+            &registry,
+            reservation,
+            "limited-caller",
+            &agent,
+            "probe-unit",
+            true,
+            "dispatched probe-unit as a single agent in its own worktree",
+        );
+        let posted = registry.inbox().list("limited-caller");
+        registry.shutdown_all();
+        let [notice] = posted.as_slice() else {
+            panic!("the caller gets exactly one outcome: {posted:#?}");
+        };
+        assert_eq!(notice.subject, "dispatch started");
+    }
+
+    #[test]
+    fn the_undelivered_result_notice_fits_its_limit_on_a_char_boundary() {
+        let notice = undelivered_result_notice(false, "é".repeat(1000).as_str(), 4096);
+        assert!(notice.starts_with("The dispatch failed and started nothing."));
+        assert!(notice.len() < 1000, "the refusal is cut: {}", notice.len());
+        for limit in [0, 1, 7, 60, 61, 62] {
+            let cut = undelivered_result_notice(true, "é é é é é é é é é é é é", limit);
+            assert!(cut.len() <= limit, "{limit}: {cut}");
+        }
     }
 
     /// PR #1735 review: a dispatch that started nothing is posted under a
