@@ -910,6 +910,7 @@ impl InboxHub {
             orchestrator,
             ledger,
             content,
+            MintedSpill::default(),
             worker_holds,
         )
     }
@@ -918,6 +919,10 @@ impl InboxHub {
     /// ([`Self::reserve_delegate`]). The post spends the reservation; a
     /// refusal leaves it held, so the caller can post the notice of the
     /// refusal into it ([`post_reserved_notice_to_live`]) or drop it.
+    ///
+    /// `spill`, the task's saved body, is tracked and held for `worker` in the
+    /// same step that accepts the task ([`Self::post_delegate_with`]); a
+    /// refused post removes it.
     #[allow(clippy::too_many_arguments)]
     pub fn post_reserved_delegate(
         &self,
@@ -927,6 +932,7 @@ impl InboxHub {
         orchestrator: Option<Recipient>,
         ledger: DelegateLedger,
         content: Content,
+        spill: MintedSpill,
         worker_holds: &dyn Fn() -> bool,
     ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
         self.post_delegate_with(
@@ -936,10 +942,18 @@ impl InboxHub {
             orchestrator,
             ledger,
             content,
+            spill,
             worker_holds,
         )
     }
 
+    /// PR #1735 seventh review (B3-01): `spill`, the task's saved body, is
+    /// tracked and held for `worker` under the lock that inserts the task, so
+    /// no exit or `work-done` can retire the task between its acceptance and
+    /// its hold — a hold installed after them would never be released. It is
+    /// held until the task is retired: its worker's `work-done`, a newer task
+    /// superseding it, or the worker exiting, since the worker may still be
+    /// working from it after acknowledging the excerpt.
     #[allow(clippy::too_many_arguments)]
     fn post_delegate_with(
         &self,
@@ -949,9 +963,11 @@ impl InboxHub {
         orchestrator: Option<Recipient>,
         ledger: DelegateLedger,
         content: Content,
+        spill: MintedSpill,
         worker_holds: &dyn Fn() -> bool,
     ) -> Result<(MessageId, oneshot::Receiver<DelegateEnd>), PostRefusal> {
         let (tx, rx) = oneshot::channel();
+        let mut saved = false;
         let (id, superseded) = {
             let mut st = self.lock();
             let now = Instant::now();
@@ -1001,8 +1017,15 @@ impl InboxHub {
                     ledger,
                 },
             );
+            if let Some((path, bytes)) = spill.take() {
+                st.spills.own_task(path, id.as_str(), bytes, &worker);
+                saved = true;
+            }
             (id, superseded)
         };
+        if saved {
+            self.record_spills(self.lock());
+        }
         if superseded > 0 {
             debug!(pane_id = %worker.pane_id, superseded, "inbox: older delegated tasks superseded");
         }
@@ -1979,19 +2002,6 @@ impl InboxHub {
         }
     }
 
-    /// PR #1735 sixth review (B2-02): [`Self::own_spill`] for a delegated
-    /// task posted to `worker`, whose body is kept until the task is retired —
-    /// its worker's `work-done`, a newer task superseding it, or the worker
-    /// exiting — since the worker may still be working from it after
-    /// acknowledging the excerpt.
-    pub fn own_task_spill(&self, spill: MintedSpill, id: &MessageId, worker: &Recipient) {
-        if let Some((path, bytes)) = spill.take() {
-            let mut st = self.lock();
-            st.spills.own_task(path, id.as_str(), bytes, worker);
-            self.record_spills(st);
-        }
-    }
-
     /// Write what `st`'s ledger tracks to this run's manifest, once `st` is
     /// released. The hub's lock is never held while the manifest's is waited
     /// for (PR #1735 review, Qodo 4295418152); a write that a newer one
@@ -2848,9 +2858,11 @@ pub enum PostRefusal {
 
 /// Audit F2: the file [`retain_full_body_minted`] saved for one post, if it
 /// saved one. Dropping it removes the file, so a post the inbox then refuses
-/// leaves nothing behind; [`InboxHub::own_spill`] keeps it for an accepted post
-/// for as long as it can be needed. A `spill_path` the caller supplied is never
-/// held here: the deck removes only what it wrote itself.
+/// leaves nothing behind; [`InboxHub::own_spill`], or
+/// [`InboxHub::post_reserved_delegate`] for a task, hands it to the ledger
+/// for an accepted post, which keeps it under the retention policy in
+/// [`crate::inbox_spills`]. A `spill_path` the caller supplied is never held
+/// here: what is removed is the path created for that post.
 #[must_use = "a saved body is removed again unless it is kept"]
 #[derive(Debug, Default)]
 pub struct MintedSpill(Option<(std::path::PathBuf, u64)>);
@@ -4730,17 +4742,7 @@ mod tests {
         let worker = Recipient::bound("w", "wa");
         let (c, spill) = saved_long(&hub, dir.path(), "QUEUED");
         let path = spill.path().unwrap().to_path_buf();
-        let (task, _end) = hub
-            .post_delegate(
-                worker.clone(),
-                "coder",
-                None,
-                DelegateLedger::default(),
-                c,
-                &|| true,
-            )
-            .unwrap();
-        hub.own_task_spill(spill, &task, &worker);
+        let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
         let context_dir = path.parent().unwrap().to_path_buf();
         let notes = context_dir.join("notes.md");
         std::fs::write(&notes, "an old coordination file").unwrap();
@@ -4780,17 +4782,7 @@ mod tests {
         let worker = Recipient::bound("w", "wa");
         let (c, spill) = saved_long(&hub, dir.path(), "TASK");
         let task_path = spill.path().unwrap().to_path_buf();
-        let (task, _end) = hub
-            .post_delegate(
-                worker.clone(),
-                "coder",
-                None,
-                DelegateLedger::default(),
-                c,
-                &|| true,
-            )
-            .unwrap();
-        hub.own_task_spill(spill, &task, &worker);
+        let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
         let taken = hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
         assert_eq!(taken.len(), 1, "the worker acknowledged its task");
 
@@ -4834,17 +4826,7 @@ mod tests {
         let worker = Recipient::bound("w", "wa");
         let (c, spill) = saved_long(&hub, dir.path(), "TASK");
         let path = spill.path().unwrap().to_path_buf();
-        let (task, _end) = hub
-            .post_delegate(
-                worker.clone(),
-                "coder",
-                None,
-                DelegateLedger::default(),
-                c,
-                &|| true,
-            )
-            .unwrap();
-        hub.own_task_spill(spill, &task, &worker);
+        let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
         hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
         hub.tick();
         assert!(path.exists(), "held while the worker works");
@@ -4854,6 +4836,141 @@ mod tests {
         hub.agent_exited("w", "wa");
         hub.tick();
         assert!(!path.exists(), "the worker's exit retired its task");
+    }
+
+    /// Delegate `c` to `worker` with its saved body `spill`, accepted and held
+    /// in one step.
+    fn delegate_saved(
+        hub: &InboxHub,
+        worker: &Recipient,
+        c: Content,
+        spill: MintedSpill,
+    ) -> (MessageId, oneshot::Receiver<DelegateEnd>) {
+        hub.post_delegate_with(
+            None,
+            worker.clone(),
+            "coder",
+            None,
+            DelegateLedger::default(),
+            c,
+            spill,
+            &|| true,
+        )
+        .unwrap()
+    }
+
+    /// The saved bodies `hub` answers for removal `age` after now, as the
+    /// default policy has it — retention, protected grace and byte bound —
+    /// with the byte bound set to `bound`.
+    fn reclaimed_after(hub: &InboxHub, age: Duration, bound: u64) -> Vec<std::path::PathBuf> {
+        let mut st = hub.lock();
+        st.spills.retention = crate::inbox_spills::DEFAULT_SPILL_RETENTION;
+        st.spills.protected_grace = crate::inbox_spills::DEFAULT_SPILL_PROTECTED_GRACE;
+        st.spills.max_settled_bytes = bound;
+        st.spills
+            .reclaim(
+                Instant::now() + age,
+                SystemTime::now(),
+                &std::collections::HashSet::new(),
+            )
+            .removed
+            .into_iter()
+            .map(|reclaimed| reclaimed.path().to_path_buf())
+            .collect()
+    }
+
+    /// PR #1735 seventh review (B3-01): a worker that exits the moment its
+    /// long task is accepted — before the dispatch that posted it goes any
+    /// further — releases the task's saved body, which is then reclaimed
+    /// after the normal retention, not held for the rest of the run.
+    #[test]
+    fn a_task_body_is_released_by_an_exit_right_after_the_task_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub();
+        let worker = Recipient::bound("w", "wa");
+        let (c, spill) = saved_long(&hub, dir.path(), "TASK");
+        let path = spill.path().unwrap().to_path_buf();
+        let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
+        assert_eq!(
+            hub.lock().spills.held_paths(),
+            vec![path.clone()],
+            "the body is held from the moment the task is accepted"
+        );
+        hub.agent_exited("w", "wa");
+        hub.tick();
+        let retention = crate::inbox_spills::DEFAULT_SPILL_RETENTION;
+        let minute = Duration::from_secs(60);
+        assert!(
+            reclaimed_after(&hub, retention - minute, u64::MAX).is_empty(),
+            "kept for its retention"
+        );
+        assert_eq!(
+            reclaimed_after(&hub, retention + minute, u64::MAX),
+            vec![path],
+            "the exited worker's task body is reclaimed after its retention"
+        );
+    }
+
+    /// PR #1735 seventh review (B3-01): a `work-done` processed the moment a
+    /// long task is accepted releases the task's saved body, which the byte
+    /// bound then reclaims once its protected grace has passed.
+    #[test]
+    fn a_task_body_is_released_by_a_work_done_right_after_the_task_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub();
+        let worker = Recipient::bound("w", "wa");
+        let (c, spill) = saved_long(&hub, dir.path(), "TASK");
+        let path = spill.path().unwrap().to_path_buf();
+        let (_task, _end) = delegate_saved(&hub, &worker, c, spill);
+        assert_eq!(
+            hub.lock().spills.held_paths(),
+            vec![path.clone()],
+            "the body is held from the moment the task is accepted"
+        );
+        hub.retire_answered_delegates_to("w");
+        hub.tick();
+        let grace = crate::inbox_spills::DEFAULT_SPILL_PROTECTED_GRACE;
+        let minute = Duration::from_secs(60);
+        assert!(
+            reclaimed_after(&hub, grace - minute, 1).is_empty(),
+            "spared by the byte bound within its grace"
+        );
+        assert_eq!(
+            reclaimed_after(&hub, grace + minute, 1),
+            vec![path],
+            "the answered task's body is reclaimed by the byte bound after its grace"
+        );
+    }
+
+    /// PR #1735 seventh review (B3-02): a tracked body whose directory cannot
+    /// be searched when its cleanup runs is not taken for someone else's file
+    /// and forgotten: it stays tracked and is removed once it can be.
+    #[cfg(unix)]
+    #[test]
+    fn a_body_that_cannot_be_inspected_at_cleanup_is_tried_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub();
+        let (c, spill) = saved_long(&hub, dir.path(), "HIDDEN");
+        let path = spill.path().unwrap().to_path_buf();
+        let id = hub.post_direct(Recipient::bound("w", "wa"), c).unwrap();
+        hub.own_spill(spill, &id);
+        hub.fetch("w", "wa", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        hub.lock().spills.retention = Duration::ZERO;
+        let context = path.parent().unwrap().to_path_buf();
+        let mode = |m| std::fs::set_permissions(&context, std::fs::Permissions::from_mode(m));
+        // Readable, but not searchable: nothing in it can be looked up.
+        mode(0o600).unwrap();
+        hub.tick();
+        mode(0o700).unwrap();
+        if !path.exists() {
+            // Privileged: the directory's mode does not stop the lookup.
+            return;
+        }
+        assert_eq!(hub.owned_spills(), vec![path.clone()], "still tracked");
+        hub.tick();
+        assert!(!path.exists(), "removed once it can be inspected");
+        assert!(hub.owned_spills().is_empty());
     }
 
     /// PR #1735 sixth review (B2-04): a saved body whose removal fails stays
@@ -4931,6 +5048,7 @@ mod tests {
                 None,
                 DelegateLedger::default(),
                 content("task"),
+                MintedSpill::default(),
                 &|| true,
             )
             .unwrap();
@@ -4961,17 +5079,7 @@ mod tests {
             let (c, spill) = saved_long(&hub, dir.path(), marker);
             let path = spill.path().unwrap().to_path_buf();
             let worker = Recipient::bound("w", "wa");
-            let (id, _end) = hub
-                .post_delegate(
-                    worker.clone(),
-                    "coder",
-                    None,
-                    DelegateLedger::default(),
-                    c,
-                    &|| true,
-                )
-                .unwrap();
-            hub.own_task_spill(spill, &id, &worker);
+            let (id, _end) = delegate_saved(&hub, &worker, c, spill);
             (id, path)
         };
         let (older, older_path) = delegate_long("OLDER");

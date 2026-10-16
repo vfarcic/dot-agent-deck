@@ -81,11 +81,26 @@ pub fn is_spill_file_name(name: &str) -> bool {
     name.starts_with(SPILL_PREFIX) && name.ends_with(".md")
 }
 
-/// `path` matches this deck's naming for a saved body: a regular file — not a
-/// symlink — named by [`spill_file_name`] for `deck`, directly inside a
-/// `.dot-agent-deck` directory that is not a symlink. Checked by path now;
-/// see the module docs for what that does not establish.
-fn is_own_spill(path: &Path, deck: &DeckId) -> bool {
+/// What [`spill_ownership`] found at a path.
+#[derive(Debug)]
+enum Ownership {
+    /// It matches this deck's naming for a saved body.
+    Ours,
+    /// Its name, its directory's name or a type looked up does not match, or
+    /// the file is not there.
+    NotOurs,
+    /// The directory or the file could not be looked up, so whether it matches
+    /// is not known (PR #1735 seventh review, B3-02).
+    Unknown(std::io::Error),
+}
+
+/// Whether `path` matches this deck's naming for a saved body: a regular
+/// file — not a symlink — named by [`spill_file_name`] for `deck`, directly
+/// inside a `.dot-agent-deck` directory that is not a symlink. Checked by path
+/// now; see the module docs for what that does not establish. A lookup that
+/// fails for any reason but the entry being missing answers
+/// [`Ownership::Unknown`], not a mismatch.
+fn spill_ownership(path: &Path, deck: &DeckId) -> Ownership {
     let named = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -94,14 +109,38 @@ fn is_own_spill(path: &Path, deck: &DeckId) -> bool {
                 .and_then(|rest| rest.strip_prefix(deck.as_str()))
                 .is_some_and(|rest| rest.starts_with('-') && rest.ends_with(".md"))
         });
-    let Some(parent) = path.parent() else {
-        return false;
+    let Some(parent) = path.parent().filter(|_| named) else {
+        return Ownership::NotOurs;
     };
-    let placed = parent
+    if parent
         .file_name()
-        .is_some_and(|dir| dir == crate::orchestrator_context::CONTEXT_DIR_NAME)
-        && std::fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_dir());
-    named && placed && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+        .is_none_or(|dir| dir != crate::orchestrator_context::CONTEXT_DIR_NAME)
+    {
+        return Ownership::NotOurs;
+    }
+    let is = |at: &Path, kind: fn(&std::fs::FileType) -> bool| match std::fs::symlink_metadata(at) {
+        Ok(meta) if kind(&meta.file_type()) => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    match is(parent, std::fs::FileType::is_dir).and_then(|placed| {
+        if placed {
+            is(path, std::fs::FileType::is_file)
+        } else {
+            Ok(false)
+        }
+    }) {
+        Ok(true) => Ownership::Ours,
+        Ok(false) => Ownership::NotOurs,
+        Err(error) => Ownership::Unknown(error),
+    }
+}
+
+/// [`spill_ownership`] found `path` matches this deck's naming.
+#[cfg(test)]
+fn is_own_spill(path: &Path, deck: &DeckId) -> bool {
+    matches!(spill_ownership(path, deck), Ownership::Ours)
 }
 
 /// What [`remove_spill`] did.
@@ -110,22 +149,27 @@ pub enum Removal {
     Removed,
     /// Nothing was there any more.
     Gone,
-    /// The path does not match this deck's naming ([`is_own_spill`]), so it
-    /// was left alone.
+    /// The path does not match this deck's naming ([`spill_ownership`]), so
+    /// it was left alone.
     NotOurs,
-    /// The removal failed; it is worth trying again.
+    /// The removal failed, or whether the path matches could not be looked
+    /// up; it is worth trying again.
     Failed(std::io::Error),
 }
 
 /// Remove `path` when it matches `deck`'s naming for a saved body
-/// ([`is_own_spill`]).
+/// ([`spill_ownership`]).
 pub fn remove_spill(path: &Path, deck: &DeckId) -> Removal {
     if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
         return Removal::Gone;
     }
-    if !is_own_spill(path, deck) {
-        debug!(path = %path.display(), "inbox: not removing a file that is not a saved body");
-        return Removal::NotOurs;
+    match spill_ownership(path, deck) {
+        Ownership::Ours => {}
+        Ownership::NotOurs => {
+            debug!(path = %path.display(), "inbox: not removing a file that is not a saved body");
+            return Removal::NotOurs;
+        }
+        Ownership::Unknown(error) => return Removal::Failed(error),
     }
     match std::fs::remove_file(path) {
         Ok(()) => {
@@ -303,6 +347,16 @@ impl SpillLedger {
     /// The saved bodies tracked now.
     pub fn paths(&self) -> Vec<PathBuf> {
         self.owned.iter().map(|spill| spill.path.clone()).collect()
+    }
+
+    /// TEST: the saved bodies a task holds now.
+    #[cfg(test)]
+    pub fn held_paths(&self) -> Vec<PathBuf> {
+        self.owned
+            .iter()
+            .filter(|spill| spill.task.is_some())
+            .map(|spill| spill.path.clone())
+            .collect()
     }
 
     /// Settle every tracked body whose message is not among `live` and that no
@@ -715,7 +769,8 @@ fn read_inventory(path: &Path) -> std::io::Result<Option<Vec<ManifestEntry>>> {
 
 /// Every run's inventory in `dir` that no running daemon holds — its lock
 /// file's lock is free — is read, and the entries it lists that match `deck`'s
-/// naming answered, with the inventory itself to release once they are
+/// naming, or that could not be looked up to tell (PR #1735 seventh review,
+/// B3-02), answered, with the inventory itself to release once they are
 /// recorded elsewhere. An inventory some running daemon holds is left alone,
 /// and so is one that cannot be read, still locked by nobody.
 fn take_over_orphans(
@@ -761,7 +816,7 @@ fn take_over_orphans(
             listed
                 .into_iter()
                 .filter_map(|entry| Some((entry.path.path()?, entry)))
-                .filter(|(path, _)| is_own_spill(path, deck)),
+                .filter(|(path, _)| !matches!(spill_ownership(path, deck), Ownership::NotOurs)),
         );
         sources.push(TakenSource {
             _lock: lock,
@@ -1184,6 +1239,65 @@ mod tests {
         assert_eq!(ledger.paths(), vec![body]);
     }
 
+    /// PR #1735 seventh review (B3-02): a body an ended run listed, whose
+    /// directory cannot be searched when a daemon starts up, is not taken for
+    /// someone else's file: the takeover keeps tracking it, records it in its
+    /// own inventory, and removes it once it can.
+    #[cfg(unix)]
+    #[test]
+    fn a_body_that_cannot_be_inspected_at_takeover_stays_tracked() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let young = spill_in(work.path(), "young");
+        let old = spill_in(work.path(), "old");
+        let wall = SystemTime::now();
+        let hour = Duration::from_secs(60 * 60);
+        let (mut ended, _) = open(state.path(), hour, wall);
+        let mut ledger = SpillLedger::default();
+        ledger.own(young.clone(), "m-young", 1);
+        ledger.own(old.clone(), "m-old", 1);
+        ledger.reclaim(Instant::now(), wall - 2 * hour, &["m-young"].into());
+        ledger.reclaim(Instant::now(), wall, &HashSet::new());
+        ended.write(&ledger.manifest_text()).unwrap();
+        drop(ended);
+
+        let context = young.parent().unwrap().to_path_buf();
+        let mode = |m| std::fs::set_permissions(&context, std::fs::Permissions::from_mode(m));
+        // Readable, but not searchable: nothing in it can be looked up.
+        mode(0o600).unwrap();
+        let privileged = std::fs::symlink_metadata(&young).is_ok();
+        let (mut started_manifest, taken) = open(state.path(), hour, wall);
+        let mut started = SpillLedger {
+            retention: hour,
+            ..SpillLedger::default()
+        };
+        let sources = started.adopt(taken);
+        started_manifest.write(&started.manifest_text()).unwrap();
+        sources.release();
+        mode(0o700).unwrap();
+        if privileged {
+            // The directory's mode does not stop the lookup.
+            return;
+        }
+        let mut tracked = started.paths();
+        tracked.sort();
+        let mut expected = vec![young.clone(), old.clone()];
+        expected.sort();
+        assert_eq!(tracked, expected, "both stay tracked");
+        assert!(young.exists() && old.exists());
+        drop(started_manifest);
+
+        // The next run finds both in this one's inventory: the one past its
+        // retention goes, the other is kept.
+        let (_next, taken) = open(state.path(), hour, wall);
+        let mut next = SpillLedger::default();
+        next.adopt(taken).release();
+        assert!(!old.exists(), "past its retention, removed once it can be");
+        assert!(young.exists());
+        assert_eq!(next.paths(), vec![young]);
+    }
+
     /// PR #1735 review (Qodo 4296692542): a saved body under a directory
     /// whose name is not UTF-8 is recorded losslessly, so a later run still
     /// removes it once its retention has passed.
@@ -1196,7 +1310,19 @@ mod tests {
         let odd = work
             .path()
             .join(std::ffi::OsStr::from_bytes(b"caf\xe9-project"));
-        std::fs::create_dir(&odd).unwrap();
+        match std::fs::create_dir(&odd) {
+            Ok(()) => {}
+            // APFS refuses a name that is not valid UTF-8 with EILSEQ, so no
+            // body can be saved under such a directory on macOS. Linux
+            // filesystems take any bytes, and run the test whatever happens.
+            Err(error)
+                if !cfg!(target_os = "linux") && error.raw_os_error() == Some(libc::EILSEQ) =>
+            {
+                eprintln!("SKIP: this filesystem refuses a directory name that is not UTF-8");
+                return;
+            }
+            Err(error) => panic!("create the non-UTF-8 directory: {error}"),
+        }
         let path = spill_in(&odd, "odd");
         assert!(path.to_str().is_none(), "precondition: not UTF-8");
         let wall = SystemTime::now();

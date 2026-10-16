@@ -5861,10 +5861,10 @@ async fn dispatch_one_owned(
         orchestrator.clone(),
         ledger,
         content,
+        spill,
         &still_live,
     ) {
         Ok((id, ended)) => {
-            registry.inbox().own_task_spill(spill, &id, &worker);
             tracing::info!(
                 role = %target_role,
                 pane_id = %pane_id,
