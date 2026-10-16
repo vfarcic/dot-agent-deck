@@ -10739,8 +10739,8 @@ pub fn spawn_daemon_serve_with_env(
 #[allow(dead_code)]
 impl DaemonProc {
     /// Block until the attach socket file exists (the daemon finished
-    /// binding), failing at once if the daemon exits first and otherwise after
-    /// `load_scaled(DAEMON_START_POLL_TIMEOUT)`.
+    /// binding) and takes connections, failing at once if the daemon exits
+    /// first and otherwise after `load_scaled(DAEMON_START_POLL_TIMEOUT)`.
     ///
     /// PRD #1258: the bound is the binary's own lazy-spawn bound
     /// ([`DAEMON_START_POLL_TIMEOUT`], which covers the daemon's pre-bind work)
@@ -10750,11 +10750,23 @@ impl DaemonProc {
     /// pre-bind work alone taking 5.7 s. PRD #1631 met the same flat 10 s
     /// failing six tests at `io full` 52-72%, which `load_scaled`'s stall
     /// share now widens for.
+    ///
+    /// PR #1735 third review: and until a connection to it is not refused.
+    /// The file appears at `bind(2)`, and the daemon's `listen(2)` follows it,
+    /// so a connect in between is refused (`ECONNREFUSED`); a starved run
+    /// landed a test's first request in that gap (`inbox/protocol/010`). The
+    /// probe connection is closed at once, which the daemon reads as a clean
+    /// end of a connection that sent nothing.
     fn wait_for_attach_socket(&mut self) {
         let budget = load_scaled(DAEMON_START_POLL_TIMEOUT);
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
-            if self.attach_socket.exists() {
+            if self.attach_socket.exists()
+                && !matches!(
+                    std::os::unix::net::UnixStream::connect(&self.attach_socket),
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused
+                )
+            {
                 return;
             }
             if let Ok(Some(status)) = self.child.try_wait() {
