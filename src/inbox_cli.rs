@@ -356,7 +356,7 @@ fn refusal(line: &str) -> Option<String> {
 }
 
 /// `dot-agent-deck inbox fetch`: print the framing sentence and every message
-/// waiting for this agent, and acknowledge them.
+/// waiting for this agent, and acknowledge them once they are printed.
 pub fn fetch(json: bool) -> ExitCode {
     fetch_as(json, None)
 }
@@ -383,6 +383,35 @@ fn fetch_as(json: bool, doorbell: Option<&str>) -> ExitCode {
         eprintln!("{NOT_IN_PANE}");
         return ExitCode::FAILURE;
     };
+    fetch_with(
+        json,
+        doorbell,
+        identity,
+        &mut request,
+        &mut std::io::stdout().lock(),
+        &mut |ids| crate::hook::acknowledge_handed_over(ids),
+    )
+}
+
+/// [`fetch_as`] with its three effects passed in: `send` asks the deck,
+/// `out` is where the content goes, and `settle` acknowledges what reached
+/// `out`.
+///
+/// PR #1735 fifth review (N2): the fetch never acknowledges. A plain fetch
+/// writes the content, flushes it, and only then acknowledges exactly what it
+/// wrote, so a reply lost on the way, a request that timed out or a closed
+/// stdout leaves the messages to be handed over again instead of shown as
+/// delivered. A doorbell fetch acknowledges nothing here: its component does,
+/// once its agent has the content. `get-seed`, the compatibility alias, keeps
+/// its own acknowledge-on-fetch in the daemon and does not come through here.
+fn fetch_with(
+    json: bool,
+    doorbell: Option<&str>,
+    identity: Identity,
+    send: &mut dyn FnMut(&DaemonMessage) -> Result<String, String>,
+    out: &mut dyn Write,
+    settle: &mut dyn FnMut(&[String]),
+) -> ExitCode {
     let message = DaemonMessage::InboxFetch(InboxFetchRequest {
         pane_id: identity.pane_id,
         agent_id: identity.agent_id,
@@ -394,10 +423,10 @@ fn fetch_as(json: bool, doorbell: Option<&str>) -> ExitCode {
         },
         max_chars: None,
         max_bytes: None,
-        ack: doorbell.is_none(),
+        ack: false,
         doorbell: doorbell.map(str::to_string),
     });
-    let line = match request(&message) {
+    let line = match send(&message) {
         Ok(line) => line,
         Err(why) => {
             eprintln!("Could not fetch messages: {why}.");
@@ -417,18 +446,24 @@ fn fetch_as(json: bool, doorbell: Option<&str>) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    if json {
-        println!("{}", line.trim_end());
-        return ExitCode::SUCCESS;
+    let written = if json {
+        writeln!(out, "{}", line.trim_end())
+    } else if messages.is_empty() {
+        writeln!(out, "No dot-agent-deck messages are waiting.")
+    } else {
+        let mut text = AGENT_FRAMING.to_string();
+        for message in &messages {
+            text.push_str("\n\n");
+            text.push_str(&message.text);
+        }
+        writeln!(out, "{text}")
+    };
+    if written.and_then(|()| out.flush()).is_err() {
+        return ExitCode::FAILURE;
     }
-    if messages.is_empty() {
-        println!("No dot-agent-deck messages are waiting.");
-        return ExitCode::SUCCESS;
-    }
-    println!("{AGENT_FRAMING}");
-    for message in &messages {
-        println!();
-        println!("{}", message.text);
+    if doorbell.is_none() {
+        let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+        settle(&ids);
     }
     ExitCode::SUCCESS
 }
@@ -756,6 +791,84 @@ pub fn parse_duration_ms(text: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writer that refuses everything, as a closed stdout does.
+    struct Closed;
+
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    /// PR #1735 fifth review (N2): plain `inbox fetch` asks the deck for the
+    /// messages without acknowledging them, writes them, and acknowledges
+    /// exactly what it wrote, only once the write succeeded. Output that
+    /// never reaches the caller — a closed stdout — acknowledges nothing, so
+    /// the deck hands the message over again rather than showing it
+    /// delivered. A doorbell fetch, which the component acknowledges itself,
+    /// settles nothing here.
+    #[test]
+    fn a_plain_fetch_acknowledges_only_what_it_wrote() {
+        let delivery = crate::event::InboxDelivery {
+            id: "m-k3xzq2ab-0123456789abcdef".to_string(),
+            subject: "subject".to_string(),
+            from: "deck".to_string(),
+            text: "[dot-agent-deck message m-k3xzq2ab-0123456789abcdef from deck]".to_string(),
+        };
+        let answer =
+            serde_json::to_string(&InboxWaitReply::messages(vec![delivery.clone()])).unwrap();
+        let identity = || Identity {
+            pane_id: "p".to_string(),
+            agent_id: Some("a".to_string()),
+            token: Some("t".to_string()),
+        };
+        let run = |json: bool, doorbell: Option<&str>, out: &mut dyn Write| {
+            let mut asked = Vec::new();
+            let mut settled = Vec::new();
+            let code = fetch_with(
+                json,
+                doorbell,
+                identity(),
+                &mut |message| {
+                    asked.push(message.clone());
+                    Ok(answer.clone())
+                },
+                out,
+                &mut |ids| settled.extend_from_slice(ids),
+            );
+            (code, asked, settled)
+        };
+        let acked = |asked: &[DaemonMessage]| match asked {
+            [DaemonMessage::InboxFetch(request)] => request.ack,
+            other => panic!("one inbox_fetch, got {other:?}"),
+        };
+
+        let (code, asked, settled) = run(false, None, &mut Closed);
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(!acked(&asked), "the fetch itself must not acknowledge");
+        assert!(settled.is_empty(), "nothing was written: {settled:?}");
+
+        for json in [false, true] {
+            let mut out = Vec::new();
+            let (code, asked, settled) = run(json, None, &mut out);
+            assert_eq!(code, ExitCode::SUCCESS);
+            assert!(!acked(&asked));
+            assert!(String::from_utf8(out).unwrap().contains(&delivery.text));
+            assert_eq!(settled, vec![delivery.id.clone()], "json: {json}");
+        }
+
+        let mut out = Vec::new();
+        let (_, asked, settled) = run(true, Some(delivery.id.as_str()), &mut out);
+        assert!(!acked(&asked));
+        assert!(
+            settled.is_empty(),
+            "a doorbell fetch's component acknowledges"
+        );
+    }
 
     /// PRD #1666 S8: `inbox wait --agent opencode-mini` speaks for OpenCode's
     /// `--mini` server plugin, on the wire as `opencode_mini`; the full TUI's
