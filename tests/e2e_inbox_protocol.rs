@@ -848,8 +848,8 @@ fn inbox_protocol_016_a_raw_event_from_outside_the_agent_acknowledges_nothing() 
 /// by the time the daemon reads it: a child of this test process connects a
 /// socket this process created, then exits, and this process keeps using it.
 /// The kernel still reports the child as the peer, and its ancestry can no
-/// longer be read.
-fn connect_from_an_exited_process(path: &Path) -> BufReader<UnixStream> {
+/// longer be read. Answers the connection and the exited child's pid.
+fn connect_from_an_exited_process(path: &Path) -> (BufReader<UnixStream>, u32) {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
     // SAFETY: plain syscalls on values this function owns. The forked child
@@ -880,19 +880,30 @@ fn connect_from_an_exited_process(path: &Path) -> BufReader<UnixStream> {
         let socket = UnixStream::from_raw_fd(fd);
         socket.set_read_timeout(Some(WAIT)).unwrap();
         socket.set_write_timeout(Some(WAIT)).unwrap();
-        BufReader::new(socket)
+        (BufReader::new(socket), child as u32)
     }
 }
 
-/// Scenario: With the daemon binding inbox components to the pane's agent, a connection whose creator exited before it is used presents the pane's own token and tries to fetch, acknowledge and get-seed the agent's queued task. The daemon can no longer read who made the connection, so each is refused and the task stays Queued.
+/// Scenario: With the daemon binding inbox components to the pane's agent, a connection whose creator exited before it is used presents the pane's own token and tries to fetch, acknowledge, arm a waiter for and get-seed the agent's queued task, and to announce a native wake naming that exited creator. The daemon can no longer read who made the connection, so each is refused and the task stays Queued; the real stream waiter then run inside the pane still arms.
 #[spec("inbox/protocol/017")]
 #[test]
 fn inbox_protocol_017_a_connection_of_unknown_ancestry_cannot_take_mail() {
     let daemon = common::spawn_daemon_serve(None, "0");
-    let pane = pane(&daemon, "bound-unknown", "exec /bin/cat");
+    let script = daemon.home.join("wait.sh");
+    std::fs::write(&script, "#!/bin/sh\nwhile [ ! -f wait-go ]; do sleep 0.05; done\n\"$INBOX_TEST_BIN\" inbox wait --agent pi --stream > wait.stdout 2> wait.stderr\nexec /bin/cat\n").unwrap();
+    // Quote only fixture-owned paths; the binary path contains no shell code.
+    // `exec` makes the script's shell the pane's agent process, as an agent's
+    // own binary is: a shell under the launch shell would read as a nested
+    // agent of the same kind, and the receiver check refuses its waiter.
+    let command = format!(
+        "exec env INBOX_TEST_BIN='{}' /bin/sh '{}'",
+        env!("CARGO_BIN_EXE_dot-agent-deck").replace('\'', "'\\''"),
+        script.display()
+    );
+    let pane = pane(&daemon, "bound-unknown", &command);
     let id = enqueue(&daemon, &pane);
     let send = |request: &Value| -> Value {
-        let mut socket = connect_from_an_exited_process(&daemon.hook_socket);
+        let (mut socket, _) = connect_from_an_exited_process(&daemon.hook_socket);
         writeln!(socket.get_mut(), "{request}").unwrap();
         line(&mut socket)
     };
@@ -917,7 +928,34 @@ fn inbox_protocol_017_a_connection_of_unknown_ancestry_cannot_take_mail() {
     assert_eq!(reply["refused"], "inbox_not_agent_process", "wait: {reply}");
     let reply = send(&request(&pane, "get_seed"));
     assert!(reply["seed"].is_null(), "get_seed: {reply}");
+    // PR #1735 third review (F1): an announce naming the exited creator would
+    // pin that dead process as the agent's receiver, and lock the real one out.
+    let (mut socket, creator) = connect_from_an_exited_process(&daemon.hook_socket);
+    let mut announce = request(&pane, "inbox_announce");
+    announce["component"] = json!("pi_extension");
+    announce["component_version"] = json!("synthetic");
+    announce["wake"] = json!("native");
+    announce["pid"] = json!(creator);
+    writeln!(socket.get_mut(), "{announce}").unwrap();
+    let reply = line(&mut socket);
+    assert_eq!(reply["accepted"], false, "announce: {reply}");
+    assert_eq!(
+        reply["reason"], "inbox_not_agent_process",
+        "announce: {reply}"
+    );
     state(&daemon, &pane, &id, "queued");
+    std::fs::write(daemon.home.join("wait-go"), b"go").unwrap();
+    let stderr = || std::fs::read_to_string(daemon.home.join("wait.stderr")).unwrap_or_default();
+    let latest = RefCell::new(Value::Null);
+    assert!(
+        common::wait_until(WAIT, || {
+            *latest.borrow_mut() = listing(&daemon, &pane);
+            latest.borrow()["armed"].as_u64() == Some(1)
+        }),
+        "the in-pane stream waiter must arm; last listing: {}, its stderr: {}",
+        latest.borrow(),
+        stderr()
+    );
 }
 
 /// Scenario: Fill a deck that may hold one message, then have an agent pane ask it to dispatch a unit. The deck has no room for the dispatch's result, so it refuses the dispatch with deck_full instead of accepting it, and no unit is started.

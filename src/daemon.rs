@@ -4998,13 +4998,14 @@ enum ComponentUse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Evidence {
     /// Refused only on a positive "not the agent's"; a walk that cannot say
-    /// admits. For the verbs that post, settle a job or announce a wake.
+    /// admits. For the verbs that post or settle a job.
     BestEffort,
     /// PR #1735 second review: admitted only on a positive "the agent's". For
     /// the verbs that take or settle the agent's own mail — fetch, ack,
-    /// get-seed and arming a waiter — since a caller can make its ancestry
-    /// unreadable on purpose: a connection whose creator exited still reports
-    /// that creator as its peer.
+    /// get-seed and arming a waiter — and, since the third review, announcing
+    /// a wake, which pins the agent's receiver: a caller can make its ancestry
+    /// unreadable on purpose, since a connection whose creator exited still
+    /// reports that creator as its peer.
     Required,
 }
 
@@ -5015,7 +5016,7 @@ enum Evidence {
 /// [`crate::platform::proc::ANCESTRY_LOOKUP`], where no caller could prove
 /// anything.
 fn admit_inbox_component(
-    peer: Option<u32>,
+    peer: Option<AcceptedPeer>,
     claimed: Option<u32>,
     root: Option<u32>,
     used_as: ComponentUse,
@@ -5029,23 +5030,107 @@ fn admit_inbox_component(
     }
     #[cfg(not(feature = "e2e"))]
     let _ = ENV_TEST_UNBOUND_COMPONENTS;
-    let descends = crate::platform::proc::descends_from;
     let evidence = if crate::platform::proc::ANCESTRY_LOOKUP {
         evidence
     } else {
         Evidence::BestEffort
     };
-    match used_as {
-        ComponentUse::Cli => admit_component_process(peer, claimed, root, descends, evidence),
+    admit_inbox_component_with(peer, claimed, root, used_as, evidence, &PLATFORM_LOOKUPS)
+}
+
+/// PR #1735 third review (F2): the connecting process as the daemon accepted
+/// its hook connection — the pid the kernel reported, and when that process
+/// started ([`crate::platform::proc::process_start_of`]), `None` where that
+/// cannot be read. A connection keeps reporting the process that made it after
+/// that process exits, and its pid can then be reused; the start time tells
+/// the process that connected from a later one holding the same number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptedPeer {
+    pid: u32,
+    started: Option<u64>,
+}
+
+impl AcceptedPeer {
+    /// The peer `pid` names, read now, as the connection is accepted.
+    fn accept(pid: Option<u32>) -> Option<Self> {
+        pid.map(|pid| Self {
+            pid,
+            started: crate::platform::proc::process_start_of(pid),
+        })
+    }
+}
+
+/// The process-table reads the inbox admission makes, injectable so a test
+/// can stand in a process table — a reused pid included.
+struct ProcessLookups {
+    descends: fn(u32, u32) -> Option<bool>,
+    parent_of: fn(u32) -> Option<u32>,
+    executable_of: fn(u32) -> Option<std::path::PathBuf>,
+    started: fn(u32) -> Option<u64>,
+}
+
+/// This platform's process table.
+const PLATFORM_LOOKUPS: ProcessLookups = ProcessLookups {
+    descends: crate::platform::proc::descends_from,
+    parent_of: crate::platform::proc::parent_pid_of,
+    executable_of: crate::platform::proc::executable_of,
+    started: crate::platform::proc::process_start_of,
+};
+
+/// [`admit_inbox_component`] over `lookups`, with `evidence` already settled
+/// for the platform.
+///
+/// PR #1735 third review (F2): the peer's ancestry is walked by its pid, so
+/// once the walk has answered, the peer must still be the process accepted
+/// ([`still_the_accepted_peer`]). Read after the walk, the same start time
+/// means that process was alive from the accept through the walk, so the walk
+/// read its ancestry and not a later process's that reuses its pid.
+fn admit_inbox_component_with(
+    peer: Option<AcceptedPeer>,
+    claimed: Option<u32>,
+    root: Option<u32>,
+    used_as: ComponentUse,
+    evidence: Evidence,
+    lookups: &ProcessLookups,
+) -> Result<Option<u32>, &'static str> {
+    let pid = peer.map(|peer| peer.pid);
+    let admitted = match used_as {
+        ComponentUse::Cli => {
+            admit_component_process(pid, claimed, root, lookups.descends, evidence)
+        }
         ComponentUse::Receiver => admit_receiver_process(
-            peer,
+            pid,
             claimed,
             root,
-            descends,
-            crate::platform::proc::parent_pid_of,
-            crate::platform::proc::executable_of,
+            lookups.descends,
+            lookups.parent_of,
+            lookups.executable_of,
             evidence,
         ),
+    }?;
+    if let Some(peer) = peer {
+        still_the_accepted_peer(peer, lookups.started, evidence)?;
+    }
+    Ok(admitted)
+}
+
+/// PR #1735 third review (F2): whether `peer.pid` still names the process
+/// accepted as `peer`. A different start time is a positive "no" and refuses
+/// under either [`Evidence`]; a start time that cannot be read now, or could
+/// not be when the connection was accepted, refuses only
+/// [`Evidence::Required`].
+fn still_the_accepted_peer(
+    peer: AcceptedPeer,
+    started_of: fn(u32) -> Option<u64>,
+    evidence: Evidence,
+) -> Result<(), &'static str> {
+    match (peer.started, started_of(peer.pid)) {
+        (Some(then), Some(now)) if then == now => Ok(()),
+        (Some(_), Some(_)) => {
+            Err("the connecting process has exited, and its process id now names another")
+        }
+        _ if evidence == Evidence::Required => Err("the connecting process cannot be identified"),
+        _ => Ok(()),
     }
 }
 
@@ -5056,7 +5141,7 @@ fn admit_inbox_component(
 /// evidence that the caller is in it ([`Evidence::Required`]). Logs a refusal.
 fn mail_taker_admitted(
     registry: &AgentPtyRegistry,
-    peer: Option<u32>,
+    peer: Option<AcceptedPeer>,
     agent_id: &str,
     verb: &str,
     pane_id: &str,
@@ -5526,7 +5611,13 @@ async fn run_hook_loop_with_limits(
                     // PRD #1666 hardening M2: the process on the other end,
                     // as the kernel reports it, for the inbox verbs that bind
                     // a component to the pane's agent.
-                    let peer_pid = crate::platform::peercred::peer_pid(&stream).ok();
+                    //
+                    // PR #1735 third review (F2): recorded with when that
+                    // process started, so every later check names the process
+                    // that connected, not whatever reuses its pid.
+                    let peer_pid = AcceptedPeer::accept(
+                        crate::platform::peercred::peer_pid(&stream).ok(),
+                    );
                     let (read_half, mut write_half) = tokio::io::split(stream);
                     let mut reader = tokio::io::BufReader::new(read_half);
 
@@ -5892,12 +5983,18 @@ async fn run_hook_loop_with_limits(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
+                                    // PR #1735 third review (F1): an announce
+                                    // pins the receiver and opens the
+                                    // native-wake grace, so it needs the same
+                                    // positive evidence as arming a waiter: an
+                                    // unproven one could pin a dead process and
+                                    // lock the real integration out.
                                     let instance = match admit_inbox_component(
                                         peer_pid,
                                         req.pid,
                                         pty_registry.child_pid(&agent_id),
                                         ComponentUse::Receiver,
-                                        Evidence::BestEffort,
+                                        Evidence::Required,
                                     ) {
                                         Ok(instance) => instance,
                                         Err(why) => {
@@ -11502,6 +11599,124 @@ mod hook_ingestion_tests {
         assert!(best_effort(Some(99), None, Some(10)).is_ok());
         assert!(best_effort(None, None, Some(10)).is_ok());
         assert!(best_effort(Some(12), None, None).is_ok());
+    }
+
+    /// PR #1735 third review (F2): a connection's creator exited and its pid
+    /// was reused by a process inside the agent's tree. The pid now descends
+    /// from the agent, but it names a process that started later than the one
+    /// accepted, so every inbox verb refuses it — taking mail, posting, arming
+    /// and announcing alike. The accepted process itself is still admitted; one
+    /// whose start time cannot be read now, or could not be at the accept, is
+    /// refused only where positive evidence is required.
+    #[test]
+    fn a_reused_peer_pid_is_refused_though_it_descends_from_the_agent() {
+        // 1 ── 10 (agent) ── 11 (hook shell) ── 12 (hook CLI, started at 2000).
+        // The connection was accepted from an earlier 12, started at 1000.
+        let lookups = ProcessLookups {
+            descends: |pid, root| {
+                crate::platform::proc::descends_from_with(pid, root, |pid| match pid {
+                    10 => Some(1),
+                    11 => Some(10),
+                    12 => Some(11),
+                    _ => None,
+                })
+            },
+            parent_of: |pid| match pid {
+                10 => Some(1),
+                11 => Some(10),
+                12 => Some(11),
+                _ => None,
+            },
+            executable_of: |_| None,
+            started: |pid| match pid {
+                10 => Some(100),
+                11 => Some(1500),
+                12 => Some(2000),
+                _ => None,
+            },
+        };
+        let admit = |peer, claimed, used_as, evidence| {
+            admit_inbox_component_with(peer, claimed, Some(10), used_as, evidence, &lookups)
+        };
+        let reused = AcceptedPeer {
+            pid: 12,
+            started: Some(1000),
+        };
+        let accepted = AcceptedPeer {
+            pid: 12,
+            started: Some(2000),
+        };
+        let unread_at_accept = AcceptedPeer {
+            pid: 12,
+            started: None,
+        };
+        for evidence in [Evidence::Required, Evidence::BestEffort] {
+            for (used_as, claimed) in [
+                (ComponentUse::Cli, None),
+                (ComponentUse::Receiver, Some(11)),
+            ] {
+                assert_eq!(
+                    admit(Some(reused), claimed, used_as, evidence),
+                    Err("the connecting process has exited, and its process id now names another"),
+                    "{used_as:?} {evidence:?}"
+                );
+                assert_eq!(
+                    admit(Some(accepted), claimed, used_as, evidence),
+                    Ok(claimed),
+                    "{used_as:?} {evidence:?}"
+                );
+            }
+        }
+        assert!(
+            admit(
+                Some(unread_at_accept),
+                None,
+                ComponentUse::Cli,
+                Evidence::Required
+            )
+            .is_err()
+        );
+        assert!(
+            admit(
+                Some(unread_at_accept),
+                None,
+                ComponentUse::Cli,
+                Evidence::BestEffort
+            )
+            .is_ok()
+        );
+        let gone = AcceptedPeer {
+            pid: 12,
+            started: Some(2000),
+        };
+        let without_12 = ProcessLookups {
+            started: |pid| (pid != 12).then_some(1),
+            ..lookups
+        };
+        assert!(
+            admit_inbox_component_with(
+                Some(gone),
+                None,
+                Some(10),
+                ComponentUse::Cli,
+                Evidence::Required,
+                &without_12
+            )
+            .is_err(),
+            "a start time that cannot be read now refuses where evidence is required"
+        );
+    }
+
+    /// The real process table: this test process reads its own start time, the
+    /// same each time, on a platform that has one.
+    #[test]
+    fn a_process_start_time_is_stable_for_one_process() {
+        let me = std::process::id();
+        let first = crate::platform::proc::process_start_of(me);
+        assert_eq!(first, crate::platform::proc::process_start_of(me));
+        if crate::platform::proc::ANCESTRY_LOOKUP {
+            assert!(first.is_some(), "this platform reads start times");
+        }
     }
 
     /// Audit F3 (b): a component registering the agent's native receiver is

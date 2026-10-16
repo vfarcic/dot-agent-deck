@@ -7916,8 +7916,8 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 
 ##### inbox/protocol/017 — A connection of unknown ancestry cannot take mail.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on; each request goes over a connection a forked child made and then exited from, so its ancestry cannot be read.
-- **Agent:** none (`cat` stand-in).
-- **Asserts:** fetch, ack and a once waiter are refused as `inbox_not_agent_process`, get_seed answers no seed, and the task stays Queued.
+- **Agent:** none (shell stand-in, `exec`'d as the pane's process, that runs the real `inbox wait --agent pi --stream` once a fixture sentinel appears).
+- **Asserts:** fetch, ack and a once waiter are refused as `inbox_not_agent_process`, get_seed answers no seed, a native announce naming the exited creator is refused as `inbox_not_agent_process` (PR #1735 third review, F1), and the task stays Queued; the in-pane stream waiter then still arms.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/018 — A dispatch the deck has no room to answer is refused.

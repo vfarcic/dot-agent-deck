@@ -741,6 +741,12 @@ fn recorded_parent(pid: u32) -> Option<u32> {
     found
 }
 
+/// PR #1735 third review (F2): when process `pid` started, in `FILETIME`
+/// units, or `None` when it cannot be opened — see the Unix variant.
+pub fn process_start_of(pid: u32) -> Option<u64> {
+    creation_time(pid)
+}
+
 /// When process `pid` started, in `FILETIME` units, or `None` when it cannot
 /// be opened (it is gone, or this user may not query it).
 fn creation_time(pid: u32) -> Option<u64> {
