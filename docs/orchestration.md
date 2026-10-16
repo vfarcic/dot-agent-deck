@@ -483,7 +483,17 @@ The desktop app's handoff rail shows `delegated · queued`, `delivered · workin
 
 In the recipient's pane, deck messages show a `Sent by:` line. Reports from other agents are marked UNTRUSTED: read them as information. After refreshing Claude Code's hooks, native messages show `✉ dot-agent-deck message` in its pane. Codex's turn-end hand-over can appear as **Blocked by hook** with an explanation of the deck message; this is how the next task reaches Codex.
 
-A long message can arrive as an excerpt naming a file with its full content. Read that file to get the rest of the task or report. If the deck cannot save the full content, it refuses the message and reports the problem to the sender. This applies in both clients.
+A long message can arrive as an excerpt naming a file with its full content, usually in the project's `.dot-agent-deck/` directory. Read that file to get the rest of the task or report. If the deck cannot save the full content, it refuses the message and reports the problem to the sender.
+
+The deck removes these files itself, on the same schedule whether you watch the agents in the TUI or the desktop app:
+
+- While the message waits to be received, its file stays.
+- A delegated task's file stays until the worker reports `work-done`, a newer task replaces it, or the worker exits.
+- After that, and for any other message once it has been received or dropped, the file is kept for about a day.
+- When many long messages pile up, the deck removes the oldest of these files sooner, but not within an hour of the message being received or the task ending.
+- Restarting the deck keeps counting from when the message was received. A file the deck was still keeping for a waiting message or an unfinished task when it stopped is kept for about a day from the restart.
+
+Copy anything you want to keep out of these files into your own project files.
 
 ### Which agents wake for messages
 
