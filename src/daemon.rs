@@ -3592,6 +3592,17 @@ fn install_delivery_notice_sink(
                 registry.publish_delivery_notice(notice);
             }
         }));
+    // PR #1735 fifth review (N4): the inbox's own notices to an agent are
+    // posted only while that agent still holds its pane, asked under the
+    // inbox's lock.
+    let live_registry = Arc::downgrade(registry);
+    registry
+        .inbox()
+        .set_live_agent_check(std::sync::Arc::new(move |pane_id, agent_id| {
+            live_registry.upgrade().is_some_and(|registry| {
+                registry.pane_current_agent_id(pane_id).as_deref() == Some(agent_id)
+            })
+        }));
     let weak_registry = Arc::downgrade(registry);
     registry.set_delivery_notice_sink(std::sync::Arc::new(move |notice| {
         let state = state.clone();
@@ -6444,6 +6455,41 @@ async fn run_hook_loop_with_limits(
                                     // reads, bound to the attested sender. Before
                                     // the return route's own handling, which is
                                     // unchanged.
+                                    //
+                                    // PR #1735 fifth review (N3): room for the
+                                    // report is held BEFORE anything is taken on —
+                                    // the completion mark, the delegation, a
+                                    // dispatched unit's return edge — so a report
+                                    // the worker is told was accepted cannot then
+                                    // be refused by its orchestrator's full inbox
+                                    // or a deck that filled meanwhile. With no room
+                                    // now the work-done is refused, visibly, and
+                                    // nothing it would have consumed is touched.
+                                    let room = match pty_registry.inbox().reserve_reply() {
+                                        Ok(room) => room,
+                                        Err(error) => {
+                                            warn!(
+                                                pane_id = %escape_id_for_log(&signal.pane_id),
+                                                %error,
+                                                "hook socket: refused a work-done; the deck has \
+                                                 no room for its report"
+                                            );
+                                            let refusal = crate::event::SignalAck::refused(
+                                                "deck_full",
+                                                &format!(
+                                                    "{error}, so it could not take this work-done \
+                                                     report; nothing was reported, so run \
+                                                     work-done again once the deck has room"
+                                                ),
+                                            );
+                                            if let Ok(json) = serde_json::to_string(&refusal) {
+                                                let line = format!("{json}\n");
+                                                let _ = write_half.write_all(line.as_bytes()).await;
+                                                let _ = write_half.flush().await;
+                                            }
+                                            continue;
+                                        }
+                                    };
                                     mark_dispatched_unit_completion(
                                         &pty_registry,
                                         &signal,
@@ -6456,7 +6502,7 @@ async fn run_hook_loop_with_limits(
                                         .await;
                                     // PRD #1666 S5: a post, not a write — nothing
                                     // waits on the recipient.
-                                    delivery.deliver(&pty_registry).await;
+                                    delivery.deliver(&pty_registry, room).await;
                                     if let Ok(json) = serde_json::to_string(
                                         &crate::event::SignalAck::accepted(),
                                     ) {
@@ -12690,6 +12736,43 @@ mod hook_ingestion_tests {
             fx.orchestrator_saw("WORKDONE-QUEUED-FIRST-7d2e", Duration::from_secs(20))
                 .await,
             "the acknowledged report never reached the orchestrator's PTY"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: PR #1735 fifth review (N3) — the orchestrator is busy and its
+    /// inbox is full when a worker reports `work-done`. The worker is told its
+    /// report was accepted, so the report must reach the orchestrator's inbox
+    /// anyway, rather than be refused there and kept only in the daemon log.
+    #[tokio::test]
+    async fn a_work_done_reaches_an_orchestrator_whose_inbox_is_full() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let fx = ProvenanceFixture::start().await;
+        let orchestrator =
+            crate::inbox::Recipient::bound(PROV_ORCH_PANE, fx.orchestrator_agent.as_str());
+        while fx
+            .registry
+            .inbox()
+            .post_direct(
+                orchestrator.clone(),
+                crate::inbox::Content::from_deck("seed", "filler", "filler"),
+            )
+            .is_ok()
+        {}
+        let stream = open_work_done(&fx, "WORKDONE-FULL-INBOX-91c4").await;
+        let mut reply = BufReader::new(stream);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(20), reply.read_line(&mut line))
+            .await
+            .expect("the work-done was never answered")
+            .expect("read the answer");
+        let ack: crate::event::SignalAck = serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("work_done reply was not a SignalAck ({e}): {line:?}"));
+        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
+        assert!(
+            fx.orchestrator_saw("WORKDONE-FULL-INBOX-91c4", Duration::from_secs(20))
+                .await,
+            "an accepted report never reached the orchestrator whose inbox was full"
         );
         fx.stop().await;
     }

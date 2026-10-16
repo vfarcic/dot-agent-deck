@@ -6984,16 +6984,19 @@ fn post_message(
     // PRD #1666 hardening H4: a body too long to hand over whole is saved to
     // a file the block names, or the post is refused.
     let dirs = crate::inbox_hub::spill_dirs(registry, pane_id, Some(live.as_str()));
-    let spill = match crate::inbox_hub::retain_full_body_minted(
-        &registry.inbox().deck(),
-        pane_id,
-        &mut content,
-        &dirs,
-    ) {
+    let deck = registry.inbox().deck();
+    let spill = match crate::inbox_hub::off_the_executor(|| {
+        crate::inbox_hub::retain_full_body_minted(&deck, pane_id, &mut content, &dirs)
+    }) {
         Ok(spill) => spill,
         Err(error) => return AttachResponse::err(format!("post-message: {error}")),
     };
-    match registry.inbox().post_direct(to, content) {
+    // PR #1735 fifth review (N4): the agent sampled above is asked about again
+    // under the inbox's lock, right before the message goes in, so a message
+    // never lands after that agent's exit sweep. A refusal removes the saved
+    // body.
+    let still_live = || registry.pane_current_agent_id(pane_id).as_deref() == Some(live.as_str());
+    match registry.inbox().post_direct_where(to, content, &still_live) {
         Ok(id) => {
             spill.keep();
             AttachResponse::with_id(id.to_string())

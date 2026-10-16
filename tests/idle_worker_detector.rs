@@ -431,7 +431,12 @@ impl IdleHarness {
             )
             .await;
         let accepted = tokio::time::Instant::now();
-        delivery.deliver(&self.registry).await;
+        let room = self
+            .registry
+            .inbox()
+            .reserve_reply()
+            .expect("room for the report");
+        delivery.deliver(&self.registry, room).await;
         accepted
     }
 

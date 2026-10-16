@@ -53,8 +53,12 @@ pub const DECK_MESSAGE_METADATA_KEY: &str = "deck_message";
 /// The label a card shows for a deck message whose subject is unknown.
 const UNKNOWN_SUBJECT: &str = "dot-agent-deck message";
 
-/// The most ids one prompt is read for.
-const MAX_IDS: usize = 16;
+/// The most ids one prompt is read for, and so the most blocks one budgeted
+/// hand-over carries (`inbox_hub`'s batch fitting): Claude's prompt hook
+/// acknowledges the ids it reads here, so a block past this count would be in
+/// the model's context unacknowledged and handed over again (PR #1735 fifth
+/// review, N1).
+pub const MAX_IDS: usize = 16;
 
 /// The most characters of a subject a card label carries.
 const MAX_SUBJECT_CHARS: usize = 120;

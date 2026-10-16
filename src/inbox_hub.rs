@@ -352,8 +352,18 @@ struct HubState {
     /// PRD #1666 S5: delegated tasks not yet acknowledged, by message id.
     delegates: HashMap<String, DelegateWatch>,
     /// Notices a state change owes — recipient, subject, body — posted once
-    /// the lock is released ([`InboxHub::post_owed_notices`]).
+    /// the lock is released ([`InboxHub::post_owed_notices`]). One a full
+    /// inbox or deck refused stays here until it is posted or its recipient
+    /// is gone (PR #1735 fifth review, N3).
     owed_notices: Vec<(Recipient, &'static str, String)>,
+    /// When owed notices a full inbox refused are next tried, so the ticker
+    /// wakes for them even when nothing else is due.
+    owed_retry_at: Option<Instant>,
+    /// Whether a bound recipient's agent still holds its pane, asked under
+    /// this lock right before a message for it goes in
+    /// ([`InboxHub::set_live_agent_check`]); unset, every post is taken as
+    /// live.
+    live_agent: Option<LiveAgentCheck>,
     /// PRD #1666 S11: open offers, by message id.
     offers: HashMap<String, OfferContext>,
     /// PRD #1666 S11: woken when an offer is back in its pool with no holder,
@@ -523,6 +533,8 @@ impl InboxHub {
                 broadcast: None,
                 delegates: HashMap::new(),
                 owed_notices: Vec::new(),
+                owed_retry_at: None,
+                live_agent: None,
                 offers: HashMap::new(),
                 pooled: Arc::new(Notify::new()),
                 rings: HashMap::new(),
@@ -586,6 +598,18 @@ impl InboxHub {
         self.lock().card_notice_sink = Some(sink);
     }
 
+    /// PR #1735 fifth review (N4): install the daemon's answer to "does agent
+    /// `agent` still hold pane `pane`?". Every post of a bound message without
+    /// its own check ([`Self::post_direct_where`]) asks it under this hub's
+    /// lock, right before the message goes in: an agent swept by
+    /// [`Self::agent_exited`] has already stopped holding its pane, so a
+    /// message can never land after that sweep and wait for an agent that is
+    /// gone. The check takes the registry's lock under this one, the order
+    /// [`Self::post_delegate`]'s check already takes.
+    pub fn set_live_agent_check(&self, check: LiveAgentCheck) {
+        self.lock().live_agent = Some(check);
+    }
+
     pub fn deck(&self) -> DeckId {
         self.lock().inbox.deck().clone()
     }
@@ -640,7 +664,20 @@ impl InboxHub {
     /// Post one direct message and hand it straight to an armed waiter if the
     /// recipient has one.
     pub fn post_direct(&self, to: Recipient, content: Content) -> Result<MessageId, PostError> {
-        self.post_with(to, content, Inbox::post_direct)
+        self.post_with(to, content, Inbox::post_direct, None)
+    }
+
+    /// [`Self::post_direct`] for a message bound to an agent generation that
+    /// `live` says, under this hub's lock and right before the message goes
+    /// in, still holds its pane; refused as [`PostError::RecipientGone`]
+    /// otherwise (PR #1735 fifth review, N4).
+    pub fn post_direct_where(
+        &self,
+        to: Recipient,
+        content: Content,
+        live: &dyn Fn() -> bool,
+    ) -> Result<MessageId, PostError> {
+        self.post_with(to, content, Inbox::post_direct, Some(live))
     }
 
     /// PR #1735 second review: [`Inbox::reserve_reply`], held until the
@@ -667,24 +704,63 @@ impl InboxHub {
     /// room back when `reservation` drops.
     pub fn post_reserved_reply(
         &self,
-        mut reservation: ReplyReservation,
+        reservation: ReplyReservation,
         to: Recipient,
         content: Content,
     ) -> Result<MessageId, PostError> {
-        let id = self.post_with(to, content, Inbox::post_reserved_reply)?;
+        self.post_reserved_reply_with(reservation, to, content, None)
+    }
+
+    /// [`Self::post_reserved_reply`] checked as [`Self::post_direct_where`] is.
+    pub fn post_reserved_reply_where(
+        &self,
+        reservation: ReplyReservation,
+        to: Recipient,
+        content: Content,
+        live: &dyn Fn() -> bool,
+    ) -> Result<MessageId, PostError> {
+        self.post_reserved_reply_with(reservation, to, content, Some(live))
+    }
+
+    fn post_reserved_reply_with(
+        &self,
+        mut reservation: ReplyReservation,
+        to: Recipient,
+        content: Content,
+        live: Option<&dyn Fn() -> bool>,
+    ) -> Result<MessageId, PostError> {
+        let id = self.post_with(to, content, Inbox::post_reserved_reply, live)?;
         // The post used the reservation's room.
         reservation.hub = None;
         Ok(id)
     }
 
+    /// Post under the lock. A message bound to an agent generation goes in
+    /// only while `live` — or, without one, the installed
+    /// [`Self::set_live_agent_check`] — says that agent still holds its pane.
     fn post_with(
         &self,
         to: Recipient,
         content: Content,
         post: fn(&mut Inbox, Instant, Recipient, Content) -> Result<MessageId, PostError>,
+        live: Option<&dyn Fn() -> bool>,
     ) -> Result<MessageId, PostError> {
         let id = {
             let mut st = self.lock();
+            if let Some(agent) = to.agent_id.as_deref() {
+                let holds = match live {
+                    Some(live) => live(),
+                    None => st
+                        .live_agent
+                        .as_ref()
+                        .is_none_or(|check| check(&to.pane_id, agent)),
+                };
+                if !holds {
+                    return Err(PostError::RecipientGone {
+                        pane_id: to.pane_id.clone(),
+                    });
+                }
+            }
             let id = post(&mut st.inbox, Instant::now(), to.clone(), content)?;
             drain_events(&mut st);
             id
@@ -756,8 +832,9 @@ impl InboxHub {
     /// told. The receiver resolves when the task is acknowledged or ends
     /// otherwise; it starts the worker's idle-worker clock.
     ///
-    /// Every older task to the same pane still owed is superseded first: a newer
-    /// delegation replaces it.
+    /// Every older task to the same pane still owed is superseded: a newer
+    /// delegation replaces it. The new task is admitted first, so one the
+    /// inbox refuses supersedes nothing.
     ///
     /// `worker_holds` is asked, under this hub's lock and before anything is
     /// superseded, whether the worker's agent still holds its pane, as
@@ -783,6 +860,23 @@ impl InboxHub {
             }
             if !worker_holds() {
                 return Err(PostRefusal::Stale(Stale::Scope));
+            }
+            // PR #1735 fifth review (N8): admitted before anything is
+            // superseded, so a task the inbox refuses leaves the worker's older
+            // task as it was. A full inbox is no refusal while an older task is
+            // there to supersede: superseding it makes the room, and only frees
+            // room, so the post below cannot then be refused.
+            match st.inbox.admit_direct(now, &worker, &content) {
+                Ok(()) => {}
+                Err(PostError::InboxFull { .. })
+                    if st.delegates.iter().any(|(id, watch)| {
+                        watch.worker.pane_id == worker.pane_id
+                            && st
+                                .inbox
+                                .get(id, &worker.pane_id)
+                                .is_some_and(|message| !message.state.is_terminal())
+                    }) => {}
+                Err(error) => return Err(PostRefusal::Refused(error)),
             }
             let superseded = retire_delegates_locked(&mut st, now, &worker.pane_id, |_| true);
             let id = st
@@ -1093,6 +1187,7 @@ impl InboxHub {
     pub fn post_owed_notices(&self) {
         let (owed, cards, sink) = {
             let mut st = self.lock();
+            st.owed_retry_at = None;
             (
                 std::mem::take(&mut st.owed_notices),
                 std::mem::take(&mut st.owed_card_notices),
@@ -1104,11 +1199,31 @@ impl InboxHub {
                 sink(notice);
             }
         }
+        // PR #1735 fifth review (N3): a notice a full inbox or deck refuses
+        // is still owed. It stays owed and is tried again — on the next
+        // acknowledgement or fetch, which make room, or at the latest after
+        // [`OWED_NOTICE_RETRY`] — until it is posted or its recipient is gone.
+        let mut still_owed = Vec::new();
         for (to, subject, body) in owed {
             let pane_id = to.pane_id.clone();
-            if let Err(error) = self.post_notice(to, subject, body) {
-                warn!(pane_id = %pane_id, %error, subject, "inbox: could not post an owed notice");
+            match self.post_notice(to.clone(), subject, body.clone()) {
+                Ok(_) => {}
+                Err(PostError::InboxFull { .. } | PostError::DeckFull { .. }) => {
+                    debug!(pane_id = %pane_id, subject, "inbox: an owed notice waits for room");
+                    still_owed.push((to, subject, body));
+                }
+                Err(error) => {
+                    warn!(pane_id = %pane_id, %error, subject, "inbox: could not post an owed notice");
+                }
             }
+        }
+        if !still_owed.is_empty() {
+            let mut st = self.lock();
+            still_owed.append(&mut st.owed_notices);
+            st.owed_notices = still_owed;
+            st.owed_retry_at = Some(Instant::now() + OWED_NOTICE_RETRY);
+            drop(st);
+            self.changed.notify_one();
         }
     }
 
@@ -1685,10 +1800,10 @@ impl InboxHub {
                         .filter(|watch| !watch.notified)
                         .map(|watch| watch.due)
                         .min();
-                    match (st.inbox.next_deadline(), watched) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (a, b) => a.or(b),
-                    }
+                    [st.inbox.next_deadline(), watched, st.owed_retry_at]
+                        .into_iter()
+                        .flatten()
+                        .min()
                 };
                 // A deadline that is far away still re-plans every minute, so a
                 // missed notification costs at most that long.
@@ -1802,14 +1917,17 @@ impl InboxHub {
     }
 }
 
+/// How long an owed notice a full inbox refused waits, at most, before it is
+/// tried again ([`InboxHub::post_owed_notices`]).
+const OWED_NOTICE_RETRY: Duration = Duration::from_secs(1);
+
+/// The daemon's "does this agent still hold this pane?", by pane and agent
+/// ([`InboxHub::set_live_agent_check`]).
+pub type LiveAgentCheck = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 /// The separator every hand-over puts before each block.
 pub const BLOCK_SEPARATOR: &str = "\n\n";
 
-/// How many of `agent_id`'s queued messages fit `budget`, in the order a fetch
-/// takes them. Each block is counted with the [`BLOCK_SEPARATOR`] ahead of it,
-/// so a caller that heads the blocks with framing asks for its budget less the
-/// framing and stays within the whole. At least one when any is queued: a
-/// single message too big for the budget is rendered with its head only.
 /// The messages queued for `agent_id` in `pane_id` that it may take, oldest
 /// first.
 fn queued_for<'a>(
@@ -1825,6 +1943,12 @@ fn queued_for<'a>(
     })
 }
 
+/// How many of `agent_id`'s queued messages fit `budget`, in the order a fetch
+/// takes them, and never more than [`crate::inbox_prompt::MAX_IDS`]. Each
+/// block is counted with the [`BLOCK_SEPARATOR`] ahead of it, so a caller that
+/// heads the blocks with framing asks for its budget less the framing and
+/// stays within the whole. At least one when any is queued: a single message
+/// too big for the budget is rendered with its head only.
 fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBudget>) -> usize {
     let queued = queued_for(inbox, pane_id, agent_id);
     let Some(budget) = budget else {
@@ -1832,7 +1956,7 @@ fn fitting(inbox: &Inbox, pane_id: &str, agent_id: &str, budget: Option<InboxBud
     };
     let mut used = 0usize;
     let mut count = 0usize;
-    for message in queued {
+    for message in queued.take(crate::inbox_prompt::MAX_IDS) {
         let len = budget.measure(&render_within(message, Some(budget)).text)
             + budget.measure(BLOCK_SEPARATOR);
         if count > 0 && used + len > budget.limit() {
@@ -2395,6 +2519,23 @@ impl Drop for MintedSpill {
     }
 }
 
+/// PR #1735 fifth review: run `save` — a body retention, which may write a
+/// file — without holding an async runtime worker. On a worker of a
+/// multi-threaded runtime, [`tokio::task::block_in_place`] hands that worker's
+/// other tasks (hooks, acknowledgements) to another worker while `save` runs;
+/// anywhere else — a blocking-pool or plain thread, a current-thread runtime —
+/// `save` runs as it is. The deck's own posts are synchronous calls, so this
+/// is what keeps their slow saves from stalling the handlers; publish and
+/// offer, which are asynchronous, use the blocking pool instead.
+pub fn off_the_executor<T>(save: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(save)
+        }
+        _ => save(),
+    }
+}
+
 /// [`retain_full_body_minted`] for a post that cannot be refused afterwards:
 /// a body it saves stays.
 pub fn retain_full_body(
@@ -2435,6 +2576,8 @@ pub fn retain_full_body_minted(
         BodyTrust::Trusted => content.body.clone(),
         BodyTrust::Untrusted => crate::state::frame_untrusted_report_for_file(&content.body),
     };
+    #[cfg(test)]
+    spill_gate_pass();
     let millis = chrono::Utc::now().timestamp_millis();
     for dir in dirs {
         if let Err(error) = crate::orchestrator_context::ensure_git_excludes_context_dir(dir) {
@@ -2466,6 +2609,31 @@ pub fn retain_full_body_minted(
          to a file the recipient can read; nothing was posted",
         content.body.len()
     ))
+}
+
+/// TEST hold on the next body saving ([`SpillGate`]).
+#[cfg(test)]
+pub(crate) static SPILL_GATE: Mutex<Option<SpillGate>> = Mutex::new(None);
+
+/// A test's hold on the next body saving: the saving says it has `reached`
+/// the gate, then waits up to ten seconds for `go`, and records in `released`
+/// whether `go` came.
+#[cfg(test)]
+pub(crate) struct SpillGate {
+    pub reached: std::sync::mpsc::Sender<()>,
+    pub go: std::sync::mpsc::Receiver<()>,
+    pub released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+fn spill_gate_pass() {
+    let gate = SPILL_GATE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let released = gate.go.recv_timeout(Duration::from_secs(10)).is_ok();
+        gate.released
+            .store(released, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// TEST record of the thread each saved body was written on, by pane.
@@ -2573,13 +2741,20 @@ fn post_live_keeping(
         return Err((error.to_string(), reservation));
     }
     let dirs = spill_dirs(registry, &to.pane_id, to.agent_id.as_deref());
-    let spill = match retain_full_body_minted(&hub.deck(), &to.pane_id, &mut content, &dirs) {
-        Ok(spill) => spill,
-        Err(error) => return Err((error, reservation)),
-    };
+    let deck = hub.deck();
+    let spill =
+        match off_the_executor(|| retain_full_body_minted(&deck, &to.pane_id, &mut content, &dirs))
+        {
+            Ok(spill) => spill,
+            Err(error) => return Err((error, reservation)),
+        };
+    // PR #1735 fifth review (N4): sampled above, separated from the insertion
+    // by the body's saving, and so asked again under the inbox's lock. A
+    // refusal removes the saved body and gives a reservation's room back.
+    let live = || registry.pane_current_agent_id(&to.pane_id).as_deref() == to.agent_id.as_deref();
     let id = match reservation {
-        Some(reservation) => hub.post_reserved_reply(reservation, to, content),
-        None => hub.post_direct(to, content),
+        Some(reservation) => hub.post_reserved_reply_where(reservation, to.clone(), content, &live),
+        None => hub.post_direct_where(to.clone(), content, &live),
     }
     .map_err(|error| (error.to_string(), None))?;
     spill.keep();
@@ -3329,6 +3504,293 @@ mod tests {
         }
         assert!(older.rx.try_recv().is_err());
         assert_eq!(hub.armed("p", "a"), 1);
+    }
+
+    /// PR #1735 fifth review (N1): Claude's prompt hook acknowledges the ids
+    /// whose openers the prompt carries, so one hand-over must never carry
+    /// more blocks than that hook reads. Seventeen short messages fit a once
+    /// waiter's character budget easily; the waiter's batch, as `inbox wait`
+    /// joins it for Claude, must be recognised id for id, and what did not fit
+    /// stays queued for the next hand-over.
+    #[tokio::test]
+    async fn a_once_waiters_batch_is_every_id_its_prompt_hook_acknowledges() {
+        let hub = hub();
+        for n in 0..17 {
+            hub.post_direct(Recipient::bound("p", "a"), content(&format!("note {n}")))
+                .unwrap();
+        }
+        let mut waiter = hub
+            .arm(
+                "p",
+                "a",
+                InboxWaitMode::Once,
+                InboxComponent::ClaudeWaiter,
+                None,
+            )
+            .unwrap();
+        let batch = match waiter.rx.try_recv() {
+            Ok(WaiterSignal::Deliver(batch)) => batch,
+            other => panic!("the waiter must get a batch: {other:?}"),
+        };
+        let prompt = batch
+            .iter()
+            .map(|delivery| delivery.text.as_str())
+            .collect::<Vec<_>>()
+            .join(BLOCK_SEPARATOR);
+        let handed: Vec<String> = batch.iter().map(|d| d.id.clone()).collect();
+        assert_eq!(
+            crate::inbox_prompt::scan(&prompt).opened,
+            handed,
+            "every id one hand-over carries is one the prompt hook acknowledges"
+        );
+        assert_eq!(hub.summary("p", "a").queued, 17 - handed.len());
+    }
+
+    /// A registry with one stand-in agent (`cat`) in `pane`, run in `cwd`.
+    fn stand_in(
+        pane: &str,
+        cwd: &std::path::Path,
+    ) -> (Arc<crate::agent_pty::AgentPtyRegistry>, String) {
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                cwd: cwd.to_str(),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        (registry, agent)
+    }
+
+    /// A body too long to hand over whole, so posting it saves it first.
+    fn long_content() -> Content {
+        content(&"a long body. ".repeat(1_000))
+    }
+
+    /// Hold the next body saving: answers the gate's `reached`, `go` and
+    /// `released` ends.
+    fn hold_next_saving() -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *SPILL_GATE.lock().unwrap() = Some(SpillGate {
+            reached: reached_tx,
+            go: go_rx,
+            released: Arc::clone(&released),
+        });
+        (reached, go, released)
+    }
+
+    /// The bodies the deck saved under `cwd`.
+    fn saved_bodies(cwd: &std::path::Path) -> usize {
+        std::fs::read_dir(cwd.join(".dot-agent-deck"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("inbox-message-")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// PR #1735 fifth review (N8): a newer task the inbox refuses supersedes
+    /// nothing: the worker's older task stays queued and watched.
+    #[test]
+    fn a_refused_delegate_supersedes_nothing() {
+        let limits = InboxLimits {
+            max_body_bytes: 64,
+            ..InboxLimits::default()
+        };
+        let hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        let worker = Recipient::bound("w", "a");
+        let ledger = || DelegateLedger {
+            commission_arm_id: None,
+            delegation_seq: None,
+        };
+        let (older, _end) = hub
+            .post_delegate(
+                worker.clone(),
+                "coder",
+                None,
+                ledger(),
+                content("older"),
+                &|| true,
+            )
+            .unwrap();
+        let refused = hub.post_delegate(
+            worker,
+            "coder",
+            None,
+            ledger(),
+            content(&"x".repeat(65)),
+            &|| true,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(PostRefusal::Refused(PostError::BodyTooLarge { .. }))
+            ),
+            "{refused:?}"
+        );
+        let state = hub
+            .list("w")
+            .into_iter()
+            .find(|m| m.id == older)
+            .map(|m| m.state);
+        assert_eq!(
+            state,
+            Some(StateName::Queued),
+            "the older task is left as it was"
+        );
+    }
+
+    /// PR #1735 fifth review (N4): a deck post samples its recipient's agent,
+    /// then saves the body, then inserts. When that agent exits and its inbox
+    /// is swept while the body saves, the post is refused — nothing lands
+    /// after the sweep, waiting for an agent that is gone — and the saved
+    /// body is removed.
+    #[test]
+    fn a_post_whose_agent_is_swept_while_its_body_saves_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, agent) = stand_in("n4-pane", dir.path());
+        let marker = post_to_live(
+            &registry,
+            Recipient::bound("n4-pane", &agent),
+            content("marker"),
+        )
+        .expect("the agent is live");
+        let (reached, go, _released) = hold_next_saving();
+        let poster = std::thread::spawn({
+            let registry = Arc::clone(&registry);
+            let agent = agent.clone();
+            move || {
+                post_to_live(
+                    &registry,
+                    Recipient::bound("n4-pane", &agent),
+                    long_content(),
+                )
+            }
+        });
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the post reaches its body's saving");
+        registry.close_agent(&agent).expect("close the stand-in");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while registry
+            .inbox()
+            .list("n4-pane")
+            .iter()
+            .any(|m| m.id == marker && m.state != StateName::Undeliverable)
+        {
+            assert!(Instant::now() < deadline, "the exit sweep never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        go.send(()).unwrap();
+        let posted = poster.join().unwrap();
+        assert!(
+            posted.is_err(),
+            "a post after its agent's sweep must be refused: {posted:?}"
+        );
+        let live: Vec<_> = registry
+            .inbox()
+            .list("n4-pane")
+            .into_iter()
+            .filter(|m| m.state != StateName::Undeliverable)
+            .collect();
+        assert!(
+            live.is_empty(),
+            "nothing may wait for an agent that is gone: {live:?}"
+        );
+        assert_eq!(
+            saved_bodies(dir.path()),
+            0,
+            "the refused post's body is removed"
+        );
+        registry.shutdown_all();
+    }
+
+    /// PR #1735 fifth review: a deck post that saves a long body — seeds,
+    /// reports, dispatch results — holds no async runtime worker while it
+    /// saves, as publish and offer do not. On a one-worker runtime, a task
+    /// that releases the saving can run only if the post handed its worker
+    /// over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_deck_post_saving_a_long_body_holds_no_runtime_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, agent) = stand_in("sync-pane", dir.path());
+        let (reached, go, released) = hold_next_saving();
+        let poster = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            let agent = agent.clone();
+            async move {
+                post_to_live(
+                    &registry,
+                    Recipient::bound("sync-pane", &agent),
+                    long_content(),
+                )
+            }
+        });
+        let releaser = tokio::spawn(async move {
+            loop {
+                if reached.try_recv().is_ok() {
+                    let _ = go.send(());
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let posted = poster.await.unwrap();
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "no other task ran while the body was being saved"
+        );
+        releaser.await.unwrap();
+        assert!(posted.is_ok(), "{posted:?}");
+        registry.shutdown_all();
+    }
+
+    /// PR #1735 fifth review (N3): a notice the deck owes an agent whose inbox
+    /// is full is still owed, and is posted once there is room, instead of
+    /// being dropped after one refused attempt.
+    #[test]
+    fn an_owed_notice_a_full_inbox_refuses_is_posted_once_there_is_room() {
+        let limits = InboxLimits {
+            max_per_recipient: 1,
+            ..InboxLimits::default()
+        };
+        let hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        let to = Recipient::bound("o", "x");
+        hub.post_direct(to.clone(), content("filler")).unwrap();
+        hub.lock()
+            .owed_notices
+            .push((to.clone(), "owed subject", "owed body".to_string()));
+        hub.post_owed_notices();
+        assert_eq!(hub.summary("o", "x").queued, 1, "the inbox is full");
+        let taken = hub.fetch("o", "x", Consumer::FetchCli, None, Some(AckHow::Explicit));
+        assert_eq!(taken.len(), 1);
+        hub.post_owed_notices();
+        let owed: Vec<_> = hub
+            .list("o")
+            .into_iter()
+            .filter(|m| m.subject == "owed subject")
+            .collect();
+        assert_eq!(
+            owed.len(),
+            1,
+            "the owed notice is posted once there is room"
+        );
     }
 
     #[tokio::test]

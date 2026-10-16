@@ -875,6 +875,11 @@ pub enum PostError {
     TooManyOffers { limit: usize },
     #[error("a claim must last between {min_ms} ms and {max_ms} ms")]
     ClaimTtlOutOfRange { min_ms: u64, max_ms: u64 },
+    /// PR #1735 fifth review (N4): the agent generation a bound message was
+    /// for had left its pane by the time the message would have gone in, so
+    /// nothing was posted rather than a message nobody can take.
+    #[error("the agent this message is for no longer holds pane {pane_id}; nothing was posted")]
+    RecipientGone { pane_id: String },
 }
 
 /// [`Inbox::publish`]'s result. Subscribers whose inbox is full are named,

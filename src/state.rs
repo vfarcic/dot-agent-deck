@@ -3058,13 +3058,30 @@ struct PendingDispatchReturn {
 }
 
 impl PendingDispatchReturn {
-    /// PRD #1666 S5: post the report to the caller generation's inbox. A
-    /// refusal stays in the daemon log, with no report text in it.
-    fn deliver(self, registry: &AgentPtyRegistry) {
-        match crate::inbox_hub::post_to_live(
+    /// PRD #1666 S5: post the report to the caller generation's inbox, into
+    /// the room `reservation` holds (PR #1735 fifth review, N3), so neither the
+    /// caller's backlog nor a full deck refuses it; a report the inbox refuses
+    /// itself is replaced by a short notice in the same room. A refusal of
+    /// both — only a caller that has gone — stays in the daemon log, with no
+    /// report text in it.
+    fn deliver(self, registry: &AgentPtyRegistry, reservation: crate::inbox_hub::ReplyReservation) {
+        let max_body = registry.inbox().limits().max_body_bytes;
+        let from = self.message.from.clone();
+        let notice = |error: &str| crate::inbox::Content {
+            from: from.clone(),
+            subject: "dispatch completed".to_string(),
+            body: undelivered_report_notice("A unit you dispatched has completed", error, max_body),
+            body_trust: crate::inbox::BodyTrust::Trusted,
+            spill_path: None,
+            id: None,
+            preface: None,
+        };
+        match crate::inbox_hub::post_reserved_reply_or_notice_to_live(
             registry,
+            reservation,
             crate::inbox::Recipient::bound(&self.pane_id, &self.agent_id),
             self.message,
+            notice,
         ) {
             Ok(id) => tracing::info!(
                 pane_id = %self.pane_id,
@@ -3079,6 +3096,27 @@ impl PendingDispatchReturn {
             ),
         }
     }
+}
+
+/// How much of the inbox's refusal [`undelivered_report_notice`] repeats.
+const MAX_REPORT_REFUSAL_CHARS: usize = 300;
+
+/// PR #1735 fifth review (N3): the body of the notice posted, in a report's
+/// reserved room, when the inbox refused the report itself: `head`, then that
+/// the report could not be delivered and why, cut to `max_body` bytes so the
+/// body limit cannot refuse it too. Composed by the deck alone — none of the
+/// report's text is in it.
+fn undelivered_report_notice(head: &str, error: &str, max_body: usize) -> String {
+    let refusal: String = error.chars().take(MAX_REPORT_REFUSAL_CHARS).collect();
+    let body = format!(
+        "{head} (dot-agent-deck daemon report, not a message from a person or an agent), but \
+         dot-agent-deck could not deliver its report to you: {refusal}."
+    );
+    let mut cut = body.len().min(max_body);
+    while !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    body[..cut].to_string()
 }
 
 /// Issue #544: the one inbox post a `work-done` owes, computed by
@@ -3111,10 +3149,23 @@ impl WorkDoneDelivery {
 
     /// PRD #1666 S5: post the report to the orchestrator generation it was
     /// routed to, if there is one. Needs no `AppState`, and waits on nothing.
-    pub async fn deliver(self, registry: &AgentPtyRegistry) {
+    ///
+    /// PR #1735 fifth review (N3): the report goes into the room
+    /// `reservation` held from before the `work-done` was taken on
+    /// ([`InboxHub::reserve_reply`](crate::inbox_hub::InboxHub::reserve_reply)),
+    /// so an orchestrator's full inbox, or a deck that filled meanwhile, does
+    /// not refuse a completion the worker was told was accepted. A report the
+    /// inbox refuses itself is replaced by a short notice in the same room.
+    pub async fn deliver(
+        self,
+        registry: &AgentPtyRegistry,
+        reservation: crate::inbox_hub::ReplyReservation,
+    ) {
         let (orch_pane_id, role_name, feedback, expected_orchestrator_agent_id) = match self.0 {
             WorkDoneWrite::Nothing => return,
-            WorkDoneWrite::DispatchReturn(pending) => return pending.deliver(registry),
+            WorkDoneWrite::DispatchReturn(pending) => {
+                return pending.deliver(registry, reservation);
+            }
             WorkDoneWrite::Feedback {
                 orch_pane_id,
                 role_name,
@@ -3127,10 +3178,32 @@ impl WorkDoneDelivery {
                 expected_orchestrator_agent_id,
             ),
         };
-        match crate::inbox_hub::post_to_live(
+        let max_body = registry.inbox().limits().max_body_bytes;
+        let from = feedback.from.clone();
+        let subject = feedback.subject.clone();
+        // The notice keeps the report's sender and subject, which name the
+        // worker and its role, so it still answers the delegation; what the
+        // deck says goes in the preface, as a report's head does, and there is
+        // no worker text in it.
+        let notice = |error: &str| crate::inbox::Content {
+            from: from.clone(),
+            subject: subject.clone(),
+            body: String::new(),
+            body_trust: crate::inbox::BodyTrust::Untrusted,
+            spill_path: None,
+            id: None,
+            preface: Some(undelivered_report_notice(
+                "A worker has completed their task",
+                error,
+                max_body,
+            )),
+        };
+        match crate::inbox_hub::post_reserved_reply_or_notice_to_live(
             registry,
+            reservation,
             crate::inbox::Recipient::bound(&orch_pane_id, &expected_orchestrator_agent_id),
             feedback,
+            notice,
         ) {
             Ok(id) => tracing::info!(
                 pane_id = %orch_pane_id,
@@ -5302,20 +5375,22 @@ async fn bind_dispatched_commission(
     }
 }
 
-/// PRD #1666 S5: write the delegated task's file — the worker's record of it
-/// and the inbox message's spill file — and hand back the full task text.
+/// PRD #1666 S5: write the delegated task's file — the worker's record of it —
+/// and hand back the full task text.
 ///
 /// The file carries what it always has (the role's `prompt_template`, the task,
 /// the work-done footer) and no "acknowledge first" header: the inbox records
-/// delivery itself. A failed write is logged and costs only the spill file; the
-/// task still travels whole in the message.
+/// delivery itself. It is a convenience copy that the next delegation to the
+/// same role rewrites, so the message never points at it (PR #1735 fifth
+/// review, N6): a task too long to hand over whole is saved to a file of its
+/// own. A failed write is logged and costs only this copy.
 fn write_delegate_task(
     cwd: Option<&str>,
     prompt_template: Option<&str>,
     task: &str,
     target_role: &str,
     pane_id: &str,
-) -> (String, Option<std::path::PathBuf>) {
+) -> String {
     let content = compose_worker_task_file(prompt_template, task, target_role);
     let Some(cwd) = cwd else {
         warn!(
@@ -5323,27 +5398,24 @@ fn write_delegate_task(
             pane_id = %pane_id,
             "delegate: no cwd recorded for worker pane — the task travels in the message only"
         );
-        return (content, None);
+        return content;
     };
     let file_name = format!("worker-task-{}.md", sanitize_role_name(target_role));
-    match crate::orchestrator_context::write_coordination_file(
+    if let Err(e) = crate::orchestrator_context::write_coordination_file(
         std::path::Path::new(cwd),
         &file_name,
         &content,
     ) {
-        Ok(path) => (content, Some(path)),
-        Err(e) => {
-            warn!(
-                file = %file_name,
-                cwd = %cwd,
-                role = %target_role,
-                pane_id = %pane_id,
-                error = %e,
-                "delegate: failed to write worker task file — the task travels in the message only"
-            );
-            (content, None)
-        }
+        warn!(
+            file = %file_name,
+            cwd = %cwd,
+            role = %target_role,
+            pane_id = %pane_id,
+            error = %e,
+            "delegate: failed to write worker task file — the task travels in the message only"
+        );
     }
+    content
 }
 
 /// PRD #1666 S5: one target of a `delegate`, delivered through the inbox.
@@ -5388,10 +5460,6 @@ async fn dispatch_one_owned(
     let dispatch_lock = registry.pane_dispatch_lock(&pane_id);
     let _dispatch_guard = dispatch_lock.lock().await;
     pointer_queue.dequeue();
-    // A newer delegation supersedes every older task to this pane still owed —
-    // BEFORE a `clear = true` respawn below retires the generation they were
-    // bound to, so they end as superseded rather than reported undeliverable.
-    registry.inbox().supersede_delegates_to(&pane_id);
     let commission_armed = commission_in_flight.is_some();
     let commission_arm_id = commission_in_flight
         .as_ref()
@@ -5425,7 +5493,7 @@ async fn dispatch_one_owned(
     let prompt_template = role_config
         .as_ref()
         .and_then(|r| r.prompt_template.as_deref());
-    let (task_body, spill_path) = write_delegate_task(
+    let task_body = write_delegate_task(
         cwd.as_deref(),
         prompt_template,
         &task,
@@ -5435,6 +5503,68 @@ async fn dispatch_one_owned(
     let orchestrator = orchestrator_agent_id
         .as_deref()
         .map(|agent| crate::inbox::Recipient::bound(&orchestrator_pane_id, agent));
+    // PR #1735 fifth review (N6): the message carries the whole task, and a
+    // task too long to hand over whole is saved below to a file of its own,
+    // written once for this message. `worker-task-<role>.md` is a convenience
+    // copy that a later delegation to the same role rewrites, so it is never
+    // what the message points at.
+    let mut content = crate::inbox::Content {
+        from: crate::inbox::Sender::Agent {
+            pane_id: orchestrator_pane_id.clone(),
+            agent_id: orchestrator_agent_id.clone().unwrap_or_default(),
+            role: None,
+            orchestration: orchestration
+                .as_ref()
+                .map(|identity| identity.name().to_string()),
+        },
+        subject: format!(
+            "task from the orchestrator for {}",
+            sanitize_role_name(&target_role)
+        ),
+        body: task_body,
+        body_trust: crate::inbox::BodyTrust::Trusted,
+        spill_path: None,
+        id: Some(message_id),
+        preface: None,
+    };
+    // PR #1735 fifth review (N8): a task the inbox would refuse is refused
+    // before anything is retired or restarted for it, so the worker's older
+    // task stays as it was.
+    let refuse = |orchestrator: Option<crate::inbox::Recipient>, error: &dyn std::fmt::Display| {
+        warn!(
+            role = %target_role,
+            pane_id = %pane_id,
+            %error,
+            "delegate: the worker's inbox refused the task"
+        );
+        release_undelivered_commission(
+            &registry,
+            &pane_id,
+            commission_arm_id,
+            &target_role,
+            "the worker's inbox refused the task",
+        );
+        retire_undelivered_idle_worker_record(
+            &registry,
+            &pane_id,
+            delegation_seq,
+            "the worker's inbox refused the task",
+        );
+        post_orchestrator_notice(
+            &registry,
+            orchestrator,
+            "task refused",
+            format!(
+                "The task for the worker in role {} was NOT delivered: its inbox refused it \
+                 ({error}). Decide whether to delegate it again later or notify the user.",
+                quote_untrusted_role(&target_role)
+            ),
+        );
+    };
+    if let Err(error) = registry.inbox().admit_reply(&content) {
+        refuse(orchestrator.clone(), &error);
+        return;
+    }
 
     // The worker generation the task is for: the replacement on a `clear = true`
     // respawn, whoever holds the pane otherwise.
@@ -5486,6 +5616,11 @@ async fn dispatch_one_owned(
             }
             _ => None,
         };
+        // A restart retires every older task to this pane, as superseded —
+        // BEFORE the respawn retires the generation they were bound to, so they
+        // end as superseded rather than reported undeliverable. The new task
+        // was admitted above, so a refusal cannot follow for its content.
+        registry.inbox().supersede_delegates_to(&pane_id);
         match registry
             .respawn_or_recreate_agent_for_pane(&pane_id, &role.command, &recreate_identity)
             .await
@@ -5658,31 +5793,31 @@ async fn dispatch_one_owned(
         )
         .await;
     }
-    let content = crate::inbox::Content {
-        from: crate::inbox::Sender::Agent {
-            pane_id: orchestrator_pane_id.clone(),
-            agent_id: orchestrator_agent_id.clone().unwrap_or_default(),
-            role: None,
-            orchestration: orchestration
-                .as_ref()
-                .map(|identity| identity.name().to_string()),
-        },
-        subject: format!(
-            "task from the orchestrator for {}",
-            sanitize_role_name(&target_role)
-        ),
-        body: task_body,
-        body_trust: crate::inbox::BodyTrust::Trusted,
-        spill_path,
-        id: Some(message_id),
-        preface: None,
+    let worker = crate::inbox::Recipient::bound(&pane_id, &worker_agent_id);
+    // Admitted again for this worker's own backlog, then the long body saved —
+    // or the task refused, never posted as an excerpt of a body nobody kept
+    // (PR #1735 fifth review, 7d). The saved file is removed again unless the
+    // post goes in.
+    if let Err(error) = registry.inbox().admit_direct(&worker, &content) {
+        refuse(orchestrator.clone(), &error);
+        return;
+    }
+    let dirs = crate::inbox_hub::spill_dirs(&registry, &pane_id, Some(&worker_agent_id));
+    let deck = registry.inbox().deck();
+    let spill = match crate::inbox_hub::off_the_executor(|| {
+        crate::inbox_hub::retain_full_body_minted(&deck, &pane_id, &mut content, &dirs)
+    }) {
+        Ok(spill) => spill,
+        Err(error) => {
+            refuse(orchestrator.clone(), &error);
+            return;
+        }
     };
     // The idle-worker clock is held from the post until the task is
     // acknowledged: a worker cannot answer a task that has not reached it.
     if let Some(seq) = delegation_seq {
         registry.begin_delegation_pointer_write(&pane_id, seq);
     }
-    let worker = crate::inbox::Recipient::bound(&pane_id, &worker_agent_id);
     let ledger = crate::inbox_hub::DelegateLedger {
         commission_arm_id,
         delegation_seq,
@@ -5705,6 +5840,7 @@ async fn dispatch_one_owned(
         &still_live,
     ) {
         Ok((id, ended)) => {
+            spill.keep();
             tracing::info!(
                 role = %target_role,
                 pane_id = %pane_id,
@@ -5744,35 +5880,7 @@ async fn dispatch_one_owned(
             if let Some(seq) = delegation_seq {
                 registry.finish_delegation_pointer_write(&pane_id, seq, Default::default());
             }
-            warn!(
-                role = %target_role,
-                pane_id = %pane_id,
-                %error,
-                "delegate: the worker's inbox refused the task"
-            );
-            release_undelivered_commission(
-                &registry,
-                &pane_id,
-                commission_arm_id,
-                &target_role,
-                "the worker's inbox refused the task",
-            );
-            retire_undelivered_idle_worker_record(
-                &registry,
-                &pane_id,
-                delegation_seq,
-                "the worker's inbox refused the task",
-            );
-            post_orchestrator_notice(
-                &registry,
-                orchestrator,
-                "task refused",
-                format!(
-                    "The task for the worker in role {} was NOT delivered: its inbox refused it \
-                     ({error}). Decide whether to delegate it again later or notify the user.",
-                    quote_untrusted_role(&target_role)
-                ),
-            );
+            refuse(orchestrator, &error);
         }
     }
 }
@@ -10529,10 +10637,20 @@ impl AppState {
     /// [`Self::prepare_work_done`] under the lock and
     /// [`WorkDoneDelivery::deliver`] after releasing it, as the daemon's hook
     /// loop does.
+    ///
+    /// Room for the report is held first, as the daemon's hook loop holds it
+    /// (PR #1735 fifth review, N3); with none, nothing is taken on.
     pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
+        let room = match registry.inbox().reserve_reply() {
+            Ok(room) => room,
+            Err(error) => {
+                warn!(%error, "work-done: the deck has no room for its report; nothing taken on");
+                return;
+            }
+        };
         self.prepare_work_done(signal, registry)
             .await
-            .deliver(registry)
+            .deliver(registry, room)
             .await;
     }
 
@@ -16671,6 +16789,141 @@ mod tests {
     /// and once work evidence lifts the block a further delegation reports
     /// nothing.
     #[cfg(unix)]
+    /// Run one `dispatch_one_owned` of `task` from `orch` (in `orch_pane`) to
+    /// role `coder` in `worker_pane`, in `cwd`, with no orchestration config.
+    async fn dispatch_task(
+        registry: &Arc<AgentPtyRegistry>,
+        orch_pane: &str,
+        orch: &str,
+        worker_pane: &str,
+        task: &str,
+        cwd: Option<&str>,
+    ) -> crate::inbox::MessageId {
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let id = registry.inbox().mint_id();
+        dispatch_one_owned(
+            registry.clone(),
+            event_tx,
+            None,
+            orch_pane.to_string(),
+            Some(orch.to_string()),
+            "coder".to_string(),
+            worker_pane.to_string(),
+            task.to_string(),
+            cwd.map(str::to_string),
+            id.clone(),
+            PointerQueueClock::new(registry.clone(), worker_pane.to_string(), None),
+            None,
+            None,
+            None,
+        )
+        .await;
+        id
+    }
+
+    fn stand_in_in(registry: &Arc<AgentPtyRegistry>, pane: &str, cwd: Option<&str>) -> String {
+        registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                cwd,
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn stand-in")
+    }
+
+    /// PR #1735 fifth review (N8): a newer delegation the worker's inbox
+    /// refuses — here, a task over the body limit — leaves the worker's older
+    /// task as it was: queued, not superseded.
+    #[tokio::test]
+    async fn a_refused_delegation_leaves_the_workers_older_task() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let orch = stand_in_in(&registry, "n8-orch", None);
+        let _worker = stand_in_in(&registry, "n8-worker", None);
+        let older = dispatch_task(
+            &registry,
+            "n8-orch",
+            &orch,
+            "n8-worker",
+            "the older task",
+            None,
+        )
+        .await;
+        let limit = registry.inbox().limits().max_body_bytes;
+        let refused = dispatch_task(
+            &registry,
+            "n8-orch",
+            &orch,
+            "n8-worker",
+            &"x".repeat(limit + 1),
+            None,
+        )
+        .await;
+        let listed = registry.inbox().list("n8-worker");
+        assert!(
+            !listed.iter().any(|m| m.id == refused),
+            "the refused task is not posted: {listed:?}"
+        );
+        let older_state = listed.iter().find(|m| m.id == older).map(|m| m.state);
+        assert_eq!(
+            older_state,
+            Some(crate::inbox::StateName::Queued),
+            "the older task must survive a refused replacement"
+        );
+        registry.shutdown_all();
+    }
+
+    /// PR #1735 fifth review (N6): two long tasks delegated to the same role
+    /// in the same directory — two orchestrations sharing a checkout — each
+    /// point at a saved copy of their own task. The shared
+    /// `worker-task-coder.md` is rewritten by the second, so it cannot be
+    /// what the first message names.
+    #[tokio::test]
+    async fn each_long_delegated_task_names_its_own_saved_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let orch = stand_in_in(&registry, "n6-orch", Some(cwd));
+        let _first = stand_in_in(&registry, "n6-worker-a", Some(cwd));
+        let _second = stand_in_in(&registry, "n6-worker-b", Some(cwd));
+        let long = |marker: &str| format!("{marker} {}", "a long task line. ".repeat(1_000));
+        let a = dispatch_task(
+            &registry,
+            "n6-orch",
+            &orch,
+            "n6-worker-a",
+            &long("TASK-A-5d1e"),
+            Some(cwd),
+        )
+        .await;
+        let _b = dispatch_task(
+            &registry,
+            "n6-orch",
+            &orch,
+            "n6-worker-b",
+            &long("TASK-B-77c0"),
+            Some(cwd),
+        )
+        .await;
+        let spill = registry
+            .inbox()
+            .list("n6-worker-a")
+            .into_iter()
+            .find(|m| m.id == a)
+            .and_then(|m| m.spill_path)
+            .expect("a long task names the file its whole text is saved in");
+        let saved = std::fs::read_to_string(&spill).unwrap();
+        assert!(
+            saved.contains("TASK-A-5d1e") && !saved.contains("TASK-B-77c0"),
+            "worker A's message names {} which holds another task",
+            spill.display()
+        );
+        registry.shutdown_all();
+    }
+
     #[tokio::test]
     async fn dispatch_one_owned_reports_an_already_published_block_to_the_new_delegation() {
         const ORCH_PANE: &str = "published-block-orch";
