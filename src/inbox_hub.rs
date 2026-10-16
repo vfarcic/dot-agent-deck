@@ -347,6 +347,9 @@ struct HubState {
     /// PR #1735 fifth review (B-05): the bodies the deck saved to files for its
     /// messages, and how long each is kept.
     spills: crate::inbox_spills::SpillLedger,
+    /// How many times `spills` has been recorded, so a manifest write that
+    /// lost the race to a newer one is skipped ([`InboxHub::record_spills`]).
+    spills_revision: u64,
     /// Oldest first, so the newest is `last()`.
     waiters: HashMap<AgentKey, Vec<Waiter>>,
     announced: HashMap<AgentKey, Announcement>,
@@ -446,9 +449,10 @@ impl std::fmt::Debug for ReplyReservation {
 pub struct InboxHub {
     state: Mutex<HubState>,
     /// PR #1735 fifth review (B-05): this run's list of the saved bodies
-    /// [`HubState::spills`] tracks, written outside the hub's lock. Taken
-    /// only after that lock, never before it.
-    spill_manifest: Mutex<Option<crate::inbox_spills::SpillManifest>>,
+    /// [`HubState::spills`] tracks, and the revision it last wrote. Taken
+    /// only once the hub's lock is released, so a slow write holds up no
+    /// inbox call.
+    spill_manifest: Mutex<Option<(crate::inbox_spills::SpillManifest, u64)>>,
     /// Woken whenever a deadline may have moved, so the ticker re-plans.
     changed: Arc<Notify>,
     keepalive: Duration,
@@ -542,6 +546,7 @@ impl InboxHub {
         Self {
             state: Mutex::new(HubState {
                 spills: crate::inbox_spills::SpillLedger::default(),
+                spills_revision: 0,
                 inbox: Inbox::new(deck, limits),
                 waiters: HashMap::new(),
                 announced: HashMap::new(),
@@ -1948,17 +1953,23 @@ impl InboxHub {
     }
 
     /// Write what `st`'s ledger tracks to this run's manifest, once `st` is
-    /// released: the manifest's lock is taken first, so writes land in the
-    /// order the ledger changed.
-    fn record_spills(&self, st: MutexGuard<'_, HubState>) {
+    /// released. The hub's lock is never held while the manifest's is waited
+    /// for (PR #1735 review, Qodo 4295418152); a write that a newer one
+    /// overtook is skipped, so the manifest ends on the latest ledger.
+    fn record_spills(&self, mut st: MutexGuard<'_, HubState>) {
+        st.spills_revision += 1;
+        let revision = st.spills_revision;
         let text = st.spills.manifest_text();
+        drop(st);
         let mut manifest = self
             .spill_manifest
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        drop(st);
-        if let Some(manifest) = manifest.as_mut() {
+        if let Some((manifest, written)) = manifest.as_mut()
+            && revision > *written
+        {
             manifest.write(&text);
+            *written = revision;
         }
     }
 
@@ -1977,7 +1988,7 @@ impl InboxHub {
                 *self
                     .spill_manifest
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(manifest);
+                    .unwrap_or_else(|e| e.into_inner()) = Some((manifest, 0));
                 let mut st = self.lock();
                 st.spills.adopt(taken);
                 self.record_spills(st);
@@ -4002,6 +4013,69 @@ mod tests {
         );
     }
 
+    /// PR #1735 fifth review (reviewer B-04): reserved answers are not held
+    /// to the recipient's own bound, so a worker's inbox can be over it. A
+    /// newer task there, whose older task would not free enough room, is
+    /// refused before that older task is retired: it stays queued and its
+    /// watch still waits.
+    #[test]
+    fn a_task_to_an_inbox_over_its_bound_is_refused_before_retiring_the_older() {
+        let limits = InboxLimits {
+            max_per_recipient: 2,
+            ..InboxLimits::default()
+        };
+        let hub = Arc::new(InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE));
+        let worker = Recipient::bound("w", "a");
+        let ledger = || DelegateLedger {
+            commission_arm_id: None,
+            delegation_seq: None,
+        };
+        let (older, mut older_end) = hub
+            .post_delegate(
+                worker.clone(),
+                "coder",
+                None,
+                ledger(),
+                content("older"),
+                &|| true,
+            )
+            .unwrap();
+        for answer in ["first answer", "second answer"] {
+            let room = hub.reserve_reply().unwrap();
+            hub.post_reserved_reply(room, worker.clone(), content(answer))
+                .unwrap();
+        }
+        assert_eq!(hub.list("w").len(), 3, "precondition: over the bound");
+
+        let refused =
+            hub.post_delegate(worker, "coder", None, ledger(), content("newer"), &|| true);
+        assert!(
+            matches!(
+                refused,
+                Err(PostRefusal::Refused(PostError::InboxFull { .. }))
+            ),
+            "{refused:?}"
+        );
+        let state = hub
+            .list("w")
+            .into_iter()
+            .find(|m| m.id == older)
+            .map(|m| m.state);
+        assert_eq!(
+            state,
+            Some(StateName::Queued),
+            "the older task stays queued"
+        );
+        assert!(
+            matches!(
+                older_end.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the older task's watch still waits"
+        );
+        assert_eq!(hub.list("w").len(), 3, "nothing was posted");
+    }
+
     /// PR #1735 fifth review (N4): a deck post samples its recipient's agent,
     /// then saves the body, then inserts. When that agent exits and its inbox
     /// is swept while the body saves, the post is refused — nothing lands
@@ -4417,6 +4491,40 @@ mod tests {
             retain_full_body_minted(&hub.deck(), "w", &mut c, &[dir.to_path_buf()]).unwrap();
         assert!(spill.path().is_some(), "the body was saved");
         (c, spill)
+    }
+
+    /// PR #1735 review (Qodo 4295418152): recording the saved bodies waits
+    /// for this run's manifest outside the hub's lock, so a manifest write in
+    /// progress holds up no inbox call — here, the room a work-done's report
+    /// reserves on a hook-socket task.
+    #[test]
+    fn a_manifest_write_in_progress_holds_up_no_inbox_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "x").unwrap();
+        let hub = Arc::new(hub());
+        let id = hub.mint_id();
+        let writing = hub.spill_manifest.lock().unwrap();
+        let recorder = {
+            let hub = Arc::clone(&hub);
+            std::thread::spawn(move || hub.own_spill(MintedSpill(Some((path, 1))), &id))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let hub = Arc::clone(&hub);
+            std::thread::spawn(move || {
+                let _ = tx.send(hub.reserve_reply().is_ok());
+            });
+        }
+        let answered = rx.recv_timeout(Duration::from_secs(5));
+        drop(writing);
+        recorder.join().unwrap();
+        assert_eq!(
+            answered,
+            Ok(true),
+            "a reservation must not wait on the manifest write"
+        );
     }
 
     /// PR #1735 fifth review (B-05): the file an accepted long message names
