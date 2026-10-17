@@ -2854,6 +2854,58 @@ mod tests {
     /// because a sibling attempt committed. Neither refusal makes the attempt
     /// final: Cancel stays held and the evidence stays reserved until the
     /// receiver revokes locally and reports `NotHanded` itself.
+    /// Scenario: A stream holds an attempt in a fresh snapshot and closes at
+    /// once. No clock pass runs until two TTLs later; that pass finds no
+    /// receipt, clears the attempt and schedules an automatic repeat. At three
+    /// TTLs the next pass retires the closed stream and fences the attempt,
+    /// which withdraws its clearance, while the repeat token, only one TTL
+    /// old, stays. A new receiver then registers in the same slot. The issue
+    /// is refused as a stale repeat, because the fenced attempt has not been
+    /// checked again; this is the one guard that refuses it (R8F-02). The
+    /// next pass checks it, and only then is the repeat handed out.
+    #[spec("inbox/boundary/029")]
+    #[test]
+    fn boundary_029_a_late_pass_fence_leaves_only_the_issue_time_clearance_check() {
+        let (mut m, t) = model();
+        let ttl = ttl();
+        m.post("m", false);
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        issue_held(&mut m, t, "m", rx, 1);
+        m.stream_closed(t, rx);
+
+        m.tick(t + ttl * 2);
+        let msg = m.delivery("m").unwrap();
+        assert!(
+            msg.attempt(1, 1).unwrap().cleared,
+            "the late pass clears it"
+        );
+        assert!(msg.repeat_scheduled(), "and schedules the repeat");
+
+        let retired = t + Limits::default().closed_retire_after();
+        m.tick_cleared(retired, &[]);
+        let msg = m.delivery("m").unwrap();
+        let at = msg.attempt(1, 1).unwrap();
+        assert_eq!(at.stage, Stage::Fenced, "the closed stream was retired");
+        assert!(!at.cleared, "the fence withdrew the clearance");
+        assert!(
+            msg.repeat_scheduled(),
+            "the token is kept, not yet uncertain"
+        );
+
+        let successor = m.register(retired, Slot::OpencodeTui, false);
+        assert!(successor.resume.is_empty(), "retired: nothing to resume");
+        assert!(m.delivery("m").unwrap().repeat_scheduled());
+        assert_eq!(
+            m.issue(retired, "m", successor.rx),
+            Err(IssueRefusal::StaleRepeat),
+            "a repeat on a check the fence withdrew"
+        );
+
+        m.tick(retired);
+        let repeat = m.issue(retired, "m", successor.rx).expect("checked again");
+        assert_eq!(repeat.kind, IssueKind::AutoRepeat);
+    }
+
     #[spec("inbox/attempts/018")]
     #[test]
     fn attempts_018_a_refused_check_is_no_not_handed_witness() {
