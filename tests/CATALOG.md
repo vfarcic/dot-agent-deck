@@ -8361,6 +8361,14 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the daemon's `Flushed` arm keeping the record (the test sets it, as that arm does; `inbox/codex/017`), or what the screen shows.
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/doorbell/020 — A replaced agent's Idle cannot release its successor's Escapes.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path against a real registry and stand-in PTYs.
+- **Agent:** none (`/usr/bin/true` replaced by `cat` on one pane), events typed as Claude Code, Codex, OpenCode and Pi.
+- **Asserts:** with the successor's Escape pair recorded while it is Thinking, an Idle naming the replaced agent and an untagged Idle attested to its token each leave the doorbell held; so do the replaced agent's Thinking then Idle after a second pair on the Idle successor; the successor's own Idle releases the pair each time.
+- **Does not assert:** a successor published concurrently with the old agent's Idle (the owner check and the change are one registry hold; there is no seam between them to park at), or which Idle counts as the end of a turn.
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
 #### inbox/boundary
 
 ##### inbox/boundary/001 — The legacy ack-wait touches only legacy-owned assignments.

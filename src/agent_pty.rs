@@ -3417,6 +3417,16 @@ impl DraftTestStream {
     }
 }
 
+/// PRD #1666: an edge of an agent's turn, as its own hook reported it — what
+/// [`AgentPtyRegistry::note_turn`] applies to the pane's input stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEdge {
+    /// The agent reported Idle: what a run of the user's Escape keys could
+    /// have been holding, the interrupt of the turn it ends, is released. See
+    /// [`crate::draft_deferral::DraftTracker::turn_ended`].
+    Ended,
+}
+
 /// Issue #424 F1/H1: what each pane's input box is holding, as far as this
 /// daemon can tell — the human-input sequence and each pane's input stream,
 /// under ONE mutex.
@@ -3549,11 +3559,16 @@ impl PaneInputState {
             .is_some_and(|stream| stream.in_paste || stream.draft.pending())
     }
 
-    /// PRD #1666: the agent in `pane_id_env` reported Idle; see
-    /// [`crate::draft_deferral::DraftTracker::turn_ended`].
-    fn note_turn_ended(&mut self, pane_id_env: &str) {
-        if let Some(stream) = self.input.get_mut(pane_id_env) {
-            stream.draft.turn_ended();
+    /// PRD #1666: apply a turn edge the agent in `pane_id_env` reported. The
+    /// caller has already checked the edge came from the pane's live owner —
+    /// see [`AgentPtyRegistry::note_turn`].
+    fn note_turn(&mut self, pane_id_env: &str, edge: TurnEdge) {
+        match edge {
+            TurnEdge::Ended => {
+                if let Some(stream) = self.input.get_mut(pane_id_env) {
+                    stream.draft.turn_ended();
+                }
+            }
         }
     }
 
@@ -8880,12 +8895,28 @@ impl AgentPtyRegistry {
         self.pane_input.lock().unwrap().draft_pending(pane_id_env)
     }
 
-    /// PRD #1666: the agent in `pane_id_env` reported Idle, which ends what a
-    /// run of the user's Escape keys could have been holding: the interrupt
-    /// of the turn that just ended. See
-    /// [`crate::draft_deferral::DraftTracker::turn_ended`].
-    pub fn note_turn_ended(&self, pane_id_env: &str) {
-        self.pane_input.lock().unwrap().note_turn_ended(pane_id_env);
+    /// PRD #1666: generation `agent_id` reported `edge` of a turn on
+    /// `pane_id_env`. Applied to the pane's input stream only while that
+    /// generation is the pane's live owner: an Idle from a replaced agent ends
+    /// none of its successor's turns (r8g R8G-01), whether it names the old
+    /// generation or was attested to its token.
+    ///
+    /// The owner is checked and the stream changed under one hold of `inner`,
+    /// the order publication (`forget_pane_input`) and `close_agent` take the
+    /// two locks in, so a successor published between the check and the change
+    /// cannot have its fresh stream touched.
+    pub fn note_turn(&self, pane_id_env: &str, agent_id: &str, edge: TurnEdge) {
+        let inner = self.inner.lock().unwrap();
+        let owns = inner
+            .agents
+            .iter()
+            .find(|(_, a)| {
+                a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+            })
+            .is_some_and(|(id, _)| id == agent_id);
+        if owns {
+            self.pane_input.lock().unwrap().note_turn(pane_id_env, edge);
+        }
     }
 
     /// Issue #525: how long a guarded delivery waits on one PTY write.

@@ -2300,12 +2300,21 @@ where
     // it ends, so the doorbell stops reading those keys as a draft
     // (`DraftTracker::turn_ended`). Under this lock, like the quota latch, so
     // it reaches the tracker in the order the card sees it.
+    //
+    // Only the generation that sent it counts, as for the quota latch: the
+    // one it names, or the one its token was minted for, and the registry
+    // applies it only while that generation is the pane's live owner (r8g
+    // R8G-01). A report with neither touches nothing. An event the daemon
+    // authored ends no turn of the agent's, and a subagent's Idle ends the
+    // subagent's turn, not the main thread's the user interrupted.
     if !unproven
-        && daemon_owns_pane
         && event.event_type == crate::event::EventType::Idle
+        && !event.is_daemon_synthetic()
+        && !event.is_from_subagent()
         && let Some(pane_id) = event.pane_id.as_deref()
+        && let Some(generation) = event.agent_id.as_deref().or(attested_agent)
     {
-        registry.note_turn_ended(pane_id);
+        registry.note_turn(pane_id, generation, crate::agent_pty::TurnEdge::Ended);
     }
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?
@@ -15271,6 +15280,94 @@ mod hook_provenance_audit_tests {
             "a report attested to the replaced generation must not lift its \
              successor's quota block"
         );
+    }
+
+    /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, agent A
+    /// exits and agent B replaces it on a pane; B reports Thinking and the
+    /// user presses Escape twice into B. A's Idle naming A, and an Idle naming
+    /// no agent but attested to A's token, must leave B's Escapes holding the
+    /// doorbell, and so must A's Thinking then Idle after B's own Idle and a
+    /// second Escape pair; B's own Idle releases them each time.
+    #[spec("inbox/doorbell/020")]
+    #[tokio::test]
+    async fn doorbell_020_a_replaced_generations_idle_cannot_release_its_successors_escapes() {
+        for agent_type in ["claude_code", "codex", "opencode", "pi"] {
+            let pane = format!("escape-generation-{agent_type}");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let old = spawn(&registry, Some(&pane), "/usr/bin/true");
+            wait_until_nothing_lives(&registry).await;
+            let new = spawn(&registry, Some(&pane), "cat");
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            let (event_tx, _events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let ingest = async |kind: &str, agent: Option<&str>, attested: Option<&str>| {
+                let mut payload = line(&format!("{pane}-session"), Some(&pane), agent, kind, None);
+                payload["agent_type"] = agent_type.into();
+                ingest_event_unless(
+                    &state,
+                    &event_tx,
+                    &registry,
+                    event_of(payload),
+                    false,
+                    attested,
+                    |_| false,
+                )
+                .await;
+            };
+            let writer = registry.agent_writer(&new).expect("the successor's writer");
+            let escape_twice = async || {
+                writer
+                    .lock()
+                    .await
+                    .write_user(&[0x1b, 0x1b])
+                    .await
+                    .expect("Escape twice reaches the successor");
+            };
+
+            ingest("thinking", Some(&new), None).await;
+            escape_twice().await;
+            assert!(
+                registry.draft_pending(&pane),
+                "{agent_type}: precondition: the successor's interrupt holds"
+            );
+            ingest("idle", Some(&old), None).await;
+            let after_tagged = registry.draft_pending(&pane);
+            ingest("idle", None, Some(&old)).await;
+            let after_attested = registry.draft_pending(&pane);
+            ingest("idle", Some(&new), None).await;
+            let after_own = registry.draft_pending(&pane);
+
+            escape_twice().await;
+            ingest("thinking", Some(&old), None).await;
+            ingest("idle", Some(&old), None).await;
+            let after_old_turn = registry.draft_pending(&pane);
+            ingest("idle", Some(&new), None).await;
+            let after_own_again = registry.draft_pending(&pane);
+            registry.shutdown_all();
+
+            assert!(
+                after_tagged,
+                "{agent_type}: an Idle naming the replaced generation released \
+                 its successor's Escapes"
+            );
+            assert!(
+                after_attested,
+                "{agent_type}: an untagged Idle attested to the replaced \
+                 generation released its successor's Escapes"
+            );
+            assert!(
+                !after_own,
+                "{agent_type}: the successor's own Idle must release its Escapes"
+            );
+            assert!(
+                after_old_turn,
+                "{agent_type}: the replaced generation's Thinking then Idle \
+                 released the successor's Escapes on an Idle agent"
+            );
+            assert!(
+                !after_own_again,
+                "{agent_type}: the successor's own Idle must release them again"
+            );
+        }
     }
 
     /// Scenario: Agent A exits and agent B replaces it on a pane, and an
