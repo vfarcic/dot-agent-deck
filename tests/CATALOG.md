@@ -8478,7 +8478,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/017 — The probe reads only clap, and is bounded.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), stand-in CLIs and the hub.
 - **Agent:** none.
-- **Asserts:** a near miss of clap's diagnostic, the exact one on exit 1, a tip naming the flag, an old help exiting 0 without it and a help naming it only in prose are unknown; clap's exact refusal on exit 2 is `cli_too_old`; a CLI writing a megabyte to each stream after its help is drained and read as supported before the deadline; output held open by a background process does not outlast the deadline; a hung CLI is killed and reaped; after a registration, a late `cli_too_old` sets nothing and mail is still handed out.
+- **Asserts:** a near miss of clap's diagnostic, the exact one on exit 1, a tip naming the flag, its words behind a cursor-control sequence or followed by an unterminated escape, an old help exiting 0 without it and a help naming it only in prose are unknown; clap's exact refusal on exit 2 is `cli_too_old`; a CLI writing a megabyte to each stream after its help is drained and read as supported before the deadline; output held open by a background process does not outlast the deadline; a hung CLI is killed and reaped; after a registration, a late `cli_too_old` sets nothing and mail is still handed out.
 - **Does not assert:** a real old release.
 - **Platform coverage:** mac+linux.
 
@@ -8492,7 +8492,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/019 — An unknown lookup blocks every repeat.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex, a real spool with a directory squatting on each committed receipt's name.
 - **Agent:** none.
-- **Asserts:** an omitted attempt and one whose issue grace ran out are never handed out again, and no new attempt is issued for either, across several possession TTLs of ticks; past the wait bound both are listed as uncertain, and still no repeat follows.
+- **Asserts:** an omitted attempt and one whose issue grace ran out are never handed out again, and no new attempt is issued for either, across several possession TTLs of ticks, nor is a repeat scheduled (the doorbell enumeration does not count the pane); past the wait bound both are listed as uncertain, and still no repeat follows.
 - **Does not assert:** a read error's degraded notice (inbox/boundary/023).
 - **Platform coverage:** all.
 
@@ -8553,6 +8553,20 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** all.
 
 #### inbox/status
+
+##### inbox/boundary/028 — Cancel keeps a fenced attempt's receipt until it is read.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
+- **Agent:** none.
+- **Asserts:** a task whose commit receipt was published, cancelled while its reloaded context's `unknown` resume answer is still owed, ends with its attempt's evidence kept, and the next spool read sends the orchestrator the delivered-after-all correction after the possibly-handed cancellation notice; a stream retired after it closed, whose late commit receipt lands before a Cancel, gets the same correction; one retired with no receipt has its evidence returned after a clean read, with no correction.
+- **Does not assert:** a real watcher (inbox/opencode/041).
+- **Platform coverage:** all.
+
+##### inbox/boundary/029 — An earlier absence check never licenses a later repeat.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
+- **Agent:** none.
+- **Asserts:** after a cleared first hand-out and its marked repeat, a commit receipt published for the first hand-out and then the repeat refused hands out no third copy, and the next read settles the message; with the first hand-out's lookup made Unknown instead, no third copy is handed out and the message is listed as uncertain; each message has exactly two attempts.
+- **Does not assert:** a real watcher.
+- **Platform coverage:** all.
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
@@ -8703,9 +8717,9 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 
 
 ##### inbox/status/022 — A long picker keeps the cursor's row and the answer in view.
-- **Layer:** L1 (`tests/render_inbox_attention.rs`), the production key funnel and the picker drawn on a 14-row `TestBackend`.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), the production key funnel and the picker drawn on a 14-row `TestBackend`, then at 9, 7 and 5 rows.
 - **Agent:** none.
-- **Asserts:** with nine items, moving to the last one keeps its row and cursor on screen, the title says which of the nine are shown, and `c` sends that row's Cancel; with an answer shown, the answer and the cursor's row are both visible.
+- **Asserts:** with nine items, moving to the last one keeps its row and cursor on screen, the title says which of the nine are shown, and `c` sends that row's Cancel; with an answer shown, the answer and the cursor's row are both visible, with the buttons too at 9 and 7 rows, and at 5 rows (the fewest that leave the picker a row) the answer is.
 - **Does not assert:** the desktop list (`desktop/src/components/InboxAttention.test.tsx`).
 - **Platform coverage:** all.
 
@@ -9907,6 +9921,34 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), a fixture whose first prompt call is recorded and then throws.
 - **Agent:** generated TUI plugin in an offer-taking worker.
 - **Asserts:** no `not_handed` is reported; the job stays fetched by this worker, is prompted again marked as a possible repeat, and is claimed when answered.
+- **Does not assert:** a real OpenCode.
+- **Cost:** none.
+
+##### inbox/opencode/045 — A committed or forgotten attempt stays possibly handed.
+- **Layer:** Fast JS (`src/opencode_manage.rs` tests), Node against a fake watcher child.
+- **Agent:** the generated receipt receiver.
+- **Asserts:** an attempt reported committed is never reported `not_handed` and a revoke of it is answered `already_handed`; after more attempts than the receiver remembers, a revoke of a lost attempt it dropped, or of one it never saw, is answered `already_handed` and neither is reported `not_handed`.
+- **Does not assert:** the daemon's side (inbox/opencode/047).
+- **Cost:** none.
+
+##### inbox/opencode/046 — An approval outlived by the stream's retirement is void.
+- **Layer:** Fast JS (`src/opencode_manage.rs` tests), Node against a fake watcher child, the event loop stalled synchronously.
+- **Agent:** the generated receipt receiver.
+- **Asserts:** with a 10 ms keepalive, an approval used at once reaches the API, and one read after a 200 ms stall does not.
+- **Does not assert:** the daemon's retirement (inbox/boundary/021, inbox/boundary/028).
+- **Cost:** none.
+
+##### inbox/opencode/047 — A Cancel racing a commit's publication keeps the offer bound.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watcher with a 3 s publish delay.
+- **Agent:** generated TUI plugin in an offer-taking worker.
+- **Asserts:** a job reported committed and cancelled while its commit receipt is still being written is answered `already_handed`, never `revoked_ack`, ends undeliverable on this worker and does not go back to its pool; one prompt.
+- **Does not assert:** a real OpenCode.
+- **Cost:** none.
+
+##### inbox/opencode/048 — A commit reported before the rebound caps waits for them.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watcher with `DOT_AGENT_DECK_INBOX_TEST_DROP_COMMITTED` and a 2 s `DOT_AGENT_DECK_INBOX_TEST_REBIND_DELAY_MS`.
+- **Agent:** generated TUI plugin.
+- **Asserts:** after a watcher restart and a `retained` resume, a commit reported before the rebound caps reach the replacement watcher's publisher is published once they do, and the deck settles the message from that receipt with one prompt.
 - **Does not assert:** a real OpenCode.
 - **Cost:** none.
 

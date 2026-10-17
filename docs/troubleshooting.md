@@ -220,12 +220,12 @@ The deck handed a message to the agent, then lost track of whether the agent sta
 
 The notice under the card's directory says which:
 
-- `this agent's deck integration is out of date; restart the agent to update it` — the agent loaded an older copy of the deck's plugin. Restart the agent; the deck rewrites its integration from the running deck before the agent starts. When the plugin names another installed copy of `dot-agent-deck`, the deck keeps that copy and updates only the plugin around it.
+- `this agent's deck integration is out of date; restart the agent to update it` — the agent loaded an older copy of the deck's plugin. Restart the agent; the deck rewrites its integration from the running deck before the agent starts. When the plugin names another installed copy of `dot-agent-deck`, the deck usually keeps that copy and updates the plugin around it; a newer installed copy of the deck can replace it instead.
 - `the deck could not update this agent's deck integration: run dot-agent-deck hooks install --agent opencode to see why, then restart the agent` — the deck could not write the agent's plugin files when it started, so restarting again will not help by itself. The install command prints the file it cannot write; fix its permissions, then restart the agent.
 - `the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent` — the agent's integration runs an older `dot-agent-deck` than the deck. Upgrade it (or point `DOT_AGENT_DECK_BIN` at the current one), then restart the agent.
 - `this agent's deck integration has not connected yet; its messages wait until it does` — the agent is still starting, or its integration did not load. It clears by itself once the integration connects, and the waiting messages are then delivered; if it stays, restart the agent or run `dot-agent-deck hooks install --agent opencode`.
 
-In each case the agent's messages wait; none is lost.
+While a notice stands, the agent's messages wait. When the integration connects without a restart, as it does for an agent that was still starting, they are then delivered. Restarting the agent is different: messages already waiting for it, uncertain ones included, are not handed to the restarted agent. They show as not delivered, an orchestrator is told about each of its tasks so it can delegate them again, and a job offered to the agent goes back to its pool. Post any other message again if it is still needed. [Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app) has the details.
 
 ### A card says messages may repeat or deck messages are paused
 
