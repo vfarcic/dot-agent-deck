@@ -159,7 +159,7 @@ fn opencode_019_live_child_view_navigates_to_root_for_delegate() {
     );
 }
 
-/// Scenario: Leave a draft in real opencode --mini and delegate a sentinel task. Without further user input, the redraw nudge must show the framed message and final reply, preserve the draft and acknowledge the task.
+/// Scenario: Leave a draft in real opencode --mini and delegate a sentinel task that prints an assembled execution token. Without further input, both views must show the ID-correlated frame and execution, the card must show delivered once, and the draft must survive; after a genuine Idle hook, both views must lose the busy footer within ten seconds.
 #[spec("inbox/opencode/020")]
 #[test]
 fn opencode_020_live_mini_redraws_native_delivery_and_keeps_draft() {
@@ -167,12 +167,19 @@ fn opencode_020_live_mini_redraws_native_delivery_and_keeps_draft() {
     let op = OpenCode::new(true, 0, true);
     let _input = op.input("MINI-DRAFT-93ab");
     op.wait_screen("MINI-DRAFT-93ab");
-    let id = op.delegate("opencode-mini-ac62f1.txt");
+    let id = op.delegate_execution("opencode-mini-ac62f1.txt", "020-93ab");
     // The delegate includes role instructions long enough to scroll its opener
     // above mini's viewport. Its closing frame remains beside the visible work.
     op.wait_screen(&format!("[end of dot-agent-deck message {id}]"));
-    op.done(&id, "opencode-mini-ac62f1.txt");
+    op.visible_execution(&id, "opencode-mini-ac62f1.txt", "NATIVE-EXEC-020-93ab");
+    op.mini_not_busy_after_idle();
     op.wait_screen("MINI-DRAFT-93ab");
+    assert!(
+        op.deck
+            .wait_for_grid_string_within("MINI-DRAFT-93ab", BUDGET),
+        "draft must remain in attached deck; {}",
+        op.evidence()
+    );
     assert_eq!(
         inbox::listing(&op.deck, &op.pane)["component"],
         "opencode_mini"
@@ -204,18 +211,37 @@ fn opencode_021_live_watcher_respawns_and_next_delegate_is_native() {
     assert!(!op.log().contains("doorbell rang"), "{}", op.evidence());
 }
 
-/// Scenario: Remove the deck entry from scratch tui.json so no TUI watcher arms, and leave real OpenCode idle after a prior prompt. The doorbell must be intercepted by the server plugin, bound to its own receiver, run the task without a model-side inbox fetch, and commit on its visible reply and sentinel.
+/// Scenario: Remove the deck entry from scratch tui.json so no TUI watcher arms, start an explicitly cancellable shell wait, and interrupt it once after its running sleep is visible in both views to obtain a genuine Idle and empty composer. The server plugin must intercept the doorbell before the model, visibly execute the delegated task in both views without restarting the wait or replying to the obsolete request, write the sentinel, acknowledge once, and show a delivered card. This covers delivery after explicit cancellation; the deck does not cancel arbitrary earlier requests.
 #[spec("inbox/opencode/022")]
 #[test]
 fn opencode_022_live_unarmed_doorbell_is_intercepted_before_model() {
     skip_unless!(live::available());
     let op = OpenCode::new(false, 0, false);
-    op.prior();
-    let id = op.delegate("opencode-doorbell-52a1cd.txt");
+    let priming_call = op.interrupted_cancellable_wait();
+    let id = op.delegate_execution("opencode-doorbell-52a1cd.txt", "022-52a1");
     // PRD #1666 §4: the server plugin's doorbell-only receiver commits the
     // substituted attempt on its own receipt stream, so the inbox records
     // PluginConfirmed, as for the armed stream.
-    op.done_with_ack(&id, "opencode-doorbell-52a1cd.txt", "plugin_confirmed");
+    op.visible_execution(&id, "opencode-doorbell-52a1cd.txt", "NATIVE-EXEC-022-52a1");
+    let transcript = op.transcript();
+    let parts = transcript["part"].as_array().unwrap();
+    assert!(
+        !parts.iter().any(|p| p["data"]["type"] == "tool"
+            && p["id"] != priming_call
+            && p["data"]["state"]["input"]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("sleep 30"))),
+        "cancelled priming wait must not run again after delivery; {}",
+        op.evidence()
+    );
+    assert!(
+        !parts.iter().any(|p| p["data"]["type"] == "text"
+            && p["data"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("PRIME-INTERRUPT-022"))),
+        "obsolete priming reply must not appear after delivery; {}",
+        op.evidence()
+    );
     assert!(op.log().contains("doorbell rang"), "{}", op.evidence());
     assert!(op.log().contains("DoorbellHook"), "{}", op.evidence());
     assert!(
@@ -227,7 +253,7 @@ fn opencode_022_live_unarmed_doorbell_is_intercepted_before_model() {
                 && p["data"]["state"]["input"]
                     .to_string()
                     .contains("inbox fetch")),
-        "model must not run inbox fetch"
+        "interception must deliver before the model can fetch the tested task"
     );
     assert!(
         !op.transcript()["part"]

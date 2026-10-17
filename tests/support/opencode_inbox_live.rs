@@ -2,9 +2,15 @@
 #![allow(dead_code)]
 
 use crate::{common, inbox};
+#[path = "../opencode_composer.rs"]
+mod composer;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 pub const BUDGET: Duration = Duration::from_secs(120);
@@ -15,6 +21,9 @@ pub struct OpenCode {
     pub deck: common::TuiDeck,
     pub work: PathBuf,
     next: std::cell::Cell<usize>,
+    diagnostics: PathBuf,
+    observer_stop: Arc<AtomicBool>,
+    observer: Option<std::thread::JoinHandle<()>>,
 }
 
 pub fn available() -> Result<(), String> {
@@ -177,11 +186,69 @@ export default {id:'deck-test-route',tui:async(api)=>{
             json!({"op":"start-agent","command":common::capability_export_command("exec ./delegate-loop.sh"),"cwd":work,"rows":40,"cols":140,"env":[["DOT_AGENT_DECK_PANE_ID","opencode-inbox-orchestrator"],["PATH",path]],"display_name":"orchestrator","tab_membership":{"kind":"orchestration","name":"opencode-inbox","role_name":"orchestrator","role_index":0,"is_start_role":true,"orchestration_cwd":work,"orchestration_id":"opencode-inbox-test"}}),
         );
         assert_eq!(reply["ok"], true, "orchestrator spawn: {reply}");
+        let diagnostics = std::env::var_os("DOT_AGENT_DECK_OPENCODE_DIAGNOSTICS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".dot-agent-deck/opencode-live-runs")
+            })
+            .join(format!(
+                "{}-{}-{}",
+                std::thread::current().name().unwrap_or("opencode"),
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            ));
+        std::fs::create_dir_all(&diagnostics).unwrap();
+        let observer_stop = Arc::new(AtomicBool::new(false));
+        let stop = observer_stop.clone();
+        let socket = deck.hook_socket_path().to_owned();
+        let request = inbox::request(&pane, "inbox_list");
+        let observations = diagnostics.join("first-observed.json");
+        let observer = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let mut first = json!({});
+            while !stop.load(Ordering::Relaxed) {
+                let sample = || -> Option<Value> {
+                    let mut stream = std::os::unix::net::UnixStream::connect(&socket).ok()?;
+                    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .ok()?;
+                    writeln!(stream, "{request}").ok()?;
+                    let mut line = String::new();
+                    BufReader::new(stream).read_line(&mut line).ok()?;
+                    serde_json::from_str(&line).ok()
+                };
+                if let Some(listing) = sample() {
+                    for message in listing["messages"].as_array().into_iter().flatten() {
+                        let Some(id) = message["id"].as_str() else {
+                            continue;
+                        };
+                        let now = json!(chrono::Utc::now().to_rfc3339());
+                        if first[id].is_null() {
+                            first[id] = json!({"enqueue_observed": now});
+                        }
+                        if message["state"] == "acknowledged" && first[id]["ack_observed"].is_null()
+                        {
+                            first[id]["ack_observed"] = now;
+                        }
+                        first[id]["latest"] = message.clone();
+                    }
+                    let _ = std::fs::write(
+                        &observations,
+                        common::redact_credentials_for_output(&first.to_string()),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
         let result = Self {
             pane,
             deck,
             work,
             next: std::cell::Cell::new(1),
+            diagnostics,
+            observer_stop,
+            observer: Some(observer),
         };
         result.wait_screen("Ask anything");
         if watcher {
@@ -298,6 +365,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
             .unwrap_or_default()
     }
     pub fn evidence(&self) -> String {
+        self.save_diagnostics();
         format!(
             "Pane:\n{}\nGrid:\n{}\nInbox:{}\nLog:\n{}",
             self.screen(),
@@ -305,6 +373,25 @@ export default {id:'deck-test-route',tui:async(api)=>{
             inbox::listing(&self.deck, &self.pane),
             self.log()
         )
+    }
+    fn save_diagnostics(&self) {
+        // Only scratch-session content and public terminal/log surfaces, never
+        // configuration or auth files. Every persisted byte uses the harness redactor.
+        let snapshot = self.diagnostics.join(format!(
+            "snapshot-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        for (name, text) in [
+            ("transcript.json", self.transcript().to_string()),
+            ("pane.txt", self.screen()),
+            ("deck.txt", self.deck.snapshot_grid()),
+            ("deck.log", self.log()),
+            ("inbox.json", inbox::listing(&self.deck, &self.pane).to_string()),
+            ("capture.json", json!({"at": chrono::Utc::now().to_rfc3339(), "panicking": std::thread::panicking(), "record": self.record()}).to_string()),
+        ] {
+            let _ = std::fs::write(snapshot.join(name), common::redact_credentials_for_output(&text));
+        }
     }
     pub fn input(&self, text: &str) -> common::AttachInput {
         let mut input =
@@ -328,6 +415,142 @@ export default {id:'deck-test-route',tui:async(api)=>{
             "OpenCode must show the prompt's session; {}",
             self.evidence()
         );
+    }
+    pub fn interrupted_cancellable_wait(&self) -> Value {
+        let before = self.log().len();
+        let prompt = "Run sleep 30 once in the shell as a disposable, cancellable wait while I prepare your next task. This request lasts only until I interrupt you. An interrupt cancels the wait and completes this request: do not restart it, send a follow-up answer, or carry it into the next task. After interruption, handle the next instruction normally.";
+        let mut priming_input = self.input(prompt);
+        assert!(
+            common::wait_until(BUDGET, || composer::composer_has_prompt(
+                &self.screen(),
+                prompt
+            )),
+            "complete cancellable prompt must be in the composer before Enter; {}",
+            self.evidence()
+        );
+        std::fs::write(
+            self.diagnostics.join("composer-ready.json"),
+            common::redact_credentials_for_output(
+                &json!({"at":chrono::Utc::now().to_rfc3339(),"pane":self.screen()}).to_string(),
+            ),
+        )
+        .unwrap();
+        priming_input.write("\r");
+        assert!(
+            common::wait_until(BUDGET, || {
+                self.record()["live"]["status"] == "Thinking"
+                    && self
+                        .log()
+                        .get(before..)
+                        .is_some_and(|log| log.contains("event_type=Thinking"))
+                    && self.route()["route"]["params"]["sessionID"].is_string()
+            }),
+            "prior prompt must genuinely start Thinking; {}",
+            self.evidence()
+        );
+        let running_call = std::cell::RefCell::new(Value::Null);
+        assert!(
+            common::wait_until(BUDGET, || {
+                let transcript = self.transcript();
+                let call = transcript["part"].as_array().unwrap().iter().find(|p| {
+                    p["data"]["type"] == "tool"
+                        && p["data"]["tool"] == "bash"
+                        && p["data"]["state"]["status"] == "running"
+                        && p["data"]["state"]["input"]["command"] == "sleep 30"
+                });
+                let Some(call) = call else { return false };
+                if !composer::sleep_tool_visible(&self.screen())
+                    || !composer::sleep_tool_visible(&self.deck.snapshot_grid())
+                {
+                    return false;
+                }
+                *running_call.borrow_mut() = call.clone();
+                true
+            }),
+            "cancellable bash sleep 30 must be running and visible in both views before interrupt; {}",
+            self.evidence()
+        );
+        let running_call = running_call.into_inner();
+        std::fs::write(
+            self.diagnostics.join("priming.json"),
+            common::redact_credentials_for_output(
+                &json!({"at":chrono::Utc::now().to_rfc3339(),"call":running_call,
+                    "pane":self.screen(),"deck":self.deck.snapshot_grid()})
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        // One logical interrupt using this agent's discovered sequence (OpenCode
+        // currently requires two Esc presses). Never repeat the sequence until Idle.
+        let record = self.record();
+        let steps = record["prompt_keys"]["interrupt"]
+            .as_array()
+            .expect("agent interrupt sequence");
+        assert!(!steps.is_empty());
+        let mut input = self.input("");
+        let mut sent = Vec::new();
+        for step in steps {
+            sent.push(chrono::Utc::now().to_rfc3339());
+            input.write(step["bytes"].as_str().unwrap());
+            std::thread::sleep(Duration::from_millis(
+                step["pause_after_ms"].as_u64().unwrap_or(0),
+            ));
+        }
+        std::fs::write(
+            self.diagnostics.join("interrupt.json"),
+            json!({"logical_interrupts":1,"key_sent_at":sent}).to_string(),
+        )
+        .unwrap();
+        self.idle();
+        assert!(
+            self.log()
+                .get(before..)
+                .is_some_and(|log| log.contains("event_type=Idle")),
+            "interrupted prompt must produce a real Idle hook; {}",
+            self.evidence()
+        );
+        let empty_composer = || {
+            let shown = self.screen();
+            let lines = shown.lines().collect::<Vec<_>>();
+            let Some(mode) = lines.iter().rposition(|line| line.contains("Build auto")) else {
+                return false;
+            };
+            mode >= 2
+                && lines[mode - 2..mode].iter().all(|line| {
+                    line.trim_matches(|c: char| c.is_whitespace() || c == '┃')
+                        .is_empty()
+                })
+                && !shown.contains("esc interrupt")
+        };
+        // The attached deck redraws its status even when the composer is empty;
+        // settle the observable composer instead of requiring all bytes to stop.
+        let empty_since = std::cell::Cell::new(None::<std::time::Instant>);
+        assert!(
+            common::wait_until(BUDGET, || {
+                if !empty_composer() || self.record()["live"]["status"] != "Idle" {
+                    empty_since.set(None);
+                    return false;
+                }
+                let since = empty_since.get().unwrap_or_else(|| {
+                    let now = std::time::Instant::now();
+                    empty_since.set(Some(now));
+                    now
+                });
+                since.elapsed() >= Duration::from_millis(250)
+            }),
+            "interrupted composer must stay settled and empty for 250ms after genuine Idle; {}",
+            self.evidence()
+        );
+        std::fs::write(
+            self.diagnostics.join("interrupted.json"),
+            common::redact_credentials_for_output(
+                &json!({"at":chrono::Utc::now().to_rfc3339(),"transcript":self.transcript(),
+                    "pane":self.screen(),"deck":self.deck.snapshot_grid()})
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        running_call["id"].clone()
     }
     /// Wait until [`Self::answered`].
     pub fn wait_answered(&self, asked: &str, answer: &str) {
@@ -379,6 +602,86 @@ export default {id:'deck-test-route',tui:async(api)=>{
     }
     pub fn delegate(&self, name: &str) -> String {
         self.delegate_body(&format!("Use the shell to run exactly: printf '{CONTENT}' > '{}'. Then give a brief final reply and end your turn. Do this once for this delivery id.",self.work.join(name).display()))
+    }
+    pub fn delegate_execution(&self, name: &str, token_suffix: &str) -> String {
+        self.delegate_body(&format!("Use the shell to run exactly: printf '{CONTENT}' > '{}'; printf '%s%s\\n' 'NATIVE-EXEC-' '{token_suffix}'. Then give a brief final reply and end your turn. Do this once for this delivery id.",self.work.join(name).display()))
+    }
+    pub fn visible_execution(&self, id: &str, name: &str, token: &str) {
+        let frame = format!("[end of dot-agent-deck message {id}]");
+        self.wait_screen(&frame);
+        assert!(
+            self.deck.wait_for_grid_string_within(&frame, BUDGET),
+            "ID-correlated frame must be visible in attached deck; {}",
+            self.evidence()
+        );
+        common::wait_for_file_trimmed_eq(&self.work.join(name), CONTENT, BUDGET)
+            .unwrap_or_else(|why| panic!("real OpenCode must act: {why}; {}", self.evidence()));
+        assert!(
+            common::wait_until(BUDGET, || {
+                let transcript = self.transcript();
+                let messages = transcript["message"].as_array().unwrap();
+                let parts = transcript["part"].as_array().unwrap();
+                let user = messages.iter().find(|m| {
+                    m["data"]["role"] == "user"
+                        && parts.iter().any(|p| {
+                            p["message_id"] == m["id"]
+                                && p["data"]["text"]
+                                    .as_str()
+                                    .is_some_and(|text| text.contains(&frame))
+                        })
+                });
+                let Some(user) = user else { return false };
+                parts.iter().any(|p| {
+                    p["data"]["type"] == "tool"
+                        && p["data"]["state"]["status"] == "completed"
+                        && p["data"]["state"]["output"]
+                            .as_str()
+                            .is_some_and(|output| output.contains(token))
+                        && messages.iter().any(|m| {
+                            m["id"] == p["message_id"] && m["data"]["parentID"] == user["id"]
+                        })
+                })
+            }),
+            "this delivery must assemble its token in a completed tool result; {}",
+            self.evidence()
+        );
+        self.wait_screen(token);
+        assert!(
+            self.deck.wait_for_grid_string_within(token, BUDGET),
+            "execution token must be visible in attached deck; {}",
+            self.evidence()
+        );
+        inbox::state(&self.deck, &self.pane, id, "acknowledged");
+        let listing = inbox::listing(&self.deck, &self.pane);
+        let message = listing["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap();
+        assert_eq!(message["ack_how"], "plugin_confirmed", "{message}");
+        assert_eq!(message["deliveries"], 1, "{message}");
+        assert!(
+            self.deck.wait_for_grid_string_within("✉ delivered", BUDGET),
+            "worker card must show delivered; {}",
+            self.evidence()
+        );
+    }
+    pub fn mini_not_busy_after_idle(&self) {
+        self.idle();
+        assert!(
+            self.log().contains("event_type=Idle"),
+            "mini must have a genuine Idle hook; {}",
+            self.evidence()
+        );
+        assert!(
+            common::wait_until(Duration::from_secs(10), || {
+                !self.screen().contains("esc interrupt")
+                    && !self.deck.snapshot_grid().contains("esc interrupt")
+            }),
+            "mini must stop showing its busy footer within 10s of genuine Idle; {}",
+            self.evidence()
+        );
     }
     pub fn delegate_body(&self, body: &str) -> String {
         let n = self.next.get();
@@ -645,6 +948,18 @@ print(json.dumps(out))
         found.sort();
         found.dedup();
         found
+    }
+}
+
+impl Drop for OpenCode {
+    fn drop(&mut self) {
+        self.observer_stop.store(true, Ordering::Relaxed);
+        if let Some(observer) = self.observer.take() {
+            let _ = observer.join();
+        }
+        // Do not let a diagnostic failure cause a second panic during unwinding.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.save_diagnostics()));
+        eprintln!("OpenCode run diagnostics: {}", self.diagnostics.display());
     }
 }
 

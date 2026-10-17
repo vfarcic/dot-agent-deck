@@ -10047,8 +10047,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/opencode/020 — Real OpenCode mini redraws native work without losing a draft.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
 - **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
-- **Asserts:** Native mini component, visible framed task and final reply without further input, draft retained, sentinel and acknowledgement.
-- **Does not assert:** A long transcript's redraw latency.
+- **Asserts:** Native mini component, ID-correlated frame and assembled execution token visible in both terminal views without further input, a completed tool result for that delivery, retained draft in both views, exact sentinel, `acknowledged` / `plugin_confirmed` / one delivery and the delivered card; the busy footer disappears from both views within ten seconds after genuine Idle.
+- **Does not assert:** A model-generated final reply or a long transcript's redraw latency.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 ##### inbox/opencode/021 — Real OpenCode respawns a killed inbox watcher and delivers natively.
@@ -10061,8 +10061,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/opencode/022 — Real unarmed OpenCode intercepts a doorbell before the model.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
 - **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
-- **Asserts:** No deck TUI watcher, genuine doorbell, server-plugin fetch bound to its doorbell-only receiver, visible reply and sentinel, a commit on that receiver (`plugin_confirmed`), no model-side inbox fetch.
-- **Does not assert:** Remote attach and non-TUI OpenCode commands.
+- **Asserts:** An explicitly cancellable request reaches Thinking with a real running `bash` `sleep 30` call visible in both views before one logical Esc, 300 ms, Esc interrupt produces a genuine Idle and settled empty composer; no deck TUI watcher, genuine doorbell, server-plugin fetch bound to its doorbell-only receiver, ID-correlated frame and assembled execution token visible in both views, sentinel, `plugin_confirmed` / one delivery and a delivered card; interception before the model, with no model-side inbox fetch, restarted `sleep 30` or obsolete priming reply through observed execution.
+- **Does not assert:** Cancellation of arbitrary earlier requests: this proves delivery and execution after an explicitly cancellable request; the deck does not cancel arbitrary earlier requests. Also excludes a completed natural-language final reply, future model behavior after execution, remote attach or non-TUI OpenCode commands.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 #### inbox/pi
