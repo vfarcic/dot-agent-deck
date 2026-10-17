@@ -3549,6 +3549,14 @@ impl PaneInputState {
             .is_some_and(|stream| stream.in_paste || stream.draft.pending())
     }
 
+    /// PRD #1666: the agent in `pane_id_env` reported Idle; see
+    /// [`crate::draft_deferral::DraftTracker::turn_ended`].
+    fn note_turn_ended(&mut self, pane_id_env: &str) {
+        if let Some(stream) = self.input.get_mut(pane_id_env) {
+            stream.draft.turn_ended();
+        }
+    }
+
     /// Issue #544 (PR #1398 finding #16): bytes the DECK just wrote into
     /// `pane_id_env`, fed into the same stream as the user's and in the same
     /// order the PTY received them — see [`PaneInputStream`]. They move the
@@ -8870,6 +8878,14 @@ impl AgentPtyRegistry {
     /// [`crate::draft_deferral::DraftTracker`] for what sets and clears it.
     pub fn draft_pending(&self, pane_id_env: &str) -> bool {
         self.pane_input.lock().unwrap().draft_pending(pane_id_env)
+    }
+
+    /// PRD #1666: the agent in `pane_id_env` reported Idle, which ends what a
+    /// run of the user's Escape keys could have been holding: the interrupt
+    /// of the turn that just ended. See
+    /// [`crate::draft_deferral::DraftTracker::turn_ended`].
+    pub fn note_turn_ended(&self, pane_id_env: &str) {
+        self.pane_input.lock().unwrap().note_turn_ended(pane_id_env);
     }
 
     /// Issue #525: how long a guarded delivery waits on one PTY write.

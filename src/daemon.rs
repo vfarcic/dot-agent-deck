@@ -2295,6 +2295,18 @@ where
             registry.quota_note_work_event(pane_id, generation);
         }
     }
+    // PRD #1666: an Idle from the pane's own agent ends what a run of the
+    // user's Escape keys could have been holding, the interrupt of the turn
+    // it ends, so the doorbell stops reading those keys as a draft
+    // (`DraftTracker::turn_ended`). Under this lock, like the quota latch, so
+    // it reaches the tracker in the order the card sees it.
+    if !unproven
+        && daemon_owns_pane
+        && event.event_type == crate::event::EventType::Idle
+        && let Some(pane_id) = event.pane_id.as_deref()
+    {
+        registry.note_turn_ended(pane_id);
+    }
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?
     // The verdict is the daemon's alone — any inbound value is dropped first,

@@ -11,7 +11,12 @@
 //! into its own box (history recall, autocomplete, a restored message) is
 //! invisible to it, as is a partial clear it reads as a full one. A key that
 //! edits nothing (a menu answer with no Enter, a draft backspaced to empty)
-//! sets it until the user's next Enter.
+//! sets it until the user's next Enter. The one exception is a run of Escape
+//! keys and nothing else, the way the user interrupts a turn (OpenCode's
+//! interrupt is Escape twice): it holds the bit only until the agent next
+//! reports Idle ([`DraftTracker::turn_ended`]). An Escape run on an agent
+//! that is already Idle opens a menu in some agents, and holds it until the
+//! user's next Enter like any other key.
 
 use std::time::Duration;
 
@@ -126,6 +131,9 @@ const MAX_STRING_LEN: u16 = 4096;
 #[derive(Debug, Default)]
 pub(crate) struct DraftTracker {
     pending: bool,
+    /// Set instead of `pending` by the user's lone Escape keys (`ESC ESC`):
+    /// held only until [`Self::turn_ended`].
+    escapes: bool,
     escape: Escape,
     /// Whether a USER byte is part of the sequence being parsed, counting the
     /// bytes AFTER the `ESC` that opened it — and that `ESC` too inside a
@@ -155,7 +163,20 @@ pub(crate) enum ByteOrigin {
 
 impl DraftTracker {
     pub(crate) fn pending(&self) -> bool {
-        self.pending
+        self.pending || self.escapes
+    }
+
+    /// The agent reported Idle. Escape keys the user sent before it, with
+    /// nothing else since the last submit or clear, were the interrupt that
+    /// ended its turn, which leaves the box as it was; they hold the bit no
+    /// longer. Anything else the user sent still holds it, and so does a lone
+    /// Escape still waiting for its next byte, but it is no longer counted as
+    /// half of `ESC ESC`, so an Escape after this one does not inherit it.
+    pub(crate) fn turn_ended(&mut self) {
+        self.escapes = false;
+        if self.escape == (Escape::Esc { paste: false }) {
+            self.esc_user = false;
+        }
     }
 
     /// Feed one byte of the pane's input stream. `submits` is whether it
@@ -173,6 +194,7 @@ impl DraftTracker {
             // Enter is a hard reset, whoever pressed it: the box was
             // submitted, and whatever sequence was being parsed is over.
             self.pending = false;
+            self.escapes = false;
             self.escape = Escape::Ground;
             return;
         }
@@ -240,9 +262,10 @@ impl DraftTracker {
                 // counted only when the user sent it (`esc_user`, not this
                 // byte's origin) AND is the one who went on typing: a deck
                 // ESC is never theirs, and a lone Escape keypress followed by
-                // a deck write edits nothing of theirs.
+                // a deck write edits nothing of theirs. It counts as an
+                // Escape key, which the agent's next Idle releases.
                 ESC => {
-                    self.pending |= self.esc_user && self.by_user;
+                    self.escapes |= self.esc_user && self.by_user;
                     self.ground(byte, in_paste)
                 }
                 // `Alt+<key>`, `Alt+Enter`, `Alt+Backspace`: an edit, and the
@@ -430,6 +453,7 @@ impl DraftTracker {
             0x15 | 0x03 if !in_paste => {
                 if self.by_user {
                     self.pending = false;
+                    self.escapes = false;
                 }
                 Escape::Ground
             }
@@ -751,6 +775,57 @@ mod tests {
         feed(&mut tracker, b"\x1b");
         feed_as(&mut tracker, b"\x1b[200~NOTICE\x1b[201~", ByteOrigin::Deck);
         assert!(!tracker.pending(), "a lone Escape before our paste");
+    }
+
+    /// PRD #1666 (live `inbox/opencode/022`): OpenCode's interrupt is Escape,
+    /// a pause, Escape. Escape keys and nothing else hold the bit only until
+    /// the agent reports Idle, and an Escape after that Idle is not half of a
+    /// double Escape with the interrupt's. A draft typed before or after the
+    /// Escapes, or around them, still holds it, and so does a double Escape
+    /// on an agent that is already Idle until the next Idle.
+    #[test]
+    fn an_interrupts_escapes_hold_the_bit_only_until_the_agent_is_idle() {
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b");
+        feed(&mut tracker, b"\x1b");
+        assert!(tracker.pending(), "before Idle an Escape run may be a menu");
+        tracker.turn_ended();
+        assert!(!tracker.pending(), "the interrupt held the bit after Idle");
+        feed(&mut tracker, b"\x1b");
+        assert!(
+            !tracker.pending(),
+            "an Escape after Idle paired with the interrupt's"
+        );
+        feed(&mut tracker, b"\x1b");
+        assert!(tracker.pending(), "a double Escape on an Idle agent");
+
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b\x1b");
+        tracker.turn_ended();
+        feed(&mut tracker, b"x");
+        assert!(tracker.pending(), "typing after the interrupt");
+
+        for (bytes, why) in [
+            (&b"draft\x1b\x1b"[..], "typed, then Escape"),
+            (b"\x1b\x1bdraft", "Escape, then typed"),
+            (b"dr\x1b\x1baft", "Escape inside a draft"),
+            (b"draft\x1b", "typed, then one Escape"),
+        ] {
+            let mut tracker = DraftTracker::default();
+            feed(&mut tracker, bytes);
+            tracker.turn_ended();
+            assert!(tracker.pending(), "{why}");
+        }
+
+        // A submit still clears an Escape run, and so does a Ctrl+U once the
+        // second Escape is no longer waiting for its next byte (right after
+        // it, `ESC Ctrl+U` is `Alt+Ctrl+U`, an edit).
+        for clear in [&b"\r"[..], b"x\x15"] {
+            let mut tracker = DraftTracker::default();
+            feed(&mut tracker, b"\x1b\x1b");
+            feed(&mut tracker, clear);
+            assert!(!tracker.pending(), "{clear:?}");
+        }
     }
 
     /// Sweep (PR #1398): CSI intermediate bytes are bounded like parameter

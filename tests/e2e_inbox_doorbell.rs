@@ -362,3 +362,65 @@ fn dispatch_023_terminal_reports_do_not_hold_doorbell() {
     );
     assert!(screen(&daemon, &pane).contains("waiting, run: dot-agent-deck inbox fetch"));
 }
+
+/// Scenario: For each supported synthetic agent type, report the worker Thinking, forward the interrupt OpenCode uses (Escape, a 300 ms pause, Escape) as the user's keys, then report it Idle and queue a task. An interrupt is not a draft, so the fixed doorbell must follow the two Escapes and a fetch must deliver the task.
+#[spec("scheduler/dispatch/023")]
+#[test]
+fn dispatch_023_an_interrupts_escapes_do_not_hold_doorbell() {
+    let daemon = daemon_unbound(&[]);
+    for agent_type in ["open_code", "claude_code", "codex", "pi"] {
+        let pane = pane(
+            &daemon,
+            &format!("interrupt-{}", agent_type.replace('_', "-")),
+        );
+        status(&daemon, &pane, "thinking", agent_type);
+        let mut user = input(&daemon, &pane, "\x1b");
+        std::thread::sleep(Duration::from_millis(300));
+        user.write("\x1b");
+        assert!(
+            common::wait_until(WAIT, || bytes(&pane) == b"\x1b\x1b"),
+            "{agent_type}: interrupt not received"
+        );
+        status(&daemon, &pane, "idle", agent_type);
+        let id = enqueue(&daemon, &pane, BODY);
+        let expected = format!("\x1b\x1b{}\r", fixed_line(&id));
+        assert!(
+            common::wait_until(WAIT, || bytes(&pane) == expected.as_bytes()),
+            "{agent_type}: an interrupt held the doorbell: {:?}",
+            bytes(&pane)
+        );
+        let fetched = fetch(&daemon, &pane, true).to_string();
+        assert!(
+            fetched.contains(&id) && fetched.contains(BODY),
+            "{agent_type}: the task was not delivered: {fetched}"
+        );
+        state(&daemon, &pane, &id, "acknowledged");
+    }
+}
+
+/// Scenario: Leave a typed draft followed by two Escapes, two Escapes followed by typing, and two Escapes pressed on an agent that is already Idle (a menu, not an interrupt), then report Idle where the agent was busy and queue a task in each pane. None of these is an interrupt that emptied the box, so each pane must receive nothing and its task must stay Queued.
+#[spec("scheduler/dispatch/023")]
+#[test]
+fn dispatch_023_drafts_and_escapes_on_an_idle_agent_still_hold_doorbell() {
+    let daemon = daemon_unbound(&[]);
+    for (name, while_busy, once_idle) in [
+        ("typed-then-escapes", "unsent\x1b\x1b", ""),
+        ("escapes-then-typed", "\x1b\x1bunsent", ""),
+        ("escapes-on-idle", "", "\x1b\x1b"),
+    ] {
+        let pane = pane(&daemon, name);
+        status(&daemon, &pane, "thinking", "open_code");
+        let mut user = (!while_busy.is_empty()).then(|| input(&daemon, &pane, while_busy));
+        status(&daemon, &pane, "idle", "open_code");
+        if !once_idle.is_empty() {
+            user = Some(input(&daemon, &pane, once_idle));
+        }
+        let before = bytes(&pane);
+        let id = enqueue(&daemon, &pane, BODY);
+        unchanged(&pane, Duration::from_millis(800));
+        assert_eq!(bytes(&pane), before, "{name}: the doorbell typed");
+        assert!(rings(&pane).is_empty(), "{name}: the doorbell rang");
+        state(&daemon, &pane, &id, "queued");
+        drop(user);
+    }
+}
