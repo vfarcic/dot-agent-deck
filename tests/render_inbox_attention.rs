@@ -203,7 +203,7 @@ fn status_021_the_picker_keys_send_retry_and_cancel_at_each_rows_revision() {
     assert!(!open, "a card with nothing to decide on opens no picker");
 }
 
-/// Scenario: A card lists nine uncertain deck messages and the terminal is only fourteen rows tall, so the picker cannot show them all. Open it with `i`, press `j` eight times to reach the last one, and look: the last message's row and the cursor are on screen, the title says which of the nine are shown, and `c` sends that message's Cancel. With an answer to show, the answer and the cursor's row are both still on screen.
+/// Scenario: A card lists nine uncertain deck messages and the terminal is only fourteen rows tall, so the picker cannot show them all. Open it with `i`, press `j` eight times to reach the last one, and look: the last message's row and the cursor are on screen, the title says which of the nine are shown, and `c` sends that message's Cancel. With an answer to show, the answer and the cursor's row are both still on screen, and so are they, with the keys, at nine and at seven rows; at five rows, the fewest that leave the picker a row, the answer is.
 #[spec("inbox/status/022")]
 #[test]
 fn status_022_a_long_picker_keeps_the_cursor_row_and_the_answer_in_view() {
@@ -280,4 +280,33 @@ fn status_022_a_long_picker_keeps_the_cursor_row_and_the_answer_in_view() {
         )),
         "and so is the cursor's row:\n{rendered}"
     );
+    // A short split terminal. The TUI declares no minimum height; five rows
+    // is the smallest at which the picker has a row inside its border, and
+    // there the answer takes it.
+    for (height, cursor_and_keys) in [(9u16, true), (7, true), (5, false)] {
+        let rendered = text(&render_inbox_attention_overlay_to_buffer(
+            &items,
+            8,
+            Some(stale),
+            100,
+            height,
+        ));
+        assert!(
+            rendered.contains(&head),
+            "{height} rows: the answer is in view:\n{rendered}"
+        );
+        if cursor_and_keys {
+            assert!(
+                rendered.contains(&format!(
+                    "▸ the orchestrator · review {}",
+                    &last[last.len() - 3..]
+                )),
+                "{height} rows: and so is the cursor's row:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("[Cancel c]"),
+                "{height} rows: and the keys:\n{rendered}"
+            );
+        }
+    }
 }

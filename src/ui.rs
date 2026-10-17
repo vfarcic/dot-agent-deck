@@ -18338,8 +18338,10 @@ fn host_metrics_lines(view: &HostMetricsView, width: u16) -> Vec<Line<'static>> 
 /// subject and what it means, in the words the desktop tile uses — then the
 /// answer to the last press, within `rows` lines. A list longer than fits is
 /// shown as the window of items that keeps the cursor's row in view, and the
-/// answer is never pushed out by it. Returns the lines and, when windowed,
-/// the first and last item shown (zero-based).
+/// answer is never pushed out by it: it takes its row first, and where two
+/// rows per item no longer fit, an item is its sender and subject alone.
+/// Returns the lines and, when windowed, the first and last item shown
+/// (zero-based).
 fn inbox_attention_lines(
     dialog: &InboxAttentionDialog,
     width: u16,
@@ -18353,15 +18355,21 @@ fn inbox_attention_lines(
             crate::inbox_display::ACTION_GONE
         )));
     }
-    let answer_rows = if dialog.answer.is_some() { 2 } else { 0 };
-    let fits = (rows.saturating_sub(answer_rows) / 2).max(1);
+    let mut room = rows.saturating_sub(usize::from(dialog.answer.is_some()));
+    // The blank row above the answer, only while a two-row item still fits.
+    let spacer = dialog.answer.is_some() && room >= 3;
+    if spacer {
+        room -= 1;
+    }
+    let compact = room < 2;
+    let fits = if compact { room } else { room / 2 };
     let total = dialog.items.len();
     let start = if total <= fits {
         0
     } else {
         (dialog.selected + 1).saturating_sub(fits).min(total - fits)
     };
-    let shown = (total > fits).then(|| (start, start + fits - 1));
+    let shown = (total > fits && fits > 0).then(|| (start, start + fits - 1));
     for (index, item) in dialog.items.iter().enumerate().skip(start).take(fits) {
         let cursor = if index == dialog.selected {
             "▸ "
@@ -18380,13 +18388,17 @@ fn inbox_attention_lines(
             ),
             style,
         ));
-        lines.push(Line::styled(
-            truncate_with_ellipsis(&format!("    {}", item.kind.reason()), width),
-            text_dim(),
-        ));
+        if !compact {
+            lines.push(Line::styled(
+                truncate_with_ellipsis(&format!("    {}", item.kind.reason()), width),
+                text_dim(),
+            ));
+        }
     }
     if let Some(answer) = &dialog.answer {
-        lines.push(Line::from(""));
+        if spacer {
+            lines.push(Line::from(""));
+        }
         lines.push(Line::from(truncate_with_ellipsis(
             &format!("  {answer}"),
             width,
@@ -18414,7 +18426,18 @@ fn render_inbox_attention_overlay(
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
     frame.render_widget(Clear, popup_area);
-    let footer_height: u16 = 2;
+    // The button row and the key hint under it. Short of room for both and
+    // the rows wanted, the hint goes first (the buttons name the same keys),
+    // and in the shortest picker the buttons too, so the answer and the
+    // cursor's row keep their place.
+    let inner_height = usize::from(popup_height.saturating_sub(2));
+    let footer_height: u16 = if inner_height >= wanted + 2 || inner_height >= 6 {
+        2
+    } else if inner_height >= 2 + usize::from(dialog.answer.is_some()) {
+        1
+    } else {
+        0
+    };
     let body_height = popup_height.saturating_sub(2).saturating_sub(footer_height);
     let (lines, shown) = inbox_attention_lines(
         dialog,
@@ -18448,6 +18471,9 @@ fn render_inbox_attention_overlay(
         inner.width,
         footer_height.min(inner.height),
     );
+    if footer_area.height == 0 {
+        return Vec::new();
+    }
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(""),
