@@ -48,9 +48,9 @@ use crate::inbox_attempts::{
 use crate::inbox_display::{AttentionKind, IntegrationNotice};
 use crate::inbox_receipt::{EvidenceStore, GenerationSpool, RecordScanner};
 
-/// How many lines may wait for one receipt stream's connection task. A
-/// stream whose queue is full is not reading, and is closed rather than
-/// handed more.
+/// How many lines may wait for one receipt stream's connection task. A line
+/// that finds the queue full is dropped ([`flush`]); the stream itself stays
+/// open.
 pub(super) const RECEIPT_SIGNAL_CAPACITY: usize = 64;
 
 /// PRD #1666 §11: how long after spawn a generation whose adapter declares

@@ -231,7 +231,11 @@ While a notice stands, the agent's messages wait. When the integration connects 
 
 `messages may repeat: the deck cannot record message receipts for this agent (…)` means the deck could not write its receipts, usually because its state directory is full or not writable; the reason follows. Messages are still delivered, but one may be sent twice. Free the space or fix the permissions, then restart the agent. When the reason says `the receipt spool could not start`, the problem is the deck's, not this agent's: fix the state directory, then restart the deck itself, since restarting the agent does not start the spool.
 
-`deck messages paused: N delivered messages still wait for proof that older copies cannot run; restart the agent to clear them` means the deck stopped handing this agent new messages until it can account for ones it already delivered. Restarting the agent clears it, but the messages waiting for it are not handed to the restarted agent: they show as not delivered, and an orchestrator is told about each of its tasks so it can delegate them again. Post any other message again if it is still needed. In an OpenCode session that has run for a long time, this can also build up from cancelled messages: after thousands of deliveries the deck's plugin can no longer tell which of the older ones it passed to OpenCode, so it treats a cancelled message it does not hold as possibly delivered, and each of those waits here until you restart the agent.
+`deck messages paused: N delivered messages still wait for proof that older copies cannot run; restart the agent to clear them` means the deck stopped handing this agent new messages until it can account for ones it already delivered. Restarting the agent clears it, but the messages waiting for it are not handed to the restarted agent: they show as not delivered, and an orchestrator is told about each of its tasks so it can delegate them again. Post any other message again if it is still needed. A long-running OpenCode session can also build up this pause after cancelled messages; restart the agent, then post or delegate any waiting work again.
+
+### An agent finishes an interrupted request before a delegated task
+
+If you interrupt an agent and a delegated task arrives soon after, the agent may finish the request you interrupted first. That is the agent's choice; the deck delivered the task. If the agent ends its turn without doing the task, ask it to, or delegate the task again.
 
 ### An agent shows the doorbell instead of waking
 

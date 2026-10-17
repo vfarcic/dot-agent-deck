@@ -1534,9 +1534,13 @@ const inboxWrite = (child, control) => {
   }
 };
 // Ending the watcher's stdin is how the receiver says it is done: the watcher
-// then finishes publishing the receipts it was given before it exits.
-// SIGTERM follows only if it is still running INBOX_STOP_GRACE_MS later, on a
-// timer that keeps nothing alive.
+// then allows bounded time for publishing the receipts it was given before it
+// exits, and one can still be lost or reported degraded. SIGTERM follows only
+// if it is still running INBOX_STOP_GRACE_MS later, on a timer that keeps
+// nothing alive. Stage reports queued while no watcher is registered (a
+// restart's backoff, or before the new one registers) are not flushed here:
+// there is no authority to publish them with, so their attempts lapse and are
+// repeated, marked, once the deck has checked its spool.
 const INBOX_STOP_GRACE_MS = 3000;
 const inboxStop = (child) => {
   if (!child) return;
@@ -1847,9 +1851,10 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
       if (refs.length) report("handed", refs);
     },
     // The agent started on these: no longer held, and possibly handed for
-    // good. Their receipts are published by the watcher after this returns
-    // (by the next one to register, if none is registered now), so a revoke
-    // meanwhile is still answered `already_handed`.
+    // good, so a revoke from now on is answered `already_handed`. Their
+    // receipts are handed to the watcher after this returns (to the next one
+    // to register, if none is registered now), which allows bounded time for
+    // publication; a stop can still lose one, or it is reported degraded.
     committed: (refs) => {
       if (!refs.length) return;
       for (const ref of refs) {

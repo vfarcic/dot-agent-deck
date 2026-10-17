@@ -16,10 +16,11 @@
 //! before the daemon's `rebound` answer for its attempt, waits for them, the
 //! attempt held meanwhile. A stage report for an attempt whose cap this
 //! watcher lacks once registered (and rebound) publishes nothing and says so,
-//! as a degraded report, rather than passing for a receipt. Told to stop (its
-//! stdin ends), or once its stream ends, the watcher waits a bounded time for
-//! the publications still in flight before it exits, so a stage reported at
-//! shutdown still reaches the spool and the daemon.
+//! as a degraded report, rather than passing for a receipt, and so does one
+//! whose watcher's registration does not come within the wait. Told to stop
+//! (its stdin ends), or once its stream ends, the watcher allows bounded time
+//! for the publications still in flight before it exits; a stage reported at
+//! shutdown can still be lost or reported degraded.
 //!
 //! Every other control (`may`, `not_handed`, revoke answers, resume answers)
 //! is forwarded on this authenticated connection only: a spool record is
@@ -92,7 +93,10 @@ mod unix {
     /// being rebound, and for an attempt being rebound the caps the daemon's
     /// `rebound` answer brings. The daemon answers a `retained` resume at
     /// once; one it no longer rebinds (its resume window ran out first) never
-    /// answers, and the report is then degraded.
+    /// answers, and the report is then degraded. A report whose watcher's
+    /// registration does not come within this wait is degraded too: with no
+    /// spool open there is nothing to publish into. Once the stream has ended
+    /// neither wait goes on, since nothing will arrive on it any more.
     const REBIND_WAIT: Duration = Duration::from_secs(5);
 
     /// How long a watcher that was told to stop, or whose stream ended, waits
@@ -265,10 +269,11 @@ mod unix {
             loop {
                 let unregistered = shared.spool.is_none() && !shared.ended;
                 let waiting = unregistered
-                    || attempts.iter().any(|at| {
-                        let k = key(at);
-                        cap(&shared, &k, stage).is_none() && shared.rebinding.contains(&k)
-                    });
+                    || (!shared.ended
+                        && attempts.iter().any(|at| {
+                            let k = key(at);
+                            cap(&shared, &k, stage).is_none() && shared.rebinding.contains(&k)
+                        }));
                 let left = deadline.saturating_duration_since(Instant::now());
                 if !waiting || left.is_zero() {
                     break;
@@ -549,6 +554,59 @@ mod unix {
             }
         }
         ExitCode::SUCCESS
+    }
+
+    #[cfg(test)]
+    mod rebind_wait_tests {
+        use super::*;
+        use spec::spec;
+
+        /// Scenario: A registered watcher whose spool could not open is still waiting for a rebound attempt's caps when its stream ends. The commit report it is publishing stops waiting at once and comes back as a failure, instead of holding the watcher's exit for the whole five-second rebinding wait.
+        #[spec("inbox/opencode/051")]
+        #[test]
+        fn opencode_051_a_rebinding_wait_stops_when_the_stream_ends() {
+            let watch = Arc::new(Watch::default());
+            let attempt = InboxAttemptRef {
+                id: "m-ended".into(),
+                a: 1,
+                e: 1,
+            };
+            {
+                let mut shared = watch.lock();
+                shared.spool = Some(Err("no spool in this test".into()));
+                shared.rebinding.insert(key(&attempt));
+            }
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let publisher = {
+                let watch = Arc::clone(&watch);
+                std::thread::spawn(move || {
+                    let started = Instant::now();
+                    started_tx.send(()).unwrap();
+                    let failed = publish(&watch, RecordStage::Committed, &[attempt]);
+                    (failed, started.elapsed())
+                })
+            };
+            started_rx.recv().unwrap();
+            // The stream ends while the report waits for the caps: the
+            // publisher is held for this long first, so a return before it
+            // would mean it never waited at all.
+            let held = Duration::from_millis(300);
+            std::thread::sleep(held);
+            watch.end();
+            let (failed, elapsed) = publisher.join().unwrap();
+            assert!(
+                elapsed >= held,
+                "precondition: the report waited for the caps ({elapsed:?})"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "the rebinding wait outlived the stream's end by {elapsed:?}"
+            );
+            assert!(
+                failed.is_some(),
+                "a report whose wait ended unanswered is a failure, not a receipt"
+            );
+        }
     }
 
     #[cfg(all(test, not(feature = "e2e")))]
