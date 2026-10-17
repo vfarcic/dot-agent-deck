@@ -212,6 +212,26 @@ The TUI card shows **Error** and the desktop tile shows **error**, with a `not d
 
 Refresh the integration with `dot-agent-deck hooks install` on the machine running the agent, then restart the agent. Check that its command starts successfully. If a delegated task belonged to the exited agent, ask the orchestrator to delegate it again to the replacement. The desktop overview counts these agents under **FAILED**, while each tile uses **error**.
 
+### A message says delivery uncertain
+
+The deck handed a message to the agent, then lost track of whether the agent started on it, and two marked repeats did not settle it. Open the pane and look: if the agent is working on it, Cancel the delivery; if it never saw it, Retry. In the TUI press `i` on the card and then `r` or `c`; in the desktop app use the tile's **Retry** or **Cancel**. If a message is out of attempts, only Cancel is offered: post it again if it is still needed.
+
+### A card says the deck integration is out of date, too old, or not connected
+
+The notice under the card's directory says which:
+
+- `this agent's deck integration is out of date; restart the agent to update it` — the agent loaded an older copy of the deck's plugin. Restart the agent; the deck rewrites its integration from the running deck when the agent starts.
+- `the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent` — the agent's integration runs an older `dot-agent-deck` than the deck. Upgrade it (or point `DOT_AGENT_DECK_BIN` at the current one), then restart the agent.
+- `this agent's deck integration has not connected yet; its messages wait until it does` — the agent is still starting, or its integration did not load. It clears by itself once the integration connects, and the waiting messages are then delivered; if it stays, restart the agent or run `dot-agent-deck hooks install --agent opencode`.
+
+In each case the agent's messages wait; none is lost.
+
+### A card says messages may repeat or deck messages are paused
+
+`messages may repeat: the deck cannot record message receipts for this agent (…)` means the deck could not write its receipts, usually because its state directory is full or not writable; the reason follows. Messages are still delivered, but one may be sent twice. Free the space or fix the permissions, then restart the agent.
+
+`deck messages paused: N delivered messages still wait for proof that older copies cannot run; restart the agent to clear them` means the deck stopped handing this agent new messages until it can account for ones it already delivered. Restart the agent to clear it; waiting messages are kept.
+
 ### An agent shows the doorbell instead of waking
 
 A line such as `dot-agent-deck: message m-… waiting, run: dot-agent-deck inbox fetch` means a message is waiting and native wake is unavailable. It is expected for Codex while idle, Claude Code below 2.1.296, and Devin. Both clients use the same delivery paths. [Which agents wake for messages](orchestration.md#which-agents-wake-for-messages) lists the supported paths and the OpenCode configuration remedy.

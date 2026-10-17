@@ -7799,7 +7799,7 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
 - **Asserts:** a stream that answers each redelivery with `hold` keeps the message alive through ten ack-waits with `max_deliver` 2 (the count never drops below one); a hold from another consumer or agent, or for a queued message, refunds nothing; past `hold_bound` from the first fetch a hold refunds nothing and the message becomes undeliverable at `max_deliver`; the default bound is one hour.
-- **Does not assert:** the stream wire (inbox/route/009) or the consumers that answer hold (inbox/opencode/024, inbox/opencode/026, the Pi extension's node tests).
+- **Does not assert:** the stream wire (inbox/route/009) or the consumer that answers hold (the Pi extension's node tests).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/core/019 — A late ack after max_deliver is recorded.
@@ -7813,7 +7813,7 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
 - **Asserts:** an offer a stream fetched is handed to the same holder again at each ack-wait while the stream answers with `hold`, never reassigned and with its assignment count unchanged, and the holder's ack still claims it; it returns to its pool, excluding the holder, once the claim TTL or the hold bound (whichever is shorter) has passed since the assignment's first fetch, or when a re-hand-over goes unanswered; a once waiter's offer returns at the first ack-wait.
-- **Does not assert:** the stream wire (inbox/offer/007) or the consumers that answer hold (inbox/opencode/027, the Pi extension's node tests).
+- **Does not assert:** the stream wire (inbox/offer/007) or the consumer that answers hold (the Pi extension's node tests).
 - **Platform coverage:** mac+linux+windows.
 
 #### inbox/attempts
@@ -8172,6 +8172,13 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** a real agent, Windows, or the refusals of an outside or exited peer (`inbox/protocol/015`–`017`).
 - **Platform coverage:** mac+linux; the reason it is in the fast tier is that CI's `build-macos` runs the fast tier.
 
+##### inbox/protocol/020 — Inbox actions are withheld from a daemon that does not advertise them.
+- **Layer:** Fast (`src/daemon_client.rs` tests), a fake attach daemon.
+- **Agent:** none.
+- **Asserts:** with no capabilities, or `inbox` alone, Retry and Cancel answer Unsupported and send nothing; with `inbox-actions` the verb is sent once with its revision and request id and the answer is read.
+- **Does not assert:** the real daemon (inbox/boundary/011).
+- **Platform coverage:** mac+linux.
+
 #### Agent CLI
 
 ##### inbox/cli/001 — In-pane fetch frames the task, acknowledges it and updates list.
@@ -8333,6 +8340,113 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the daemon's `Flushed` arm keeping the record (the test sets it, as that arm does; `inbox/codex/017`), or what the screen shows.
 - **Platform coverage:** mac+linux+windows.
 
+#### inbox/boundary
+
+##### inbox/boundary/001 — The legacy ack-wait touches only legacy-owned assignments.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex
+- **Agent:** none.
+- **Asserts:** with the ack-wait elapsed, a message `inbox fetch` took is redelivered and a receipt-owned hand-out is not; the legacy `hold` and `nack` refuse the receipt-owned one even from its own consumer; a receipt receiver never takes the legacy-owned one back.
+- **Does not assert:** Pi, which stays on the legacy policy in this slice.
+- **Platform coverage:** all.
+
+##### inbox/boundary/002 — Returning a reservation removes the attempt's files.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex, real spool under a temp state directory
+- **Agent:** none.
+- **Asserts:** after a commit settles a message, its attempt's `handed` and `committed` records, caps and revoke marker are removed.
+- **Does not assert:** Windows (the spool tests there are CI's).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/003 — A late registration clears not_armed and delivers.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex, readiness deadline 50 ms
+- **Agent:** none.
+- **Asserts:** past the deadline the snapshot and a broadcast carry `not_armed` and the mail waits queued; a later registration delivers it and the notice clears in both.
+- **Does not assert:** the spawn hook (inbox/boundary/012).
+- **Platform coverage:** all.
+
+##### inbox/boundary/004 — An old adapter is refused and its mail waits.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex
+- **Agent:** none.
+- **Asserts:** a stream declaring no or a lower integration is refused `adapter_too_old`, registers nothing, leaves mail queued, silences the doorbell and sets the notice.
+- **Does not assert:** an old plugin file on disk.
+- **Platform coverage:** all.
+
+##### inbox/boundary/005 — The capability probe proves only what clap says.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), stand-in CLIs.
+- **Agent:** none.
+- **Asserts:** clap's unexpected-argument error is `cli_too_old`, help naming the flag is supported, a timeout, another error or a missing binary is unknown; `cli_too_old` silences the doorbell.
+- **Does not assert:** the spawn hook (inbox/boundary/013).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/006 — Uncertain, Retry and Cancel through the hub.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex
+- **Agent:** none.
+- **Asserts:** omitted hand-outs lapse through both marked repeats to uncertain; the card lists it at its revision; of two clients' Retry at that revision one applies and the other is told `stale`, a retransmission answers as before; Cancel revokes every open attempt and ends the message cancelled once answered.
+- **Does not assert:** the attach transport (inbox/boundary/011).
+- **Platform coverage:** all.
+
+##### inbox/boundary/007 — Server and TUI contexts never fence each other.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex
+- **Agent:** none.
+- **Asserts:** a doorbell fetch binds its attempt to the server context with caps only on that stream; TUI registrations resume nothing of it and its commit settles it.
+- **Does not assert:** the plugins (inbox/opencode/036).
+- **Platform coverage:** all.
+
+##### inbox/boundary/008 — A retained resume rebinds and an unknown one repeats.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex
+- **Agent:** none.
+- **Asserts:** a watcher respawn resumes the held attempt, `retained` rebinds it with no repeat; a reload answering `unknown` gets one marked repeat on the same assignment.
+- **Does not assert:** the plugins (inbox/opencode/005, 035).
+- **Platform coverage:** all.
+
+##### inbox/boundary/009 — A closed stream decides nothing and the next registration resumes.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex
+- **Agent:** none.
+- **Asserts:** a closed stream requeues nothing; the next registration is asked to resume the attempt, and `unknown` gives a marked repeat.
+- **Does not assert:** the watcher's own close (inbox/opencode/033).
+- **Platform coverage:** all.
+
+##### inbox/boundary/010 — Fresh possession never repeats and held_long is attention.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex, keepalive 60 ms, held_long after 400 ms
+- **Agent:** none.
+- **Asserts:** an attempt named in fresh snapshots is never repeated or lapsed; past the span it raises one held_long item, which its commit clears.
+- **Does not assert:** the one-hour default.
+- **Platform coverage:** all.
+
+##### inbox/boundary/011 — The daemon advertises and answers Retry and Cancel.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_boundary.rs`), real daemon.
+- **Agent:** none.
+- **Asserts:** the hello advertises `inbox-actions`; `inbox-retry` and `inbox-cancel` for an unknown or malformed id answer outcome `unknown`, not a decode refusal.
+- **Does not assert:** a held message's outcome (inbox/boundary/006).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/012 — A slow boot shows not_armed until a late registration delivers.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_boundary.rs`), real daemon with a 400 ms readiness deadline.
+- **Agent:** a python stand-in spawned as OpenCode; a receipt stream from the test process.
+- **Asserts:** the `ListAgents` record carries `not_armed` and a broadcast says so; the queued mail is handed to the late registration; the record and a broadcast clear it.
+- **Does not assert:** the desktop render (`desktop/src/components/InboxAttention.test.tsx`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/013 — The probe marks only a flag-rejecting CLI too old.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_boundary.rs`), real daemon with a 500 ms probe deadline.
+- **Agent:** python stand-ins spawned as OpenCode with `DOT_AGENT_DECK_BIN` pointing at a stand-in CLI.
+- **Asserts:** a CLI refusing the flag as clap does gives `cli_too_old`, the mail waits queued and nothing is typed; a probe that times out sets no notice.
+- **Does not assert:** a real old release.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/014 — An old hook command is served and an old OpenCode fetch is refused.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_boundary.rs`), real daemon.
+- **Agent:** python stand-ins spawned as Claude Code and as OpenCode.
+- **Asserts:** a legacy doorbell-hook fetch from the Claude pane is served and acknowledged; the same fetch from the OpenCode pane is refused `adapter_too_old`, its mail waits queued and the record says so.
+- **Does not assert:** a real Claude hook.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/015 — This build's CLI passes the capability probe.
+- **Layer:** Fast (`tests/inbox_adapter_floor.rs`), the built binary.
+- **Agent:** none.
+- **Asserts:** `inbox wait --adapter-integration 2 --help` names the flag, so the probe answers supported.
+- **Does not assert:** an older release.
+- **Platform coverage:** all.
+
 #### inbox/status
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
@@ -8417,6 +8531,69 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** an inbox summary with `wake_stalled` renders `✉1 waiting to wake: send it a prompt`, built from the shared `tests/fixtures/inbox-display.json` words the desktop reads.
 - **Does not assert:** when the daemon decides a wake has stalled (`doorbell::tests`), or the desktop tile (`desktop/src/lib/inboxWords.test.ts`).
+- **Platform coverage:** all.
+
+##### inbox/status/013 — One uncertain delivery is named on the card.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam.
+- **Agent:** none.
+- **Asserts:** an inbox summary listing one uncertain item renders `✉ delivery uncertain` and the uncertain reason row, in the shared words.
+- **Does not assert:** the desktop tile (`desktop/src/components/InboxAttention.test.tsx`).
+- **Platform coverage:** all.
+
+##### inbox/status/014 — Several uncertain deliveries are counted together.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam.
+- **Agent:** none.
+- **Asserts:** three uncertain items, one out of attempts, render `✉ 3 deliveries uncertain`.
+- **Does not assert:** the picker (inbox/status/019).
+- **Platform coverage:** all.
+
+##### inbox/status/015 — held_long is attention, not a failure.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam.
+- **Agent:** none.
+- **Asserts:** a held_long item renders its sentence and no Error.
+- **Does not assert:** when the daemon raises it (inbox/boundary/010).
+- **Platform coverage:** all.
+
+##### inbox/status/016 — The integration notice takes the card's notice row.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam.
+- **Agent:** none.
+- **Asserts:** `adapter_too_old`, `cli_too_old` and `not_armed` each render their shared sentence.
+- **Does not assert:** how the daemon decides them (inbox/boundary/003–005, 012–014).
+- **Platform coverage:** all.
+
+##### inbox/status/017 — Paused hand-outs are named on the card.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam.
+- **Agent:** none.
+- **Asserts:** `evidence_paused` renders the paused sentence with its count.
+- **Does not assert:** the evidence store (inbox/attempts).
+- **Platform coverage:** all.
+
+##### inbox/status/018 — Failed receipt storage warns that messages may repeat.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam.
+- **Agent:** none.
+- **Asserts:** `receipts_degraded` renders the warning with the deck's error.
+- **Does not assert:** what degrades the spool (inbox/receipt).
+- **Platform coverage:** all.
+
+##### inbox/status/019 — The picker lists each message in the shared words.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), TestBackend overlay render.
+- **Agent:** none.
+- **Asserts:** the deck-messages picker lists sender, subject and reason for each item with Retry and Cancel in the shared words.
+- **Does not assert:** sending the press (inbox/status/021).
+- **Platform coverage:** all.
+
+##### inbox/status/020 — The picker shows the deck's answer.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), TestBackend overlay render.
+- **Agent:** none.
+- **Asserts:** the answer to the last press renders under the rows in the shared words.
+- **Does not assert:** the daemon's answer (inbox/boundary/006).
+- **Platform coverage:** all.
+
+##### inbox/status/021 — The picker keys send Retry and Cancel at each row's revision.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), production picker key handler over an `AppState` hydrated from a daemon summary.
+- **Agent:** none.
+- **Asserts:** `i` opens the picker on a card with items; `r` sends Retry at the row's revision; `j` moves; `r` sends nothing for an out-of-attempts row and `c` sends its Cancel; Escape closes; a card with nothing opens no picker.
+- **Does not assert:** the attach round trip (inbox/protocol/020, inbox/boundary/011).
 - **Platform coverage:** all.
 
 #### inbox/claude
@@ -8540,7 +8717,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms, `max_deliver` 2 and the undelivered notice at 4500 ms.
 - **Agent:** scripted stand-ins; a stream component (`pi_extension`) armed from the test process answers each redelivery with `hold`.
 - **Asserts:** over ten ack-waits the delegated task is never undeliverable and the orchestrator receives no notice; the component's ack makes it acknowledged and the orchestrator still receives nothing.
-- **Does not assert:** that a real consumer withholds the duplicate hand-over (inbox/opencode/024, inbox/opencode/026, the Pi extension's node tests).
+- **Does not assert:** that a real consumer withholds the duplicate hand-over (the Pi extension's node tests; OpenCode's possession: inbox/opencode/024, inbox/opencode/026).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/route/010 — A late ack after max_deliver corrects the orchestrator.
@@ -8561,6 +8738,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon; attach `start-agent` with a 64 KiB seed while a file stands where each spill directory's `.dot-agent-deck/` would go.
 - **Agent:** none (`cat` stand-in).
 - **Asserts:** the start answers an error naming the first prompt, and `list-agents` shows no agent for the pane.
+- **Platform coverage:** mac+linux.
+
+##### inbox/route/013 — A task possessed through a long turn raises no false notice.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), keepalive 300 ms, ack-wait 1.5 s, `max_deliver` 2.
+- **Agent:** an OpenCode receipt stream armed from the test process.
+- **Asserts:** fresh snapshots for ten seconds keep the delegated task fetched with no repeat and no orchestrator notice; its commit acknowledges it and the orchestrator still hears nothing.
+- **Does not assert:** the legacy `hold` path (inbox/route/009).
 - **Platform coverage:** mac+linux.
 
 #### inbox/codex
@@ -9451,52 +9635,115 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** OpenCode's own plugin deduplication.
 - **Cost:** none.
 
-##### inbox/opencode/005 — Watcher EOF and TUI disposal close the stream and requeue unacked work.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
-- **Agent:** generated TUI plugin and real watcher with explicit fake lifecycle callbacks.
-- **Asserts:** child exit, zero armed streams and fetched-to-queued transition without ack.
+##### inbox/opencode/005 — A lost watcher resumes its attempt; a closed one requeues nothing.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`)
+- **Agent:** generated TUI plugin and real receipt watcher with explicit fake lifecycle callbacks.
+- **Asserts:** a killed watcher respawns with `--resumed`, its registration resumes the held attempt and the plugin answers `retained`, with no repeat; closing the watcher input or disposing the TUI ends the stream with zero armed streams, the message still fetched, no second prompt and no new watcher.
 - **Does not assert:** recovery from SIGKILL of the entire host process.
 - **Cost:** none.
 
-##### inbox/opencode/006 — Aborted delivery is redelivered without premature acknowledgement.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+##### inbox/opencode/006 — A held delivery is never repeated.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), keepalive 300 ms
 - **Agent:** fake API withholding assistant-child events.
-- **Asserts:** redelivery after ack-wait, no premature ack, then plugin-confirmed ack for the matching assistant.
-- **Does not assert:** real agent cancellation behavior.
+- **Asserts:** a delivery without an assistant child stays fetched with one prompt across many keepalives, one possession snapshot answering each; the matching assistant turn then acknowledges it.
+- **Does not assert:** real agent cancellation behaviour.
 - **Cost:** none.
 
-##### inbox/opencode/024 — A prompt queued behind a long turn is held, not prompted again.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), daemon with `max_deliver` 2 and ack-wait 3 s.
-- **Agent:** fake OpenCode API running the generated full TUI plugin and the real inbox watcher CLI.
-- **Asserts:** with the shown session reporting busy, each redelivery over four ack-waits is answered with `hold`; there is one prompt and the message is never undeliverable; the matching assistant turn acknowledges it.
+##### inbox/opencode/024 — A prompt queued behind a long turn is possessed, not repeated.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), keepalive 300 ms and `max_deliver` 2
+- **Agent:** fake OpenCode API running the generated full TUI plugin and the real receipt watcher.
+- **Asserts:** with the shown session busy, the prompt stays possessed for five seconds — many possession windows — with one prompt and never undeliverable; the matching assistant turn acknowledges it.
 - **Does not assert:** real OpenCode's queueing of a prompt behind a turn.
 - **Cost:** none.
 
-##### inbox/opencode/025 — An aborted or removed queued prompt is prompted again.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+##### inbox/opencode/025 — An aborted or removed queued prompt is prompted again, marked.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`)
 - **Agent:** fake OpenCode API running the generated full TUI plugin.
-- **Asserts:** a prompt queued behind a busy session whose session then goes idle unanswered is prompted again on redelivery; a prompt whose user message OpenCode removes is prompted again on redelivery while the session stays busy; each is acknowledged once answered.
+- **Asserts:** a prompt whose busy session goes idle unanswered, and one whose user message OpenCode removes, are dropped from the plugin's snapshots and prompted again; the aborted one's repeat carries the possible-repeat line; each is acknowledged once answered.
 - **Does not assert:** real cancellation behaviour.
 - **Cost:** none.
 
-##### inbox/opencode/026 — Mini holds a queued prompt and prompts an aborted one again.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), daemon with `max_deliver` 2 and ack-wait 3 s.
+##### inbox/opencode/026 — Mini possesses a queued prompt and repeats an aborted one.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), keepalive 300 ms
 - **Agent:** fake OpenCode API running the generated server plugin under `--mini`.
-- **Asserts:** with mini's session busy, redeliveries over four ack-waits are answered with `hold`, with one prompt and no undeliverable message; a second prompt whose session goes idle unanswered is prompted again; both are acknowledged once answered.
+- **Asserts:** with mini's session busy, a prompt stays possessed for five seconds with one prompt and no undeliverable message; a second whose session goes idle unanswered is prompted again, marked; both are acknowledged once answered.
 - **Does not assert:** real mini rendering.
 - **Cost:** none.
 
-##### inbox/opencode/027 — An offer queued behind a long turn is held and stays assigned.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), daemon with ack-wait 3 s.
+##### inbox/opencode/027 — An offer queued behind a long turn stays assigned.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), keepalive 300 ms
 - **Agent:** fake OpenCode API running the generated full TUI plugin as a worker taking a pool's jobs; a stand-in orchestrator offers the job.
-- **Asserts:** with the shown session busy, each redelivery of the job over four ack-waits is answered with `hold`, with one prompt, and the job stays with the OpenCode worker; the matching assistant turn's acknowledgement claims it.
-- **Does not assert:** real OpenCode's queueing, or mini (whose hold path is the one inbox/opencode/026 covers).
+- **Asserts:** with the shown session busy, the job stays fetched by the OpenCode worker for five seconds with one prompt; the matching assistant turn's commit claims it.
+- **Does not assert:** real OpenCode's queueing, or mini.
+- **Cost:** none.
+
+##### inbox/opencode/028 — Possession snapshots rise and report a contiguous watermark.
+- **Layer:** Fast JS (`src/opencode_manage.rs` tests), Node against a fake watcher child.
+- **Agent:** the generated shared receipt receiver.
+- **Asserts:** the watcher is spawned with `--adapter-integration 2`; each snapshot rises in `seq`, holds every issued attempt, and reports `seen` as the contiguous observed prefix (1 for delivery numbers 1 and 3).
+- **Does not assert:** the daemon's side of possession (inbox/attempts, inbox/boundary).
+- **Cost:** none.
+
+##### inbox/opencode/029 — Revokes are answered by where the callback stands.
+- **Layer:** Fast JS (`src/opencode_manage.rs` tests), Node against a fake watcher child.
+- **Agent:** the generated shared receipt receiver and hand-over helper.
+- **Asserts:** a revoke of a queued attempt drops it and answers `revoked_ack`; one past the call answers `already_handed`; a later hand-over check for the revoked one never reaches OpenCode and reports `not_handed`.
+- **Does not assert:** real OpenCode dialogs.
+- **Cost:** none.
+
+##### inbox/opencode/030 — Resume answers retain only what the context holds.
+- **Layer:** Fast JS (`src/opencode_manage.rs` tests), Node against a fake watcher child.
+- **Agent:** the generated shared receipt receiver.
+- **Asserts:** a respawned watcher carries `--resumed`; the registration's resume list is answered `retained` for the held attempt and `unknown` for one never held; the rebound delivery number is observed.
+- **Does not assert:** the daemon's rebind (inbox/boundary/008).
+- **Cost:** none.
+
+##### inbox/opencode/031 — An approval dies with its epoch.
+- **Layer:** Fast JS (`src/opencode_manage.rs` tests), Node against a fake watcher child.
+- **Agent:** the generated shared receipt receiver and hand-over helper.
+- **Asserts:** an approval granted before a watcher restart no longer passes the synchronous check; the callback asks again and is handed once; a retired context's approved callback never reaches OpenCode and reports `not_handed`.
+- **Does not assert:** a real OpenCode plugin re-instantiation (inbox/opencode/035).
+- **Cost:** none.
+
+##### inbox/opencode/032 — A refused or silent check hands nothing over.
+- **Layer:** Fast JS (`src/opencode_manage.rs` tests), Node against a fake watcher child.
+- **Agent:** the generated hand-over helper.
+- **Asserts:** a refused final hand-over check reaches nothing and reports `not_handed`.
+- **Does not assert:** the grant timeout's length.
+- **Cost:** none.
+
+##### inbox/opencode/033 — A stalled adapter is dropped by its watcher and resumes.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), keepalive 300 ms
+- **Agent:** fake API whose event loop is blocked for 2.5 s.
+- **Asserts:** the watcher closes a stream that heard no snapshot for three keepalives; the plugin respawns it, the registration's resume is answered `retained`, the message is not repeated, and is acknowledged once answered.
+- **Does not assert:** a process that never recovers.
+- **Cost:** none.
+
+##### inbox/opencode/034 — A delayed receipt publish is held across keepalives.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), keepalive 300 ms, publish delay 2 s
+- **Agent:** generated TUI plugin and the real receipt watcher with `DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS`.
+- **Asserts:** while the commit's receipt publish is in flight the message is never repeated, then it settles with one prompt.
+- **Does not assert:** a real slow filesystem.
+- **Cost:** none.
+
+##### inbox/opencode/035 — An unknown reload gets one marked repeat.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`)
+- **Agent:** generated server plugin under `--mini`, re-run in the same module as OpenCode does on dispose.
+- **Asserts:** the new instance answers the resume `unknown`, and the deck gives the message one repeat on the same generation, carrying the possible-repeat line; its answer acknowledges it.
+- **Does not assert:** real OpenCode reload timing.
+- **Cost:** none.
+
+##### inbox/opencode/036 — Server and TUI contexts reconnect separately.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`)
+- **Agent:** generated server plugin in a worker (doorbell-only receiver) and the TUI plugin, as the full TUI loads them.
+- **Asserts:** the server context keeps its own `--doorbell-only` watcher; killing the TUI's watcher respawns only it, its attempt is resumed `retained`, not repeated, and acknowledged once answered.
+- **Does not assert:** the server context's attempts across the TUI reconnect (inbox/boundary/007).
 - **Cost:** none.
 
 ##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`)
 - **Agent:** generated server plugin under mini, full-TUI, run, serve and attach argv.
-- **Asserts:** mini and mini with a project path arm once; other main-thread modes arm nothing.
+- **Asserts:** mini and mini with a project path arm once; the full TUI's worker starts one `--doorbell-only` watcher and arms nothing; other main-thread modes start no watcher.
 - **Does not assert:** OpenCode's own choice of process or worker thread; the stand-in also runs the server module in a genuine Node worker to pin that guard.
 - **Cost:** none.
 
@@ -9521,10 +9768,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** plugin interception (covered by inbox/opencode/011).
 - **Cost:** none.
 
-##### inbox/opencode/011 — Submitted doorbell is replaced in place and acknowledged when its assistant starts.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
+##### inbox/opencode/011 — Submitted doorbell is replaced in place, bound to the server context, and acknowledged when its assistant starts.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`)
 - **Agent:** generated server plugin's real chat.message hook, loaded in a worker thread as the full TUI loads it, under a fake OpenCode host.
-- **Asserts:** original text-parts array receives framed fetched content; fetch does not ack; abort before assistant start permits redelivery; only the matching assistant parent acknowledges the retry; recalling a handled id leaves newer pending work untouched; one coalesced assistant turn acknowledges both intercepted tasks around a human message without redelivery.
+- **Asserts:** original text-parts array receives framed fetched content; an unrelated assistant parent neither commits nor requeues it; the matching parent acknowledges it with one commit; recalling a handled id leaves newer pending work untouched; one coalesced assistant turn acknowledges both intercepted tasks around a human message, each once, without redelivery.
 - **Does not assert:** real OpenCode rendering or cancellation; the interception channel was measured separately in full TUI and mini.
 - **Cost:** none.
 
@@ -9602,7 +9849,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/opencode/022 — Real unarmed OpenCode intercepts a doorbell before the model.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
 - **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
-- **Asserts:** No deck TUI watcher, genuine doorbell, server-plugin fetch, visible reply and sentinel, server-plugin CLI acknowledgement (`explicit`), no model-side inbox fetch.
+- **Asserts:** No deck TUI watcher, genuine doorbell, server-plugin fetch bound to its doorbell-only receiver, visible reply and sentinel, a commit on that receiver (`plugin_confirmed`), no model-side inbox fetch.
 - **Does not assert:** Remote attach and non-TUI OpenCode commands.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
@@ -9728,7 +9975,14 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_pubsub.rs`), real sandbox daemon with ack-wait 1500 ms and `max_deliver` 2.
 - **Agent:** synthetic PTY recorders; stream components (`pi_extension`) for both workers armed from the test process.
 - **Asserts:** the holder's component is handed the job again at each ack-wait over ten ack-waits and answers with hold; the other worker never lists it and its component is never handed it; the holder's ack claims it and the offerer is told it was claimed.
-- **Does not assert:** the bound past which a held job returns to its pool (inbox/core/020) or a real consumer (inbox/opencode/027).
+- **Does not assert:** the bound past which a held job returns to its pool (inbox/core/020) or a real consumer (the Pi extension's node tests).
+- **Platform coverage:** mac+linux.
+
+##### inbox/offer/008 — A job possessed behind a long turn is not reassigned.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_pubsub.rs`), keepalive 300 ms.
+- **Agent:** two OpenCode receipt streams armed from the test process.
+- **Asserts:** the holder's fresh snapshots for ten seconds keep the job with it, unrepeated and never handed to the other worker; its commit claims it.
+- **Does not assert:** the legacy `hold` path (inbox/offer/007).
 - **Platform coverage:** mac+linux.
 
 #### inbox/load
