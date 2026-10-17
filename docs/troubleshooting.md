@@ -228,7 +228,7 @@ In each case the agent's messages wait; none is lost.
 
 ### A card says messages may repeat or deck messages are paused
 
-`messages may repeat: the deck cannot record message receipts for this agent (…)` means the deck could not write its receipts, usually because its state directory is full or not writable; the reason follows. Messages are still delivered, but one may be sent twice. Free the space or fix the permissions, then restart the agent.
+`messages may repeat: the deck cannot record message receipts for this agent (…)` means the deck could not write its receipts, usually because its state directory is full or not writable; the reason follows. Messages are still delivered, but one may be sent twice. Free the space or fix the permissions, then restart the agent. When the reason says `the receipt spool could not start`, the problem is the deck's, not this agent's: fix the state directory, then restart the deck itself, since restarting the agent does not start the spool.
 
 `deck messages paused: N delivered messages still wait for proof that older copies cannot run; restart the agent to clear them` means the deck stopped handing this agent new messages until it can account for ones it already delivered. Restart the agent to clear it; waiting messages are kept.
 

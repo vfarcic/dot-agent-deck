@@ -490,6 +490,9 @@ struct HubState {
     cancelled_tasks: HashMap<String, (Recipient, String)>,
     /// This run's receipt spool, once the daemon started one.
     spool: Option<Arc<crate::inbox_receipt::Spool>>,
+    /// Why this run's spool could not start, shown as every receipt
+    /// generation's `receipts_degraded`.
+    spool_error: Option<String>,
     /// PRD #1666 §2: the first press applied per message, so a second
     /// client's press of the same verb at the same revision is told it came
     /// too late ([`InboxHub::inbox_action`]).
@@ -666,6 +669,7 @@ impl InboxHub {
                 ),
                 cancelled_tasks: HashMap::new(),
                 spool: None,
+                spool_error: None,
                 action_presses: HashMap::new(),
             }),
             spill_manifest: Mutex::new(None),
@@ -2398,6 +2402,37 @@ impl InboxHub {
     /// daemon at boot ([`crate::inbox_receipt::Spool::start`]).
     pub fn set_spool(&self, spool: crate::inbox_receipt::Spool) {
         self.lock().spool = Some(Arc::new(spool));
+    }
+
+    /// PRD #1666 §3: the daemon could not start this run's spool, so no
+    /// receipt protects any delivery; every receipt generation's card says
+    /// so, with `error`, instead of the deck falling back silently.
+    pub fn set_spool_error(&self, error: &str) {
+        self.lock().spool_error = Some(crate::untrusted_text::display_line(error, 200));
+    }
+
+    /// PRD #1666 §3: take the spool's next sibling reap step every
+    /// [`crate::inbox_receipt::REAP_INTERVAL`] on a thread of its own, for as
+    /// long as the spool lives, so a root longer than one step's listing is
+    /// still reaped all through.
+    pub fn spawn_spool_reaper(&self) {
+        let Some(spool) = self.lock().spool.as_ref().map(Arc::downgrade) else {
+            return;
+        };
+        let spawned = std::thread::Builder::new()
+            .name("inbox-spool-reaper".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(crate::inbox_receipt::REAP_INTERVAL);
+                    let Some(spool) = spool.upgrade() else {
+                        return;
+                    };
+                    spool.reap_step();
+                }
+            });
+        if let Err(error) = spawned {
+            warn!(%error, "inbox: could not start the receipt spool's reaper");
+        }
     }
 
     /// PRD #1666 §3: the absolute value of

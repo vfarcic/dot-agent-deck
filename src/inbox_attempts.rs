@@ -855,13 +855,14 @@ impl AttemptModel {
         self.finalize_bound_to(now, rx);
     }
 
-    /// The final hand-over check (§3), the daemon's half. A refusal for a
-    /// committed assignment or a revoked attempt publishes `NotHanded`; an
-    /// attempt not bound to `rx` is refused without touching it. An approval
-    /// carries the incarnation epoch it was granted under.
+    /// The final hand-over check (§3), the daemon's half. It only answers: a
+    /// refusal changes no stage, since an earlier approval of the same
+    /// attempt may still be live in the context. `NotHanded` comes from the
+    /// receiver itself, once it has dropped the callback and installed its
+    /// local revoke. An approval carries the incarnation epoch it was granted
+    /// under.
     pub fn may_hand_over(
-        &mut self,
-        now: Instant,
+        &self,
         id: &str,
         a: u32,
         e: u32,
@@ -884,16 +885,11 @@ impl AttemptModel {
             .attempts
             .iter()
             .any(|t| t.a == a && t.stage == Stage::Committed);
-        let refusal = if committed {
-            Some(HandOverRefusal::Committed)
-        } else if at.revoked || msg.latch || a != msg.a {
-            Some(HandOverRefusal::Revoked)
-        } else {
-            None
-        };
-        if let Some(refusal) = refusal {
-            self.stage(now, id, a, e, Stage::NotHanded, Some(rx));
-            return Err(refusal);
+        if committed {
+            return Err(HandOverRefusal::Committed);
+        }
+        if at.revoked || msg.latch || a != msg.a {
+            return Err(HandOverRefusal::Revoked);
         }
         Ok(Grant {
             id: id.to_string(),
@@ -1323,9 +1319,10 @@ impl AttemptModel {
     /// Finality already implies that no approval under a current epoch is
     /// outstanding, so the model carries no separate approval predicate:
     /// every path to a final stage is either the approved incarnation
-    /// reporting what its callback did (the approval is spent), a resume
-    /// answer or its silence (the incarnation was retired, which bumps the
-    /// epoch), or exit. That the epoch bump reaches a surviving old JS
+    /// reporting what its callback did (the approval is spent, or revoked
+    /// locally before a `NotHanded`), a resume answer or its silence (the
+    /// incarnation was retired, which bumps the epoch), or exit. A refused
+    /// [`Self::may_hand_over`] is none of these, so it stages nothing. That the epoch bump reaches a surviving old JS
     /// context before its approved callback resumes is the adapter's
     /// obligation, proven in the §13 step 4 migration, not here.
     fn reclaim(&mut self, id: &str) {
@@ -1971,9 +1968,9 @@ mod tests {
             m.snapshot(t, tui2, 2, u.d, &[("u", 1, u.e)]),
             SnapshotOutcome::Dropped
         );
-        assert!(m.may_hand_over(t, "s", 1, s.e, server2).is_ok());
+        assert!(m.may_hand_over("s", 1, s.e, server2).is_ok());
         assert_eq!(
-            m.may_hand_over(t, "u", 1, u.e, tui2),
+            m.may_hand_over("u", 1, u.e, tui2),
             Err(HandOverRefusal::WrongReceiver)
         );
         assert!(
@@ -2098,7 +2095,7 @@ mod tests {
         let rx1 = m.register(t, Slot::Pi, true).rx;
         m.post("g", false);
         let g = issue_held(&mut m, t, "g", rx1, 1);
-        let grant = m.may_hand_over(t, "g", 1, g.e, rx1).expect("approved");
+        let grant = m.may_hand_over("g", 1, g.e, rx1).expect("approved");
         let mut guard = CallbackGuard::new(grant.epoch);
         assert!(guard.may_call(&grant));
         let rx2 = m.register(t, Slot::Pi, true).rx;
@@ -2109,12 +2106,10 @@ mod tests {
             "rebinding voids the outstanding approval"
         );
         assert_eq!(
-            m.may_hand_over(t, "g", 1, g.e, rx1),
+            m.may_hand_over("g", 1, g.e, rx1),
             Err(HandOverRefusal::WrongReceiver)
         );
-        let fresh = m
-            .may_hand_over(t, "g", 1, g.e, rx2)
-            .expect("approved again");
+        let fresh = m.may_hand_over("g", 1, g.e, rx2).expect("approved again");
         assert!(guard.may_call(&fresh));
         guard.revoke("g", 1, g.e);
         assert!(!guard.may_call(&fresh));
@@ -2124,7 +2119,7 @@ mod tests {
         m.post("q", false);
         let before = m.evidence_reserved();
         let q1 = issue_held(&mut m, t, "q", server, 1);
-        m.may_hand_over(t, "q", 1, q1.e, server).expect("approved");
+        m.may_hand_over("q", 1, q1.e, server).expect("approved");
         let t1 = past_ttl(t);
         m.snapshot(t1, tui, 1, 0, &[]);
         m.tick(t1);
@@ -2558,5 +2553,90 @@ mod tests {
             m.delivery("hook").unwrap().repeat_scheduled(),
             "a closed fetch connection holds nothing, whatever the status"
         );
+    }
+
+    /// Scenario: A Pi attempt is approved and that approval is kept live;
+    /// the user cancels, and a second check of the same attempt is refused
+    /// before the revoke reaches the context. Likewise a check refused
+    /// because a sibling attempt committed. Neither refusal makes the attempt
+    /// final: Cancel stays held and the evidence stays reserved until the
+    /// receiver revokes locally and reports `NotHanded` itself.
+    #[spec("inbox/attempts/018")]
+    #[test]
+    fn attempts_018_a_refused_check_is_no_not_handed_witness() {
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::Pi, false).rx;
+        m.post("m", false);
+        let at = issue_held(&mut m, t, "m", rx, 1);
+        let grant = m.may_hand_over("m", 1, at.e, rx).expect("approved");
+        let mut guard = CallbackGuard::new(grant.epoch);
+        let r = m.delivery("m").unwrap().revision;
+        assert!(matches!(
+            m.cancel(t, "m", GEN, r),
+            ActionOutcome::Applied { .. }
+        ));
+        m.drain_effects();
+        assert_eq!(
+            m.may_hand_over("m", 1, at.e, rx),
+            Err(HandOverRefusal::Revoked)
+        );
+        assert_eq!(
+            m.delivery("m").unwrap().attempt(1, at.e).unwrap().stage,
+            Stage::Issued,
+            "a refusal is not a witness"
+        );
+        assert_eq!(m.state("m"), Some(MessageState::CancelHeld));
+        assert_eq!(m.evidence_reserved(), EVIDENCE_PER_ATTEMPT);
+        assert!(
+            !m.drain_effects()
+                .iter()
+                .any(|e| matches!(e, Effect::Reclaimed { .. })),
+            "no reclamation while the earlier approval can still call"
+        );
+        assert!(guard.may_call(&grant), "the earlier approval is still live");
+        let past = past_ttl(t);
+        m.tick(past);
+        assert_eq!(m.state("m"), Some(MessageState::CancelHeld));
+        assert_eq!(m.evidence_reserved(), EVIDENCE_PER_ATTEMPT);
+
+        guard.revoke("m", 1, at.e);
+        assert!(!guard.may_call(&grant));
+        m.stage(past, "m", 1, at.e, Stage::NotHanded, Some(rx));
+        assert_eq!(
+            m.state("m"),
+            Some(MessageState::Undeliverable(UndeliverableReason::Cancelled))
+        );
+        assert_eq!(m.evidence_reserved(), 0);
+        assert!(m.drain_effects().contains(&Effect::Reclaimed {
+            id: "m".into(),
+            a: 1,
+            e: at.e
+        }));
+
+        let server = m.register(past, Slot::OpencodeServer, false).rx;
+        let tui = m.register(past, Slot::OpencodeTui, false).rx;
+        m.post("c", false);
+        let first = issue_held(&mut m, past, "c", server, 1);
+        let later = past_ttl(past);
+        m.snapshot(later, server, 2, first.d, &[]);
+        m.snapshot(later, tui, 1, 0, &[]);
+        m.tick(later);
+        let second = m.issue(later, "c", tui).expect("marked repeat");
+        m.stage(later, "c", 1, second.e, Stage::Committed, None);
+        let reserved = m.evidence_reserved();
+        assert_eq!(
+            m.may_hand_over("c", 1, first.e, server),
+            Err(HandOverRefusal::Committed)
+        );
+        assert!(
+            !m.delivery("c")
+                .unwrap()
+                .attempt(1, first.e)
+                .unwrap()
+                .stage
+                .is_final(),
+            "a refusal for a committed assignment is not a witness either"
+        );
+        assert_eq!(m.evidence_reserved(), reserved);
     }
 }

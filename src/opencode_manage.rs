@@ -1748,8 +1748,21 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
       inboxWrite(child, { committed: refs });
       snapshot();
     },
-    // Positively not handed to OpenCode.
+    // Positively not handed to OpenCode by this callback. A refusal is only
+    // a refusal: while another approved callback of the attempt is inside
+    // its call, that call reports for itself. Otherwise the attempt is
+    // revoked locally first, so no approval still outstanding for it can
+    // reach OpenCode once the deck believes it was not handed.
     notHanded: (ref) => {
+      const key = inboxKey(ref);
+      if (held.get(key)?.stage === "handed") return;
+      revoked.add(key);
+      held.delete(key);
+      inboxWrite(child, { not_handed: [ref] });
+      snapshot();
+    },
+    // The call this callback started failed: OpenCode did not take it.
+    callFailed: (ref) => {
       held.delete(inboxKey(ref));
       inboxWrite(child, { not_handed: [ref] });
       snapshot();
@@ -1789,11 +1802,11 @@ const inboxHandOver = async (receiver, ref, sessionID, call) => {
   try {
     result = await call();
   } catch (_) {
-    receiver.notHanded(ref);
+    receiver.callFailed(ref);
     return false;
   }
   if (result?.error) {
-    receiver.notHanded(ref);
+    receiver.callFailed(ref);
     return false;
   }
   receiver.handed([ref]);
@@ -4754,6 +4767,61 @@ feed({ grant: { q: sent().find((c) => c.may).may.q, ok: false, refusal: "committ
 await refused;
 check(called, 0, "a refused check reaches nothing");
 check(sent().filter((c) => c.not_handed).length, 1, "and is reported not handed");
+"#,
+        );
+    }
+
+    /// Scenario: Two hand-over checks of one attempt race. First an approved callback is already inside its OpenCode call when the other check is refused: the refusal reaches nothing and claims nothing, and the call reports handed. Then a refusal arrives before the other check's approval: the refusal revokes the attempt locally before reporting it not handed, so the late approval never reaches OpenCode.
+    #[spec("inbox/opencode/037")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_037_a_refusal_never_races_an_approval_into_a_false_witness() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+const ref = { id, a: 1, e: 1 };
+feed({ messages: [{ ...ref, subject: "s", from: "x", text: "t", d: 1 }] });
+const lastMay = () => sent().filter((c) => c.may).pop().may.q;
+let called = 0;
+let release;
+const first = inboxHandOver(receiver, ref, "s1", () => {
+  called += 1;
+  return new Promise((r) => { release = r; });
+});
+await tick();
+feed({ grant: { q: lastMay(), ok: true } });
+await tick();
+check(called, 1, "the approved callback is inside its call");
+const second = inboxHandOver(receiver, ref, "s1", async () => { called += 1; return {}; });
+await tick();
+feed({ grant: { q: lastMay(), ok: false, refusal: "revoked" } });
+await second;
+check(called, 1, "the refused check reaches nothing");
+check(sent().filter((c) => c.not_handed).length, 0, "and claims nothing while the approved call is in flight");
+release({});
+await first;
+check(sent().filter((c) => c.handed).length, 1, "the approved call reports handed");
+
+const later = { id, a: 1, e: 2 };
+feed({ messages: [{ ...later, subject: "s", from: "x", text: "t", d: 2 }] });
+const approved = inboxHandOver(receiver, later, "s1", async () => { called += 1; return {}; });
+const refused = inboxHandOver(receiver, later, "s1", async () => { called += 1; return {}; });
+await tick();
+const [approvedQ, refusedQ] = sent().filter((c) => c.may).slice(-2).map((c) => c.may.q);
+feed({ grant: { q: refusedQ, ok: false, refusal: "revoked" } });
+await refused;
+check(sent().filter((c) => c.not_handed).map((c) => c.not_handed[0].e), [2], "the refusal reports not handed");
+feed({ grant: { q: approvedQ, ok: true } });
+await approved;
+check(called, 1, "an approval after the refusal's local revoke never reaches OpenCode");
+check(sent().filter((c) => c.handed).length, 1, "and nothing more is reported handed");
 "#,
         );
     }

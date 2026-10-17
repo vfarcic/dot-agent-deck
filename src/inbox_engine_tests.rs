@@ -749,3 +749,142 @@ async fn boundary_010_fresh_possession_never_repeats_and_held_long_is_attention(
     assert!(hub.summary("p", "a").notices.attention.is_empty());
     peer.close().await;
 }
+
+/// Scenario: The daemon's receipt spool cannot start (its root is a plain file), and an OpenCode receipt stream registers. Its card names the storage failure as degraded receipts while its mail is still handed out, rather than the deck carrying on as if receipts protected it.
+#[spec("inbox/boundary/016")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_016_a_spool_that_cannot_start_is_degraded_storage() {
+    let state = tempfile::tempdir().unwrap();
+    let state = state.path().canonicalize().unwrap();
+    std::fs::write(state.join(crate::inbox_receipt::SPOOL_DIR_NAME), b"").unwrap();
+    let error = crate::inbox_receipt::Spool::start(&state).unwrap_err();
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    hub.set_spool_error(&error.to_string());
+    assert_eq!(hub.spool_env(), None, "nothing is pinned without a spool");
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    assert!(peer.next().await.registered.is_some());
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("still delivered"))
+        .unwrap();
+    let handed = peer.handout().await;
+    assert_eq!(handed[0].id, id.as_str());
+    let degraded = hub
+        .summary("p", "a")
+        .notices
+        .receipts_degraded
+        .expect("the card says receipts are degraded");
+    assert!(
+        degraded.contains("could not start") && degraded.contains(&error.to_string()),
+        "it names the start failure: {degraded}"
+    );
+    peer.close().await;
+}
+
+/// Scenario: Run the capability probe against stand-in CLIs that come close to clap's refusal without being it, an old help that exits 0 without the flag, one that names the flag only in prose, one that writes a megabyte to each stream after its help, one that leaves a background process holding its output open, and one that hangs; then let a registration land before a late `cli_too_old`. Only clap's exact diagnostic on exit 2 is `cli_too_old` and only a help line listing the flag is support; the chatty CLI, which fails if a write to it fails, is drained and read as supported before the deadline; the probe returns by its deadline despite the held output, and kills and reaps the hung CLI; the late result changes nothing after the registration.
+#[spec("inbox/boundary/017")]
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_017_the_probe_reads_only_clap_and_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let stand_in = |name: &str, body: &str| {
+        let path = dir.path().join(name);
+        crate::test_isolation::write_script(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let exact = "error: unexpected argument '--adapter-integration' found";
+    let deadline = Duration::from_millis(500);
+    for (name, body) in [
+        (
+            "loose",
+            "echo \"warning: unexpected argument '--adapter-integration' found\" >&2\nexit 2"
+                .to_string(),
+        ),
+        ("exit-1", format!("echo \"{exact}\" >&2\nexit 1")),
+        (
+            "tip-only",
+            "echo \"error: unexpected argument '--bogus' found\" >&2\necho \"  tip: a similar argument exists: '--adapter-integration'\" >&2\nexit 2".to_string(),
+        ),
+        (
+            "old-help",
+            "echo 'Usage: dot-agent-deck inbox wait --agent <AGENT>'\necho '      --agent <AGENT>  The agent'\nexit 0".to_string(),
+        ),
+        (
+            "prose",
+            "echo 'Usage: dot-agent-deck inbox wait --agent <AGENT>'\necho '      --agent <AGENT>  Unlike --adapter-integration, names the agent'\nexit 0".to_string(),
+        ),
+    ] {
+        let cli = stand_in(name, &body);
+        assert_eq!(probe_cli(&cli, deadline), ProbeVerdict::Unknown, "{name}");
+    }
+    let refused = stand_in(
+        "refused",
+        &format!(
+            "echo \"{exact}\" >&2\necho >&2\necho \"Usage: dot-agent-deck inbox wait --agent <AGENT>\" >&2\nexit 2"
+        ),
+    );
+    assert_eq!(probe_cli(&refused, deadline), ProbeVerdict::CliTooOld);
+
+    let chatty = stand_in(
+        "chatty",
+        // A write the probe stopped reading fails, as it fails a Rust CLI
+        // (EPIPE), and turns the exit status non-zero.
+        "echo '      --adapter-integration <N>  The integration'\nhead -c 1048576 /dev/zero | tr '\\0' x || exit 3\nhead -c 1048576 /dev/zero | tr '\\0' y >&2 || exit 3\nexit 0",
+    );
+    let started = Instant::now();
+    assert_eq!(
+        probe_cli(&chatty, Duration::from_secs(5)),
+        ProbeVerdict::Supported,
+        "both streams are drained past the cap"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+
+    let held = stand_in(
+        "held",
+        "(sleep 3) &\necho '      --adapter-integration <N>  The integration'\nexit 0",
+    );
+    let started = Instant::now();
+    let _ = probe_cli(&held, deadline);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "output held open by another process does not outlast the deadline: {:?}",
+        started.elapsed()
+    );
+
+    let pid_file = dir.path().join("hung.pid");
+    let hung = stand_in(
+        "hung",
+        &format!("echo $$ > '{}'\nexec sleep 30", pid_file.display()),
+    );
+    assert_eq!(probe_cli(&hung, deadline), ProbeVerdict::Unknown);
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: signal 0 only asks whether `pid` still exists; a zombie still
+    // does, so failure here means the child was killed and reaped.
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "the hung CLI is killed and reaped"
+    );
+
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    hub.expect_integration("p", "a");
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    assert!(peer.next().await.registered.is_some());
+    hub.set_cli_too_old("p", "a");
+    assert_eq!(
+        hub.integration_notice("p", "a"),
+        None,
+        "a registration outranks a late probe"
+    );
+    assert!(!hub.doorbell_facts("p", "a").blocked);
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("after a late probe"))
+        .unwrap();
+    assert_eq!(peer.handout().await[0].id, id.as_str());
+    peer.close().await;
+}

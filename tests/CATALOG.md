@@ -7939,6 +7939,13 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Does not assert:** the Claude status events or hook connections that will drive these calls.
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/attempts/018 — A refused check is no not-handed witness.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** with an earlier approval kept live, a check refused after Cancel leaves the attempt issued, the message cancel-held and its evidence reserved, with no reclamation, across a lapse; the receiver's own `NotHanded` after its local revoke makes it undeliverable as cancelled and reclaims; a check refused because a sibling attempt committed leaves the attempt open and its reservation held.
+- **Does not assert:** the adapter's local revoke (inbox/opencode/037).
+- **Platform coverage:** mac+linux+windows.
+
 #### inbox/receipt
 
 The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the daemon's locked instance namespace under `<state_dir>/inbox-spool`, trusted one-component-at-a-time traversal from the state-directory anchor, immutable `Handed`/`Committed` bearer records, bounded resumable scans streamed to the cap-based evidence store, the exact lookup before absence, and the resumable sibling reaper, plus `platform::lock::try_lock_file`. It is library-only: nothing in the daemon calls it yet, records are published and read, nothing is pruned and no suppression decision is drawn from them.
@@ -8051,9 +8058,23 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 ##### inbox/receipt/016 — Windows spool directories are owner-only and held against replacement.
 - **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
 - **Agent:** none.
-- **Asserts:** the stored DACL of the spool root, the instance and every generation directory is protected with one allow ACE for the current user; a spool root pre-created under the temp directory's inherited ACL is refused and its DACL is unchanged; renaming a held generation's `rec` aside (the first step of a junction swap) fails while the generation is open and succeeds once it is dropped, and a publish in between lands in the original directory.
-- **Does not assert:** creating a junction (renaming or deleting the held directory is the step a swap needs, and that is what fails); ancestors of the state-directory anchor.
+- **Asserts:** the stored DACL of the spool root, the instance and every generation directory is protected with one allow ACE for the current user; a spool root pre-created under the temp directory's inherited ACL is refused and its DACL is unchanged; renaming a held generation's `rec` aside (one route to a junction swap) fails while the generation is open and succeeds once it is dropped, and a publish in between lands in the original directory.
+- **Does not assert:** a junction made in place, without a rename (inbox/receipt/017); ancestors of the state-directory anchor.
 - **Platform coverage:** windows only (runs on the `build-windows` CI job, never on a Linux or macOS host).
+
+##### inbox/receipt/017 — Windows refuses a held directory made a mount point in place.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir.
+- **Agent:** none.
+- **Asserts:** a second, writable handle turns a held, empty `rec` into a mount point at a decoy with `FSCTL_SET_REPARSE_POINT`, with no rename; a publish is then refused and the decoy stays empty; once the mount point is deleted the same generation publishes into `rec`, a fresh generation is created and publishes, and after everything is dropped the next start reaps the instance.
+- **Does not assert:** a reparse point made and removed again inside one operation, which the recheck before and after it does not see.
+- **Platform coverage:** windows only (runs on the `build-windows` CI job, never on a Linux or macOS host).
+
+##### inbox/receipt/018 — Reaping advances past a root listing that stays.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir, a 64-name reap step.
+- **Agent:** none.
+- **Asserts:** with three steps' worth of root names that stay and eight stopped spools beside them, further reap steps reach and remove every stopped spool with its lock file, wherever the directory lists it, while the names that stay and the live spool remain.
+- **Does not assert:** the daemon's reaper thread or its one-minute interval; a cursor across daemon restarts (it is not persisted).
+- **Platform coverage:** mac+linux+windows.
 
 #### Protocol and waiter lifecycle
 
@@ -8446,6 +8467,27 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Asserts:** `inbox wait --adapter-integration 2 --help` names the flag, so the probe answers supported.
 - **Does not assert:** an older release.
 - **Platform coverage:** all.
+
+##### inbox/boundary/016 — A spool that cannot start is degraded storage.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex, a real failing `Spool::start`.
+- **Agent:** none.
+- **Asserts:** with the spool root a plain file, the start error is kept; an OpenCode stream still registers and is handed its mail, and the snapshot's `receipts_degraded` names the start failure.
+- **Does not assert:** the card words (`tests/render_dashboard.rs`, `desktop/src/components/InboxAttention.test.tsx`); four lost pending-lock races, the other way a start fails.
+- **Platform coverage:** all.
+
+##### inbox/boundary/017 — The probe reads only clap, and is bounded.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), stand-in CLIs and the hub.
+- **Agent:** none.
+- **Asserts:** a near miss of clap's diagnostic, the exact one on exit 1, a tip naming the flag, an old help exiting 0 without it and a help naming it only in prose are unknown; clap's exact refusal on exit 2 is `cli_too_old`; a CLI writing a megabyte to each stream after its help is drained and read as supported before the deadline; output held open by a background process does not outlast the deadline; a hung CLI is killed and reaped; after a registration, a late `cli_too_old` sets nothing and mail is still handed out.
+- **Does not assert:** a real old release.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/018 — An OpenCode role named only by its command gets the receipt policy.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_boundary.rs`), real daemon with a 400 ms readiness deadline.
+- **Agent:** a python stand-in launched as the bare `opencode` on its PATH and as a path-qualified `…/bin/opencode`, with no agent type; `DOT_AGENT_DECK_BIN` pointing at a stand-in CLI that records its argv.
+- **Asserts:** each spawn regenerates the deck's OpenCode plugin, runs the capability probe with the literal argv, and shows `not_armed` until a receipt stream registers; the queued message is then handed to the stream and settles on its commit, and the notice clears.
+- **Does not assert:** a real OpenCode.
+- **Platform coverage:** mac+linux.
 
 #### inbox/status
 
@@ -9738,6 +9780,13 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Agent:** generated server plugin in a worker (doorbell-only receiver) and the TUI plugin, as the full TUI loads them.
 - **Asserts:** the server context keeps its own `--doorbell-only` watcher; killing the TUI's watcher respawns only it, its attempt is resumed `retained`, not repeated, and acknowledged once answered.
 - **Does not assert:** the server context's attempts across the TUI reconnect (inbox/boundary/007).
+- **Cost:** none.
+
+##### inbox/opencode/037 — A refusal never races an approval into a false witness.
+- **Layer:** Fast JS (`src/opencode_manage.rs` tests), Node against a fake watcher child.
+- **Agent:** the generated hand-over helper.
+- **Asserts:** a check refused while another approved callback of the same attempt is inside its OpenCode call reaches nothing and reports no `not_handed`, and that call reports `handed`; a refusal answered before the other check's approval reports `not_handed` after revoking the attempt locally, so the later approval never reaches OpenCode.
+- **Does not assert:** the daemon's side (inbox/attempts/018 pins that a refusal stages nothing).
 - **Cost:** none.
 
 ##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.

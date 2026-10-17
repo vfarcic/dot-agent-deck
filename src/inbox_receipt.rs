@@ -20,6 +20,8 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -41,8 +43,10 @@ pub const SCAN_MAX_BYTES: u64 = 1024 * 1024;
 /// a file oversized. A pass opens a record only while this much budget is left,
 /// so no read can take it past [`SCAN_MAX_BYTES`].
 const READ_RESERVE: u64 = MAX_RECORD_BYTES + 1;
-/// Names one sibling reap lists in the spool root.
+/// Names one sibling reap step lists in the spool root.
 const ROOT_LIST_MAX: usize = 4 * SCAN_MAX_ENTRIES;
+/// How often a running daemon takes its next sibling reap step.
+pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// How deep below an instance a reap descends: pane, agent, `rec`/`caps`/
 /// `revoked`.
 const REAP_DEPTH: usize = 3;
@@ -243,7 +247,11 @@ fn attempt_name(msg: &str, a: u32, e: u32) -> io::Result<String> {
 pub struct Spool {
     root_path: PathBuf,
     instance: String,
+    root: fsdir::TrustedDir,
     dir: fsdir::TrustedDir,
+    root_list_max: usize,
+    /// Where the next reap step goes on listing the root.
+    cursor: Mutex<Option<fsdir::DirStream>>,
     _lock: File,
 }
 
@@ -261,6 +269,12 @@ impl Spool {
     /// while its daemon runs; an instance directory with no lock file is
     /// never reaped.
     pub fn start(state_dir: &Path) -> io::Result<Spool> {
+        Spool::start_listing(state_dir, ROOT_LIST_MAX)
+    }
+
+    /// [`Self::start`], listing at most `root_list_max` root names per reap
+    /// step.
+    fn start_listing(state_dir: &Path, root_list_max: usize) -> io::Result<Spool> {
         if !state_dir.is_absolute() {
             return Err(invalid(
                 "the inbox spool's state directory must be absolute",
@@ -273,13 +287,17 @@ impl Spool {
             match mint(&root) {
                 Ok((instance, lock)) => {
                     let dir = root.child(&instance, true)?;
-                    reap_siblings(&root, &instance);
-                    return Ok(Spool {
+                    let spool = Spool {
                         root_path: state_dir.join(SPOOL_DIR_NAME),
                         instance,
+                        root,
                         dir,
+                        root_list_max,
+                        cursor: Mutex::new(None),
                         _lock: lock,
-                    });
+                    };
+                    spool.reap_step();
+                    return Ok(spool);
                 }
                 Err(error) => last = Some(error),
             }
@@ -289,6 +307,15 @@ impl Spool {
 
     pub fn instance(&self) -> &str {
         &self.instance
+    }
+
+    /// One bounded step of reaping sibling instances no running daemon
+    /// holds, going on from where the previous step stopped listing the
+    /// root. [`Self::start`] takes the first; a running daemon takes one
+    /// every [`REAP_INTERVAL`].
+    pub fn reap_step(&self) {
+        let mut cursor = self.cursor.lock().unwrap_or_else(PoisonError::into_inner);
+        reap_siblings(&self.root, &self.instance, self.root_list_max, &mut cursor);
     }
 
     /// The value of [`ENV_INBOX_SPOOL`] for this run.
@@ -365,27 +392,51 @@ impl Sibling {
     }
 }
 
-/// Reap sibling instances no running daemon holds, within one shared budget
-/// of [`SCAN_MAX_ENTRIES`] entries: try-lock each lock file and keep holding
-/// it while its instance is removed, unlinking the lock file last; a busy
-/// lock, or a directory with no lock file, is skipped. A pending lock a start
-/// left behind is removed under its own lock, never by age. Removal deletes
-/// as it enumerates, so a reap cut short by the budget still makes progress
-/// and keeps the lock file for the next start. Siblings are visited from a
-/// random rotation, so a large one cannot starve the ones listed after it.
-fn reap_siblings(root: &fsdir::TrustedDir, own: &str) {
-    let Ok(mut stream) = root.stream() else {
+/// One step of reaping sibling instances no running daemon holds, within one
+/// shared budget of [`SCAN_MAX_ENTRIES`] entries: try-lock each lock file and
+/// keep holding it while its instance is removed, unlinking the lock file
+/// last; a busy lock, or a directory with no lock file, is skipped. A pending
+/// lock a start left behind is removed under its own lock, never by age.
+/// Removal deletes as it enumerates, so a reap cut short by the budget still
+/// makes progress and keeps the lock file for a later step.
+///
+/// The root is listed through `cursor`, kept across steps: a step reads at
+/// most `root_list_max` names on from where the previous one stopped, and the
+/// end of the listing starts a new pass at the next step. So every entry that
+/// stays in the root is listed once per pass, however many names come before
+/// it. The siblings one step lists are visited from a random rotation, so one
+/// large sibling does not take the budget first in every pass; a sibling the
+/// budget does not reach waits for a later pass.
+fn reap_siblings(
+    root: &fsdir::TrustedDir,
+    own: &str,
+    root_list_max: usize,
+    cursor: &mut Option<fsdir::DirStream>,
+) {
+    if cursor.is_none() {
+        let Ok(stream) = root.stream() else {
+            return;
+        };
+        *cursor = Some(stream);
+    }
+    let Some(stream) = cursor.as_mut() else {
         return;
     };
     let mut siblings = Vec::new();
-    for _ in 0..ROOT_LIST_MAX {
+    let mut ended = false;
+    for _ in 0..root_list_max {
         match stream.next_name() {
-            None => break,
+            None => {
+                ended = true;
+                break;
+            }
             Some(Err(_)) => continue,
             Some(Ok(name)) => siblings.extend(Sibling::of(&name, own)),
         }
     }
-    drop(stream);
+    if ended {
+        *cursor = None;
+    }
     let start = random_index(siblings.len());
     siblings.rotate_left(start);
     let mut budget = SCAN_MAX_ENTRIES;
@@ -1553,11 +1604,14 @@ mod fsdir {
         /// An open directory handle and the handles of every component above
         /// it, back to the anchor. Each is opened **without**
         /// `FILE_SHARE_DELETE`, so while it is held no component of the chain
-        /// can be renamed, deleted or replaced by a junction.
+        /// can be renamed or deleted. Write sharing stays allowed, since
+        /// linking or renaming into a directory opens it for writing, so a
+        /// same-user writer can still make a held, empty directory a mount
+        /// point in place; [`TrustedDir::guarded`] rechecks for that.
         #[derive(Debug)]
         struct Held {
-            _dir: File,
-            _parent: Option<Arc<Held>>,
+            dir: File,
+            parent: Option<Arc<Held>>,
         }
 
         fn open_dir(path: &Path, follow: bool) -> io::Result<File> {
@@ -1593,7 +1647,9 @@ mod fsdir {
 
         /// A verified directory, held as a handle chain back to the anchor.
         /// Windows has no `openat`, so operations go by path, but every
-        /// component of that path is held open without delete sharing, so the
+        /// component of that path is held open without delete sharing, so it
+        /// cannot be renamed or deleted, and every operation rechecks through
+        /// those handles that none became a reparse point in place, so the
         /// path keeps resolving to the directories that were verified.
         #[derive(Debug)]
         pub(in super::super) struct TrustedDir {
@@ -1614,19 +1670,45 @@ mod fsdir {
                     .map_err(|why| refused(format!("{}: {why}", path.display())))?;
                 Ok(TrustedDir {
                     path: path.to_path_buf(),
-                    held: Arc::new(Held {
-                        _dir: dir,
-                        _parent: None,
-                    }),
+                    held: Arc::new(Held { dir, parent: None }),
                 })
+            }
+
+            /// Every held handle of the chain still names a directory that is
+            /// not a reparse point, read through the handle itself, so an
+            /// in-place `FSCTL_SET_REPARSE_POINT` on any component is seen.
+            fn intact(&self) -> io::Result<()> {
+                let mut held = Some(&self.held);
+                while let Some(h) = held {
+                    if h.dir.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                        return Err(refused(format!(
+                            "a spool directory at or above {} became a reparse point",
+                            self.path.display()
+                        )));
+                    }
+                    held = h.parent.as_ref();
+                }
+                Ok(())
+            }
+
+            /// Run one path operation between two [`Self::intact`] checks:
+            /// refused when a component is a reparse point before it, and an
+            /// error after it even when it succeeded, since it may then have
+            /// been redirected. A reparse point both made and removed inside
+            /// the one operation is not seen.
+            fn guarded<T>(&self, op: impl FnOnce(&Path) -> io::Result<T>) -> io::Result<T> {
+                self.intact()?;
+                let result = op(&self.path);
+                self.intact()?;
+                result
             }
 
             fn below(&self, path: PathBuf, dir: File) -> Self {
                 TrustedDir {
                     path,
                     held: Arc::new(Held {
-                        _dir: dir,
-                        _parent: Some(self.held.clone()),
+                        dir,
+                        parent: Some(self.held.clone()),
                     }),
                 }
             }
@@ -1645,10 +1727,12 @@ mod fsdir {
                     ));
                 }
                 let path = self.path.join(name);
-                if create {
-                    crate::platform::fsperm::create_dir_owner_only(&path)?;
-                }
-                let dir = open_dir(&path, false)?;
+                let dir = self.guarded(|_| {
+                    if create {
+                        crate::platform::fsperm::create_dir_owner_only(&path)?;
+                    }
+                    open_dir(&path, false)
+                })?;
                 verify_dir(&dir, name)?;
                 crate::platform::fsperm::verify_dacl_owner_only(handle(&dir))
                     .map_err(|why| refused(format!("{name}: {why}")))?;
@@ -1660,7 +1744,7 @@ mod fsdir {
             pub(in super::super) fn child_for_removal(&self, name: &OsStr) -> io::Result<Self> {
                 plain(name)?;
                 let path = self.path.join(name);
-                let dir = open_dir(&path, false)?;
+                let dir = self.guarded(|_| open_dir(&path, false))?;
                 verify_dir(&dir, &format!("{name:?}"))?;
                 Ok(self.below(path, dir))
             }
@@ -1680,7 +1764,7 @@ mod fsdir {
                 options.write(true).create_new(true);
                 crate::platform::fsperm::set_create_mode_owner_only(&mut options);
                 options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-                let file = options.open(self.path.join(name))?;
+                let file = self.guarded(|dir| options.open(dir.join(name)))?;
                 crate::platform::fsperm::set_file_owner_only(&file)?;
                 Ok(file)
             }
@@ -1688,28 +1772,29 @@ mod fsdir {
             pub(in super::super) fn link(&self, from: &str, to: &str) -> io::Result<()> {
                 plain(OsStr::new(from))?;
                 plain(OsStr::new(to))?;
-                std::fs::hard_link(self.path.join(from), self.path.join(to))
+                self.guarded(|dir| std::fs::hard_link(dir.join(from), dir.join(to)))
             }
 
             pub(in super::super) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
                 plain(OsStr::new(from))?;
                 plain(OsStr::new(to))?;
-                std::fs::rename(self.path.join(from), self.path.join(to))
+                self.guarded(|dir| std::fs::rename(dir.join(from), dir.join(to)))
             }
 
             pub(in super::super) fn remove_file(&self, name: impl AsRef<OsStr>) -> io::Result<()> {
                 plain(name.as_ref())?;
-                std::fs::remove_file(self.path.join(name.as_ref()))
+                self.guarded(|dir| std::fs::remove_file(dir.join(name.as_ref())))
             }
 
             pub(in super::super) fn remove_dir(&self, name: impl AsRef<OsStr>) -> io::Result<()> {
                 plain(name.as_ref())?;
-                std::fs::remove_dir(self.path.join(name.as_ref()))
+                self.guarded(|dir| std::fs::remove_dir(dir.join(name.as_ref())))
             }
 
             pub(in super::super) fn entry(&self, name: impl AsRef<OsStr>) -> io::Result<EntryInfo> {
                 plain(name.as_ref())?;
-                let meta = std::fs::symlink_metadata(self.path.join(name.as_ref()))?;
+                let meta =
+                    self.guarded(|dir| std::fs::symlink_metadata(dir.join(name.as_ref())))?;
                 let reparse = meta.file_type().is_symlink()
                     || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
                 let kind = if reparse {
@@ -1738,10 +1823,12 @@ mod fsdir {
                         "it is not a regular file",
                     ));
                 }
-                let file = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                    .open(self.path.join(name))?;
+                let file = self.guarded(|dir| {
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                        .open(dir.join(name))
+                })?;
                 let meta = file.metadata()?;
                 if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                     return Err(io::Error::new(
@@ -1754,15 +1841,15 @@ mod fsdir {
 
             pub(in super::super) fn stream(&self) -> io::Result<DirStream> {
                 Ok(DirStream {
-                    path: self.path.clone(),
-                    iter: Some(std::fs::read_dir(&self.path)?),
+                    dir: self.try_clone()?,
+                    iter: Some(self.guarded(|dir| std::fs::read_dir(dir))?),
                 })
             }
         }
 
         #[derive(Debug)]
         pub(in super::super) struct DirStream {
-            path: PathBuf,
+            dir: TrustedDir,
             iter: Option<std::fs::ReadDir>,
         }
 
@@ -1781,7 +1868,7 @@ mod fsdir {
 
             pub(in super::super) fn rewind(&mut self) -> io::Result<()> {
                 self.iter = None;
-                self.iter = Some(std::fs::read_dir(&self.path)?);
+                self.iter = Some(self.dir.guarded(|dir| std::fs::read_dir(dir))?);
                 Ok(())
             }
         }
@@ -2666,8 +2753,9 @@ mod tests {
     /// back the stored DACL of the root, the instance and every generation
     /// directory; pre-create a spool root under the temp directory's
     /// inherited ACL and start a spool on it; and try to rename a held
-    /// generation's `rec` directory aside (the first step of a junction swap)
-    /// before and after the generation is dropped. Every created directory's
+    /// generation's `rec` directory aside (one route to a junction swap; the
+    /// in-place route is inbox/receipt/017) before and after the generation
+    /// is dropped. Every created directory's
     /// DACL is protected with one owner ACE; the permissive root is refused
     /// with its DACL unchanged; the rename fails while the generation holds
     /// the directory and succeeds once it is released. Runs only on Windows
@@ -2733,5 +2821,173 @@ mod tests {
                 .join(key("m-1", 1, RecordStage::Handed).file_name())
                 .is_file()
         );
+    }
+
+    /// Scenario: On Windows, open a generation whose `rec` is empty, then
+    /// from a second, writable handle turn that held `rec` into a mount point
+    /// aimed at a decoy directory in place, with `FSCTL_SET_REPARSE_POINT`
+    /// and no rename. A publish into it is refused and nothing lands in the
+    /// decoy; once the mount point is deleted again the same generation
+    /// publishes normally, a fresh generation is created and publishes, and
+    /// after everything is dropped a later start reaps the instance. Runs
+    /// only on Windows CI.
+    #[cfg(windows)]
+    #[spec("inbox/receipt/017")]
+    #[test]
+    fn receipt_017_windows_an_in_place_reparse_point_is_refused() {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+        const FSCTL_DELETE_REPARSE_POINT: u32 = 0x0009_00AC;
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+        let control = |file: &std::fs::File, code: u32, buffer: &[u8]| {
+            let mut returned = 0u32;
+            // SAFETY: `file` is an open handle, `buffer` is a live input
+            // buffer of the length passed, and no output or overlapped
+            // structure is used.
+            let ok = unsafe {
+                DeviceIoControl(
+                    file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                    code,
+                    buffer.as_ptr().cast(),
+                    buffer.len() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        let reparse = |path: &Path| {
+            std::fs::symlink_metadata(path).unwrap().file_attributes()
+                & FILE_ATTRIBUTE_REPARSE_POINT
+                != 0
+        };
+
+        let state = crate::test_temp::tempdir().unwrap();
+        let decoy = crate::test_temp::tempdir().unwrap();
+        let spool = Spool::start(state.path()).unwrap();
+        let generation = spool.generation("2", "agent-a").unwrap();
+        let rec = spool.instance_path().join("2").join("agent-a").join("rec");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&rec)
+            .expect("a same-user writer opens the held, empty rec");
+        let target = decoy.path().to_string_lossy().into_owned();
+        let target = target.strip_prefix(r"\\?\").unwrap_or(&target);
+        let substitute: Vec<u16> = std::ffi::OsStr::new(&format!(r"\??\{target}\"))
+            .encode_wide()
+            .collect();
+        let names = (substitute.len() as u16 + 2) * 2;
+        let mut buffer = Vec::new();
+        buffer.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        buffer.extend((8 + names).to_le_bytes());
+        buffer.extend(0u16.to_le_bytes());
+        buffer.extend(0u16.to_le_bytes());
+        buffer.extend((substitute.len() as u16 * 2).to_le_bytes());
+        buffer.extend((substitute.len() as u16 * 2 + 2).to_le_bytes());
+        buffer.extend(0u16.to_le_bytes());
+        for unit in substitute.iter().chain(&[0u16, 0]) {
+            buffer.extend(unit.to_le_bytes());
+        }
+        control(&writer, FSCTL_SET_REPARSE_POINT, &buffer)
+            .expect("the in-place reparse is possible, so the boundary must catch it");
+        assert!(reparse(&rec), "rec is now a mount point, with no rename");
+
+        let handed = key("m-1", 1, RecordStage::Handed);
+        let err = generation
+            .publish(&handed, &Cap::random().unwrap())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            std::fs::read_dir(decoy.path()).unwrap().next().is_none(),
+            "nothing is written through the mount point"
+        );
+
+        let mut header = Vec::new();
+        header.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        header.extend([0u8; 4]);
+        control(&writer, FSCTL_DELETE_REPARSE_POINT, &header).expect("delete the mount point");
+        drop(writer);
+        assert!(!reparse(&rec));
+        generation
+            .publish(&handed, &Cap::random().unwrap())
+            .expect("an intact chain publishes again");
+        assert!(rec.join(handed.file_name()).is_file());
+        let fresh = spool.generation("3", "agent-b").unwrap();
+        let other = key("m-2", 1, RecordStage::Committed);
+        fresh.publish(&other, &Cap::random().unwrap()).unwrap();
+        assert!(
+            spool
+                .instance_path()
+                .join("3")
+                .join("agent-b")
+                .join("rec")
+                .join(other.file_name())
+                .is_file()
+        );
+
+        let old = spool.instance_path();
+        drop((generation, fresh, spool));
+        let next = Spool::start(state.path()).unwrap();
+        assert!(!old.exists(), "the released instance is reaped");
+        drop(next);
+    }
+
+    /// Scenario: Fill a spool root with three times one reap step's listing
+    /// of names that stay (files no daemon uses), add eight stopped spools
+    /// beside them, start a spool, and run further reap steps. Every stopped
+    /// spool is reached and removed with its lock file within a few steps,
+    /// wherever the directory lists it, and the names that stay and the live
+    /// spool remain.
+    #[spec("inbox/receipt/018")]
+    #[test]
+    fn receipt_018_reaping_advances_past_a_root_listing_that_stays() {
+        let state = crate::test_temp::tempdir().unwrap();
+        let root = state.path().join(SPOOL_DIR_NAME);
+        drop(Spool::start(state.path()).unwrap());
+        let window = 64;
+        for i in 0..3 * window {
+            std::fs::write(root.join(format!("junk-{i}")), b"").unwrap();
+        }
+        let dead: Vec<String> = (0..8).map(|_| random_hex(16).unwrap()).collect();
+        for stem in &dead {
+            std::fs::create_dir(root.join(stem)).unwrap();
+            std::fs::write(root.join(stem).join("left"), b"x").unwrap();
+            std::fs::write(root.join(lock_name(stem)), b"").unwrap();
+        }
+        let spool = Spool::start_listing(state.path(), window).unwrap();
+        let gone = || {
+            dead.iter()
+                .filter(|stem| !root.join(stem).exists() && !root.join(lock_name(stem)).exists())
+                .count()
+        };
+        let mut steps = 1;
+        while gone() < dead.len() && steps < 20 {
+            spool.reap_step();
+            steps += 1;
+        }
+        assert_eq!(
+            gone(),
+            dead.len(),
+            "every stopped spool is reached, after {steps} steps"
+        );
+        for i in 0..3 * window {
+            assert!(root.join(format!("junk-{i}")).exists());
+        }
+        assert!(spool.instance_path().is_dir());
     }
 }

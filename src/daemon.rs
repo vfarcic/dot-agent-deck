@@ -921,12 +921,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         // listed for this run, and those earlier runs left are taken over.
         hub.open_spill_ledger(&state_dir);
         // PRD #1666 §3: this run's receipt spool, with the instances earlier
-        // runs left reaped. A spool that cannot start costs suppression, which
-        // every card it affects says, not delivery.
+        // runs left reaped, a step at a time. A spool that cannot start costs
+        // suppression, which every card it affects says, with the reason, not
+        // delivery.
         match crate::inbox_receipt::Spool::start(&state_dir) {
-            Ok(spool) => hub.set_spool(spool),
+            Ok(spool) => {
+                hub.set_spool(spool);
+                hub.spawn_spool_reaper();
+            }
             Err(error) => {
                 warn!(%error, "could not start the inbox receipt spool; deck messages may repeat");
+                hub.set_spool_error(&error.to_string());
             }
         }
         pty_registry.install_inbox(hub);

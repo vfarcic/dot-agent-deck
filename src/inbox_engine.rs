@@ -220,11 +220,15 @@ pub(super) fn generation_mut<'a>(
     spool: Option<Result<Arc<GenerationSpool>, String>>,
 ) -> &'a mut Gen {
     let limits = st.receipts.limits;
+    let missing = match &st.spool_error {
+        Some(error) => format!("the receipt spool could not start: {error}"),
+        None => "the deck has no receipt spool".to_string(),
+    };
     st.receipts.gens.entry(key.clone()).or_insert_with(|| {
         let (spool, degraded) = match spool {
             Some(Ok(spool)) => (Some(spool), None),
             Some(Err(error)) => (None, Some(error)),
-            None => (None, Some("the deck has no receipt spool".to_string())),
+            None => (None, Some(missing)),
         };
         let scanner = spool.as_ref().and_then(|spool| spool.scanner().ok());
         Gen {
@@ -634,10 +638,7 @@ pub(super) fn control(
         }
     }
     let grant = control.may.as_ref().map(|may| {
-        match generation
-            .model
-            .may_hand_over(now, &may.id, may.a, may.e, rx)
-        {
+        match generation.model.may_hand_over(&may.id, may.a, may.e, rx) {
             Ok(_) => InboxGrant {
                 q: may.q,
                 ok: true,
@@ -1107,15 +1108,27 @@ pub enum ProbeVerdict {
     Unknown,
 }
 
+/// clap's refusal of the integration flag, the whole first line of its
+/// diagnostic on exit 2.
+const CLAP_REFUSAL: &str = "error: unexpected argument '--adapter-integration' found";
+/// clap's usage-error exit status.
+const CLAP_USAGE_EXIT: i32 = 2;
+
 /// PRD #1666 §11 (a): run `<binary> inbox wait --adapter-integration 2
-/// --help` with a literal argv (no shell), within `deadline`, reading at most
-/// [`PROBE_OUTPUT_CAP`] of each output stream, and say what it proves. Only
-/// clap's unexpected-argument error naming the flag proves it missing.
-/// Blocking: run it off the executor.
+/// --help` with a literal argv (no shell), within `deadline`, and say what it
+/// proves. Each output stream is read up to [`PROBE_OUTPUT_CAP`] and drained
+/// past it, so a chatty CLI never blocks on a full pipe; a CLI still running
+/// at the deadline is killed and reaped, and output that is still open then
+/// (another process holding it) proves nothing. Only clap's exact refusal of
+/// the flag on its usage-error exit proves it missing, and only a help line
+/// listing the flag proves it supported; anything else, an old help that
+/// exits 0 without the flag or a diagnostic in other words included, is
+/// unknown. Blocking: run it off the executor.
 pub fn probe_cli(binary: &std::path::Path, deadline: Duration) -> ProbeVerdict {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let integration = super::ADAPTER_INTEGRATION.to_string();
+    let started = Instant::now();
     let Ok(mut child) = Command::new(binary)
         .args([
             "inbox",
@@ -1131,28 +1144,32 @@ pub fn probe_cli(binary: &std::path::Path, deadline: Duration) -> ProbeVerdict {
     else {
         return ProbeVerdict::Unknown;
     };
-    let read = |pipe: Option<Box<dyn Read + Send>>| {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let read = |pipe: Option<Box<dyn Read + Send>>, err: bool| {
+        let tx = tx.clone();
         std::thread::spawn(move || {
-            let mut text = String::new();
-            if let Some(pipe) = pipe {
-                let _ = pipe.take(PROBE_OUTPUT_CAP).read_to_string(&mut text);
+            let mut text = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.by_ref().take(PROBE_OUTPUT_CAP).read_to_end(&mut text);
+                let _ = std::io::copy(&mut pipe, &mut std::io::sink());
             }
-            text
-        })
+            let _ = tx.send((err, String::from_utf8_lossy(&text).into_owned()));
+        });
     };
-    let stdout = read(
+    read(
         child
             .stdout
             .take()
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        false,
     );
-    let stderr = read(
+    read(
         child
             .stderr
             .take()
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        true,
     );
-    let started = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -1169,13 +1186,23 @@ pub fn probe_cli(binary: &std::path::Path, deadline: Duration) -> ProbeVerdict {
     let Some(status) = status else {
         return ProbeVerdict::Unknown;
     };
-    let (stdout, stderr) = (
-        stdout.join().unwrap_or_default(),
-        stderr.join().unwrap_or_default(),
-    );
-    if status.success() && stdout.contains("--adapter-integration") {
+    let (mut stdout, mut stderr) = (None, None);
+    while stdout.is_none() || stderr.is_none() {
+        let left = deadline.saturating_sub(started.elapsed());
+        match rx.recv_timeout(left.max(Duration::from_millis(50))) {
+            Ok((true, text)) => stderr = Some(text),
+            Ok((false, text)) => stdout = Some(text),
+            Err(_) => return ProbeVerdict::Unknown,
+        }
+    }
+    let (stdout, stderr) = (stdout.unwrap_or_default(), stderr.unwrap_or_default());
+    let lists_flag = stdout
+        .lines()
+        .any(|line| line.trim_start().starts_with("--adapter-integration "));
+    if status.success() && lists_flag {
         ProbeVerdict::Supported
-    } else if !status.success() && stderr.contains("unexpected argument '--adapter-integration'") {
+    } else if status.code() == Some(CLAP_USAGE_EXIT) && stderr.lines().next() == Some(CLAP_REFUSAL)
+    {
         ProbeVerdict::CliTooOld
     } else {
         ProbeVerdict::Unknown
