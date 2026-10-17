@@ -1061,6 +1061,12 @@ impl SessionState {
         self.recent_events.iter().rev().find_map(card_inbox_of)
     }
 
+    /// PRD #1666 §6.5: the row the card's inbox notices take
+    /// ([`crate::inbox_display::CardInbox::notice_text`]), when there is one.
+    pub fn inbox_notice(&self) -> Option<String> {
+        self.card_inbox().and_then(|inbox| inbox.notice_text())
+    }
+
     /// PRD #1666 §2.8: the deck's notice explaining this card's Error — a
     /// message it could not deliver — while the card is in Error because of it.
     /// The notice is the `delivery_notice` the daemon's report event carried;
@@ -6313,10 +6319,15 @@ fn push_journal_carrier(session: &mut SessionState, carrier: AgentEvent) {
 /// PRD #1666: the inbox state a journal entry carries, if it is the card's
 /// inbox entry.
 fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> {
-    event
+    let mut inbox = event
         .metadata
         .get(crate::inbox_display::CARD_INBOX_METADATA_KEY)
-        .and_then(|value| crate::inbox_display::CardInbox::decode(value))
+        .and_then(|value| crate::inbox_display::CardInbox::decode(value))?;
+    inbox.receipts_degraded = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_DEGRADED_METADATA_KEY)
+        .cloned();
+    Some(inbox)
 }
 
 /// Drop the oldest entry of a card's bounded journal, keeping its inbox entry
@@ -6348,6 +6359,12 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
         crate::inbox_display::CARD_INBOX_METADATA_KEY.to_string(),
         inbox.encode(),
     );
+    if let Some(error) = &inbox.receipts_degraded {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_DEGRADED_METADATA_KEY.to_string(),
+            error.clone(),
+        );
+    }
     session.recent_events.push_back(AgentEvent {
         session_id: session.session_id.clone(),
         agent_type: session.agent_type.clone(),
@@ -6404,6 +6421,10 @@ struct PaneInbox {
     /// agent for its waiting messages. Set from the summary and from the deck's
     /// wake-stall notices alone (B-03, B-04), which report its end as well.
     stalled: bool,
+    /// PRD #1666 §6.5: the items waiting on the user and the card's notices,
+    /// from the summary and from each attention notice, which carries them
+    /// whole.
+    notices: crate::inbox_hub::InboxCardNotices,
 }
 
 impl PaneInbox {
@@ -6420,10 +6441,22 @@ impl PaneInbox {
             .values()
             .filter(|seen| **seen == SeenMessage::PendingNew)
             .count();
+        let count = |uncertain: bool| {
+            self.notices
+                .attention
+                .iter()
+                .filter(|item| item.kind.uncertain() == uncertain)
+                .count()
+        };
         crate::inbox_display::CardInbox {
             pending: self.baseline + new,
             delivered: self.delivered,
             stalled: self.stalled,
+            uncertain: count(true),
+            held_long: count(false),
+            integration: self.notices.integration,
+            evidence_paused: self.notices.evidence_paused,
+            receipts_degraded: self.notices.receipts_degraded.clone(),
         }
     }
 
@@ -8312,6 +8345,7 @@ impl AppState {
                 seen: HashMap::new(),
                 delivered: summary.last_acked_at.is_some(),
                 stalled: summary.wake_stalled,
+                notices: summary.notices.clone(),
             },
         );
         self.refresh_card_inbox(pane_id);
@@ -8337,7 +8371,11 @@ impl AppState {
             (None, Some(named)) => inbox.agent_id = Some(named.clone()),
             _ => {}
         }
-        if notice.wake_update {
+        if notice.attention_update {
+            // PRD #1666 §6.5: the pane's card notices, whole; no message
+            // changed state.
+            inbox.notices = notice.notices.clone();
+        } else if notice.wake_update {
             // PR #1735 fifth review (B-03): the agent's wake stall changed and
             // the message it names did not, so nothing is counted.
             inbox.stalled = notice.wake_stalled;
@@ -8352,6 +8390,23 @@ impl AppState {
             inbox.apply(&notice.message_id, state);
         }
         self.refresh_card_inbox(&notice.pane_id);
+    }
+
+    /// PRD #1666 §6.4: the items `pane_id`'s card lists for the user to
+    /// decide on, with the agent generation they belong to.
+    pub fn inbox_attention(
+        &self,
+        pane_id: &str,
+    ) -> Option<(Option<&str>, &[crate::inbox_hub::InboxAttentionItem])> {
+        self.pane_inboxes
+            .get(pane_id)
+            .filter(|inbox| !inbox.notices.attention.is_empty())
+            .map(|inbox| {
+                (
+                    inbox.agent_id.as_deref(),
+                    inbox.notices.attention.as_slice(),
+                )
+            })
     }
 
     /// The card [`Self::pane_inboxes`] draws `pane_id`'s inbox on: the pane's
@@ -19152,6 +19207,8 @@ mod tests {
             returned: false,
             wake_stalled: false,
             wake_update: false,
+            attention_update: false,
+            notices: Default::default(),
         }
     }
 
@@ -19173,6 +19230,7 @@ mod tests {
                 pending,
                 delivered,
                 stalled: false,
+                ..CardInbox::default()
             })
         };
         let mut state = AppState::default();
@@ -19191,6 +19249,7 @@ mod tests {
                 wake: crate::inbox_hub::WakePath::Doorbell,
                 component: None,
                 wake_stalled: false,
+                notices: Default::default(),
             },
         );
         assert_eq!(card(&state), pending(2, false));
@@ -19247,6 +19306,7 @@ mod tests {
                 wake: crate::inbox_hub::WakePath::Native,
                 component: None,
                 wake_stalled: false,
+                notices: Default::default(),
             },
         );
         let card = |state: &AppState| state.sessions["gen-q"].card_inbox();
@@ -19255,6 +19315,7 @@ mod tests {
                 pending,
                 delivered: false,
                 stalled: false,
+                ..CardInbox::default()
             })
         };
         assert_eq!(
@@ -19289,7 +19350,7 @@ mod tests {
         let line = |state: &AppState| {
             state.sessions["gen-q"]
                 .card_inbox()
-                .and_then(crate::inbox_display::CardInbox::full_text)
+                .and_then(|inbox| inbox.full_text())
         };
         let wake = |id: &str, stalled: bool| {
             let mut notice = inbox_notice("pane-q", id, Queued);
@@ -19324,6 +19385,7 @@ mod tests {
                 wake: crate::inbox_hub::WakePath::Doorbell,
                 component: None,
                 wake_stalled: true,
+                notices: Default::default(),
             },
         );
         assert_eq!(
@@ -19415,7 +19477,7 @@ mod tests {
         let line = |state: &AppState| {
             state.sessions["gen-q"]
                 .card_inbox()
-                .and_then(crate::inbox_display::CardInbox::full_text)
+                .and_then(|inbox| inbox.full_text())
         };
         assert_eq!(
             line(&state).as_deref(),

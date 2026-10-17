@@ -204,7 +204,7 @@ fn opencode_021_live_watcher_respawns_and_next_delegate_is_native() {
     assert!(!op.log().contains("doorbell rang"), "{}", op.evidence());
 }
 
-/// Scenario: Remove the deck entry from scratch tui.json so no watcher arms, and leave real OpenCode idle after a prior prompt. The doorbell must be intercepted by the server plugin, run the task without a model-side inbox fetch, and acknowledge its visible reply and sentinel.
+/// Scenario: Remove the deck entry from scratch tui.json so no TUI watcher arms, and leave real OpenCode idle after a prior prompt. The doorbell must be intercepted by the server plugin, bound to its own receiver, run the task without a model-side inbox fetch, and commit on its visible reply and sentinel.
 #[spec("inbox/opencode/022")]
 #[test]
 fn opencode_022_live_unarmed_doorbell_is_intercepted_before_model() {
@@ -212,9 +212,10 @@ fn opencode_022_live_unarmed_doorbell_is_intercepted_before_model() {
     let op = OpenCode::new(false, 0, false);
     op.prior();
     let id = op.delegate("opencode-doorbell-52a1cd.txt");
-    // The unarmed server plugin acknowledges through the CLI, so the inbox
-    // records Explicit rather than the armed stream's PluginConfirmed.
-    op.done_with_ack(&id, "opencode-doorbell-52a1cd.txt", "explicit");
+    // PRD #1666 §4: the server plugin's doorbell-only receiver commits the
+    // substituted attempt on its own receipt stream, so the inbox records
+    // PluginConfirmed, as for the armed stream.
+    op.done_with_ack(&id, "opencode-doorbell-52a1cd.txt", "plugin_confirmed");
     assert!(op.log().contains("doorbell rang"), "{}", op.evidence());
     assert!(op.log().contains("DoorbellHook"), "{}", op.evidence());
     assert!(

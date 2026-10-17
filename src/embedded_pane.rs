@@ -719,6 +719,79 @@ impl HostMetricsReader {
     }
 }
 
+/// The answer to a Retry (`true`) or Cancel press: the daemon's outcome, or
+/// why none came.
+type InboxActionAnswer = (bool, Result<String, String>);
+
+/// PRD #1666 §6.4: sends the TUI's Retry and Cancel presses to the daemon off
+/// the event loop, and holds the answer for the picker to show.
+#[derive(Clone)]
+pub struct InboxActionSender {
+    client: DaemonClient,
+    runtime: tokio::runtime::Handle,
+    slot: Arc<Mutex<Option<InboxActionAnswer>>>,
+}
+
+impl InboxActionSender {
+    /// Send one press — Retry (`retry`) or Cancel — for `message_id` of
+    /// `agent_id` in `pane_id`, at `revision`, bounded by `timeout`.
+    pub fn send(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        message_id: &str,
+        revision: u64,
+        retry: bool,
+        timeout: Duration,
+    ) {
+        let client = self.client.clone();
+        let slot = Arc::clone(&self.slot);
+        let (pane_id, agent_id, message_id) = (
+            pane_id.to_string(),
+            agent_id.to_string(),
+            message_id.to_string(),
+        );
+        let request_id = generate_client_id();
+        self.runtime.spawn(async move {
+            let answer = match tokio::time::timeout(
+                timeout,
+                client.inbox_action(
+                    &pane_id,
+                    &agent_id,
+                    &message_id,
+                    revision,
+                    retry,
+                    &request_id,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(crate::daemon_client::GatedQuery::Answered(reply))) => {
+                    serde_json::to_value(reply.outcome)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_string))
+                        .ok_or_else(|| {
+                            "the deck's answer was not one this build understands".to_string()
+                        })
+                }
+                Ok(Ok(crate::daemon_client::GatedQuery::Unsupported)) => {
+                    Ok("unsupported".to_string())
+                }
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("the deck did not answer in time".to_string()),
+            };
+            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((retry, answer));
+        });
+    }
+
+    /// The answer to the last press, once it has arrived: whether it was a
+    /// Retry, and the daemon's outcome (`applied`, `stale`, …) or why none
+    /// came.
+    pub fn take(&self) -> Option<InboxActionAnswer> {
+        self.slot.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+}
+
 impl EmbeddedPaneController {
     /// Build a controller whose panes are stream-backed against the daemon
     /// at `socket_path`. Caller is responsible for ensuring the daemon is
@@ -752,6 +825,16 @@ impl EmbeddedPaneController {
     /// PRD #1258 M3: a handle the host overlay fetches through — on this
     /// controller's own client, so it describes the host of the very daemon the
     /// TUI is attached to, local or remote.
+    /// PRD #1666 §6.4: the sender of this controller's Retry and Cancel
+    /// presses, on the same client as every other attach.
+    pub fn inbox_action_sender(&self) -> InboxActionSender {
+        InboxActionSender {
+            client: self.client.clone(),
+            runtime: self.runtime.clone(),
+            slot: Arc::new(Mutex::new(None)),
+        }
+    }
+
     pub fn host_metrics_reader(&self) -> HostMetricsReader {
         HostMetricsReader {
             client: self.client.clone(),

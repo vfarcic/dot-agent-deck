@@ -12,7 +12,7 @@ import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
 import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
-import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, RuntimeMode, TerminalBuffer } from "../types";
+import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -376,6 +376,12 @@ export function useDeckRuntime(): DeckRuntimeState {
   const upgradeDaemon = useMemo(() => (typeof bridge.upgradeDaemon === "function"
     ? (deckId: string, onEvent: (event: UpgradeEvent) => void) => bridge.upgradeDaemon(deckId, onEvent)
     : undefined), [bridge]);
+  // PRD #1666 §6.4: Retry and Cancel on a listed deck message. The answer is
+  // the row's to show, so this bypasses `runAction` too.
+  const inboxAction = useMemo(() => (typeof bridge.inboxAction === "function"
+    ? (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) =>
+      bridge.inboxAction!(target, item, verb)
+    : undefined), [bridge]);
   const decideUpgrade = useMemo(() => (typeof bridge.decideUpgrade === "function"
     ? (upgradeId: string, questionId: number, choice: UpgradeChoice) => bridge.decideUpgrade(upgradeId, questionId, choice)
     : undefined), [bridge]);
@@ -430,6 +436,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     runAction,
     ...(upgradeDaemon ? { upgradeDaemon } : {}),
     ...(decideUpgrade ? { decideUpgrade } : {}),
+    ...(inboxAction ? { inboxAction } : {}),
     sendTerminalInput,
     resizeTerminal,
     setShownTerminals,

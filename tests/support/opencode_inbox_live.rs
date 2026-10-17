@@ -632,8 +632,11 @@ print(json.dumps(out))
                 .split_whitespace()
             {
                 let cmd = std::fs::read(format!("/proc/{child}/cmdline")).unwrap_or_default();
+                // PRD #1666 §4: the server context's `--doorbell-only`
+                // receiver is not the pane's delivery watcher.
                 if cmd.split(|b| *b == 0).any(|arg| arg == b"inbox")
                     && cmd.split(|b| *b == 0).any(|arg| arg == b"wait")
+                    && !cmd.split(|b| *b == 0).any(|arg| arg == b"--doorbell-only")
                 {
                     found.push(child.parse().unwrap());
                 }

@@ -41,6 +41,9 @@ import type { HandoffEdge,
   DisconnectedReason,
   EvidenceItem,
   HostMetricsReport,
+  InboxActionResult,
+  InboxActionVerb,
+  InboxAttentionItem,
   NewAgentOptions,
   NewAgentOrchestrations,
   PromptKeys,
@@ -368,6 +371,11 @@ export interface DesktopAgentDto {
     component?: string;
     /** PR #1735 fifth review (R5): nothing has woken the agent for its waiting messages. */
     wakeStalled?: boolean;
+    /** PRD #1666 §6.5: deck messages waiting on the user's Retry or Cancel. */
+    attention?: Array<{ messageId: string; revision: number; kind: string; fromLabel: string; subject: string; taskId?: string }>;
+    integration?: string;
+    receiptsDegraded?: string;
+    evidencePaused?: number;
   };
   /**
    * PRD #1666 — the deck's notice explaining an `error` status (a message the
@@ -2146,6 +2154,13 @@ export interface DeckBridge {
    * asked again is refused.
    */
   decideUpgrade(upgradeId: string, questionId: number, choice: UpgradeChoice): Promise<void>;
+  /**
+   * PRD #1666 §6.4 — Retry or Cancel one deck message an agent card lists
+   * (`desktop_inbox_action`), at the revision the card shows. Optional: a
+   * bridge without it (the browser preview) offers no buttons. The daemon
+   * answers `stale` to the second of two clients acting at once.
+   */
+  inboxAction?(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult>;
   dispose(): Promise<void>;
 }
 
@@ -2301,6 +2316,10 @@ function blockedFromDto(blocked: NonNullable<DesktopAgentDto["blocked"]>): Agent
 /** PRD #1666: the card's view of `DesktopAgentDto.inbox`; counts the crate did not send read as zero. */
 function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox {
   const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0);
+  const attention = attentionFromDto(inbox.attention ?? []);
+  const integration = inbox.integration && INTEGRATION_NOTICES.has(inbox.integration)
+    ? inbox.integration as NonNullable<AgentInbox["integration"]>
+    : undefined;
   return {
     queued: count(inbox.queued),
     fetched: count(inbox.fetched),
@@ -2309,7 +2328,30 @@ function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox 
     wake: inbox.wake,
     ...(inbox.component ? { component: inbox.component } : {}),
     ...(inbox.wakeStalled === true ? { wakeStalled: true } : {}),
+    ...(attention.length > 0 ? { attention } : {}),
+    ...(integration ? { integration } : {}),
+    ...(typeof inbox.receiptsDegraded === "string" ? { receiptsDegraded: displayText(inbox.receiptsDegraded, DISPLAY_LIMITS.prompt) } : {}),
+    ...(typeof inbox.evidencePaused === "number" && Number.isFinite(inbox.evidencePaused) ? { evidencePaused: count(inbox.evidencePaused) } : {}),
   };
+}
+
+const ATTENTION_KINDS = new Set(["uncertain", "out_of_attempts", "held_long"]);
+const INTEGRATION_NOTICES = new Set(["cli_too_old", "adapter_too_old", "not_armed"]);
+
+/** PRD #1666 §6.5: the listed items the crate sent, an unknown kind dropped. */
+function attentionFromDto(items: NonNullable<NonNullable<DesktopAgentDto["inbox"]>["attention"]>): InboxAttentionItem[] {
+  return items.flatMap((item) => {
+    if (!ATTENTION_KINDS.has(item.kind) || typeof item.messageId !== "string") return [];
+    const revision = typeof item.revision === "number" && Number.isFinite(item.revision) ? item.revision : 0;
+    return [{
+      messageId: item.messageId,
+      revision,
+      kind: item.kind as InboxAttentionItem["kind"],
+      fromLabel: displayText(item.fromLabel ?? "", DISPLAY_LIMITS.prompt),
+      subject: displayText(item.subject ?? "", DISPLAY_LIMITS.prompt),
+      ...(item.taskId ? { taskId: item.taskId } : {}),
+    }];
+  });
 }
 
 /**
@@ -5207,6 +5249,18 @@ export class TauriDeckBridge implements DeckBridge {
     // Issue #1240: `options` only when given, so a PRD #1223 listing is the
     // same invoke it always was.
     return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
+  }
+
+  async inboxAction(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult> {
+    const invoke = await this.getInvoke();
+    return invoke<InboxActionResult>("desktop_inbox_action", {
+      deckId: target.deckId,
+      agentId: target.agentId,
+      paneId: item.paneId,
+      messageId: item.messageId,
+      revision: item.revision,
+      verb,
+    });
   }
 
   async upgradeDaemon(deckId: string, onEvent: (event: UpgradeEvent) => void): Promise<UpgradeOutcome> {

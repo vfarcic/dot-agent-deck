@@ -614,6 +614,164 @@ fn status_012_card_says_a_stalled_wake_and_what_to_do() {
     insta::assert_snapshot!(rendered);
 }
 
+/// PRD #1666 §6.5: a card whose daemon summary carries `notices` (the attention
+/// items, the integration notice, failed receipts, paused hand-outs) beside
+/// one fetched message, rendered at the Normal density's 80 columns.
+fn inbox_notice_card(notices: serde_json::Value) -> String {
+    let session = card_stats_session("/home/dev/api-svc");
+    let mut inbox = serde_json::json!({
+        "queued": 0, "fetched": 1, "undeliverable": 0,
+        "last_acked_at": null, "wake": "native", "component": "opencode_plugin"
+    });
+    for (key, value) in notices.as_object().unwrap() {
+        inbox[key] = value.clone();
+    }
+    let record: dot_agent_deck::agent_pty::AgentRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
+            "live": session.live_snapshot(), "inbox": inbox
+        }))
+        .expect("the daemon's AgentRecord wire shape with PRD #1666 card notices");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    state.resync_after_event_gap(&[record]);
+    let session = state.sessions.remove("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    buffer_to_text(&buffer)
+}
+
+fn attention_item(id: &str, kind: &str) -> serde_json::Value {
+    serde_json::json!({"message_id": id, "revision": 4, "kind": kind,
+        "from_label": "the orchestrator", "subject": "review the fixture"})
+}
+
+/// Scenario: The daemon's snapshot lists one deck message whose delivery is uncertain. The card says `delivery uncertain` in the words the desktop uses, instead of only counting it.
+#[spec("inbox/status/013")]
+#[test]
+fn status_013_card_says_one_delivery_is_uncertain() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "uncertain")]
+    }));
+    let line = format!(
+        "{} {}",
+        words["glyph"].as_str().unwrap(),
+        words["uncertain"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+    let reason: String = words["uncertainReason"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        rendered.contains(&reason),
+        "{reason:?} missing:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Three deck messages on one card are uncertain, one of them out of attempts. The card counts them together as `3 deliveries uncertain`.
+#[spec("inbox/status/014")]
+#[test]
+fn status_014_card_counts_several_uncertain_deliveries() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "uncertain"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b851", "uncertain"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b852", "out_of_attempts")
+        ]
+    }));
+    let line = format!(
+        "{} 3 {}",
+        words["glyph"].as_str().unwrap(),
+        words["uncertainMany"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+}
+
+/// Scenario: A deck message has been held by the agent for an hour without a commit. The card shows the one-shot held-for-an-hour attention, not a failure.
+#[spec("inbox/status/015")]
+#[test]
+fn status_015_card_shows_held_long_attention() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "held_long")]
+    }));
+    let head: String = words["heldLong"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+    assert!(
+        !rendered.contains("Error"),
+        "held_long is not a failure:\n{rendered}"
+    );
+}
+
+/// Scenario: The agent's integration is out of date, or its CLI too old, or it has not connected yet. The card shows that notice in the words the desktop uses, under its directory.
+#[spec("inbox/status/016")]
+#[test]
+fn status_016_card_shows_the_integration_notice() {
+    let words = inbox_display_words();
+    for (code, key) in [
+        ("adapter_too_old", "adapterTooOld"),
+        ("cli_too_old", "cliTooOld"),
+        ("not_armed", "notArmed"),
+    ] {
+        let rendered = inbox_notice_card(serde_json::json!({ "integration": code }));
+        let head: String = words[key].as_str().unwrap().chars().take(40).collect();
+        assert!(
+            rendered.contains(&head),
+            "{code}: {head:?} missing:\n{rendered}"
+        );
+    }
+}
+
+/// Scenario: Hand-outs to the agent are paused because its evidence store is full. The card says deck messages are paused and how many delivered messages still wait.
+#[spec("inbox/status/017")]
+#[test]
+fn status_017_card_shows_paused_hand_outs() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({ "evidence_paused": 7 }));
+    let text = words["evidencePaused"]
+        .as_str()
+        .unwrap()
+        .replace("{n}", "7");
+    let head: String = text.chars().take(40).collect();
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+}
+
+/// Scenario: The deck cannot record message receipts for the agent. The card warns that messages may repeat, under its directory.
+#[spec("inbox/status/018")]
+#[test]
+fn status_018_card_warns_that_messages_may_repeat() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({ "receipts_degraded": "disk full" }));
+    let head: String = words["receiptsDegraded"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+}
+
 /// Scenario: Render a pending-message card at the existing 20-column Compact snapshot budget. The envelope count must fit beside Thinking without removing the tools counter or overrunning either border.
 #[spec("inbox/status/007")]
 #[test]

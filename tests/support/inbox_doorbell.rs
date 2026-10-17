@@ -122,6 +122,12 @@ pub fn attach(daemon: &impl Endpoint, req: Value) -> Value {
 }
 
 pub fn pane(daemon: &impl Endpoint, name: &str) -> Pane {
+    pane_with(daemon, name, json!({}))
+}
+
+/// [`pane`], with `extra`'s fields merged into the start request (an
+/// `agent_type`, more `env` pairs appended to the pane's own).
+pub fn pane_with(daemon: &impl Endpoint, name: &str, extra: Value) -> Pane {
     let script = daemon.home().join(format!("{name}.py"));
     // Raw mode preserves CR versus LF and disables kernel echo. Render the
     // received line so the same bytes can also be checked through vt100.
@@ -152,12 +158,18 @@ while True:
     let base = daemon.home().join(name);
     let quote = |path: &std::path::Path| path.to_string_lossy().replace('\'', "'\\''");
     let command = format!("exec python3 '{}' '{}'", quote(&script), quote(&base));
-    let reply = attach(
-        daemon,
-        json!({"op":"start-agent",
+    let mut start = json!({"op":"start-agent",
         "command":common::capability_export_command(&command), "cwd":daemon.cwd(),
-        "rows":40,"cols":140,"env":[["DOT_AGENT_DECK_PANE_ID",name]],"display_name":name}),
-    );
+        "rows":40,"cols":140,"env":[["DOT_AGENT_DECK_PANE_ID",name]],"display_name":name});
+    for (key, value) in extra.as_object().into_iter().flatten() {
+        if key == "env" {
+            let env = start["env"].as_array_mut().unwrap();
+            env.extend(value.as_array().cloned().unwrap_or_default());
+        } else {
+            start[key] = value.clone();
+        }
+    }
+    let reply = attach(daemon, start);
     assert_eq!(reply["ok"], true, "stand-in spawn: {reply}");
     let agent = reply["id"].as_str().unwrap().to_string();
     let token = tokio::runtime::Runtime::new()
@@ -288,6 +300,80 @@ pub fn announce(daemon: &impl Endpoint, pane: &Pane, wake: &str) {
     req["wake"] = json!(wake);
     req["pid"] = json!(pane.pid);
     assert_eq!(hook(daemon, req)["accepted"], true);
+}
+
+/// PRD #1666 §4: a stand-in for OpenCode's TUI receipt stream (its watcher),
+/// armed from the test process at the adapter floor; returns once the deck
+/// registered it.
+pub fn receipt_stream(daemon: &impl Endpoint, pane: &Pane) -> BufReader<UnixStream> {
+    let mut req = request(pane, "inbox_wait");
+    req["component"] = json!("opencode_plugin");
+    req["component_version"] = json!("synthetic-receipt");
+    req["mode"] = json!("stream");
+    req["pid"] = json!(pane.pid);
+    req["adapter_integration"] = json!(2);
+    let mut stream = connect(daemon, &req);
+    let registered = line(&mut stream);
+    assert!(
+        registered["registered"].is_object(),
+        "a receipt stream registers first: {registered}"
+    );
+    stream
+}
+
+/// Read a receipt stream until it hands over `id`, skipping keepalives and
+/// other lines; the hand-out (`{id, a, e, d, …}`).
+pub fn receipt_handout(stream: &mut BufReader<UnixStream>, id: &str) -> Value {
+    loop {
+        let reply = line(stream);
+        if let Some(found) = reply["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|m| m["id"] == id))
+        {
+            return found.clone();
+        }
+    }
+}
+
+/// Write one control line to a receipt stream.
+pub fn receipt_control(stream: &mut BufReader<UnixStream>, control: Value) {
+    writeln!(stream.get_mut(), "{control}").unwrap();
+}
+
+/// Every line a receipt stream writes within `span`, keepalives included.
+pub fn receipt_lines_within(stream: &mut BufReader<UnixStream>, span: Duration) -> Vec<Value> {
+    let until = std::time::Instant::now() + span;
+    let mut out = Vec::new();
+    while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+        stream
+            .get_mut()
+            .set_read_timeout(Some(left.max(Duration::from_millis(5))))
+            .unwrap();
+        let mut text = String::new();
+        match stream.read_line(&mut text) {
+            Ok(n) if n > 0 => out.extend(serde_json::from_str::<Value>(&text).ok()),
+            _ => break,
+        }
+    }
+    stream.get_mut().set_read_timeout(Some(WAIT)).unwrap();
+    out
+}
+
+/// PRD #1666 §4: keep `held` possessed on `stream` for `span`, one fresh
+/// snapshot every 150 ms, and return what the deck wrote meanwhile.
+pub fn possess_for(stream: &mut BufReader<UnixStream>, held: &Value, span: Duration) -> Vec<Value> {
+    let until = std::time::Instant::now() + span;
+    let mut seq = 0u64;
+    let mut written = Vec::new();
+    while std::time::Instant::now() < until {
+        seq += 1;
+        receipt_control(
+            stream,
+            json!({"possess": {"seq": seq, "seen": held["d"], "held": [{"id": held["id"], "a": held["a"], "e": held["e"]}]}}),
+        );
+        written.extend(receipt_lines_within(stream, Duration::from_millis(150)));
+    }
+    written
 }
 
 pub fn waiter(daemon: &impl Endpoint, pane: &Pane) -> BufReader<UnixStream> {

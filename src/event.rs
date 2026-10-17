@@ -3002,6 +3002,14 @@ pub struct InboxNotice {
     /// from them and the summary alone. Additive, as `wake_stalled` is.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake_update: bool,
+    /// PRD #1666 §6.5: this notice carries the pane's whole card notices
+    /// ([`Self::notices`]) and nothing else, as [`Self::wake_update`] carries
+    /// the wake stall: a client replaces what it holds for the pane with
+    /// them. Additive: a client that does not know it ignores them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attention_update: bool,
+    #[serde(flatten, default)]
+    pub notices: crate::inbox_hub::InboxCardNotices,
 }
 
 /// PRD #120: the structural membership of a daemon-spawned orchestration,
@@ -3313,6 +3321,139 @@ pub struct InboxWaitRequest {
     pub session: Option<InboxWaitSession>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// PRD #1666 §11: the integration the hand-over component declares
+    /// (`--adapter-integration`), forwarded by the watcher apart from its own
+    /// version. A component the receipt policy covers is refused below
+    /// [`crate::inbox_hub::ADAPTER_INTEGRATION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_integration: Option<u32>,
+    /// PRD #1666 §4: this stream only carries the component's doorbell
+    /// substitutions (OpenCode's server plugin in the full TUI): it registers
+    /// a receiver, but no message is handed to it unasked and it does not
+    /// count as armed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub doorbell_only: bool,
+    /// PRD #1666 §4: the component's callback queue survived since its
+    /// previous registration (a watcher respawned for the same context), so
+    /// its `not_handed` resume answers are believed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumed: bool,
+}
+
+/// PRD #1666 §2, §4: one attempt, by its identity. Every control on the
+/// receipt stream names one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxAttemptRef {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+}
+
+/// PRD #1666 §4: a resumed attempt rebound to the new incarnation, with the
+/// delivery number it now carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxRebound {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+    pub d: u64,
+}
+
+/// PRD #1666 §5: an attempt's two capabilities, as the daemon hands them to
+/// the watcher that publishes its receipts. Never written to the component's
+/// JavaScript, to a hook's output or to `inbox fetch --json`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxAttemptCaps {
+    pub handed: String,
+    pub commit: String,
+}
+
+impl std::fmt::Debug for InboxAttemptCaps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InboxAttemptCaps(..)")
+    }
+}
+
+/// PRD #1666 §2: one hand-out's attempt, beside the rendered block on a
+/// receipt stream ([`InboxDelivery::attempt`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxDeliveryAttempt {
+    pub a: u32,
+    pub e: u32,
+    /// The per-receiver delivery number `seen` counts (§4).
+    pub d: u64,
+    /// A marked repeat (§6.1): its frame carries the possible-repeat line.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat: bool,
+    /// For the watcher only; stripped before the component sees the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<InboxAttemptCaps>,
+}
+
+/// PRD #1666 §4: an incarnation's answer for one attempt it was asked to
+/// resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxResumeReply {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+    /// `retained`, `not_handed` or `unknown`.
+    pub answer: String,
+}
+
+/// PRD #1666 §4: a possession snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxPossess {
+    /// Rises strictly per incarnation; a stale or replayed one is dropped.
+    pub seq: u64,
+    /// The contiguous observed prefix of delivery numbers.
+    pub seen: u64,
+    #[serde(default)]
+    pub held: Vec<InboxAttemptRef>,
+}
+
+/// PRD #1666 §3: the final hand-over check's question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxMayHandOver {
+    /// The component's question number; the grant names it.
+    pub q: u64,
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+}
+
+/// PRD #1666 §3: the answer to [`InboxMayHandOver`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxGrant {
+    pub q: u64,
+    pub ok: bool,
+    /// Why not (`committed`, `revoked`, `wrong_receiver`, `unknown`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+/// PRD #1666 §4: the first line on a receipt stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxRegistered {
+    /// The daemon-minted incarnation.
+    pub rx: u64,
+    /// `opencode_server`, `opencode_tui`, …
+    pub slot: String,
+    /// The daemon's keepalive interval: a watcher that hears no snapshot from
+    /// its component for three of them closes the stream (§4 "Dead adapter,
+    /// live watcher").
+    pub keepalive_ms: u64,
+}
+
+/// PRD #1666 §5: caps for attempts a doorbell fetch issued to this
+/// incarnation; their bodies went to the fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxIssued {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+    pub d: u64,
+    pub caps: InboxAttemptCaps,
 }
 
 /// Payload of [`DaemonMessage::InboxAnnounce`].
@@ -3359,6 +3500,15 @@ pub struct InboxFetchRequest {
     /// the caller, decided under the inbox's lock with the fetch itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doorbell: Option<String>,
+    /// PRD #1666 §11: the integration of the component that runs the fetch
+    /// (OpenCode's doorbell substitution), as on [`InboxWaitRequest`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_integration: Option<u32>,
+    /// PRD #1666 §4: the incarnation the fetched attempts are bound to — the
+    /// component's own receipt stream, which holds their caps and their
+    /// possession.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx: Option<u64>,
 }
 
 /// Payload of [`DaemonMessage::InboxList`].
@@ -3486,6 +3636,9 @@ pub struct InboxDelivery {
     /// `[dot-agent-deck message <id> from <from>]` … `[end of dot-agent-deck
     /// message <id>]`.
     pub text: String,
+    /// PRD #1666 §2: on a receipt stream, the attempt this hand-out is.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<InboxDeliveryAttempt>,
 }
 
 /// The line written for [`DaemonMessage::InboxWait`] and
@@ -3510,6 +3663,24 @@ pub struct InboxWaitReply {
     /// Sent on an idle waiter so both ends notice a dead peer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keepalive: bool,
+    /// PRD #1666 §4: a receipt registration's incarnation (first line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered: Option<InboxRegistered>,
+    /// PRD #1666 §4: attempts the new incarnation is asked to resume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume: Vec<InboxAttemptRef>,
+    /// PRD #1666 §4: resumed attempts now bound to this incarnation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rebound: Vec<InboxRebound>,
+    /// PRD #1666 §3: the answer to a `may` question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<InboxGrant>,
+    /// PRD #1666 §2: attempts to revoke.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoke: Vec<InboxAttemptRef>,
+    /// PRD #1666 §5: caps of attempts a doorbell fetch issued here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issued: Vec<InboxIssued>,
 }
 
 impl InboxWaitReply {
@@ -3569,9 +3740,39 @@ pub struct InboxStreamControl {
     /// progress — and did not hand over again. The deck refunds each such
     /// redelivery ([`crate::inbox::Inbox::hold`]) so a long turn does not use
     /// up `max_deliver`. A daemon that predates it reads the line as an empty
-    /// ack and counts the redelivery, as before.
+    /// ack and counts the redelivery, as before. Legacy streams only (Pi's
+    /// extension, until it moves to receipts): a receipt stream's possession
+    /// is its snapshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hold: Vec<String>,
+    /// PRD #1666 §4: the receipt stream's controls. A daemon that predates
+    /// them reads the line as an empty ack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub possess: Option<InboxPossess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub may: Option<InboxMayHandOver>,
+    /// PRD #1666 §3: attempts the component handed to the agent, their
+    /// `handed` receipt already published by the watcher.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handed: Vec<InboxAttemptRef>,
+    /// PRD #1666 §3: attempts the agent started on, their `committed`
+    /// receipt already published by the watcher.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub committed: Vec<InboxAttemptRef>,
+    /// PRD #1666 §2: attempts the component positively did not hand over.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_handed: Vec<InboxAttemptRef>,
+    /// PRD #1666 §2: revoked attempts whose callback is off the queue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_ack: Vec<InboxAttemptRef>,
+    /// PRD #1666 §2: revoked attempts already past the native call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub already_handed: Vec<InboxAttemptRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume_answers: Vec<InboxResumeReply>,
+    /// PRD #1666 §3: the watcher could not publish a receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
 }
 
 /// The answer to [`DaemonMessage::InboxList`].

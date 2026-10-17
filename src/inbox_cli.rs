@@ -118,7 +118,17 @@ pub const STREAM_NOT_IN_DECK_EXIT: u8 = 3;
 /// side closes. Run outside a deck pane, or without a capability token, it
 /// exits [`STREAM_NOT_IN_DECK_EXIT`] so the caller knows a respawn cannot
 /// succeed.
-pub fn wait(agent: &str, stream: bool) -> ExitCode {
+/// PRD #1666 §4, §11: what a watcher's component declared on its command
+/// line beyond `--agent` and `--stream`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Receipt {
+    /// `--adapter-integration`: with it, the stream carries receipts.
+    pub adapter_integration: Option<u32>,
+    pub doorbell_only: bool,
+    pub resumed: bool,
+}
+
+pub fn wait(agent: &str, stream: bool, receipt: Receipt) -> ExitCode {
     let not_in_deck = if stream {
         ExitCode::from(STREAM_NOT_IN_DECK_EXIT)
     } else {
@@ -144,11 +154,16 @@ pub fn wait(agent: &str, stream: bool) -> ExitCode {
         },
         session,
         pid: parent_pid(),
+        adapter_integration: receipt.adapter_integration,
+        doorbell_only: receipt.doorbell_only,
+        resumed: receipt.resumed,
     });
     let Ok(json) = serde_json::to_string(&request) else {
         return ExitCode::SUCCESS;
     };
-    if stream {
+    if stream && receipt.adapter_integration.is_some() {
+        crate::inbox_watcher::wait_receipt_stream(&json)
+    } else if stream {
         wait_stream(&json)
     } else {
         wait_once(&json)
@@ -358,7 +373,7 @@ fn refusal(line: &str) -> Option<String> {
 /// `dot-agent-deck inbox fetch`: print the framing sentence and every message
 /// waiting for this agent, and acknowledge them once they are printed.
 pub fn fetch(json: bool) -> ExitCode {
-    fetch_as(json, None)
+    fetch_as(json, None, None, None)
 }
 
 /// PRD #1666 S8: `dot-agent-deck inbox fetch --json --doorbell <id>`, run by
@@ -370,15 +385,25 @@ pub fn fetch(json: bool) -> ExitCode {
 /// history, or a message another consumer took meanwhile — it fetches
 /// nothing, so a newer message is never pulled into an old doorbell's turn.
 /// The daemon decides that with the fetch itself, under its inbox lock.
-pub fn fetch_for_doorbell(id: &str) -> ExitCode {
+///
+/// PRD #1666 §4, §11: with `adapter_integration` and `rx` (the OpenCode
+/// plugin's receipt stream), the fetched attempts are bound to that stream,
+/// which holds their caps and their possession; the JSON names each attempt
+/// and carries no cap.
+pub fn fetch_for_doorbell(id: &str, adapter_integration: Option<u32>, rx: Option<u64>) -> ExitCode {
     if !crate::inbox::is_valid_message_id(id) {
         eprintln!("Could not fetch messages: {id:?} is not a deck message id.");
         return ExitCode::FAILURE;
     }
-    fetch_as(true, Some(id))
+    fetch_as(true, Some(id), adapter_integration, rx)
 }
 
-fn fetch_as(json: bool, doorbell: Option<&str>) -> ExitCode {
+fn fetch_as(
+    json: bool,
+    doorbell: Option<&str>,
+    adapter_integration: Option<u32>,
+    rx: Option<u64>,
+) -> ExitCode {
     let Some(identity) = identity() else {
         eprintln!("{NOT_IN_PANE}");
         return ExitCode::FAILURE;
@@ -386,6 +411,7 @@ fn fetch_as(json: bool, doorbell: Option<&str>) -> ExitCode {
     fetch_with(
         json,
         doorbell,
+        (adapter_integration, rx),
         identity,
         &mut request,
         &mut std::io::stdout().lock(),
@@ -407,6 +433,7 @@ fn fetch_as(json: bool, doorbell: Option<&str>) -> ExitCode {
 fn fetch_with(
     json: bool,
     doorbell: Option<&str>,
+    (adapter_integration, rx): (Option<u32>, Option<u64>),
     identity: Identity,
     send: &mut dyn FnMut(&DaemonMessage) -> Result<String, String>,
     out: &mut dyn Write,
@@ -425,6 +452,8 @@ fn fetch_with(
         max_bytes: None,
         ack: false,
         doorbell: doorbell.map(str::to_string),
+        adapter_integration,
+        rx,
     });
     let line = match send(&message) {
         Ok(line) => line,
@@ -818,6 +847,7 @@ mod tests {
             subject: "subject".to_string(),
             from: "deck".to_string(),
             text: "[dot-agent-deck message m-k3xzq2ab-0123456789abcdef from deck]".to_string(),
+            attempt: None,
         };
         let answer =
             serde_json::to_string(&InboxWaitReply::messages(vec![delivery.clone()])).unwrap();
@@ -832,6 +862,7 @@ mod tests {
             let code = fetch_with(
                 json,
                 doorbell,
+                (None, None),
                 identity(),
                 &mut |message| {
                     asked.push(message.clone());

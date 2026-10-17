@@ -1400,19 +1400,27 @@ fn inbox_js(chunk: &str) -> String {
             "__DOORBELL_SUFFIX_JSON__",
             &json(crate::doorbell::LINE_SUFFIX),
         )
+        .replace(
+            "__ADAPTER_INTEGRATION__",
+            &crate::inbox_hub::ADAPTER_INTEGRATION.to_string(),
+        )
 }
 
 /// PRD #1666 S8: what both plugins share for the deck's inbox.
 const INBOX_SHARED_JS: &str = r#"// PRD #1666: dot-agent-deck's inbox. The deck hands its messages to a
-// watcher this plugin runs (`dot-agent-deck inbox wait --stream`), one JSON
-// line each; the plugin starts them as prompts with OpenCode's own client and
-// acknowledges each once OpenCode starts answering it — the first assistant
-// message whose parent is the deck's prompt or a later user message of the
-// same session — so a turn aborted before then is handed over again. It never touches what the user is typing.
+// watcher this plugin runs (`dot-agent-deck inbox wait --stream
+// --adapter-integration 2`), one JSON line each, as attempts: `{id, a, e, d}`
+// and the framed text. The plugin starts each as a prompt with OpenCode's own
+// client and tells the deck where each attempt stands — still held, handed to
+// OpenCode, started on (its commit), or positively not handed — and the
+// watcher records the receipts the deck reads back. It never touches what the
+// user is typing.
 const INBOX_FRAMING = __FRAMING_JSON__;
+const INBOX_ADAPTER_INTEGRATION = __ADAPTER_INTEGRATION__;
 const INBOX_ID = "(m-[a-z2-7]{8}-[0-9a-f]{16})";
 const INBOX_OPENER = new RegExp("\\[dot-agent-deck message " + INBOX_ID, "g");
 const INBOX_MAX_TRACKED = 256;
+const INBOX_GRANT_TIMEOUT_MS = 5000;
 const inboxSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const inboxRemember = (map, key, value) => {
   map.delete(key);
@@ -1424,12 +1432,12 @@ const inboxRemember = (map, key, value) => {
 const inboxInPane = () =>
   !!process.env.DOT_AGENT_DECK_PANE_ID && !!process.env.DOT_AGENT_DECK_PANE_CAPABILITY;
 // OpenCode answers several queued user messages in ONE assistant turn whose
-// `parentID` names only the last of them, so a turn acknowledges every user
+// `parentID` names only the last of them, so a turn answers every user
 // message its session had up to that parent. `users` maps each user message
 // to its session and the order this process first saw it (OpenCode's ids are
 // time-ordered too), at most INBOX_MAX_TRACKED of them; a message OpenCode
 // removes, as a revert does, leaves it and every `pendings` map, so nothing
-// acknowledges it any more.
+// commits it any more.
 let inboxUserSeq = 0;
 const inboxObserveUsers = (users, event, ...pendings) => {
   const properties = event?.properties;
@@ -1462,55 +1470,6 @@ const inboxCovered = (users, pending, assistant) => {
     const user = users.get(key);
     return !!user && user.sessionID === sessionID && user.seq <= parent.seq;
   });
-};
-// PRD #1666 long-turn delivery. A deck prompt OpenCode queues behind a turn
-// in progress stays unanswered for as long as that turn runs, which can be
-// longer than the deck waits for an ack, so the deck hands it over again. A
-// plugin that remembers the session it prompted (`holds.sessions`) answers
-// such a redelivery with `hold` instead of prompting a second time, for as
-// long as that session has stayed busy since. The session going idle with the
-// prompt unanswered means OpenCode dropped it (the person aborted the turn),
-// and OpenCode removing the prompt's user message means it was reverted:
-// either way the next redelivery prompts it again. With no busy status seen
-// for the session, a redelivery prompts again, as it always did.
-const inboxHolds = () => ({ sessions: new Map(), busy: new Set(), lost: new Set() });
-// Whether a redelivery of `id` is still queued in OpenCode: answer `hold`.
-const inboxHeld = (holds, delivered, id) =>
-  delivered.has(id) && !holds.lost.has(id) && holds.busy.has(holds.sessions.get(id));
-// `id` was prompted into `sessionID`.
-const inboxPrompted = (holds, id, sessionID) => {
-  holds.lost.delete(id);
-  inboxRemember(holds.sessions, id, sessionID);
-};
-// `id` was acknowledged, or will not be: forget it.
-const inboxForget = (holds, id) => {
-  holds.sessions.delete(id);
-  holds.lost.delete(id);
-};
-const inboxObserveBusy = (holds, event) => {
-  const properties = event?.properties;
-  const sessionID = properties?.sessionID;
-  if (!sessionID) return;
-  const status =
-    event?.type === "session.idle" ? "idle" : event?.type === "session.status" ? properties?.status?.type : undefined;
-  if (status === "busy" || status === "retry") {
-    holds.busy.add(sessionID);
-  } else if (status === "idle") {
-    holds.busy.delete(sessionID);
-    for (const [id, session] of holds.sessions) {
-      if (session === sessionID) holds.lost.add(id);
-    }
-  }
-};
-// The user message `event` removes: the deck ids it carried (`pending`) are
-// no longer in the session, so their redelivery prompts again.
-const inboxObserveRemoved = (holds, delivered, pending, event) => {
-  const messageID = event?.type === "message.removed" ? event?.properties?.messageID : undefined;
-  if (!messageID) return;
-  for (const id of pending.get(messageID) ?? []) {
-    delivered.delete(id);
-    inboxForget(holds, id);
-  }
 };
 // The deck message ids whose opener `text` carries.
 const inboxIdsIn = (text) =>
@@ -1553,41 +1512,6 @@ const inboxLastSelection = (messages) => {
   return undefined;
 };
 const inboxText = (message) => INBOX_FRAMING + "\n\n" + message.text;
-// Run the watcher; `deliver` gets each message, `exited` hears when it ends.
-const inboxSpawnWatcher = (agent, deliver, exited) => {
-  const child = spawn(hookBinary(), ["inbox", "wait", "--agent", agent, "--stream"], {
-    stdio: ["pipe", "pipe", "inherit"],
-  });
-  let buffer = "";
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => {
-    try {
-      buffer += chunk;
-      let newline;
-      while ((newline = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        let message;
-        try {
-          message = JSON.parse(line);
-        } catch (_) {
-          continue;
-        }
-        if (message && typeof message.id === "string" && typeof message.text === "string") {
-          deliver(message);
-        }
-      }
-    } catch (_) {}
-  });
-  child.stdin.on("error", () => {});
-  child.on("error", () => {});
-  child.on("exit", () => {
-    try {
-      exited(child);
-    } catch (_) {}
-  });
-  return child;
-};
 // Whether `control` was handed to the watcher's stdin (which answers nothing).
 const inboxWrite = (child, control) => {
   try {
@@ -1597,131 +1521,6 @@ const inboxWrite = (child, control) => {
   } catch (_) {
     return false;
   }
-};
-// PR #1735 third review: an acknowledgement this plugin sends — over the
-// watcher's stdin, which answers nothing, or with the CLI — is kept until
-// `dot-agent-deck ack --json` reports the deck recorded it, whether or not the
-// deck hands the message over again (it may not: it allows a message a bounded
-// number of hand-overs). The first ask comes at once when the CLI carries the
-// acknowledgement, and a second after a stdin one; later asks back off,
-// doubling to 30 s, at most INBOX_ACK_CONFIRM_ATTEMPTS asks per id. A refusal
-// by id, or running out of asks, is reported to the person.
-const INBOX_ACK_CONFIRM_DELAY_MS = 1000;
-const INBOX_ACK_CONFIRM_MAX_DELAY_MS = 30000;
-const INBOX_ACK_CONFIRM_ATTEMPTS = 8;
-// What the deck said to `ack --json`: "recorded", `{ refused }` (asking again
-// changes nothing), or "unconfirmed" (ask again).
-const inboxAckOutcome = (stdout) => {
-  if (typeof stdout !== "string") return "unconfirmed";
-  for (const line of stdout.split("\n")) {
-    let reply;
-    try {
-      reply = JSON.parse(line);
-    } catch (_) {
-      continue;
-    }
-    if (reply?.acknowledged === true) return "recorded";
-    if (reply?.acknowledged === false) {
-      return reply.final === true
-        ? { refused: typeof reply.reason === "string" ? reply.reason : "refused" }
-        : "unconfirmed";
-    }
-  }
-  return "unconfirmed";
-};
-// The CLI's stdout for `ack --json id`; a refusal exits 1 and still answers.
-const inboxAckByCli = (id) =>
-  new Promise((resolve) => {
-    try {
-      execFile(hookBinary(), ["ack", "--json", id], { timeout: 5000 }, (_error, stdout) => resolve(stdout));
-    } catch (_) {
-      resolve(undefined);
-    }
-  });
-const inboxUnconfirmedNotice = (id, why) =>
-  "dot-agent-deck could not record message " + id + " as delivered (" + why +
-  "). OpenCode received it; the deck may show it as not delivered.";
-// `report(id, why)` tells the person; `ask(id)` resolves to what `ack --json` printed.
-const inboxConfirmer = (
-  report,
-  ask = inboxAckByCli,
-  timers = { set: (fn, ms) => setTimeout(fn, ms), clear: (timer) => clearTimeout(timer) }
-) => {
-  const unconfirmed = new Map();
-  // Each id's own timer, so its asks follow its own schedule: a new
-  // acknowledgement never moves another id's due time.
-  const pending = new Map();
-  // The ids whose confirmation is due, asked one at a time.
-  const due = new Set();
-  let confirming = false;
-  const schedule = (id, delay) => {
-    if (!unconfirmed.has(id) || pending.has(id) || due.has(id)) return;
-    const timer = timers.set(() => {
-      pending.delete(id);
-      due.add(id);
-      void confirm();
-    }, delay);
-    try {
-      timer?.unref?.();
-    } catch (_) {}
-    pending.set(id, timer);
-  };
-  const settle = (id, why) => {
-    unconfirmed.delete(id);
-    try {
-      report(id, why);
-    } catch (_) {}
-  };
-  const confirm = async () => {
-    // A running pass takes the ids that fell due meanwhile.
-    if (confirming) return;
-    confirming = true;
-    try {
-      for (let id = due.values().next().value; id !== undefined; id = due.values().next().value) {
-        due.delete(id);
-        const asked = unconfirmed.get(id);
-        if (asked === undefined) continue;
-        let stdout;
-        try {
-          stdout = await ask(id);
-        } catch (_) {}
-        if (!unconfirmed.has(id)) continue;
-        const outcome = inboxAckOutcome(stdout);
-        if (outcome === "recorded") {
-          unconfirmed.delete(id);
-        } else if (outcome !== "unconfirmed") {
-          settle(id, outcome.refused);
-        } else if (asked + 1 >= INBOX_ACK_CONFIRM_ATTEMPTS) {
-          settle(id, "the deck did not confirm it");
-        } else {
-          unconfirmed.set(id, asked + 1);
-          schedule(id, Math.min(INBOX_ACK_CONFIRM_DELAY_MS * 2 ** (asked + 1), INBOX_ACK_CONFIRM_MAX_DELAY_MS));
-        }
-      }
-    } finally {
-      confirming = false;
-    }
-  };
-  return {
-    // `ids` were acknowledged: confirm them now when `now` (the CLI carries
-    // them, or the watcher's stdin did not take them), else after a second,
-    // unless an id's confirmation is already scheduled.
-    add(ids, now) {
-      if (!ids.length) return;
-      for (const id of ids) {
-        if (!unconfirmed.has(id)) unconfirmed.set(id, 0);
-        if (now) {
-          const timer = pending.get(id);
-          if (timer !== undefined) timers.clear(timer);
-          pending.delete(id);
-          due.add(id);
-        } else {
-          schedule(id, INBOX_ACK_CONFIRM_DELAY_MS);
-        }
-      }
-      if (now) void confirm();
-    },
-  };
 };
 const inboxStop = (child) => {
   if (!child) return;
@@ -1744,6 +1543,262 @@ const inboxFixedBackoff = () => {
 const inboxFirstBackoff = () => inboxFixedBackoff() ?? 1000;
 const inboxNextBackoff = (backoff, ranForMs) =>
   inboxFixedBackoff() ?? (ranForMs > 30000 ? 1000 : Math.min(backoff * 2, 30000));
+const inboxKey = (ref) => ref.id + "|" + ref.a + "|" + ref.e;
+const inboxRef = (entry) => ({ id: entry.id, a: entry.a, e: entry.e });
+// PRD #1666 §2–§4: one context's receiver on the deck's receipt stream — the
+// attempts it holds, from hand-out until the agent started on them (their
+// commit) or they were positively not handed, its possession snapshots, the
+// final hand-over check, and its answers to revokes and resumes.
+//
+// `epoch` counts the watchers this receiver has run. An approval of the final
+// hand-over check carries the epoch it was granted under, and a callback may
+// reach OpenCode only while its context is still active, the epoch still that
+// one and the attempt neither revoked nor dropped (`ready`), checked with no
+// await between it and the call. A watcher restart (a rebinding) or the
+// context's disposal (a retirement) therefore voids every outstanding
+// approval: a callback that resumes after either never reaches OpenCode.
+const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
+  const held = new Map();
+  const revoked = new Set();
+  const grants = new Map();
+  let watermark = { seen: 0, above: new Set() };
+  let child;
+  let epoch = 0;
+  let rx;
+  let seq = 0;
+  let q = 0;
+  let runs = 0;
+  const observe = (d) => {
+    if (typeof d !== "number" || d <= watermark.seen) return;
+    watermark.above.add(d);
+    while (watermark.above.delete(watermark.seen + 1)) watermark.seen += 1;
+  };
+  const snapshot = () => {
+    if (!child || rx === undefined) return;
+    seq += 1;
+    inboxWrite(child, {
+      possess: { seq, seen: watermark.seen, held: [...held.values()].map(inboxRef) },
+    });
+  };
+  const take = (entry) => {
+    observe(entry.d);
+    if (!held.has(inboxKey(entry))) {
+      held.set(inboxKey(entry), { id: entry.id, a: entry.a, e: entry.e, d: entry.d, stage: "queued" });
+    }
+    return held.get(inboxKey(entry));
+  };
+  const answerRevoke = (ref) => {
+    const key = inboxKey(ref);
+    revoked.add(key);
+    const entry = held.get(key);
+    if (entry?.stage === "handed") {
+      inboxWrite(child, { already_handed: [ref] });
+    } else {
+      held.delete(key);
+      inboxWrite(child, { revoked_ack: [ref] });
+    }
+  };
+  const onLine = (line) => {
+    let reply;
+    try {
+      reply = JSON.parse(line);
+    } catch (_) {
+      return;
+    }
+    if (!reply || typeof reply !== "object") return;
+    if (reply.registered && typeof reply.registered.rx === "number") {
+      rx = reply.registered.rx;
+      watermark = { seen: 0, above: new Set() };
+      const answers = (Array.isArray(reply.resume) ? reply.resume : []).map((ref) => ({
+        id: ref.id,
+        a: ref.a,
+        e: ref.e,
+        answer: held.has(inboxKey(ref)) ? "retained" : "unknown",
+      }));
+      if (answers.length) inboxWrite(child, { resume_answers: answers });
+      snapshot();
+    }
+    for (const rebound of Array.isArray(reply.rebound) ? reply.rebound : []) {
+      const entry = held.get(inboxKey(rebound));
+      if (entry) entry.d = rebound.d;
+      observe(rebound.d);
+    }
+    if (reply.grant && typeof reply.grant.q === "number") {
+      const resolve = grants.get(reply.grant.q);
+      grants.delete(reply.grant.q);
+      resolve?.(reply.grant.ok === true);
+    }
+    for (const ref of Array.isArray(reply.revoke) ? reply.revoke : []) answerRevoke(ref);
+    if (Array.isArray(reply.messages)) {
+      for (const message of reply.messages) {
+        if (!message || typeof message.id !== "string" || typeof message.text !== "string") continue;
+        if (typeof message.a !== "number" || typeof message.e !== "number") continue;
+        take(message);
+      }
+      snapshot();
+      for (const message of reply.messages) {
+        if (message && typeof message.id === "string" && typeof message.a === "number") deliver?.(message);
+      }
+    }
+    if (reply.keepalive || (Array.isArray(reply.rebound) && reply.rebound.length)) snapshot();
+  };
+  const start = (backoff) => {
+    if (!active()) return;
+    const started = Date.now();
+    const args = ["inbox", "wait", "--agent", agent, "--stream", "--adapter-integration", String(INBOX_ADAPTER_INTEGRATION)];
+    if (doorbellOnly) args.push("--doorbell-only");
+    if (runs > 0) args.push("--resumed");
+    runs += 1;
+    epoch += 1;
+    rx = undefined;
+    for (const [, resolve] of grants) resolve(false);
+    grants.clear();
+    let spawned;
+    try {
+      spawned = spawn(hookBinary(), args, { stdio: ["pipe", "pipe", "inherit"] });
+    } catch (_) {
+      setTimeout(() => start(inboxNextBackoff(backoff, 0)), backoff).unref?.();
+      return;
+    }
+    child = spawned;
+    let buffer = "";
+    spawned.stdout.setEncoding("utf8");
+    spawned.stdout.on("data", (chunk) => {
+      try {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          if (child === spawned) onLine(line);
+        }
+      } catch (_) {}
+    });
+    spawned.stdin.on("error", () => {});
+    spawned.on("error", () => {});
+    spawned.on("exit", () => {
+      try {
+        if (child === spawned) {
+          child = undefined;
+          rx = undefined;
+        }
+        if (!active() || spawned.stdin.writableEnded) return;
+        const next = inboxNextBackoff(backoff, Date.now() - started);
+        setTimeout(() => start(next), backoff).unref?.();
+      } catch (_) {}
+    });
+  };
+  return {
+    start: () => start(inboxFirstBackoff()),
+    stop: () => {
+      const gone = child;
+      child = undefined;
+      rx = undefined;
+      for (const [, resolve] of grants) resolve(false);
+      grants.clear();
+      inboxStop(gone);
+    },
+    rx: () => rx,
+    epoch: () => epoch,
+    send: (control) => inboxWrite(child, control),
+    // The attempts a doorbell fetch issued to this receiver.
+    take: (messages) => {
+      for (const message of messages) take(message);
+      snapshot();
+    },
+    // §3: the daemon's final hand-over check; resolves to the epoch it was
+    // granted under, or undefined when it was refused or went unanswered.
+    may: async (ref) => {
+      if (!child || rx === undefined) return undefined;
+      const asked = epoch;
+      q += 1;
+      const id = q;
+      const answered = new Promise((resolve) => {
+        grants.set(id, resolve);
+        const timer = setTimeout(() => {
+          if (grants.delete(id)) resolve(false);
+        }, INBOX_GRANT_TIMEOUT_MS);
+        timer.unref?.();
+      });
+      if (!inboxWrite(child, { may: { q: id, ...ref } })) {
+        grants.delete(id);
+        return undefined;
+      }
+      return (await answered) ? asked : undefined;
+    },
+    // §2: whether a callback holding an approval granted under `granted` may
+    // reach OpenCode right now. Synchronous: call it with no await between it
+    // and the native call.
+    ready: (ref, granted) =>
+      active() && granted !== undefined && granted === epoch && held.has(inboxKey(ref)) && !revoked.has(inboxKey(ref)),
+    // The callback is about to reach OpenCode: from here a revoke is
+    // answered `already_handed`.
+    calling: (ref) => {
+      const entry = held.get(inboxKey(ref));
+      if (entry) entry.stage = "handed";
+    },
+    handed: (refs) => {
+      if (refs.length) inboxWrite(child, { handed: refs });
+    },
+    // The agent started on these: their receipts are published and they are
+    // no longer held.
+    committed: (refs) => {
+      if (!refs.length) return;
+      for (const ref of refs) held.delete(inboxKey(ref));
+      inboxWrite(child, { committed: refs });
+      snapshot();
+    },
+    // Positively not handed to OpenCode.
+    notHanded: (ref) => {
+      held.delete(inboxKey(ref));
+      inboxWrite(child, { not_handed: [ref] });
+      snapshot();
+    },
+    // Lost without a witness — an aborted turn, a reverted prompt: no longer
+    // held, so the deck may repeat it, marked as a possible repeat.
+    lost: (ref) => {
+      if (held.delete(inboxKey(ref))) snapshot();
+    },
+    // The held attempts of deck message `id`.
+    of: (id) => [...held.values()].filter((entry) => entry.id === id).map(inboxRef),
+    // The attempts handed to OpenCode in `sessionID` and not yet started on.
+    inSession: (sessionID) =>
+      [...held.values()].filter((entry) => entry.stage === "handed" && entry.sessionID === sessionID).map(inboxRef),
+    // Remember which session an attempt was handed to.
+    session: (ref, sessionID) => {
+      const entry = held.get(inboxKey(ref));
+      if (entry) entry.sessionID = sessionID;
+    },
+  };
+};
+// PRD #1666 §3: hand one attempt to OpenCode through `call`, behind the final
+// hand-over check: the deck's approval, then — with no await between it and
+// the call — this context's own synchronous check. An approval voided by a
+// watcher restart is asked for once more under the new incarnation; any other
+// refusal means the attempt was not handed. Returns whether it was handed.
+const inboxHandOver = async (receiver, ref, sessionID, call) => {
+  let granted = await receiver.may(ref);
+  if (granted !== undefined && granted !== receiver.epoch()) granted = await receiver.may(ref);
+  if (!receiver.ready(ref, granted)) {
+    receiver.notHanded(ref);
+    return false;
+  }
+  receiver.calling(ref);
+  receiver.session(ref, sessionID);
+  let result;
+  try {
+    result = await call();
+  } catch (_) {
+    receiver.notHanded(ref);
+    return false;
+  }
+  if (result?.error) {
+    receiver.notHanded(ref);
+    return false;
+  }
+  receiver.handed([ref]);
+  return true;
+};
 "#;
 
 /// PRD #1666 S8: the server plugin's inbox roles (design §7.3, §7.7, and
@@ -1769,59 +1824,31 @@ const INBOX_DOORBELL = new RegExp(
     __DOORBELL_SUFFIX_JSON__.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
 const INBOX_HANDLED =
   "[dot-agent-deck: the message this line announced was already handed over. Nothing is waiting.]";
-const INBOX_WATCHER = "__dotAgentDeckWatcher";
+const INBOX_RECEIVER = "__dotAgentDeckReceiver";
 const INBOX_GENERATION = "__dotAgentDeckGeneration";
 const INBOX_ANNOUNCED = "__dotAgentDeckAnnounced";
-// --mini: the last root session this process created, the deck messages its
-// stream handed over and not yet acknowledged, which OpenCode user message
-// carries which of them, and the sessions running a deck turn.
+// --mini: the last root session this process created, which OpenCode user
+// message carries which deck message ids, and the sessions running a deck
+// turn.
 let miniTarget = undefined;
-const miniDelivered = new Set();
 const miniPending = new Map();
-const miniHolds = inboxHolds();
 const miniTurns = new Set();
 let miniQueue = Promise.resolve();
 // Every mode: doorbell prompts whose content this plugin swapped in, by
-// OpenCode user message id.
+// OpenCode user message id, with the attempts they carry.
 const intercepted = new Map();
-// Every mode: the deck messages OpenCode answered in this process, at most
-// INBOX_MAX_TRACKED. The deck hands one over again only because it never
-// recorded the acknowledgement, so it is acknowledged again, not run again.
-const inboxCommitted = new Map();
-// Every mode: confirms each acknowledgement with the deck, and shows the
-// person, as an OpenCode toast, one the deck could not record.
-const inboxConfirm = inboxConfirmer((id, why) => {
-  try {
-    void sessionClient?.tui
-      ?.showToast?.({ body: { message: inboxUnconfirmedNotice(id, why), variant: "warning" } })
-      ?.catch?.(() => {});
-  } catch (_) {}
-});
-// OpenCode answered `ids`: acknowledge them over the watcher's stdin, or with
-// the CLI (`viaCli`, and when the watcher does not take the line), and
-// confirm each with the deck.
-const inboxCommit = (ids, viaCli, control = {}) => {
-  for (const id of [...ids, ...viaCli]) inboxRemember(inboxCommitted, id, true);
-  const written = ids.length > 0 && inboxWrite(globalThis[INBOX_WATCHER], { ack: ids, ...control });
-  inboxConfirm.add(ids, !written);
-  inboxConfirm.add(viaCli, true);
-};
 // Every mode: the user messages this process saw (`inboxObserveUsers`).
 const inboxUsers = new Map();
 
 const inboxGeneration = () => globalThis[INBOX_GENERATION] ?? 0;
+const serverReceiver = () => globalThis[INBOX_RECEIVER];
 const isMini = () =>
   isMainThread && process.argv.slice(2).includes("--mini") && !INBOX_SUBCOMMANDS.has(process.argv[2]);
 
 const miniDeliver = async (client, message, generation) => {
-  if (inboxCommitted.has(message.id)) {
-    inboxCommit([message.id], []);
-    return;
-  }
-  if (inboxHeld(miniHolds, miniDelivered, message.id)) {
-    inboxWrite(globalThis[INBOX_WATCHER], { hold: [message.id] });
-    return;
-  }
+  const ref = inboxRef(message);
+  const receiver = serverReceiver();
+  if (!receiver || generation !== inboxGeneration()) return;
   try {
     while (!miniTarget) {
       if (generation !== inboxGeneration()) return;
@@ -1837,109 +1864,106 @@ const miniDeliver = async (client, message, generation) => {
       const model = inboxArgvModel();
       selection = model ? { model } : {};
     }
-    // Hardening M7: re-checked after the lookup, right before the prompt. A
-    // retired instance does nothing (its stream's end hands the message back);
-    // a target that moved on hands it back now.
+    // Hardening M7: re-checked after the lookup. A retired instance does
+    // nothing — the deck asks its successor about the attempt — and a target
+    // that moved on is positively not handed.
     if (generation !== inboxGeneration()) return;
-    if (miniTarget !== sessionID) throw new Error("the session changed during the lookup");
+    if (miniTarget !== sessionID) {
+      receiver.notHanded(ref);
+      return;
+    }
     const body = { parts: [{ type: "text", text: inboxText(message) }] };
     if (selection.model) body.model = selection.model;
     if (selection.agent) body.agent = selection.agent;
-    miniDelivered.add(message.id);
-    inboxPrompted(miniHolds, message.id, sessionID);
-    const result = await client.session.promptAsync({ path: { id: sessionID }, body });
-    if (result?.error) throw new Error("promptAsync refused");
+    await inboxHandOver(receiver, ref, sessionID, () =>
+      client.session.promptAsync({ path: { id: sessionID }, body }));
   } catch (_) {
-    miniDelivered.delete(message.id);
-    inboxForget(miniHolds, message.id);
-    inboxWrite(globalThis[INBOX_WATCHER], { nack: [message.id] });
+    if (generation === inboxGeneration()) receiver.notHanded(ref);
   }
-};
-
-const startMini = (client, generation, backoff) => {
-  if (generation !== inboxGeneration()) return;
-  const started = Date.now();
-  let child;
-  try {
-    child = inboxSpawnWatcher(
-      "opencode-mini",
-      (message) => {
-        miniQueue = miniQueue.then(() => miniDeliver(client, message, generation));
-      },
-      (gone) => {
-        if (globalThis[INBOX_WATCHER] === gone) globalThis[INBOX_WATCHER] = undefined;
-        if (generation !== inboxGeneration() || gone.stdin.writableEnded) return;
-        const next = inboxNextBackoff(backoff, Date.now() - started);
-        setTimeout(() => startMini(client, generation, next), backoff).unref?.();
-      }
-    );
-  } catch (_) {
-    setTimeout(() => startMini(client, generation, inboxNextBackoff(backoff, 0)), backoff).unref?.();
-    return;
-  }
-  globalThis[INBOX_WATCHER] = child;
 };
 
 // Called at every instantiation: OpenCode re-runs a plugin in the same module
 // when it disposes an instance, and the previous instance hears nothing, so
-// its watcher is stopped here and its callbacks retire with its generation.
+// its receiver is stopped here and its callbacks retire with its generation.
+// In the full TUI (a worker thread) this plugin only announces and keeps a
+// doorbell-only receiver for the doorbell substitution below; the TUI plugin
+// is the one handed messages. In `--mini`, where no TUI plugin loads, it is
+// the receiver handed them.
 const startInbox = (client) => {
   try {
     if (!inboxInPane()) return;
     const generation = inboxGeneration() + 1;
     globalThis[INBOX_GENERATION] = generation;
-    inboxStop(globalThis[INBOX_WATCHER]);
-    globalThis[INBOX_WATCHER] = undefined;
-    if (!isMainThread) {
-      if (!globalThis[INBOX_ANNOUNCED]) {
-        globalThis[INBOX_ANNOUNCED] = true;
-        try {
-          execFileSync(hookBinary(), ["inbox", "announce", "--agent", "opencode"], {
-            timeout: 5000,
-            stdio: ["ignore", "ignore", "ignore"],
-          });
-        } catch (_) {}
-      }
-      return;
+    serverReceiver()?.stop();
+    globalThis[INBOX_RECEIVER] = undefined;
+    if (isMainThread && !isMini()) return;
+    if (!isMainThread && !globalThis[INBOX_ANNOUNCED]) {
+      globalThis[INBOX_ANNOUNCED] = true;
+      try {
+        execFileSync(hookBinary(), ["inbox", "announce", "--agent", "opencode"], {
+          timeout: 5000,
+          stdio: ["ignore", "ignore", "ignore"],
+        });
+      } catch (_) {}
     }
-    if (isMini() && client?.session) startMini(client, generation, inboxFirstBackoff());
+    const mini = isMini() && !!client?.session;
+    const receiver = inboxReceiver({
+      agent: "opencode-mini",
+      doorbellOnly: !mini,
+      active: () => generation === inboxGeneration(),
+      deliver: mini
+        ? (message) => {
+            miniQueue = miniQueue.then(() => miniDeliver(client, message, generation));
+          }
+        : undefined,
+    });
+    globalThis[INBOX_RECEIVER] = receiver;
+    receiver.start();
   } catch (_) {}
 };
 
+// OpenCode started answering: every attempt the turn covers is committed.
 const inboxAck = (assistant) => {
+  const receiver = serverReceiver();
+  if (!receiver) return;
   for (const key of inboxCovered(inboxUsers, intercepted, assistant)) {
-    const fromDoorbell = intercepted.get(key);
+    const refs = intercepted.get(key);
     intercepted.delete(key);
-    inboxCommit([], fromDoorbell);
+    receiver.committed(refs);
   }
-  const ids = [];
+  const refs = [];
   for (const key of inboxCovered(inboxUsers, miniPending, assistant)) {
-    ids.push(...miniPending.get(key).filter((id) => miniDelivered.delete(id)));
+    for (const id of miniPending.get(key)) refs.push(...receiver.of(id));
     miniPending.delete(key);
   }
-  for (const id of ids) {
-    inboxForget(miniHolds, id);
-  }
-  if (ids.length) {
+  if (refs.length) {
     if (assistant.sessionID) miniTurns.add(assistant.sessionID);
-    inboxCommit(ids, [], { repaint: true });
+    receiver.committed(refs);
+    receiver.send({ repaint: true });
   }
 };
 
 const observeInbox = (event) => {
   try {
-    inboxObserveRemoved(miniHolds, miniDelivered, miniPending, event);
-    inboxObserveBusy(miniHolds, event);
-    inboxObserveUsers(inboxUsers, event, intercepted, miniPending);
+    const receiver = serverReceiver();
     const type = event?.type;
     const properties = event?.properties;
+    // A reverted prompt: its attempts are lost, not released — the deck may
+    // repeat them, marked as possible repeats.
+    if (type === "message.removed" && properties?.messageID && receiver) {
+      for (const id of miniPending.get(properties.messageID) ?? []) {
+        for (const ref of receiver.of(id)) receiver.lost(ref);
+      }
+      for (const ref of intercepted.get(properties.messageID) ?? []) receiver.lost(ref);
+    }
+    inboxObserveUsers(inboxUsers, event, intercepted, miniPending);
     if (type === "session.created") {
       const info = properties?.info;
       if (info?.id && !info.parentID) miniTarget = info.id;
     } else if (type === "message.part.updated") {
       const part = properties?.part;
-      if (part?.type !== "text" || !part.messageID) return;
-      const ids = inboxIdsIn(part.text).filter((id) => miniDelivered.has(id));
+      if (part?.type !== "text" || !part.messageID || !receiver) return;
+      const ids = inboxIdsIn(part.text).filter((id) => receiver.of(id).length > 0);
       if (ids.length) {
         inboxRemember(miniPending, part.messageID, [...new Set([...(miniPending.get(part.messageID) ?? []), ...ids])]);
       }
@@ -1947,19 +1971,23 @@ const observeInbox = (event) => {
       if (properties?.info?.role === "assistant") inboxAck(properties.info);
     } else if (type === "session.idle" || (type === "session.status" && properties?.status?.type === "idle")) {
       const sessionID = properties?.sessionID;
-      if (sessionID && miniTurns.delete(sessionID)) {
-        inboxWrite(globalThis[INBOX_WATCHER], { repaint: true });
-      }
+      if (!sessionID) return;
+      // The session went idle with an attempt handed and not started on: the
+      // turn was aborted. Lost, so the deck may repeat it.
+      for (const ref of receiver?.inSession(sessionID) ?? []) receiver.lost(ref);
+      if (miniTurns.delete(sessionID)) receiver?.send({ repaint: true });
     }
   } catch (_) {}
 };
 
-// The doorbell, submitted because no watcher was armed, never reaches the
-// model as typed: its text is replaced IN PLACE (OpenCode saves the parts
-// array it passed in) with the waiting content, fetched without
-// acknowledging. A recalled doorbell whose message was already handed over
-// fetches nothing. If the deck cannot be asked, the line stays as it is, and
-// asks the model to fetch.
+// The doorbell, submitted because no receiver was handed the message, never
+// reaches the model as typed: its text is replaced IN PLACE (OpenCode saves
+// the parts array it passed in) with the waiting content, fetched as attempts
+// bound to this context's receiver. The fetch is the deck's final hand-over
+// check: it issues under its lock, and nothing awaits between it and the
+// substitution. A recalled doorbell whose message was already handed over
+// fetches nothing. With no receiver yet, or a deck that cannot be asked, the
+// line stays as it is, and asks the model to fetch.
 // PRD #1666 hardening M2: only in the interactive OpenCode the deck manages —
 // the full TUI, whose server plugin runs in a worker thread, or `--mini` — never
 // in `run`, `serve` or another subcommand an agent starts inside its pane.
@@ -1967,36 +1995,54 @@ const inboxInteractive = () => !isMainThread || isMini();
 const interceptDoorbell = async (input, output) => {
   try {
     if (!inboxInPane() || !inboxInteractive() || !Array.isArray(output?.parts)) return;
+    const receiver = serverReceiver();
     for (const part of output.parts) {
       if (part?.type !== "text" || typeof part.text !== "string") continue;
       const match = INBOX_DOORBELL.exec(part.text);
       if (!match) continue;
+      const rx = receiver?.rx();
+      if (rx === undefined) return;
       let reply;
       try {
         reply = JSON.parse(
-          execFileSync(hookBinary(), ["inbox", "fetch", "--json", "--doorbell", match[1]], {
-            timeout: 3000,
-            stdio: ["ignore", "pipe", "ignore"],
-            encoding: "utf8",
-          })
+          execFileSync(
+            hookBinary(),
+            ["inbox", "fetch", "--json", "--doorbell", match[1],
+              "--adapter-integration", String(INBOX_ADAPTER_INTEGRATION), "--rx", String(rx)],
+            { timeout: 3000, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8" }
+          )
         );
       } catch (_) {
         return;
       }
-      const fetched = Array.isArray(reply?.messages) ? reply.messages : undefined;
-      if (!fetched) return;
-      // One OpenCode already answered is handed over again only because the
-      // deck never recorded its acknowledgement: acknowledged, not run again.
-      const messages = fetched.filter((m) => !inboxCommitted.has(m.id));
-      inboxCommit([], fetched.filter((m) => inboxCommitted.has(m.id)).map((m) => m.id));
-      if (messages.length === 0) {
+      if (!Array.isArray(reply?.messages)) return;
+      const fetched = reply.messages.filter(
+        (m) => typeof m?.id === "string" && typeof m.text === "string" && typeof m.a === "number" && typeof m.e === "number"
+      );
+      if (fetched.length === 0) {
         part.text = part.text.replace(match[0], () => INBOX_HANDLED);
         return;
       }
-      const content = INBOX_FRAMING + messages.map((m) => "\n\n" + m.text).join("");
+      receiver.take(fetched);
+      const epoch = receiver.epoch();
+      const ready = fetched.filter((m) => receiver.ready(inboxRef(m), epoch));
+      for (const m of fetched) {
+        if (!ready.includes(m)) receiver.notHanded(inboxRef(m));
+      }
+      if (ready.length === 0) {
+        part.text = part.text.replace(match[0], () => INBOX_HANDLED);
+        return;
+      }
+      const refs = ready.map(inboxRef);
+      for (const ref of refs) {
+        receiver.calling(ref);
+        receiver.session(ref, input?.sessionID ?? output?.message?.sessionID);
+      }
+      const content = INBOX_FRAMING + ready.map((m) => "\n\n" + m.text).join("");
       part.text = part.text.replace(match[0], () => content);
       const messageID = input?.messageID ?? output?.message?.id;
-      if (messageID) inboxRemember(intercepted, messageID, messages.map((m) => m.id));
+      if (messageID) inboxRemember(intercepted, messageID, refs);
+      receiver.handed(refs);
       return;
     }
   } catch (_) {}
@@ -2038,30 +2084,17 @@ const hookBinary = () => {
 const TUI_INBOX_JS: &str = r#"// One live instance per process: a second copy of this file (another
 // spelling of its path, another tui.json) stays inert while the first runs.
 const TUI_GUARD = "__dotAgentDeckTuiLoaded";
-// The deck messages OpenCode answered in this process, at most
-// INBOX_MAX_TRACKED, and the confirmation of each acknowledgement with the
-// deck, which outlives a disposed instance: an acknowledgement stays this
-// pane's whichever instance sent it. One the deck could not record is shown
-// as a toast by the instance that is live then.
-const tuiCommitted = new Map();
-let tuiToast;
-const tuiConfirm = inboxConfirmer((id, why) => {
-  tuiToast?.({ variant: "warning", message: inboxUnconfirmedNotice(id, why) });
-});
 
 const tui = async (api) => {
   try {
     if (globalThis[TUI_GUARD]?.active || !inboxInPane()) return;
     const instance = { active: true };
     globalThis[TUI_GUARD] = instance;
-    tuiToast = (toast) => api.ui?.toast?.(toast);
-    let watcher;
     let lastSeen;
     let queue = Promise.resolve();
-    const delivered = new Set();
+    // Which OpenCode user message carries which deck message ids.
     const pending = new Map();
     const users = new Map();
-    const holds = inboxHolds();
 
     const sessionOf = (id) => {
       try {
@@ -2106,7 +2139,7 @@ const tui = async (api) => {
       return route?.name === "session" ? route.params?.sessionID : undefined;
     };
     // Hardening M7: a delivery whose instance was disposed during an await is
-    // dropped — its stream's end hands the message back.
+    // dropped — the deck asks the next instance about its attempt.
     class Retired extends Error {}
     const stillActive = () => {
       if (!instance.active) throw new Retired();
@@ -2131,23 +2164,9 @@ const tui = async (api) => {
       api.route.navigate("session", { sessionID });
       return sessionID;
     };
-    // OpenCode answered `ids`: acknowledge them over the watcher's stdin
-    // and confirm each with the deck.
-    const commit = (ids) => {
-      for (const id of ids) inboxRemember(tuiCommitted, id, true);
-      tuiConfirm.add(ids, !inboxWrite(watcher, { ack: ids }));
-    };
+    let receiver;
     const deliver = async (message) => {
-      // The deck hands an answered message over again only because it never
-      // recorded the acknowledgement: acknowledged, not prompted again.
-      if (tuiCommitted.has(message.id)) {
-        commit([message.id]);
-        return;
-      }
-      if (inboxHeld(holds, delivered, message.id)) {
-        inboxWrite(watcher, { hold: [message.id] });
-        return;
-      }
+      const ref = inboxRef(message);
       try {
         stillActive();
         const sessionID = await target();
@@ -2162,16 +2181,18 @@ const tui = async (api) => {
         stillActive();
         const now = shownSession();
         if (now !== undefined && rootOf(now) !== sessionID) throw new Error("the session changed");
-        delivered.add(message.id);
-        inboxPrompted(holds, message.id, sessionID);
-        const result = await api.client.session.promptAsync(request);
-        if (result?.error) throw new Error("promptAsync refused");
+        await inboxHandOver(receiver, ref, sessionID, () => api.client.session.promptAsync(request));
       } catch (error) {
-        delivered.delete(message.id);
-        inboxForget(holds, message.id);
-        if (!(error instanceof Retired)) inboxWrite(watcher, { nack: [message.id] });
+        if (!(error instanceof Retired)) receiver.notHanded(ref);
       }
     };
+    receiver = inboxReceiver({
+      agent: "opencode",
+      active: () => instance.active,
+      deliver: (message) => {
+        queue = queue.then(() => deliver(message));
+      },
+    });
 
     api.event.on("message.updated", (event) => {
       try {
@@ -2182,25 +2203,32 @@ const tui = async (api) => {
           return;
         }
         if (info?.role !== "assistant") return;
-        const ids = [];
+        const refs = [];
         for (const key of inboxCovered(users, pending, info)) {
-          ids.push(...pending.get(key).filter((id) => delivered.delete(id)));
+          for (const id of pending.get(key)) refs.push(...receiver.of(id));
           pending.delete(key);
         }
-        for (const id of ids) inboxForget(holds, id);
-        if (ids.length) commit(ids);
+        receiver.committed(refs);
       } catch (_) {}
     });
     api.event.on("message.removed", (event) => {
       try {
-        inboxObserveRemoved(holds, delivered, pending, event);
+        // A reverted prompt: lost, not released.
+        for (const id of pending.get(event?.properties?.messageID) ?? []) {
+          for (const ref of receiver.of(id)) receiver.lost(ref);
+        }
         inboxObserveUsers(users, event, pending);
       } catch (_) {}
     });
     for (const type of ["session.status", "session.idle"]) {
       api.event.on(type, (event) => {
         try {
-          inboxObserveBusy(holds, event);
+          const properties = event?.properties;
+          const idle = event?.type === "session.idle" || properties?.status?.type === "idle";
+          if (!idle || !properties?.sessionID) return;
+          // Idle with an attempt handed and not started on: the turn was
+          // aborted. Lost, so the deck may repeat it.
+          for (const ref of receiver.inSession(properties.sessionID)) receiver.lost(ref);
         } catch (_) {}
       });
     }
@@ -2208,40 +2236,17 @@ const tui = async (api) => {
       try {
         const part = event?.properties?.part;
         if (part?.type !== "text" || !part.messageID) return;
-        const ids = inboxIdsIn(part.text).filter((id) => delivered.has(id));
+        const ids = inboxIdsIn(part.text).filter((id) => receiver.of(id).length > 0);
         if (ids.length) {
           inboxRemember(pending, part.messageID, [...new Set([...(pending.get(part.messageID) ?? []), ...ids])]);
         }
       } catch (_) {}
     });
-
-    const start = (backoff) => {
-      if (!instance.active) return;
-      const started = Date.now();
-      try {
-        watcher = inboxSpawnWatcher(
-          "opencode",
-          (message) => {
-            queue = queue.then(() => deliver(message));
-          },
-          (gone) => {
-            if (watcher === gone) watcher = undefined;
-            if (!instance.active || gone.stdin.writableEnded) return;
-            const next = inboxNextBackoff(backoff, Date.now() - started);
-            setTimeout(() => start(next), backoff).unref?.();
-          }
-        );
-      } catch (_) {
-        setTimeout(() => start(inboxNextBackoff(backoff, 0)), backoff).unref?.();
-      }
-    };
     api.lifecycle?.onDispose?.(() => {
       instance.active = false;
-      const child = watcher;
-      watcher = undefined;
-      inboxStop(child);
+      receiver.stop();
     });
-    start(inboxFirstBackoff());
+    receiver.start();
   } catch (_) {}
 };
 
@@ -4290,23 +4295,45 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
         );
     }
 
-    /// A recorder standing in for the deck binary: `inbox wait` hands over one
-    /// deck message and then records every control line the plugin writes
-    /// back; every call is logged.
+    /// A recorder standing in for the deck binary: `inbox wait` registers the
+    /// receiver, hands over one deck message as attempt `(1, 1)`, grants every
+    /// final hand-over check it is asked, and records every control line the
+    /// plugin writes back; every call is logged.
     #[cfg(unix)]
     fn inbox_recorder(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let controls = dir.join("controls.log");
         let recorder = dir.join("recorder.sh");
         let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
-        let message = serde_json::json!({
+        let message = serde_json::json!({"messages": [{
             "id": id,
+            "subject": "s",
+            "from": "x",
             "text": format!("[dot-agent-deck message {id} from x]\nbody\n[end of dot-agent-deck message {id}]"),
-        });
+            "a": 1, "e": 1, "d": 1,
+        }]});
+        let registered = serde_json::json!({"registered": {"rx": 7, "slot": "opencode_tui", "keepalive_ms": 30000}});
         crate::test_isolation::write_script(
             &recorder,
             format!(
-                "#!/bin/sh\necho \"call $*\" >> '{c}'\ncase \"$1 $2\" in 'inbox wait') printf '%s\\n' '{m}'; cat >> '{c}';; esac\nexit 0\n",
+                r#"#!/bin/sh
+echo "call $*" >> '{c}'
+case "$1 $2" in
+  'inbox wait')
+    printf '%s\n' '{r}'
+    printf '%s\n' '{m}'
+    while IFS= read -r line; do
+      printf '%s\n' "$line" >> '{c}'
+      case "$line" in
+        *'"may"'*)
+          q=$(printf '%s' "$line" | sed -n 's/.*"q":\([0-9]*\).*/\1/p')
+          printf '{{"grant":{{"q":%s,"ok":true}}}}\n' "$q";;
+      esac
+    done;;
+esac
+exit 0
+"#,
                 c = controls.display(),
+                r = registered,
                 m = message,
             ),
         )
@@ -4452,8 +4479,9 @@ process.exit(0);
     }
 
     /// Hardening M7: in `--mini`, a delivery whose target session changes
-    /// while it looks up that session's model is handed back (nack), not
-    /// started in the session that is no longer the target.
+    /// while it looks up that session's model is reported positively not
+    /// handed (PRD #1666 §2), not started in the session that is no longer the
+    /// target.
     #[cfg(unix)]
     #[test]
     fn opencode_mini_delivery_is_handed_back_when_its_session_changes_mid_lookup() {
@@ -4499,333 +4527,60 @@ process.exit(0);
         );
         assert_eq!(result["prompts"], serde_json::json!([]), "{result}");
         let written = std::fs::read_to_string(&controls).unwrap_or_default();
-        assert!(written.contains("\"nack\""), "handed back: {written}");
-    }
-
-    /// The deck message id the acknowledgement-confirmation drivers below hand
-    /// over, and its framed text.
-    #[cfg(unix)]
-    const CONFIRM_ID: &str = "m-k3xzq2ab-0f3c9a71d2e4b850";
-
-    #[cfg(unix)]
-    fn confirm_message() -> serde_json::Value {
-        let id = CONFIRM_ID;
-        serde_json::json!({
-            "id": id,
-            "text": format!("[dot-agent-deck message {id} from x]\nbody\n[end of dot-agent-deck message {id}]"),
-        })
-    }
-
-    /// A recorder standing in for the deck binary for the acknowledgement
-    /// confirmation drivers: every call is logged to `calls.log`; `inbox
-    /// fetch` hands [`confirm_message`] over; `inbox wait` hands it over,
-    /// then again once `trigger` exists, then records the control lines; and
-    /// `ack` answers the line in `answers` numbered by how many acks came
-    /// before it (the last line for every later one), exiting 1 on a final
-    /// refusal as the CLI does.
-    #[cfg(unix)]
-    fn confirm_recorder(
-        dir: &std::path::Path,
-        answers: &[serde_json::Value],
-    ) -> std::path::PathBuf {
-        let recorder = dir.join("recorder.sh");
-        let answer_lines: Vec<String> = answers.iter().map(|a| a.to_string()).collect();
-        std::fs::write(dir.join("answers"), answer_lines.join("\n") + "\n").unwrap();
-        crate::test_isolation::write_script(
-            &recorder,
-            format!(
-                r#"#!/bin/sh
-d='{d}'
-echo "$*" >> "$d/calls.log"
-case "$1 $2" in
-  'inbox fetch') printf '%s\n' '{{"messages":[{m}]}}'; exit 0;;
-  'inbox wait')
-    printf '%s\n' '{m}'
-    n=0
-    while [ ! -f "$d/trigger" ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done
-    printf '%s\n' '{m}'
-    cat >> "$d/controls.log"
-    exit 0;;
-esac
-if [ "$1" = "ack" ]; then
-  n=$(cat "$d/acks" 2>/dev/null || echo 0)
-  echo $((n+1)) > "$d/acks"
-  total=$(wc -l < "$d/answers")
-  line=$((n+1)); [ $line -gt $total ] && line=$total
-  answer=$(sed -n "${{line}}p" "$d/answers")
-  printf '%s\n' "$answer"
-  case "$answer" in *'"final":true'*) exit 1;; esac
-fi
-exit 0
-"#,
-                d = dir.display(),
-                m = confirm_message(),
-            ),
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        recorder
-    }
-
-    /// The `ack` calls the recorder logged, as their argument lists.
-    #[cfg(unix)]
-    fn confirm_ack_calls(dir: &std::path::Path) -> Vec<String> {
-        std::fs::read_to_string(dir.join("calls.log"))
-            .unwrap_or_default()
-            .lines()
-            .filter(|call| call.starts_with("ack"))
-            .map(str::to_owned)
-            .collect()
-    }
-
-    /// Drive the server plugin in `--mini` through a doorbell OpenCode
-    /// answers: the line is swapped for the waiting message, and the answer to
-    /// it acknowledges that message. The driver's last line reports the
-    /// toasts the plugin showed.
-    #[cfg(unix)]
-    fn drive_doorbell_answer(
-        dir: &std::path::Path,
-        recorder: &std::path::Path,
-        wait_ms: u64,
-    ) -> serde_json::Value {
-        let plugin = dir.join("dot-agent-deck.mjs");
-        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
-        let line_json = serde_json::to_string(&crate::doorbell::doorbell_line(CONFIRM_ID)).unwrap();
-        let driver = dir.join("driver.mjs");
-        std::fs::write(
-            &driver,
-            format!(
-                r#"process.argv = [process.argv[0], "opencode", "--mini"];
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const toasts = [];
-const client = {{ tui: {{ showToast: async (options) => {{ toasts.push(options?.body); return {{}}; }} }} }};
-const {{ default: plugin }} = await import({plugin});
-const hooks = await plugin({{ directory: "/work", client }});
-const output = {{ parts: [{{ type: "text", text: {line_json} }}] }};
-await hooks["chat.message"]({{ messageID: "u1" }}, output);
-const swapped = output.parts[0].text.includes("body");
-await hooks.event({{ event: {{ type: "message.updated", properties: {{ info: {{ role: "user", id: "u1", sessionID: "s1" }} }} }} }});
-await hooks.event({{ event: {{ type: "message.updated", properties: {{ info: {{ role: "assistant", id: "a1", parentID: "u1", sessionID: "s1" }} }} }} }});
-await sleep({wait_ms});
-console.log(JSON.stringify({{ swapped, toasts }}));
-process.exit(0);
-"#,
-                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
-            ),
-        )
-        .unwrap();
-        run_inbox_driver(&driver)
-    }
-
-    /// PR #1735 third review: the server plugin's acknowledgement of a
-    /// message a doorbell handed over is confirmed with `ack --json` until
-    /// the deck records it, without the deck handing the message over again;
-    /// once it is recorded the plugin asks no more.
-    #[cfg(unix)]
-    #[test]
-    fn opencode_doorbell_acknowledgement_is_confirmed_until_the_deck_records_it() {
-        if !node_available() {
-            eprintln!("SKIP: node is not available");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let recorder = confirm_recorder(
-            dir.path(),
-            &[
-                serde_json::json!({"acknowledged": false, "final": false, "reason": "the deck is not reachable"}),
-                serde_json::json!({"acknowledged": true}),
-            ],
-        );
-        let result = drive_doorbell_answer(dir.path(), &recorder, 2500);
-        assert_eq!(result["swapped"], true, "{result}");
-        let ack = format!("ack --json {CONFIRM_ID}");
-        assert_eq!(
-            confirm_ack_calls(dir.path()),
-            vec![ack.clone(), ack],
-            "asked until the deck recorded it, then no more"
-        );
-        assert_eq!(result["toasts"], serde_json::json!([]), "{result}");
-    }
-
-    /// PR #1735 third review: an acknowledgement the deck refuses for good
-    /// (the message is no longer deliverable) is asked once, and the person
-    /// is told in OpenCode which message the deck could not record.
-    #[cfg(unix)]
-    #[test]
-    fn opencode_a_finally_refused_acknowledgement_is_shown_to_the_user() {
-        if !node_available() {
-            eprintln!("SKIP: node is not available");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let recorder = confirm_recorder(
-            dir.path(),
-            &[serde_json::json!({"acknowledged": false, "final": true, "reason": "undeliverable"})],
-        );
-        let result = drive_doorbell_answer(dir.path(), &recorder, 1500);
-        assert_eq!(
-            confirm_ack_calls(dir.path()),
-            vec![format!("ack --json {CONFIRM_ID}")],
-            "a refusal by id is final"
-        );
-        let toasts = result["toasts"].as_array().cloned().unwrap_or_default();
-        assert_eq!(toasts.len(), 1, "{result}");
-        assert_eq!(toasts[0]["variant"], "warning", "{result}");
-        let message = toasts[0]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains(CONFIRM_ID) && message.contains("undeliverable"),
-            "{result}"
+            written.contains("\"not_handed\""),
+            "positively not handed: {written}"
         );
     }
 
-    /// PR #1735 third review: the TUI plugin's acknowledgement over the
-    /// watcher's stdin, which answers nothing, is confirmed with `ack --json`;
-    /// and when the deck hands a message OpenCode already answered over again,
-    /// it is acknowledged again, not prompted a second time.
+    /// PRD #1666 §2–§4: drive the shared receipt receiver against a fake
+    /// watcher child: `script` runs after the receiver and helpers are
+    /// defined, with `feed(reply)` writing a daemon line to the receiver,
+    /// `sent()` the controls it wrote back (parsed), `restart()` its watcher
+    /// respawning, and `check(actual, expected, what)` failing the run.
     #[cfg(unix)]
-    #[test]
-    fn opencode_tui_acknowledgement_is_confirmed_and_a_committed_redelivery_is_not_prompted() {
-        if !node_available() {
-            eprintln!("SKIP: node is not available");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let recorder = confirm_recorder(dir.path(), &[serde_json::json!({"acknowledged": true})]);
-        let plugin = dir.path().join("dot-agent-deck-tui.mjs");
-        std::fs::write(&plugin, tui_plugin_template(&recorder.to_string_lossy())).unwrap();
-        let opener = format!("[dot-agent-deck message {CONFIRM_ID} from x]\nbody");
-        let driver = dir.path().join("driver.mjs");
-        std::fs::write(
-            &driver,
-            format!(
-                r#"import {{ writeFileSync }} from "fs";
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const prompts = [];
-const toasts = [];
-const handlers = {{}};
-let route = {{ name: "home", params: {{}} }};
-const api = {{
-  state: {{ session: {{ get: () => ({{}}), messages: () => [] }} }},
-  ui: {{ dialog: {{ open: false }}, toast: (t) => toasts.push(t) }},
-  mode: {{ current: () => "normal" }},
-  route: {{
-    get current() {{ return route; }},
-    navigate: (name, params) => {{ route = {{ name, params }}; }},
-  }},
-  client: {{ session: {{
-    create: async () => ({{ data: {{ id: "s1" }} }}),
-    promptAsync: async (req) => {{ prompts.push(req.sessionID); return {{}}; }},
-  }} }},
-  event: {{ on: (type, cb) => {{ (handlers[type] ??= []).push(cb); }} }},
-  lifecycle: {{ onDispose: () => {{}} }},
-}};
-const emit = (type, properties) => (handlers[type] ?? []).forEach((cb) => cb({{ type, properties }}));
-const {{ default: mod }} = await import({plugin});
-await mod.tui(api);
-for (let n = 0; n < 200 && prompts.length === 0; n++) await sleep(20);
-emit("message.updated", {{ info: {{ role: "user", id: "u1", sessionID: "s1" }} }});
-emit("message.part.updated", {{ part: {{ type: "text", messageID: "u1", text: {opener} }} }});
-emit("message.updated", {{ info: {{ role: "assistant", id: "a1", parentID: "u1", sessionID: "s1" }} }});
-writeFileSync({trigger}, "");
-await sleep(2000);
-console.log(JSON.stringify({{ prompts, toasts }}));
-process.exit(0);
-"#,
-                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
-                opener = serde_json::to_string(&opener).unwrap(),
-                trigger = serde_json::to_string(&dir.path().join("trigger").display().to_string()).unwrap(),
-            ),
-        )
-        .unwrap();
-        let result = run_inbox_driver(&driver);
-        assert_eq!(
-            result["prompts"],
-            serde_json::json!(["s1"]),
-            "prompted once: {result}"
-        );
-        let controls = std::fs::read_to_string(dir.path().join("controls.log")).unwrap_or_default();
-        let acks = controls
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|c| c["ack"] == serde_json::json!([CONFIRM_ID]))
-            .count();
-        assert_eq!(
-            acks, 2,
-            "acknowledged on the answer and on the redelivery: {controls}"
-        );
-        let calls = confirm_ack_calls(dir.path());
-        assert!(
-            !calls.is_empty()
-                && calls
-                    .iter()
-                    .all(|c| *c == format!("ack --json {CONFIRM_ID}")),
-            "confirmed with the CLI: {calls:?}"
-        );
-        assert_eq!(result["toasts"], serde_json::json!([]), "{result}");
-    }
-
-    /// PR #1735 third review: the confirmation both plugins share asks a deck
-    /// that never answers a bounded number of times, backing off from 1 s to
-    /// 30 s, then reports the message; it stops at once on a record or a
-    /// final refusal.
-    #[cfg(unix)]
-    #[test]
-    fn opencode_ack_confirmation_is_bounded_and_reports_its_outcome() {
-        if !node_available() {
-            eprintln!("SKIP: node is not available");
-            return;
-        }
-        let script = format!(
-            "{}\n{}",
-            inbox_js(""),
-            r#"
+    fn run_receiver_script(script: &str) {
+        let prelude = r#"
+import { EventEmitter } from "events";
+const children = [];
+const spawn = (_bin, args) => {
+  const child = new EventEmitter();
+  child.args = args;
+  child.stdout = new EventEmitter();
+  child.stdout.setEncoding = () => {};
+  child.written = [];
+  child.stdin = new EventEmitter();
+  child.stdin.writableEnded = false;
+  child.stdin.destroyed = false;
+  child.stdin.write = (line) => { child.written.push(JSON.parse(line)); return true; };
+  child.stdin.end = () => { child.stdin.writableEnded = true; };
+  child.kill = () => {};
+  children.push(child);
+  return child;
+};
+const hookBinary = () => "/fake/dot-agent-deck";
+"#;
+        let helpers = r#"
 const check = (actual, expected, what) => {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     console.error(what + ": " + JSON.stringify(actual) + " != " + JSON.stringify(expected));
     process.exit(1);
   }
 };
-const run = async (answer, now) => {
-  const asks = [];
-  const delays = [];
-  const reports = [];
-  const due = [];
-  const timers = { set: (fn, ms) => { delays.push(ms); due.push(fn); return due.length; }, clear: () => {} };
-  const confirmer = inboxConfirmer((id, why) => reports.push([id, why]), async (id) => {
-    asks.push(id);
-    return JSON.stringify(answer);
-  }, timers);
-  confirmer.add(["m-1"], now);
-  for (let n = 0; n < 50; n++) {
-    await new Promise((r) => setImmediate(r));
-    const fn = due.shift();
-    if (fn) fn();
-  }
-  return { asks: asks.length, delays, reports };
-};
-const silent = await run({ acknowledged: false, final: false, reason: "no answer" }, true);
-check(silent.asks, INBOX_ACK_CONFIRM_ATTEMPTS, "asks of a deck that never answers");
-check(silent.delays, [2000, 4000, 8000, 16000, 30000, 30000, 30000], "the backoff");
-check(silent.reports, [["m-1", "the deck did not confirm it"]], "the report");
-const later = await run({ acknowledged: true }, false);
-check(later.delays, [1000], "a stdin acknowledgement is first confirmed after a second");
-check(later.asks, 1, "a recorded acknowledgement is asked once");
-check(later.reports, [], "a recorded acknowledgement reports nothing");
-const refused = await run({ acknowledged: false, final: true, reason: "wrong_agent" }, true);
-check(refused.asks, 1, "a final refusal is asked once");
-check(refused.reports, [["m-1", "wrong_agent"]], "a final refusal is reported");
-check(inboxAckOutcome("not json\n" + JSON.stringify({ acknowledged: true })), "recorded", "the JSON line is found");
-check(inboxAckOutcome(undefined), "unconfirmed", "no output is unconfirmed");
-process.exit(0);
-"#
+const current = () => children[children.length - 1];
+const feed = (reply) => current().stdout.emit("data", JSON.stringify(reply) + "\n");
+const sent = () => current().written;
+const tick = () => new Promise((r) => setImmediate(r));
+"#;
+        let source = format!(
+            "{prelude}\n{}\n{helpers}\n{script}\nprocess.exit(0);\n",
+            inbox_js("")
         );
         let output = std::process::Command::new("node")
             .arg("--input-type=module")
             .arg("-e")
-            .arg(&script)
+            .arg(&source)
+            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
             .output()
             .expect("run node");
         assert!(
@@ -4835,76 +4590,171 @@ process.exit(0);
         );
     }
 
-    /// PR #1735 third review, finding 2: a new acknowledgement never postpones
-    /// an older one's confirmation. One id is acknowledged, then a fresh one
-    /// every 500 ms for four seconds; the first is still asked at 1 s and,
-    /// unanswered there, again at its 2 s backoff, and each fresh id is asked
-    /// once on its own schedule.
+    /// Scenario: A receiver registers, is handed attempts with delivery numbers 1 and 3, and hears a keepalive. Every snapshot it sends rises in `seq`, names every attempt it holds, and reports only the contiguous observed prefix as `seen`, so the unobserved number 2 never reads as omitted.
+    #[spec("inbox/opencode/028")]
     #[cfg(unix)]
     #[test]
-    fn opencode_fresh_acknowledgements_do_not_postpone_an_older_confirmation() {
+    fn opencode_028_snapshots_rise_and_report_a_contiguous_watermark() {
         if !node_available() {
             eprintln!("SKIP: node is not available");
             return;
         }
-        let script = format!(
-            "{}\n{}",
-            inbox_js(""),
+        run_receiver_script(
             r#"
-const check = (actual, expected, what) => {
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    console.error(what + ": " + JSON.stringify(actual) + " != " + JSON.stringify(expected));
-    process.exit(1);
-  }
-};
-let now = 0;
-let seq = 0;
-const pending = new Map();
-const timers = {
-  set: (fn, ms) => { seq += 1; pending.set(seq, { at: now + ms, fn }); return seq; },
-  clear: (t) => { pending.delete(t); },
-};
-const asks = [];
-const confirmer = inboxConfirmer(() => {}, async (id) => {
-  asks.push([id, now]);
-  const unanswered = id === "m-old" && asks.filter(([a]) => a === "m-old").length === 1;
-  return JSON.stringify(unanswered ? { acknowledged: false, final: false, reason: "no answer" } : { acknowledged: true });
-}, timers);
-const settle = async () => { for (let n = 0; n < 8; n++) await new Promise((r) => setImmediate(r)); };
-const advanceTo = async (t) => {
-  for (;;) {
-    const due = [...pending].filter(([, v]) => v.at <= t).sort((a, b) => a[1].at - b[1].at)[0];
-    if (!due) break;
-    pending.delete(due[0]);
-    now = due[1].at;
-    due[1].fn();
-    await settle();
-  }
-  now = t;
-};
-confirmer.add(["m-old"], false);
-for (let i = 1; i <= 8; i++) {
-  await advanceTo(i * 500);
-  confirmer.add(["m-new-" + i], false);
-}
-await advanceTo(60000);
-check(asks.filter(([a]) => a === "m-old").map(([, t]) => t), [1000, 3000], "the older id's asks");
-for (let i = 1; i <= 8; i++) {
-  check(asks.filter(([a]) => a === "m-new-" + i).map(([, t]) => t), [i * 500 + 1000], "m-new-" + i + "'s asks");
-}
-process.exit(0);
-"#
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+check(current().args.slice(0, 7), ["inbox", "wait", "--agent", "opencode", "--stream",
+  "--adapter-integration", String(INBOX_ADAPTER_INTEGRATION)], "the watcher declares the integration");
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const msg = (e, d) => ({ id: "m-k3xzq2ab-0f3c9a71d2e4b850", subject: "s", from: "x", text: "t", a: 1, e, d });
+feed({ messages: [msg(1, 1), msg(3, 3)] });
+feed({ keepalive: true });
+const snaps = sent().filter((c) => c.possess).map((c) => c.possess);
+check(snaps.map((p) => p.seq), [1, 2, 3], "seq rises strictly");
+check(snaps[2].seen, 1, "seen is the contiguous prefix");
+check(snaps[2].held.map((h) => h.e), [1, 3], "both attempts are held");
+"#,
         );
-        let output = std::process::Command::new("node")
-            .arg("--input-type=module")
-            .arg("-e")
-            .arg(&script)
-            .output()
-            .expect("run node");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+    }
+
+    /// Scenario: A revoke reaches an attempt still queued behind a dialog, then one already handed to OpenCode. The queued one is dropped and answered `revoked_ack`; the handed one is answered `already_handed`; a later hand-over check for the revoked one is refused and reported positively not handed.
+    #[spec("inbox/opencode/029")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_029_revokes_are_answered_by_where_the_callback_stands() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+feed({ messages: [{ id, subject: "s", from: "x", text: "t", a: 1, e: 1, d: 1 },
+  { id, subject: "s", from: "x", text: "t", a: 1, e: 2, d: 2 }] });
+receiver.calling({ id, a: 1, e: 2 });
+feed({ revoke: [{ id, a: 1, e: 1 }] });
+feed({ revoke: [{ id, a: 1, e: 2 }] });
+check(sent().filter((c) => c.revoked_ack).map((c) => c.revoked_ack), [[{ id, a: 1, e: 1 }]], "queued: revoked_ack");
+check(sent().filter((c) => c.already_handed).map((c) => c.already_handed), [[{ id, a: 1, e: 2 }]], "handed: already_handed");
+let called = false;
+const pending = inboxHandOver(receiver, { id, a: 1, e: 1 }, "s1", async () => { called = true; return {}; });
+await tick();
+const may = sent().find((c) => c.may);
+feed({ grant: { q: may.may.q, ok: true } });
+await pending;
+check(called, false, "a revoked attempt never reaches OpenCode");
+check(sent().filter((c) => c.not_handed).length, 1, "it is reported not handed");
+"#,
+        );
+    }
+
+    /// Scenario: A watcher respawns while its context still holds one attempt; the new registration asks it to resume that one and another it never knew. It answers `retained` for the held attempt and `unknown` for the other, and observes the rebound delivery number the deck answers with.
+    #[spec("inbox/opencode/030")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_030_resume_answers_retained_only_what_the_context_holds() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+let live = true;
+const receiver = inboxReceiver({ agent: "opencode", active: () => live, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+feed({ messages: [{ id, subject: "s", from: "x", text: "t", a: 1, e: 1, d: 1 }] });
+current().emit("exit");
+await new Promise((r) => setTimeout(r, 10));
+// The fixed backoff is an hour: respawn by hand, as the timer would.
+receiver.start();
+check(current().args.includes("--resumed"), true, "a respawned watcher says its callbacks survived");
+feed({ registered: { rx: 5, slot: "opencode_tui", keepalive_ms: 30000 },
+  resume: [{ id, a: 1, e: 1 }, { id: "m-k3xzq2ab-0f3c9a71d2e4b851", a: 1, e: 1 }] });
+const answers = sent().find((c) => c.resume_answers).resume_answers;
+check(answers.map((a) => a.answer), ["retained", "unknown"], "the answers");
+feed({ rebound: [{ id, a: 1, e: 1, d: 1 }] });
+const last = sent().filter((c) => c.possess).pop().possess;
+check(last.seen, 1, "the rebound delivery number is observed");
+check(last.held.length, 1, "the retained attempt is still held");
+"#,
+        );
+    }
+
+    /// Scenario: A callback is approved by the deck's final hand-over check, then its watcher restarts (a rebinding) or its context is disposed (a retirement) before it resumes. The old approval is void: a rebound callback asks again under the new incarnation, and a retired one never reaches OpenCode and reports the attempt not handed.
+    #[spec("inbox/opencode/031")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_031_an_approval_dies_with_its_epoch() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+let live = true;
+const receiver = inboxReceiver({ agent: "opencode", active: () => live, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+const ref = { id, a: 1, e: 1 };
+feed({ messages: [{ ...ref, subject: "s", from: "x", text: "t", d: 1 }] });
+const granted = receiver.may(ref);
+await tick();
+feed({ grant: { q: sent().find((c) => c.may).may.q, ok: true } });
+const epoch = await granted;
+check(receiver.ready(ref, epoch), true, "approved under the live incarnation");
+receiver.start();
+check(receiver.ready(ref, epoch), false, "a rebinding voids the approval");
+feed({ registered: { rx: 5, slot: "opencode_tui", keepalive_ms: 30000 }, resume: [ref] });
+let called = 0;
+const second = inboxHandOver(receiver, ref, "s1", async () => { called += 1; return {}; });
+await tick();
+feed({ grant: { q: sent().filter((c) => c.may).pop().may.q, ok: true } });
+await second;
+check(called, 1, "asked again under the new incarnation, then handed once");
+check(sent().filter((c) => c.handed).length, 1, "and reported handed");
+feed({ messages: [{ id, subject: "s", from: "x", text: "t", a: 1, e: 2, d: 2 }] });
+const later = { id, a: 1, e: 2 };
+const third = inboxHandOver(receiver, later, "s1", async () => { called += 1; return {}; });
+await tick();
+live = false;
+feed({ grant: { q: sent().filter((c) => c.may).pop().may.q, ok: true } });
+await third;
+check(called, 1, "a retired context's approved callback never reaches OpenCode");
+check(sent().filter((c) => c.not_handed).map((c) => c.not_handed[0].e), [2], "it reports not handed");
+"#,
+        );
+    }
+
+    /// Scenario: The deck refuses a hand-over check, or never answers it. Neither reaches OpenCode, and both are reported positively not handed, so the deck may hand the message out again, unmarked.
+    #[spec("inbox/opencode/032")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_032_a_refused_or_silent_check_hands_nothing_over() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+feed({ messages: [{ id, subject: "s", from: "x", text: "t", a: 1, e: 1, d: 1 }] });
+let called = 0;
+const refused = inboxHandOver(receiver, { id, a: 1, e: 1 }, "s1", async () => { called += 1; return {}; });
+await tick();
+feed({ grant: { q: sent().find((c) => c.may).may.q, ok: false, refusal: "committed" } });
+await refused;
+check(called, 0, "a refused check reaches nothing");
+check(sent().filter((c) => c.not_handed).length, 1, "and is reported not handed");
+"#,
         );
     }
 
@@ -4930,7 +4780,7 @@ process.exit(0);
         crate::test_isolation::write_script(
             &recorder,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1 $2\" in 'inbox fetch') echo '{{\"messages\":[]}}';; esac\nexit 0\n",
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1 $2\" in 'inbox fetch') echo '{{\"messages\":[]}}';; 'inbox wait') echo '{{\"registered\":{{\"rx\":3,\"slot\":\"opencode_server\",\"keepalive_ms\":30000}}}}'; cat >/dev/null;; esac\nexit 0\n",
                 calls.display()
             ),
         )
@@ -4957,6 +4807,8 @@ process.exit(0);
                     r#"process.argv = [process.argv[0], "opencode", ...{argv}];
 const {{ default: plugin }} = await import("{}");
 const hooks = await plugin({{ directory: "/work" }});
+// PRD #1666 §4: the substitution needs this context's receiver registered.
+await new Promise((r) => setTimeout(r, 500));
 const output = {{ parts: [{{ type: "text", text: {line_json} }}] }};
 await hooks["chat.message"]({{ messageID: "u1" }}, output);
 console.log(JSON.stringify(output.parts[0].text));
@@ -4976,11 +4828,15 @@ process.exit(0);
             assert!(out.status.success(), "{argv}: {out:?}");
             let text: String =
                 serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
-            let fetched = std::fs::read_to_string(&calls)
-                .unwrap_or_default()
-                .lines()
-                .any(|call| call.starts_with("inbox fetch"));
+            let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+            let fetched = calls.lines().any(|call| call.starts_with("inbox fetch"));
             assert_eq!(fetched, intercepts, "{argv}: fetch calls");
+            if intercepts {
+                assert!(
+                    calls.contains("--adapter-integration 2 --rx 3"),
+                    "{argv}: the fetch binds its attempts to the receiver: {calls}"
+                );
+            }
             assert_eq!(text == line, !intercepts, "{argv}: {text:?}");
         }
     }

@@ -101,6 +101,9 @@ pub enum Action {
     /// PRD #1258 M3: open the overlay showing the attached deck's host — disk
     /// per watched role, load per core, memory and the sample's age.
     HostMetrics,
+    /// PRD #1666 §6.4: open the picker of the selected card's deck messages
+    /// that wait on the user's Retry or Cancel.
+    InboxAttention,
 }
 
 /// Static description of one action: which section it lives in, its config
@@ -387,6 +390,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "host_metrics",
         default: "m",
         description: "Host of this deck",
+    },
+    // PRD #1666 §6.4: the selected card's deck messages waiting on Retry or
+    // Cancel. Last in canonical order, for the reason `host_metrics` is.
+    ActionSpec {
+        action: Action::InboxAttention,
+        section: Section::Dashboard,
+        name: "inbox_attention",
+        default: "i",
+        description: "Deck messages: Retry or Cancel",
     },
 ];
 

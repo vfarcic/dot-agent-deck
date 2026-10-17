@@ -1841,6 +1841,65 @@ impl DaemonClient {
     /// **Withholds unless the daemon advertises
     /// [`crate::daemon_protocol::CAP_INBOX`]**, answering
     /// [`GatedQuery::Unsupported`] without sending anything.
+    /// PRD #1666 §6.4: the user's Retry (`retry`) or Cancel on deck message
+    /// `message_id` that `agent_id`'s card in `pane_id` lists, at the
+    /// `revision` the card showed. `request_id` names the press, so sending it
+    /// again answers as before.
+    ///
+    /// **Withheld from a daemon that does not advertise
+    /// [`crate::daemon_protocol::CAP_INBOX_ACTIONS`]**, which answers
+    /// [`GatedQuery::Unsupported`] without sending anything (CLAUDE.md rule
+    /// 18, second rung): an older daemon would refuse the verb with a generic
+    /// decode error, and a client must not offer a button that cannot work.
+    pub async fn inbox_action(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        message_id: &str,
+        revision: u64,
+        retry: bool,
+        request_id: &str,
+    ) -> Result<GatedQuery<crate::daemon_protocol::InboxActionReply>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_INBOX_ACTIONS)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (pane_id, agent_id, message_id, request_id) = (
+            pane_id.to_string(),
+            agent_id.to_string(),
+            message_id.to_string(),
+            request_id.to_string(),
+        );
+        let request = if retry {
+            AttachRequest::InboxRetry {
+                pane_id,
+                agent_id,
+                message_id,
+                revision,
+                request_id,
+            }
+        } else {
+            AttachRequest::InboxCancel {
+                pane_id,
+                agent_id,
+                message_id,
+                revision,
+                request_id,
+            }
+        };
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(&mut rd, &mut wr, &request).await?;
+        match resp.inbox_action {
+            Some(reply) if resp.ok => Ok(GatedQuery::Answered(reply)),
+            _ => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the deck did not answer the inbox action".into()
+            }))),
+        }
+    }
+
     pub async fn list_inbox(
         &self,
         pane_id: Option<&str>,
@@ -4825,6 +4884,121 @@ mod tests {
             close_agents_withheld_inner(Some(&[crate::daemon_protocol::CAP_CLOSE_AGENTS])).await;
             close_agents_withheld_inner(Some(&[crate::daemon_protocol::CAP_HELLO_FOLLOW_ON])).await;
         });
+    }
+
+    /// Scenario: A desktop or TUI presses Retry or Cancel on a deck message against a daemon that does not advertise `inbox-actions`. The client answers Unsupported and sends no verb; against one that does, the verb goes out with the press's revision and request id.
+    #[spec("inbox/protocol/020")]
+    #[cfg(unix)]
+    #[test]
+    fn protocol_020_inbox_actions_are_withheld_from_a_daemon_that_does_not_advertise_them() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build fake-daemon runtime");
+        runtime.block_on(async {
+            for retry in [true, false] {
+                let (sent, answer) = inbox_action_against(None, retry).await;
+                assert!(
+                    sent.is_empty(),
+                    "nothing is sent without capabilities: {sent:?}"
+                );
+                assert!(matches!(answer, GatedQuery::Unsupported));
+                let (sent, answer) =
+                    inbox_action_against(Some(&[crate::daemon_protocol::CAP_INBOX]), retry).await;
+                assert!(
+                    sent.is_empty(),
+                    "inbox alone does not license the verbs: {sent:?}"
+                );
+                assert!(matches!(answer, GatedQuery::Unsupported));
+                let (sent, answer) =
+                    inbox_action_against(Some(&[crate::daemon_protocol::CAP_INBOX_ACTIONS]), retry)
+                        .await;
+                assert_eq!(sent.len(), 1, "one verb is sent once advertised");
+                let op = if retry { "inbox-retry" } else { "inbox-cancel" };
+                assert_eq!(sent[0]["op"], op);
+                assert_eq!(sent[0]["revision"], 7);
+                assert_eq!(sent[0]["request_id"], "press-1");
+                assert!(matches!(
+                    answer,
+                    GatedQuery::Answered(crate::daemon_protocol::InboxActionReply {
+                        outcome: crate::daemon_protocol::InboxActionOutcome::Stale,
+                        ..
+                    })
+                ));
+            }
+        });
+    }
+
+    /// One Retry or Cancel against a fake daemon advertising `advertised`:
+    /// every non-hello request it saw, and the client's answer.
+    #[cfg(unix)]
+    async fn inbox_action_against(
+        advertised: Option<&'static [&'static str]>,
+        retry: bool,
+    ) -> (
+        Vec<serde_json::Value>,
+        GatedQuery<crate::daemon_protocol::InboxActionReply>,
+    ) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fake-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind fake daemon");
+            (dir, path, listener)
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_seen = seen.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) =
+                    read_frame(&mut stream).await.expect("read request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode request");
+                let response = if request["op"] == "hello" {
+                    AttachResponse {
+                        capabilities: advertised
+                            .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    }
+                } else {
+                    server_seen.lock().unwrap().push(request);
+                    AttachResponse {
+                        ok: true,
+                        inbox_action: Some(crate::daemon_protocol::InboxActionReply {
+                            outcome: crate::daemon_protocol::InboxActionOutcome::Stale,
+                            revision: Some(8),
+                        }),
+                        ..AttachResponse::default()
+                    }
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write response");
+            }
+        });
+        let client = DaemonClient::new(path);
+        let answer = client
+            .inbox_action(
+                "worker",
+                "7",
+                "m-k3xzq2ab-0f3c9a71d2e4b850",
+                7,
+                retry,
+                "press-1",
+            )
+            .await
+            .expect("the fake daemon answers");
+        drop(client);
+        let _ = server.await;
+        drop(dir);
+        let seen = seen.lock().unwrap().clone();
+        (seen, answer)
     }
 
     #[cfg(unix)]

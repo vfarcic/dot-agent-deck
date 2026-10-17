@@ -373,6 +373,10 @@ pub enum UiMode {
     /// (default `u`) or a click on the footer's update badge. Its state lives
     /// in `UiState::upgrade_dialog`.
     Upgrade,
+    /// PRD #1666 §6.4: the picker of the selected card's deck messages that
+    /// wait on the user's Retry or Cancel, opened by the `inbox_attention` key
+    /// (default `i`). Its state lives in `UiState::inbox_attention`.
+    InboxAttention,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2139,6 +2143,23 @@ struct UiState {
     /// without a daemon-backed controller (render seams), where the overlay
     /// shows whatever [`Self::host_metrics`] already holds.
     host_metrics_reader: Option<crate::embedded_pane::HostMetricsReader>,
+    /// PRD #1666 §6.4 — the deck-messages picker while it is open.
+    inbox_attention: Option<InboxAttentionDialog>,
+    /// PRD #1666 §6.4 — sends Retry and Cancel off the TUI thread. `None`
+    /// without a daemon-backed controller.
+    inbox_action_sender: Option<crate::embedded_pane::InboxActionSender>,
+}
+
+/// PRD #1666 §6.4 — the deck-messages picker: one card's items waiting on
+/// Retry or Cancel, refreshed from the daemon's state every pass, the row the
+/// cursor is on, and the answer to the last press.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboxAttentionDialog {
+    pane_id: String,
+    agent_id: String,
+    items: Vec<crate::inbox_hub::InboxAttentionItem>,
+    selected: usize,
+    answer: Option<String>,
 }
 
 /// PRD #1258 M3 — the host overlay's content.
@@ -2303,6 +2324,8 @@ impl UiState {
             host_metrics: HostMetricsView::Loading,
             host_metrics_received_at: None,
             host_metrics_reader: None,
+            inbox_attention: None,
+            inbox_action_sender: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -4764,6 +4787,14 @@ pub enum Action {
     /// PRD #1258 M3: close the host overlay — its Escape key and its `[Close]`
     /// button share this arm.
     CloseHostMetrics,
+    /// PRD #1666 §6.4: open the deck-messages picker on the selected card.
+    OpenInboxAttention,
+    /// PRD #1666 §6.4: close it — Escape and its `[Close]` button.
+    CloseInboxAttention,
+    /// PRD #1666 §6.4: move the picker's cursor by one row (`true`: down).
+    InboxAttentionMove(bool),
+    /// PRD #1666 §6.4: Retry (`true`) or Cancel the row under the cursor.
+    InboxAttentionAct(bool),
     /// Issue #1635: open the upgrade dialog. Shared by the `open_upgrade` key
     /// (default `u`) and a click on the footer's update badge.
     OpenUpgrade,
@@ -7432,6 +7463,11 @@ fn handle_normal_key(
     if pressed(KbAction::HostMetrics) {
         return Action::OpenHostMetrics;
     }
+    // PRD #1666 §6.4: the selected card's deck messages waiting on Retry or
+    // Cancel (default `i`). The dispatcher resolves the card.
+    if kb.matches(KbAction::InboxAttention, &key) && total > 0 {
+        return Action::OpenInboxAttention;
+    }
     // Issue #1635: open the upgrade dialog the footer badge names (default
     // `u`), shared with a click on the badge.
     if pressed(KbAction::OpenUpgrade) {
@@ -7576,6 +7612,91 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> Action {
         _ => {}
     }
     Action::Continue
+}
+
+/// PRD #1666 §6.4: keys while the deck-messages picker is up — `j`/`k` (or the
+/// arrows) move, `r` is Retry, `c` is Cancel, and Escape, `q` or the picker's
+/// own binding close it; Ctrl+C keeps its PRD #40 safety net.
+fn handle_inbox_attention_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig) -> Action {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
+        ui.mode = UiMode::QuitConfirm;
+        return Action::Continue;
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => Action::CloseInboxAttention,
+        KeyCode::Down | KeyCode::Char('j') => Action::InboxAttentionMove(true),
+        KeyCode::Up | KeyCode::Char('k') => Action::InboxAttentionMove(false),
+        KeyCode::Char('r') => Action::InboxAttentionAct(true),
+        KeyCode::Char('c') => Action::InboxAttentionAct(false),
+        _ if kb.matches(KbAction::InboxAttention, &key) => Action::CloseInboxAttention,
+        _ => Action::Continue,
+    }
+}
+
+/// PRD #1666 §6.4: one Retry or Cancel the picker sends: the row's message at
+/// the revision it showed.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxAttentionPress {
+    pub pane_id: String,
+    pub agent_id: String,
+    pub message_id: String,
+    pub revision: u64,
+    pub retry: bool,
+}
+
+/// The press `retry` (or Cancel) makes on the row under the picker's cursor;
+/// `None` with no row, or for Retry on a message out of attempts.
+fn inbox_attention_press(
+    dialog: &InboxAttentionDialog,
+    retry: bool,
+) -> Option<InboxAttentionPress> {
+    let item = dialog.items.get(dialog.selected)?;
+    (!retry || item.kind.retry_offered()).then(|| InboxAttentionPress {
+        pane_id: dialog.pane_id.clone(),
+        agent_id: dialog.agent_id.clone(),
+        message_id: item.message_id.clone(),
+        revision: item.revision,
+        retry,
+    })
+}
+
+fn move_inbox_attention(dialog: &mut InboxAttentionDialog, down: bool) {
+    if dialog.items.is_empty() {
+        return;
+    }
+    let last = dialog.items.len() - 1;
+    dialog.selected = if down {
+        (dialog.selected + 1).min(last)
+    } else {
+        dialog.selected.saturating_sub(1)
+    };
+}
+
+/// PRD #1666 §6.4: keep the open picker's rows the daemon's current ones and
+/// land the answer to its last press. Called once per pass of the event loop,
+/// before the frame is drawn, like [`poll_host_metrics`].
+fn poll_inbox_attention(ui: &mut UiState, snapshot: &AppState) {
+    let answer = ui
+        .inbox_action_sender
+        .as_ref()
+        .and_then(crate::embedded_pane::InboxActionSender::take);
+    let Some(dialog) = ui.inbox_attention.as_mut() else {
+        return;
+    };
+    if let Some((retry, outcome)) = answer {
+        dialog.answer = Some(match outcome {
+            Ok(outcome) => crate::inbox_display::action_text(retry, &outcome).to_string(),
+            Err(why) => why,
+        });
+    }
+    dialog.items = snapshot
+        .inbox_attention(&dialog.pane_id)
+        .filter(|(agent, _)| *agent == Some(dialog.agent_id.as_str()))
+        .map(|(_, items)| items.to_vec())
+        .unwrap_or_default();
+    dialog.selected = dialog.selected.min(dialog.items.len().saturating_sub(1));
 }
 
 /// PRD #1258 M3: keys while the host overlay is up. Escape, `q` and the
@@ -8889,7 +9010,9 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         // never to whatever pane the centered dialog happens to cover.
         | UiMode::ScheduledTasks
         // Issue #1635: the upgrade dialog is a topmost modal.
-        | UiMode::Upgrade => true,
+        | UiMode::Upgrade
+        // PRD #1666 §6.4: the deck-messages picker is a topmost modal too.
+        | UiMode::InboxAttention => true,
         UiMode::Normal | UiMode::Filter | UiMode::Rename | UiMode::PaneInput => false,
     }
 }
@@ -10504,6 +10627,60 @@ fn dispatch_action(
                 ui.mode = UiMode::Normal;
             }
         }
+        Action::OpenInboxAttention => {
+            let card = selected_id
+                .and_then(|sid| snapshot.sessions.get(sid))
+                .and_then(|session| session.pane_id.clone());
+            let found = card.and_then(|pane_id| {
+                let (agent, items) = snapshot.inbox_attention(&pane_id)?;
+                Some((pane_id, agent?.to_string(), items.to_vec()))
+            });
+            match found {
+                Some((pane_id, agent_id, items)) => {
+                    ui.inbox_attention = Some(InboxAttentionDialog {
+                        pane_id,
+                        agent_id,
+                        items,
+                        selected: 0,
+                        answer: None,
+                    });
+                    ui.mode = UiMode::InboxAttention;
+                }
+                None => {
+                    ui.status_message = Some((
+                        "This agent has no deck messages waiting on Retry or Cancel.".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+        }
+        Action::CloseInboxAttention => {
+            if ui.mode == UiMode::InboxAttention {
+                ui.mode = UiMode::Normal;
+            }
+            ui.inbox_attention = None;
+        }
+        Action::InboxAttentionMove(down) => {
+            if let Some(dialog) = ui.inbox_attention.as_mut() {
+                move_inbox_attention(dialog, down);
+            }
+        }
+        Action::InboxAttentionAct(retry) => {
+            let press = ui
+                .inbox_attention
+                .as_ref()
+                .and_then(|dialog| inbox_attention_press(dialog, retry));
+            if let (Some(press), Some(sender)) = (press, ui.inbox_action_sender.as_ref()) {
+                sender.send(
+                    &press.pane_id,
+                    &press.agent_id,
+                    &press.message_id,
+                    press.revision,
+                    press.retry,
+                    DAEMON_REQUEST_TIMEOUT,
+                );
+            }
+        }
         Action::OpenUpgrade => open_upgrade_dialog(ui),
         Action::UpgradeChoose(choice) => {
             if let Some(dialog) = ui.upgrade_dialog.as_mut() {
@@ -11404,6 +11581,7 @@ fn handle_key_event(
             UiMode::CloseConfirm => handle_close_confirm_key(&mut ui.close_confirm, key),
             UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, ui),
             UiMode::HostMetrics => handle_host_metrics_key(key, ui, &kb),
+            UiMode::InboxAttention => handle_inbox_attention_key(key, ui, &kb),
             // Issue #1635: `Ctrl+C` keeps its PRD #40 safety net here too, even
             // while an upgrade runs; the running upgrade's dialog is kept so the
             // upgrade key reopens it on the same run.
@@ -11613,6 +11791,11 @@ pub fn run_tui(
         .as_any()
         .downcast_ref::<EmbeddedPaneController>()
         .map(EmbeddedPaneController::host_metrics_reader);
+    // PRD #1666 §6.4: so do the deck-messages picker's Retry and Cancel.
+    ui.inbox_action_sender = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(EmbeddedPaneController::inbox_action_sender);
     if let (Some(reader), Some(command)) = (
         ui.last_command_reader.as_ref(),
         ui.last_command.as_deref().filter(|c| !c.trim().is_empty()),
@@ -12583,6 +12766,8 @@ pub fn run_tui(
         // last pass is on screen in this one, not a 16 ms input poll later,
         // and its shown age starts from what the daemon reported.
         poll_host_metrics(&mut ui, std::time::Instant::now());
+        // PRD #1666 §6.4: the picker shows the daemon's current rows.
+        poll_inbox_attention(&mut ui, &snapshot);
 
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
@@ -13521,6 +13706,8 @@ pub fn run_tui(
                         // PRD #1258 M3: the host overlay's [Close] button lives
                         // in `modal_button_rects`, like help's.
                         | UiMode::HostMetrics
+                        // PRD #1666 §6.4: so do the deck-messages picker's.
+                        | UiMode::InboxAttention
                         // PRD #127 finding #4: the Schedules dialog is a
                         // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
                         // buttons live in `modal_button_rects` and any miss is
@@ -15384,6 +15571,11 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     }
     if ui.mode == UiMode::HostMetrics {
         ui.modal_button_rects = render_host_metrics_overlay(frame, &ui.host_metrics);
+    }
+    if ui.mode == UiMode::InboxAttention
+        && let Some(dialog) = ui.inbox_attention.as_ref()
+    {
+        ui.modal_button_rects = render_inbox_attention_overlay(frame, dialog);
     }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
@@ -17830,6 +18022,10 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         ),
         help_key_line(&lettered(KbAction::OpenScheduledTasks), "Schedules manager"),
         help_key_line(&lettered(KbAction::HostMetrics), "Host of this deck"),
+        help_key_line(
+            &n(KbAction::InboxAttention),
+            "Deck messages: Retry or Cancel",
+        ),
         // PRD #1401: the terminal has no in-app browser, so this hands the PR
         // to the system browser.
         help_key_line(&n(KbAction::OpenPullRequest), "Open pull request"),
@@ -18138,6 +18334,126 @@ fn host_metrics_lines(view: &HostMetricsView, width: u16) -> Vec<Line<'static>> 
 
 /// PRD #1258 M3: the "Host of this deck" overlay. Returns its `[Close]` button
 /// rect for the mouse hit-test, as [`render_help_overlay`] does.
+/// PRD #1666 §6.4: the deck-messages picker's rows — each item's sender,
+/// subject and what it means, in the words the desktop tile uses — then the
+/// answer to the last press.
+fn inbox_attention_lines(dialog: &InboxAttentionDialog, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width);
+    let mut lines = Vec::new();
+    if dialog.items.is_empty() {
+        lines.push(Line::from(format!(
+            "  {}",
+            crate::inbox_display::ACTION_GONE
+        )));
+    }
+    for (index, item) in dialog.items.iter().enumerate() {
+        let cursor = if index == dialog.selected {
+            "▸ "
+        } else {
+            "  "
+        };
+        let style = if index == dialog.selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            text_primary()
+        };
+        lines.push(Line::styled(
+            truncate_with_ellipsis(
+                &format!("{cursor}{} · {}", item.from_label, item.subject),
+                width,
+            ),
+            style,
+        ));
+        lines.push(Line::styled(
+            truncate_with_ellipsis(&format!("    {}", item.kind.reason()), width),
+            text_dim(),
+        ));
+    }
+    if let Some(answer) = &dialog.answer {
+        lines.push(Line::from(""));
+        lines.push(Line::from(truncate_with_ellipsis(
+            &format!("  {answer}"),
+            width,
+        )));
+    }
+    lines
+}
+
+fn render_inbox_attention_overlay(
+    frame: &mut Frame,
+    dialog: &InboxAttentionDialog,
+) -> Vec<(Action, Rect)> {
+    let area = frame.area();
+    let popup_width = 96u16.min(area.width.saturating_sub(2));
+    let lines = inbox_attention_lines(dialog, popup_width.saturating_sub(2));
+    let popup_height = lines
+        .len()
+        .saturating_add(3 + 2)
+        .min(usize::from(area.height.saturating_sub(2))) as u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", crate::inbox_display::ATTENTION_TITLE))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+    let footer_height: u16 = 2;
+    let body_height = inner.height.saturating_sub(footer_height);
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(inner.x, inner.y, inner.width, body_height),
+    );
+    let footer_area = Rect::new(
+        inner.x,
+        inner.y + body_height,
+        inner.width,
+        footer_height.min(inner.height),
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::styled(
+                format!(
+                    "  r {} · c {} · Esc to close",
+                    crate::inbox_display::RETRY,
+                    crate::inbox_display::CANCEL
+                ),
+                text_primary(),
+            ),
+        ]),
+        footer_area,
+    );
+    let retry_offered = dialog
+        .items
+        .get(dialog.selected)
+        .is_some_and(|item| item.kind.retry_offered());
+    let buttons = [
+        Button::new(
+            crate::inbox_display::RETRY,
+            "r",
+            Action::InboxAttentionAct(true),
+            retry_offered,
+        ),
+        Button::new(
+            crate::inbox_display::CANCEL,
+            "c",
+            Action::InboxAttentionAct(false),
+            !dialog.items.is_empty(),
+        ),
+        Button::new("Close", "", Action::CloseInboxAttention, true),
+    ];
+    let btn_row = Rect {
+        x: footer_area.x,
+        y: footer_area.y,
+        width: footer_area.width,
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 2)
+}
+
 fn render_host_metrics_overlay(frame: &mut Frame, view: &HostMetricsView) -> Vec<(Action, Rect)> {
     let area = frame.area();
     // Wide enough for a disk row with its level word (PRD #1258).
@@ -19556,7 +19872,7 @@ fn render_session_card(
     } else {
         session
             .card_inbox()
-            .and_then(|inbox| card_inbox_badge(inbox, &status_text, area.width as usize))
+            .and_then(|inbox| card_inbox_badge(&inbox, &status_text, area.width as usize))
     };
     let badge_width = unicode_width::UnicodeWidthStr::width(status_text.as_str())
         + inbox_text
@@ -19741,6 +20057,17 @@ fn render_session_card(
         ));
     }
 
+    // PRD #1666 §6.5: what the deck says about this agent's deck messages
+    // beyond the inbox badge — an integration that takes nothing yet, paused
+    // hand-outs, an uncertain delivery, held_long attention, failed receipt
+    // storage. Fixed daemon words, the desktop tile's notice row.
+    if !is_placeholder && let Some(notice) = session.inbox_notice() {
+        attention.push((
+            notice,
+            Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
+        ));
+    }
+
     // Issue #1678: background work the agent left running after its turn
     // ended, under the status rows and above the prompt. `fit_card_rows`
     // sheds the separator, prompts and `Dir:` before a status row, but it
@@ -19829,7 +20156,7 @@ const CARD_TITLE_MIN_FOR_INBOX_WORDS: usize = 16;
 /// [`CARD_TITLE_MIN_FOR_INBOX_WORDS`] columns, the pending count alone where
 /// only that fits, else nothing.
 fn card_inbox_badge(
-    inbox: crate::inbox_display::CardInbox,
+    inbox: &crate::inbox_display::CardInbox,
     status_text: &str,
     width: usize,
 ) -> Option<String> {
@@ -22662,6 +22989,93 @@ pub fn observe_command_banner_key_burst(
         visibility_before,
         visibility_after: ui.command_banner.visibility(closing),
     }
+}
+
+/// PRD #1666 §6.4 L1 seam: draw the live deck-messages picker over `items`,
+/// the cursor on `selected`, with `answer` as the last press's answer.
+pub fn render_inbox_attention_overlay_to_buffer(
+    items: &[crate::inbox_hub::InboxAttentionItem],
+    selected: usize,
+    answer: Option<&str>,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let dialog = InboxAttentionDialog {
+        pane_id: "pane".into(),
+        agent_id: "agent".into(),
+        items: items.to_vec(),
+        selected,
+        answer: answer.map(str::to_string),
+    };
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_inbox_attention_overlay(frame, &dialog);
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+/// PRD #1666 §6.4 L1 seam: open the picker on `state`'s card for `pane_id`
+/// through the production dashboard key and [`dispatch_action`], press `keys`
+/// one at a time through the production picker handler, and return the presses
+/// they made and whether the picker is still open.
+pub fn inbox_attention_key_presses(
+    keybindings: &KeybindingConfig,
+    state: &AppState,
+    session_id: &str,
+    open: KeyEvent,
+    keys: &[KeyEvent],
+) -> (bool, Vec<InboxAttentionPress>) {
+    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
+    let opened = {
+        if keybindings.matches(KbAction::InboxAttention, &open) {
+            let card = state
+                .sessions
+                .get(session_id)
+                .and_then(|session| session.pane_id.clone());
+            if let Some((pane_id, (Some(agent), items))) =
+                card.and_then(|pane| state.inbox_attention(&pane).map(|found| (pane, found)))
+            {
+                ui.inbox_attention = Some(InboxAttentionDialog {
+                    pane_id,
+                    agent_id: agent.to_string(),
+                    items: items.to_vec(),
+                    selected: 0,
+                    answer: None,
+                });
+                ui.mode = UiMode::InboxAttention;
+            }
+        }
+        ui.mode == UiMode::InboxAttention
+    };
+    if !opened {
+        return (false, Vec::new());
+    }
+    let mut presses = Vec::new();
+    for key in keys {
+        match handle_inbox_attention_key(*key, &mut ui, keybindings) {
+            Action::InboxAttentionMove(down) => {
+                if let Some(dialog) = ui.inbox_attention.as_mut() {
+                    move_inbox_attention(dialog, down);
+                }
+            }
+            Action::InboxAttentionAct(retry) => presses.extend(
+                ui.inbox_attention
+                    .as_ref()
+                    .and_then(|dialog| inbox_attention_press(dialog, retry)),
+            ),
+            Action::CloseInboxAttention => {
+                ui.mode = UiMode::Normal;
+                ui.inbox_attention = None;
+            }
+            _ => {}
+        }
+    }
+    (ui.mode == UiMode::InboxAttention, presses)
 }
 
 /// PRD #1258 M3 L1 seam: draw the live host overlay renderer for `report`
@@ -36443,7 +36857,8 @@ mod tests {
             | UiMode::ScheduledTasks
             | UiMode::CloseConfirm
             | UiMode::HostMetrics
-            | UiMode::Upgrade => mode,
+            | UiMode::Upgrade
+            | UiMode::InboxAttention => mode,
         }
     }
 
@@ -36466,6 +36881,7 @@ mod tests {
             UiMode::CloseConfirm,
             UiMode::HostMetrics,
             UiMode::Upgrade,
+            UiMode::InboxAttention,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)

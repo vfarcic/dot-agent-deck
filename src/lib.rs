@@ -86,6 +86,7 @@ pub mod inbox_prompt;
 pub mod inbox_pubsub;
 pub mod inbox_receipt;
 pub mod inbox_spills;
+pub mod inbox_watcher;
 pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;

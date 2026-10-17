@@ -121,6 +121,15 @@ const timer=setInterval(async ()=>{
     if(control.dispose) {for(const fn of disposers)await fn(); log('disposed');}
     if(control.eof) {for(const child of spawned)child.stdin?.end();}
     if(control.killWatcher) {for(const child of spawned)child.kill('SIGKILL');}
+    // PRD #1666 §4: a stalled event loop (a dead adapter, while it lasts).
+    if(control.stall) {const until=Date.now()+control.stall;while(Date.now()<until){} log('stalled',{ms:control.stall});}
+    // PRD #1666 §4: OpenCode re-running the server plugin in the same module, as
+    // it does when it disposes an instance: the new instance knows nothing.
+    if(control.reload && config.server) {
+      server=await (imported.server ?? imported)({client:api.client,directory:process.cwd(),worktree:process.cwd(),project:{id:'fixture'}});
+      await server.event({event:{type:'session.created',properties:{info:{id:'shown',directory:process.cwd()}}}});
+      log('reloaded');
+    }
     if(control.doorbell) {
       const id=control.userID??'fallback-user';
       const parts=[{type:'text',text:control.doorbell}];

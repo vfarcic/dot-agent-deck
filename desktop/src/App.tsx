@@ -2510,6 +2510,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   appliedGeometry={runtime.appliedGeometry?.[agentKey(agent.daemonId, agent.id)]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext, { open: true }); }}
                   onRename={mode === "live" ? renameAgent : undefined}
+                  onInboxAction={mode === "live" ? runtime.inboxAction : undefined}
                   /*
                     Opening SELECTS as well, which is the difference between the
                     overlay's `selected` being harmlessly degenerate and being

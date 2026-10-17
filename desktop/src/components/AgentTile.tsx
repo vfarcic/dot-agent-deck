@@ -23,13 +23,16 @@ import type {
   AgentSession,
   AgentTarget,
   EvidenceItem,
+  InboxActionResult,
+  InboxActionVerb,
+  InboxAttentionItem,
   PanelTab,
   RuntimeMode,
   TerminalFeed,
 } from "../types";
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
 import { blockedReasonText } from "../lib/blockedReason";
-import { inboxBadge } from "../lib/inboxWords";
+import { attentionReason, inboxActionText, inboxBadge, inboxNotice, INBOX_WORDS } from "../lib/inboxWords";
 import { displayBackgroundWork, displayUptime } from "../lib/displayText";
 import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
@@ -264,6 +267,60 @@ export interface AgentTileProps {
    * The wrapper that positions the tile is what supplies it.
    */
   onClose?: () => void;
+  /**
+   * PRD #1666 §6.4 — Retry or Cancel one deck message the tile lists, at the
+   * revision it shows. Supplied only where a daemon can answer: without it the
+   * rows show no buttons, as a control that does nothing must not exist.
+   */
+  onInboxAction?: (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
+}
+
+/**
+ * PRD #1666 §6.4: one listed deck message — who sent it, its subject, what it
+ * means — with its own Retry and Cancel, and the deck's answer once one was
+ * pressed. Retry is not offered once the message is out of attempts.
+ */
+function InboxAttentionRow({ agent, item, onInboxAction }: {
+  agent: AgentSession;
+  item: InboxAttentionItem;
+  onInboxAction?: AgentTileProps["onInboxAction"];
+}) {
+  const [answer, setAnswer] = useState<string>();
+  const [busy, setBusy] = useState(false);
+  const paneId = agent.paneId;
+  const act = async (verb: InboxActionVerb) => {
+    if (!onInboxAction || busy || !paneId) return;
+    setBusy(true);
+    try {
+      const result = await onInboxAction(
+        { deckId: agent.daemonId, agentId: agent.id },
+        { paneId, messageId: item.messageId, revision: item.revision },
+        verb,
+      );
+      setAnswer(inboxActionText(verb, result.outcome));
+    } catch (cause) {
+      setAnswer(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <li className="agent-inbox-attention-row" data-testid={`inbox-attention-${item.messageId}`} onMouseDown={(event) => event.stopPropagation()}>
+      <span className="agent-inbox-attention-who">{item.fromLabel}</span>
+      <span aria-hidden="true"> · </span>
+      <span className="agent-inbox-attention-subject">{item.subject}</span>
+      <span className="agent-inbox-attention-reason">{attentionReason(item.kind)}</span>
+      {onInboxAction && paneId && (
+        <span className="agent-inbox-attention-actions">
+          {item.kind !== "out_of_attempts" && (
+            <button type="button" disabled={busy} onClick={() => void act("retry")}>{INBOX_WORDS.retry}</button>
+          )}
+          <button type="button" disabled={busy} onClick={() => void act("cancel")}>{INBOX_WORDS.cancel}</button>
+        </span>
+      )}
+      {answer && <span className="agent-inbox-attention-answer" role="status">{answer}</span>}
+    </li>
+  );
 }
 
 function formatTokens(tokens: number): string {
@@ -293,6 +350,7 @@ export function AgentTile({
   onOpen,
   panePresent,
   onClose,
+  onInboxAction,
 }: AgentTileProps) {
   /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
   const openPullRequest = useContext(OpenPullRequest);
@@ -372,6 +430,8 @@ export function AgentTile({
   // what the daemon said, the word the TUI's card uses (rule 22).
   const tileStatusLabel = agent.daemonStatus === "error" ? "error" : statusLabel(agent.status);
   const badge = inboxBadge(agent.inbox);
+  const inboxNoticeRow = inboxNotice(agent.inbox);
+  const attention = agent.inbox?.attention ?? [];
 
   return (
     <article
@@ -469,6 +529,19 @@ export function AgentTile({
                 message it could not deliver. */}
             {agent.deliveryNotice && !held && (
               <p className="agent-delivery-notice" data-testid={`delivery-notice-${agent.id}`}>{agent.deliveryNotice}</p>
+            )}
+            {/* PRD #1666 §6.5: what the deck says about this agent's deck
+                messages beyond the badge — the TUI card's notice row — and the
+                messages waiting on the user's Retry or Cancel. */}
+            {inboxNoticeRow && !held && (
+              <p className="agent-inbox-notice" data-testid={`inbox-notice-${agent.id}`}>{inboxNoticeRow}</p>
+            )}
+            {attention.length > 0 && !held && (
+              <ul className="agent-inbox-attention" data-testid={`inbox-attention-list-${agent.id}`}>
+                {attention.map((item) => (
+                  <InboxAttentionRow key={item.messageId} agent={agent} item={item} onInboxAction={onInboxAction} />
+                ))}
+              </ul>
             )}
             {/* Issue #1678: the agent's turn is over and something it started
                 is still running — the TUI card's words, counts only. */}

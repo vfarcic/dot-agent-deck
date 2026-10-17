@@ -436,6 +436,8 @@ pub enum UndeliverableReason {
     Superseded,
     /// The inbox is shutting down.
     InboxShut,
+    /// PRD #1666 §6.4: the user cancelled its delivery.
+    Cancelled,
 }
 
 /// The state machine. See the module docs.
@@ -546,6 +548,25 @@ pub struct Message {
     /// Offers only: whether the holder's stream has said it holds the offer
     /// since it was last handed to it again ([`Inbox::hold`]).
     pub offer_hold: OfferHold,
+    /// PRD #1666 §13 step 4: which policy owns this assignment, fixed at its
+    /// first issuance by the receiver that took it. A direct message has one
+    /// assignment for life; an offer has one per holder, so this is cleared
+    /// when it returns to its pool. The legacy ack-wait, requeue, nack and
+    /// hold act only on `Legacy`-owned messages, and only a receipt receiver
+    /// takes a `Receipt`-owned one, so the two policies never run for one
+    /// assignment.
+    pub owner: Option<AssignmentOwner>,
+}
+
+/// PRD #1666 §13 step 4: the policy that owns an assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssignmentOwner {
+    /// Ack-wait redelivery, `hold` and `max_deliver`, for a consumer not yet
+    /// switched to receipts.
+    Legacy,
+    /// The attempt model (`crate::inbox_attempts`) through the hub's receipt
+    /// engine.
+    Receipt,
 }
 
 /// PRD #1666 long-turn delivery: where an offer's holder stands on holding it.
@@ -1308,6 +1329,7 @@ impl Inbox {
             .enumerate()
             .filter(|(_, m)| {
                 m.state == MessageState::Queued
+                    && m.owner != Some(AssignmentOwner::Receipt)
                     && m.recipient
                         .as_ref()
                         .is_some_and(|r| r.admits(pane_id, agent_id))
@@ -1321,6 +1343,9 @@ impl Inbox {
             if !self.messages[index].is_offer() {
                 self.messages[index].deliveries += 1;
             }
+            self.messages[index]
+                .owner
+                .get_or_insert(AssignmentOwner::Legacy);
             self.messages[index].first_fetched_at.get_or_insert(now);
             self.transition(
                 index,
@@ -1448,7 +1473,8 @@ impl Inbox {
         let message = &mut self.messages[index];
         let fetched_by_consumer =
             matches!(&message.state, MessageState::Fetched { by, .. } if by == consumer);
-        if !fetched_by_consumer || !within_bound {
+        if !fetched_by_consumer || !within_bound || message.owner == Some(AssignmentOwner::Receipt)
+        {
             return false;
         }
         if message.is_offer() {
@@ -1489,6 +1515,72 @@ impl Inbox {
             && self.within_hold_bound(index, now)
     }
 
+    /// PRD #1666 §13 step 4: hand message `id`, queued for `agent_id` in
+    /// `pane_id`, to a receipt receiver: it becomes fetched by `consumer` and
+    /// its assignment `Receipt`-owned. `None` unless it is queued, admits the
+    /// agent and is not `Legacy`-owned.
+    pub fn take_receipt(
+        &mut self,
+        now: Instant,
+        id: &str,
+        pane_id: &str,
+        agent_id: &str,
+        consumer: Consumer,
+    ) -> Option<Message> {
+        let index = self.find_for(id, pane_id, agent_id)?;
+        let message = &mut self.messages[index];
+        if message.state != MessageState::Queued || message.owner == Some(AssignmentOwner::Legacy) {
+            return None;
+        }
+        if !message.is_offer() {
+            message.deliveries += 1;
+        }
+        message.owner = Some(AssignmentOwner::Receipt);
+        message.first_fetched_at.get_or_insert(now);
+        let ack_deadline = now + self.limits.ack_wait;
+        self.transition(
+            index,
+            now,
+            MessageState::Fetched {
+                by: consumer,
+                at: now,
+                ack_deadline,
+            },
+        );
+        Some(self.messages[index].clone())
+    }
+
+    /// PRD #1666 §2 rule 3: a `Receipt`-owned message every attempt of which
+    /// was positively not handed is queued again for its recipient, or for an
+    /// offer returned to its pool, excluding this holder. The attempt model
+    /// counts and bounds these requeues, so `max_deliver` is not applied here.
+    /// Returns whether it was fetched.
+    pub fn requeue_receipt(&mut self, now: Instant, id: &str, pane_id: &str) -> bool {
+        let Some(index) = self.messages.iter().position(|m| {
+            m.id.as_str() == id
+                && m.owner == Some(AssignmentOwner::Receipt)
+                && m.recipient.as_ref().is_some_and(|r| r.pane_id == pane_id)
+        }) else {
+            return false;
+        };
+        if !matches!(self.messages[index].state, MessageState::Fetched { .. }) {
+            return false;
+        }
+        if self.messages[index].is_offer() {
+            self.return_offer(index, now, ReturnCause::AckWaitExpired);
+        } else {
+            self.transition(index, now, MessageState::Queued);
+        }
+        self.trim_history(now);
+        true
+    }
+
+    /// The owner of the copy of `id` this agent may act on.
+    pub fn owner_of(&self, id: &str, pane_id: &str, agent_id: &str) -> Option<AssignmentOwner> {
+        self.find_for(id, pane_id, agent_id)
+            .and_then(|index| self.messages[index].owner)
+    }
+
     /// A consumer handing a fetched message back unread. It is redelivered
     /// (or becomes undeliverable at `max_deliver`). Returns whether the
     /// message was fetched by this agent.
@@ -1496,7 +1588,9 @@ impl Inbox {
         let Some(index) = self.find_for(id, pane_id, agent_id) else {
             return false;
         };
-        if !matches!(self.messages[index].state, MessageState::Fetched { .. }) {
+        if !matches!(self.messages[index].state, MessageState::Fetched { .. })
+            || self.messages[index].owner == Some(AssignmentOwner::Receipt)
+        {
             return false;
         }
         self.redeliver(index, now);
@@ -1511,7 +1605,10 @@ impl Inbox {
             .messages
             .iter()
             .enumerate()
-            .filter(|(_, m)| matches!(&m.state, MessageState::Fetched { by, .. } if by == consumer))
+            .filter(|(_, m)| {
+                m.owner != Some(AssignmentOwner::Receipt)
+                    && matches!(&m.state, MessageState::Fetched { by, .. } if by == consumer)
+            })
             .map(|(i, _)| i)
             .collect();
         for &index in &indices {
@@ -1631,7 +1728,13 @@ impl Inbox {
         while index > 0 {
             index -= 1;
             match &self.messages[index].state {
-                MessageState::Fetched { ack_deadline, .. } if *ack_deadline <= now => {
+                // PRD #1666 §13 step 4: the ack-wait is the legacy policy's;
+                // a `Receipt`-owned hand-out ends only through the attempt
+                // model.
+                MessageState::Fetched { ack_deadline, .. }
+                    if *ack_deadline <= now
+                        && self.messages[index].owner != Some(AssignmentOwner::Receipt) =>
+                {
                     if self.offer_stays_with_holder(index, now) {
                         // Handed to the same holder again, uncounted: an
                         // offer counted its delivery when it was assigned.
@@ -1676,7 +1779,11 @@ impl Inbox {
         self.messages
             .iter()
             .filter_map(|m| match &m.state {
-                MessageState::Fetched { ack_deadline, .. } => Some(*ack_deadline),
+                MessageState::Fetched { ack_deadline, .. }
+                    if m.owner != Some(AssignmentOwner::Receipt) =>
+                {
+                    Some(*ack_deadline)
+                }
                 MessageState::Claimed { expires, .. } => Some(*expires),
                 MessageState::Queued => m.assign_deadline,
                 _ => None,
@@ -1887,6 +1994,7 @@ impl Inbox {
             excluded: Vec::new(),
             assign_deadline: None,
             offer_hold: OfferHold::NotAsked,
+            owner: None,
         };
         self.messages.push(message);
         let index = self.messages.len() - 1;
@@ -1970,6 +2078,7 @@ impl Inbox {
         message.assign_deadline = None;
         message.first_fetched_at = None;
         message.offer_hold = OfferHold::NotAsked;
+        message.owner = None;
         let previous = message.recipient.take();
         if let Some(holder) = &previous {
             message.excluded.push(holder.clone());

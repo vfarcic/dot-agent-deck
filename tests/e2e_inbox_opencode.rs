@@ -57,6 +57,14 @@ impl OpenCode {
                 config["maxDeliver"].as_str().unwrap_or("5"),
             ),
         ];
+        // PRD #1666 §4: a short keepalive makes POSSESS_TTL three of it, so a
+        // test can outlive several TTLs in seconds.
+        if let Some(ms) = config["keepaliveMs"].as_str() {
+            env.push(("DOT_AGENT_DECK_INBOX_KEEPALIVE_MS", ms));
+        }
+        if let Some(ms) = config["publishDelayMs"].as_str() {
+            env.push(("DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS", ms));
+        }
         // The stand-in orchestrator's offer is posted from the test process,
         // outside its pane's agent.
         if config["offerPool"].is_string() {
@@ -117,9 +125,16 @@ impl OpenCode {
             "orchestration_cwd":daemon.cwd()})
         };
         let pool = config["offerPool"].as_str();
+        let delay = config["publishDelayMs"].as_str();
         let mut start = json!({"op":"start-agent","command":command,"cwd":daemon.home,
             "agent_type":"opencode","rows":40,"cols":140,
             "env":[["DOT_AGENT_DECK_PANE_ID","opencode-fixture"],["PATH",path]],"display_name":"opencode fixture"});
+        if let Some(ms) = delay {
+            start["env"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(["DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS", ms]));
+        }
         if let Some(pool) = pool {
             std::fs::write(
                 daemon.cwd().join(".dot-agent-deck.toml"),
@@ -204,18 +219,44 @@ impl OpenCode {
             .unwrap_or(json!("shown"));
         self.control(json!({"event":"message.updated","properties":{"info":{"id":format!("assistant-{parent}"),"role":"assistant","parentID":parent,"sessionID":session}}}));
     }
-    /// The `hold` lines the plugin's watcher wrote for `id`.
-    fn holds(&self, id: &str) -> usize {
+    /// The control lines the plugin wrote to its watchers, parsed.
+    fn controls(&self) -> Vec<Value> {
         self.events()
             .iter()
             .filter(|e| e["kind"] == "stdin")
-            .filter_map(|e| serde_json::from_str::<Value>(e["text"].as_str()?.trim()).ok())
-            .filter(|line| {
-                line["hold"]
-                    .as_array()
-                    .is_some_and(|ids| ids.iter().any(|held| held == id))
+            .filter_map(|e| e["text"].as_str().map(str::to_owned))
+            .flat_map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+            .collect()
+    }
+    /// PRD #1666 §3: the attempts of `id` the plugin reported committed.
+    fn commits(&self, id: &str) -> usize {
+        self.controls()
+            .iter()
+            .filter_map(|c| c["committed"].as_array().cloned())
+            .flatten()
+            .filter(|at| at["id"] == id)
+            .count()
+    }
+    /// PRD #1666 §6.1: the prompts of `id` marked as a possible repeat.
+    fn marked(&self, id: &str) -> usize {
+        let line = dot_agent_deck::inbox_display::repeat_line(id);
+        self.prompts()
+            .iter()
+            .filter(|p| {
+                p["parts"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains(&line))
             })
             .count()
+    }
+    /// The watchers the plugin started, their argv.
+    fn watchers(&self) -> Vec<Value> {
+        self.events()
+            .into_iter()
+            .filter(|e| e["kind"] == "spawn" && e["args"][1][1] == "wait")
+            .map(|e| e["args"][1].clone())
+            .collect()
     }
     /// The session `sessionID` reports `status` (`busy` or `idle`), once the
     /// plugin host has emitted it.
@@ -458,26 +499,13 @@ fn assert_coalesced_turn_acks_once(mini: bool) {
         assert_eq!(message["ack_how"], "plugin_confirmed");
         assert_eq!(message["deliveries"], 1, "no redelivery: {message}");
     }
-    let acks: Vec<Value> = op
-        .events()
-        .iter()
-        .filter(|e| e["kind"] == "stdin")
-        .filter_map(|e| e["text"].as_str())
-        .flat_map(str::lines)
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|v| v["ack"].as_array().cloned())
-        .flatten()
-        .collect();
-    assert_eq!(
-        acks.len(),
-        3,
-        "exactly three deck acknowledgements: {acks:?}"
-    );
+    // PRD #1666 §3: each sibling's attempt is committed once.
     for id in &ids {
         assert_eq!(
-            acks.iter().filter(|v| **v == *id).count(),
+            op.commits(id),
             1,
-            "each sibling must ack once: {acks:?}"
+            "each sibling commits once: {:?}",
+            op.controls()
         );
     }
 }
@@ -561,45 +589,95 @@ fn opencode_004_double_load_guard_arms_once() {
     op.acknowledge(&id);
 }
 
-/// Scenario: Deliver without emitting an assistant child, then close the watcher input or dispose the fake TUI. No acknowledgement may occur; the watcher must exit and the daemon must requeue the delivery.
+/// Scenario: Deliver without an assistant child, then kill the watcher, close its input, or dispose the fake TUI. Nothing commits and nothing is requeued. A killed watcher is respawned and its registration resumes the attempt the context still holds (`retained`), with no repeat; a closed input or a dispose means the context is done, so its stream ends, the message stays taken and nothing prompts it again.
 #[spec("inbox/opencode/005")]
 #[test]
-fn opencode_005_stdin_eof_and_dispose_exit_and_requeue_unacked() {
+fn opencode_005_a_lost_watcher_resumes_and_a_closed_one_requeues_nothing() {
+    let op = OpenCode::new("home", json!({}));
+    let id = op.post();
+    op.wait_kind("prompt");
+    state(&op.daemon, &op.pane, &id, "fetched");
+    op.control(json!({"killWatcher":true}));
+    op.wait_kind("exit");
+    assert!(
+        common::wait_until(WAIT, || op.watchers().len() >= 2),
+        "the watcher respawns: {:?}",
+        op.events()
+    );
+    assert!(
+        op.watchers()[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "--resumed"),
+        "the respawned watcher says its callbacks survived: {:?}",
+        op.watchers()
+    );
+    assert!(
+        common::wait_until(WAIT, || op
+            .controls()
+            .iter()
+            .any(|c| c["resume_answers"][0]["answer"] == "retained")),
+        "the held attempt is resumed, retained: {:?}",
+        op.controls()
+    );
+    assert!(
+        !common::wait_until(Duration::from_millis(1500), || op.prompts().len() > 1),
+        "a retained attempt is not repeated: {:?}",
+        op.events()
+    );
+    state(&op.daemon, &op.pane, &id, "fetched");
+    op.acknowledge(&id);
+
     for control in [json!({"eof":true}), json!({"dispose":true})] {
         let op = OpenCode::new("home", json!({}));
         let id = op.post();
         op.wait_kind("prompt");
-        state(&op.daemon, &op.pane, &id, "fetched");
-        op.control(control);
+        op.control(control.clone());
         op.wait_kind("exit");
         armed(&op.daemon, &op.pane, 0);
-        state(&op.daemon, &op.pane, &id, "queued");
+        assert!(
+            !common::wait_until(Duration::from_millis(1500), || op.message_state(&id)
+                != "fetched"
+                || op.prompts().len() > 1),
+            "{control}: a closed stream requeues nothing: {}",
+            listing(&op.daemon, &op.pane)
+        );
+        assert_eq!(
+            op.watchers().len(),
+            1,
+            "{control}: a done context starts no watcher"
+        );
     }
 }
 
-/// Scenario: Leave a delivered task without an assistant child. It must remain unacknowledged and be redelivered after the accelerated acknowledgement deadline.
+/// Scenario: Leave a delivered task without an assistant child across many keepalives. The plugin keeps it in every possession snapshot, so it is never repeated and never undeliverable; once OpenCode answers it, it is acknowledged, with one prompt.
 #[spec("inbox/opencode/006")]
 #[test]
-fn opencode_006_aborted_delivery_redelivers_without_ack() {
-    let op = OpenCode::new("session", json!({}));
+fn opencode_006_a_held_delivery_is_never_repeated() {
+    let op = OpenCode::new("session", json!({"keepaliveMs":"300","maxDeliver":"2"}));
     let id = op.post();
     op.wait_kind("prompt");
     assert!(
-        common::wait_until(WAIT, || op.prompts().len() >= 2),
-        "unacked delivery must redeliver: {:?}",
+        !common::wait_until(Duration::from_secs(4), || op.prompts().len() > 1
+            || op.message_state(&id) != "fetched"),
+        "a possessed delivery is never repeated: {:?}",
         op.events()
     );
     assert!(
-        listing(&op.daemon, &op.pane)["messages"]
-            .as_array()
-            .unwrap()
+        op.controls()
             .iter()
-            .all(|m| m["state"] != "acknowledged")
+            .filter(|c| c["possess"].is_object())
+            .count()
+            >= 6,
+        "a snapshot answers each keepalive: {:?}",
+        op.controls()
     );
     op.acknowledge(&id);
+    assert_eq!(op.prompts().len(), 1);
 }
 
-/// Scenario: Load the generated server plugin with mini, full-TUI, run, serve and attach argv. Only the main-thread mini process may arm a native watcher.
+/// Scenario: Load the generated server plugin with mini, full-TUI, run, serve and attach argv. Only the main-thread mini process arms a native watcher; the full TUI's worker keeps a doorbell-only receiver that is never armed, and run, serve and attach start none.
 #[spec("inbox/opencode/007")]
 #[test]
 fn opencode_007_server_inbox_is_mini_only() {
@@ -615,7 +693,18 @@ fn opencode_007_server_inbox_is_mini_only() {
             != 0),
         "a worker-thread server plugin must never arm, even with --mini argv"
     );
-    assert!(!worker.events().iter().any(|event| event["kind"] == "spawn"));
+    // PRD #1666 §4: the full TUI's server context keeps a doorbell-only
+    // receiver for its substitutions, which is never armed.
+    let watchers = worker.watchers();
+    assert_eq!(watchers.len(), 1, "{:?}", worker.events());
+    assert!(
+        watchers[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "--doorbell-only"),
+        "{watchers:?}"
+    );
     drop(worker);
     for (argv, expected) in [
         (json!(["--mini"]), 1),
@@ -761,6 +850,10 @@ while os.read(0,4096):pass
         req["mode"] = json!("stream");
         req["pid"] = json!(pane.pid);
         req["component_version"] = json!("size-probe");
+        // PRD #1666 §11: the OpenCode components declare the floor.
+        if component.starts_with("opencode") {
+            req["adapter_integration"] = json!(2);
+        }
         let mut stream = connect(&daemon, &req);
         armed(&daemon, &pane, 1);
         writeln!(stream.get_mut(), "{{\"repaint\":true}}").unwrap();
@@ -856,13 +949,18 @@ fn opencode_010_full_and_mini_unarmed_fall_back_after_grace() {
     }
 }
 
-/// Scenario: Submit fixed doorbells through the generated server plugin in the full TUI's worker thread and inspect the original text-parts array. An aborted delivery must redeliver, recalling a handled doorbell must leave newer work untouched, and one coalesced assistant turn must acknowledge two intercepted tasks around an intervening human message.
+/// Scenario: Submit fixed doorbells through the generated server plugin in the full TUI's worker thread and inspect the original text-parts array. The substitution hands the message over, bound to the server context's own receiver: an unrelated answer commits nothing and nothing repeats it, the matching answer acknowledges it, recalling a handled doorbell leaves newer work untouched, and one coalesced assistant turn acknowledges two intercepted tasks around an intervening human message, each once.
 #[spec("inbox/opencode/011")]
 #[test]
 fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
     // Hardening M2: interception runs only in the managed interactive
     // OpenCode — the full TUI's worker or `--mini` — never under `run`.
     let op = OpenCode::new("session", json!({"server":true,"worker":true}));
+    // The server context's receiver is registered once it sends a snapshot.
+    assert!(common::wait_until(WAIT, || op
+        .controls()
+        .iter()
+        .any(|c| c["possess"].is_object())));
     let id = op.post();
     op.control(json!({"doorbell":fixed_line(&id)}));
     op.wait_kind("intercepted");
@@ -877,27 +975,14 @@ fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
     assert!(!text.contains("waiting, run: dot-agent-deck inbox fetch"));
     state(&op.daemon, &op.pane, &id, "fetched");
     op.assistant("unrelated-human-message");
-    state(&op.daemon, &op.pane, &id, "queued");
-    op.control(json!({"doorbell":fixed_line(&id),"userID":"retry-user"}));
-    assert!(common::wait_until(WAIT, || op
-        .events()
-        .iter()
-        .filter(|e| e["kind"] == "intercepted")
-        .count()
-        == 2));
-    state(&op.daemon, &op.pane, &id, "fetched");
-    op.assistant("unrelated-retry-message");
     assert!(
-        !common::wait_until(Duration::from_millis(250), || listing(&op.daemon, &op.pane)
-            ["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["id"] == id && m["state"] == "acknowledged")),
-        "an unrelated assistant parent must not acknowledge the retry"
+        !common::wait_until(Duration::from_millis(2500), || op.message_state(&id)
+            != "fetched"),
+        "an unrelated answer neither commits nor requeues the substitution"
     );
-    op.assistant("retry-user");
+    op.assistant("fallback-user");
     state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert_eq!(op.commits(&id), 1, "{:?}", op.controls());
     let next = op.post();
     op.control(json!({"doorbell":fixed_line(&id),"userID":"history-user"}));
     assert!(common::wait_until(WAIT, || op
@@ -905,7 +990,7 @@ fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
         .iter()
         .filter(|e| e["kind"] == "intercepted")
         .count()
-        == 3));
+        == 2));
     op.assistant("history-user");
     state(&op.daemon, &op.pane, &next, "queued");
     let history = op
@@ -924,12 +1009,12 @@ fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
         "a recalled handled doorbell must not ask the model to fetch a newer task"
     );
 
-    // Hold receipt long enough to make the first task remain fetched while
-    // the second is intercepted; a receipt deadline is not the signal under test.
-    let op = OpenCode::new(
-        "session",
-        json!({"server":true,"worker":true,"ackWaitMs":"10000"}),
-    );
+    let op = OpenCode::new("session", json!({"server":true,"worker":true}));
+    // The server context's receiver is registered once it sends a snapshot.
+    assert!(common::wait_until(WAIT, || op
+        .controls()
+        .iter()
+        .any(|c| c["possess"].is_object())));
     let first = op.post();
     op.control(json!({"doorbell":fixed_line(&first),"userID":"coalesced-first"}));
     state(&op.daemon, &op.pane, &first, "fetched");
@@ -947,7 +1032,7 @@ fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
     state(&op.daemon, &op.pane, &first, "acknowledged");
     op.assistant("coalesced-last");
     assert!(
-        !common::wait_until(Duration::from_secs(11), || {
+        !common::wait_until(Duration::from_secs(3), || {
             listing(&op.daemon, &op.pane)["messages"]
                 .as_array()
                 .unwrap()
@@ -956,6 +1041,11 @@ fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
         }),
         "coalesced intercepted tasks must stay acknowledged without redelivery: {}",
         listing(&op.daemon, &op.pane)
+    );
+    assert_eq!(
+        (op.commits(&first), op.commits(&second)),
+        (1, 1),
+        "each commits once"
     );
 }
 
@@ -1046,30 +1136,25 @@ fn opencode_014_server_announces_before_idle_and_delayed_tui_arms() {
     );
 }
 
-/// Scenario: The shown OpenCode session is busy with a long turn when a deck task arrives, so the TUI plugin's prompt waits in OpenCode's queue. For four ack-waits — twice the deck's hand-over limit — every redelivery is answered with hold: no second prompt, and the task is never reported undeliverable. When OpenCode answers the queued prompt the task is acknowledged.
+/// Scenario: The shown OpenCode session is busy with a long turn when a deck task arrives, so the TUI plugin's prompt waits in OpenCode's queue. Across many keepalives — far longer than the deck's possession window — the plugin's snapshots keep holding it: no second prompt, no repeat, never undeliverable. When OpenCode answers the queued prompt the task is acknowledged.
 #[spec("inbox/opencode/024")]
 #[test]
-fn opencode_024_a_prompt_queued_behind_a_long_turn_is_held_not_reinjected() {
-    let op = OpenCode::new("session", json!({"maxDeliver":"2","ackWaitMs":"3000"}));
+fn opencode_024_a_prompt_queued_behind_a_long_turn_is_possessed_not_repeated() {
+    let op = OpenCode::new("session", json!({"maxDeliver":"2","keepaliveMs":"300"}));
     armed(&op.daemon, &op.pane, 1);
     op.session_status("shown", "busy");
     let id = op.post();
     op.wait_kind("prompt");
-    op.held_through(&id, Duration::from_millis(12000));
-    assert!(
-        op.holds(&id) >= 2,
-        "each redelivery answers hold: {:?}",
-        op.events()
-    );
+    op.held_through(&id, Duration::from_secs(5));
     op.acknowledge(&id);
     assert_eq!(op.prompts().len(), 1);
 }
 
-/// Scenario: The OpenCode pane is a worker that takes jobs from a pool, and its shown session is busy with a long turn when the orchestrator offers it a job, so the TUI plugin's prompt waits in OpenCode's queue. For four ack-waits every redelivery of the job is answered with hold: there is no second prompt, and the job stays with this worker instead of going back to its pool. When OpenCode answers the queued prompt, the plugin's acknowledgement claims the job.
+/// Scenario: The OpenCode pane is a worker that takes jobs from a pool, and its shown session is busy with a long turn when the orchestrator offers it a job, so the TUI plugin's prompt waits in OpenCode's queue. Across many keepalives the job stays possessed with this worker: one prompt, never back in its pool. When OpenCode answers the queued prompt, the commit claims the job.
 #[spec("inbox/opencode/027")]
 #[test]
-fn opencode_027_an_offer_queued_behind_a_long_turn_is_held_and_stays_assigned() {
-    let op = OpenCode::new("session", json!({"offerPool":"review","ackWaitMs":"3000"}));
+fn opencode_027_an_offer_queued_behind_a_long_turn_stays_assigned() {
+    let op = OpenCode::new("session", json!({"offerPool":"review","keepaliveMs":"300"}));
     armed(&op.daemon, &op.pane, 1);
     op.session_status("shown", "busy");
     let orch = op.orchestrator.as_ref().unwrap();
@@ -1084,17 +1169,11 @@ fn opencode_027_an_offer_queued_behind_a_long_turn_is_held_and_stays_assigned() 
         .to_string();
     op.wait_kind("prompt");
     assert!(
-        !common::wait_until(Duration::from_millis(12000), || {
-            let state = op.message_state(&id);
-            !(state == "queued" || state == "fetched") || op.prompts().len() != 1
+        !common::wait_until(Duration::from_secs(5), || {
+            op.message_state(&id) != "fetched" || op.prompts().len() != 1
         }),
-        "a held job stays with its holder with one prompt: state {}, events {:?}",
+        "a possessed job stays with its holder with one prompt: state {}, events {:?}",
         op.message_state(&id),
-        op.events()
-    );
-    assert!(
-        op.holds(&id) >= 2,
-        "each redelivery answers hold: {:?}",
         op.events()
     );
     op.wait_kind("user-message");
@@ -1112,7 +1191,7 @@ fn opencode_027_an_offer_queued_behind_a_long_turn_is_held_and_stays_assigned() 
     assert_eq!(op.prompts().len(), 1, "the job ran once");
 }
 
-/// Scenario: A deck task waits behind a busy OpenCode session, then the person aborts: the session goes idle without answering it. The deck's next redelivery prompts it again. A second task waits behind another long turn and the person reverts its prompt (OpenCode removes the message); its redelivery is prompted again too. Each is acknowledged once answered.
+/// Scenario: A deck task waits behind a busy OpenCode session, then the person aborts: the session goes idle without answering it. The plugin drops it from its snapshots, and the deck prompts it again, marked as a possible repeat. A second task waits behind another long turn and the person reverts its prompt (OpenCode removes the message); it is prompted again too. Each is acknowledged once answered.
 #[spec("inbox/opencode/025")]
 #[test]
 fn opencode_025_an_aborted_or_removed_queued_prompt_is_reinjected() {
@@ -1126,6 +1205,11 @@ fn opencode_025_an_aborted_or_removed_queued_prompt_is_reinjected() {
         common::wait_until(WAIT, || op.prompts().len() >= 2),
         "an aborted queued prompt must be prompted again: {:?}",
         op.events()
+    );
+    assert_eq!(
+        op.marked(&aborted),
+        1,
+        "the repeat is marked as a possible repeat"
     );
     op.acknowledge(&aborted);
 
@@ -1160,24 +1244,19 @@ fn opencode_025_an_aborted_or_removed_queued_prompt_is_reinjected() {
     op.acknowledge(&removed);
 }
 
-/// Scenario: Under `opencode --mini` the server plugin starts a deck task in a session busy with a long turn. Each redelivery over four ack-waits is answered with hold, with no second prompt and no undeliverable task, and the task is acknowledged once answered. A second task queued behind another long turn is prompted again once the session goes idle without answering it.
+/// Scenario: Under `opencode --mini` the server plugin starts a deck task in a session busy with a long turn. Across many keepalives it stays possessed, with no second prompt and no undeliverable task, and is acknowledged once answered. A second task queued behind another long turn is prompted again, marked, once the session goes idle without answering it.
 #[spec("inbox/opencode/026")]
 #[test]
-fn opencode_026_mini_holds_a_queued_prompt_and_reinjects_an_aborted_one() {
+fn opencode_026_mini_possesses_a_queued_prompt_and_repeats_an_aborted_one() {
     let op = OpenCode::new(
         "session",
-        json!({"server":true,"argv":["--mini"],"maxDeliver":"2","ackWaitMs":"3000"}),
+        json!({"server":true,"argv":["--mini"],"maxDeliver":"2","keepaliveMs":"300"}),
     );
     armed(&op.daemon, &op.pane, 1);
     op.session_status("shown", "busy");
     let held = op.post();
     op.wait_kind("prompt");
-    op.held_through(&held, Duration::from_millis(12000));
-    assert!(
-        op.holds(&held) >= 2,
-        "each redelivery answers hold: {:?}",
-        op.events()
-    );
+    op.held_through(&held, Duration::from_secs(5));
     op.acknowledge(&held);
 
     op.session_status("shown", "busy");
@@ -1189,5 +1268,133 @@ fn opencode_026_mini_holds_a_queued_prompt_and_reinjects_an_aborted_one() {
         "an aborted queued prompt must be prompted again: {:?}",
         op.events()
     );
+    assert_eq!(op.marked(&aborted), 1);
     op.acknowledge(&aborted);
+}
+
+/// Scenario: The plugin's event loop stalls for longer than three keepalives while its watcher lives on. The watcher, hearing no snapshot, closes the stream; once the loop runs again the plugin respawns its watcher, whose registration resumes the attempt the context still holds, so it is not repeated and is acknowledged when answered.
+#[spec("inbox/opencode/033")]
+#[test]
+fn opencode_033_a_stalled_adapter_is_dropped_by_its_watcher_and_resumes() {
+    let op = OpenCode::new("session", json!({"keepaliveMs":"300"}));
+    let id = op.post();
+    op.wait_kind("prompt");
+    op.control(json!({"stall": 2500}));
+    op.wait_kind("stalled");
+    assert!(
+        common::wait_until(WAIT, || op.events().iter().any(|e| e["kind"] == "exit")),
+        "the watcher closes a stream its adapter stopped answering: {:?}",
+        op.events()
+    );
+    assert!(common::wait_until(WAIT, || op.watchers().len() >= 2));
+    assert!(
+        common::wait_until(WAIT, || op
+            .controls()
+            .iter()
+            .any(|c| c["resume_answers"][0]["answer"] == "retained")),
+        "{:?}",
+        op.controls()
+    );
+    assert!(
+        !common::wait_until(Duration::from_millis(1500), || op.prompts().len() > 1),
+        "not repeated: {:?}",
+        op.events()
+    );
+    op.acknowledge(&id);
+}
+
+/// Scenario: The agent starts on a deck message and the watcher's receipt publish takes two seconds — several keepalives. Throughout, the watcher keeps the attempt in each snapshot it forwards, so it never lapses or repeats; the commit then settles it with one prompt.
+#[spec("inbox/opencode/034")]
+#[test]
+fn opencode_034_a_delayed_receipt_publish_is_held_across_keepalives() {
+    let op = OpenCode::new(
+        "session",
+        json!({"keepaliveMs":"300","publishDelayMs":"2000"}),
+    );
+    let id = op.post();
+    op.wait_kind("user-message");
+    let parent = op
+        .events()
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "user-message")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    op.assistant(&parent);
+    assert!(
+        !common::wait_until(Duration::from_millis(1500), || op.prompts().len() > 1),
+        "an in-flight publish is still possessed: {:?}",
+        op.events()
+    );
+    state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert_eq!(op.prompts().len(), 1);
+}
+
+/// Scenario: Under `opencode --mini`, OpenCode re-runs the server plugin while a deck message is handed over and unanswered. The new instance knows nothing of it and answers the resume `unknown`, so the deck gives it one repeat on the same generation, marked as a possible repeat; the answer to that acknowledges it.
+#[spec("inbox/opencode/035")]
+#[test]
+fn opencode_035_an_unknown_reload_gets_one_marked_repeat() {
+    let op = OpenCode::new("session", json!({"server":true,"argv":["--mini"]}));
+    armed(&op.daemon, &op.pane, 1);
+    let id = op.post();
+    op.wait_kind("prompt");
+    op.control(json!({"reload": true}));
+    op.wait_kind("reloaded");
+    assert!(
+        common::wait_until(WAIT, || op.prompts().len() >= 2),
+        "the reloaded instance is handed a repeat: {:?}",
+        op.events()
+    );
+    assert_eq!(
+        op.marked(&id),
+        1,
+        "the repeat is marked: {:?}",
+        op.prompts()
+    );
+    assert!(
+        op.controls()
+            .iter()
+            .any(|c| c["resume_answers"][0]["answer"] == "unknown"),
+        "{:?}",
+        op.controls()
+    );
+    op.acknowledge(&id);
+}
+
+/// Scenario: The full TUI runs both contexts: the server plugin's doorbell-only receiver and the TUI plugin's receiver. The TUI's watcher is killed and respawns; its attempt is resumed and retained, and the server context's receiver is untouched — a doorbell substitution afterwards still binds to it and settles on its answer.
+#[spec("inbox/opencode/036")]
+#[test]
+fn opencode_036_server_and_tui_contexts_reconnect_separately() {
+    let op = OpenCode::new("home", json!({"preServer":true}));
+    armed(&op.daemon, &op.pane, 1);
+    let delivered = op.post();
+    op.wait_kind("prompt");
+    let tui_watchers = || op.watchers().iter().filter(|w| w[3] == "opencode").count();
+    assert!(
+        op.watchers().iter().any(|w| w[3] == "opencode-mini"
+            && w.as_array().unwrap().iter().any(|a| a == "--doorbell-only")),
+        "the server context keeps its own doorbell-only receiver: {:?}",
+        op.watchers()
+    );
+    op.control(json!({"killWatcher":true}));
+    assert!(
+        common::wait_until(WAIT, || tui_watchers() >= 2),
+        "the TUI watcher respawns: {:?}",
+        op.events()
+    );
+    assert!(
+        common::wait_until(WAIT, || op
+            .controls()
+            .iter()
+            .any(|c| c["resume_answers"][0]["answer"] == "retained")),
+        "{:?}",
+        op.controls()
+    );
+    assert!(
+        !common::wait_until(Duration::from_millis(1000), || op.prompts().len() > 1),
+        "the TUI attempt is not repeated"
+    );
+    op.acknowledge(&delivered);
 }

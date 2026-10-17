@@ -806,6 +806,34 @@ pub struct DesktopInbox {
     /// messages, so the tile shows them as waiting to wake.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub wake_stalled: bool,
+    /// PRD #1666 §6.5: the deck messages waiting on the user's Retry or
+    /// Cancel. Sender and subject are display copies.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<DesktopInboxAttention>,
+    /// PRD #1666 §11: `cli_too_old`, `adapter_too_old` or `not_armed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
+    /// PRD #1666 §3: the deck's error recording receipts, a display copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipts_degraded: Option<String>,
+    /// PRD #1666 §7: delivered messages whose evidence pauses hand-outs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_paused: Option<usize>,
+}
+
+/// PRD #1666 §6.4: one deck message a tile lists with its own Retry and
+/// Cancel.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopInboxAttention {
+    pub message_id: String,
+    pub revision: u64,
+    /// `uncertain`, `out_of_attempts` or `held_long`.
+    pub kind: String,
+    pub from_label: String,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 /// PRD #1541: the webview's view of `agent_registry::PromptKeys` — the keys
@@ -2206,6 +2234,33 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             .unwrap_or_else(|| "none".to_string()),
         component: summary.component.as_deref().map(safe_display_text),
         wake_stalled: summary.wake_stalled,
+        attention: summary
+            .notices
+            .attention
+            .iter()
+            .filter_map(|item| {
+                let kind = serde_json::to_value(item.kind).ok()?.as_str()?.to_string();
+                Some(DesktopInboxAttention {
+                    message_id: item.message_id.clone(),
+                    revision: item.revision,
+                    kind,
+                    from_label: safe_display_text(&item.from_label),
+                    subject: safe_display_text(&item.subject),
+                    task_id: item.task_id.clone(),
+                })
+            })
+            .collect(),
+        integration: summary
+            .notices
+            .integration
+            .and_then(|notice| serde_json::to_value(notice).ok())
+            .and_then(|value| value.as_str().map(str::to_string)),
+        receipts_degraded: summary
+            .notices
+            .receipts_degraded
+            .as_deref()
+            .map(safe_display_text),
+        evidence_paused: summary.notices.evidence_paused,
     });
     let delivery_notice = live
         .filter(|snapshot| snapshot.status == SessionStatus::Error)
@@ -4007,6 +4062,7 @@ mod tests {
             wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
             component: None,
             wake_stalled: false,
+            notices: Default::default(),
         });
         let value = serde_json::to_value(map_agent(record)).unwrap();
         assert_eq!(
@@ -4016,6 +4072,46 @@ mod tests {
         assert_eq!(value["inbox"]["fetched"], 1);
         assert_eq!(value["inbox"]["undeliverable"], 1);
         assert_eq!(value["inbox"]["wake"], "doorbell");
+        assert!(
+            value["inbox"].get("attention").is_none(),
+            "absent while empty"
+        );
+    }
+
+    /// Scenario: Map a daemon record whose inbox summary lists an uncertain delivery, an integration notice, failed receipts and paused hand-outs into the desktop DTO; each survives, by its wire spelling, for the tile's notice row and its Retry and Cancel rows.
+    #[test]
+    fn agent_mapping_carries_the_inbox_card_notices() {
+        let mut record = fixture_record();
+        record.inbox = Some(
+            serde_json::from_value(serde_json::json!({
+                "queued": 0, "fetched": 1, "undeliverable": 0, "wake": "native",
+                "attention": [{"message_id": "m-k3xzq2ab-0f3c9a71d2e4b850", "revision": 6,
+                    "kind": "out_of_attempts", "from_label": "the orchestrator\u{1b}[31m",
+                    "subject": "review"}],
+                "integration": "not_armed",
+                "receipts_degraded": "disk full",
+                "evidence_paused": 3
+            }))
+            .unwrap(),
+        );
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        let inbox = &value["inbox"];
+        assert_eq!(
+            inbox["attention"][0]["messageId"],
+            "m-k3xzq2ab-0f3c9a71d2e4b850"
+        );
+        assert_eq!(inbox["attention"][0]["revision"], 6);
+        assert_eq!(inbox["attention"][0]["kind"], "out_of_attempts");
+        assert!(
+            !inbox["attention"][0]["fromLabel"]
+                .as_str()
+                .unwrap()
+                .contains('\u{1b}'),
+            "display copies only: {inbox}"
+        );
+        assert_eq!(inbox["integration"], "not_armed");
+        assert_eq!(inbox["receiptsDegraded"], "disk full");
+        assert_eq!(inbox["evidencePaused"], 3);
     }
 
     /// Issue #856: the CLI column is the DAEMON's answer, copied through

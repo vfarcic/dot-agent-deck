@@ -920,6 +920,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         // PR #1735 fifth review (B-05): the saved bodies of long messages are
         // listed for this run, and those earlier runs left are taken over.
         hub.open_spill_ledger(&state_dir);
+        // PRD #1666 §3: this run's receipt spool, with the instances earlier
+        // runs left reaped. A spool that cannot start costs suppression, which
+        // every card it affects says, not delivery.
+        match crate::inbox_receipt::Spool::start(&state_dir) {
+            Ok(spool) => hub.set_spool(spool),
+            Err(error) => {
+                warn!(%error, "could not start the inbox receipt spool; deck messages may repeat");
+            }
+        }
         pty_registry.install_inbox(hub);
     }
     let inbox_ticker = pty_registry.inbox().spawn_ticker();
@@ -5405,6 +5414,48 @@ fn handle_inbox_fetch(
     if req.doorbell.is_some() && doorbell.is_none() {
         return crate::event::InboxWaitReply::messages(Vec::new());
     }
+    // PRD #1666 §4, §11: a doorbell substitution by a receipt component binds
+    // its attempts to that component's own stream; one from an OpenCode
+    // plugin below the floor is refused, and its card says why.
+    if let Some(rx) = req.rx {
+        if req
+            .adapter_integration
+            .is_none_or(|declared| declared < crate::inbox_hub::ADAPTER_INTEGRATION)
+        {
+            registry.inbox().refuse_old_adapter(&req.pane_id, agent_id);
+            return crate::event::InboxWaitReply::refused(
+                "adapter_too_old",
+                crate::inbox_display::ADAPTER_TOO_OLD,
+            );
+        }
+        let fetched = registry
+            .inbox()
+            .receipt_fetch(&req.pane_id, agent_id, rx, doorbell, budget);
+        info!(
+            pane_id = %escape_id_for_log(&req.pane_id),
+            consumer = ?req.consumer,
+            rx,
+            count = fetched.as_ref().map_or(0, Vec::len),
+            refused = ?fetched.as_ref().err(),
+            "Received inbox fetch"
+        );
+        return match fetched {
+            Ok(messages) => crate::event::InboxWaitReply::messages(messages),
+            Err(code) => crate::event::InboxWaitReply::refused(
+                code,
+                "the deck could not issue to that receiver",
+            ),
+        };
+    }
+    if req.consumer == InboxFetchConsumer::DoorbellHook
+        && registry.spawn_agent_type(agent_id) == Some(crate::event::AgentType::OpenCode)
+    {
+        registry.inbox().refuse_old_adapter(&req.pane_id, agent_id);
+        return crate::event::InboxWaitReply::refused(
+            "adapter_too_old",
+            crate::inbox_display::ADAPTER_TOO_OLD,
+        );
+    }
     let messages = registry.inbox().fetch_named_within(
         &req.pane_id,
         agent_id,
@@ -5430,15 +5481,15 @@ async fn handle_inbox_list(
     state: &SharedState,
     req: &crate::event::InboxListRequest,
     agent_id: &str,
-) -> Result<crate::event::InboxListReply, crate::event::InboxWaitReply> {
+) -> Result<crate::event::InboxListReply, Box<crate::event::InboxWaitReply>> {
     let hub = registry.inbox();
     let panes: Vec<String> = if req.all {
         let state = state.read().await;
         if !state.orchestrator_pane_ids.contains(&req.pane_id) {
-            return Err(crate::event::InboxWaitReply::refused(
+            return Err(Box::new(crate::event::InboxWaitReply::refused(
                 "not_orchestrator",
                 "only an orchestrator pane may list its orchestration's inboxes",
-            ));
+            )));
         }
         let mut panes = vec![req.pane_id.clone()];
         if let Some(identity) = state.pane_orchestration_map.get(&req.pane_id) {
@@ -5980,6 +6031,11 @@ async fn run_hook_loop_with_limits(
                                     // idle timeout: a waiter is idle by design, and
                                     // the waiter pool bounds it instead.
                                     drop(permit.take());
+                                    let arm = crate::inbox_hub::ReceiptArm {
+                                        adapter_integration: req.adapter_integration,
+                                        doorbell_only: req.doorbell_only,
+                                        resumed: req.resumed,
+                                    };
                                     crate::inbox_hub::serve_waiter(
                                         hub,
                                         req.pane_id,
@@ -5987,6 +6043,7 @@ async fn run_hook_loop_with_limits(
                                         req.mode,
                                         req.component,
                                         instance,
+                                        arm,
                                         reader,
                                         write_half,
                                         |agent: &str| pty_registry.nudge_repaint(agent),

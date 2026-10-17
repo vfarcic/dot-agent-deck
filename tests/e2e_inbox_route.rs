@@ -599,6 +599,38 @@ fn route_009_a_task_held_through_a_long_turn_raises_no_false_notice() {
     route::no_messages(&daemon, &orch, Duration::from_millis(1200));
 }
 
+/// Scenario: A worker's OpenCode receipt stream holds a delegated task queued behind a long turn, naming it in a fresh snapshot every keepalive. For ten seconds — past ack-wait × max_deliver and past the undelivered-notice deadline — the task is never repeated nor undeliverable and the orchestrator gets no notice; when the stream commits it, it is delivered and the orchestrator still hears nothing.
+#[spec("inbox/route/013")]
+#[test]
+fn route_013_a_task_possessed_through_a_long_turn_raises_no_false_notice() {
+    let daemon = daemon_unbound(&[
+        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500"),
+        ("DOT_AGENT_DECK_INBOX_MAX_DELIVER", "2"),
+        (route::UNDELIVERED_MS, "4500"),
+        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
+        ("DOT_AGENT_DECK_INBOX_KEEPALIVE_MS", "300"),
+    ]);
+    let (orch, worker) = route::team(&daemon, false);
+    let mut stream = receipt_stream(&daemon, &worker);
+    let id = route::delegate(&daemon, &orch, route::TASK, false);
+    let handed = receipt_handout(&mut stream, &id);
+    let written = possess_for(&mut stream, &handed, Duration::from_secs(10));
+    assert!(
+        !written
+            .iter()
+            .any(|w| w["messages"].as_array().is_some_and(|m| !m.is_empty())),
+        "a possessed task is never repeated: {written:?}"
+    );
+    assert_eq!(message_state(&daemon, &worker, &id), "fetched");
+    route::no_messages(&daemon, &orch, Duration::from_millis(300));
+    receipt_control(
+        &mut stream,
+        json!({"committed": [{"id": id, "a": handed["a"], "e": handed["e"]}]}),
+    );
+    state(&daemon, &worker, &id, "acknowledged");
+    route::no_messages(&daemon, &orch, Duration::from_millis(1200));
+}
+
 /// Scenario: A worker's component holds a delegated task without answering the deck's redeliveries, so after max_deliver hand-overs the task is undeliverable and the orchestrator is told so. The component then acknowledges it: the task is recorded as delivered and the orchestrator gets a correction naming the task, saying it reached the worker after all.
 #[spec("inbox/route/010")]
 #[test]

@@ -322,7 +322,10 @@ pub fn decide(bell: &Bell, facts: &Facts, config: &DoorbellConfig, now: Instant)
 /// again under the writer before each byte of a ring, so a component that
 /// arms or announces while the ring waits for the writer stops it.
 pub fn ring_still_admitted(inbox: &DoorbellFacts, config: &DoorbellConfig, now: Instant) -> bool {
-    inbox.armed == 0
+    // PRD #1666 §11: an incompatible integration gets no doorbell; its mail
+    // waits queued under the card's notice.
+    !inbox.blocked
+        && inbox.armed == 0
         && inbox
             .native_announced_at
             .is_none_or(|at| now >= at + config.arm_grace)
@@ -730,6 +733,7 @@ mod tests {
                 queued: queued.iter().map(|s| s.to_string()).collect(),
                 armed: 0,
                 native_announced_at: None,
+                blocked: false,
             },
             idle: true,
             draft: false,

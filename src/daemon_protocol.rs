@@ -1038,6 +1038,44 @@ impl HostMetrics {
     }
 }
 
+/// Capability string for [`AttachRequest::InboxRetry`] and
+/// [`AttachRequest::InboxCancel`] (PRD #1666 §6.4): the user's Retry and
+/// Cancel on a deck message an agent card lists. Held by
+/// [`crate::daemon_client::DaemonClient::inbox_action`], which withholds both
+/// verbs from a daemon that does not advertise it (CLAUDE.md rule 18, second
+/// rung), so neither moves [`PROTOCOL_VERSION`]. Advertised on every
+/// platform: neither dispatch arm is `#[cfg]`-gated.
+pub const CAP_INBOX_ACTIONS: &str = "inbox-actions";
+
+/// PRD #1666 §2: how a Retry or Cancel fared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxActionOutcome {
+    /// Applied at the revision the client showed.
+    Applied,
+    /// Another client acted first, or the message changed since: the card
+    /// shows where it stands now.
+    Stale,
+    /// The message is in a state the verb does not apply to.
+    NotApplicable,
+    /// It reached the agent after all.
+    AlreadySettled,
+    /// Retry refused past the attempt budget.
+    RetryLimit,
+    /// No such message for that agent generation.
+    Unknown,
+}
+
+/// PRD #1666 §2: the answer to [`AttachRequest::InboxRetry`] and
+/// [`AttachRequest::InboxCancel`], on [`AttachResponse::inbox_action`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxActionReply {
+    pub outcome: InboxActionOutcome,
+    /// The message's revision now, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+}
+
 /// Capability string for [`AttachRequest::CloseAgents`] (PRD #1589): close
 /// dispatched units, one agent, or one orchestration instance, with the
 /// default refusals and the caller authority the `close` verb applies. Held by
@@ -1228,6 +1266,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
     CAP_INBOX,
+    CAP_INBOX_ACTIONS,
     CAP_HOST_METRICS,
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
@@ -1249,6 +1288,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_RESTART_DAEMON,
     CAP_TURN_REPLIES,
     CAP_INBOX,
+    CAP_INBOX_ACTIONS,
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
 ];
@@ -2808,6 +2848,30 @@ pub enum AttachRequest {
         spill_path: Option<String>,
         origin: crate::inbox_hub::PostOrigin,
     },
+    /// PRD #1666 §6.4: the user's Retry on a deck message `agent_id`'s card in
+    /// `pane_id` lists as uncertain or held_long, at the `revision` it showed.
+    /// `request_id` names the press, so a retransmission answers as before
+    /// and a second client's press is told it came too late. The reply rides
+    /// back on [`AttachResponse::inbox_action`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_INBOX_ACTIONS`]**: an
+    /// older daemon has no such variant and refuses it with the generic
+    /// `malformed request: …`, changing nothing.
+    InboxRetry {
+        pane_id: String,
+        agent_id: String,
+        message_id: String,
+        revision: u64,
+        request_id: String,
+    },
+    /// PRD #1666 §6.4: the user's Cancel, as [`Self::InboxRetry`].
+    InboxCancel {
+        pane_id: String,
+        agent_id: String,
+        message_id: String,
+        revision: u64,
+        request_id: String,
+    },
     /// PRD #1666 S3: list the inbox of `pane_id` — every message addressed to
     /// it, live and recent history — or, with no pane, of the whole deck. The
     /// reply rides back on [`AttachResponse::inbox_messages`].
@@ -3719,6 +3783,12 @@ pub struct AttachResponse {
     /// other response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbox_messages: Option<Vec<crate::inbox::MessageSummary>>,
+    /// PRD #1666 §6.4: the answer to [`AttachRequest::InboxRetry`] and
+    /// [`AttachRequest::InboxCancel`]. `None` on every other response.
+    /// Additive and optional, and the requests it answers are
+    /// capability-gated, so neither moves [`PROTOCOL_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox_action: Option<InboxActionReply>,
     /// PRD #1631: why an [`AttachRequest::AnswerQuestion`] was refused, so a
     /// client never branches on `error` text. `None` on success and on every
     /// other response. Unlike [`Self::close_agents`], an answer refusal is
@@ -6920,6 +6990,77 @@ async fn handle_connection(
                 spill_path,
                 origin,
             );
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::InboxRetry {
+            pane_id,
+            agent_id,
+            message_id,
+            revision,
+            request_id,
+        }
+        | AttachRequest::InboxCancel {
+            pane_id,
+            agent_id,
+            message_id,
+            revision,
+            request_id,
+        } if !is_valid_message_id_text(&message_id) => {
+            let _ = (pane_id, agent_id, revision, request_id);
+            let resp = AttachResponse {
+                ok: true,
+                inbox_action: Some(InboxActionReply {
+                    outcome: InboxActionOutcome::Unknown,
+                    revision: None,
+                }),
+                ..AttachResponse::default()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::InboxRetry {
+            pane_id,
+            agent_id,
+            message_id,
+            revision,
+            request_id,
+        } => {
+            let hub = std::sync::Arc::clone(registry.inbox());
+            let reply = hub.inbox_action(
+                &pane_id,
+                &agent_id,
+                &message_id,
+                revision,
+                true,
+                &request_id,
+            );
+            let resp = AttachResponse {
+                ok: true,
+                inbox_action: Some(reply),
+                ..AttachResponse::default()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::InboxCancel {
+            pane_id,
+            agent_id,
+            message_id,
+            revision,
+            request_id,
+        } => {
+            let hub = std::sync::Arc::clone(registry.inbox());
+            let reply = hub.inbox_action(
+                &pane_id,
+                &agent_id,
+                &message_id,
+                revision,
+                false,
+                &request_id,
+            );
+            let resp = AttachResponse {
+                ok: true,
+                inbox_action: Some(reply),
+                ..AttachResponse::default()
+            };
             write_resp(&mut stream, &resp).await?
         }
         AttachRequest::ListInbox { pane_id, bodies } => {
@@ -11596,6 +11737,8 @@ mod tests {
             returned: false,
             wake_stalled: false,
             wake_update: false,
+            attention_update: false,
+            notices: Default::default(),
         });
         let value = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -14624,4 +14767,9 @@ mod question_answer_tests {
         assert_eq!(broadcast.resolved_question_id(), Some("q-bash"));
         assert!(broadcast.is_daemon_synthetic());
     }
+}
+
+/// PRD #1666 §6.4: a Retry or Cancel names a message by its exact id.
+fn is_valid_message_id_text(text: &str) -> bool {
+    crate::inbox::is_valid_message_id(text)
 }

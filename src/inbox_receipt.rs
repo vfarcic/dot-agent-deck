@@ -3,10 +3,10 @@
 //!
 //! A receiver component publishes an immutable stage record for a delivery
 //! attempt (`<msg>.<A>.<e>.<stage>`) into its agent generation's spool before
-//! the daemon is asked anything, and the daemon reads it back. **This module is
-//! library-only** (§13 step 3): nothing in the daemon calls it yet, records are
-//! published and read, nothing is pruned, and no suppression decision is drawn
-//! from them.
+//! the daemon is asked anything, and the daemon reads it back. Since §13 step
+//! 4 the daemon starts one [`Spool`] per run and the hub's receipt engine
+//! (`crate::inbox_engine`) reads it before it lets an attempt lapse; an
+//! attempt's files are removed when its evidence reservation is returned.
 //!
 //! A spool record is bearer evidence: whoever holds an attempt's cap can
 //! publish it. So it carries only the stages whose meaning holds whoever bears
@@ -148,6 +148,18 @@ impl Cap {
         hex(&self.0)
     }
 
+    /// The cap whose [`Self::hex`] is `text`; `None` for anything else.
+    pub fn from_hex(text: &str) -> Option<Cap> {
+        if text.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0u8; 16];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(text.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        Some(Cap(bytes))
+    }
+
     fn hash_hex(hex_cap: &str) -> [u8; 32] {
         Sha256::digest(hex_cap.as_bytes()).into()
     }
@@ -287,6 +299,30 @@ impl Spool {
     /// The daemon's side of one agent generation's spool, created as needed.
     pub fn generation(&self, pane: &str, agent: &str) -> io::Result<GenerationSpool> {
         GenerationSpool::at(&self.dir, pane, agent, true)
+    }
+
+    /// Remove an exited generation's spool (§2 T9): every record, cap and
+    /// revoke marker it held, without following a link. Its pane directory
+    /// stays for the pane's next generation.
+    pub fn remove_generation(&self, pane: &str, agent: &str) -> io::Result<()> {
+        if !valid_component(pane) || !valid_component(agent) {
+            return Err(invalid(
+                "a spool generation is named by two path components",
+            ));
+        }
+        let pane_dir = match self.dir.child(pane, false) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut budget = usize::MAX;
+        if remove_tree(&pane_dir, OsStr::new(agent), 1, &mut budget)? {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "an exited generation's receipts were not all removed",
+            ))
+        }
     }
 }
 
@@ -548,6 +584,31 @@ impl GenerationSpool {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    /// Remove every spool file of one attempt — its two records, its caps
+    /// and its revoke marker — once its evidence reservation is returned
+    /// (§7). A file already gone is not an error; the first other failure is
+    /// returned after every removal was tried.
+    pub fn remove_attempt(&self, msg: &str, a: u32, e: u32) -> io::Result<()> {
+        let attempt = attempt_name(msg, a, e)?;
+        let mut first = None;
+        let mut gone = |result: io::Result<()>| {
+            if let Err(error) = result
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                first.get_or_insert(error);
+            }
+        };
+        for stage in [RecordStage::Handed, RecordStage::Committed] {
+            gone(
+                self.rec
+                    .remove_file(format!("{attempt}.{}", stage.as_str())),
+            );
+        }
+        gone(self.caps.remove_file(&attempt));
+        gone(self.revoked.remove_file(&attempt));
+        first.map_or(Ok(()), Err)
     }
 
     pub fn revoked(&self, msg: &str, a: u32, e: u32) -> bool {
@@ -981,10 +1042,9 @@ struct IssuedCaps {
 /// The daemon's per-generation suppression evidence (§7): the hashes of every
 /// issued attempt's caps and the records admitted on them. It holds keys only
 /// for issued attempts, at most two records each, so its size follows the
-/// attempts issued. In this slice it only records: nothing is pruned, nothing
-/// is suppressed from it, and it does not yet coordinate with the attempt
-/// model's evidence reservations, which return without removing any file;
-/// §13 step 4 connects a reservation's return to the removal of its files.
+/// attempts issued. An attempt is forgotten ([`Self::forget`]) when the
+/// attempt model returns its evidence reservation, which is also when its
+/// spool files are removed ([`GenerationSpool::remove_attempt`]).
 #[derive(Debug, Default)]
 pub struct EvidenceStore {
     issued: BTreeMap<(String, u32, u32), IssuedCaps>,
@@ -1031,6 +1091,14 @@ impl EvidenceStore {
 
     pub fn admitted(&self, key: &RecordKey) -> bool {
         self.admitted.contains(key)
+    }
+
+    /// Forget an attempt whose evidence was reclaimed: its caps no longer
+    /// admit a record, and its admitted records are dropped.
+    pub fn forget(&mut self, msg: &str, a: u32, e: u32) {
+        self.issued.remove(&(msg.to_string(), a, e));
+        self.admitted
+            .retain(|key| !(key.msg == msg && key.a == a && key.e == e));
     }
 
     /// Keys held: issued attempts plus admitted records.

@@ -482,6 +482,7 @@ mod tests {
             wake,
             component: None,
             wake_stalled: false,
+            notices: Default::default(),
         };
         assert_eq!(inbox_cell(Some(&summary(2, 1, WakePath::Native))), "2q 1f");
         assert_eq!(inbox_cell(Some(&summary(0, 2, WakePath::Native))), "0q 2f");

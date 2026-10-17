@@ -70,7 +70,32 @@ export type AgentInbox = {
   component?: string;
   /** PR #1735 fifth review (R5): nothing has woken the agent for its waiting messages. */
   wakeStalled?: boolean;
+  /** PRD #1666 §6.5: the deck messages waiting on the user's Retry or Cancel. */
+  attention?: InboxAttentionItem[];
+  /** PRD #1666 §11: why the agent's integration takes no deck messages yet. */
+  integration?: "cli_too_old" | "adapter_too_old" | "not_armed";
+  /** PRD #1666 §3: the deck's error recording receipts for this agent. */
+  receiptsDegraded?: string;
+  /** PRD #1666 §7: delivered messages whose evidence pauses hand-outs. */
+  evidencePaused?: number;
 };
+/**
+ * PRD #1666 §6.4: one deck message an agent card lists for the user to decide
+ * on. `revision` is what Retry and Cancel compare on, so a second client
+ * acting on the same message is told it was too late.
+ */
+export type InboxAttentionItem = {
+  messageId: string;
+  revision: number;
+  kind: "uncertain" | "out_of_attempts" | "held_long";
+  fromLabel: string;
+  subject: string;
+  taskId?: string;
+};
+/** PRD #1666 §6.4: the two user actions on a listed deck message. */
+export type InboxActionVerb = "retry" | "cancel";
+/** PRD #1666 §2: the daemon's answer to Retry or Cancel. */
+export type InboxActionResult = { outcome: string };
 /**
  * Issue #1678: the background work an agent left running after its turn ended,
  * as the DAEMON counts it — commands still running in their own session and
@@ -1477,6 +1502,8 @@ export interface DeckRuntimeState {
   upgradeDaemon?: (deckId: string, onEvent: (event: import("./lib/upgrade").UpgradeEvent) => void) => Promise<import("./lib/upgrade").UpgradeOutcome>;
   /** Answer question `questionId` of the upgrade `upgradeId`. */
   decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
+  /** PRD #1666 §6.4: Retry or Cancel one listed deck message; absent where no daemon can answer. */
+  inboxAction?: (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**

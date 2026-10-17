@@ -188,6 +188,8 @@ fn hand_over_request(
         max_bytes,
         ack: false,
         doorbell: rung.map(str::to_string),
+        adapter_integration: None,
+        rx: None,
     }
 }
 

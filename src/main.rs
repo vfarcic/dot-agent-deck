@@ -787,6 +787,14 @@ enum InboxAction {
         /// is still waiting. Implies `--json`.
         #[arg(long, hide = true, value_name = "ID")]
         doorbell: Option<String>,
+        /// The integration the component running a doorbell fetch declares
+        /// (PRD #1666 §11). Run by that component, not by hand.
+        #[arg(long, hide = true, value_name = "N")]
+        adapter_integration: Option<u32>,
+        /// The receiver incarnation a doorbell fetch's attempts are bound to:
+        /// the component's own stream (PRD #1666 §4).
+        #[arg(long, hide = true, value_name = "RX")]
+        rx: Option<u64>,
     },
     /// List your messages and their delivery states.
     List {
@@ -808,6 +816,17 @@ enum InboxAction {
         /// `{"ack":[…]}` / `{"nack":[…]}` lines from stdin.
         #[arg(long)]
         stream: bool,
+        /// The deck integration the component that runs this watcher
+        /// declares; with it the stream carries deck message receipts.
+        #[arg(long, value_name = "N")]
+        adapter_integration: Option<u32>,
+        /// Register a receiver that only carries the component's doorbell
+        /// substitutions.
+        #[arg(long, hide = true)]
+        doorbell_only: bool,
+        /// The component's callbacks survived since its previous watcher.
+        #[arg(long, hide = true)]
+        resumed: bool,
     },
     /// Tell the deck an agent's native inbox component is about to arm. Run
     /// by those components, not by hand.
@@ -1749,14 +1768,32 @@ fn main() -> ExitCode {
         }
         Some(Commands::Inbox { action }) => match action {
             InboxAction::Fetch {
-                doorbell: Some(id), ..
-            } => dot_agent_deck::inbox_cli::fetch_for_doorbell(&id),
+                doorbell: Some(id),
+                adapter_integration,
+                rx,
+                ..
+            } => dot_agent_deck::inbox_cli::fetch_for_doorbell(&id, adapter_integration, rx),
             InboxAction::Fetch {
                 json,
                 doorbell: None,
+                ..
             } => dot_agent_deck::inbox_cli::fetch(json),
             InboxAction::List { json, all } => dot_agent_deck::inbox_cli::list(json, all),
-            InboxAction::Wait { agent, stream } => dot_agent_deck::inbox_cli::wait(&agent, stream),
+            InboxAction::Wait {
+                agent,
+                stream,
+                adapter_integration,
+                doorbell_only,
+                resumed,
+            } => dot_agent_deck::inbox_cli::wait(
+                &agent,
+                stream,
+                dot_agent_deck::inbox_cli::Receipt {
+                    adapter_integration,
+                    doorbell_only,
+                    resumed,
+                },
+            ),
             InboxAction::Announce { agent } => dot_agent_deck::inbox_cli::announce(&agent),
             InboxAction::Publish { topic, body } => {
                 dot_agent_deck::inbox_cli::publish(&topic, body.text, body.file)

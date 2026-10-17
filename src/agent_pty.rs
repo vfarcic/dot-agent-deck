@@ -9355,6 +9355,7 @@ impl AgentPtyRegistry {
         // path replays. See `RunningAgent::spawn_agent_type`.
         let agent_type = opts.agent_type.clone();
         let spawn_agent_type = opts.agent_type.clone();
+        let inbox_agent_type = opts.agent_type.clone();
 
         // PRD #92 F9 followup-7: pre-allocate the registry id *before*
         // `spawn` so we can inject `DOT_AGENT_DECK_AGENT_ID = <id>` into
@@ -9463,6 +9464,17 @@ impl AgentPtyRegistry {
             crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY.to_string(),
             hook_token_for_record.clone(),
         ));
+        // PRD #1666 §3: where this run's receipt spool is, the daemon's value
+        // and never a caller's, so a component publishes into this daemon's
+        // spool and no other.
+        opts.env
+            .retain(|(k, _)| k != crate::inbox_receipt::ENV_INBOX_SPOOL);
+        if let Some(spool) = self.inbox().spool_env() {
+            opts.env.push((
+                crate::inbox_receipt::ENV_INBOX_SPOOL.to_string(),
+                spool.to_string_lossy().into_owned(),
+            ));
+        }
 
         // Capture the full env vec and the requested PTY size BEFORE
         // `spawn(opts)` consumes the options. Stored on `RunningAgent`
@@ -9766,12 +9778,76 @@ impl AgentPtyRegistry {
                 .or_default()
                 .insert(id.clone());
         }
+        let inbox_spawn = (
+            agent.pane_id_env.clone(),
+            agent.spawn_command.clone(),
+            agent.spawn_env.clone(),
+        );
         inner.agents.insert(id.clone(), agent);
         // Signal *after* releasing the lock would be cleaner, but we still
         // hold `inner` here. Notify is cheap and a spurious wake-up is
         // harmless — the monitor will re-check counters anyway.
         self.change_notify.notify_one();
+        drop(inner);
+        if let (Some(pane), command, env) = inbox_spawn {
+            self.note_inbox_spawn(&pane, &id, inbox_agent_type, command.as_deref(), &env);
+        }
         Ok(id)
+    }
+
+    /// PRD #1666 §11: what an OpenCode generation's start owes its inbox,
+    /// after the registry lock is released. Its adapter declares the floor,
+    /// so its card says the integration has not connected yet if nothing
+    /// registers by the readiness deadline. Off the executor, its integration
+    /// files are regenerated from this daemon's binary, so restarting the
+    /// agent really refreshes them, and the capability probe runs the CLI the
+    /// adapter will run: only clap refusing the flag marks the generation's CLI
+    /// too old.
+    fn note_inbox_spawn(
+        &self,
+        pane: &str,
+        agent: &str,
+        agent_type: Option<crate::event::AgentType>,
+        command: Option<&str>,
+        env: &[(String, String)],
+    ) {
+        let basename = command
+            .and_then(|c| c.split_whitespace().next())
+            .and_then(|program| std::path::Path::new(program).file_name())
+            .and_then(|name| name.to_str())
+            .and_then(crate::agent_registry::detect_from_basename);
+        if agent_type.or(basename) != Some(crate::event::AgentType::OpenCode) {
+            return;
+        }
+        let hub = Arc::clone(self.inbox());
+        hub.expect_integration(pane, agent);
+        let override_bin = env
+            .iter()
+            .find(|(k, _)| k == "DOT_AGENT_DECK_BIN")
+            .map(|(_, v)| std::path::PathBuf::from(v))
+            .filter(|path| path.is_absolute());
+        let (pane, agent) = (pane.to_string(), agent.to_string());
+        std::thread::spawn(move || {
+            let pins = crate::opencode_manage::auto_install();
+            let binary = override_bin.or_else(|| {
+                pins.first()
+                    .map(|pin| std::path::PathBuf::from(&pin.binary))
+                    .or_else(|| {
+                        crate::opencode_manage::configured_pins()
+                            .and_then(|pins| pins.into_iter().next())
+                            .map(|pin| std::path::PathBuf::from(pin.binary))
+                    })
+            });
+            let Some(binary) = binary else {
+                return;
+            };
+            let verdict =
+                crate::inbox_hub::probe_cli(&binary, crate::inbox_hub::probe_deadline_from_env());
+            tracing::info!(pane_id = %pane, ?verdict, binary = %binary.display(), "inbox: capability probe");
+            if verdict == crate::inbox_hub::ProbeVerdict::CliTooOld {
+                hub.set_cli_too_old(&pane, &agent);
+            }
+        });
     }
 
     /// PRD #20 R20-003/R20-006: the live target that currently owns `pane_id`,

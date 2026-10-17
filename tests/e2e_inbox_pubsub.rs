@@ -564,6 +564,61 @@ fn offer_007_a_job_held_behind_a_long_turn_is_not_reassigned() {
     assert!(!contains(&daemon, other, &id));
 }
 
+/// Scenario: Offer a job to two subscribed workers whose OpenCode receipt streams are armed from the test process. The worker it is assigned to holds it queued behind a long turn, naming it in a fresh snapshot every keepalive: for ten seconds the job is never repeated, never reassigned, and the other worker's stream is never handed it. The holder's commit then claims it, so the job runs once.
+#[spec("inbox/offer/008")]
+#[test]
+fn offer_008_a_job_possessed_behind_a_long_turn_is_not_reassigned() {
+    let daemon = inbox::daemon_unbound(&[
+        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500"),
+        ("DOT_AGENT_DECK_INBOX_MAX_DELIVER", "2"),
+        (route::UNDELIVERED_MS, "4500"),
+        ("DOT_AGENT_DECK_INBOX_KEEPALIVE_MS", "300"),
+    ]);
+    let (orch, first, second) = team(&daemon, "held");
+    let mut first_stream = inbox::receipt_stream(&daemon, &first);
+    let mut second_stream = inbox::receipt_stream(&daemon, &second);
+    inbox::armed(&daemon, &first, 1);
+    inbox::armed(&daemon, &second, 1);
+    let mut req = inbox::request(&orch, "inbox_offer");
+    req["pool"] = json!("review");
+    req["body"] = json!(BODY);
+    req["claim_ttl_ms"] = json!(60_000);
+    let id = accepted(&hook(&daemon, req));
+    let (chosen, other) = holder(&daemon, &first, &second, &id);
+    let (stream, other_stream) = if chosen.id == first.id {
+        (&mut first_stream, &mut second_stream)
+    } else {
+        (&mut second_stream, &mut first_stream)
+    };
+    let handed = inbox::receipt_handout(stream, &id);
+    let written = inbox::possess_for(stream, &handed, Duration::from_secs(10));
+    assert!(
+        !written
+            .iter()
+            .any(|w| w["messages"].as_array().is_some_and(|m| !m.is_empty())),
+        "a possessed job is never repeated: {written:?}"
+    );
+    assert!(
+        !contains(&daemon, other, &id),
+        "a possessed job is not reassigned"
+    );
+    inbox::receipt_control(
+        stream,
+        json!({"committed": [{"id": id, "a": handed["a"], "e": handed["e"]}]}),
+    );
+    inbox::state(&daemon, chosen, &id, "claimed");
+    notice(&daemon, &orch, &id, "claim");
+    assert!(
+        !inbox::receipt_lines_within(other_stream, Duration::from_millis(300))
+            .iter()
+            .any(|w| w["messages"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|m| m["id"] == id))),
+        "the other worker's stream was never handed the job"
+    );
+    assert!(!contains(&daemon, other, &id));
+}
+
 /// Read `stream` until it hands over `id` (true), skipping keepalives and
 /// other hand-overs, or until its read times out or it closes (false).
 fn handed(stream: &mut std::io::BufReader<std::os::unix::net::UnixStream>, id: &str) -> bool {

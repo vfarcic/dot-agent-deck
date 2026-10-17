@@ -273,6 +273,12 @@ impl Delivery {
         self.token.is_some()
     }
 
+    /// Whether the one held_long attention (§6.3) was raised at the current
+    /// revision and still stands.
+    pub fn held_long(&self) -> bool {
+        self.state == MessageState::Attempting && self.held_long_sent == Some(self.revision)
+    }
+
     fn set_state(&mut self, state: MessageState) {
         if self.state != state {
             self.state = state;
@@ -298,6 +304,10 @@ pub enum Effect {
     HeldLong { id: String, revision: u64 },
     /// Hand-outs are paused for room in the evidence store (§7).
     EvidencePaused { reserved: usize },
+    /// An attempt's evidence reservation was returned: its spool files go
+    /// now (§7). Exit (T9) emits none, since the generation's whole spool
+    /// goes with it.
+    Reclaimed { id: String, a: u32, e: u32 },
 }
 
 /// Why a hand-out was refused (T1).
@@ -785,6 +795,57 @@ impl AttemptModel {
         self.finalize_bound_to(now, rx);
     }
 
+    /// Whether `rx` is a live incarnation.
+    pub fn live(&self, rx: Rx) -> bool {
+        self.receivers.get(&rx).is_some_and(|r| !r.retired)
+    }
+
+    /// The live incarnation of `slot`, if one is registered.
+    pub fn slot_rx(&self, slot: Slot) -> Option<Rx> {
+        self.slots.get(&slot).copied().filter(|rx| self.live(*rx))
+    }
+
+    /// The open attempts T4 would lapse at `now`: neither final, resuming,
+    /// lapsed already nor possessed. The caller may first check each for a
+    /// receipt (§3) and keep those it cannot yet call receipt-less.
+    pub fn lapse_candidates(&self, now: Instant) -> Vec<(String, u32, u32)> {
+        let mut out = Vec::new();
+        if self.exited {
+            return out;
+        }
+        for (id, msg) in &self.messages {
+            for at in &msg.attempts {
+                if !at.stage.is_final()
+                    && !at.resume_pending
+                    && !at.lapsed
+                    && !possessed(&self.receivers, &self.limits, id, at, now)
+                {
+                    out.push((id.clone(), at.a, at.e));
+                }
+            }
+        }
+        out
+    }
+
+    /// The message ids this model holds.
+    pub fn ids(&self) -> Vec<String> {
+        self.messages.keys().cloned().collect()
+    }
+
+    /// The incarnation an attempt is bound to.
+    pub fn attempt_rx(&self, id: &str, a: u32, e: u32) -> Option<Rx> {
+        self.messages.get(id)?.attempt(a, e).map(|at| at.rx)
+    }
+
+    /// Messages whose delivered attempts still hold evidence (§7 "N
+    /// delivered messages still wait").
+    pub fn holding_evidence(&self) -> usize {
+        self.messages
+            .values()
+            .filter(|msg| msg.attempts.iter().any(|at| !at.reclaimed))
+            .count()
+    }
+
     /// A hook or `inbox fetch` receiver's connection closed (§4): its
     /// possession ends.
     pub fn connection_closed(&mut self, now: Instant, rx: Rx) {
@@ -896,6 +957,14 @@ impl AttemptModel {
 
     /// T4 (lapse), T8 (resume silence) and held_long attention.
     pub fn tick(&mut self, now: Instant) {
+        self.tick_keeping(now, &BTreeSet::new());
+    }
+
+    /// [`Self::tick`], except that the attempts in `keep` are not lapsed yet:
+    /// those the caller could not yet show to have no receipt (§3 "Slow and
+    /// failed storage": only a completed, error-free scan and an exact lookup
+    /// that finds neither record name is absence).
+    pub fn tick_keeping(&mut self, now: Instant, keep: &BTreeSet<(String, u32, u32)>) {
         if self.exited {
             return;
         }
@@ -917,7 +986,10 @@ impl AttemptModel {
                             at.resume_deadline = None;
                             at.stage = Stage::Fenced;
                         }
-                    } else if !at.stage.is_final() && !held {
+                    } else if !at.stage.is_final()
+                        && !held
+                        && !keep.contains(&(id.clone(), at.a, at.e))
+                    {
                         at.lapsed = true;
                     }
                 }
@@ -1270,6 +1342,11 @@ impl AttemptModel {
                 at.reclaimed = true;
                 self.evidence_reserved =
                     self.evidence_reserved.saturating_sub(EVIDENCE_PER_ATTEMPT);
+                self.effects.push(Effect::Reclaimed {
+                    id: id.to_string(),
+                    a: at.a,
+                    e: at.e,
+                });
             }
         }
     }
@@ -1547,10 +1624,17 @@ mod tests {
         );
         assert_eq!(
             m.drain_effects(),
-            vec![Effect::DeliveredAfterAll {
-                id: "inert".into(),
-                despite_cancel: true
-            }]
+            vec![
+                Effect::DeliveredAfterAll {
+                    id: "inert".into(),
+                    despite_cancel: true
+                },
+                Effect::Reclaimed {
+                    id: "inert".into(),
+                    a: 1,
+                    e: i1.e
+                }
+            ]
         );
         assert_eq!(
             m.stage(t, "inert", 1, i1.e, Stage::Committed, None),
@@ -2117,10 +2201,17 @@ mod tests {
         );
         assert_eq!(
             m.drain_effects(),
-            vec![Effect::DeliveredAfterAll {
-                id: "w".into(),
-                despite_cancel: true
-            }]
+            vec![
+                Effect::DeliveredAfterAll {
+                    id: "w".into(),
+                    despite_cancel: true
+                },
+                Effect::Reclaimed {
+                    id: "w".into(),
+                    a: 1,
+                    e: w.e
+                }
+            ]
         );
         assert_eq!(m.evidence_reserved(), 0);
     }

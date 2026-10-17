@@ -1840,6 +1840,79 @@ async fn desktop_list_directories(
     list_directories_on(&state, &deck_id, path, options.unwrap_or_default()).await
 }
 
+/// PRD #1666 §6.4: the desktop's answer to a Retry or Cancel — the daemon's
+/// outcome by its wire spelling (`applied`, `stale`, …), or `unsupported` for
+/// a deck whose daemon predates the verbs.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopInboxActionResult {
+    outcome: String,
+}
+
+/// PRD #1666 §6.4: the user's Retry (`verb: "retry"`) or Cancel on deck
+/// message `message_id` that agent `agent_id`'s tile in `pane_id` lists, at
+/// the `revision` the tile showed. The deck comes from the request, never the
+/// selection, as for every per-deck verb. A deck that does not advertise the
+/// verbs is answered `unsupported` without being sent one (CLAUDE.md rule 18).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn desktop_inbox_action(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    agent_id: String,
+    pane_id: String,
+    message_id: String,
+    revision: u64,
+    verb: String,
+) -> Result<DesktopInboxActionResult, String> {
+    ensure_main_webview(&webview)?;
+    inbox_action_on(
+        &state,
+        &deck_id,
+        &agent_id,
+        &pane_id,
+        &message_id,
+        revision,
+        &verb,
+    )
+    .await
+}
+
+/// [`desktop_inbox_action`] minus the webview.
+async fn inbox_action_on(
+    state: &DesktopState,
+    deck_id: &str,
+    agent_id: &str,
+    pane_id: &str,
+    message_id: &str,
+    revision: u64,
+    verb: &str,
+) -> Result<DesktopInboxActionResult, String> {
+    let retry = match verb {
+        "retry" => true,
+        "cancel" => false,
+        _ => return Err("an inbox action is retry or cancel".to_string()),
+    };
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let request_id = dot_agent_deck::daemon_client::generate_client_id();
+    let answer = daemon
+        .client
+        .inbox_action(pane_id, agent_id, message_id, revision, retry, &request_id)
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    let outcome = match answer {
+        GatedQuery::Answered(reply) => serde_json::to_value(reply.outcome)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string()),
+        GatedQuery::Unsupported => "unsupported".to_string(),
+    };
+    Ok(DesktopInboxActionResult { outcome })
+}
+
 /// Issue #1240: the refusal for listing options sent to a deck that does not
 /// advertise them. Unreachable from the dialog, which offers the options only
 /// where the connection says the deck honours them.
@@ -6485,6 +6558,7 @@ pub fn run() {
             desktop_resolve_project,
             desktop_new_agent_orchestrations,
             desktop_list_directories,
+            desktop_inbox_action,
             desktop_new_agent_options,
             desktop_bootstrap,
             desktop_start_daemon,

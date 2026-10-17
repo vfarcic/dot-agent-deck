@@ -109,6 +109,35 @@ pub const LATE_ACK_MAX_RECORDS: usize = 256;
 /// [`crate::inbox::DEFAULT_HOLD_BOUND`].
 pub const LATE_ACK_MEMORY: Duration = crate::inbox::DEFAULT_HOLD_BOUND;
 
+/// PRD #1666 §11: the integration the deck's hand-over components declare
+/// (`--adapter-integration`). A component the receipt policy covers that
+/// declares less, or nothing, is refused: its generation's mail waits queued
+/// and its card says the integration is out of date.
+pub const ADAPTER_INTEGRATION: u32 = 2;
+
+#[path = "inbox_engine.rs"]
+mod engine;
+#[cfg(test)]
+#[path = "inbox_engine_tests.rs"]
+mod engine_tests;
+pub use engine::{
+    ARM_DEADLINE, ENV_ARM_DEADLINE_MS, ENV_PROBE_DEADLINE_MS, PROBE_DEADLINE, ProbeVerdict,
+    arm_deadline_from_env, probe_cli, probe_deadline_from_env,
+};
+
+/// PRD #1666 §6.6: the subject of the notice an orchestrator gets when a
+/// delegated task's delivery is uncertain.
+pub const UNCERTAIN_SUBJECT: &str = "task delivery uncertain";
+/// PRD #1666 §2 T3: the subject of the notice an offerer gets when an
+/// earlier holder of its reassigned job received it too.
+pub const ALSO_REACHED_SUBJECT: &str = "task also reached an earlier worker";
+/// PRD #1666 §6.6: the subject of a cancelled task's notice.
+pub const CANCELLED_SUBJECT: &str = "task cancelled";
+
+/// How many cancelled tasks the hub remembers, so a commit after the Cancel
+/// still corrects their orchestrator (§2 "Late commit after Cancel").
+const MAX_CANCELLED_TASKS: usize = 256;
+
 /// The sender `reason` of a notice the deck itself writes to an agent; its
 /// label is "dot-agent-deck (daemon notice)".
 pub const NOTICE_REASON: &str = "notice";
@@ -193,6 +222,44 @@ pub struct InboxSummary {
     /// daemon's answer, and while false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake_stalled: bool,
+    /// PRD #1666 §6.5: what the card lists and warns of beside its counts.
+    /// Every field is additive and absent while empty.
+    #[serde(flatten, default)]
+    pub notices: InboxCardNotices,
+}
+
+/// PRD #1666 §6.5: one message a card lists for the user to decide on, with
+/// its own Retry and Cancel.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InboxAttentionItem {
+    pub message_id: String,
+    /// The message's revision; Retry and Cancel compare on it (§2).
+    pub revision: u64,
+    pub kind: crate::inbox_display::AttentionKind,
+    /// Who sent it, as the agent sees it labelled.
+    pub from_label: String,
+    pub subject: String,
+    /// The delegated task it carries, when it carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+}
+
+/// PRD #1666 §6.5, §3, §7, §11: what a card shows beside its inbox counts —
+/// the items waiting on the user, the integration notice, failed receipt
+/// storage and paused hand-outs. Carried by the snapshot
+/// ([`InboxSummary::notices`]) and, whole, by each change
+/// ([`crate::event::InboxNotice::attention_update`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InboxCardNotices {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<InboxAttentionItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::inbox_display::IntegrationNotice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipts_degraded: Option<String>,
+    /// Delivered messages whose evidence pauses hand-outs (§7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_paused: Option<usize>,
 }
 
 /// The wire spelling of `component`, for [`InboxSummary::component`].
@@ -209,6 +276,8 @@ pub enum WaiterSignal {
     Deliver(Vec<InboxDelivery>),
     /// A newer waiter for the same agent took this one's place.
     Superseded,
+    /// PRD #1666 §4: one line for a receipt stream to write as it is.
+    Line(Box<InboxWaitReply>),
 }
 
 /// Why a waiter could not arm.
@@ -277,13 +346,18 @@ struct Announcement {
 /// inbox. See [`InboxHub::doorbell_facts`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DoorbellFacts {
-    /// The ids of the agent's `queued` messages, oldest first.
+    /// The ids of the agent's `queued` messages, oldest first. For a
+    /// generation the receipt policy owns, also its scheduled repeats
+    /// waiting for a receiver (PRD #1666 §6).
     pub queued: Vec<String>,
     /// Live waiters armed for the agent.
     pub armed: usize,
     /// When the agent's component last announced `Native` wake-up, if that is
     /// what it announced.
     pub native_announced_at: Option<Instant>,
+    /// PRD #1666 §11: the generation's integration is incompatible, so its
+    /// doorbell stays silent: no fetch could hand it anything.
+    pub blocked: bool,
 }
 
 /// PRD #1666 S5: how a delegated task's message ended, for the worker's
@@ -407,6 +481,19 @@ struct HubState {
     /// [`LATE_ACK_MAX_RECORDS`] and [`LATE_ACK_MEMORY`]. A late ack takes its
     /// record and corrects them ([`settle_late_ack`]).
     late_acks: HashMap<(String, String), LateAck>,
+    /// PRD #1666 §13 step 4: the receipt engine's generations, floors and
+    /// pending spool work ([`engine`]).
+    receipts: engine::Receipts,
+    /// PRD #1666 §2: delegated tasks the user cancelled, with the
+    /// orchestrator and role to correct when one commits after all. Oldest
+    /// dropped past [`MAX_CANCELLED_TASKS`].
+    cancelled_tasks: HashMap<String, (Recipient, String)>,
+    /// This run's receipt spool, once the daemon started one.
+    spool: Option<Arc<crate::inbox_receipt::Spool>>,
+    /// PRD #1666 §2: the first press applied per message, so a second
+    /// client's press of the same verb at the same revision is told it came
+    /// too late ([`InboxHub::inbox_action`]).
+    action_presses: HashMap<(AgentKey, String), (u64, bool, String)>,
 }
 
 /// PRD #1666 long-turn delivery: who was told that a message ran out of
@@ -543,6 +630,7 @@ impl HubState {
 
 impl InboxHub {
     pub fn new(deck: DeckId, limits: InboxLimits, keepalive: Duration) -> Self {
+        let (limits_max_deliver, limits_ack_wait) = (limits.max_deliver, limits.ack_wait);
         Self {
             state: Mutex::new(HubState {
                 spills: crate::inbox_spills::SpillLedger::default(),
@@ -567,6 +655,18 @@ impl InboxHub {
                 card_notice_sink: None,
                 owed_card_notices: Vec::new(),
                 late_acks: HashMap::new(),
+                receipts: engine::Receipts::new(
+                    crate::inbox_attempts::Limits {
+                        max_deliver: limits_max_deliver,
+                        possess_ttl: keepalive * crate::inbox_attempts::KEEPALIVES_PER_POSSESS_TTL,
+                        ack_wait: limits_ack_wait,
+                        ..crate::inbox_attempts::Limits::default()
+                    },
+                    arm_deadline_from_env(),
+                ),
+                cancelled_tasks: HashMap::new(),
+                spool: None,
+                action_presses: HashMap::new(),
             }),
             spill_manifest: Mutex::new(None),
             changed: Arc::new(Notify::new()),
@@ -1373,8 +1473,14 @@ impl InboxHub {
                 .inbox
                 .get(&id, &worker.pane_id)
                 .map(|message| message.state.clone());
+            let receipt = st.inbox.get(&id, &worker.pane_id).and_then(|m| m.owner)
+                == Some(crate::inbox::AssignmentOwner::Receipt);
             let held = match state {
                 Some(MessageState::Queued) => "still queued: the worker has not taken it",
+                // PRD #1666 §6.6: a receipt-owned hand-out is possessed, or
+                // its delivery is uncertain and said so; it is not "not
+                // reached".
+                Some(MessageState::Fetched { .. }) if receipt => continue,
                 Some(MessageState::Fetched { .. }) => {
                     "fetched by the worker but not acknowledged: it may not have reached the \
                      agent's session"
@@ -1562,6 +1668,7 @@ impl InboxHub {
             wake: WakePath::Doorbell,
             component: None,
             wake_stalled: st.wake_stalled.contains_key(&key),
+            notices: engine::notices(&st, &key, now),
         };
         let mut last_acked: Option<Instant> = None;
         for m in st.inbox.list(pane_id).into_iter().filter(|m| {
@@ -1605,8 +1712,22 @@ impl InboxHub {
     /// [`Self::post_owed_notices`].
     pub fn agent_exited(&self, pane_id: &str, agent_id: &str) -> Vec<DelegateLedger> {
         let mut st = self.lock();
-        st.inbox.agent_exited(Instant::now(), pane_id, agent_id);
+        let now = Instant::now();
+        st.inbox.agent_exited(now, pane_id, agent_id);
         let key = (pane_id.to_string(), agent_id.to_string());
+        // PRD #1666 §2 T9: the generation's attempts are fenced and its
+        // receipt spool goes, off the lock.
+        if let Some(spool) = engine::exit(&mut st, &key, now) {
+            let generation = self.spool_generation_dir(&st, pane_id, agent_id);
+            drop(spool);
+            if let (Some(root), Some((pane, agent))) = (st.spool.clone(), generation) {
+                std::thread::spawn(move || {
+                    if let Err(error) = root.remove_generation(&pane, &agent) {
+                        debug!(%error, "inbox: could not remove an exited generation's receipts");
+                    }
+                });
+            }
+        }
         st.announced.remove(&key);
         st.receivers.remove(&key);
         st.rings.remove(&key);
@@ -1703,25 +1824,34 @@ impl InboxHub {
     pub fn doorbell_facts(&self, pane_id: &str, agent_id: &str) -> DoorbellFacts {
         let st = self.lock();
         let key = (pane_id.to_string(), agent_id.to_string());
+        let mut queued: Vec<String> = st
+            .inbox
+            .list(pane_id)
+            .into_iter()
+            .filter(|m| {
+                m.state == MessageState::Queued
+                    && m.recipient
+                        .as_ref()
+                        .is_some_and(|r| r.admits(pane_id, agent_id))
+            })
+            .map(|m| m.id.as_str().to_string())
+            .collect();
+        // PRD #1666 §6: a scheduled repeat waiting for a receiver is waiting
+        // mail too, so the doorbell (and the stalled-wake notice) cover it.
+        for id in engine::candidates(&st, &key) {
+            if !queued.contains(&id) {
+                queued.push(id);
+            }
+        }
         DoorbellFacts {
-            queued: st
-                .inbox
-                .list(pane_id)
-                .into_iter()
-                .filter(|m| {
-                    m.state == MessageState::Queued
-                        && m.recipient
-                            .as_ref()
-                            .is_some_and(|r| r.admits(pane_id, agent_id))
-                })
-                .map(|m| m.id.as_str().to_string())
-                .collect(),
+            queued,
             armed: st.waiters.get(&key).map_or(0, Vec::len),
             native_announced_at: st
                 .announced
                 .get(&key)
                 .filter(|a| a.wake == InboxWake::Native)
                 .map(|a| a.at),
+            blocked: st.receipts.blocked(&key),
         }
     }
 
@@ -1829,7 +1959,24 @@ impl InboxHub {
     pub fn ack(&self, id: &str, pane_id: &str, agent_id: &str, how: AckHow) -> AckOutcome {
         let outcome = {
             let mut st = self.lock();
-            let outcome = st.inbox.ack(Instant::now(), id, pane_id, agent_id, how);
+            let now = Instant::now();
+            let key = (pane_id.to_string(), agent_id.to_string());
+            // PRD #1666 §13 step 4: a receipt-owned assignment is settled
+            // through its attempt model, never by the legacy ack alone.
+            if st.inbox.owner_of(id, pane_id, agent_id)
+                == Some(crate::inbox::AssignmentOwner::Receipt)
+                && engine::explicit_commit(&mut st, &key, id, now)
+            {
+                drain_events(&mut st);
+                return match st.inbox.get(id, pane_id).map(|m| &m.state) {
+                    Some(MessageState::Acknowledged { .. }) => AckOutcome::Acknowledged,
+                    Some(MessageState::Claimed { expires, .. }) => AckOutcome::Claimed {
+                        expires_in_ms: expires.saturating_duration_since(now).as_millis() as u64,
+                    },
+                    _ => AckOutcome::Acknowledged,
+                };
+            }
+            let outcome = st.inbox.ack(now, id, pane_id, agent_id, how);
             drain_events(&mut st);
             outcome
         };
@@ -1948,6 +2095,7 @@ impl InboxHub {
     /// Apply every deadline that has passed, then hand what came back to the
     /// queue to any armed waiter.
     pub fn tick(&self) {
+        self.tick_receipts();
         let (deck, reclaim) = {
             let mut st = self.lock();
             let now = Instant::now();
@@ -2095,10 +2243,15 @@ impl InboxHub {
                         .filter(|watch| !watch.notified)
                         .map(|watch| watch.due)
                         .min();
-                    [st.inbox.next_deadline(), watched, st.owed_retry_at]
-                        .into_iter()
-                        .flatten()
-                        .min()
+                    [
+                        st.inbox.next_deadline(),
+                        watched,
+                        st.owed_retry_at,
+                        st.receipts.next_deadline(Instant::now()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
                 };
                 // A deadline that is far away still re-plans every minute, so a
                 // missed notification costs at most that long.
@@ -2145,6 +2298,17 @@ impl InboxHub {
         }
         let mut st = self.lock();
         let key = (pane_id.to_string(), agent_id.to_string());
+        // PRD #1666 §13 step 4: a generation with a receipt receiver is
+        // handed its mail by the receipt engine; the legacy waiters below never
+        // see it.
+        if st.receipts.gens.contains_key(&key) {
+            let mut out = engine::Outbox::new();
+            engine::dispatch(&mut st, &key, Instant::now(), &mut out);
+            drop(st);
+            engine::flush(out);
+            self.changed.notify_one();
+            return;
+        }
         loop {
             let Some(waiter) = st.waiters.get(&key).and_then(|list| list.last()) else {
                 return;
@@ -2209,6 +2373,526 @@ impl InboxHub {
             st.inbox.requeue_consumer(now, &consumer);
             drain_events(&mut st);
         }
+    }
+}
+
+/// PRD #1666 §4: what a receipt stream's request declared beyond a plain
+/// stream's ([`crate::event::InboxWaitRequest`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReceiptArm {
+    /// `--adapter-integration`, as the watcher forwarded it.
+    pub adapter_integration: Option<u32>,
+    pub doorbell_only: bool,
+    pub resumed: bool,
+}
+
+/// PRD #1666 §13 step 4: whether `component`'s streams are owned by the
+/// receipt policy. A component it covers is refused below
+/// [`ADAPTER_INTEGRATION`].
+pub fn receipt_component(component: InboxComponent) -> bool {
+    engine::slot_for(component).is_some()
+}
+
+impl InboxHub {
+    /// PRD #1666 §3: keep this run's receipts in `spool`, started by the
+    /// daemon at boot ([`crate::inbox_receipt::Spool::start`]).
+    pub fn set_spool(&self, spool: crate::inbox_receipt::Spool) {
+        self.lock().spool = Some(Arc::new(spool));
+    }
+
+    /// PRD #1666 §3: the absolute value of
+    /// [`crate::inbox_receipt::ENV_INBOX_SPOOL`] the daemon pins into every
+    /// process it spawns; `None` without a spool.
+    pub fn spool_env(&self) -> Option<std::path::PathBuf> {
+        self.lock()
+            .spool
+            .as_ref()
+            .map(|spool| spool.instance_path())
+    }
+
+    /// The spool directory names of one generation: its pane and agent ids,
+    /// each encoded as one path component.
+    fn spool_generation_dir(
+        &self,
+        _st: &HubState,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> Option<(String, String)> {
+        Some(spool_names(pane_id, agent_id))
+    }
+
+    /// The daemon's side of `agent_id`'s generation spool, created off the
+    /// executor and outside the lock; `None` with no spool this run, an
+    /// error text when it cannot be made.
+    fn generation_spool(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> Option<Result<Arc<crate::inbox_receipt::GenerationSpool>, String>> {
+        let spool = self.lock().spool.clone()?;
+        let (pane, agent) = spool_names(pane_id, agent_id);
+        Some(
+            off_the_executor(|| spool.generation(&pane, &agent))
+                .map(Arc::new)
+                .map_err(|error| error.to_string()),
+        )
+    }
+
+    /// PRD #1666 §11: `agent_id` in `pane_id` was spawned with an adapter
+    /// that declares the floor; without a registration by
+    /// [`ARM_DEADLINE`] its card says its integration has not connected yet.
+    pub fn expect_integration(&self, pane_id: &str, agent_id: &str) {
+        let mut st = self.lock();
+        let deadline = st.receipts.arm_deadline;
+        let floor = st
+            .receipts
+            .floors
+            .entry((pane_id.to_string(), agent_id.to_string()))
+            .or_default();
+        floor.arm_by = Some(Instant::now() + deadline);
+        drop(st);
+        self.changed.notify_one();
+    }
+
+    /// PRD #1666 §11: the capability probe proved `agent_id`'s CLI rejects
+    /// the integration flag. Its mail waits queued, its doorbell is silent
+    /// and its card says to upgrade.
+    pub fn set_cli_too_old(&self, pane_id: &str, agent_id: &str) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        let floor = st.receipts.floors.entry(key.clone()).or_default();
+        if floor.registered {
+            // A registration already proved the flag works.
+            return;
+        }
+        floor.cli_too_old = true;
+        engine::broadcast_notices(&mut st, &key, Instant::now());
+    }
+
+    /// PRD #1666 §11: the integration notice `agent_id`'s card shows now.
+    pub fn integration_notice(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> Option<crate::inbox_display::IntegrationNotice> {
+        let st = self.lock();
+        engine::notices(
+            &st,
+            &(pane_id.to_string(), agent_id.to_string()),
+            Instant::now(),
+        )
+        .integration
+    }
+
+    /// PRD #1666 §6.4: the user's Retry (`retry`) or Cancel on message `id`
+    /// of `agent_id` in `pane_id`, at the `revision` their card showed.
+    /// `request` names this press: the same press sent again is answered as
+    /// before, and a different press of the same verb at a revision another
+    /// client already acted on is told it was too late.
+    pub fn inbox_action(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        id: &str,
+        revision: u64,
+        retry: bool,
+        request: &str,
+    ) -> crate::daemon_protocol::InboxActionReply {
+        use crate::daemon_protocol::{InboxActionOutcome, InboxActionReply};
+        use crate::inbox_attempts::ActionOutcome;
+        let mut out = engine::Outbox::new();
+        let reply = {
+            let mut st = self.lock();
+            let now = Instant::now();
+            let key = (pane_id.to_string(), agent_id.to_string());
+            let marker = (key.clone(), id.to_string());
+            let outcome = engine::action(&mut st, &key, id, revision, retry, now, &mut out);
+            let current = st
+                .receipts
+                .gens
+                .get(&key)
+                .and_then(|generation| generation.model.delivery(id))
+                .map(|d| d.revision);
+            let reply = match outcome {
+                ActionOutcome::Applied { revision: applied } => {
+                    let first = st
+                        .action_presses
+                        .entry(marker)
+                        .or_insert_with(|| (revision, retry, request.to_string()));
+                    if first.0 == revision && first.1 == retry && first.2 != request {
+                        InboxActionReply {
+                            outcome: InboxActionOutcome::Stale,
+                            revision: current,
+                        }
+                    } else {
+                        *first = (revision, retry, request.to_string());
+                        InboxActionReply {
+                            outcome: InboxActionOutcome::Applied,
+                            revision: Some(applied),
+                        }
+                    }
+                }
+                ActionOutcome::Stale { revision, .. } => InboxActionReply {
+                    outcome: InboxActionOutcome::Stale,
+                    revision: Some(revision),
+                },
+                ActionOutcome::NotApplicable { .. } => InboxActionReply {
+                    outcome: InboxActionOutcome::NotApplicable,
+                    revision: current,
+                },
+                ActionOutcome::AlreadySettled => InboxActionReply {
+                    outcome: InboxActionOutcome::AlreadySettled,
+                    revision: current,
+                },
+                ActionOutcome::RetryLimit => InboxActionReply {
+                    outcome: InboxActionOutcome::RetryLimit,
+                    revision: current,
+                },
+                ActionOutcome::WrongGeneration | ActionOutcome::Unknown => InboxActionReply {
+                    outcome: InboxActionOutcome::Unknown,
+                    revision: None,
+                },
+            };
+            if st.action_presses.len() > MAX_CANCELLED_TASKS {
+                st.action_presses.clear();
+            }
+            info!(pane_id, message_id = %id, revision, retry, outcome = ?reply.outcome, "inbox: user action");
+            reply
+        };
+        engine::flush(out);
+        self.after_receipts();
+        reply
+    }
+
+    /// Spool removals the engine queued, run off the executor and outside the
+    /// lock, then owed notices.
+    fn after_receipts(&self) {
+        let removals = std::mem::take(&mut self.lock().receipts.removals);
+        if !removals.is_empty() {
+            off_the_executor(|| {
+                for (spool, id, a, e) in removals {
+                    if let Err(error) = spool.remove_attempt(&id, a, e) {
+                        debug!(message_id = %id, a, e, %error, "inbox: could not remove a reclaimed attempt's receipts");
+                    }
+                }
+            });
+        }
+        self.changed.notify_one();
+        self.post_owed_notices();
+    }
+
+    /// PRD #1666 §3, §4: the receipt engine's clock. Lapse candidates are
+    /// first looked up in their generation's spool, off the lock: a found
+    /// commit settles, an unknown answer keeps the attempt from lapsing, and
+    /// only a confirmed absence lets it lapse.
+    fn tick_receipts(&self) {
+        let checks = {
+            let st = self.lock();
+            engine::lapse_checks(&st, Instant::now())
+        };
+        let mut keep: HashMap<AgentKey, std::collections::BTreeSet<(String, u32, u32)>> =
+            HashMap::new();
+        let mut found: HashMap<AgentKey, Vec<(String, u32, u32)>> = HashMap::new();
+        if !checks.is_empty() {
+            off_the_executor(|| {
+                for (key, evidence, candidates) in checks {
+                    let mut evidence = evidence.lock().unwrap_or_else(|e| e.into_inner());
+                    let engine::Evidence { store, scanner } = &mut *evidence;
+                    let Some(scanner) = scanner.as_mut() else {
+                        continue;
+                    };
+                    // A completed, error-free cycle first; a bounded number
+                    // of passes, so a huge directory stays Unknown.
+                    for _ in 0..8 {
+                        if scanner.pass(store).complete {
+                            break;
+                        }
+                    }
+                    for (id, a, e) in candidates {
+                        let committed = crate::inbox_receipt::RecordKey {
+                            msg: id.clone(),
+                            a,
+                            e,
+                            stage: crate::inbox_receipt::RecordStage::Committed,
+                        };
+                        match scanner.presence(store, &id, a, e) {
+                            crate::inbox_receipt::Presence::Found if store.admitted(&committed) => {
+                                found.entry(key.clone()).or_default().push((id, a, e));
+                            }
+                            crate::inbox_receipt::Presence::Found
+                            | crate::inbox_receipt::Presence::Absent => {}
+                            crate::inbox_receipt::Presence::Unknown => {
+                                keep.entry(key.clone()).or_default().insert((id, a, e));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        let mut out = engine::Outbox::new();
+        {
+            let mut st = self.lock();
+            let now = Instant::now();
+            engine::tick(&mut st, now, &keep, &found, &mut out);
+        }
+        engine::flush(out);
+        self.after_receipts();
+    }
+
+    /// PRD #1666 §4: a doorbell substitution by the component that holds
+    /// incarnation `rx` of `agent_id`'s generation: the waiting mail is
+    /// issued to `rx` — its caps to that stream, its bodies to the caller.
+    pub fn receipt_fetch(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        rx: u64,
+        named: Option<&str>,
+        budget: Option<InboxBudget>,
+    ) -> Result<Vec<InboxDelivery>, &'static str> {
+        let mut out = engine::Outbox::new();
+        let result = {
+            let mut st = self.lock();
+            let key = (pane_id.to_string(), agent_id.to_string());
+            engine::doorbell_fetch(
+                &mut st,
+                &key,
+                crate::inbox_attempts::Rx(rx),
+                named,
+                budget,
+                Instant::now(),
+                &mut out,
+            )
+        };
+        engine::flush(out);
+        self.after_receipts();
+        result
+    }
+
+    /// PRD #1666 §11: a fetch or stream from a component the receipt policy
+    /// covers declared an integration below the floor.
+    pub fn refuse_old_adapter(&self, pane_id: &str, agent_id: &str) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        engine::refuse_adapter(&mut st, &key);
+        engine::broadcast_notices(&mut st, &key, Instant::now());
+    }
+}
+
+/// One generation's spool directory names.
+fn spool_names(pane_id: &str, agent_id: &str) -> (String, String) {
+    (
+        crate::inbox::encode_token(pane_id),
+        crate::inbox::encode_token(agent_id),
+    )
+}
+
+/// PRD #1666 §4: serve one receipt stream (a component the receipt policy
+/// covers, at [`ADAPTER_INTEGRATION`] or above) until it ends: register its
+/// incarnation, write each line the engine hands it, and apply each control
+/// it sends. A stream that ends never requeues anything: the attempt model
+/// decides what its open attempts become.
+#[allow(clippy::too_many_arguments)]
+async fn serve_receipt<R, W, P>(
+    hub: Arc<InboxHub>,
+    pane_id: String,
+    agent_id: String,
+    component: InboxComponent,
+    instance: Option<u32>,
+    arm: ReceiptArm,
+    reader: R,
+    mut writer: W,
+    repaint: P,
+) where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    P: Fn(&str),
+{
+    let deadline = hub.write_deadline();
+    let key = (pane_id.clone(), agent_id.clone());
+    let Ok(_slot) = Arc::clone(&hub.waiter_slots).try_acquire_owned() else {
+        let error = ArmError::NoSlots;
+        let _ = write_line_within(
+            deadline,
+            &mut writer,
+            &InboxWaitReply::refused(error.code(), &error.message()),
+        )
+        .await;
+        return;
+    };
+    let spool = hub.generation_spool(&pane_id, &agent_id);
+    let (tx, mut signals) = mpsc::channel(engine::RECEIPT_SIGNAL_CAPACITY);
+    let registered = {
+        let mut st = hub.lock();
+        if let Err(error) = st.admit_receiver(&key, instance) {
+            Err(error)
+        } else {
+            let conn_id = st.next_conn;
+            st.next_conn += 1;
+            let now = Instant::now();
+            // A newer stream of the same component takes the older one's
+            // place: its task is told so and ends.
+            if let Some(generation) = st.receipts.gens.get(&key) {
+                for link in generation
+                    .links
+                    .values()
+                    .filter(|link| link.component == component)
+                {
+                    let _ = link.tx.try_send(WaiterSignal::Superseded);
+                }
+            }
+            let first = engine::register(
+                &mut st,
+                &key,
+                component,
+                arm.doorbell_only,
+                arm.resumed,
+                conn_id,
+                tx.clone(),
+                spool,
+                now,
+            );
+            if !arm.doorbell_only {
+                let list = st.waiters.entry(key.clone()).or_default();
+                list.retain(|w| w.component != component);
+                list.push(Waiter {
+                    conn_id,
+                    mode: InboxWaitMode::Stream,
+                    component,
+                    instance,
+                    tx: tx.clone(),
+                });
+            }
+            let mut out = engine::Outbox::new();
+            engine::apply(&mut st, &key, now, &mut out);
+            Ok((conn_id, first, out))
+        }
+    };
+    let (conn_id, first, out) = match registered {
+        Ok(registered) => registered,
+        Err(error) => {
+            let _ = write_line_within(
+                deadline,
+                &mut writer,
+                &InboxWaitReply::refused(error.code(), &error.message()),
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(first) = first else {
+        return;
+    };
+    let rx = crate::inbox_attempts::Rx(first.registered.as_ref().map_or(0, |r| r.rx));
+    if write_line_within(deadline, &mut writer, &first)
+        .await
+        .is_err()
+    {
+        hub.receipt_closed(&key, rx, conn_id);
+        return;
+    }
+    engine::flush(out);
+    hub.dispatch_agent(&pane_id, &agent_id);
+    hub.after_receipts();
+    let (line_tx, mut lines) = mpsc::channel::<String>(16);
+    let read_task = tokio::spawn(async move {
+        let mut reader = reader;
+        while let Ok(Some(line)) = crate::bounded_read::read_capped_line(
+            &mut reader,
+            crate::bounded_read::MAX_HOOK_LINE_BYTES,
+        )
+        .await
+        {
+            if line_tx.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut keepalive = tokio::time::interval(hub.keepalive());
+    keepalive.tick().await;
+    loop {
+        tokio::select! {
+            signal = signals.recv() => match signal {
+                Some(WaiterSignal::Line(reply)) => {
+                    if write_line_within(deadline, &mut writer, &*reply).await.is_err() {
+                        debug!(conn_id, "inbox: a receipt stream stopped reading");
+                        break;
+                    }
+                }
+                Some(WaiterSignal::Deliver(batch)) => {
+                    if write_line_within(deadline, &mut writer, &InboxWaitReply::messages(batch)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(WaiterSignal::Superseded) => {
+                    let _ = write_line_within(deadline, &mut writer, &InboxWaitReply::superseded()).await;
+                    break;
+                }
+                None => break,
+            },
+            line = lines.recv() => match line {
+                Some(line) => match serde_json::from_str::<InboxStreamControl>(&line) {
+                    Ok(control) => {
+                        if control.repaint {
+                            if component == InboxComponent::OpenCodeMini {
+                                repaint(&agent_id);
+                            } else {
+                                debug!(conn_id, ?component, "inbox: ignoring a repaint request from a component that may not ask for one");
+                            }
+                        }
+                        hub.receipt_control(&key, rx, &control);
+                    }
+                    Err(_) => debug!(conn_id, "inbox: ignoring a receipt stream line that is not a control"),
+                },
+                None => {
+                    debug!(conn_id, "inbox: receipt stream closed its connection");
+                    break;
+                }
+            },
+            _ = keepalive.tick() => {
+                if write_line_within(deadline, &mut writer, &InboxWaitReply::keepalive()).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    read_task.abort();
+    hub.receipt_closed(&key, rx, conn_id);
+    let _ = tokio::time::timeout(deadline, writer.shutdown()).await;
+}
+
+impl InboxHub {
+    fn receipt_control(
+        &self,
+        key: &AgentKey,
+        rx: crate::inbox_attempts::Rx,
+        control: &InboxStreamControl,
+    ) {
+        let mut out = engine::Outbox::new();
+        {
+            let mut st = self.lock();
+            engine::control(&mut st, key, rx, control, Instant::now(), &mut out);
+        }
+        engine::flush(out);
+        self.after_receipts();
+    }
+
+    fn receipt_closed(&self, key: &AgentKey, rx: crate::inbox_attempts::Rx, conn_id: u64) {
+        let mut out = engine::Outbox::new();
+        {
+            let mut st = self.lock();
+            let now = Instant::now();
+            engine::closed(&mut st, key, rx, conn_id);
+            if let Some(list) = st.waiters.get_mut(key) {
+                list.retain(|w| w.conn_id != conn_id);
+                if list.is_empty() {
+                    st.waiters.remove(key);
+                }
+            }
+            engine::apply(&mut st, key, now, &mut out);
+        }
+        engine::flush(out);
+        self.after_receipts();
     }
 }
 
@@ -2376,6 +3060,8 @@ fn drain_events(st: &mut HubState) {
                 returned: true,
                 wake_stalled: false,
                 wake_update: false,
+                attention_update: false,
+                notices: InboxCardNotices::default(),
             }));
         }
         let Some(recipient) = event.recipient else {
@@ -2393,6 +3079,8 @@ fn drain_events(st: &mut HubState) {
             returned: false,
             wake_stalled: false,
             wake_update: false,
+            attention_update: false,
+            notices: InboxCardNotices::default(),
         }));
     }
 }
@@ -2420,6 +3108,8 @@ fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, 
         returned: false,
         wake_stalled: stalled,
         wake_update: true,
+        attention_update: false,
+        notices: InboxCardNotices::default(),
     }));
 }
 
@@ -2601,8 +3291,51 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
                 Instant::now(),
             );
         }
-        st.owed_notices.push((to, UNDELIVERED_SUBJECT, body));
+        let subject = if reason == UndeliverableReason::Cancelled {
+            CANCELLED_SUBJECT
+        } else {
+            UNDELIVERED_SUBJECT
+        };
+        st.owed_notices.push((to, subject, body));
     }
+}
+
+/// PRD #1666 §6.6: the notice an orchestrator gets once when a delegated
+/// task's delivery became uncertain.
+pub fn compose_uncertain_notice(message_id: &str, role: &str) -> String {
+    format!(
+        "Task {message_id} to the worker in role {} may or may not have reached the worker: the \
+         deck handed it over, lost track of it, and its repeats did not settle it. The worker's \
+         card offers Retry, which sends it again marked as a possible repeat, and Cancel. If it \
+         reached the worker after all, you will be told.",
+        crate::state::quote_untrusted_role(role),
+    )
+}
+
+/// PRD #1666 §2 rule 1: the correction an orchestrator gets when a task it was
+/// told was uncertain, or cancelled, reached its worker after all.
+pub fn compose_after_all_notice(message_id: &str, role: &str, despite_cancel: bool) -> String {
+    let told = if despite_cancel {
+        "it was delivered after all, despite Cancel"
+    } else {
+        "it reached the worker after all"
+    };
+    format!(
+        "Correction: task {message_id} to the worker in role {} - {told}. The worker is working \
+         on it and its work-done can arrive. If you already re-delegated or reassigned the task, \
+         it may now be done twice: check the worker's pane, or notify the user.",
+        crate::state::quote_untrusted_role(role),
+    )
+}
+
+/// PRD #1666 §2 T3: the notice an offerer gets when the earlier holder of a
+/// job reassigned after a positive not-handed witness received it after all.
+pub fn compose_also_reached_notice(message_id: &str, role: &str) -> String {
+    format!(
+        "Task {message_id} also reached the worker in role {} that held it before it was \
+         reassigned. It may run twice: check both workers' panes, or notify the user.",
+        crate::state::quote_untrusted_role(role),
+    )
 }
 
 /// PRD #1666 long-turn delivery: remember a message that just ran out of
@@ -2753,6 +3486,9 @@ pub fn compose_undeliverable_notice(
         }
         UndeliverableReason::InboxShut => "the deck is shutting down",
         UndeliverableReason::Superseded => "a newer task replaced it",
+        UndeliverableReason::Cancelled => {
+            "the user cancelled its delivery; it may already have reached the worker"
+        }
     };
     format!(
         "Task {message_id} to the worker in role {} is undeliverable: {why}. The worker did not \
@@ -2831,6 +3567,7 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
         excluded: Vec::new(),
         assign_deadline: None,
         offer_hold: crate::inbox::OfferHold::NotAsked,
+        owner: None,
     };
     // Counted with the separator a hand-over puts before each block.
     let budget = tightest_hand_over().less(BLOCK_SEPARATOR);
@@ -3283,6 +4020,17 @@ pub fn render(message: &Message, max_chars: Option<usize>) -> InboxDelivery {
 /// outside it, and the block fits the budget whenever the budget can hold the
 /// structure at all.
 pub fn render_within(message: &Message, budget: Option<InboxBudget>) -> InboxDelivery {
+    render_marked(message, budget, false)
+}
+
+/// [`render_within`], and for a marked repeat (PRD #1666 §6.1) with the
+/// deck's possible-repeat line in its trusted head, after `Sent by:` and
+/// before any body.
+pub fn render_marked(
+    message: &Message,
+    budget: Option<InboxBudget>,
+    repeat: bool,
+) -> InboxDelivery {
     let id = message.id.as_str();
     let from = kind_sender_label(message.kind.name(), &message.from, message.body_trust);
     let untrusted = message.body_trust == BodyTrust::Untrusted;
@@ -3299,10 +4047,14 @@ pub fn render_within(message: &Message, budget: Option<InboxBudget>) -> InboxDel
         }
     };
     // PRD #1666 S6: the opener, then who sent it, outside any untrusted frame.
-    let head = format!(
+    let mut head = format!(
         "{BLOCK_OPENER}{id} from {from}]\n{PROVENANCE_PREFIX}{}.",
         sender_provenance(&message.from, message.body_trust)
     );
+    if repeat {
+        head.push('\n');
+        head.push_str(&crate::inbox_display::repeat_line(id));
+    }
     let closer = format!("{BLOCK_CLOSER}{id}]");
     // PRD #1666 S5: what the deck says about the body, ahead of it and outside
     // any untrusted frame. Its block markers are neutralised like a body's.
@@ -3353,6 +4105,7 @@ pub fn render_within(message: &Message, budget: Option<InboxBudget>) -> InboxDel
         subject: message.subject.clone(),
         from,
         text,
+        attempt: None,
     }
 }
 
@@ -3371,6 +4124,7 @@ pub async fn serve_waiter<R, W, P>(
     mode: InboxWaitMode,
     component: InboxComponent,
     instance: Option<u32>,
+    arm: ReceiptArm,
     reader: R,
     mut writer: W,
     repaint: P,
@@ -3380,6 +4134,36 @@ pub async fn serve_waiter<R, W, P>(
     P: Fn(&str),
 {
     let deadline = hub.write_deadline();
+    // PRD #1666 §13 step 4, §11: a component the receipt policy covers is
+    // served by the receipt engine, at the floor or above; below it nothing
+    // registers and its card says the integration is out of date.
+    if receipt_component(component) {
+        if mode == InboxWaitMode::Stream
+            && arm
+                .adapter_integration
+                .is_some_and(|declared| declared >= ADAPTER_INTEGRATION)
+        {
+            serve_receipt(
+                hub, pane_id, agent_id, component, instance, arm, reader, writer, repaint,
+            )
+            .await;
+            return;
+        }
+        hub.refuse_old_adapter(&pane_id, &agent_id);
+        warn!(
+            pane_id = %pane_id,
+            ?component,
+            declared = ?arm.adapter_integration,
+            "inbox: refused a component whose integration is out of date"
+        );
+        let _ = write_line_within(
+            deadline,
+            &mut writer,
+            &InboxWaitReply::refused("adapter_too_old", crate::inbox_display::ADAPTER_TOO_OLD),
+        )
+        .await;
+        return;
+    }
     let armed = match hub.arm(&pane_id, &agent_id, mode, component, instance) {
         Ok(armed) => armed,
         Err(error) => {
@@ -3444,6 +4228,8 @@ pub async fn serve_waiter<R, W, P>(
                     let _ = write_line_within(deadline, &mut writer, &InboxWaitReply::superseded()).await;
                     break;
                 }
+                // Only a receipt stream is sent single lines.
+                Some(WaiterSignal::Line(_)) => {}
                 None => break,
             },
             line = lines.recv() => match line {
@@ -3723,6 +4509,11 @@ mod tests {
             let (read, write) = tokio::io::split(server);
             let calls = Arc::new(Mutex::new(Vec::<String>::new()));
             let seen = Arc::clone(&calls);
+            // PRD #1666 §11: the OpenCode streams declare the floor.
+            let arm = ReceiptArm {
+                adapter_integration: Some(ADAPTER_INTEGRATION),
+                ..ReceiptArm::default()
+            };
             let serve = tokio::spawn(serve_waiter(
                 Arc::new(hub()),
                 "p".to_string(),
@@ -3730,6 +4521,7 @@ mod tests {
                 InboxWaitMode::Stream,
                 component,
                 None,
+                arm,
                 tokio::io::BufReader::new(read),
                 write,
                 move |agent: &str| seen.lock().unwrap().push(agent.to_string()),
@@ -4398,6 +5190,7 @@ mod tests {
             InboxWaitMode::Stream,
             InboxComponent::PiExtension,
             None,
+            ReceiptArm::default(),
             tokio::io::BufReader::new(read),
             write,
             |_: &str| {},
@@ -5222,6 +6015,7 @@ mod tests {
             InboxWaitMode::Stream,
             InboxComponent::PiExtension,
             Some(4242),
+            ReceiptArm::default(),
             tokio::io::BufReader::new(daemon_reads),
             daemon_writes,
             |_: &str| {},
