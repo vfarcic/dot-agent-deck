@@ -2848,12 +2848,6 @@ mod tests {
         );
     }
 
-    /// Scenario: A Pi attempt is approved and that approval is kept live;
-    /// the user cancels, and a second check of the same attempt is refused
-    /// before the revoke reaches the context. Likewise a check refused
-    /// because a sibling attempt committed. Neither refusal makes the attempt
-    /// final: Cancel stays held and the evidence stays reserved until the
-    /// receiver revokes locally and reports `NotHanded` itself.
     /// Scenario: A stream holds an attempt in a fresh snapshot and closes at
     /// once. No clock pass runs until two TTLs later; that pass finds no
     /// receipt, clears the attempt and schedules an automatic repeat. At three
@@ -2906,6 +2900,12 @@ mod tests {
         assert_eq!(repeat.kind, IssueKind::AutoRepeat);
     }
 
+    /// Scenario: A Pi attempt is approved and that approval is kept live;
+    /// the user cancels, and a second check of the same attempt is refused
+    /// before the revoke reaches the context. Likewise a check refused
+    /// because a sibling attempt committed. Neither refusal makes the attempt
+    /// final: Cancel stays held and the evidence stays reserved until the
+    /// receiver revokes locally and reports `NotHanded` itself.
     #[spec("inbox/attempts/018")]
     #[test]
     fn attempts_018_a_refused_check_is_no_not_handed_witness() {

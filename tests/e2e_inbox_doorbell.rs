@@ -375,7 +375,8 @@ fn dispatch_023_an_interrupts_escapes_do_not_hold_doorbell() {
         );
         status(&daemon, &pane, "thinking", agent_type);
         let mut user = input(&daemon, &pane, "\x1b");
-        std::thread::sleep(Duration::from_millis(300));
+        // OpenCode's interrupt: the second Escape about 300 ms later.
+        unchanged(&pane, Duration::from_millis(300));
         user.write("\x1b");
         assert!(
             common::wait_until(WAIT, || bytes(&pane) == b"\x1b\x1b"),
