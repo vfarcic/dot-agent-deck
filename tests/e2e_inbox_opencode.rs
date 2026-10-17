@@ -143,6 +143,14 @@ impl OpenCode {
                 .unwrap()
                 .push(json!(["DOT_AGENT_DECK_INBOX_TEST_DROP_COMMITTED", "1"]));
         }
+        // PRD #1666 §4: a replacement watcher's rebound caps reach its
+        // publisher this long after the `rebound` line.
+        if let Some(ms) = config["rebindDelayMs"].as_str() {
+            start["env"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(["DOT_AGENT_DECK_INBOX_TEST_REBIND_DELAY_MS", ms]));
+        }
         if let Some(pool) = pool {
             std::fs::write(
                 daemon.cwd().join(".dot-agent-deck.toml"),
@@ -1541,4 +1549,117 @@ fn opencode_044_an_offer_whose_call_failed_after_it_began_stays_bound() {
     assert_eq!(op.message_state(&id), "fetched", "still this worker's");
     op.assistant(&last_user(&op));
     state(&op.daemon, &op.pane, &id, "claimed");
+}
+
+/// Press Cancel on `id` for the OpenCode fixture's agent, at the revision the
+/// daemon names when the first press is stale.
+fn cancel(op: &OpenCode, id: &str) -> Value {
+    let press = |revision: u64| {
+        attach(
+            &op.daemon,
+            json!({"op":"inbox-cancel","pane_id":op.pane.id,"agent_id":op.pane.agent,
+                "message_id":id,"revision":revision,"request_id":"cancel-1"}),
+        )
+    };
+    let first = press(0);
+    match first["inbox_action"]["outcome"].as_str() {
+        Some("stale") => press(first["inbox_action"]["revision"].as_u64().unwrap()),
+        _ => first,
+    }
+}
+
+/// Scenario: The OpenCode pane is a worker taking jobs from a pool, and every receipt its watcher publishes takes three seconds. A job is offered to it, prompted, and answered, so the plugin reports it committed; while that receipt is still being written, the user cancels the job. The plugin answers the revoke `already_handed`, never `revoked_ack`, and the job ends cancelled on this worker instead of going back to its pool.
+#[spec("inbox/opencode/047")]
+#[test]
+fn opencode_047_a_cancel_racing_a_commits_publication_keeps_the_offer_bound() {
+    let op = OpenCode::new(
+        "session",
+        json!({"offerPool":"review","publishDelayMs":"3000"}),
+    );
+    armed(&op.daemon, &op.pane, 1);
+    let orch = op.orchestrator.as_ref().unwrap();
+    let mut req = request(orch, "inbox_offer");
+    req["pool"] = json!("review");
+    req["body"] = json!(BODY);
+    req["claim_ttl_ms"] = json!(120_000);
+    let reply = hook(&op.daemon, req);
+    let id = reply["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the offer is accepted: {reply}"))
+        .to_string();
+    op.wait_kind("user-message");
+    op.assistant(&last_user(&op));
+    assert!(
+        common::wait_until(WAIT, || op.commits(&id) >= 1),
+        "the plugin reports the commit: {:?}",
+        op.controls()
+    );
+    let pressed = cancel(&op, &id);
+    assert_eq!(pressed["inbox_action"]["outcome"], "applied", "{pressed}");
+    let answered = |what: &str| {
+        op.controls()
+            .iter()
+            .filter_map(|c| c[what].as_array().cloned())
+            .flatten()
+            .any(|at| at["id"] == id.as_str())
+    };
+    assert!(
+        common::wait_until(WAIT, || answered("already_handed")
+            || answered("revoked_ack")),
+        "the revoke is answered: {:?}",
+        op.controls()
+    );
+    assert!(
+        !answered("revoked_ack"),
+        "a committed job is no not-handed witness: {:?}",
+        op.controls()
+    );
+    assert!(
+        common::wait_until(WAIT, || op.message_state(&id) == "undeliverable"),
+        "the job ends cancelled on this worker: {}",
+        op.message_state(&id)
+    );
+    assert!(
+        !common::wait_until(Duration::from_millis(4000), || op.message_state(&id)
+            != "undeliverable"),
+        "and never goes back to its pool: {}",
+        op.message_state(&id)
+    );
+    assert_eq!(op.prompts().len(), 1);
+}
+
+/// Scenario: The TUI plugin is handed a deck message and prompts it; its watcher is killed and respawns, the new registration resumes the attempt, and the context answers that it retained it. The deck's answer, with the attempt's caps, reaches the new watcher's publisher two seconds late, and OpenCode answers the message inside that window, so the plugin reports it committed before the caps are there; the commit's control never reaches the deck. The new watcher waits for the caps and publishes the commit receipt, and the deck settles the message from it, with one prompt.
+#[spec("inbox/opencode/048")]
+#[test]
+fn opencode_048_a_commit_reported_before_the_rebound_caps_waits_for_them() {
+    let op = OpenCode::new(
+        "session",
+        json!({"dropCommitted":true,"keepaliveMs":"300","rebindDelayMs":"2000"}),
+    );
+    armed(&op.daemon, &op.pane, 1);
+    let id = op.post();
+    op.wait_kind("user-message");
+    op.control(json!({"killWatcher":true}));
+    assert!(common::wait_until(WAIT, || op.watchers().len() >= 2));
+    assert!(
+        common::wait_until(WAIT, || op
+            .controls()
+            .iter()
+            .any(|c| c["resume_answers"][0]["answer"] == "retained")),
+        "{:?}",
+        op.controls()
+    );
+    op.assistant(&last_user(&op));
+    assert!(
+        common::wait_until(WAIT, || op.commits(&id) >= 1),
+        "the plugin reports the commit: {:?}",
+        op.controls()
+    );
+    state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert_eq!(
+        op.prompts().len(),
+        1,
+        "settled from the replacement watcher's receipt: {:?}",
+        op.prompts()
+    );
 }

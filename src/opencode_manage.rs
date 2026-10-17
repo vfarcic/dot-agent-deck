@@ -1404,6 +1404,12 @@ fn inbox_js(chunk: &str) -> String {
             "__ADAPTER_INTEGRATION__",
             &crate::inbox_hub::ADAPTER_INTEGRATION.to_string(),
         )
+        .replace(
+            "__RETIRE_KEEPALIVES__",
+            &(crate::inbox_attempts::KEEPALIVES_PER_POSSESS_TTL
+                * crate::inbox_attempts::CLOSED_RETIRE_TTLS)
+                .to_string(),
+        )
 }
 
 /// PRD #1666 S8: what both plugins share for the deck's inbox.
@@ -1420,7 +1426,12 @@ const INBOX_ADAPTER_INTEGRATION = __ADAPTER_INTEGRATION__;
 const INBOX_ID = "(m-[a-z2-7]{8}-[0-9a-f]{16})";
 const INBOX_OPENER = new RegExp("\\[dot-agent-deck message " + INBOX_ID, "g");
 const INBOX_MAX_TRACKED = 256;
+const INBOX_MAX_CALLED = 4096;
 const INBOX_GRANT_TIMEOUT_MS = 5000;
+// Keepalives from a stream's close to the deck retiring it with no successor
+// (three POSSESS_TTLs of three keepalives each).
+const INBOX_RETIRE_KEEPALIVES = __RETIRE_KEEPALIVES__;
+const inboxNow = () => performance.now();
 const inboxSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const inboxRemember = (map, key, value) => {
   map.delete(key);
@@ -1551,29 +1562,54 @@ const inboxRef = (entry) => ({ id: entry.id, a: entry.a, e: entry.e });
 // final hand-over check, and its answers to revokes and resumes.
 //
 // `epoch` counts the watchers this receiver has run. An approval of the final
-// hand-over check carries the epoch it was granted under, and a callback may
-// reach OpenCode only while its context is still active, the epoch still that
-// one and the attempt neither revoked nor dropped (`ready`), checked with no
-// await between it and the call. A watcher restart (a rebinding) or the
-// context's disposal (a retirement) therefore voids every outstanding
-// approval: a callback that resumes after either never reaches OpenCode.
+// hand-over check carries the epoch it was granted under and when it was
+// asked for, and a callback may reach OpenCode only while its context is
+// still active, the epoch still that one, the approval younger than the
+// deck's retirement of a closed stream, and the attempt neither revoked nor
+// dropped (`ready`), checked with no await between it and the call. A
+// watcher restart (a rebinding), the context's disposal or a stall the deck
+// may have retired the stream across therefore voids every outstanding
+// approval: a callback that resumes after any of them never reaches OpenCode.
 const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
   const held = new Map();
   const revoked = new Set();
-  // Attempts a callback took into OpenCode's API and that did not end in a
-  // positive refusal: possibly handed, whatever happens to their held entry
-  // afterwards (an abort, a revert, an ambiguous failure). A revoke of one is
-  // answered `already_handed` and it is never reported not handed. Bounded,
-  // oldest dropped first.
+  // Attempts a callback took into OpenCode's API, or that the agent started
+  // on, and that did not end in a positive refusal: possibly handed, whatever
+  // happens to their held entry afterwards (a commit, an abort, a revert, an
+  // ambiguous failure). A revoke of one is answered `already_handed` and it is
+  // never reported not handed. Bounded, oldest dropped first; once one was
+  // dropped, an attempt this receiver does not hold may be one of them, so
+  // it is answered the same way.
   const called = new Set();
+  let forgot = false;
   const call = (key) => {
+    called.delete(key);
     called.add(key);
-    if (called.size > 4096) called.delete(called.values().next().value);
+    if (called.size > INBOX_MAX_CALLED) {
+      called.delete(called.values().next().value);
+      forgot = true;
+    }
   };
+  const handedBefore = (key) =>
+    held.get(key)?.stage === "handed" || called.has(key) || (forgot && !held.has(key));
+  // §2 "Revoke proof and callback quiescence": the deck retires a stream
+  // that closed no sooner than INBOX_RETIRE_KEEPALIVES after the close, and
+  // the close comes after any approval it sent. An approval used within that
+  // span of being asked for is therefore used before any retirement, so a
+  // context stalled past it, with the approval buffered, cannot call once
+  // the deck has fenced the attempt and a Cancel may have ended it.
+  const approval = () => ({
+    epoch,
+    at: inboxNow(),
+    valid: keepaliveMs ? Math.min(INBOX_GRANT_TIMEOUT_MS, keepaliveMs * INBOX_RETIRE_KEEPALIVES) : INBOX_GRANT_TIMEOUT_MS,
+  });
+  const fresh = (granted) =>
+    granted !== undefined && granted.epoch === epoch && inboxNow() - granted.at < granted.valid;
   const grants = new Map();
   let watermark = { seen: 0, above: new Set() };
   let child;
   let epoch = 0;
+  let keepaliveMs;
   let rx;
   let seq = 0;
   let q = 0;
@@ -1599,9 +1635,9 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
   };
   const answerRevoke = (ref) => {
     const key = inboxKey(ref);
+    const handed = handedBefore(key);
     revoked.add(key);
-    const entry = held.get(key);
-    if (entry?.stage === "handed" || called.has(key)) {
+    if (handed) {
       inboxWrite(child, { already_handed: [ref] });
     } else {
       held.delete(key);
@@ -1618,6 +1654,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     if (!reply || typeof reply !== "object") return;
     if (reply.registered && typeof reply.registered.rx === "number") {
       rx = reply.registered.rx;
+      keepaliveMs = typeof reply.registered.keepalive_ms === "number" ? reply.registered.keepalive_ms : undefined;
       watermark = { seen: 0, above: new Set() };
       const answers = (Array.isArray(reply.resume) ? reply.resume : []).map((ref) => ({
         id: ref.id,
@@ -1716,11 +1753,12 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
       for (const message of messages) take(message);
       snapshot();
     },
-    // §3: the daemon's final hand-over check; resolves to the epoch it was
-    // granted under, or undefined when it was refused or went unanswered.
+    // §3: the daemon's final hand-over check; resolves to the approval (its
+    // epoch and when it was asked for), or undefined when it was refused or
+    // went unanswered.
     may: async (ref) => {
       if (!child || rx === undefined) return undefined;
-      const asked = epoch;
+      const asked = approval();
       q += 1;
       const id = q;
       const answered = new Promise((resolve) => {
@@ -1736,15 +1774,18 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
       }
       return (await answered) ? asked : undefined;
     },
-    // §2: whether a callback holding an approval granted under `granted` may
-    // reach OpenCode right now. Synchronous: call it with no await between it
-    // and the native call. One native call per attempt: once a callback has
+    // An approval the deck gives in this synchronous step: a doorbell fetch
+    // issues its attempts under the deck's lock.
+    approval: () => approval(),
+    // §2: whether a callback holding the approval `granted` may reach
+    // OpenCode right now. Synchronous: call it with no await between it and
+    // the native call. One native call per attempt: once a callback has
     // called, every other approval of the attempt is refused, so a call's
     // outcome is the attempt's.
     ready: (ref, granted) => {
       const key = inboxKey(ref);
       const entry = held.get(key);
-      return active() && granted !== undefined && granted === epoch && entry !== undefined &&
+      return active() && fresh(granted) && entry !== undefined &&
         entry.stage !== "handed" && !called.has(key) && !revoked.has(key);
     },
     // The callback is about to reach OpenCode: from here a revoke is
@@ -1757,13 +1798,14 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     handed: (refs) => {
       if (refs.length) inboxWrite(child, { handed: refs });
     },
-    // The agent started on these: their receipts are published and they are
-    // no longer held.
+    // The agent started on these: no longer held, and possibly handed for
+    // good. Their receipts are published by the watcher after this returns,
+    // so a revoke meanwhile is still answered `already_handed`.
     committed: (refs) => {
       if (!refs.length) return;
       for (const ref of refs) {
         held.delete(inboxKey(ref));
-        called.delete(inboxKey(ref));
+        call(inboxKey(ref));
       }
       inboxWrite(child, { committed: refs });
       snapshot();
@@ -1775,7 +1817,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     // reach OpenCode once the deck believes it was not handed.
     notHanded: (ref) => {
       const key = inboxKey(ref);
-      if (held.get(key)?.stage === "handed" || called.has(key)) return;
+      if (handedBefore(key)) return;
       revoked.add(key);
       held.delete(key);
       inboxWrite(child, { not_handed: [ref] });
@@ -1833,7 +1875,7 @@ const inboxRefusedBeforeAcceptance = (result) => {
 // failure is lost, for a marked repeat. Returns whether it was handed.
 const inboxHandOver = async (receiver, ref, sessionID, call, valid = () => true) => {
   let granted = await receiver.may(ref);
-  if (granted !== undefined && granted !== receiver.epoch()) granted = await receiver.may(ref);
+  if (granted !== undefined && granted.epoch !== receiver.epoch()) granted = await receiver.may(ref);
   let still = false;
   try {
     still = receiver.ready(ref, granted) && valid();
@@ -2067,6 +2109,7 @@ const interceptDoorbell = async (input, output) => {
       if (!match) continue;
       const rx = receiver?.rx();
       if (rx === undefined) return;
+      const approval = receiver.approval();
       let reply;
       try {
         reply = JSON.parse(
@@ -2089,8 +2132,7 @@ const interceptDoorbell = async (input, output) => {
         return;
       }
       receiver.take(fetched);
-      const epoch = receiver.epoch();
-      const ready = fetched.filter((m) => receiver.ready(inboxRef(m), epoch));
+      const ready = fetched.filter((m) => receiver.ready(inboxRef(m), approval));
       for (const m of fetched) {
         if (!ready.includes(m)) receiver.notHanded(inboxRef(m));
       }
@@ -5228,6 +5270,93 @@ process.exit(0);
         assert_eq!(result["prompts"], serde_json::json!([]), "mini: {result}");
         let written = std::fs::read_to_string(&controls).unwrap_or_default();
         assert!(written.contains("\"not_handed\""), "mini: {written}");
+    }
+
+    /// Scenario: An attempt reaches OpenCode's API and the agent starts on it, so the plugin reports it committed while the watcher's receipt publish has not finished; a Cancel's revoke then arrives. It is answered `already_handed`, never `revoked_ack`, and a late refusal path reports nothing. Then a lost attempt is followed by thousands of later attempts that are called and committed, more than the receiver remembers: a revoke of the lost one, or of one the receiver never saw, is still answered `already_handed`, and neither is reported not handed.
+    #[spec("inbox/opencode/045")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_045_a_committed_or_forgotten_attempt_stays_possibly_handed() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+const ref = (e) => ({ id, a: 1, e });
+const copy = (e) => ({ ...ref(e), subject: "s", from: "x", text: "t", d: e });
+const answers = (e) => sent().flatMap((c) => [
+  ...(c.already_handed ?? []).filter((r) => r.e === e).map(() => "already_handed"),
+  ...(c.revoked_ack ?? []).filter((r) => r.e === e).map(() => "revoked_ack"),
+]);
+const notHanded = (e) => sent().flatMap((c) => c.not_handed ?? []).filter((r) => r.e === e).length;
+feed({ messages: [copy(1)] });
+receiver.calling(ref(1));
+receiver.handed([ref(1)]);
+receiver.committed([ref(1)]);
+receiver.notHanded(ref(1));
+check(notHanded(1), 0, "a committed attempt is never reported not handed");
+feed({ revoke: [ref(1)] });
+check(answers(1), ["already_handed"], "a revoke racing the commit's publication");
+
+feed({ messages: [copy(2)] });
+receiver.calling(ref(2));
+receiver.lost(ref(2));
+for (let e = 3; e < 3 + 5000; e++) {
+  feed({ messages: [copy(e)] });
+  receiver.calling(ref(e));
+  receiver.committed([ref(e)]);
+}
+feed({ revoke: [ref(2)] });
+check(answers(2), ["already_handed"], "a lost attempt the receiver no longer remembers");
+receiver.notHanded(ref(2));
+check(notHanded(2), 0, "and it is never reported not handed");
+feed({ revoke: [ref(9000)] });
+check(answers(9000), ["already_handed"], "once anything was forgotten, absence proves nothing");
+receiver.notHanded(ref(9000));
+check(notHanded(9000), 0, "nor does a refusal of an attempt it does not hold");
+"#,
+        );
+    }
+
+    /// Scenario: A receiver registers with a ten-millisecond keepalive. One hand-over check is approved and used at once, and reaches OpenCode. The next approval is buffered while the plugin's event loop stalls for longer than the deck waits before retiring a stream that closed: when the loop resumes and reads the approval, it never reaches OpenCode.
+    #[spec("inbox/opencode/046")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_046_an_approval_outlived_by_the_streams_retirement_is_void() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 10 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+const ref = (e) => ({ id, a: 1, e });
+feed({ messages: [1, 2].map((e) => ({ ...ref(e), subject: "s", from: "x", text: "t", d: e })) });
+const lastMay = () => sent().filter((c) => c.may).pop().may.q;
+const called = [];
+const handOver = (e) => inboxHandOver(receiver, ref(e), "s1", async () => { called.push(e); return {}; });
+const prompt = handOver(1);
+await tick();
+feed({ grant: { q: lastMay(), ok: true } });
+check(await prompt, true, "an approval used at once");
+const stale = handOver(2);
+await tick();
+const q = lastMay();
+const resumes = performance.now() + 200;
+while (performance.now() < resumes) {}
+feed({ grant: { q, ok: true } });
+check(await stale, false, "an approval read after the stall");
+check(called, [1], "never reaches OpenCode");
+"#,
+        );
     }
 
     /// Hardening M2: the server plugin swaps a submitted doorbell line for the

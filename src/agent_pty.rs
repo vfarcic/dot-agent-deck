@@ -1781,6 +1781,11 @@ fn spawn_with_dir(
     // reads. Only `spawn_agent`'s overlay, this daemon's own value, reaches a
     // child.
     cmd.env_remove(crate::inbox_receipt::ENV_INBOX_SPOOL);
+    // The receipt watcher's test knobs, likewise: one left in the daemon's
+    // environment never reaches an agent's watcher unless the spawn sets it.
+    for knob in crate::inbox_watcher::TEST_KNOBS {
+        cmd.env_remove(knob);
+    }
 
     for (k, v) in &opts.env {
         // PRD #127 C2: `SHELL` in `opts.env` is a wrapper-choice override only
@@ -23975,6 +23980,64 @@ mod spawn_tests {
         assert_eq!(without_spool, "unset", "no spool of its own: none at all");
         assert_eq!(with_spool, own.to_string_lossy(), "only its own");
         assert_eq!(after_respawn, own.to_string_lossy(), "and after a respawn");
+    }
+
+    /// Scenario: A daemon is launched with every receipt-watcher test knob in its environment. A child it spawns sees none of them; a knob the spawn sets explicitly, as a test does, reaches the child.
+    #[test]
+    fn the_child_inherits_no_receipt_watcher_test_knob() {
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let knobs = crate::inbox_watcher::TEST_KNOBS;
+        let prior: Vec<_> = knobs.iter().map(std::env::var_os).collect();
+        // SAFETY: see `ENV_TEST_LOCK`; the prior values are restored below.
+        unsafe {
+            for knob in knobs {
+                std::env::set_var(knob, "0");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen");
+        let report: Vec<String> = knobs.iter().map(|k| format!("${{{k}-unset}}")).collect();
+        let command = format!(
+            "sh -c 'printf \"%s \" {} > {}.tmp && mv {}.tmp {}; exec cat'",
+            report.join(" "),
+            seen.display(),
+            seen.display(),
+            seen.display()
+        );
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), "knobs".to_string()),
+                    (knobs[2].to_string(), "7".to_string()),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let mut text = None;
+        for _ in 0..500 {
+            if let Ok(read) = std::fs::read_to_string(&seen) {
+                text = Some(read);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: as above.
+        unsafe {
+            for (knob, value) in knobs.iter().zip(prior) {
+                match value {
+                    Some(v) => std::env::set_var(knob, v),
+                    None => std::env::remove_var(knob),
+                }
+            }
+        }
+        registry.shutdown_all();
+        assert_eq!(
+            text.expect("the child reported its environment").trim(),
+            "unset unset 7",
+            "only the knob the spawn set reaches the child"
+        );
     }
 
     /// The token must not travel to any client. `AgentRecord` is what

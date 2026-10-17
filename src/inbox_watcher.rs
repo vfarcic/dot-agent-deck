@@ -11,9 +11,11 @@
 //! A publish still in flight is added to every possession snapshot the
 //! component sends meanwhile, so a slow spool write never reads as absence.
 //! An attempt the component retained across a watcher restart is rebound to
-//! the new watcher with its caps, so its receipts are still published; a
-//! stage report for an attempt whose cap this watcher lacks publishes nothing
-//! and says so, as a degraded report, rather than passing for a receipt.
+//! the new watcher with its caps, so its receipts are still published: a
+//! stage report for it that comes before the daemon's `rebound` answer waits
+//! for those caps, the attempt held meanwhile. A stage report for an attempt
+//! whose cap this watcher still lacks publishes nothing and says so, as a
+//! degraded report, rather than passing for a receipt.
 //!
 //! Every other control (`may`, `not_handed`, revoke answers, resume answers)
 //! is forwarded on this authenticated connection only: a spool record is
@@ -25,14 +27,30 @@
 //! taken as dead (§4 "Dead adapter, live watcher"): the watcher closes the
 //! stream, and the daemon stops counting the component as holding anything.
 
-/// TEST knob: every receipt publish waits this many milliseconds first, so a
-/// test can hold one in flight across keepalives.
+/// TEST knob, read only by a build with the `e2e` feature: every receipt
+/// publish waits this many milliseconds first, so a test can hold one in
+/// flight across keepalives.
 pub const ENV_TEST_PUBLISH_DELAY_MS: &str = "DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS";
 
-/// TEST knob: the watcher publishes each `committed` receipt but never
-/// forwards the control, as if its stream died between the two, so a test can
-/// show the daemon settling from the spool alone.
+/// TEST knob, read only by a build with the `e2e` feature: the watcher
+/// publishes each `committed` receipt but never forwards the control, as if
+/// its stream died between the two, so a test can show the daemon settling
+/// from the spool alone.
 pub const ENV_TEST_DROP_COMMITTED: &str = "DOT_AGENT_DECK_INBOX_TEST_DROP_COMMITTED";
+
+/// TEST knob, read only by a build with the `e2e` feature: the caps of a
+/// `rebound` answer reach the watcher's publisher this many milliseconds
+/// late, while the line itself goes on to the component at once, so a test
+/// can report a retained attempt's stage inside that window.
+pub const ENV_TEST_REBIND_DELAY_MS: &str = "DOT_AGENT_DECK_INBOX_TEST_REBIND_DELAY_MS";
+
+/// Every TEST knob above. A spawned agent inherits none of them from the
+/// daemon's environment (`agent_pty`); a test sets one explicitly.
+pub const TEST_KNOBS: [&str; 3] = [
+    ENV_TEST_PUBLISH_DELAY_MS,
+    ENV_TEST_DROP_COMMITTED,
+    ENV_TEST_REBIND_DELAY_MS,
+];
 
 #[cfg(not(unix))]
 pub fn wait_receipt_stream(_json: &str) -> std::process::ExitCode {
@@ -45,27 +63,87 @@ pub use unix::wait_receipt_stream;
 
 #[cfg(unix)]
 mod unix {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     use std::process::ExitCode;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
-    use super::{ENV_TEST_DROP_COMMITTED, ENV_TEST_PUBLISH_DELAY_MS};
-    use crate::event::{InboxAttemptRef, InboxStreamControl, InboxWaitReply};
+    use crate::event::{InboxAttemptCaps, InboxAttemptRef, InboxStreamControl, InboxWaitReply};
     use crate::inbox_receipt::{Cap, GenerationSpool, RecordKey, RecordStage};
 
     /// Keepalives without a snapshot after which the component counts as
     /// dead.
     const SNAPSHOT_KEEPALIVES: u32 = crate::inbox_attempts::KEEPALIVES_PER_POSSESS_TTL;
 
+    /// How long a stage report for an attempt still being rebound waits for
+    /// the caps the daemon's `rebound` answer brings. The daemon answers a
+    /// `retained` resume at once; one it no longer rebinds (its resume window
+    /// ran out first) never answers, and the report is then degraded.
+    const REBIND_WAIT: Duration = Duration::from_secs(5);
+
     type Key = (String, u32, u32);
     type SpoolOrError = Result<Arc<GenerationSpool>, String>;
+
+    #[cfg(feature = "e2e")]
+    fn test_ms(knob: &str) -> Option<u64> {
+        std::env::var(knob)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+    }
+
+    #[cfg(not(feature = "e2e"))]
+    fn test_ms(_knob: &str) -> Option<u64> {
+        None
+    }
+
+    #[cfg(feature = "e2e")]
+    fn test_drops_committed() -> bool {
+        std::env::var_os(super::ENV_TEST_DROP_COMMITTED).is_some()
+    }
+
+    #[cfg(not(feature = "e2e"))]
+    fn test_drops_committed() -> bool {
+        false
+    }
+
+    /// The watcher's state, shared by its threads; `rebound` is signalled
+    /// whenever an attempt's rebinding ends.
+    #[derive(Default)]
+    struct Watch {
+        shared: Mutex<Shared>,
+        rebound: Condvar,
+    }
+
+    impl Watch {
+        fn lock(&self) -> MutexGuard<'_, Shared> {
+            self.shared.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// A rebound attempt's caps arrived (or the daemon had none): its
+        /// stage reports go ahead.
+        fn rebind(&self, key: Key, caps: Option<&InboxAttemptCaps>) {
+            let mut shared = self.lock();
+            if let Some(caps) = caps {
+                shared.caps.insert(key.clone(), caps_of(caps));
+            }
+            shared.rebinding.remove(&key);
+            drop(shared);
+            self.rebound.notify_all();
+        }
+    }
+
+    fn caps_of(caps: &InboxAttemptCaps) -> (Option<Cap>, Option<Cap>) {
+        (Cap::from_hex(&caps.handed), Cap::from_hex(&caps.commit))
+    }
 
     #[derive(Default)]
     struct Shared {
         caps: HashMap<Key, (Option<Cap>, Option<Cap>)>,
+        /// Attempts the daemon asked this watcher's component to resume, whose
+        /// `rebound` answer (and caps) has not arrived yet.
+        rebinding: HashSet<Key>,
         /// Publications still being written, per attempt: one per stage
         /// worker, so an attempt stays in every snapshot until the last of
         /// its overlapping `handed` and `committed` publishes is done.
@@ -101,23 +179,45 @@ mod unix {
         .map_err(|error| error.to_string())
     }
 
+    fn cap(shared: &Shared, key: &Key, stage: RecordStage) -> Option<Cap> {
+        shared
+            .caps
+            .get(key)
+            .and_then(|(handed, commit)| match stage {
+                RecordStage::Handed => handed.clone(),
+                RecordStage::Committed => commit.clone(),
+            })
+    }
+
     /// Publish `stage`'s receipt for each attempt, with the attempt's own
-    /// cap. The first failure is returned. A cap this watcher was never handed
-    /// is a failure too: the receipt it would have protected is not there,
-    /// so the generation must read as degraded rather than protected.
-    fn publish(
-        shared: &Mutex<Shared>,
-        stage: RecordStage,
-        attempts: &[InboxAttemptRef],
-    ) -> Option<String> {
-        let delay = std::env::var(ENV_TEST_PUBLISH_DELAY_MS)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok());
-        if let Some(ms) = delay {
+    /// cap. An attempt still being rebound waits, up to [`REBIND_WAIT`], for
+    /// the caps its `rebound` answer brings; its caller keeps it in flight,
+    /// so held, meanwhile. The first failure is returned. A cap this watcher
+    /// still lacks is a failure too: the receipt it would have protected is
+    /// not there, so the generation must read as degraded rather than
+    /// protected.
+    fn publish(watch: &Watch, stage: RecordStage, attempts: &[InboxAttemptRef]) -> Option<String> {
+        if let Some(ms) = test_ms(super::ENV_TEST_PUBLISH_DELAY_MS) {
             std::thread::sleep(Duration::from_millis(ms));
         }
         let (spool, caps): (SpoolOrError, Vec<(Key, Option<Cap>)>) = {
-            let shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let mut shared = watch.lock();
+            let deadline = Instant::now() + REBIND_WAIT;
+            loop {
+                let waiting = attempts.iter().any(|at| {
+                    let k = key(at);
+                    cap(&shared, &k, stage).is_none() && shared.rebinding.contains(&k)
+                });
+                let left = deadline.saturating_duration_since(Instant::now());
+                if !waiting || left.is_zero() {
+                    break;
+                }
+                shared = watch
+                    .rebound
+                    .wait_timeout(shared, left)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
             let spool = match &shared.spool {
                 Some(Ok(spool)) => Ok(Arc::clone(spool)),
                 Some(Err(error)) => Err(error.clone()),
@@ -127,13 +227,7 @@ mod unix {
                 .iter()
                 .map(|at| {
                     let k = key(at);
-                    let cap = shared
-                        .caps
-                        .get(&k)
-                        .and_then(|(handed, commit)| match stage {
-                            RecordStage::Handed => handed.clone(),
-                            RecordStage::Committed => commit.clone(),
-                        });
+                    let cap = cap(&shared, &k, stage);
                     (k, cap)
                 })
                 .collect();
@@ -182,12 +276,12 @@ mod unix {
         if write_line(&writer, json).is_err() {
             return ExitCode::SUCCESS;
         }
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        let watch = Arc::new(Watch::default());
         // The component's controls. Its closing our stdin is how it says it
         // is done, so the watcher then exits.
         {
             let writer = Arc::clone(&writer);
-            let shared = Arc::clone(&shared);
+            let watch = Arc::clone(&watch);
             std::thread::spawn(move || {
                 let stdin = std::io::stdin();
                 for line in stdin.lock().lines() {
@@ -203,8 +297,15 @@ mod unix {
                     };
                     let handed = std::mem::take(&mut control.handed);
                     let committed = std::mem::take(&mut control.committed);
+                    // An attempt the component did not retain is not
+                    // rebound: nothing waits for its caps.
+                    for answer in &control.resume_answers {
+                        if answer.answer != "retained" {
+                            watch.rebind((answer.id.clone(), answer.a, answer.e), None);
+                        }
+                    }
                     if let Some(possess) = control.possess.as_mut() {
-                        let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut shared = watch.lock();
                         shared.last_snapshot = Some(Instant::now());
                         for (id, a, e) in shared.in_flight.keys() {
                             if !possess
@@ -230,23 +331,23 @@ mod unix {
                         continue;
                     }
                     {
-                        let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut shared = watch.lock();
                         for at in handed.iter().chain(&committed) {
                             *shared.in_flight.entry(key(at)).or_default() += 1;
                         }
                     }
                     let writer = Arc::clone(&writer);
-                    let shared = Arc::clone(&shared);
+                    let watch = Arc::clone(&watch);
                     std::thread::spawn(move || {
                         let mut degraded = None;
                         if !handed.is_empty() {
-                            degraded = publish(&shared, RecordStage::Handed, &handed);
+                            degraded = publish(&watch, RecordStage::Handed, &handed);
                         }
                         if !committed.is_empty() {
                             degraded =
-                                publish(&shared, RecordStage::Committed, &committed).or(degraded);
+                                publish(&watch, RecordStage::Committed, &committed).or(degraded);
                         }
-                        let dropped = std::env::var_os(ENV_TEST_DROP_COMMITTED).is_some();
+                        let dropped = test_drops_committed();
                         let stages = InboxStreamControl {
                             handed: handed.clone(),
                             committed: if dropped {
@@ -262,7 +363,7 @@ mod unix {
                         {
                             let _ = write_line(&writer, &text);
                         }
-                        let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut shared = watch.lock();
                         for at in handed.iter().chain(&committed) {
                             let k = key(at);
                             if let Some(count) = shared.in_flight.get_mut(&k) {
@@ -288,7 +389,7 @@ mod unix {
             };
             if reply.keepalive {
                 let dead = {
-                    let shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let shared = watch.lock();
                     match (shared.keepalive, shared.last_snapshot) {
                         (Some(keepalive), Some(last)) => {
                             last.elapsed() >= keepalive * SNAPSHOT_KEEPALIVES
@@ -306,16 +407,14 @@ mod unix {
             }
             if let Some(registered) = &reply.registered {
                 let spool = open_spool();
-                let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+                let mut shared = watch.lock();
                 shared.keepalive = Some(Duration::from_millis(registered.keepalive_ms.max(1)));
                 shared.last_snapshot = Some(Instant::now());
                 shared.spool = Some(spool);
+                shared.rebinding = reply.resume.iter().map(key).collect();
             }
-            let caps_of = |caps: &crate::event::InboxAttemptCaps| {
-                (Cap::from_hex(&caps.handed), Cap::from_hex(&caps.commit))
-            };
             if !reply.issued.is_empty() {
-                let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+                let mut shared = watch.lock();
                 for issued in std::mem::take(&mut reply.issued) {
                     shared
                         .caps
@@ -342,18 +441,22 @@ mod unix {
             }
             // §4, §5: a retained attempt rebound to this watcher comes with its
             // caps, so its receipts can still be published from here.
-            if !reply.rebound.is_empty() {
-                let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
-                for rebound in reply.rebound.iter_mut() {
-                    if let Some(caps) = rebound.caps.take() {
-                        shared
-                            .caps
-                            .insert((rebound.id.clone(), rebound.a, rebound.e), caps_of(&caps));
+            for rebound in reply.rebound.iter_mut() {
+                let key = (rebound.id.clone(), rebound.a, rebound.e);
+                let caps = rebound.caps.take();
+                match test_ms(super::ENV_TEST_REBIND_DELAY_MS) {
+                    Some(ms) => {
+                        let watch = Arc::clone(&watch);
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(ms));
+                            watch.rebind(key, caps.as_ref());
+                        });
                     }
+                    None => watch.rebind(key, caps.as_ref()),
                 }
             }
             if let Some(messages) = reply.messages.as_mut() {
-                let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+                let mut shared = watch.lock();
                 for message in messages.iter_mut() {
                     if let Some(attempt) = message.attempt.as_mut()
                         && let Some(caps) = attempt.caps.take()
@@ -375,5 +478,32 @@ mod unix {
             }
         }
         ExitCode::SUCCESS
+    }
+
+    #[cfg(all(test, not(feature = "e2e")))]
+    mod tests {
+        /// Scenario: A build without the `e2e` feature runs with every TEST knob set in its environment. It reads none of them: no publish delay, no rebind delay, and committed controls are forwarded.
+        #[test]
+        fn a_build_without_e2e_reads_no_test_knob() {
+            // SAFETY: nextest runs each test in its own process, and no
+            // other code in this one reads these variables.
+            unsafe {
+                for knob in super::super::TEST_KNOBS {
+                    std::env::set_var(knob, "1");
+                }
+            }
+            let read = (
+                super::test_ms(super::super::ENV_TEST_PUBLISH_DELAY_MS),
+                super::test_ms(super::super::ENV_TEST_REBIND_DELAY_MS),
+                super::test_drops_committed(),
+            );
+            // SAFETY: as above.
+            unsafe {
+                for knob in super::super::TEST_KNOBS {
+                    std::env::remove_var(knob);
+                }
+            }
+            assert_eq!(read, (None, None, false), "a knob was read");
+        }
     }
 }
