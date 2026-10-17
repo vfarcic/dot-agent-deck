@@ -2670,6 +2670,7 @@ impl InboxHub {
                         // the deck cannot read claims no suppression, so its
                         // candidates count as checked.
                         found.cleared = check.candidates;
+                        found.verified = check.verify;
                         continue;
                     };
                     for _ in 0..8 {
@@ -2684,7 +2685,12 @@ impl InboxHub {
                             break;
                         }
                     }
-                    for candidate in check.candidates {
+                    for (candidate, verify) in check
+                        .candidates
+                        .into_iter()
+                        .map(|c| (c, false))
+                        .chain(check.verify.into_iter().map(|c| (c, true)))
+                    {
                         match scanner.commit_presence(
                             store,
                             &candidate.id,
@@ -2696,6 +2702,7 @@ impl InboxHub {
                                 candidate.a,
                                 candidate.e,
                             )),
+                            Presence::Absent if verify => found.verified.push(candidate),
                             Presence::Absent => found.cleared.push(candidate),
                             Presence::Unknown => {}
                         }

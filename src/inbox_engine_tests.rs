@@ -851,7 +851,7 @@ async fn boundary_016_a_spool_that_cannot_start_is_degraded_storage() {
     peer.close().await;
 }
 
-/// Scenario: Run the capability probe against stand-in CLIs that come close to clap's refusal without being it, an old help that exits 0 without the flag, one that names the flag only in prose, one that writes a megabyte to each stream after its help, one that leaves a background process holding its output open, and one that hangs; then let a registration land before a late `cli_too_old`. Only clap's exact diagnostic on exit 2 is `cli_too_old` and only a help line listing the flag is support; the chatty CLI, which fails if a write to it fails, is drained and read as supported before the deadline; the probe returns by its deadline despite the held output, and kills and reaps the hung CLI; the late result changes nothing after the registration.
+/// Scenario: Run the capability probe against stand-in CLIs that come close to clap's refusal without being it (among them its words behind a cursor-control sequence, and its words followed by an unterminated escape), an old help that exits 0 without the flag, one that names the flag only in prose, one that writes a megabyte to each stream after its help, one that leaves a background process holding its output open, and one that hangs; then let a registration land before a late `cli_too_old`. Only clap's exact diagnostic on exit 2 is `cli_too_old` and only a help line listing the flag is support; the chatty CLI, which fails if a write to it fails, is drained and read as supported before the deadline; the probe returns by its deadline despite the held output, and kills and reaps the hung CLI; the late result changes nothing after the registration.
 #[spec("inbox/boundary/017")]
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -884,6 +884,15 @@ async fn boundary_017_the_probe_reads_only_clap_and_is_bounded() {
         (
             "prose",
             "echo 'Usage: dot-agent-deck inbox wait --agent <AGENT>'\necho '      --agent <AGENT>  Unlike --adapter-integration, names the agent'\nexit 0".to_string(),
+        ),
+        (
+            // Cursor control, not styling: the line as written is not clap's.
+            "cursor",
+            "printf '\\033[2Kerror: unexpected argument \\047--adapter-integration\\047 found\\n' >&2\nexit 2".to_string(),
+        ),
+        (
+            "unterminated",
+            "printf 'error: unexpected argument \\047--adapter-integration\\047 found\\033[1\\n' >&2\nexit 2".to_string(),
         ),
     ] {
         let cli = stand_in(name, &body);
@@ -1034,7 +1043,7 @@ fn attempts_of(hub: &InboxHub, pane: &str, agent: &str, id: &str) -> usize {
         .map_or(0, |d| d.attempts.len())
 }
 
-/// Scenario: Two messages are handed to a receipt stream, and a directory squats on each one's committed receipt name, so the spool lookup cannot say whether either committed. The stream's next snapshot omits the first, the second's issue grace runs out with no snapshot covering it, and the clock ticks through several possession TTLs: neither is handed out again and no new attempt is issued for either. Once the wait bound passes, both are listed on the card as uncertain, with Retry and Cancel, rather than repeated.
+/// Scenario: Two messages are handed to a receipt stream, and a directory squats on each one's committed receipt name, so the spool lookup cannot say whether either committed. The stream's next snapshot omits the first, the second's issue grace runs out with no snapshot covering it, and the clock ticks through several possession TTLs: neither is handed out again, no new attempt is issued for either, and no repeat is even scheduled, so the doorbell's tick sees no waiting mail. Once the wait bound passes, both are listed on the card as uncertain, with Retry and Cancel, rather than repeated.
 #[spec("inbox/boundary/019")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boundary_019_an_unknown_lookup_blocks_every_repeat() {
@@ -1066,6 +1075,10 @@ async fn boundary_019_an_unknown_lookup_blocks_every_repeat() {
         "unknown lookup",
     )
     .await;
+    assert!(
+        !hub.panes_with_queued().iter().any(|p| p == "p"),
+        "no repeat is scheduled, so the doorbell's tick sees no waiting mail"
+    );
     for id in [&omitted, &expired] {
         assert_eq!(
             attempts_of(&hub, "p", "a", id.as_str()),
@@ -1585,4 +1598,248 @@ async fn boundary_027_an_offer_moved_from_pi_to_opencode_is_not_settled_by_a_lat
     })
     .await;
     oc.close().await;
+}
+
+/// The current revision of `id` in `pane`/`agent`'s attempt model.
+fn revision_of(hub: &InboxHub, pane: &str, agent: &str, id: &str) -> u64 {
+    hub.lock().receipts.gens[&(pane.to_string(), agent.to_string())]
+        .model
+        .delivery(id)
+        .unwrap()
+        .revision
+}
+
+/// Delegate a task to `pane`/`a` from orchestrator pane `o`.
+fn delegate_to(hub: &InboxHub, pane: &str, body: &str) -> MessageId {
+    hub.post_delegate(
+        Recipient::bound(pane, "a"),
+        "coder",
+        Some(Recipient::bound("o", "oa")),
+        DelegateLedger::default(),
+        content(body),
+        &|| true,
+    )
+    .unwrap()
+    .0
+}
+
+/// The subjects and texts posted to orchestrator pane `o` so far.
+fn orchestrator_notices(hub: &InboxHub) -> Vec<(String, String)> {
+    hub.post_owed_notices();
+    hub.list_with_bodies(Some("o"))
+        .into_iter()
+        .map(|m| (m.subject.clone(), m.text.clone().unwrap_or_default()))
+        .collect()
+}
+
+/// Whether `id`'s attempt `(a, e)` in `pane`/`a` has had its evidence
+/// reservation returned.
+fn reclaimed(hub: &InboxHub, pane: &str, id: &str, a: u32, e: u32) -> bool {
+    hub.lock().receipts.gens[&(pane.to_string(), "a".to_string())]
+        .model
+        .delivery(id)
+        .and_then(|d| d.attempt(a, e))
+        .is_some_and(|at| at.reclaimed)
+}
+
+/// Scenario: A task delegated to an OpenCode pane is handed over, its watcher publishes the task's committed receipt, and the stream dies before the commit control reaches the deck. A reloaded context registers, and the user cancels the task before the context answers the resume `unknown`. The cancelled attempt keeps its receipt until the deck has read the spool: the orchestrator is told the task was cancelled after it may have reached the worker, and then that it was delivered after all. In a second pane the stream closes for good and the deck retires it, the watcher's late commit receipt lands, and the user cancels: the orchestrator again gets the correction. A third task, whose stream is retired with no receipt, is cancelled, and its evidence is returned once the deck has read the spool.
+#[spec("inbox/boundary/028")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_028_cancel_keeps_a_fenced_attempts_receipt_until_it_is_read() {
+    use crate::daemon_protocol::InboxActionOutcome;
+    use crate::inbox_receipt::RecordStage;
+    let (hub, _state) = hub_with_spool(Duration::from_millis(50), Duration::from_secs(60));
+    let mut first = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    first.next().await;
+    let task = delegate_to(&hub, "p", "started then cancelled");
+    let handed = first.handout().await;
+    for stage in [RecordStage::Handed, RecordStage::Committed] {
+        publish_receipt(&hub, "p", "a", &handed[0], stage);
+    }
+    first.close().await;
+    let mut reloaded =
+        Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    assert_eq!(reloaded.next().await.resume.len(), 1);
+    let cancel = hub.inbox_action(
+        "p",
+        "a",
+        task.as_str(),
+        revision_of(&hub, "p", "a", task.as_str()),
+        false,
+        "tui-1",
+    );
+    assert_eq!(cancel.outcome, InboxActionOutcome::Applied);
+    let (a, e) = (attempt(&handed[0]).a, attempt(&handed[0]).e);
+    reloaded
+        .send(serde_json::json!({"resume_answers": [{"id": task.as_str(), "a": a, "e": e, "answer": "unknown"}]}))
+        .await;
+    until("the cancel to end it", || {
+        state_of(&hub, "p", task.as_str()) == StateName::Undeliverable
+    })
+    .await;
+    assert!(
+        !reclaimed(&hub, "p", task.as_str(), a, e),
+        "the fenced attempt keeps its receipt until the spool is read"
+    );
+    until("the correction", || {
+        hub.tick();
+        orchestrator_notices(&hub).len() == 2
+    })
+    .await;
+    let told = orchestrator_notices(&hub);
+    assert_eq!(told[0].0, CANCELLED_SUBJECT, "{told:?}");
+    assert!(
+        told[0].1.contains("may already have reached the worker"),
+        "{}",
+        told[0].1
+    );
+    assert_eq!(told[1].0, LATE_ACK_SUBJECT, "{told:?}");
+    assert!(
+        told[1]
+            .1
+            .contains(&compose_after_all_notice(task.as_str(), "coder", true)),
+        "{}",
+        told[1].1
+    );
+    reloaded.close().await;
+
+    // POSSESS_TTL is 150 ms: a stream closed with no successor is retired
+    // 450 ms later, which fences what it held.
+    for (pane, published) in [("q", true), ("r", false)] {
+        let mut peer =
+            Peer::open(&hub, pane, "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+        peer.next().await;
+        let task = delegate_to(&hub, pane, "retired");
+        let handed = peer.handout().await;
+        let (a, e) = (attempt(&handed[0]).a, attempt(&handed[0]).e);
+        peer.send(serde_json::json!({"handed": [at(&handed[0])]}))
+            .await;
+        peer.close().await;
+        let key = (pane.to_string(), "a".to_string());
+        until("the closed stream's retirement", || {
+            hub.tick();
+            hub.lock().receipts.gens[&key]
+                .model
+                .delivery(task.as_str())
+                .and_then(|d| d.attempt(a, e))
+                .is_some_and(|at| at.stage == crate::inbox_attempts::Stage::Fenced)
+        })
+        .await;
+        if published {
+            publish_receipt(&hub, pane, "a", &handed[0], RecordStage::Committed);
+        }
+        let before = orchestrator_notices(&hub).len();
+        let cancel = hub.inbox_action(
+            pane,
+            "a",
+            task.as_str(),
+            revision_of(&hub, pane, "a", task.as_str()),
+            false,
+            "desktop-1",
+        );
+        assert_eq!(cancel.outcome, InboxActionOutcome::Applied, "{pane}");
+        assert_eq!(
+            state_of(&hub, pane, task.as_str()),
+            StateName::Undeliverable,
+            "{pane}"
+        );
+        assert!(
+            !reclaimed(&hub, pane, task.as_str(), a, e),
+            "{pane}: kept until the spool is read"
+        );
+        if published {
+            until("the correction after a retirement", || {
+                hub.tick();
+                orchestrator_notices(&hub).len() == before + 2
+            })
+            .await;
+            let told = orchestrator_notices(&hub);
+            assert_eq!(told[before + 1].0, LATE_ACK_SUBJECT, "{told:?}");
+        } else {
+            until("a clean read to return the evidence", || {
+                hub.tick();
+                reclaimed(&hub, pane, task.as_str(), a, e)
+            })
+            .await;
+            assert_eq!(
+                orchestrator_notices(&hub).len(),
+                before + 1,
+                "no correction without a receipt"
+            );
+        }
+    }
+}
+
+/// Scenario: A message's first hand-out lapses unpossessed, the spool shows no receipt for it, and the deck hands out a marked repeat, which the receiver holds. The first hand-out's watcher then publishes its commit receipt late, and before the deck reads the spool again the receiver positively refuses the repeat. No third copy is handed out on the strength of the earlier check: the deck reads the spool, finds the receipt and settles the message. On a second message, a directory squats on the first hand-out's receipt name after the repeat went out, so the lookup cannot tell: refusing the repeat hands out nothing more, and the message is listed as uncertain instead.
+#[spec("inbox/boundary/029")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_029_an_earlier_absence_check_never_licenses_a_later_repeat() {
+    for unknown in [false, true] {
+        let what = if unknown { "unknown" } else { "published" };
+        let (hub, _state) = hub_with_spool(Duration::from_millis(50), Duration::from_secs(60));
+        let mut peer =
+            Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+        peer.next().await;
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content(what))
+            .unwrap();
+        let first = peer.handout().await;
+        peer.send(
+            serde_json::json!({"possess": {"seq": 1, "seen": attempt(&first[0]).d, "held": []}}),
+        )
+        .await;
+        let repeat = peer.handout_ticking(&hub).await;
+        assert!(attempt(&repeat[0]).repeat, "{what}: the marked repeat");
+        peer.send(serde_json::json!({"possess": {"seq": 2, "seen": attempt(&repeat[0]).d, "held": [at(&repeat[0])]}}))
+            .await;
+        if unknown {
+            let at = attempt(&first[0]);
+            std::fs::create_dir(
+                rec_dir(&hub, "p", "a").join(format!("{}.{}.{}.committed", id, at.a, at.e)),
+            )
+            .unwrap();
+        } else {
+            publish_receipt(
+                &hub,
+                "p",
+                "a",
+                &first[0],
+                crate::inbox_receipt::RecordStage::Committed,
+            );
+        }
+        peer.send(serde_json::json!({"not_handed": [at(&repeat[0])]}))
+            .await;
+        if let Ok(reply) = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                let reply = peer.next().await;
+                if reply.messages.is_some() {
+                    return reply;
+                }
+            }
+        })
+        .await
+        {
+            panic!("{what}: a third copy was handed out on the earlier check: {reply:?}");
+        }
+        if unknown {
+            no_handout_while_ticking(&hub, &mut peer, Duration::from_millis(200), what).await;
+            until("it to be listed as uncertain", || {
+                hub.tick();
+                hub.summary("p", "a").notices.attention.len() == 1
+            })
+            .await;
+            assert_eq!(
+                hub.summary("p", "a").notices.attention[0].kind,
+                AttentionKind::Uncertain
+            );
+        } else {
+            until("the receipt to settle it", || {
+                hub.tick();
+                state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
+            })
+            .await;
+        }
+        assert_eq!(attempts_of(&hub, "p", "a", id.as_str()), 2, "{what}");
+        peer.close().await;
+    }
 }

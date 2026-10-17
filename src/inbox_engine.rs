@@ -212,10 +212,10 @@ impl Receipts {
         // §3: an attempt that just lost possession is checked in the spool
         // soon, so its repeat (or its settling receipt) is not left waiting
         // for the next ordinary step; at most once a second while one waits.
-        let checking = self
-            .gens
-            .values()
-            .any(|generation| !generation.model.lapse_candidates(now).is_empty());
+        let checking = self.gens.values().any(|generation| {
+            !generation.model.lapse_candidates(now).is_empty()
+                || !generation.model.verify_candidates().is_empty()
+        });
         let check = checking.then(|| {
             self.last_check
                 .map_or(now, |at| at + step.min(Duration::from_secs(1)))
@@ -773,6 +773,8 @@ pub(super) struct Checked {
     pub(super) committed: Vec<(String, u32, u32)>,
     /// Lapse candidates a completed check found no receipt for.
     pub(super) cleared: Vec<LapseCheck>,
+    /// Verify candidates a completed check found no commit for.
+    pub(super) verified: Vec<LapseCheck>,
     /// The deck's own spool error, if the IO met one (§3).
     pub(super) degraded: Option<String>,
 }
@@ -807,6 +809,9 @@ pub(super) fn tick(
                     info!(message_id = %id, a, e, "inbox: a receipt the stream never reported was found");
                 }
             }
+            generation
+                .model
+                .tick_verified(checked.map(|c| c.verified.as_slice()).unwrap_or_default());
             generation.model.tick_cleared(
                 now,
                 checked.map(|c| c.cleared.as_slice()).unwrap_or_default(),
@@ -826,6 +831,8 @@ pub(super) struct Check {
     pub(super) evidence: Arc<Mutex<Evidence>>,
     /// The lapse candidates the spool lookup must clear.
     pub(super) candidates: Vec<LapseCheck>,
+    /// The ended messages' fenced attempts the lookup must verify.
+    pub(super) verify: Vec<LapseCheck>,
 }
 
 /// The generations whose spool the clock reads now: those with a lapse
@@ -837,11 +844,14 @@ pub(super) fn lapse_checks(st: &HubState, now: Instant) -> Vec<Check> {
         .iter()
         .filter_map(|(key, generation)| {
             let candidates = generation.model.lapse_candidates(now);
-            (!candidates.is_empty() || generation.model.watching_receipts()).then(|| Check {
-                key: key.clone(),
-                evidence: Arc::clone(&generation.evidence),
-                candidates,
-            })
+            let verify = generation.model.verify_candidates();
+            (!candidates.is_empty() || !verify.is_empty() || generation.model.watching_receipts())
+                .then(|| Check {
+                    key: key.clone(),
+                    evidence: Arc::clone(&generation.evidence),
+                    candidates,
+                    verify,
+                })
         })
         .collect()
 }
@@ -1317,23 +1327,29 @@ pub fn probe_cli(binary: &std::path::Path, deadline: Duration) -> ProbeVerdict {
 
 /// One line of the probe's output as clap means it, on every platform: a
 /// trailing carriage return (a CRLF the line split left behind, or a lone one)
-/// and any ANSI styling clap was told to force are dropped, and nothing else
-/// changes, so the comparison stays exact.
+/// and complete ANSI SGR sequences (`ESC [` digits and `;`, then `m`), the
+/// styling clap may be told to force, are dropped. Any other escape, cursor
+/// control included, or one cut short, is kept, so such a line matches
+/// nothing; otherwise the comparison stays exact.
 fn plain(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
-    let mut chars = line.trim_end_matches('\r').chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) {
-                    break;
-                }
+    let mut rest = line.trim_end_matches('\r');
+    while let Some(at) = rest.find('\u{1b}') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let sgr = tail.strip_prefix("\u{1b}[").and_then(|params| {
+            let end = params.find(|c: char| !(c.is_ascii_digit() || c == ';'))?;
+            params[end..].starts_with('m').then_some(2 + end + 1)
+        });
+        match sgr {
+            Some(len) => rest = &tail[len..],
+            None => {
+                out.push('\u{1b}');
+                rest = &tail[1..];
             }
-        } else {
-            out.push(c);
         }
     }
+    out.push_str(rest);
     out
 }
 

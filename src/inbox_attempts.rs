@@ -198,9 +198,11 @@ pub struct Attempt {
     pub d: u64,
     pub stage: Stage,
     pub kind: IssueKind,
-    /// A spool check since the attempt last held possession found no
-    /// receipt for it (§3): only then does it count toward an automatic
-    /// repeat. Possession regained, a rebinding or a fence clears it.
+    /// A spool check since the attempt last held possession, and since the
+    /// assignment's last hand-out, found no receipt for it (§3): only then
+    /// does it count toward an automatic repeat. Possession regained, a
+    /// rebinding, a fence or another hand-out of its assignment clears it, so
+    /// each repeat rests on a check made after the one before it.
     pub cleared: bool,
     /// Bumped whenever possession is regained, so a check begun before is
     /// not taken as covering what was published after.
@@ -208,8 +210,9 @@ pub struct Attempt {
     /// Its incarnation was retired and the resume answer is still owed.
     pub resume_pending: bool,
     pub revoked: bool,
-    /// Kept for a `HandedInert` attempt whose late commit can still correct
-    /// the sender (§7).
+    /// Kept for an attempt whose late commit can still correct the sender
+    /// (§7): a `HandedInert` one, and a `Fenced` one until a spool check
+    /// after its message ended found no commit for it.
     pub verifier: bool,
     pub reclaimed: bool,
     issued_at: Instant,
@@ -686,6 +689,11 @@ impl AttemptModel {
         };
         let a = msg.a;
         let e = msg.attempts.len() as u32 + 1;
+        // §3: a check covers one repeat decision. One begun before this
+        // hand-out and answered after it is stale too (the mark).
+        for at in msg.attempts.iter_mut().filter(|at| at.a == a) {
+            at.recheck();
+        }
         msg.attempts.push(Attempt {
             a,
             e,
@@ -908,6 +916,56 @@ impl AttemptModel {
             }
         }
         out
+    }
+
+    /// The fenced attempts of ended messages that still keep their late-commit
+    /// verifier (§7): each is looked up in the spool, and only a lookup that
+    /// finds no commit lets [`Self::tick_verified`] return its evidence, so a
+    /// receipt its incarnation published before a Cancel ended the message
+    /// still corrects the sender.
+    pub fn verify_candidates(&self) -> Vec<LapseCheck> {
+        let mut out = Vec::new();
+        if self.exited {
+            return out;
+        }
+        for (id, msg) in &self.messages {
+            if !msg.state.is_terminal() {
+                continue;
+            }
+            for at in &msg.attempts {
+                if at.stage == Stage::Fenced && at.verifier && !at.reclaimed {
+                    out.push(LapseCheck {
+                        id: id.clone(),
+                        a: at.a,
+                        e: at.e,
+                        mark: at.mark,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// The verify candidates whose spool lookup found no commit: each one
+    /// still fenced, unchanged since, drops its verifier, and its evidence is
+    /// returned.
+    pub fn tick_verified(&mut self, verified: &[LapseCheck]) {
+        if self.exited {
+            return;
+        }
+        for check in verified {
+            let Some(at) = self
+                .messages
+                .get_mut(&check.id)
+                .and_then(|msg| msg.attempt_mut(check.a, check.e))
+            else {
+                continue;
+            };
+            if at.mark == check.mark && at.stage == Stage::Fenced {
+                at.verifier = false;
+            }
+            self.reclaim(&check.id);
+        }
     }
 
     /// Whether any attempt could still have a commit receipt the deck has
@@ -1494,18 +1552,21 @@ impl AttemptModel {
 
     /// Return an attempt's evidence reservation once it is quiescent (§7):
     /// its message is terminal, it is final with no resume answer owed, and
-    /// it keeps no late-commit verifier (kept while the message is not
-    /// settled).
+    /// it keeps no late-commit verifier (a `HandedInert` one's is kept while
+    /// the message is not settled, a `Fenced` one's until a spool check after
+    /// the message ended).
     ///
     /// Finality already implies that no approval under a current epoch is
     /// outstanding, so the model carries no separate approval predicate:
     /// every path to a final stage is either the approved incarnation
     /// reporting what its callback did (the approval is spent, or revoked
     /// locally before a `NotHanded`), a resume answer or its silence (the
-    /// incarnation was retired, which bumps the epoch), or exit. A refused
-    /// [`Self::may_hand_over`] is none of these, so it stages nothing. That the epoch bump reaches a surviving old JS
-    /// context before its approved callback resumes is the adapter's
-    /// obligation, proven in the §13 step 4 migration, not here.
+    /// incarnation was retired, which bumps the epoch), the retirement of a
+    /// stream that closed (no sooner than an approval it sent has expired),
+    /// or exit. A refused [`Self::may_hand_over`] is none of these, so it
+    /// stages nothing. That a surviving old JS context honours the epoch bump
+    /// and the expiry before its approved callback resumes is the adapter's
+    /// obligation (inbox/opencode/031, inbox/opencode/046), not this model's.
     fn reclaim(&mut self, id: &str) {
         let Some(msg) = self.messages.get_mut(id) else {
             return;
@@ -1531,18 +1592,27 @@ impl AttemptModel {
 }
 
 impl Attempt {
-    /// Possession was regained: an earlier spool check covers nothing
-    /// published from here on.
-    fn regained(&mut self) {
+    /// An earlier spool check covers nothing from here on: possession was
+    /// regained, or its assignment was handed out again.
+    fn recheck(&mut self) {
         self.cleared = false;
         self.mark += 1;
     }
 
+    /// Possession was regained: an earlier spool check covers nothing
+    /// published from here on.
+    fn regained(&mut self) {
+        self.recheck();
+    }
+
     /// Fenced: possibly handed, and checked in the spool again before it
     /// leads to a repeat (§3), since its incarnation may have published a
-    /// receipt it never reported.
+    /// receipt it never reported. For the same reason it keeps its
+    /// late-commit verifier until a check after its message ended
+    /// ([`AttemptModel::verify_candidates`]).
     fn fence(&mut self) {
         self.stage = Stage::Fenced;
+        self.verifier = true;
         self.regained();
     }
 }

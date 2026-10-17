@@ -131,7 +131,10 @@ impl RecordKey {
     }
 }
 
-/// A 128-bit OS-random capability (§5). The daemon keeps only its hash.
+/// A 128-bit OS-random capability (§5). The daemon admits a record by the
+/// cap's hash, and also keeps an issued attempt's raw caps in memory
+/// ([`EvidenceStore::caps`]) to hand them to a replacement watcher in
+/// `rebound`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Cap(pub [u8; 16]);
 
