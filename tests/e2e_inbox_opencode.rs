@@ -1697,9 +1697,9 @@ fn resume_answers(op: &OpenCode) -> Vec<Value> {
 }
 
 /// Scenario: The TUI plugin is handed a deck message and prompts it; its watcher is killed, and every respawn waits three seconds. OpenCode answers the message while no watcher runs, so the plugin has nowhere to report the commit yet. It keeps the report: the replacement's registration asks for the attempt back, the plugin answers that it retained it and then reports the commit, whose control never reaches the deck. The replacement publishes the commit receipt and the deck settles the message from it, with one prompt.
-#[spec("inbox/opencode/048")]
+#[spec("inbox/opencode/049")]
 #[test]
-fn opencode_048_a_commit_reported_while_no_watcher_runs_waits_for_the_next() {
+fn opencode_049_a_commit_reported_while_no_watcher_runs_waits_for_the_next() {
     let op = OpenCode::new("session", json!({"dropCommitted":true,"backoffMs":"3000"}));
     armed(&op.daemon, &op.pane, 1);
     let id = op.post();
@@ -1740,9 +1740,9 @@ fn opencode_048_a_commit_reported_while_no_watcher_runs_waits_for_the_next() {
 }
 
 /// Scenario: The TUI plugin is handed a deck message and prompts it; its watcher is killed, and the replacement reads its registration two and a half seconds late, inside the deck's eight-second resume window. OpenCode answers the message after the replacement started but before it registered. The plugin holds the commit report until the registration has asked for the attempt back and been answered `retained`, then reports it, its control never reaching the deck; the replacement publishes the commit receipt and the deck settles the message from it, with one prompt.
-#[spec("inbox/opencode/048")]
+#[spec("inbox/opencode/049")]
 #[test]
-fn opencode_048_a_commit_reported_before_the_replacement_registers_waits_for_it() {
+fn opencode_049_a_commit_reported_before_the_replacement_registers_waits_for_it() {
     let op = OpenCode::new(
         "session",
         json!({"dropCommitted":true,"registerDelayMs":"2500","ackWaitMs":"8000"}),
@@ -1765,6 +1765,30 @@ fn opencode_048_a_commit_reported_before_the_replacement_registers_waits_for_it(
         "the plugin reports the commit once registered: {:?}",
         op.controls()
     );
+    // The plugin answers the replacement's resume in the step that reads its
+    // registration, so that answer is the registration's mark in the
+    // transcript: no commit may come before it.
+    let controls = op.controls();
+    let registered = controls
+        .iter()
+        .position(|c| {
+            c["resume_answers"]
+                .as_array()
+                .is_some_and(|answers| answers.iter().any(|a| a["id"] == id))
+        })
+        .unwrap_or_else(|| panic!("the replacement asks for the attempt back: {controls:?}"));
+    let committed = controls
+        .iter()
+        .position(|c| {
+            c["committed"]
+                .as_array()
+                .is_some_and(|attempts| attempts.iter().any(|at| at["id"] == id))
+        })
+        .expect("the commit was reported");
+    assert!(
+        committed > registered,
+        "a commit reached the replacement before it registered: {controls:?}"
+    );
     assert!(
         resume_answers(&op)
             .iter()
@@ -1782,9 +1806,9 @@ fn opencode_048_a_commit_reported_before_the_replacement_registers_waits_for_it(
 }
 
 /// Scenario: The TUI plugin is handed a deck message and prompts it; its watcher is killed, and the replacement reads its registration two and a half seconds late, inside the deck's eight-second resume window. A commit for the attempt reaches the replacement's stdin directly, before that registration is read, and its control never reaches the deck. The replacement waits for its registration and the attempt's rebound caps instead of failing for want of a spool, publishes the commit receipt, and the deck settles the message from it, with one prompt.
-#[spec("inbox/opencode/048")]
+#[spec("inbox/opencode/050")]
 #[test]
-fn opencode_048_a_stage_reaching_a_watcher_before_its_registration_waits_for_it() {
+fn opencode_050_a_stage_reaching_a_watcher_before_its_registration_waits_for_it() {
     let op = OpenCode::new(
         "session",
         json!({"dropCommitted":true,"registerDelayMs":"2500","ackWaitMs":"8000"}),
@@ -1817,9 +1841,9 @@ fn opencode_048_a_stage_reaching_a_watcher_before_its_registration_waits_for_it(
 }
 
 /// Scenario: The TUI plugin is handed a deck message and prompts it, and every receipt publish takes a second and a half. OpenCode answers the message, the plugin reports the commit, and the context is disposed at once, so the plugin stops its watcher while that publish is still in flight. The watcher finishes the publish and reports the commit before it exits, and the deck acknowledges the message, with one prompt.
-#[spec("inbox/opencode/048")]
+#[spec("inbox/opencode/051")]
 #[test]
-fn opencode_048_a_commit_reported_at_shutdown_reaches_the_deck() {
+fn opencode_051_a_commit_reported_at_shutdown_reaches_the_deck() {
     let op = OpenCode::new("session", json!({"publishDelayMs":"1500"}));
     armed(&op.daemon, &op.pane, 1);
     let id = op.post();

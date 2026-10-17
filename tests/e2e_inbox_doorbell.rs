@@ -364,9 +364,9 @@ fn dispatch_023_terminal_reports_do_not_hold_doorbell() {
 }
 
 /// Scenario: For each supported synthetic agent type, report the worker Thinking, forward the interrupt OpenCode uses (Escape, a 300 ms pause, Escape) as the user's keys, then report it Idle and queue a task. An interrupt is not a draft, so the fixed doorbell must follow the two Escapes and a fetch must deliver the task.
-#[spec("scheduler/dispatch/023")]
+#[spec("inbox/doorbell/019")]
 #[test]
-fn dispatch_023_an_interrupts_escapes_do_not_hold_doorbell() {
+fn doorbell_019_an_interrupts_escapes_do_not_hold_doorbell() {
     let daemon = daemon_unbound(&[]);
     for agent_type in ["open_code", "claude_code", "codex", "pi"] {
         let pane = pane(
@@ -400,9 +400,9 @@ fn dispatch_023_an_interrupts_escapes_do_not_hold_doorbell() {
 }
 
 /// Scenario: Leave a typed draft followed by two Escapes, two Escapes followed by typing, and two Escapes pressed on an agent that is already Idle (a menu, not an interrupt), then report Idle where the agent was busy and queue a task in each pane. None of these is an interrupt that emptied the box, so each pane must receive nothing and its task must stay Queued.
-#[spec("scheduler/dispatch/023")]
+#[spec("inbox/doorbell/019")]
 #[test]
-fn dispatch_023_drafts_and_escapes_on_an_idle_agent_still_hold_doorbell() {
+fn doorbell_019_drafts_and_escapes_on_an_idle_agent_still_hold_doorbell() {
     let daemon = daemon_unbound(&[]);
     for (name, while_busy, once_idle) in [
         ("typed-then-escapes", "unsent\x1b\x1b", ""),

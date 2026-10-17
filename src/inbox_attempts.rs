@@ -2857,9 +2857,9 @@ mod tests {
     /// is refused as a stale repeat, because the fenced attempt has not been
     /// checked again; this is the one guard that refuses it (R8F-02). The
     /// next pass checks it, and only then is the repeat handed out.
-    #[spec("inbox/boundary/029")]
+    #[spec("inbox/boundary/037")]
     #[test]
-    fn boundary_029_a_late_pass_fence_leaves_only_the_issue_time_clearance_check() {
+    fn boundary_037_a_late_pass_fence_leaves_only_the_issue_time_clearance_check() {
         let (mut m, t) = model();
         let ttl = ttl();
         m.post("m", false);

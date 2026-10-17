@@ -8361,6 +8361,14 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the daemon's `Flushed` arm keeping the record (the test sets it, as that arm does; `inbox/codex/017`), or what the screen shows.
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/doorbell/019 — An interrupt's Escapes stop holding the doorbell when the turn ends; drafts and an Idle agent's Escapes still hold it.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary, daemon-owned PTY and attach input stream.
+- **Agent:** none (raw Python stand-in announced as OpenCode, Claude Code, Codex and Pi; no agent credential).
+- **Asserts:** for each of the four agent types, Thinking, then Escape, 300 ms, Escape forwarded as the user's keys, then Idle: queued work rings the fixed doorbell after the two Escapes and a fetch delivers it. Text typed before or after the Escapes, and two Escapes pressed on an agent that is already Idle, each leave the pane untouched and the task Queued.
+- **Does not assert:** a real agent's interrupt, an Idle reported twice for one turn, or an Idle from an agent that has since been replaced (`inbox/doorbell/020`).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
 ##### inbox/doorbell/020 — A replaced agent's Idle cannot release its successor's Escapes.
 - **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path against a real registry and stand-in PTYs.
 - **Agent:** none (`/usr/bin/true` replaced by `cat` on one pane), events typed as Claude Code, Codex, OpenCode and Pi.
@@ -8575,6 +8583,14 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Asserts:** after a cleared first hand-out and its marked repeat, a commit receipt published for the first hand-out and then the repeat refused hands out no third copy, and the next read settles the message; with the first hand-out's lookup made Unknown instead, no third copy is handed out and the message is listed as uncertain; each message has exactly two attempts.
 - **Does not assert:** a real watcher.
 - **Platform coverage:** all.
+
+##### inbox/boundary/037 — A late clock pass's fence leaves the hand-out's own clearance check as the only guard.
+- **Layer:** L1 unit (`src/inbox_attempts.rs`, injected time).
+- **Agent:** none.
+- **Asserts:** with a cleared attempt's repeat scheduled by a late pass, the next pass retires the closed stream and fences the attempt, withdrawing its clearance while the repeat stays scheduled; a receiver registering in the same slot is refused the repeat at issue as stale, and it is handed out only after the next pass checks the fenced attempt.
+- **Does not assert:** the hub or a real spool (`inbox/boundary/029`).
+- **Platform coverage:** all.
+- **Cost:** none.
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
@@ -9958,6 +9974,27 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Agent:** generated TUI plugin.
 - **Asserts:** after a watcher restart and a `retained` resume, a commit reported before the rebound caps reach the replacement watcher's publisher is published once they do, and the deck settles the message from that receipt with one prompt.
 - **Does not assert:** a real OpenCode.
+- **Cost:** none.
+
+##### inbox/opencode/049 — A commit reported while the watcher restarts waits for the replacement's registration.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watcher with `DOT_AGENT_DECK_INBOX_TEST_DROP_COMMITTED`, and either a 3 s respawn backoff or a 2.5 s `DOT_AGENT_DECK_INBOX_TEST_REGISTER_DELAY_MS`.
+- **Agent:** generated TUI plugin.
+- **Asserts:** a commit the plugin witnesses while no watcher runs, or after the replacement started and before it registered, is kept: the replacement's registration asks for the attempt back, it is answered `retained`, and only then is the commit reported (the transcript shows no commit before that answer); the replacement publishes the receipt and the deck settles the message from it with one prompt.
+- **Does not assert:** a real OpenCode, or a commit for an attempt the deck no longer asks back.
+- **Cost:** none.
+
+##### inbox/opencode/050 — A stage reaching a watcher before its registration waits for it.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watcher with `DOT_AGENT_DECK_INBOX_TEST_DROP_COMMITTED` and a 2.5 s `DOT_AGENT_DECK_INBOX_TEST_REGISTER_DELAY_MS`.
+- **Agent:** generated TUI plugin; the commit is written straight to the replacement watcher's stdin.
+- **Asserts:** a commit that reaches the replacement watcher before it has read its registration waits for the registration and the rebound caps instead of failing for want of a spool; the deck settles the message from its receipt with one prompt.
+- **Does not assert:** a real OpenCode, or a registration that never comes, which is reported degraded.
+- **Cost:** none.
+
+##### inbox/opencode/051 — Disposal allows bounded time for a commit's publication.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watcher with a 1.5 s `DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS`; plus a fast unit test in `src/inbox_watcher.rs`.
+- **Agent:** generated TUI plugin; the unit half has no agent.
+- **Asserts:** a commit reported as the context is disposed, its publish still in flight, is published and reported before the watcher exits, and the deck acknowledges the message with one prompt. Unit: a publish waiting for a rebound attempt's caps stops waiting when the stream ends, returning a failure well inside the five-second rebinding wait.
+- **Does not assert:** that every report made at shutdown arrives (a publish longer than the drain is lost or degraded), or reports queued while no watcher is registered, which the plugin's stop does not flush.
 - **Cost:** none.
 
 ##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.
