@@ -727,9 +727,22 @@ type InboxActionAnswer = (bool, Result<String, String>);
 /// the event loop, and holds the answer for the picker to show.
 #[derive(Clone)]
 pub struct InboxActionSender {
-    client: DaemonClient,
-    runtime: tokio::runtime::Handle,
+    to: InboxActionTarget,
     slot: Arc<Mutex<Option<InboxActionAnswer>>>,
+}
+
+/// One recorded press: pane, agent, message, revision and whether it was a
+/// Retry.
+type RecordedPress = (String, String, String, u64, bool);
+
+#[derive(Clone)]
+enum InboxActionTarget {
+    Daemon {
+        client: DaemonClient,
+        runtime: tokio::runtime::Handle,
+    },
+    /// The TUI's L1 seam: each press is recorded, nothing is sent.
+    Recorder(Arc<Mutex<Vec<RecordedPress>>>),
 }
 
 impl InboxActionSender {
@@ -744,7 +757,19 @@ impl InboxActionSender {
         retry: bool,
         timeout: Duration,
     ) {
-        let client = self.client.clone();
+        let (client, runtime) = match &self.to {
+            InboxActionTarget::Daemon { client, runtime } => (client.clone(), runtime.clone()),
+            InboxActionTarget::Recorder(sent) => {
+                sent.lock().unwrap_or_else(|p| p.into_inner()).push((
+                    pane_id.to_string(),
+                    agent_id.to_string(),
+                    message_id.to_string(),
+                    revision,
+                    retry,
+                ));
+                return;
+            }
+        };
         let slot = Arc::clone(&self.slot);
         let (pane_id, agent_id, message_id) = (
             pane_id.to_string(),
@@ -752,7 +777,7 @@ impl InboxActionSender {
             message_id.to_string(),
         );
         let request_id = generate_client_id();
-        self.runtime.spawn(async move {
+        runtime.spawn(async move {
             let answer = match tokio::time::timeout(
                 timeout,
                 client.inbox_action(
@@ -789,6 +814,19 @@ impl InboxActionSender {
     /// came.
     pub fn take(&self) -> Option<InboxActionAnswer> {
         self.slot.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    /// The TUI's L1 seam: a sender that records each press, and the record.
+    #[doc(hidden)]
+    pub fn recording() -> (Self, Arc<Mutex<Vec<RecordedPress>>>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        (
+            InboxActionSender {
+                to: InboxActionTarget::Recorder(Arc::clone(&sent)),
+                slot: Arc::default(),
+            },
+            sent,
+        )
     }
 }
 
@@ -829,8 +867,10 @@ impl EmbeddedPaneController {
     /// presses, on the same client as every other attach.
     pub fn inbox_action_sender(&self) -> InboxActionSender {
         InboxActionSender {
-            client: self.client.clone(),
-            runtime: self.runtime.clone(),
+            to: InboxActionTarget::Daemon {
+                client: self.client.clone(),
+                runtime: self.runtime.clone(),
+            },
             slot: Arc::new(Mutex::new(None)),
         }
     }

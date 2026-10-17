@@ -18336,8 +18336,15 @@ fn host_metrics_lines(view: &HostMetricsView, width: u16) -> Vec<Line<'static>> 
 /// rect for the mouse hit-test, as [`render_help_overlay`] does.
 /// PRD #1666 §6.4: the deck-messages picker's rows — each item's sender,
 /// subject and what it means, in the words the desktop tile uses — then the
-/// answer to the last press.
-fn inbox_attention_lines(dialog: &InboxAttentionDialog, width: u16) -> Vec<Line<'static>> {
+/// answer to the last press, within `rows` lines. A list longer than fits is
+/// shown as the window of items that keeps the cursor's row in view, and the
+/// answer is never pushed out by it. Returns the lines and, when windowed,
+/// the first and last item shown (zero-based).
+fn inbox_attention_lines(
+    dialog: &InboxAttentionDialog,
+    width: u16,
+    rows: usize,
+) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
     let width = usize::from(width);
     let mut lines = Vec::new();
     if dialog.items.is_empty() {
@@ -18346,7 +18353,16 @@ fn inbox_attention_lines(dialog: &InboxAttentionDialog, width: u16) -> Vec<Line<
             crate::inbox_display::ACTION_GONE
         )));
     }
-    for (index, item) in dialog.items.iter().enumerate() {
+    let answer_rows = if dialog.answer.is_some() { 2 } else { 0 };
+    let fits = (rows.saturating_sub(answer_rows) / 2).max(1);
+    let total = dialog.items.len();
+    let start = if total <= fits {
+        0
+    } else {
+        (dialog.selected + 1).saturating_sub(fits).min(total - fits)
+    };
+    let shown = (total > fits).then(|| (start, start + fits - 1));
+    for (index, item) in dialog.items.iter().enumerate().skip(start).take(fits) {
         let cursor = if index == dialog.selected {
             "▸ "
         } else {
@@ -18376,7 +18392,7 @@ fn inbox_attention_lines(dialog: &InboxAttentionDialog, width: u16) -> Vec<Line<
             width,
         )));
     }
-    lines
+    (lines, shown)
 }
 
 fn render_inbox_attention_overlay(
@@ -18385,22 +18401,42 @@ fn render_inbox_attention_overlay(
 ) -> Vec<(Action, Rect)> {
     let area = frame.area();
     let popup_width = 96u16.min(area.width.saturating_sub(2));
-    let lines = inbox_attention_lines(dialog, popup_width.saturating_sub(2));
-    let popup_height = lines
-        .len()
+    // Every row it would take unwindowed: two per item (or the one "gone"
+    // line) and the answer's two; then a spare row, the footer's two and the
+    // border.
+    let wanted = (dialog.items.len() * 2)
+        .max(1)
+        .saturating_add(if dialog.answer.is_some() { 2 } else { 0 });
+    let popup_height = wanted
         .saturating_add(3 + 2)
         .min(usize::from(area.height.saturating_sub(2))) as u16;
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
     frame.render_widget(Clear, popup_area);
+    let footer_height: u16 = 2;
+    let body_height = popup_height.saturating_sub(2).saturating_sub(footer_height);
+    let (lines, shown) = inbox_attention_lines(
+        dialog,
+        popup_width.saturating_sub(2),
+        usize::from(body_height),
+    );
+    let title = match shown {
+        Some((first, last)) => format!(
+            " {} · {}–{} of {} ",
+            crate::inbox_display::ATTENTION_TITLE,
+            first + 1,
+            last + 1,
+            dialog.items.len()
+        ),
+        None => format!(" {} ", crate::inbox_display::ATTENTION_TITLE),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {} ", crate::inbox_display::ATTENTION_TITLE))
+        .title(title)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
-    let footer_height: u16 = 2;
     let body_height = inner.height.saturating_sub(footer_height);
     frame.render_widget(
         Paragraph::new(lines),
@@ -23019,10 +23055,131 @@ pub fn render_inbox_attention_overlay_to_buffer(
     terminal.backend().buffer().clone()
 }
 
-/// PRD #1666 §6.4 L1 seam: open the picker on `state`'s card for `pane_id`
-/// through the production dashboard key and [`dispatch_action`], press `keys`
-/// one at a time through the production picker handler, and return the presses
-/// they made and whether the picker is still open.
+/// What one run of [`inbox_attention_run`] did.
+#[doc(hidden)]
+pub struct InboxAttentionRun {
+    /// The picker is still open after the last key.
+    pub open: bool,
+    /// The Retry and Cancel presses sent, in order.
+    pub presses: Vec<InboxAttentionPress>,
+    /// The picker as drawn after the last key, when it is open.
+    pub screen: Option<ratatui::buffer::Buffer>,
+}
+
+/// The pane controller of the picker seam: the picker never touches a pane.
+struct SeamPanes;
+
+impl PaneController for SeamPanes {
+    fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+        Ok(())
+    }
+    fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+        Ok(())
+    }
+    fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+        Ok(Vec::new())
+    }
+    fn resize_pane(
+        &self,
+        _pane_id: &str,
+        _direction: crate::pane::PaneDirection,
+        _amount: u16,
+    ) -> Result<(), PaneError> {
+        Ok(())
+    }
+    fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+        Ok(RenameOutcome::Applied(name.to_string()))
+    }
+    fn toggle_layout(&self) -> Result<(), PaneError> {
+        Ok(())
+    }
+    fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+        Ok(())
+    }
+    fn name(&self) -> &str {
+        "picker-seam"
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// PRD #1666 §6.4 L1 seam: on the dashboard with `state`'s card
+/// `session_id` selected, feed `open` and then `keys` one at a time through
+/// the production key funnel ([`handle_key_event`], which resolves each to an
+/// action and runs it through [`dispatch_action`]), with a sender that
+/// records each Retry or Cancel press instead of sending it to a daemon. The
+/// picker is then drawn into a `width × height` buffer if it is still open.
+pub fn inbox_attention_run(
+    keybindings: &KeybindingConfig,
+    state: &AppState,
+    session_id: &str,
+    open: KeyEvent,
+    keys: &[KeyEvent],
+    (width, height): (u16, u16),
+) -> InboxAttentionRun {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
+    let (sender, sent) = crate::embedded_pane::InboxActionSender::recording();
+    ui.inbox_action_sender = Some(sender);
+    let panes: Arc<dyn PaneController> = Arc::new(SeamPanes);
+    let mut tab_manager = TabManager::new(Arc::clone(&panes));
+    let shared: SharedState = Arc::new(tokio::sync::RwLock::new(state.clone()));
+    let filtered: Vec<(&String, &SessionState)> = state
+        .sessions
+        .iter()
+        .filter(|(id, _)| id.as_str() == session_id)
+        .collect();
+    let frame_area = Rect::new(0, 0, width, height);
+    for key in std::iter::once(&open).chain(keys) {
+        handle_key_event(
+            *key,
+            &mut ui,
+            panes.as_ref(),
+            &shared,
+            &mut tab_manager,
+            state,
+            &filtered,
+            frame_area,
+        );
+    }
+    let open = ui.mode == UiMode::InboxAttention;
+    let screen = ui.inbox_attention.as_ref().filter(|_| open).map(|dialog| {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
+        terminal
+            .draw(|frame| {
+                render_inbox_attention_overlay(frame, dialog);
+            })
+            .expect("TestBackend draw should succeed");
+        terminal.backend().buffer().clone()
+    });
+    let presses = sent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(
+            |(pane_id, agent_id, message_id, revision, retry)| InboxAttentionPress {
+                pane_id: pane_id.clone(),
+                agent_id: agent_id.clone(),
+                message_id: message_id.clone(),
+                revision: *revision,
+                retry: *retry,
+            },
+        )
+        .collect();
+    InboxAttentionRun {
+        open,
+        presses,
+        screen,
+    }
+}
+
+/// [`inbox_attention_run`]'s presses and whether the picker is still open.
 pub fn inbox_attention_key_presses(
     keybindings: &KeybindingConfig,
     state: &AppState,
@@ -23030,52 +23187,8 @@ pub fn inbox_attention_key_presses(
     open: KeyEvent,
     keys: &[KeyEvent],
 ) -> (bool, Vec<InboxAttentionPress>) {
-    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
-    let opened = {
-        if keybindings.matches(KbAction::InboxAttention, &open) {
-            let card = state
-                .sessions
-                .get(session_id)
-                .and_then(|session| session.pane_id.clone());
-            if let Some((pane_id, (Some(agent), items))) =
-                card.and_then(|pane| state.inbox_attention(&pane).map(|found| (pane, found)))
-            {
-                ui.inbox_attention = Some(InboxAttentionDialog {
-                    pane_id,
-                    agent_id: agent.to_string(),
-                    items: items.to_vec(),
-                    selected: 0,
-                    answer: None,
-                });
-                ui.mode = UiMode::InboxAttention;
-            }
-        }
-        ui.mode == UiMode::InboxAttention
-    };
-    if !opened {
-        return (false, Vec::new());
-    }
-    let mut presses = Vec::new();
-    for key in keys {
-        match handle_inbox_attention_key(*key, &mut ui, keybindings) {
-            Action::InboxAttentionMove(down) => {
-                if let Some(dialog) = ui.inbox_attention.as_mut() {
-                    move_inbox_attention(dialog, down);
-                }
-            }
-            Action::InboxAttentionAct(retry) => presses.extend(
-                ui.inbox_attention
-                    .as_ref()
-                    .and_then(|dialog| inbox_attention_press(dialog, retry)),
-            ),
-            Action::CloseInboxAttention => {
-                ui.mode = UiMode::Normal;
-                ui.inbox_attention = None;
-            }
-            _ => {}
-        }
-    }
-    (ui.mode == UiMode::InboxAttention, presses)
+    let run = inbox_attention_run(keybindings, state, session_id, open, keys, (100, 30));
+    (run.open, run.presses)
 }
 
 /// PRD #1258 M3 L1 seam: draw the live host overlay renderer for `report`

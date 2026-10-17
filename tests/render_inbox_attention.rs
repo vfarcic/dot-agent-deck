@@ -9,7 +9,8 @@ use dot_agent_deck::inbox_hub::InboxAttentionItem;
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::state::AppState;
 use dot_agent_deck::ui::{
-    InboxAttentionPress, inbox_attention_key_presses, render_inbox_attention_overlay_to_buffer,
+    InboxAttentionPress, inbox_attention_key_presses, inbox_attention_run,
+    render_inbox_attention_overlay_to_buffer,
 };
 use spec::spec;
 use std::collections::HashMap;
@@ -200,4 +201,83 @@ fn status_021_the_picker_keys_send_retry_and_cancel_at_each_rows_revision() {
         &[],
     );
     assert!(!open, "a card with nothing to decide on opens no picker");
+}
+
+/// Scenario: A card lists nine uncertain deck messages and the terminal is only fourteen rows tall, so the picker cannot show them all. Open it with `i`, press `j` eight times to reach the last one, and look: the last message's row and the cursor are on screen, the title says which of the nine are shown, and `c` sends that message's Cancel. With an answer to show, the answer and the cursor's row are both still on screen.
+#[spec("inbox/status/022")]
+#[test]
+fn status_022_a_long_picker_keeps_the_cursor_row_and_the_answer_in_view() {
+    let ids: Vec<String> = (0..9)
+        .map(|n| format!("m-k3xzq2ab-0f3c9a71d2e4b8{n:02}"))
+        .collect();
+    let items: Vec<InboxAttentionItem> = ids
+        .iter()
+        .enumerate()
+        .map(|(n, id)| item(id, AttentionKind::Uncertain, 10 + n as u64))
+        .collect();
+    let state = state_with(&items);
+    let mut keys = vec![key(KeyCode::Char('j')); 8];
+    let run = inbox_attention_run(
+        &KeybindingConfig::default(),
+        &state,
+        "gen-q",
+        key(KeyCode::Char('i')),
+        &keys,
+        (100, 14),
+    );
+    assert!(run.open);
+    let rendered = text(run.screen.as_ref().expect("the picker is drawn"));
+    let last = &ids[8];
+    assert!(
+        rendered.contains(&format!(
+            "▸ the orchestrator · review {}",
+            &last[last.len() - 3..]
+        )),
+        "the cursor's row is in view:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("of 9"),
+        "the title says what is shown:\n{rendered}"
+    );
+    keys.push(key(KeyCode::Char('c')));
+    let run = inbox_attention_run(
+        &KeybindingConfig::default(),
+        &state,
+        "gen-q",
+        key(KeyCode::Char('i')),
+        &keys,
+        (100, 14),
+    );
+    assert_eq!(
+        run.presses,
+        vec![InboxAttentionPress {
+            pane_id: "pane-q".into(),
+            agent_id: "agent-q".into(),
+            message_id: last.clone(),
+            revision: 18,
+            retry: false,
+        }],
+        "the press acts on the row on screen"
+    );
+    let words = words();
+    let stale = words["actionStale"].as_str().unwrap();
+    let rendered = text(&render_inbox_attention_overlay_to_buffer(
+        &items,
+        8,
+        Some(stale),
+        100,
+        14,
+    ));
+    let head: String = stale.chars().take(40).collect();
+    assert!(
+        rendered.contains(&head),
+        "the answer is in view:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!(
+            "▸ the orchestrator · review {}",
+            &last[last.len() - 3..]
+        )),
+        "and so is the cursor's row:\n{rendered}"
+    );
 }

@@ -106,6 +106,29 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     expect(await card.findByText(words.cancelApplied)).toBeVisible();
   });
 
+  /// Scenario: Nine deliveries on one card are uncertain. Each is listed with its own Retry and Cancel in one list that scrolls in place, and Cancel on the last one asks the daemon for that message at its revision, as the TUI's picker does for the row its cursor is on.
+  it("lists every one of many deliveries, each with its own actions", async () => {
+    const onInboxAction = vi.fn(async () => ({ outcome: "applied" }));
+    const ids = Array.from({ length: 9 }, (_, n) => `m-k3xzq2ab-0f3c9a71d2e4b8${String(n).padStart(2, "0")}`);
+    const agent = mapDesktopSnapshot(snapshot({
+      attention: ids.map((id, n) => item(id, "uncertain", 10 + n)),
+    })).agents[0];
+    const card = tile(agent, onInboxAction);
+    const list = card.getByTestId("inbox-attention-list-7");
+    expect(list).toHaveClass("agent-inbox-attention");
+    for (const id of ids) {
+      const row = within(list).getByTestId(`inbox-attention-${id}`);
+      expect(within(row).getByRole("button", { name: words.retry })).toBeInTheDocument();
+      expect(within(row).getByRole("button", { name: words.cancel })).toBeInTheDocument();
+    }
+    fireEvent.click(within(card.getByTestId(`inbox-attention-${ids[8]}`)).getByRole("button", { name: words.cancel }));
+    await waitFor(() => expect(onInboxAction).toHaveBeenCalledWith(
+      { deckId: agent.daemonId, agentId: "7" },
+      { paneId: "worker", messageId: ids[8], revision: 18 },
+      "cancel",
+    ));
+  });
+
   /// Scenario: The agent's integration is out of date, its CLI too old, or it has not connected yet; the tile shows that notice in the words the TUI uses.
   it.each([
     ["adapter_too_old", words.adapterTooOld],

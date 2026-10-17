@@ -8695,12 +8695,19 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** all.
 
 ##### inbox/status/021 — The picker keys send Retry and Cancel at each row's revision.
-- **Layer:** L1 (`tests/render_inbox_attention.rs`), production picker key handler over an `AppState` hydrated from a daemon summary.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), the production key funnel (`handle_key_event` and `dispatch_action`) over an `AppState` hydrated from a daemon summary, with a recording press sender.
 - **Agent:** none.
 - **Asserts:** `i` opens the picker on a card with items; `r` sends Retry at the row's revision; `j` moves; `r` sends nothing for an out-of-attempts row and `c` sends its Cancel; Escape closes; a card with nothing opens no picker.
 - **Does not assert:** the attach round trip (inbox/protocol/020, inbox/boundary/011).
 - **Platform coverage:** all.
 
+
+##### inbox/status/022 — A long picker keeps the cursor's row and the answer in view.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), the production key funnel and the picker drawn on a 14-row `TestBackend`.
+- **Agent:** none.
+- **Asserts:** with nine items, moving to the last one keeps its row and cursor on screen, the title says which of the nine are shown, and `c` sends that row's Cancel; with an answer shown, the answer and the cursor's row are both visible.
+- **Does not assert:** the desktop list (`desktop/src/components/InboxAttention.test.tsx`).
+- **Platform coverage:** all.
 
 #### inbox/claude
 

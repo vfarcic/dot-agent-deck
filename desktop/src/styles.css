@@ -578,6 +578,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* PRD #1666: the inbox line beside the status, and the undelivered-message notice under it. */
 .agent-inbox-badge { color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; white-space: nowrap; flex-shrink: 0; }
+/* PRD #1666 §6.4: a long list of deliveries waiting on Retry or Cancel scrolls in
+   place, so every row and its buttons stay reachable in a tile that hides overflow. */
+.agent-inbox-attention { max-height: 160px; overflow-y: auto; }
 .agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Issue #1678: background work still running after the turn ended. Ink rather
    than --muted, as the TUI draws it in its primary text colour: it is a reading
