@@ -2645,7 +2645,9 @@ fn auto_install_to_reporting(
         // (PRD #381 audit, MEDIUM-1 — issue #536's own vector).
         //
         // PRD #1487: a plugin pinning ANOTHER live, durable install is not
-        // regenerated at all. Two installs of the deck each resolve to
+        // regenerated, apart from the two exceptions below (a takeover by an
+        // eligible newer copy, and a template below the integration floor,
+        // regenerated around the same pin). Two installs of the deck each resolve to
         // themselves, and a template that differs between their versions would
         // otherwise be rewritten by whichever started last, every start. The
         // pinned install refreshes its own template when it starts; `hooks
@@ -2675,9 +2677,9 @@ fn auto_install_to_reporting(
                 } else if below_floor(&plugin_file(root)) {
                     // PRD #1666 §11: the other install's pin is kept, but a
                     // template below the integration floor would be refused,
-                    // so it is regenerated with that same pin. Only a stale
-                    // template is rewritten, so two installs that both meet
-                    // the floor still never rewrite each other's.
+                    // so it is regenerated with that same pin. This branch
+                    // rewrites only a stale template; a pin that an eligible
+                    // newer copy supersedes was already taken over above.
                     (existing, false)
                 } else {
                     pins.push((root.clone(), existing));
