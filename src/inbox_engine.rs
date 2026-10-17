@@ -1224,7 +1224,10 @@ const CLAP_USAGE_EXIT: i32 = 2;
 /// the flag on its usage-error exit proves it missing, and only a help line
 /// listing the flag proves it supported; anything else, an old help that
 /// exits 0 without the flag or a diagnostic in other words included, is
-/// unknown. Blocking: run it off the executor.
+/// unknown. Blocking: run it off the executor. What is bounded is the
+/// return and the bytes kept, not the readers: a reader of a stream another
+/// process still holds open is left behind, and lives until that process
+/// closes it.
 pub fn probe_cli(binary: &std::path::Path, deadline: Duration) -> ProbeVerdict {
     use std::io::Read;
     use std::process::{Command, Stdio};

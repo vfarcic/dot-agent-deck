@@ -1647,10 +1647,16 @@ mod fsdir {
         /// An open directory handle and the handles of every component above
         /// it, back to the anchor. Each is opened **without**
         /// `FILE_SHARE_DELETE`, so while it is held no component of the chain
-        /// can be renamed or deleted. Write sharing stays allowed, since
-        /// linking or renaming into a directory opens it for writing, so a
-        /// same-user writer can still make a held, empty directory a mount
-        /// point in place; [`TrustedDir::guarded`] rechecks for that.
+        /// can be renamed or deleted. Write sharing stays allowed. The reason
+        /// it was kept is unverified: the belief that linking or renaming
+        /// into a directory opens it for writing, and that dropping write
+        /// sharing would not stop `FSCTL_SET_REPARSE_POINT` anyway, since a
+        /// handle asking only for attribute access is not checked against
+        /// share mode. inbox/receipt/017 makes the mount point through a
+        /// generic writable handle, so it cannot tell the two apart. A
+        /// same-user writer can make a held, empty directory a mount point in
+        /// place; [`TrustedDir::guarded`] detects one that is there when it
+        /// looks.
         #[derive(Debug)]
         struct Held {
             dir: File,
@@ -1689,11 +1695,14 @@ mod fsdir {
         }
 
         /// A verified directory, held as a handle chain back to the anchor.
-        /// Windows has no `openat`, so operations go by path, but every
-        /// component of that path is held open without delete sharing, so it
-        /// cannot be renamed or deleted, and every operation rechecks through
-        /// those handles that none became a reparse point in place, so the
-        /// path keeps resolving to the directories that were verified.
+        /// Windows has no `openat`, so operations go by path. Every component
+        /// of that path is held open without delete sharing, so it cannot be
+        /// renamed or deleted, and every operation checks through those
+        /// handles, before and after, that none is a reparse point. That
+        /// detects a reparse point present when a check looks; it is not
+        /// confinement. A postcheck cannot undo a create, link, rename or
+        /// remove that already went through a redirected path, and a junction
+        /// installed and removed between the two checks is not seen.
         #[derive(Debug)]
         pub(in super::super) struct TrustedDir {
             path: PathBuf,
@@ -1737,8 +1746,9 @@ mod fsdir {
             /// Run one path operation between two [`Self::intact`] checks:
             /// refused when a component is a reparse point before it, and an
             /// error after it even when it succeeded, since it may then have
-            /// been redirected. A reparse point both made and removed inside
-            /// the one operation is not seen.
+            /// been redirected. The error does not undo what the redirected
+            /// operation did. A reparse point both made and removed between
+            /// the two checks is not seen.
             fn guarded<T>(&self, op: impl FnOnce(&Path) -> io::Result<T>) -> io::Result<T> {
                 self.intact()?;
                 let result = op(&self.path);

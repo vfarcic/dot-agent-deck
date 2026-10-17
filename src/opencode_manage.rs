@@ -1738,9 +1738,15 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     },
     // §2: whether a callback holding an approval granted under `granted` may
     // reach OpenCode right now. Synchronous: call it with no await between it
-    // and the native call.
-    ready: (ref, granted) =>
-      active() && granted !== undefined && granted === epoch && held.has(inboxKey(ref)) && !revoked.has(inboxKey(ref)),
+    // and the native call. One native call per attempt: once a callback has
+    // called, every other approval of the attempt is refused, so a call's
+    // outcome is the attempt's.
+    ready: (ref, granted) => {
+      const key = inboxKey(ref);
+      const entry = held.get(key);
+      return active() && granted !== undefined && granted === epoch && entry !== undefined &&
+        entry.stage !== "handed" && !called.has(key) && !revoked.has(key);
+    },
     // The callback is about to reach OpenCode: from here a revoke is
     // answered `already_handed`.
     calling: (ref) => {
@@ -1776,9 +1782,13 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
       snapshot();
     },
     // OpenCode refused the call this callback made before accepting it
-    // (`inboxRefusedBeforeAcceptance`): positively not handed.
+    // (`inboxRefusedBeforeAcceptance`). It was the attempt's only call
+    // (`ready`), so the attempt was positively not handed: revoked locally
+    // first, like `notHanded`, so no approval still outstanding for it can
+    // reach OpenCode once the deck believes it was not handed.
     rejected: (ref) => {
       const key = inboxKey(ref);
+      revoked.add(key);
       called.delete(key);
       held.delete(key);
       inboxWrite(child, { not_handed: [ref] });
@@ -4965,7 +4975,7 @@ check(sent().filter((c) => c.not_handed).length, 1, "and is reported not handed"
         );
     }
 
-    /// Scenario: Two hand-over checks of one attempt race. First an approved callback is already inside its OpenCode call when the other check is refused: the refusal reaches nothing and claims nothing, and the call reports handed. Then a refusal arrives before the other check's approval: the refusal revokes the attempt locally before reporting it not handed, so the late approval never reaches OpenCode.
+    /// Scenario: Two hand-over checks of one attempt race. First an approved callback is already inside its OpenCode call when the other check is refused: the refusal reaches nothing and claims nothing, and the call reports handed. Then a refusal arrives before the other check's approval: the refusal revokes the attempt locally before reporting it not handed, so the late approval never reaches OpenCode. Last, two checks of one attempt are both approved: only one reaches OpenCode, the other claims nothing while that call is in flight, the call's refusal before acceptance is reported not handed, and an approval delayed past it never reaches OpenCode even when the attempt is delivered again.
     #[spec("inbox/opencode/037")]
     #[cfg(unix)]
     #[test]
@@ -5015,6 +5025,33 @@ check(sent().filter((c) => c.not_handed).map((c) => c.not_handed[0].e), [2], "th
 feed({ grant: { q: approvedQ, ok: true } });
 await approved;
 check(called, 1, "an approval after the refusal's local revoke never reaches OpenCode");
+check(sent().filter((c) => c.handed).length, 1, "and nothing more is reported handed");
+
+const third = { id, a: 1, e: 3 };
+const copy = { ...third, subject: "s", from: "x", text: "t", d: 3 };
+const thirdNotHanded = () => sent().filter((c) => c.not_handed).flatMap((c) => c.not_handed).filter((r) => r.e === 3);
+feed({ messages: [copy] });
+let fail;
+const one = inboxHandOver(receiver, third, "s1", () => {
+  called += 1;
+  return new Promise((r) => { fail = r; });
+});
+const other = inboxHandOver(receiver, third, "s1", async () => { called += 1; return {}; });
+await tick();
+for (const c of sent().filter((c) => c.may).slice(-2)) feed({ grant: { q: c.may.q, ok: true } });
+await tick();
+check(called, 2, "two approvals of one attempt make one native call");
+check(await other, false, "the other approved check reaches nothing");
+check(thirdNotHanded().length, 0, "and claims nothing while the call is in flight");
+const delayed = inboxHandOver(receiver, third, "s1", async () => { called += 1; return {}; });
+await tick();
+fail({ error: { message: "no such session" }, response: { status: 400 } });
+check(await one, false, "the one call is refused before acceptance");
+check(thirdNotHanded().length, 1, "and reported not handed");
+feed({ messages: [copy] });
+feed({ grant: { q: sent().filter((c) => c.may).pop().may.q, ok: true } });
+check(await delayed, false, "an approval delayed past the failure");
+check(called, 2, "never reaches OpenCode, even with the attempt delivered again");
 check(sent().filter((c) => c.handed).length, 1, "and nothing more is reported handed");
 "#,
         );
