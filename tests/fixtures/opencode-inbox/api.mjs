@@ -27,6 +27,7 @@ cp.spawn = (...args) => {
   spawned.push(child);
   log('spawn', {pid: child.pid, args: args.slice(0, 2)});
   const write = child.stdin?.write.bind(child.stdin);
+  child.rawWrite = write;
   if (write) child.stdin.write = (bytes, ...rest) => {
     log('stdin', {text: bytes.toString()});
     return write(bytes, ...rest);
@@ -124,6 +125,9 @@ const timer=setInterval(async ()=>{
     if(control.dispose) {for(const fn of disposers)await fn(); log('disposed');}
     if(control.eof) {for(const child of spawned)child.stdin?.end();}
     if(control.killWatcher) {for(const child of spawned)child.kill('SIGKILL');}
+    // PRD #1666 §4: a line written to the newest watcher's stdin past the
+    // plugin, as a component that reports a stage before registration would.
+    if(control.rawStdin) {const text=JSON.stringify(control.rawStdin)+'\n';spawned[spawned.length-1]?.rawWrite?.(text);log('raw-stdin',{text});}
     // PRD #1666 §4: a stalled event loop (a dead adapter, while it lasts).
     if(control.stall) {const until=Date.now()+control.stall;while(Date.now()<until){} log('stalled',{ms:control.stall});}
     // PRD #1666 §4: OpenCode re-running the server plugin in the same module, as

@@ -24051,7 +24051,7 @@ mod spawn_tests {
         registry.shutdown_all();
         assert_eq!(
             text.expect("the child reported its environment").trim(),
-            "unset unset 7",
+            "unset unset 7 unset",
             "only the knob the spawn set reaches the child"
         );
     }

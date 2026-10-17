@@ -1533,14 +1533,29 @@ const inboxWrite = (child, control) => {
     return false;
   }
 };
+// Ending the watcher's stdin is how the receiver says it is done: the watcher
+// then finishes publishing the receipts it was given before it exits.
+// SIGTERM follows only if it is still running INBOX_STOP_GRACE_MS later, on a
+// timer that keeps nothing alive.
+const INBOX_STOP_GRACE_MS = 3000;
 const inboxStop = (child) => {
   if (!child) return;
   try {
     child.stdin.end();
   } catch (_) {}
+  if (typeof child.exitCode === "number" || child.signalCode) return;
+  const kill = () => {
+    try {
+      child.kill("SIGTERM");
+    } catch (_) {}
+  };
   try {
-    child.kill("SIGTERM");
-  } catch (_) {}
+    const timer = setTimeout(kill, INBOX_STOP_GRACE_MS);
+    timer.unref?.();
+    child.once("exit", () => clearTimeout(timer));
+  } catch (_) {
+    kill();
+  }
 };
 // PRD #1666: DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS sets every watcher respawn
 // delay to that many milliseconds (a whole number, 1 to 3600000), as the Pi
@@ -1605,6 +1620,33 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
   });
   const fresh = (granted) =>
     granted !== undefined && granted.epoch === epoch && inboxNow() - granted.at < granted.valid;
+  // Stage reports (`handed`, `committed`) no registered watcher has taken
+  // yet, or that a watcher took and then exited. One made while no watcher
+  // runs, or before a new one has registered, waits here and its attempt
+  // answers a resume `retained`; the registered watcher is sent it after the
+  // resume answers, and publishes its receipt with the caps the deck rebinds
+  // to it. One a watcher that has since exited took is sent again only for an
+  // attempt the deck asks back, i.e. one it never settled. Bounded, oldest
+  // dropped first.
+  const reports = new Map();
+  const reported = (key) => reports.has("handed|" + key) || reports.has("committed|" + key);
+  const flush = () => {
+    if (!child || rx === undefined) return;
+    for (const stage of ["handed", "committed"]) {
+      const due = [...reports.values()].filter((entry) => entry.stage === stage && entry.to !== child);
+      if (!due.length || !inboxWrite(child, { [stage]: due.map((entry) => entry.ref) })) continue;
+      for (const entry of due) entry.to = child;
+    }
+  };
+  const report = (stage, refs) => {
+    for (const ref of refs) {
+      const key = stage + "|" + inboxKey(ref);
+      reports.delete(key);
+      reports.set(key, { stage, ref: inboxRef(ref), to: undefined });
+      if (reports.size > INBOX_MAX_CALLED) reports.delete(reports.keys().next().value);
+    }
+    flush();
+  };
   const grants = new Map();
   let watermark = { seen: 0, above: new Set() };
   let child;
@@ -1656,13 +1698,19 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
       rx = reply.registered.rx;
       keepaliveMs = typeof reply.registered.keepalive_ms === "number" ? reply.registered.keepalive_ms : undefined;
       watermark = { seen: 0, above: new Set() };
-      const answers = (Array.isArray(reply.resume) ? reply.resume : []).map((ref) => ({
+      const resume = Array.isArray(reply.resume) ? reply.resume : [];
+      const asked = new Set(resume.map(inboxKey));
+      for (const [key, entry] of reports) {
+        if (entry.to !== undefined && !asked.has(inboxKey(entry.ref))) reports.delete(key);
+      }
+      const answers = resume.map((ref) => ({
         id: ref.id,
         a: ref.a,
         e: ref.e,
-        answer: held.has(inboxKey(ref)) ? "retained" : "unknown",
+        answer: held.has(inboxKey(ref)) || reported(inboxKey(ref)) ? "retained" : "unknown",
       }));
       if (answers.length) inboxWrite(child, { resume_answers: answers });
+      flush();
       snapshot();
     }
     for (const rebound of Array.isArray(reply.rebound) ? reply.rebound : []) {
@@ -1796,18 +1844,19 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
       call(inboxKey(ref));
     },
     handed: (refs) => {
-      if (refs.length) inboxWrite(child, { handed: refs });
+      if (refs.length) report("handed", refs);
     },
     // The agent started on these: no longer held, and possibly handed for
-    // good. Their receipts are published by the watcher after this returns,
-    // so a revoke meanwhile is still answered `already_handed`.
+    // good. Their receipts are published by the watcher after this returns
+    // (by the next one to register, if none is registered now), so a revoke
+    // meanwhile is still answered `already_handed`.
     committed: (refs) => {
       if (!refs.length) return;
       for (const ref of refs) {
         held.delete(inboxKey(ref));
         call(inboxKey(ref));
       }
-      inboxWrite(child, { committed: refs });
+      report("committed", refs);
       snapshot();
     },
     // Positively not handed to OpenCode by this callback. A refusal is only
@@ -4846,6 +4895,48 @@ const tick = () => new Promise((r) => setImmediate(r));
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Scenario: A receiver's watcher dies while it holds an attempt, and the agent starts on that attempt before a replacement runs, then the replacement starts and the commit is reported again before it registers. Nothing goes to the dead or the unregistered watcher; once the replacement registers and asks for the attempt back, it is answered `retained` and the commit follows the answers. A commit a watcher took and then died with is sent again only to a successor that asks for its attempt back.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_receiver_keeps_a_stage_report_until_a_watcher_registers() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const ref = (e) => ({ id: "m-k3xzq2ab-0f3c9a71d2e4b850", a: 1, e });
+feed({ messages: [{ ...ref(1), subject: "s", from: "x", text: "t", d: 1 }] });
+const first = current();
+first.emit("exit");
+receiver.committed([ref(1)]);
+check(first.written.filter((c) => c.committed).length, 0, "nothing to the dead watcher");
+receiver.start();
+receiver.committed([ref(1)]);
+check(sent(), [], "nothing before the replacement registers");
+feed({ registered: { rx: 5, slot: "opencode_tui", keepalive_ms: 30000 }, resume: [ref(1)] });
+check(sent()[0], { resume_answers: [{ ...ref(1), answer: "retained" }] }, "the committed attempt is retained");
+check(sent()[1], { committed: [ref(1)] }, "and its commit follows the answers");
+check(sent().filter((c) => c.committed).length, 1, "once");
+
+// Taken by a registered watcher that then died: resent only when asked back.
+current().emit("exit");
+receiver.start();
+feed({ registered: { rx: 6, slot: "opencode_tui", keepalive_ms: 30000 } });
+check(sent().filter((c) => c.committed || c.resume_answers).length, 0, "not asked back: settled");
+receiver.committed([ref(2)]);
+current().emit("exit");
+receiver.start();
+feed({ registered: { rx: 7, slot: "opencode_tui", keepalive_ms: 30000 }, resume: [ref(2)] });
+check(sent()[0], { resume_answers: [{ ...ref(2), answer: "retained" }] }, "asked back");
+check(sent()[1], { committed: [ref(2)] }, "and sent again");
+"#,
         );
     }
 

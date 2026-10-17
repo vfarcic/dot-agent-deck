@@ -151,6 +151,20 @@ impl OpenCode {
                 .unwrap()
                 .push(json!(["DOT_AGENT_DECK_INBOX_TEST_REBIND_DELAY_MS", ms]));
         }
+        // PRD #1666 §4: every watcher respawn waits this long, and every
+        // watcher reads its registration this long after it arrives.
+        if let Some(ms) = config["backoffMs"].as_str() {
+            start["env"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(["DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", ms]));
+        }
+        if let Some(ms) = config["registerDelayMs"].as_str() {
+            start["env"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(["DOT_AGENT_DECK_INBOX_TEST_REGISTER_DELAY_MS", ms]));
+        }
         if let Some(pool) = pool {
             std::fs::write(
                 daemon.cwd().join(".dot-agent-deck.toml"),
@@ -1662,4 +1676,162 @@ fn opencode_048_a_commit_reported_before_the_rebound_caps_waits_for_them() {
         "settled from the replacement watcher's receipt: {:?}",
         op.prompts()
     );
+}
+
+/// PRD #1666 §4: the pid of the first watcher the plugin started.
+fn first_watcher_pid(op: &OpenCode) -> Value {
+    op.events()
+        .into_iter()
+        .find(|e| e["kind"] == "spawn" && e["args"][1][1] == "wait")
+        .expect("a watcher was started")["pid"]
+        .clone()
+}
+
+/// The resume answers the plugin wrote to its watchers.
+fn resume_answers(op: &OpenCode) -> Vec<Value> {
+    op.controls()
+        .into_iter()
+        .filter_map(|c| c["resume_answers"].as_array().cloned())
+        .flatten()
+        .collect()
+}
+
+/// Scenario: The TUI plugin is handed a deck message and prompts it; its watcher is killed, and every respawn waits three seconds. OpenCode answers the message while no watcher runs, so the plugin has nowhere to report the commit yet. It keeps the report: the replacement's registration asks for the attempt back, the plugin answers that it retained it and then reports the commit, whose control never reaches the deck. The replacement publishes the commit receipt and the deck settles the message from it, with one prompt.
+#[spec("inbox/opencode/048")]
+#[test]
+fn opencode_048_a_commit_reported_while_no_watcher_runs_waits_for_the_next() {
+    let op = OpenCode::new("session", json!({"dropCommitted":true,"backoffMs":"3000"}));
+    armed(&op.daemon, &op.pane, 1);
+    let id = op.post();
+    op.wait_kind("user-message");
+    let first = first_watcher_pid(&op);
+    op.control(json!({"killWatcher":true}));
+    assert!(
+        common::wait_until(WAIT, || op
+            .events()
+            .iter()
+            .any(|e| e["kind"] == "exit" && e["pid"] == first)),
+        "the watcher exits"
+    );
+    let before = op.emitted("message.updated");
+    op.assistant(&last_user(&op));
+    assert!(common::wait_until(WAIT, || op.emitted("message.updated") > before));
+    assert_eq!(op.watchers().len(), 1, "answered during the backoff");
+    assert_eq!(op.commits(&id), 0, "no watcher to report to yet");
+    assert!(
+        common::wait_until(WAIT, || op.commits(&id) >= 1),
+        "the plugin reports the commit to the replacement: {:?}",
+        op.controls()
+    );
+    assert!(
+        resume_answers(&op)
+            .iter()
+            .any(|a| a["id"] == id && a["answer"] == "retained"),
+        "the committed attempt is retained: {:?}",
+        op.controls()
+    );
+    state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert_eq!(
+        op.prompts().len(),
+        1,
+        "settled from the replacement watcher's receipt: {:?}",
+        op.prompts()
+    );
+}
+
+/// Scenario: The TUI plugin is handed a deck message and prompts it; its watcher is killed, and the replacement reads its registration two and a half seconds late, inside the deck's eight-second resume window. OpenCode answers the message after the replacement started but before it registered. The plugin holds the commit report until the registration has asked for the attempt back and been answered `retained`, then reports it, its control never reaching the deck; the replacement publishes the commit receipt and the deck settles the message from it, with one prompt.
+#[spec("inbox/opencode/048")]
+#[test]
+fn opencode_048_a_commit_reported_before_the_replacement_registers_waits_for_it() {
+    let op = OpenCode::new(
+        "session",
+        json!({"dropCommitted":true,"registerDelayMs":"2500","ackWaitMs":"8000"}),
+    );
+    armed(&op.daemon, &op.pane, 1);
+    let id = op.post();
+    op.wait_kind("user-message");
+    op.control(json!({"killWatcher":true}));
+    assert!(common::wait_until(WAIT, || op.watchers().len() >= 2));
+    let before = op.emitted("message.updated");
+    op.assistant(&last_user(&op));
+    assert!(common::wait_until(WAIT, || op.emitted("message.updated") > before));
+    assert!(
+        resume_answers(&op).is_empty(),
+        "answered before the replacement registered: {:?}",
+        op.controls()
+    );
+    assert!(
+        common::wait_until(WAIT, || op.commits(&id) >= 1),
+        "the plugin reports the commit once registered: {:?}",
+        op.controls()
+    );
+    assert!(
+        resume_answers(&op)
+            .iter()
+            .any(|a| a["id"] == id && a["answer"] == "retained"),
+        "the committed attempt is retained: {:?}",
+        op.controls()
+    );
+    state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert_eq!(
+        op.prompts().len(),
+        1,
+        "settled from the replacement watcher's receipt: {:?}",
+        op.prompts()
+    );
+}
+
+/// Scenario: The TUI plugin is handed a deck message and prompts it; its watcher is killed, and the replacement reads its registration two and a half seconds late, inside the deck's eight-second resume window. A commit for the attempt reaches the replacement's stdin directly, before that registration is read, and its control never reaches the deck. The replacement waits for its registration and the attempt's rebound caps instead of failing for want of a spool, publishes the commit receipt, and the deck settles the message from it, with one prompt.
+#[spec("inbox/opencode/048")]
+#[test]
+fn opencode_048_a_stage_reaching_a_watcher_before_its_registration_waits_for_it() {
+    let op = OpenCode::new(
+        "session",
+        json!({"dropCommitted":true,"registerDelayMs":"2500","ackWaitMs":"8000"}),
+    );
+    armed(&op.daemon, &op.pane, 1);
+    let id = op.post();
+    op.wait_kind("user-message");
+    let may = op
+        .controls()
+        .into_iter()
+        .find(|c| c["may"]["id"] == id)
+        .expect("the final hand-over check");
+    let attempt = json!({"id": id, "a": may["may"]["a"], "e": may["may"]["e"]});
+    op.control(json!({"killWatcher":true}));
+    assert!(common::wait_until(WAIT, || op.watchers().len() >= 2));
+    op.control(json!({"rawStdin": {"committed": [attempt]}}));
+    op.wait_kind("raw-stdin");
+    assert!(
+        resume_answers(&op).is_empty(),
+        "reached the replacement before it registered: {:?}",
+        op.controls()
+    );
+    state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert_eq!(
+        op.prompts().len(),
+        1,
+        "settled from the replacement watcher's receipt: {:?}",
+        op.prompts()
+    );
+}
+
+/// Scenario: The TUI plugin is handed a deck message and prompts it, and every receipt publish takes a second and a half. OpenCode answers the message, the plugin reports the commit, and the context is disposed at once, so the plugin stops its watcher while that publish is still in flight. The watcher finishes the publish and reports the commit before it exits, and the deck acknowledges the message, with one prompt.
+#[spec("inbox/opencode/048")]
+#[test]
+fn opencode_048_a_commit_reported_at_shutdown_reaches_the_deck() {
+    let op = OpenCode::new("session", json!({"publishDelayMs":"1500"}));
+    armed(&op.daemon, &op.pane, 1);
+    let id = op.post();
+    op.wait_kind("user-message");
+    op.assistant(&last_user(&op));
+    assert!(
+        common::wait_until(WAIT, || op.commits(&id) >= 1),
+        "the plugin reports the commit: {:?}",
+        op.controls()
+    );
+    op.control(json!({"dispose":true}));
+    op.wait_kind("disposed");
+    state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert_eq!(op.prompts().len(), 1, "{:?}", op.prompts());
 }
