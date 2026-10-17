@@ -18,6 +18,11 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { describe, test } from "node:test";
 import {
+	tagHandOver,
+	untagHandOver,
+	watcherBackoffOverride,
+	WATCHER_BACKOFF_ENV,
+	WATCHER_BACKOFF_OVERRIDE_MAX_MS,
 	AGENT_EVENT_TYPES,
 	AGENT_STATES,
 	buildAgentEventArgv,
@@ -32,7 +37,6 @@ import {
 	DECK_BIN_OVERRIDE_ENV,
 	DECK_EXE_ENV,
 	DeckExecError,
-	DECLARE_PROMPT_REPORTS_FLAG,
 	execFailureMessage,
 	execWithStdin,
 	isAgentState,
@@ -193,24 +197,10 @@ describe("row 8: agent-event argv", () => {
 		assert.deepEqual(buildAgentEventArgv("finished", {}), ["agent-event", "--type", "finished"]);
 	});
 
-	// Issue #1567: the declaration goes FIRST among the flags, so a CLI that
-	// predates it names it, and not `--cwd`, as the argument it does not know.
-	test("the prompt-report declaration is the first flag when asked for", () => {
-		assert.equal(DECLARE_PROMPT_REPORTS_FLAG, "--reports-prompts");
-		assert.deepEqual(buildAgentEventArgv("prompt", { cwd: "/w", prompt: "go" }, true), [
-			"agent-event",
-			"--type",
-			"prompt",
-			"--reports-prompts",
-			"--cwd=/w",
-			"--prompt=go",
-		]);
-		assert.deepEqual(buildAgentEventArgv("finished", {}, true), [
-			"agent-event",
-			"--type",
-			"finished",
-			"--reports-prompts",
-		]);
+	// PRD #1666: the extension no longer declares that it reports every
+	// prompt — nothing the deck does reads that any more.
+	test("no report carries the retired prompt-report declaration", () => {
+		assert.ok(!buildAgentEventArgv("prompt", { cwd: "/w", prompt: "go" }).includes("--reports-prompts"));
 	});
 });
 
@@ -596,20 +586,12 @@ describe("issue #622: falling back for a CLI older than the extension", () => {
 	});
 });
 
-describe("issue #1567: report levels for decks of every age", () => {
+describe("report levels for decks of every age", () => {
 	const prompt = { type: "prompt" as const, detail: { cwd: "/w", prompt: "go" } };
 	const lifecycle = { type: "running" as const, detail: { cwd: "/w" } };
 
 	test("each level sends what it names, and a detail report has no lifecycle form", () => {
-		assert.deepEqual([...REPORT_LEVELS], ["declared", "detail", "lifecycle"]);
-		assert.deepEqual(reportArgvAt(prompt, "declared"), [
-			"agent-event",
-			"--type",
-			"prompt",
-			"--reports-prompts",
-			"--cwd=/w",
-			"--prompt=go",
-		]);
+		assert.deepEqual([...REPORT_LEVELS], ["detail", "lifecycle"]);
 		assert.deepEqual(reportArgvAt(prompt, "detail"), ["agent-event", "--type", "prompt", "--cwd=/w", "--prompt=go"]);
 		assert.equal(reportArgvAt(prompt, "lifecycle"), null);
 		assert.deepEqual(reportArgvAt(lifecycle, "lifecycle"), ["agent-event", "--type", "running"]);
@@ -638,19 +620,7 @@ describe("issue #1567: report levels for decks of every age", () => {
 	}
 	const DETAIL_FLAGS = ["--cwd", "--prompt", "--tool-name", "--tool-detail"];
 
-	test("a current deck gets every report declared, first time", async () => {
-		const cli = fakeCli([DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL_FLAGS]);
-		const reporter = createReporter(cli.run);
-		await reporter.send(lifecycle);
-		await reporter.send(prompt);
-		assert.equal(reporter.level(), "declared");
-		assert.deepEqual(
-			cli.calls.map((argv) => argv.includes("--reports-prompts")),
-			[true, true],
-		);
-	});
-
-	test("a deck from #622 to #1567 keeps the detail and loses only the declaration", async () => {
+	test("a deck from #622 on gets every report with its detail, first time", async () => {
 		const cli = fakeCli(DETAIL_FLAGS);
 		const reporter = createReporter(cli.run);
 		await reporter.send(prompt);
@@ -658,7 +628,7 @@ describe("issue #1567: report levels for decks of every age", () => {
 		assert.deepEqual(cli.calls.at(-1), ["agent-event", "--type", "prompt", "--cwd=/w", "--prompt=go"]);
 		await reporter.send(lifecycle);
 		assert.deepEqual(cli.calls.at(-1), ["agent-event", "--type", "running", "--cwd=/w"]);
-		assert.equal(cli.calls.length, 3, "after the first refusal no report is spent on the declaration");
+		assert.equal(cli.calls.length, 2, "nothing was refused, so nothing was resent");
 	});
 
 	test("a deck from before #622 falls all the way to bare lifecycle reports", async () => {
@@ -667,21 +637,20 @@ describe("issue #1567: report levels for decks of every age", () => {
 		await reporter.send(lifecycle);
 		assert.equal(reporter.level(), "lifecycle");
 		assert.deepEqual(cli.calls, [
-			["agent-event", "--type", "running", "--reports-prompts", "--cwd=/w"],
 			["agent-event", "--type", "running", "--cwd=/w"],
 			["agent-event", "--type", "running"],
 		]);
 		await reporter.send(prompt);
-		assert.equal(cli.calls.length, 3, "a detail report has nothing to send to such a deck");
+		assert.equal(cli.calls.length, 2, "a detail report has nothing to send to such a deck");
 	});
 
 	test("a transient failure keeps the level and retries a lifecycle report bare", async () => {
-		const cli = fakeCli([DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL_FLAGS], { down: true });
+		const cli = fakeCli(DETAIL_FLAGS, { down: true });
 		const reporter = createReporter(cli.run);
 		await reporter.send(lifecycle);
-		assert.equal(reporter.level(), "declared");
+		assert.equal(reporter.level(), "detail");
 		assert.deepEqual(cli.calls, [
-			["agent-event", "--type", "running", "--reports-prompts", "--cwd=/w"],
+			["agent-event", "--type", "running", "--cwd=/w"],
 			["agent-event", "--type", "running"],
 		]);
 		await reporter.send(prompt);
@@ -695,7 +664,7 @@ describe("issue #1567: report levels for decks of every age", () => {
 			throw new Error("spawn ENOENT");
 		});
 		await reporter.send(lifecycle);
-		assert.equal(reporter.level(), "declared");
+		assert.equal(reporter.level(), "detail");
 		assert.equal(calls.length, 2);
 	});
 });
@@ -840,36 +809,33 @@ describe("PRD #1497: the settled turn's final reply", () => {
 		assert.deepEqual(tracker.take(), { text: "All 42 tests pass.", failed: false });
 	});
 
-	test("only agent_settled carries the reply, as the last flags of a declared report, its text never on argv", () => {
+	test("only agent_settled carries the reply, as the last flags of a detail report, its text never on argv", () => {
 		const reply = { text: "All 42 tests pass.", failed: false };
 		const settled = piEventReport("agent_settled", { type: "agent_settled" }, "/w", reply);
 		assert.deepEqual(settled, { type: "finished", detail: { cwd: "/w" }, reply });
 		assert.deepEqual(piEventReport("session_shutdown", {}, "/w", reply), { type: "finished", detail: { cwd: "/w" } });
 		assert.deepEqual(piEventReport("agent_settled", {}, "/w"), { type: "finished", detail: { cwd: "/w" } });
-		assert.deepEqual(reportArgvAt(settled!, "declared", true), [
+		assert.deepEqual(reportArgvAt(settled!, "detail", true), [
 			"agent-event",
 			"--type",
 			"finished",
-			"--reports-prompts",
 			"--cwd=/w",
 			TURN_REPLY_STDIN_FLAG,
 		]);
 		const failed = { ...settled!, reply: { text: "--boom", failed: true } };
-		assert.deepEqual(reportArgvAt(failed, "declared", true)?.slice(-2), [TURN_REPLY_STDIN_FLAG, TURN_REPLY_FAILED_FLAG]);
+		assert.deepEqual(reportArgvAt(failed, "detail", true)?.slice(-2), [TURN_REPLY_STDIN_FLAG, TURN_REPLY_FAILED_FLAG]);
 		assert.equal(turnReplyStdin(settled!.reply), "All 42 tests pass.");
 		assert.equal(turnReplyStdin(failed.reply), "--boom");
 		assert.equal(turnReplyStdin({ text: " \n ", failed: false }), "", "a blank reply is an empty turn end");
 		assert.equal(turnReplyStdin(undefined), undefined);
-		// Without the reply, and below `declared`, the argv is what it always was.
-		assert.deepEqual(reportArgvAt(settled!, "declared"), ["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w"]);
-		assert.deepEqual(reportArgvAt(settled!, "detail", true), ["agent-event", "--type", "finished", "--cwd=/w"]);
+		// Without the reply, and at `lifecycle`, the argv is what it always was.
+		assert.deepEqual(reportArgvAt(settled!, "detail"), ["agent-event", "--type", "finished", "--cwd=/w"]);
 		assert.deepEqual(reportArgvAt(settled!, "lifecycle", true), ["agent-event", "--type", "finished"]);
 		// A blank reply still carries the flags: the turn ended with nothing to read.
-		assert.deepEqual(buildAgentEventArgv("finished", {}, true, { text: "   ", failed: true }), [
+		assert.deepEqual(buildAgentEventArgv("finished", {}, { text: "   ", failed: true }), [
 			"agent-event",
 			"--type",
 			"finished",
-			"--reports-prompts",
 			TURN_REPLY_STDIN_FLAG,
 			TURN_REPLY_FAILED_FLAG,
 		]);
@@ -899,13 +865,13 @@ describe("PRD #1497: the settled turn's final reply", () => {
 	const DETAIL = ["--cwd", "--prompt", "--tool-name", "--tool-detail"];
 	const settled = { type: "finished" as const, detail: { cwd: "/w" }, reply: { text: "done", failed: false } };
 
-	test("a current deck takes the reply on the declared report", async () => {
-		const cli = cliKnowing([DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL, TURN_REPLY_STDIN_FLAG, TURN_REPLY_FAILED_FLAG]);
+	test("a current deck takes the reply on the detail report", async () => {
+		const cli = cliKnowing([...DETAIL, TURN_REPLY_STDIN_FLAG, TURN_REPLY_FAILED_FLAG]);
 		const reporter = createReporter(cli.run);
 		await reporter.send(settled);
-		assert.deepEqual(cli.calls, [["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w", "--turn-reply-stdin"]]);
+		assert.deepEqual(cli.calls, [["agent-event", "--type", "finished", "--cwd=/w", "--turn-reply-stdin"]]);
 		assert.deepEqual(cli.stdins, ["done"], "the reply goes on stdin");
-		assert.equal(reporter.level(), "declared");
+		assert.equal(reporter.level(), "detail");
 		assert.equal(reporter.replies(), true);
 		// A report with no reply writes no stdin.
 		await reporter.send({ type: "running", detail: { cwd: "/w" } });
@@ -916,8 +882,7 @@ describe("PRD #1497: the settled turn's final reply", () => {
 		const secret = "the-reply-text-" + "x".repeat(20);
 		const report = { ...settled, reply: { text: secret, failed: true } };
 		for (const known of [
-			[DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL, TURN_REPLY_STDIN_FLAG, TURN_REPLY_FAILED_FLAG],
-			[DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL],
+			[...DETAIL, TURN_REPLY_STDIN_FLAG, TURN_REPLY_FAILED_FLAG],
 			DETAIL,
 			[],
 		]) {
@@ -933,28 +898,23 @@ describe("PRD #1497: the settled turn's final reply", () => {
 		}
 	});
 
-	test("a deck from #1567 drops the reply once and keeps the declaration", async () => {
-		const cli = cliKnowing([DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL]);
+	test("a deck that predates the reply drops it once and keeps the detail", async () => {
+		const cli = cliKnowing(DETAIL);
 		const reporter = createReporter(cli.run);
 		await reporter.send(settled);
 		assert.deepEqual(cli.calls, [
-			["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w", "--turn-reply-stdin"],
-			["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w"],
+			["agent-event", "--type", "finished", "--cwd=/w", "--turn-reply-stdin"],
+			["agent-event", "--type", "finished", "--cwd=/w"],
 		]);
 		assert.deepEqual(cli.stdins, ["done", undefined], "the resend at the same level carries no reply");
-		assert.equal(reporter.level(), "declared");
+		assert.equal(reporter.level(), "detail");
 		assert.equal(reporter.replies(), false);
 		await reporter.send(settled);
 		assert.equal(cli.calls.length, 3, "no later report is spent on the reply");
-		assert.deepEqual(cli.calls.at(-1), ["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w"]);
+		assert.deepEqual(cli.calls.at(-1), ["agent-event", "--type", "finished", "--cwd=/w"]);
 	});
 
 	test("an older deck still steps down the levels exactly as before", async () => {
-		const detailOnly = cliKnowing(DETAIL);
-		const reporter = createReporter(detailOnly.run);
-		await reporter.send(settled);
-		assert.equal(reporter.level(), "detail");
-		assert.deepEqual(detailOnly.calls.at(-1), ["agent-event", "--type", "finished", "--cwd=/w"]);
 
 		const bare = cliKnowing([]);
 		const oldest = createReporter(bare.run);
@@ -1032,5 +992,27 @@ describe("PRD #1497: a reply reaches the CLI on stdin, never on its command line
 		const outcome = await execWithStdin(spawn, node, ["-e", "setTimeout(() => {}, 60000)"], "x", { timeout: 50 });
 		assert.equal(outcome.killed, true);
 		assert.notEqual(outcome.code, 0);
+	});
+});
+
+describe("watcherBackoffOverride (PRD #1666)", () => {
+	test("reads a whole number of milliseconds within bounds, and nothing else", () => {
+		const read = (value: string | undefined) => watcherBackoffOverride({ [WATCHER_BACKOFF_ENV]: value });
+		assert.equal(read("45000"), 45000);
+		assert.equal(read(" 1 "), 1);
+		assert.equal(read(String(WATCHER_BACKOFF_OVERRIDE_MAX_MS)), WATCHER_BACKOFF_OVERRIDE_MAX_MS);
+		for (const bad of [undefined, "", "0", "-5", "1.5", "1e3", "soon", String(WATCHER_BACKOFF_OVERRIDE_MAX_MS + 1)]) {
+			assert.equal(read(bad), undefined, `${bad} must leave the default backoff`);
+		}
+	});
+});
+
+describe("hand-over attempt line (PRD #1666)", () => {
+	test("names the attempt on a first line that comes off whole, and nothing else reads as one", () => {
+		const text = "[dot-agent-deck message m-1 from the orchestrator]\nWork.\n[end of dot-agent-deck message m-1]";
+		assert.deepEqual(untagHandOver(tagHandOver("k3x9.12", text)), { attempt: "k3x9.12", text });
+		for (const plain of [text, "[dot-agent-deck hand-over k3x9.12] no newline", "[dot-agent-deck hand-over not an attempt]\nx", "[dot-agent-deck hand-over k3x9]\nx", undefined, 7]) {
+			assert.equal(untagHandOver(plain), undefined, `${String(plain)} names no attempt`);
+		}
 	});
 });

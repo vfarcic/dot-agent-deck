@@ -576,6 +576,12 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
 .status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
 .agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* PRD #1666: the inbox line beside the status, and the undelivered-message notice under it. */
+.agent-inbox-badge { color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; white-space: nowrap; flex-shrink: 0; }
+/* PRD #1666 §6.4: a long list of deliveries waiting on Retry or Cancel scrolls in
+   place, so every row and its buttons stay reachable in a tile that hides overflow. */
+.agent-inbox-attention { max-height: 160px; overflow-y: auto; }
+.agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Issue #1678: background work still running after the turn ended. Ink rather
    than --muted, as the TUI draws it in its primary text colour: it is a reading
    about now, not a label. */
@@ -624,7 +630,6 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .terminal-input-status { flex: 0 0 auto; margin: 0; padding: 5px 9px 6px; display: flex; align-items: flex-start; gap: 5px; border-top: 1px solid var(--shell-line); background: var(--shell); font-size: 9px; line-height: 1.35; }
 .terminal-input-status svg { flex: 0 0 auto; margin-top: 1px; }
 .terminal-input-status.is-blocked { color: var(--status-error); }
-.terminal-input-status.is-unconfirmed { color: var(--status-warn); }
 .terminal-viewport[aria-disabled="true"] { opacity: .62; }
 /* PRD #1105 — what stands where the terminal would be when this pane has none,
    which today means an agent on a deck that is not the selected one. It reuses

@@ -576,6 +576,14 @@ jobs:
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-nextest@0.9.146
+      # The Pi extension's Node suites run from the fast tier
+      # (`question_detect_008` in src/hook.rs, `the_pi_extensions_node_suites_pass`
+      # in src/orchestrator_ext.rs) and need a Node that strips TypeScript types
+      # (23.6+); with an older one they print `SKIP:` and pass. Same major as
+      # the desktop jobs and devbox.json.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
       # The desktop crate's Linux build deps, needed because clippy/nextest below
       # run with --workspace, which includes desktop/src-tauri
       # (dot-agent-deck-desktop). Without them that crate fails to build on this

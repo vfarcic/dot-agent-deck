@@ -330,6 +330,14 @@ pub(crate) struct ConfigLock {
     _file: Option<std::fs::File>,
 }
 
+impl ConfigLock {
+    /// Whether a lock is actually held: `false` on a filesystem that cannot
+    /// lock, where [`lock_config`] lets the caller go on unlocked.
+    pub(crate) fn is_held(&self) -> bool {
+        self._file.is_some()
+    }
+}
+
 /// Serialise a read-modify-write of `dest` — an agent config the deck merges
 /// its entries into — across PROCESSES (issue #1493's follow-up).
 ///
@@ -1134,6 +1142,25 @@ pub(crate) fn executables_match(existing: &str, installing: &str) -> bool {
 /// it impossible.
 pub(crate) fn pin_is_dead_sibling(exe: &str, binary_path: &str) -> bool {
     pin_is_same_named(exe, binary_path) && crate::platform::paths::pin_is_repairable(exe)
+}
+
+/// Whether `exe` is another install of the deck under the installing binary's
+/// name that this copy supersedes — a strictly older release, read from its own
+/// `--version`, with this copy eligible to take over (issue #1637,
+/// [`crate::hook_binary::Takeover`]).
+///
+/// The Codex and Devin retired-event sweeps prune it beside
+/// [`pin_is_dead_sibling`]. A takeover repoints every installed event at this
+/// copy, so the superseded copy's rule under an event no longer installed is
+/// left behind by that copy, and no later start removes it: the superseded copy
+/// no longer installs, and a sweep that keeps live siblings (issue #730) keeps
+/// it. A tie, a newer sibling and one whose version cannot be read are not
+/// superseded. The cheap checks come first, because the takeover check runs the
+/// sibling's `--version`.
+pub(crate) fn pin_is_superseded_sibling(exe: &str, binary_path: &str) -> bool {
+    pin_is_same_named(exe, binary_path)
+        && !executables_match(exe, binary_path)
+        && crate::hook_binary::Takeover::current().supersedes(exe)
 }
 
 /// Whether `exe` names the same program as `binary_path`, wherever either sits
@@ -2494,6 +2521,119 @@ mod tests {
     #[test]
     fn config_auto_install_devin_takeover_matrix() {
         takeover_matrix("devin");
+    }
+
+    /// A deck rule pinning A under an event no writer installs, beside a user's
+    /// handler in the same rule list, followed by an automatic install by B
+    /// under `takeover`. Returns A and the retired event's rules afterwards.
+    #[cfg(unix)]
+    fn takeover_over_a_retired_rule(
+        agent: &str,
+        fixture: &Path,
+        takeover: crate::hook_binary::Takeover,
+    ) -> (String, Value) {
+        const RETIRED: &str = "UpgradeRetiredEvent";
+        let home = fixture.join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let a = seed_versioned_deck(
+            &fixture.join("homebrew").join("dot-agent-deck"),
+            Some("0.0.1"),
+        );
+        let b = seed_deck(&fixture.join("local").join("dot-agent-deck"));
+        install_config(agent, &home, &a).unwrap();
+        let path = home.join(config_name(agent));
+        let mut document: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let a_command = build_command(&a, &format!("hook --agent {agent}"), HookShell::Posix);
+        document["hooks"][RETIRED] = json!([
+            {"hooks":[{"type":"command", "command":"/user/audit-handler"}]},
+            {"hooks":[{"type":"command", "command":a_command}]},
+        ]);
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        crate::hook_binary::with_takeover(takeover, || auto_install_config(agent, &home, &b));
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        (a, after["hooks"][RETIRED].clone())
+    }
+
+    /// The deck commands among `rules`.
+    #[cfg(unix)]
+    fn deck_commands_in(agent: &str, rules: &Value) -> Vec<String> {
+        let suffix = format!("hook --agent {agent}");
+        rules
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|rule| rule["hooks"].as_array())
+            .flatten()
+            .filter_map(|handler| handler["command"].as_str())
+            .filter(|command| command.ends_with(&suffix))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A takeover also clears the superseded copy's rule under a retired
+    /// event, which nothing else would ever remove, and leaves the user's
+    /// handler beside it alone.
+    #[cfg(unix)]
+    fn takeover_prunes_a_retired_rule(agent: &str) {
+        use crate::hook_binary::Takeover;
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let (_, retired) =
+            takeover_over_a_retired_rule(agent, fixture.path(), Takeover::eligible("1.0.0"));
+        assert_eq!(
+            deck_commands_in(agent, &retired),
+            Vec::<String>::new(),
+            "{agent}: a newer eligible copy took over, so the older copy's rule under a retired \
+             event must go with it: {retired:?}"
+        );
+        assert!(
+            retired.to_string().contains("/user/audit-handler"),
+            "{agent}: the user's handler under the retired event must stay: {retired:?}"
+        );
+    }
+
+    /// Scenario: Codex hooks pin an older live install and also carry its rule under an event the deck no longer installs; a newer eligible copy's automatic install removes that retired rule along with the takeover and keeps the user's handler, while an ineligible copy leaves the live install's rule in place.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_codex_takeover_prunes_a_retired_rule() {
+        takeover_prunes_a_retired_rule("codex");
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let (a, retired) = takeover_over_a_retired_rule(
+            "codex",
+            fixture.path(),
+            crate::hook_binary::Takeover::ineligible(),
+        );
+        assert_eq!(
+            deck_commands_in("codex", &retired),
+            vec![build_command(&a, "hook --agent codex", HookShell::Posix)],
+            "without a takeover a live sibling's retired rule is not this install's to remove \
+             (issue #730)"
+        );
+    }
+
+    /// Scenario: the same retired-rule takeover for Devin's config file.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_devin_takeover_prunes_a_retired_rule() {
+        takeover_prunes_a_retired_rule("devin");
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let (a, retired) = takeover_over_a_retired_rule(
+            "devin",
+            fixture.path(),
+            crate::hook_binary::Takeover::ineligible(),
+        );
+        assert_eq!(
+            deck_commands_in("devin", &retired),
+            vec![build_command(&a, "hook --agent devin", HookShell::Posix)],
+            "without a takeover a live sibling's retired rule is not this install's to remove \
+             (issue #730)"
+        );
+    }
+
+    /// Scenario: the same retired-rule takeover for Claude Code's settings file, whose retired-event sweep removes every deck rule whichever install wrote it.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_claude_takeover_prunes_a_retired_rule() {
+        takeover_prunes_a_retired_rule("claude-code");
     }
 
     /// Scenario: Install Codex hooks from live install A, then auto-install from install B. The hooks file keeps its bytes, inode and mtime and still names A.

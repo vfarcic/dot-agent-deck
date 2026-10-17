@@ -89,7 +89,7 @@ The Dashboard shows an **ORCHESTRATION** group with a numbered row per role and 
 
 ![The desktop app's Dashboard with an activated orchestration: below the standalone agents, an ORCHESTRATION group named demo-loop with a Close button and a numbered row per role, 01 planner carrying the ORCHESTRATOR badge and 02 builder](/img/orchestration-desktop.png)
 
-**Check:** run `dot-agent-deck daemon status`. It prints one row per agent with the columns `PANE AGENT ROLE STATUS TOOL LABEL CWD`. The three roles appear with ROLE `orchestrator (orchestrator)`, `coder` and `reviewer`, and CWD is the project directory. `(orchestrator)` marks the role that may delegate.
+**Check:** run `dot-agent-deck daemon status`. It prints one row per agent with the columns `PANE AGENT ROLE STATUS TOOL INBOX WAKE LABEL CWD`. The three roles appear with ROLE `orchestrator (orchestrator)`, `coder` and `reviewer`, and CWD is the project directory. `(orchestrator)` marks the role that may delegate.
 
 ### 4. Give the orchestrator a request
 
@@ -97,7 +97,7 @@ Type your request into the orchestrator's pane, for example *"Add input validati
 
 **Check each hand-off:**
 
-- When the orchestrator delegates, the `coder` card (TUI) or row (desktop) changes to a working status, and the coder's pane shows a line of the form `Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-…]`. The task is in `.dot-agent-deck/worker-task-coder.md` in the project directory.
+- When the orchestrator delegates, the `coder` card (TUI) or tile (desktop) shows `✉1 queued` until the coder takes the task, then `✉ delivered`, and its status changes to a working one. The task reaches the coder's pane as a deck message whose `Sent by:` line names the orchestrator; see [Delivery in the TUI and desktop app](#delivery-in-the-tui-and-desktop-app) for how each agent shows it. In the desktop app, the handoff rail shows `delegated · queued`, then `delivered · working`. A copy of the task is also saved to `.dot-agent-deck/worker-task-coder.md` in the project directory.
 - When the coder finishes, it runs `dot-agent-deck work-done`. Its report appears in the orchestrator's pane and is saved to `.dot-agent-deck/work-done-coder.md`.
 - The orchestrator then delegates to `reviewer`, and the same two signs appear for it.
 
@@ -148,6 +148,7 @@ A `[[modes]]` block from older releases is ignored; `dot-agent-deck validate` wa
 | `name` | string | no | the directory's name | The orchestration's name, shown in the tab bar, on the `Orch: <name>` Mode chip, and used by `dispatch --orchestration <name>` and a schedule's `shape = "orchestration:<name>"`. An empty or missing name uses the project directory's name. |
 | `default` | boolean | no | `false` | Marks the orchestration a run opens when nothing names one. See [Which orchestration a schedule opens](#which-orchestration-a-schedule-opens). |
 | `extends` | string | no | — | The `name` of another orchestration in the same file whose roles this one inherits. See [Sharing a workflow with `extends`](#sharing-a-workflow-with-extends). |
+| `subscribe` | array of strings | no | `[]` | Announcement topics received by roles in this orchestration. See [Announcements and pooled jobs](#announcements-and-pooled-jobs). |
 | `roles` | array of tables | yes | — | The roles, written as `[[orchestrations.roles]]` entries. `validate` requires at least two after inheritance. A block that `extends` another may list only the roles it changes. |
 
 ### `[[orchestrations.roles]]`
@@ -160,7 +161,9 @@ A `[[modes]]` block from older releases is ignored; `dot-agent-deck validate` wa
 | `start` | boolean | no | `false` | `true` marks the orchestrator. `validate` requires exactly one role with `start = true`. |
 | `description` | string | no | — | What the role is for. The orchestrator reads it to choose which worker gets a task, and it is shown on the role's card. `validate` warns about a worker without one. |
 | `prompt_template` | string | no | — | Standing instructions. For a worker, they are written at the top of every task file it receives, followed by a `## Task` heading and the orchestrator's task. For the orchestrator, they are included in the context it receives when the orchestration starts. |
-| `clear` | boolean | no | `true` | `true` restarts the worker's agent before each task, so every task starts with a fresh context. `false` keeps the agent running and types each task into its existing session. See [What `clear` does to delivery](#what-clear-does-to-delivery). |
+| `clear` | boolean | no | `true` | `true` restarts the worker's agent before each task, so every task starts with a fresh context. `false` keeps the agent running and queues each task in its inbox. See [What `clear` does to delivery](#what-clear-does-to-delivery). |
+| `subscribe` | array of strings | no | `[]` | Additional announcement topics received by this role. |
+| `take_offers` | array of strings | no | `[]` | Job pools this role can take work from. |
 
 Which role is the orchestrator, for a file `validate` rejects: the first role with `start = true`; if none has it, the role named `orchestrator`; otherwise the first role.
 
@@ -171,8 +174,7 @@ The deck identifies the agent from the start of `command`: `claude --model opus`
 A role whose agent the deck cannot identify:
 
 - shows **No agent** and no status on its TUI card, and a blank **CLI** column in the desktop app. A Codex role behind a launcher stays blank until its first task starts. A Claude Code role behind a launcher identifies itself when it starts, so it looks normal;
-- if it is a Codex, Pi or OpenCode worker with `clear = true`, waits up to 30 seconds before every task is delivered;
-- gets no automatic [re-send of a lost task](#a-lost-task-is-re-sent-into-the-same-worker).
+- can lack the agent-specific doorbell guards and status detection until its integration identifies itself. Native inbox wake depends on that integration, so a launcher does not by itself prevent native delivery.
 
 `dot-agent-deck validate` warns about each such role. Fix it by declaring the agent:
 
@@ -400,17 +402,13 @@ While the TUI is **locked**, it moves focus within the active orchestration tab:
 ## How delegation works
 
 1. The orchestrator runs `dot-agent-deck delegate --to <role> --task-file <file>` (or `--task "<text>"`).
-2. The deck writes the worker's task file, `.dot-agent-deck/worker-task-<role>.md` in the worker's directory: the role's `prompt_template`, then `## Task`, then the task. It then types one line into the worker's pane: `Read .dot-agent-deck/worker-task-<role>.md for your task. [delivery d-XXXXXXXX]`.
-3. The worker runs `dot-agent-deck ack d-XXXXXXXX` (the task file tells it to), does the work, and runs `dot-agent-deck work-done --task-file <file>`.
-4. The deck saves the report to `.dot-agent-deck/work-done-<role>.md` and types it into the orchestrator's pane as a new message.
+2. The deck writes the worker's task file, `.dot-agent-deck/worker-task-<role>.md` in the worker's directory: the role's `prompt_template`, then `## Task`, then the task. It queues an inbox message pointing the worker to that file.
+3. The worker's integration receives and acknowledges the message. The worker does the work and runs `dot-agent-deck work-done --task-file <file>`.
+4. The deck saves the report to `.dot-agent-deck/work-done-<role>.md` and puts a message in the orchestrator's inbox.
 
 The deck teaches the orchestrator and the workers these commands when they start, so a `prompt_template` only needs to describe your workflow.
 
-![Coder pane active and working after receiving a delegation from the orchestrator](./img/orchestration-coder.png)
-
-The orchestrator can delegate one task to several roles at once (`--to reviewer --to auditor`). Each starts immediately and reports back separately.
-
-![Orchestrator delegating to reviewer and auditor in parallel — both cards light up simultaneously](./img/orchestration-delegation-parallel.png)
+The orchestrator can delegate one task to several roles at once (`--to reviewer --to auditor`). Each receives its own inbox message and reports back separately.
 
 ### Commands
 
@@ -420,7 +418,9 @@ These commands work only from a pane the deck started, which sets `DOT_AGENT_DEC
 |---|---|---|
 | `dot-agent-deck delegate --to <role> [--to <role> …] (--task <text> \| --task-file <path>) [--supersede]` | orchestrator | Sends a task to one or more workers. `--task-file -` reads the task from stdin. `--task-file` is the safe choice for text with quotes, backticks, `$` or newlines; the file must be a regular file of at most 1 MiB. `--supersede` sends even to a worker that still owes a `work-done` ([One task per worker at a time](#one-task-per-worker-at-a-time)). |
 | `dot-agent-deck work-done (--task <text> \| --task-file <path>) [--done]` | worker, or orchestrator with `--done` | Reports a finished task to the orchestrator. The orchestrator uses `--done` to mark the whole orchestration complete; in a dispatched unit, that reports back to the dispatcher ([Dispatcher Mode](dispatcher-mode.md)). |
-| `dot-agent-deck ack <delivery-id>` | worker | Tells the deck the task arrived, which stops re-sends. Always exits 0. |
+| `dot-agent-deck ack <message-id>` | worker or agent integration | Acknowledges a message. The installed integration normally does this itself. Always exits 0. |
+| `dot-agent-deck inbox list [--all] [--json]` | agent | Lists its inbox messages and their delivery states. An orchestrator can use `--all` to inspect its orchestration's inboxes. |
+| `dot-agent-deck inbox fetch [--json]` | agent | Reads and acknowledges its waiting messages. Run inside the recipient's deck pane; fetching changes delivery state. |
 | `dot-agent-deck pane restart <role> [--force]` | orchestrator | Replaces the worker's agent with a fresh one and drops the task it owed. Without `--force`, only a worker whose agent has exited (crashed or finished) is restarted. |
 | `dot-agent-deck pane spawn <role>` | orchestrator | Starts a role that is in `.dot-agent-deck.toml` but not running in this orchestration, for example one added to the file after the orchestration started, or one whose pane was closed. Refused for a role that is already running and for the orchestrator role. |
 
@@ -428,9 +428,9 @@ These commands work only from a pane the deck started, which sets `DOT_AGENT_DEC
 
 | Outcome | Exit status | Printed on stderr |
 |---|---|---|
-| Delivered to every named role | 0 | nothing |
-| Delivered to some roles, not others | 0 | `Warning: …` naming the roles that were missed and why. Re-send only to those roles; repeating the whole command gives the delivered roles the task twice. |
-| Delivered to no role | non-zero | `Error: delegate from pane … reached no worker for role(s): …`, or `… was NOT sent: every worker it reached still owes a work-done …` |
+| Accepted for every named role | 0 | nothing; check the inbox badge for delivery. |
+| Accepted for some roles, not others | 0 | `Warning: …` naming the roles that were missed and why. Re-send only to those roles; repeating the whole command gives the accepted roles the task twice. |
+| Accepted for no role | non-zero | `Error: delegate from pane … reached no worker for role(s): …`, or `… was NOT sent: every worker it reached still owes a work-done …` |
 | Refused: the caller is not the orchestrator | non-zero | `Error: delegate from pane … failed: pane … is the \`<role>\` role, not this orchestration's orchestrator, so it may not delegate.` |
 | Daemon not reachable | non-zero | `Error: could not reach the dot-agent-deck daemon socket, …` |
 
@@ -444,7 +444,7 @@ A worker that has been given a task is busy until it sends `work-done`, and unti
 
 When the earlier task is not coming back:
 
-- **`delegate --supersede`** sends the task anyway. The earlier task is not cancelled: on a `clear = false` worker the new task goes into the same session, and a late `work-done` for the earlier task still counts. On a `clear = true` worker the agent is restarted, so the earlier task is lost.
+- **`delegate --supersede`** queues the new task and retires an earlier task that has not been acknowledged. On a `clear = false` worker, work it already received can finish and a late `work-done` for that earlier task still counts. On a `clear = true` worker the agent is restarted, so its earlier work is lost.
 - **`pane restart <role>`** replaces the worker's agent and drops the task it owed, together with its pending [idle-worker reports](idle-workers-and-notifications.md).
 - **Wait.** Seven days after a task was sent, the deck stops counting it.
 
@@ -452,48 +452,138 @@ If the orchestrator's own agent was replaced since it delegated, the new orchest
 
 ### What `clear` does to delivery
 
-With `clear = true` (the default), the deck stops the worker's agent, starts the role's `command` again in the same pane, waits for the new agent to be ready, and then types the task pointer. The role's card or row stays in place with the same name, but the previous conversation is gone. The wait is about one to eight seconds for `claude`, `codex`, `opencode` or `pi`, depending on the agent, and up to 30 seconds for a Codex, Pi or OpenCode role behind a launcher without an [`agent`](#declaring-the-agent-behind-a-launcher-command) line. A worker whose agent has exited is started again the same way on its next task.
+With `clear = true` (the default), the deck replaces the worker's agent in the same pane and queues the task for the replacement. Its card in the TUI or row in the desktop app keeps the same name, and its previous conversation is gone. With `clear = false`, the task goes to the running agent's inbox and the worker keeps its conversation. A `clear = true` worker whose agent has exited is started again on its next task; restart a `clear = false` worker before delegating to it again.
 
-With `clear = false`, the agent keeps running and the task pointer is typed into its current session. The worker keeps what it learned from earlier tasks. If the worker started only moments ago (the orchestration just opened, or you ran `pane restart`), the deck first waits for it to be ready, the same wait as for `clear = true`; a worker that has been up for a while gets the task immediately.
+If the replacement cannot start, or exits before taking the task, the orchestrator is told. See [A delegated worker never came up](#a-delegated-worker-never-came-up).
 
-If the new agent cannot be started, or exits before it takes the task, the task is not delivered and the orchestrator is told; see [A delegated worker never came up](#a-delegated-worker-never-came-up).
+### Delivery in the TUI and desktop app
 
-If tasks are lost regularly on your machine because agents are not yet ready when the task is typed (the task line sits unsubmitted in the worker's input box, or the worker looks idle and never starts), raise the wait with `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`, in milliseconds. It replaces the deck's own wait for every agent, also applies to a schedule's first prompt, and is capped at `30000`. Like the other variables on this page, it is read by the daemon; see [Setting the delivery variables](#setting-the-delivery-variables).
+Tasks, worker reports, dispatch results, scheduled prompts and deck notices wait in the recipient's inbox. The installed hooks, plugin or extension hand them to the agent and acknowledge receipt. A successful `delegate` means the task was accepted; delivery and finishing the work are separate steps.
+
+Both clients show `✉N queued` while messages await acknowledgement and `✉ delivered` after receipt when nothing remains pending. A narrow TUI card shortens the badge to `✉N`. If messages wait longer than a wake-up normally takes while the agent is not working, both clients show `✉N waiting to wake: send it a prompt`. That happens when nothing the deck can do wakes the agent, for example when a doorbell is held by a draft you left in the input box or by a screen the deck does not recognise. Send the agent any prompt, or clear your draft: the agent takes its messages at the start or end of its next turn, and the badge goes back to `✉N queued` or `✉ delivered`. If a message cannot be delivered, the recipient shows **Error** (desktop **error**) and a `not delivered: …` notice. Delivered means the agent received the message; read its `work-done` report to judge the result.
+
+For an OpenCode agent the deck also knows when a message reached the agent but may not have been started on. If it cannot tell, it sends the message again, at most twice, with a line asking the agent to continue rather than restart work it already began. If it still cannot tell, both clients show `✉ delivery uncertain` (or `✉ N deliveries uncertain`) and explain it under the card's directory. The deck also shows a message as uncertain, without sending it again, when for a few minutes it cannot check whether the agent started on it, or when the agent's OpenCode integration stopped and nothing has taken its place. Choose what happens next:
+
+- In the TUI, select the card and press `i` to open **Deck messages**. Each row names who sent the message and its subject. Press `r` to **Retry** (send it again, marked as a possible repeat) or `c` to **Cancel** (stop delivering it); `j`/`k` move between rows and Escape closes the list.
+- In the desktop app, the tile lists the same rows, each with **Retry** and **Cancel** buttons.
+
+If two people choose at the same time, the second is told another client acted first; the card shows where the message stands now. A message the deck sent as many times as it allows offers only Cancel; post it again if it is still needed. A message the agent has held for an hour without starting on it shows a one-time reminder, `the agent has had a deck message for an hour without confirming it`, with the same two choices; it is not an error, and the agent may still be working on it. An orchestrator whose task is uncertain is told so, and told again if the task reached the worker after all. When you cancel a task the deck had already handed over, its orchestrator is told it may already have reached the worker, so it checks the worker's pane before delegating the task again; a task cancelled before it was handed over is reported as not delivered.
+
+Restarting an agent, or its exiting, ends delivery to it: messages already waiting for it, uncertain ones included, are not handed to the agent that replaces it. They show as not delivered, an orchestrator is told about each task among them, and a job offered to it goes back to its pool. Post the others again if they are still needed.
+
+Long turns affect delivery the same way in the TUI and the desktop app:
+
+- When OpenCode or Pi keeps a message queued behind a busy turn, the message waits for that turn to end. The deck does not report it as not delivered during this wait, and OpenCode does not receive another copy. Claude Code has no way to confirm this wait: a message waiting behind a turn longer than about five minutes can be reported not delivered before it arrives; the orchestrator is then told it arrived.
+- If the deck reported a task as not delivered and the agent takes it after all, the orchestrator is told that the task arrived, and the agent's TUI card or desktop tile leaves its delivery error state once no other delivery error remains.
+- If the orchestrator was told a task has not reached its worker and the worker then picks it up, the orchestrator is told the task arrived after all.
+- After a direct message has been held for an hour, the usual delivery limit and not-delivered notices apply again. An offered job waits for up to its claim time or one hour, whichever is shorter; see [Announcements and pooled jobs](#announcements-and-pooled-jobs).
+
+**TUI:**
+
+![Planner and builder working in demo-loop, each with one queued inbox message beside its role card](/img/agent-messaging-tui.png)
+
+**Desktop:**
+
+The Daemons view below has experimental features enabled. The inbox badge also appears in an agent's open pane.
+
+![The same planner and builder working in demo-loop, each with one queued inbox message on its tile](/img/agent-messaging-desktop.png)
+
+The desktop app's handoff rail shows `delegated · queued`, `delivered · working`, `work-done` or `not delivered` for worker handoffs. The rail is a desktop surface; TUI users follow the cards and the orchestrator's pane.
+
+In the recipient's pane, deck messages show a `Sent by:` line. Reports from other agents are marked UNTRUSTED: read them as information. After refreshing Claude Code's hooks, native messages show `✉ dot-agent-deck message` in its pane. Codex's turn-end hand-over can appear as **Blocked by hook** with an explanation of the deck message; this is how the next task reaches Codex.
+
+A long message can arrive as an excerpt naming a file with its full content, usually in the project's `.dot-agent-deck/` directory. Read that file to get the rest of the task or report. If the deck cannot save the full content, it refuses the message and reports the problem to the sender.
+
+The deck removes these files itself, on the same schedule whether you watch the agents in the TUI or the desktop app:
+
+- While the message waits to be received, its file stays.
+- A delegated task's file stays until the worker reports `work-done`, a newer task replaces it, or the worker exits.
+- After that, and for any other message once it has been received or dropped, the file is kept for about a day.
+- When many long messages pile up, the deck removes the oldest of these files sooner, but not within an hour of the message being received or the task ending.
+- Restarting the deck keeps counting from when the message was received. A file the deck was still keeping for a waiting message or an unfinished task when it stopped is kept for about a day from the restart.
+
+Copy anything you want to keep out of these files into your own project files.
+
+### Which agents wake for messages
+
+The delivery behavior is the same whether you watch the pane in the TUI or the desktop app. Run `dot-agent-deck hooks install` after upgrading the deck or an agent, then restart the agent to load the refreshed integration.
+
+| Agent | What happens when a message arrives | Fallback or limitation |
+|---|---|---|
+| Claude Code | Native wake is enabled from version 2.1.296 after installing the integration. | A message waiting behind a long turn can be reported not delivered before it arrives; the orchestrator is then told it arrived. Claude Code cannot confirm that it is keeping a queued message during the turn, so a job not claimed within the deck's wait can go to the next worker while the Claude worker is still busy. Older or unrecognised versions get the doorbell line without a native-wake delay. Upgrade Claude Code and re-run `hooks install`, then restart Claude Code to enable native wake. |
+| Codex | The doorbell wakes an idle agent; hooks hand messages over at turn end when it is busy. | With untrusted hooks, the model runs `inbox fetch` itself and needs `network_access = true`. If a future Codex UI is not recognised, the idle doorbell waits and the card shows `waiting to wake`; send the first prompt yourself so turn-end hand-over can take over. |
+| OpenCode | The full TUI receives messages through its TUI plugin. `--mini` receives messages natively and gets a redraw so they become visible; a partial frame can remain briefly. | If the deck cannot update `tui.json`, it uses the doorbell; add the plugin entry by hand as described below. A `/models` choice before the first prompt is not readable by the integration; launch with `--model` to choose that first message's model. `attach`, `acp`, `web`, `pr` and `github` have not been measured for this delivery path; expect the doorbell. |
+| Pi | Native delivery works while idle and queues follow-ups while busy. | The extension stops trying to connect when Pi runs outside a deck pane. Restart Pi inside the deck to receive deck messages. |
+| Devin | Uses the doorbell. | No native inbox wake integration is provided. |
+
+When OpenCode's installation reports that it left `tui.json` unchanged, use the exact path it prints in that file's `plugin` list, for example:
+
+```json
+"plugin": ["/home/you/.config/opencode/dot-agent-deck-tui.js"]
+```
+
+Preserve your other plugin entries, then restart OpenCode. The installer prints the path for the configuration directory it found; yours may differ.
 
 #### A lost task is re-sent into the same worker
 
-When a worker shows no sign of starting its task and has not run `ack`, the deck sends the task again into the same agent; it does not restart the worker to do it. If the task line is sitting unsent in the worker's input box, the deck presses Enter instead of typing it again. With the default schedule it tries three more times, about 20 seconds, 1 minute and 2 minutes 20 seconds after the first attempt. The task file tells the worker that a task line it sees twice is the same task.
+A message that was taken but never acknowledged becomes available again. Its id stays the same so an agent can recognise a repeat. The deck stops retrying after the delivery limit and shows `not delivered`; a delegated task that remains unacknowledged also produces a notice for its orchestrator. Restarting an agent does not move an already bound message to the replacement: delegate the task again when needed.
 
-A turn the worker starts on only part of the task line does not count as a response: the deck keeps re-sending, and if the re-sends run out, the report says the worker got only part of its task. If none of the re-sends gets a response, the orchestrator receives the [went-quiet report](idle-workers-and-notifications.md#the-reports), about 3 minutes 40 seconds after the task was first sent with the default schedule, or later if the worker was still starting or the task waited for an unsent draft.
-
-Which workers are covered:
-
-- Claude Code, OpenCode, Devin and Pi workers: re-sent as described.
-- Codex workers: the deck presses Enter for a task left in the input box, but does not type the task a second time, unless the worker started a turn on only part of the task line (its last few characters, for example). Then the task did not arrive, so the deck types it again.
-- A role whose agent the deck cannot identify (a launcher without an `agent` line): no re-send.
-- A Pi role with `clear = true` fetches its task itself, so there is nothing to re-send.
-
-A re-send is skipped whenever you have typed into that worker's pane since the task went in, so it does not submit text you started there.
-
-`DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS` changes the schedule: a comma-separated list of waits in milliseconds, each measured from the previous attempt (default `20000,40000,80000`). `0` or an empty value turns re-sending off. Each wait is clamped to 100–300000 ms and at most 8 entries are read; a value that is not a list of numbers is ignored and the default is used.
+In both clients, replacing an earlier task with a new delegation or restarting the worker stops delivery notices for the superseded task. A late `work-done` for a task the worker acknowledged leaves a newer task it has not taken queued, and the orchestrator is still told if that newer task does not reach the worker. A worker that reports `work-done` twice for one task, though, can make the deck drop a newer task it has not taken yet, without telling the orchestrator; delegate that task again if the worker never picked it up. If the worker takes a task directly from its file, it should acknowledge the message id too: otherwise its completion can stop delivery notices for other tasks waiting in its inbox, or, if it acknowledged an earlier task it never finished, the deck can report the task it took from the file as not delivered and hand it to the worker again.
 
 ### A deck prompt waits while you have an unsent draft
 
-The deck types messages into panes for you: a delegated task, a worker's report, a scheduled prompt, the reports in [Idle Workers & Notifications](idle-workers-and-notifications.md). If you have typed text into that pane through the deck, in either client, and not sent it, the deck's message waits instead of being submitted together with your text. Press **Enter** to send your text, or **Ctrl+U** or **Ctrl+C** to clear it, and the waiting message follows. Other panes keep running meanwhile.
+Native inbox delivery does not type a task into your input box. When native wake is unavailable, the deck sends a fixed doorbell line only when the agent is idle and your input is clear:
 
-The wait lasts at most **60 seconds**. After that the message is sent anyway, possibly together with your text, and the pane's status shows **Error** in the TUI (**FAILED** in the desktop app). `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` changes the limit (milliseconds, at most `600000`); `0` switches the wait off.
+```text
+dot-agent-deck: message m-… waiting, run: dot-agent-deck inbox fetch
+```
 
-Text the agent itself put in its input box, such as a prompt recalled from history, does not make a message wait. Messages the deck sends at your request, such as a new orchestration's first prompt, do not wait either.
+The message stays queued while you have an unsent draft or the agent needs a permission or dialog answer. Send or clear your draft, or answer the prompt, to let the doorbell proceed. In either client, no timeout forces the doorbell over your draft. The installed integration can replace this line with the message; otherwise the agent runs the fetch command.
+
+### Inspect delivery
+
+Run `dot-agent-deck daemon status` in your terminal to see **INBOX** and **WAKE**. `2q 1f` means two queued messages and one taken but not acknowledged; a dash means none pending. **WAKE** reads `native`, `turn-end`, `doorbell` or `none`; `none` means the deck has neither an armed integration nor a reported idle moment for the doorbell.
+
+Inside the recipient's deck pane, `dot-agent-deck inbox list` shows its messages and states; recent delivered and undeliverable messages are included while retained. An orchestrator can add `--all` to inspect its orchestration's inboxes, or any agent can use `--json` for structured output. `dot-agent-deck inbox fetch` reads and acknowledges the waiting messages, so use `list` when you only want to inspect them. These commands work for agents in either client.
+
+Recent delivery history is temporary: older entries and message bodies expire, and closing a pane removes its delivery history. Keep task results in your project files or saved reports when you need them later. Long subjects are shortened in the inbox listing and card labels.
+
+### Announcements and pooled jobs
+
+Agents can announce progress to subscribed roles instead of sending a separate message to each one:
+
+```bash
+dot-agent-deck inbox publish review-ready --text 'The signup change is ready for review.'
+dot-agent-deck inbox publish progress --file .dot-agent-deck/progress.md
+```
+
+An announcement reaches subscribers in the sender's orchestration, or its dispatch tree when dispatched. The sender does not receive its own announcement. In either client, the recipient's pane labels the text as another agent's UNTRUSTED announcement: it is information to assess, rather than an instruction from the user. The command prints how many subscribers it reached and identifies recipients whose inboxes were full.
+
+An orchestrator, or an agent that dispatched a unit, can offer a job to a pool. Configure workers with `take_offers` and topics with `subscribe`; see [Configuration](configuration.md#subscribe-to-announcements-and-job-pools).
+
+```bash
+dot-agent-deck inbox offer reviews --file .dot-agent-deck/review-task.md --claim-ttl 30m
+```
+
+One eligible worker receives the job at a time. Receiving and acknowledging it claims the work; the worker's pane shows the orchestrator's instructions and the commands to finish or hand it back:
+
+```bash
+dot-agent-deck inbox complete <id>
+dot-agent-deck inbox release <id>
+```
+
+The default claim lasts 30 minutes; `--claim-ttl` accepts durations from one minute to 24 hours, such as `90s` or `1h30m`. If the worker releases the job, its claim expires, or it exits, the job returns to the pool for another worker. Once a claim has expired, the worker can no longer complete or release that job: `inbox complete` and `inbox release` are refused, because the job has gone back to its pool and may already be with another worker. A worker that never picks up its assigned job also loses that assignment after five minutes by default. The offerer receives notices when a job is claimed, completed, its claim expires or delivery attempts are exhausted without completion.
+
+In both the TUI and the desktop app, if OpenCode or Pi is busy with a long turn when a job arrives, the job waits for that agent and is not offered to another worker during that wait, preventing duplicate work. It can wait for up to the job's claim time or one hour, whichever is shorter. For Claude Code, a job not claimed within the deck's wait still goes to the next worker.
+
+In the TUI and desktop app, a claimed job stays counted as a taken message until completed or handed back. The desktop evidence rail records **Job handed back to its pool** when an assignment returns. The CLI commands work in agent panes in either client. Both `publish` and `offer` accept exactly one of `--text` or `--file`; `--file -` reads standard input, with a 1 MiB body limit.
+
+If a command is refused, check its explanation: offers require an orchestrator or dispatching pane, topic and pool names must follow the [configuration rules](configuration.md#subscribe-to-announcements-and-job-pools), and publish and offer share a limit of 60 requests per minute per agent. For a full inbox, let the recipient consume its queued work before trying again.
 
 ### Setting the delivery variables
 
-`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`, `DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS`, `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` and the variables in [Idle Workers & Notifications](idle-workers-and-notifications.md#tune-or-turn-off-the-other-reports) are read by the **daemon**. Set them in the environment of the command that starts the daemon, for example:
+Delivery normally needs no timing settings. The waiting-for-input notice is configurable in [Idle Workers & Notifications](idle-workers-and-notifications.md#tune-or-turn-off-the-other-reports). Daemon settings must be present when it starts; a variable on a later client command does not change an already running daemon. See [Configuration](configuration.md#daemon-behaviour).
 
-```bash
-DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS=10000,20000 dot-agent-deck
-```
-
-A daemon that is already running keeps the environment it started with, so a variable set on a later `dot-agent-deck` command does not reach it. Restart the daemon to apply a change: `dot-agent-deck daemon restart` (it refuses while agents are running unless you pass `--force`, which stops them). See [Configuration](configuration.md) for the full list of environment variables.
 
 ## Context handoff and permissions
 
@@ -519,7 +609,7 @@ The deck keeps its hand-off files in `.dot-agent-deck/` inside the orchestration
 | `work-done-<role>.md` | each `work-done` for a delegated task | The worker's last report. |
 | other `*.md` files | when an agent writes them | Longer context an orchestrator passes by file. |
 
-When it writes an orchestrator context, the deck deletes `.md` files in this directory, other than `orchestrator-context.md`, that were last modified more than 14 days ago. `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` changes the number of days, and `0` turns the clean-up off. Do not keep your own files there.
+When it writes an orchestrator context, the deck deletes `.md` files in this directory, other than `orchestrator-context.md` and the saved copies of long messages (`inbox-message-*.md`), that were last modified more than 14 days ago. The saved copies follow their own schedule, described in [Delivery in the TUI and desktop app](#delivery-in-the-tui-and-desktop-app). `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` changes the number of days, and `0` turns the clean-up off. Do not keep your own files there.
 
 ## More than one orchestration
 
@@ -658,7 +748,7 @@ The worker has not reported its earlier task. See [One task per worker at a time
 
 ### The worker received the task line but never started
 
-The deck [re-sends it](#a-lost-task-is-re-sent-into-the-same-worker), and the orchestrator gets the went-quiet report once the re-sends run out. The task line in the worker's pane ends with `[delivery d-…]`; search the daemon log for that id to see each re-send and why they stopped. A role behind a launcher gets no re-send; declare its [`agent`](#declaring-the-agent-behind-a-launcher-command). If this happens often, raise `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` ([What `clear` does to delivery](#what-clear-does-to-delivery)).
+Check the inbox badge and run `dot-agent-deck daemon status`. If the message stays queued, see [An agent shows the doorbell instead of waking](troubleshooting.md#an-agent-shows-the-doorbell-instead-of-waking). If the card says `not delivered`, see [A message says not delivered](troubleshooting.md#a-message-says-not-delivered). A delivered task whose agent does no work needs its pane inspected; receipt does not mean completion.
 
 ### A worker stops at an approval prompt at the start of every task
 
@@ -695,7 +785,7 @@ The role was started from the desktop app's New agent dialog or Runs screen, and
 
 ### The orchestrator receives no report
 
-Reports are typed into the orchestrator's pane. If that pane is closed, the report is lost, but for a delegated task it is also saved to `.dot-agent-deck/work-done-<role>.md`. If the daemon log shows `failed to write work-done summary`, that file is from an earlier task; the orchestrator then receives the report inline, on one line, without its Markdown formatting.
+Reports wait in the orchestrator's inbox and appear in its pane when taken. If that agent exits, its pending messages are not transferred to a replacement; a delegated report is also saved to `.dot-agent-deck/work-done-<role>.md`. If the daemon log shows `failed to write work-done summary`, that file is from an earlier task; the orchestrator then receives the report inline, on one line, without its Markdown formatting.
 
 An orchestrator that runs `work-done` without `--done` reports to nobody; it should delegate the work to a role instead.
 

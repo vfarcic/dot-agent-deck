@@ -60,108 +60,6 @@ pub enum IntegrationStrategy {
     Wrapper,
 }
 
-/// Issue #243: what a FRESHLY STARTED instance of this agent announces BEFORE it
-/// is given a prompt — i.e. what a readiness gate can actually wait for.
-///
-/// This exists because the gate used to ask `hook_install.is_some()`, which
-/// correctly answers "does this agent have native hooks" and was standing in for
-/// a different question entirely: *will a real `SessionStart` arrive before this
-/// agent needs a prompt?* Codex and OpenCode both satisfy the first and neither
-/// satisfies the second — one mis-predicate, two victims — so a `clear = true`
-/// delegate to either burned the full [`crate::state::SESSION_START_WAIT_TIMEOUT`]
-/// (measured at 31.2 / 31.2 / 31.7 / 31.7 / 32.3 s on production Codex delegates)
-/// and only the timeout fallback ever delivered.
-///
-/// Say what is meant instead. The value is a per-agent FACT, established by
-/// measurement and recorded next to everything else the deck knows about that
-/// agent, so the gate reads it rather than inferring it from an unrelated field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrePromptReadiness {
-    /// The agent's own integration announces an initialized session before the
-    /// first prompt: a genuine, unmarked `SessionStart` (Claude Code, Devin).
-    ///
-    /// Note what this does NOT promise: `SessionStart` means "a session exists",
-    /// not "the TUI interprets `\r` as submit". Claude Code fires it early in its
-    /// boot sequence, which is why the gate still holds the prompt for
-    /// [`crate::state::DELEGATE_READINESS_BUFFER`] afterwards (#199, #249, #663).
-    NativeSessionStart,
-    /// Nothing arrives from the agent itself before the prompt, but the deck's
-    /// own `dot-agent-deck wrap` hosts the child's PTY and announces its
-    /// interface once it can SEE it — a `SessionStart` carrying
-    /// [`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] or
-    /// [`crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`] (Codex;
-    /// PRD #211's Gemini inherits this).
-    ///
-    /// The best readiness fact the deck has, because in the honest case it is an
-    /// observation of the child rather than an announcement about it — which is
-    /// why the strong half of it is what the readiness gate releases on. It is
-    /// NOT an input-readiness signal, and does not skip the post-readiness
-    /// buffer: a full-screen TUI clears `ICANON`/`ECHO` at init, ~85 ms in on
-    /// real codex-cli, and goes on discarding keystrokes until it has finished
-    /// drawing. See `crate::state::WRAPPER_INTERFACE_READINESS_BUFFER`.
-    ///
-    /// **"Observation, not announcement" describes the honest case; it is not a
-    /// security property, and nothing the deck does rests on it alone** (issue
-    /// #243 audit F2). Both facts are read off the INNER PTY, which is not private
-    /// to the child: a same-uid process can find it (`/proc/<wrapper-pid>/fd` →
-    /// the pts node, mode `0620`) and either `tcsetattr` away `ICANON`/`ECHO` or
-    /// write one byte and go quiet, making the genuine wrapper emit a genuine
-    /// event about a child that is not ready. Suspected from the permissions, not
-    /// reproduced, and it grants nothing beyond forging the event outright — but
-    /// it is why `crate::state::dispatch_one_owned` reads the frozen launch shape
-    /// and the operator's own interval as well as this fact. What that guards is
-    /// smaller than it once was: with no buffer suppression left to buy, a forged
-    /// or driven fact can only release a gate that an unmarked `SessionStart`
-    /// already released.
-    WrapperInterfaceReady,
-    /// MEASURED: this agent emits nothing at all before its first prompt, and no
-    /// wrapper is watching it either, so there is no signal for a gate to wait
-    /// for and waiting is a DEAD wait.
-    ///
-    /// OpenCode is the case (#146, measured against `opencode 1.18.16`): a 35 s
-    /// idle cold boot produced zero `session.*` events, and `session.created`
-    /// then landed 16 ms AFTER the prompt was accepted. It is a `Plugin` agent,
-    /// so [`IntegrationStrategy::Wrapper`] cannot cover it — the ceiling is to
-    /// skip straight to a bounded buffer, which is what the gate does.
-    ///
-    /// **That buffer is this value's whole safety margin, so it is sized against
-    /// a real one** ([`crate::state::NO_SIGNAL_READINESS_BUFFER`], 8 s). The dead
-    /// wait it replaces was also, accidentally, the only thing giving the agent
-    /// time to boot; the interval inherited when the wait was first deleted was
-    /// PRD #249's warm-case-doubled 1000 ms, and measurement says a replacement
-    /// OpenCode swallows a prompt written that early at every load level tested.
-    /// Declaring this for a new agent is therefore also a statement that the
-    /// shipped interval covers ITS cold start — measure, do not assume.
-    NoSignal,
-    /// Not established. The conservative default: the gate keeps waiting exactly
-    /// as it does today, because "we have not measured this" is not evidence that
-    /// skipping the wait is safe.
-    ///
-    /// Carried by the neutral [`NONE`] placeholder — an unrecognized command,
-    /// where the deck genuinely does not know what is in the pane — and
-    /// deliberately by Pi as well: Pi structurally never emits
-    /// `EventType::SessionStart` (PRD #201), so [`Self::NoSignal`] is the
-    /// literally true classification, but nobody has measured Pi's boot window
-    /// and issue #243 measured only Codex and OpenCode. Claiming it would take
-    /// the scheduler's Pi delivery from a 30 s wait to a ~1 s buffer on no
-    /// evidence, and buy nothing on the delegate path, which bypasses this gate
-    /// for Pi entirely (the native seed hand-off in
-    /// [`crate::state::dispatch_one_owned`]). Reclassify when Pi's boot is
-    /// measured.
-    Unknown,
-}
-
-impl PrePromptReadiness {
-    /// Issue #243: is there a pre-prompt readiness signal for a gate to wait
-    /// FOR? `false` only for [`Self::NoSignal`] — an agent that has positively
-    /// declared it announces nothing, which is the one case where waiting is
-    /// provably dead time. [`Self::Unknown`] answers `true`: we cannot know it is
-    /// safe to skip, so it keeps waiting.
-    pub fn has_signal(self) -> bool {
-        !matches!(self, PrePromptReadiness::NoSignal)
-    }
-}
-
 /// PRD #1541: the keys that edit or interrupt this agent's prompt — what voice
 /// control presses to interrupt a turn, clear the prompt, or remove what it last
 /// typed.
@@ -324,8 +222,11 @@ static OPENCODE_DOUBLE_ESC: [KeyStep; 2] = [
 /// `Ok(())` on success, `Err(message)` on a reported failure.
 pub type HookFn = fn() -> Result<(), String>;
 
-/// PRD #20 finding #15: a spawn-time materialize handler (the `Extension`
-/// strategy). Receives the spawn env so it can honor `HOME` / deck env vars.
+/// PRD #20 finding #15: a materialize handler (the `Extension` strategy).
+/// Receives an env so it can honor `HOME` / deck env vars. No production code
+/// calls it through [`AgentSpec::materialize`]: Pi's extension is materialized
+/// once at daemon startup instead (PRD #201, the #210 fix — see the note in
+/// `AgentPtyRegistry::spawn_agent_with_dir`).
 pub type MaterializeFn = fn(&[(String, String)]);
 
 /// One cohesive registry entry per agent — the single place per-agent data
@@ -346,10 +247,6 @@ pub struct AgentSpec {
     /// Which integration mechanism carries this agent's events to the deck.
     /// `None` for the neutral placeholder (not a real agent).
     pub strategy: Option<IntegrationStrategy>,
-    /// Issue #243: what this agent announces BEFORE its first prompt — the fact
-    /// the readiness gate needs and used to infer, wrongly, from
-    /// [`Self::hook_install`]. See [`PrePromptReadiness`].
-    pub pre_prompt_readiness: PrePromptReadiness,
     /// Per-agent badge colour. Populated now as the single source of truth even
     /// though rendering coloured badges on cards is a later PRD #20 milestone.
     /// A named ANSI colour only (no absolute `Color::Rgb`), matching the
@@ -367,8 +264,9 @@ pub struct AgentSpec {
     /// extension materialize; the neutral placeholder has none at all).
     pub hook_install: Option<HookFn>,
     pub hook_uninstall: Option<HookFn>,
-    /// Materialize a bundled artifact into the agent's HOME just before spawn
-    /// (the `Extension` strategy).
+    /// Materialize a bundled artifact into the agent's HOME (the `Extension`
+    /// strategy). Capability metadata: the daemon materializes Pi's extension
+    /// once at startup, and the spawn path calls no materialize (#210).
     pub materialize: Option<MaterializeFn>,
     /// PRD #20 R20-010: this agent's OWN startup auto-install action — the
     /// silent, best-effort install the TUI runs at launch for every shipped
@@ -379,7 +277,8 @@ pub struct AgentSpec {
     /// installer. With the action on the spec, `main.rs` iterates [`ALL`] and
     /// calls `spec.startup_auto_install` directly, and a new agent slots in its
     /// own installer here. `None` where the agent has no startup install step —
-    /// a spawn-time `Extension` (Pi materializes at spawn), a `Wrapper` (Codex
+    /// an `Extension` (Pi's is materialized once at daemon startup, outside
+    /// this loop), a `Wrapper` (Codex
     /// synthesizes events from stdout), or the neutral placeholder.
     ///
     /// Issue #1637: it returns what the agent's hooks are pinned to afterwards,
@@ -399,6 +298,22 @@ pub struct AgentSpec {
     /// where they are unmeasured (Devin) or there is no agent to press them at
     /// (the neutral placeholder). See [`PromptKeys`].
     pub prompt_keys: Option<PromptKeys>,
+    /// PRD #1666 S7 (decision A): recognises this agent's empty composer in
+    /// the pane's screen rows, for an agent whose wrapper reports it Idle while
+    /// a start dialog may still be up. Until the agent's own hooks report, the
+    /// doorbell writes no byte unless this matches
+    /// ([`crate::agent_pty::AgentPtyRegistry::write_doorbell`]). `None` where
+    /// the agent's status comes only from its own hooks, so it reads Unknown,
+    /// and is never rung, until they report.
+    pub doorbell_composer: Option<fn(&[String]) -> bool>,
+    /// Recognises, in the composer [`Self::doorbell_composer`] guards, the
+    /// line the doorbell last typed into this pane, left unsubmitted because
+    /// its Enter was not taken. Such a screen is not empty, so without this
+    /// the bare CR that flushes the line would wait for an empty composer
+    /// forever. Called with the screen rows, the cursor (as
+    /// [`crate::pane_screen_text::visible_rows_and_cursor`] reports them)
+    /// and that exact line. `Some` exactly where `doorbell_composer` is.
+    pub doorbell_stranded_line: Option<StrandedLineRecogniser>,
     /// PRD #1631: the options this agent draws on screen but never reports in
     /// a payload — its permission and plan menus, and the free-text entries it
     /// appends to a multiple-choice list — with the keys that pick each where
@@ -409,9 +324,15 @@ pub struct AgentSpec {
     pub questions: Option<&'static QuestionTables>,
 }
 
+/// [`AgentSpec::doorbell_stranded_line`]: screen rows, cursor, the line the
+/// doorbell left.
+pub type StrandedLineRecogniser =
+    fn(&[String], crate::pane_screen_text::ScreenCursor, &str) -> bool;
+
 /// PRD #1631: one agent's per-version option tables (decision 3). The deck
-/// never reads the screen, so every option an agent draws without reporting it
-/// comes from here, keyed on the versions it was verified on; the lane-2
+/// does not read question options off the screen (the doorbell reads only the
+/// composer rows), so every option an agent draws without reporting it comes
+/// from here, keyed on the versions it was verified on; the lane-2
 /// `question/live/*` tests are what pin them.
 #[derive(Debug)]
 pub struct QuestionTables {
@@ -871,7 +792,6 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     // Claude Code posts its native `SessionStart` early in boot, before any
     // prompt — the delegate gate's healthy fast path (3.80-4.39 s end to end
     // on the production samples in #243).
-    pre_prompt_readiness: PrePromptReadiness::NativeSessionStart,
     badge_color: Color::LightMagenta,
     hook_install: Some(claude_install),
     hook_uninstall: Some(claude_uninstall),
@@ -894,6 +814,8 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
             max_literal_write_chars: Some(800),
         },
     }),
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
     questions: Some(&CLAUDE_CODE_QUESTIONS),
 };
 
@@ -910,7 +832,6 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     // prompt the gate withholds. `server.connected` is NOT the missing event: it
     // is synthesized as the first frame of the SSE `/event` response, never
     // reaches the plugin hook, and would fire on the deck's own connect.
-    pre_prompt_readiness: PrePromptReadiness::NoSignal,
     badge_color: Color::LightGreen,
     hook_install: Some(opencode_install),
     hook_uninstall: Some(opencode_uninstall),
@@ -932,6 +853,8 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
             max_literal_write_chars: None,
         },
     }),
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
     questions: Some(&OPEN_CODE_QUESTIONS),
 };
 
@@ -942,14 +865,13 @@ pub static PI: AgentSpec = AgentSpec {
     detect_basenames: &["pi"],
     default_command: Some("pi"),
     strategy: Some(IntegrationStrategy::Extension),
-    // Pi emits no `EventType::SessionStart` at all, so `NoSignal` is literally
-    // true — and deliberately not claimed here. See `PrePromptReadiness::Unknown`.
-    pre_prompt_readiness: PrePromptReadiness::Unknown,
     badge_color: Color::LightCyan,
     hook_install: None,
     hook_uninstall: None,
     materialize: Some(pi_materialize),
-    // Pi materializes its extension at SPAWN time, not startup.
+    // Pi's extension is materialized once at DAEMON startup
+    // (`orchestrator_ext::auto_materialize`, called by `daemon serve`), not by
+    // a startup install step and not per spawn (#210).
     startup_auto_install: None,
     configured_pins: None,
     // PRD #1541, measured on Pi 0.87.1: one ESC interrupts; one Ctrl+U per
@@ -967,6 +889,8 @@ pub static PI: AgentSpec = AgentSpec {
             max_literal_write_chars: None,
         },
     }),
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
     questions: None,
 };
 
@@ -986,7 +910,6 @@ pub static CODEX: AgentSpec = AgentSpec {
     // a prompt is submitted (measured on 0.145.0 and still true on 0.149.0), so
     // it is useless as a gate. The wrapper that hosts its PTY announces the
     // child's interface instead (#243).
-    pre_prompt_readiness: PrePromptReadiness::WrapperInterfaceReady,
     badge_color: Color::LightYellow,
     // Codex is a HYBRID (PRD #20 W1): the wrapper is its PTY host, but its rich
     // events come from Codex's Claude-Code-compatible NATIVE hooks — so unlike a
@@ -1017,8 +940,178 @@ pub static CODEX: AgentSpec = AgentSpec {
             max_literal_write_chars: Some(1000),
         },
     }),
+    // PRD #1666 S7: Codex's wrapper reports raw input while its start
+    // dialogs are up, so the doorbell needs the composer itself.
+    doorbell_composer: Some(codex_composer_on_screen),
+    doorbell_stranded_line: Some(codex_composer_holds_doorbell_line),
     questions: Some(&CODEX_QUESTIONS),
 };
+
+/// PRD #1666 S7 (decision A): whether `rows` — a pane's screen, one trimmed
+/// row each — show Codex's composer **empty**, as measured on Codex 0.160.0:
+///
+/// ```text
+/// › Ask Codex to do anything
+///
+///   GPT-5.6-Luna low · /path/to/project
+///   ? for shortcuts                                  ⚠ 1 warning · f2 to view
+/// ```
+///
+/// The footer must be the last row with text and hold `? for shortcuts`,
+/// either at its start or after a `· ` separator (measured on a real 0.160.0
+/// after a turn: `← for agents · ? for shortcuts`). A `›` prompt row that is
+/// not a numbered choice must sit at most
+/// [`CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER`] rows above it, holding nothing or
+/// one of Codex's placeholders ([`CODEX_COMPOSER_PLACEHOLDERS`]), with a
+/// blank row right below it. Codex's start dialogs (update, folder trust,
+/// hooks review) put `›` on a numbered choice and end in a key-hint footer
+/// instead, so none of them matches; nor does any screen this does not know.
+///
+/// **Empty, not merely present** (decision 2): Codex can keep a human's text
+/// in the composer after an Enter it took as a newline (a paste burst), so
+/// the input tracker can believe a draft was submitted while it is still on
+/// screen. Any text on the prompt row other than a placeholder, or a second
+/// composer row below it, is a draft the doorbell must not join.
+///
+/// **This is the one place that knows what Codex's composer looks like.** A
+/// Codex release that redraws it makes this return `false`, and the effect is
+/// the safe one: the doorbell holds, and queued messages wait for the `Stop`
+/// hand-over or for a recognised empty composer, never typed into a screen
+/// the deck does not recognise. Re-measure and update this function, and the
+/// fixture `tests/fixtures/codex-inbox/composer.txt`, together.
+pub fn codex_composer_on_screen(rows: &[String]) -> bool {
+    let Some(footer) = rows.iter().rposition(|row| !row.is_empty()) else {
+        return false;
+    };
+    let footer_row = &rows[footer];
+    if !(footer_row.starts_with("? for shortcuts") || footer_row.contains("· ? for shortcuts")) {
+        return false;
+    }
+    let first = footer.saturating_sub(CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER);
+    let Some(prompt) = (first..footer).rev().find(|&n| {
+        rows[n].strip_prefix('›').is_some_and(|rest| {
+            let rest = rest.trim_start();
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            !(digits > 0 && rest[digits..].starts_with('.'))
+        })
+    }) else {
+        return false;
+    };
+    let content = rows[prompt].strip_prefix('›').unwrap_or_default().trim();
+    let empty = content.is_empty() || CODEX_COMPOSER_PLACEHOLDERS.contains(&content);
+    empty && rows.get(prompt + 1).is_some_and(String::is_empty)
+}
+
+/// PRD #1666: do `rows` show Codex's composer holding `line` — the doorbell
+/// line ([`crate::doorbell::doorbell_line`]) the deck last typed into this
+/// pane — unsubmitted, in one of the two states measured on Codex 0.160.0.
+/// The cursor is marked `▏`.
+///
+/// Its Enter was dropped, and the cursor sits right after the text (live
+/// `codex/worker/001`: on the prompt row at column 95):
+///
+/// ```text
+/// ›  dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch▏
+///
+///   GPT-5.6-Luna low · /path/to/project
+///                                                    ⚠ 1 warning · f2 to view
+/// ```
+///
+/// Or, under CPU pressure, its Enter became a newline in the composer, and
+/// the cursor sits on the empty row directly below the text, at the
+/// composer indent (live `inbox/load/004`: row 36, cell column 2, below the
+/// line on row 35):
+///
+/// ```text
+/// ›  dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch
+///   ▏
+///
+///   GPT-5.6-Luna low · /path/to/project
+///                                                    ⚠ 1 warning · f2 to view
+/// ```
+///
+/// Codex hides `? for shortcuts` while its composer holds text, so the
+/// composer is found from the bottom instead: the lowest `›` row that is not a
+/// numbered choice, at most [`CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM`] rows
+/// above the last row with text. Its text, with any wrapped rows below it
+/// joined up to the first blank row, must be `line` exactly, message id
+/// included; a row with text must follow below the cursor (Codex's model
+/// line); and the cursor must sit at the end of the composer's last text
+/// row, or on the blank row directly below it at
+/// [`CODEX_COMPOSER_INDENT`]. A human draft, an edited line, a
+/// doorbell-shaped line naming another message and a dialog do not match,
+/// and neither does `line` itself with the cursor anywhere else. `line` comes
+/// from the doorbell's record of what it typed, so with no record the
+/// doorbell does not ask.
+///
+/// **This narrows the match; it does not authenticate the screen.** Text
+/// on a screen carries no record of who wrote it: a process that controls
+/// what this pane renders can draw this exact frame, line and cursor, and a
+/// human can type the same line by hand. Either earns the one bare CR the
+/// flush sends, which goes to whatever then owns the pane's input. The
+/// writer's other guards — the pane's agent identity, no unsent draft, and
+/// the doorbell's admission re-checked before the byte — still apply.
+pub fn codex_composer_holds_doorbell_line(
+    rows: &[String],
+    cursor: crate::pane_screen_text::ScreenCursor,
+    line: &str,
+) -> bool {
+    let Some(bottom) = rows.iter().rposition(|row| !row.is_empty()) else {
+        return false;
+    };
+    let first = bottom.saturating_sub(CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM);
+    let Some(prompt) = (first..=bottom).rev().find(|&n| {
+        rows[n].strip_prefix('›').is_some_and(|rest| {
+            let rest = rest.trim_start();
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            !(digits > 0 && rest[digits..].starts_with('.'))
+        })
+    }) else {
+        return false;
+    };
+    let mut text = rows[prompt]
+        .strip_prefix('›')
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut last = prompt;
+    for row in rows[prompt + 1..].iter().take_while(|row| !row.is_empty()) {
+        text.push(' ');
+        text.push_str(row.trim());
+        last += 1;
+    }
+    if text != line.trim() {
+        return false;
+    }
+    // The Enter was dropped: the cursor right after the text.
+    let after_text =
+        last < bottom && cursor.row == last && cursor.through == rows[last].chars().count();
+    // The Enter became a newline: the cursor on the composer's new, empty
+    // row, which `take_while` above stopped at, so it is blank.
+    let on_new_row =
+        last + 1 < bottom && cursor.row == last + 1 && cursor.cell == CODEX_COMPOSER_INDENT;
+    after_text || on_new_row
+}
+
+/// The cell column where Codex 0.160.0's composer text starts, after `› `,
+/// and where it puts the cursor on an empty composer row (measured: cell
+/// column 2 in live `inbox/load/004`).
+pub const CODEX_COMPOSER_INDENT: usize = 2;
+
+/// How far above the last row with text [`codex_composer_holds_doorbell_line`]'s
+/// prompt row may be: the composer's wrapped rows, a blank row, the model
+/// line and the footer.
+const CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM: usize = 6;
+
+/// The texts Codex 0.160.0 shows in an empty composer: the first at start
+/// and after a turn (measured), the second from the binary's strings
+/// (unmeasured on screen). Anything else on the prompt row is a draft.
+const CODEX_COMPOSER_PLACEHOLDERS: [&str; 2] =
+    ["Ask Codex to do anything", "Ask a follow-up question"];
+
+/// How far above [`codex_composer_on_screen`]'s footer the prompt row may be:
+/// the prompt, a blank row, the model line, plus room for a wrapped prompt.
+const CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER: usize = 6;
 
 /// Devin CLI — native-hooks strategy. The second agent to reuse
 /// [`IntegrationStrategy::NativeHooks`], and the reason the strategy dispatch had
@@ -1030,11 +1123,6 @@ pub static CODEX: AgentSpec = AgentSpec {
 /// hook socket. Unlike Codex it needs neither a wrapper (its own TUI runs
 /// directly on the deck's PTY) nor a hook-trust ceremony, which makes it the
 /// cheapest possible registry addition: pure `NativeHooks` + one `hook.rs` arm.
-///
-/// `hook_install` is `Some`, which the PRD #225 readiness gate reads as the
-/// promise that a real (unmarked) `SessionStart` still arrives — Devin documents
-/// a `SessionStart` hook, and being unwrapped it emits no fork-time marked event
-/// at all, so the gate simply waits for the genuine one.
 pub static DEVIN: AgentSpec = AgentSpec {
     agent_type: AgentType::Devin,
     label: "Devin",
@@ -1053,7 +1141,6 @@ pub static DEVIN: AgentSpec = AgentSpec {
     // — which is why it ships unmeasured rather than as `Unknown`, and why a
     // future reader should not cite it as evidence the way the other four can be
     // cited. Measure it before treating this as established.
-    pre_prompt_readiness: PrePromptReadiness::NativeSessionStart,
     // A named ANSI colour not used by Claude (LightMagenta), OpenCode
     // (LightGreen), Pi (LightCyan) or Codex (LightYellow), and never the neutral
     // DarkGray reserved for the "No agent" placeholder.
@@ -1066,6 +1153,8 @@ pub static DEVIN: AgentSpec = AgentSpec {
     // PRD #1541: unsupported, not measured — Devin was logged out on the box
     // the key table was measured on, so none of its keys could be verified.
     prompt_keys: None,
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
     questions: Some(&DEVIN_QUESTIONS),
 };
 
@@ -1082,7 +1171,6 @@ pub static NONE: AgentSpec = AgentSpec {
     strategy: None,
     // Not an agent: nothing is known about what is in the pane, so the gate keeps
     // its conservative wait.
-    pre_prompt_readiness: PrePromptReadiness::Unknown,
     badge_color: Color::DarkGray,
     hook_install: None,
     hook_uninstall: None,
@@ -1091,6 +1179,8 @@ pub static NONE: AgentSpec = AgentSpec {
     configured_pins: None,
     // Not an agent: there is nothing to press keys at.
     prompt_keys: None,
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
     questions: None,
 };
 
@@ -1193,6 +1283,48 @@ pub fn resolve_type_alias(alias: &str) -> Option<AgentType> {
 mod tests {
     use super::*;
 
+    /// The rows the doorbell's gate reads for a fixture screen: one trimmed
+    /// row per line, as `crate::pane_screen_text` produces them.
+    fn rows(screen: &str) -> Vec<String> {
+        screen.lines().map(|line| line.trim().to_string()).collect()
+    }
+
+    /// PRD #1666 S7: the Codex composer recogniser accepts the measured 0.160.0
+    /// composer, with or without the warning indicator on its footer row, and
+    /// refuses every measured start dialog, an unknown dialog, a composer with
+    /// output below it, and a blank screen.
+    #[test]
+    fn codex_composer_is_recognised_and_dialogs_are_not() {
+        let composer = include_str!("../tests/fixtures/codex-inbox/composer.txt");
+        assert!(codex_composer_on_screen(&rows(composer)));
+        let warned = composer.replace(
+            "? for shortcuts",
+            "? for shortcuts                       ⚠ 1 warning · f2 to view",
+        );
+        assert!(codex_composer_on_screen(&rows(&warned)));
+        // Measured on a real 0.160.0 after a turn.
+        let agents = composer.replace("? for shortcuts", "← for agents · ? for shortcuts");
+        assert!(codex_composer_on_screen(&rows(&agents)));
+        let empty_line_draft =
+            composer.replace("› Ask Codex to do anything\n", "›\n  typed below\n");
+        assert!(!codex_composer_on_screen(&rows(&empty_line_draft)));
+        for dialog in [
+            include_str!("../tests/fixtures/codex-inbox/update.txt"),
+            include_str!("../tests/fixtures/codex-inbox/folder.txt"),
+            include_str!("../tests/fixtures/codex-inbox/hooks.txt"),
+            include_str!("../tests/fixtures/codex-inbox/unknown.txt"),
+        ] {
+            assert!(!codex_composer_on_screen(&rows(dialog)), "{dialog}");
+        }
+        assert!(!codex_composer_on_screen(&rows(&format!(
+            "{composer}\n  something printed below"
+        ))));
+        let numbered = composer.replace("› Ask Codex to do anything", "› 1. Ask Codex");
+        assert!(!codex_composer_on_screen(&rows(&numbered)));
+        assert!(!codex_composer_on_screen(&rows("\n\n")));
+        assert!(!codex_composer_on_screen(&[]));
+    }
+
     // Pure-data registry lookups — plain `#[test]` unit tests (no `#[spec]` /
     // CATALOG reproducer needed; these assert compiled-in data, not runtime
     // TUI behaviour).
@@ -1248,7 +1380,7 @@ mod tests {
     /// PRD #20 R20-010: startup auto-install is resolved PER SPEC, not by
     /// mapping the reusable `IntegrationStrategy` enum to a hardcoded incumbent.
     /// The two agents with a startup install step (Claude native hooks, OpenCode
-    /// plugin) carry an action; the spawn-time `Extension` (Pi), the `Wrapper`
+    /// plugin) carry an action; the `Extension` (Pi), the `Wrapper`
     /// (Codex), and the neutral placeholder carry `None` — so a future agent
     /// reusing `NativeHooks`/`Plugin` runs ITS OWN installer, never another
     /// agent's.

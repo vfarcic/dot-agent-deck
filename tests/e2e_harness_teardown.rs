@@ -56,11 +56,10 @@ impl Drop for RestorePairedDoc {
     }
 }
 
-/// Scenario: On a thread named after this test, start the deck on the minimal
-/// fixture, wait for the dashboard, and panic with the deck still alive, as a
-/// failing e2e test does. The failure dump is still written (with a `failed`
-/// provenance), but the paired `test.md` is not regenerated, which is the step
-/// that kept a panicked test's process alive for minutes.
+/// Scenario: Start the deck and a sleeping stand-in agent on a named thread,
+/// capture their sandbox daemon and agent pids, then panic as a failing test does.
+/// Teardown must stop both before deleting their working directory, still write
+/// the failed recording, and skip regeneration of the paired test document.
 #[test]
 #[spec("harness/teardown/001")]
 fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
@@ -81,10 +80,45 @@ fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
         .name()
         .expect("libtest names the test thread")
         .to_string();
+    #[cfg(unix)]
+    let (sender, receiver) = std::sync::mpsc::channel();
     let joined = std::thread::Builder::new()
         .name(thread_name)
-        .spawn(|| {
-            let deck = TuiDeck::builder().launch_with_fixture("minimal");
+        .spawn(move || {
+            let builder = TuiDeck::builder();
+            #[cfg(unix)]
+            let builder = builder.with_continue_session(
+                "teardown-standin",
+                "sh -c 'echo $$ > teardown-agent.pid; exec sleep 180'",
+            );
+            let deck = builder.launch_with_fixture("minimal");
+            #[cfg(unix)]
+            {
+                deck.wait_for_string("teardown-standin");
+                let pid_path = deck.workdir().join("teardown-agent.pid");
+                assert!(common::wait_for_path(
+                    &pid_path,
+                    std::time::Duration::from_secs(10)
+                ));
+                let agent_pid: i32 = std::fs::read_to_string(pid_path)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let stream = runtime
+                    .block_on(dot_agent_deck::platform::ipc::IpcStream::connect(
+                        deck.attach_socket_path(),
+                    ))
+                    .expect("connect to this test's daemon");
+                let daemon_pid = dot_agent_deck::platform::peercred::peer_pid(&stream)
+                    .expect("capture sandbox daemon peer pid")
+                    as i32;
+                sender
+                    .send((daemon_pid, agent_pid, deck.workdir().to_owned()))
+                    .unwrap();
+            }
+            #[cfg(not(unix))]
             deck.wait_for_string("No active agents");
             panic!("{DELIBERATE_PANIC}");
         })
@@ -103,6 +137,34 @@ fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
         message, DELIBERATE_PANIC,
         "the deck thread panicked before reaching the deliberate panic"
     );
+
+    #[cfg(unix)]
+    {
+        let (daemon_pid, agent_pid, workdir) = receiver.recv().expect("captured sandbox pids");
+        // Reap only captured processes even when this regression is red, so
+        // proving the leak does not leave another test agent on the host.
+        struct ReapCaptured(i32, i32);
+        impl Drop for ReapCaptured {
+            fn drop(&mut self) {
+                for pid in [self.1, self.0] {
+                    if common::process_running(pid) {
+                        // SAFETY: each pid was captured from this test's sandbox.
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+            }
+        }
+        let _reap = ReapCaptured(daemon_pid, agent_pid);
+        assert!(
+            common::wait_until(std::time::Duration::from_secs(2), || {
+                !common::process_running(daemon_pid) && !common::process_running(agent_pid)
+            }),
+            "panicking TuiDeck teardown left sandbox processes alive after deleting cwd {}: daemon pid {daemon_pid} alive={}, agent pid {agent_pid} alive={}",
+            workdir.display(),
+            common::process_running(daemon_pid),
+            common::process_running(agent_pid)
+        );
+    }
 
     // Control: the drop really ran its failure dump, so the doc's absence below
     // is the regeneration being skipped rather than the dump never happening.
@@ -125,5 +187,85 @@ fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
          source file and kept a failed test's process alive until nextest's \
          180s timeout on starved CI runners (issue #1566)",
         paired_doc.display()
+    );
+}
+
+/// Scenario: Start two stand-in daemons, one for this fixture and one standing
+/// for another deck, then give the fixture's attach-socket name to the other
+/// daemon's socket — first as a hard link, then as a symlink — and run the
+/// harness teardown stop. Both attempts must be refused with the other daemon
+/// still running and answering; pointed at the other daemon's own fixture, the
+/// same stop then stops it.
+#[cfg(unix)]
+#[test]
+#[spec("harness/teardown/002")]
+fn teardown_002_a_swapped_fixture_socket_cannot_stop_another_daemon() {
+    use common::FixtureDaemonStop;
+
+    let mut other = common::spawn_daemon_serve(None, "0");
+    let mut own = common::spawn_daemon_serve(None, "0");
+    let own_root = own.attach_socket.parent().unwrap().to_path_buf();
+    let other_root = other.attach_socket.parent().unwrap().to_path_buf();
+    let own_socket = own.attach_socket.clone();
+
+    fn assert_other_untouched(
+        other: &mut common::DaemonProc,
+        how: &str,
+        outcome: common::FixtureDaemonStop,
+    ) {
+        assert!(
+            matches!(outcome, common::FixtureDaemonStop::Refused(_)),
+            "a fixture socket {how} the other daemon's socket must be refused, got {outcome:?}"
+        );
+        assert!(
+            other.is_alive_public(),
+            "teardown through a fixture socket {how} the other daemon's socket stopped it"
+        );
+        assert!(
+            common::attach_request_on(
+                &other.attach_socket,
+                &dot_agent_deck::daemon_protocol::AttachRequest::ListAgents,
+            )
+            .is_ok_and(|resp| resp.ok),
+            "the other daemon stopped answering after teardown through a socket {how} it"
+        );
+    }
+
+    // A hard link keeps the fixture's own pathname, even canonicalised, while
+    // connecting to it reaches the other daemon's listener.
+    std::fs::remove_file(&own_socket).expect("unlink the fixture's socket name");
+    std::fs::hard_link(&other.attach_socket, &own_socket)
+        .expect("hard-link the other daemon's socket into the fixture");
+    assert_other_untouched(
+        &mut other,
+        "hard-linked to",
+        common::stop_fixture_daemon(&own_root, &own_socket),
+    );
+
+    // A symlink, as a process swapping the name after a path check would leave.
+    std::fs::remove_file(&own_socket).expect("unlink the hard link");
+    std::os::unix::fs::symlink(&other.attach_socket, &own_socket)
+        .expect("symlink the other daemon's socket into the fixture");
+    assert_other_untouched(
+        &mut other,
+        "symlinked to",
+        common::stop_fixture_daemon(&own_root, &own_socket),
+    );
+    assert!(
+        own.is_alive_public(),
+        "the fixture's own daemon stopped, though neither swapped name leads to it"
+    );
+
+    // Control: the refusals above are about identity, not an inability to
+    // stop — the other daemon's own fixture stops it.
+    let pid = other.pid();
+    assert_eq!(
+        common::stop_fixture_daemon(&other_root, &other.attach_socket),
+        FixtureDaemonStop::Stopped { pid },
+        "the daemon launched with that fixture's socket must be stopped by it"
+    );
+    assert!(
+        other.wait_for_exit(std::time::Duration::from_secs(2)),
+        "the stopped daemon is still running"
     );
 }

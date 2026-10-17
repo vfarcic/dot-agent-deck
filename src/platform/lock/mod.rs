@@ -19,6 +19,18 @@ pub use unix::{SpawnLock, acquire_spawn_lock};
 #[cfg(windows)]
 pub use windows::{SpawnLock, acquire_spawn_lock};
 
+/// Take an exclusive lock on an open file without waiting (PRD #1666 design
+/// §3): `Ok(true)` when this handle now holds it, `Ok(false)` when another
+/// handle does. A wrapper over std's `File::try_lock`, which the inbox's spill
+/// inventory already uses; [`acquire_spawn_lock`] is the blocking lock.
+pub fn try_lock_file(file: &std::fs::File) -> std::io::Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
 /// Name of the Windows named mutex that stands in for the Unix `flock(2)` on
 /// `lock_path` (PRD #163 M2). `user_token` is
 /// [`crate::platform::paths::endpoint_user_suffix`] — the current user's SID.

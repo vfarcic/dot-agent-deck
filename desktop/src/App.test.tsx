@@ -463,15 +463,8 @@ describe("ControlDeck", () => {
    * input-unavailable notice.
    */
   it("keeps a terminal input enabled when delivery is applied", () => {
-    const id = "input-applied";
     const snapshot = liveSnapshot([{ ...agentIn("input-applied", "/tmp/project"), status: "running", writeLease: "write" }]);
-    const deck = {
-      ...runtime({ mode: "live", snapshot }),
-      // By the composite `(deckId, agentId)` key the runtime uses since PRD
-      // #1105's security audit — a bare id names an agent on every deck.
-      terminalInputResults: { [agentKey(FIXTURE_DAEMON_ID, id)]: "applied" },
-    } as DeckRuntimeState & { terminalInputResults: Record<string, SendResult> };
-    render(<ControlDeck runtime={deck} />);
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot })} />);
 
     const terminal = screen.getByTestId("terminal-input-applied");
     expect(terminal).toHaveAttribute("data-input-state", "applied");
@@ -505,33 +498,6 @@ describe("ControlDeck", () => {
       expect(status!).toHaveTextContent(`Terminal input unavailable — ${reason}.`);
     },
   );
-
-  /**
-   * Scenario: a running, normally writable pane receives a wrong-session
-   * delivery verdict after its session rolls over. The terminal is marked and
-   * disabled, and its status region tells the operator that the pane handle no
-   * longer maps to the current agent session.
-   */
-  it("marks and disables terminal input after a wrong-session verdict", () => {
-    const id = "input-wrong-session";
-    const snapshot = liveSnapshot([{ ...agentIn(id, "/tmp/project"), status: "running", writeLease: "write" }]);
-    const deck = {
-      ...runtime({ mode: "live", snapshot }),
-      terminalInputResults: { [agentKey(FIXTURE_DAEMON_ID, id)]: "wrong-session" },
-    } as DeckRuntimeState & { terminalInputResults: Record<string, SendResult> };
-    render(<ControlDeck runtime={deck} />);
-
-    const terminal = screen.getByTestId(`terminal-${id}`);
-    expect.soft(terminal).toHaveAttribute("data-input-state", "wrong-session");
-    expect.soft(terminal).toHaveAttribute("aria-disabled", "true");
-    expect.soft(within(terminal).getByRole("textbox", { name: "Planner terminal input" })).toBeDisabled();
-    const status = screen.queryByTestId(`terminal-input-status-${id}`);
-    expect(status, `missing terminal-input-status-${id}`).not.toBeNull();
-    expect(status!).toHaveAttribute("role", "status");
-    expect(status!).toHaveTextContent(
-      "Terminal input unavailable — the pane handle no longer maps to that agent's session.",
-    );
-  });
 
   /**
    * Scenario: open the Reader over an agent and read what it offers. Issue

@@ -180,9 +180,32 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         _ => return ExitCode::SUCCESS,
     };
 
-    let Some(event) = hook_payload_event(agent, &input) else {
+    let Some(mut event) = hook_payload_event(agent, &input) else {
         return ExitCode::SUCCESS;
     };
+
+    // PRD #1666 S6: what Claude Code's own hooks do for the deck's inbox, in a
+    // deck pane only — every Claude session runs these global hooks.
+    let mut announce = None;
+    if matches!(agent, "claude-code" | "claude_code" | "claude")
+        && crate::inbox_prompt::in_deck_pane()
+        && let Some(output) = claude_inbox_hooks(&input, &mut event, &mut announce)
+    {
+        output.print();
+    }
+    // PRD #1666 S7: Codex's side. A `Stop` that hands messages over keeps the
+    // turn going, so it reports no Idle: the doorbell must not ring for the
+    // rest while Codex works on what it was just given.
+    if agent == "codex" && crate::inbox_prompt::in_deck_pane() {
+        match codex_inbox_hooks(&input, &mut event, &mut announce) {
+            CodexInbox::Nothing => {}
+            CodexInbox::Print(output) => output.print(),
+            CodexInbox::ContinueTurn(output) => {
+                output.print();
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
 
     // PRD #1631: a Claude Code question the deck can answer through this hook
     // is HELD — the hook waits for the daemon's decision and prints it.
@@ -234,8 +257,388 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         Err(_) => return ExitCode::SUCCESS,
     };
 
-    let _ = send_to_socket(&json);
+    // The announce goes FIRST on the same connection (design §6.5): the daemon
+    // reads one connection's lines in order, so it knows a native waiter is
+    // coming before the Idle this SessionStart reports could ring the doorbell.
+    let _ = match announce {
+        Some(announce) => send_lines_and_drain(&format!("{announce}\n{json}")),
+        None => send_to_socket(&json),
+    };
     ExitCode::SUCCESS
+}
+
+/// PRD #1666 S6: send `lines` on one connection, half-close it, and read
+/// whatever the daemon answers until it closes — the announce's `SignalAck` —
+/// so the connection never ends under a reply still being written. An older
+/// daemon that answers nothing closes at the half-close, so this waits on no
+/// reply; the whole exchange is bounded by [`SIGNAL_ACK_TIMEOUT`].
+fn send_lines_and_drain(lines: &str) -> Option<()> {
+    let mut stream =
+        crate::platform::ipc::IpcClient::connect_timeout(&client_socket_path(), SIGNAL_ACK_TIMEOUT)
+            .ok()?;
+    let _ = stream.set_timeouts(SIGNAL_ACK_TIMEOUT);
+    stream.write_all(format!("{lines}\n").as_bytes()).ok()?;
+    stream.flush().ok()?;
+    stream.shutdown_write().ok()?;
+    let deadline = std::time::Instant::now() + SIGNAL_ACK_TIMEOUT;
+    let mut buf = [0u8; 1024];
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    Some(())
+}
+
+/// PRD #1666 S6: Claude Code's side of the inbox, for one hook payload in a
+/// deck pane. Returns what the hook prints on stdout, if anything.
+///
+/// - `SessionStart` prints the session framing as `additionalContext` (a
+///   static text, so no daemon round trip) and, when Claude's settings carry
+///   the deck's waiter ([`crate::hooks_manage::claude_waiter_installed`]),
+///   queues an `inbox_announce` `Native` line for the caller to send ahead of
+///   the status event. Native wake-up is enabled by this announcement, never
+///   by the launch command.
+/// - `UserPromptSubmit` recognises the deck's own prompts
+///   ([`crate::inbox_prompt`]): a doorbell line is answered by fetching the
+///   waiting content and handing it to the model, and the event is marked so
+///   the daemon acknowledges what the prompt carried and labels the card.
+fn claude_inbox_hooks(
+    input: &str,
+    event: &mut AgentEvent,
+    announce: &mut Option<String>,
+) -> Option<HookOutput> {
+    let payload: Value = serde_json::from_str(input).ok()?;
+    let hook_event_name = payload.get("hook_event_name").and_then(Value::as_str)?;
+    match hook_event_name {
+        "SessionStart" => {
+            // Review SF-2: only a Claude whose settings carry the deck's
+            // waiter will arm one, so only it announces Native.
+            if crate::hooks_manage::claude_waiter_installed() {
+                *announce = inbox_announce(
+                    crate::event::InboxComponent::ClaudeHooks,
+                    crate::event::InboxWake::Native,
+                );
+            }
+            Some(HookOutput::text(crate::inbox_prompt::hook_output(
+                "SessionStart",
+                crate::inbox_hub::SESSION_FRAMING,
+            )))
+        }
+        "UserPromptSubmit" => {
+            let prompt = payload.get("prompt").and_then(Value::as_str)?;
+            deck_prompt_submit(
+                prompt,
+                crate::event::InboxComponent::ClaudeHooks.inline_budget(),
+                crate::inbox_hub::SESSION_FRAMING,
+                event,
+            )
+        }
+        _ => None,
+    }
+}
+
+/// What a hook prints for the inbox, and the messages that output hands over.
+pub struct HookOutput {
+    stdout: String,
+    /// Fetched, not yet acknowledged: acknowledged once `stdout` is written.
+    fetched: Vec<String>,
+}
+
+impl HookOutput {
+    fn text(stdout: String) -> Self {
+        Self {
+            stdout,
+            fetched: Vec::new(),
+        }
+    }
+
+    /// Write the output, then acknowledge the messages it hands over. A write
+    /// that fails acknowledges nothing, so what it carried is handed over
+    /// again after the ack-wait (PR #1735 review).
+    fn print(self) {
+        let mut out = std::io::stdout();
+        if writeln!(out, "{}", self.stdout).is_ok() && out.flush().is_ok() {
+            acknowledge_handed_over(&self.fetched);
+        }
+    }
+}
+
+/// How many times a hook asks the deck to record one acknowledgement.
+const HOOK_ACK_ATTEMPTS: u32 = 3;
+/// The wait before a hook asks again; it doubles for each ask after that.
+const HOOK_ACK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// PR #1735 review: acknowledge `ids`, which this hook fetched and has just
+/// handed to its agent, and confirm each with the deck ([`acknowledge_at`]).
+/// Nothing is sent without the pane's token. One the deck never records costs
+/// a second hand-over after the ack-wait, never the message.
+pub(crate) fn acknowledge_handed_over(ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let Some(pane_id) = std::env::var(DOT_AGENT_DECK_PANE_ID)
+        .ok()
+        .filter(|pane| !pane.is_empty())
+    else {
+        return;
+    };
+    let Some(token) = crate::hook_provenance::token_from_env() else {
+        return;
+    };
+    let agent_id = std::env::var(crate::agent_pty::DOT_AGENT_DECK_AGENT_ID)
+        .ok()
+        .filter(|agent| !agent.is_empty());
+    let acks: Vec<(String, String)> = ids
+        .iter()
+        .filter_map(|id| {
+            serde_json::to_string(&crate::event::DaemonMessage::Ack(crate::event::AckSignal {
+                pane_id: pane_id.clone(),
+                delivery_id: id.clone(),
+                agent_id: agent_id.clone(),
+                token: Some(token.clone()),
+            }))
+            .ok()
+            .map(|line| (id.clone(), line))
+        })
+        .collect();
+    acknowledge_at(
+        &client_socket_path(),
+        &acks,
+        SIGNAL_ACK_TIMEOUT,
+        &mut std::io::stderr(),
+    );
+}
+
+/// [`acknowledge_handed_over`] against an explicit endpoint: `acks` pairs each
+/// message id with its `ack` line.
+///
+/// PR #1735 third review: each acknowledgement is sent on its own connection
+/// and confirmed by the deck's answer ([`ack_confirmation`]). One the deck
+/// does not answer for is asked again, up to [`HOOK_ACK_ATTEMPTS`] times,
+/// [`HOOK_ACK_RETRY_DELAY`] apart and doubling — an `ack` is idempotent, so
+/// asking again after an answer that was lost records nothing twice. The whole
+/// exchange stays within `budget`, as the single connection it replaces did.
+/// One the deck refuses by id, or never answers for, is written to `report`
+/// (the hook's stderr), naming the message.
+fn acknowledge_at(
+    path: &std::path::Path,
+    acks: &[(String, String)],
+    budget: std::time::Duration,
+    report: &mut dyn std::io::Write,
+) {
+    let deadline = std::time::Instant::now() + budget;
+    let mut left: Vec<&(String, String)> = acks.iter().collect();
+    let mut delay = HOOK_ACK_RETRY_DELAY;
+    for attempt in 0..HOOK_ACK_ATTEMPTS {
+        if attempt > 0 {
+            if std::time::Instant::now() + delay >= deadline {
+                break;
+            }
+            std::thread::sleep(delay);
+            delay *= 2;
+        }
+        let mut unanswered = Vec::new();
+        for ack in left {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                unanswered.push(ack);
+                continue;
+            }
+            match ack_confirmation(&request_from_socket_at(path, &ack.1, Some(remaining))) {
+                AckConfirmation::Recorded => {}
+                AckConfirmation::Refused(reason) => {
+                    let _ = writeln!(
+                        report,
+                        "dot-agent-deck: the deck could not record message {} as delivered ({reason})",
+                        ack.0
+                    );
+                }
+                AckConfirmation::Unconfirmed => unanswered.push(ack),
+            }
+        }
+        left = unanswered;
+        if left.is_empty() {
+            return;
+        }
+    }
+    for (id, _) in left {
+        let _ = writeln!(
+            report,
+            "dot-agent-deck: the deck did not confirm message {id} as delivered; it may hand it over again"
+        );
+    }
+}
+
+/// PR #1735 third review: what the deck said to one `ack`, for a component
+/// that confirms its acknowledgements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckConfirmation {
+    /// The deck recorded it, now or before.
+    Recorded,
+    /// The deck refused it for this id (`unknown`, `wrong_agent`,
+    /// `undeliverable`): asking again changes nothing.
+    Refused(&'static str),
+    /// No answer the deck stands behind — none at all, or a refusal of the
+    /// request rather than of the id: it may be asked again.
+    Unconfirmed,
+}
+
+/// Classify the deck's answer to one `ack` request.
+pub fn ack_confirmation(reply: &SocketReply) -> AckConfirmation {
+    use crate::event::{AckDelivery, SignalAck};
+    let SocketReply::Line(line) = reply else {
+        return AckConfirmation::Unconfirmed;
+    };
+    let Some(ack) = serde_json::from_str::<SignalAck>(line)
+        .ok()
+        .filter(|ack| ack.is_signal_ack() && ack.accepted)
+    else {
+        return AckConfirmation::Unconfirmed;
+    };
+    match ack.delivery {
+        Some(delivery) if delivery.recorded() => AckConfirmation::Recorded,
+        Some(AckDelivery::Unknown) => AckConfirmation::Refused("unknown"),
+        Some(AckDelivery::WrongAgent) => AckConfirmation::Refused("wrong_agent"),
+        Some(AckDelivery::Undeliverable) => AckConfirmation::Refused("undeliverable"),
+        _ => AckConfirmation::Unconfirmed,
+    }
+}
+
+/// What the deck's Codex hook does for the inbox with one payload.
+enum CodexInbox {
+    Nothing,
+    /// Print this, then report the event as usual.
+    Print(HookOutput),
+    /// Print this and report nothing: the turn goes on.
+    ContinueTurn(HookOutput),
+}
+
+/// PRD #1666 S7: Codex's side of the inbox, for one hook payload in a deck
+/// pane. Codex is woken by the doorbell when idle; its hooks run outside its
+/// sandbox, so they, not the model, fetch and acknowledge.
+///
+/// - `SessionStart` queues an `inbox_announce` `TurnEnd` line, sent ahead of
+///   the status event.
+/// - `UserPromptSubmit` answers a doorbell line with the waiting content as
+///   `additionalContext` ([`deck_prompt_submit`]).
+/// - `Stop` hands over what is waiting as `{"decision":"block","reason":…}`,
+///   so Codex continues the turn with it. Nothing waiting, or no answer from
+///   the daemon, and the turn ends as usual.
+///
+/// Every hand-over is headed by [`crate::inbox_hub::AGENT_FRAMING`] and stays
+/// within [`crate::event::InboxComponent::CodexHooks`]'s byte budget; what does
+/// not fit stays queued for the next `Stop` or doorbell.
+fn codex_inbox_hooks(
+    input: &str,
+    event: &mut AgentEvent,
+    announce: &mut Option<String>,
+) -> CodexInbox {
+    let Ok(payload) = serde_json::from_str::<Value>(input) else {
+        return CodexInbox::Nothing;
+    };
+    let budget = crate::event::InboxComponent::CodexHooks.inline_budget();
+    let framing = crate::inbox_hub::AGENT_FRAMING;
+    match payload.get("hook_event_name").and_then(Value::as_str) {
+        Some("SessionStart") => {
+            *announce = inbox_announce(
+                crate::event::InboxComponent::CodexHooks,
+                crate::event::InboxWake::TurnEnd,
+            );
+            CodexInbox::Nothing
+        }
+        Some("UserPromptSubmit") => payload
+            .get("prompt")
+            .and_then(Value::as_str)
+            .and_then(|prompt| deck_prompt_submit(prompt, budget, framing, event))
+            .map_or(CodexInbox::Nothing, CodexInbox::Print),
+        Some("Stop") => crate::inbox_prompt::turn_end_hand_over(budget, framing).map_or(
+            CodexInbox::Nothing,
+            |hand_over| {
+                CodexInbox::ContinueTurn(HookOutput {
+                    stdout: serde_json::json!({"decision": "block", "reason": hand_over.context})
+                        .to_string(),
+                    fetched: hand_over.fetched,
+                })
+            },
+        ),
+        _ => CodexInbox::Nothing,
+    }
+}
+
+/// PRD #1666 S6: the `UserPromptSubmit` side of the inbox, agent-neutral so
+/// every agent whose hook accepts `hookSpecificOutput.additionalContext`
+/// shares it (Claude Code now, Codex in S7), each with its own `budget` and
+/// the `framing` that heads an injection. An ordinary prompt costs a local
+/// scan and no daemon call. A doorbell line fetches only while the message it
+/// names is queued, and what it hands over is acknowledged once the hook has
+/// printed it ([`HookOutput::print`]). A message whose block the prompt itself
+/// opens (a native wake) is acknowledged before this returns.
+pub fn deck_prompt_submit(
+    prompt: &str,
+    budget: crate::event::InboxBudget,
+    framing: &str,
+    event: &mut AgentEvent,
+) -> Option<HookOutput> {
+    let ids = crate::inbox_prompt::scan(prompt);
+    if ids.is_empty() {
+        return None;
+    }
+    let injection = ids.rung.first().and_then(|rung| {
+        crate::inbox_prompt::doorbell_injection(budget, framing, Some(rung.as_str()))
+    });
+    let fetched = injection
+        .as_ref()
+        .map(|injection| injection.fetched.clone())
+        .unwrap_or_default();
+    // PR #1735 second review: the content of the blocks the prompt opens is
+    // already in the model's context, so they are acknowledged here, with the
+    // `ack` verb the daemon admits only from the agent's own process tree.
+    acknowledge_handed_over(&crate::inbox_prompt::mark_event(event, &ids, &fetched));
+    injection.map(|injection| HookOutput {
+        stdout: crate::inbox_prompt::hook_output("UserPromptSubmit", &injection.context),
+        fetched: injection.fetched,
+    })
+}
+
+/// PRD #1666 S8: send an `inbox_announce` on its own connection, for a
+/// component that announces outside a hook event (OpenCode's server plugin, as
+/// it loads in the full TUI). Nothing is sent without the pane's token.
+pub(crate) fn send_inbox_announce(
+    component: crate::event::InboxComponent,
+    wake: crate::event::InboxWake,
+) {
+    if let Some(announce) = inbox_announce(component, wake) {
+        let _ = send_lines_and_drain(&announce);
+    }
+}
+
+/// The `inbox_announce` line an agent's `SessionStart` hook sends, or `None`
+/// without the pane's token (the daemon would refuse it).
+fn inbox_announce(
+    component: crate::event::InboxComponent,
+    wake: crate::event::InboxWake,
+) -> Option<String> {
+    let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
+        .ok()
+        .filter(|pane| !pane.is_empty())?;
+    let token = crate::hook_provenance::token_from_env()?;
+    let request = crate::event::DaemonMessage::InboxAnnounce(crate::event::InboxAnnounceRequest {
+        pane_id,
+        agent_id: std::env::var(DOT_AGENT_DECK_AGENT_ID)
+            .ok()
+            .filter(|agent| !agent.is_empty()),
+        token: Some(token),
+        component,
+        component_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        wake,
+        #[cfg(unix)]
+        pid: Some(std::os::unix::process::parent_id()),
+        #[cfg(not(unix))]
+        pid: None,
+    });
+    serde_json::to_string(&request).ok()
 }
 
 /// PRD #1497: `line` with `reply` added under
@@ -956,7 +1359,7 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
 /// emitted at all, which for a `user_prompt` now also means a delivered prompt
 /// can never be confirmed. Identical output for ASCII, so nothing else moves.
 fn truncate(s: &str, max: usize) -> String {
-    crate::prompt_delivery::truncate_on_char_boundary(s, max)
+    crate::submitted_prompt::truncate_on_char_boundary(s, max)
 }
 
 /// Record a reported prompt as the text the agent actually submitted, with the
@@ -974,10 +1377,10 @@ fn truncate(s: &str, max: usize) -> String {
 ///   show the prompt instead of `<pasted_content id="239f">You a…`, which is
 ///   what the pane rendered for every seeded Claude agent (measured on
 ///   `prompt/new-pane/016`);
-/// * the [`crate::prompt_delivery::USER_PROMPT_MAX_LEN`] budget below is spent
+/// * the [`crate::submitted_prompt::USER_PROMPT_MAX_LEN`] budget below is spent
 ///   on the prompt rather than partly on a wrapper.
 ///
-/// **This does not replace [`crate::prompt_delivery`]'s envelope shape and must
+/// **This does not replace [`crate::submitted_prompt`]'s envelope shape and must
 /// not be read as making it unreachable.** The `dot-agent-deck` invoked inside
 /// a pane comes from the agent's own hook configuration and can be OLDER than
 /// the daemon it reports to — `crate::hook_provenance`'s `missing_token`
@@ -986,7 +1389,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// to read them.
 ///
 /// Unwrapping is refused for anything but a turn that is wholly one paste (see
-/// [`crate::prompt_delivery::paste_envelope_payload`]): a turn where someone
+/// [`crate::submitted_prompt::paste_envelope_payload`]): a turn where someone
 /// typed prose AROUND a paste is reported as they composed it.
 fn record_submitted_prompt(prompt: &str) -> String {
     // The closing delimiter is stripped ONLY when an opening one was found and
@@ -994,11 +1397,11 @@ fn record_submitted_prompt(prompt: &str) -> String {
     // `</pasted_content …>` off a turn this deliberately declined to unwrap —
     // pinned by `a_turn_that_merely_contains_a_paste_is_recorded_unchanged`,
     // which is what caught it.
-    let recorded = match crate::prompt_delivery::paste_envelope_payload(prompt) {
-        Some((payload, _)) => crate::prompt_delivery::strip_paste_envelope_close(payload),
+    let recorded = match crate::submitted_prompt::paste_envelope_payload(prompt) {
+        Some((payload, _)) => crate::submitted_prompt::strip_paste_envelope_close(payload),
         None => prompt,
     };
-    truncate(recorded, crate::prompt_delivery::USER_PROMPT_MAX_LEN)
+    truncate(recorded, crate::submitted_prompt::USER_PROMPT_MAX_LEN)
 }
 
 /// PRD #20 W1: normalize a Codex `shell` tool's `command` value into a single
@@ -1157,10 +1560,8 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // as `dot-agent-deck wrap` does on its fork-time event (PRD #225 M3).
     // Without this, the whole `metadata` object of a Claude-compatible payload
     // was dropped on the floor here, so such a launcher was INDISTINGUISHABLE
-    // from an initialized session — which is what made a boot-time generation
-    // change and a `/clear` look identical to the delivery latch, and what was
-    // used to argue for the (rejected) forward-tracking rule. See
-    // [`crate::state::latch_generation`].
+    // from an initialized session: its boot-time start read as the agent's
+    // conversation announcing itself.
     //
     // Deliberately narrow: ONE key, only on `SessionStart`, only the one value
     // the repo defines. Everything else in an incoming `metadata` object is
@@ -1172,10 +1573,10 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // `WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`) and neither is forwardable
     // here. The asymmetry is deliberate: boot provenance is a producer CONFESSING
     // that its child is not up yet, which costs it privilege and is therefore safe
-    // to believe from anyone; interface readiness is a producer CLAIMING that its
-    // child is up, which BUYS privilege — it releases the readiness gate, and the
-    // strong value additionally selects which post-readiness buffer is paid over
-    // it. So this CLI does not carry it, and should not be taught to.
+    // to believe from anyone; an interface origin is a producer CLAIMING that its
+    // child is up, which is the kind of claim a privilege gets keyed on (today
+    // it only lets a wrapped agent's `Idle` stand in for its own hooks' until
+    // they report). So this CLI does not carry it, and should not be taught to.
     //
     // **This narrowing is NOT the trust boundary, and the comment that used to
     // stand here claimed it was.** `build_event_typed` is one of several
@@ -1186,10 +1587,9 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // `wrapper_interface_ready` `SessionStart` from a bare `python3` with no deck
     // environment variables at all. Keep the narrowing — it is correct and cheap,
     // and it keeps the Claude-shaped path honest — but do not build an argument on
-    // it. The privilege is gated where it is USED, by asking whether this daemon
-    // spawned the named agent as a wrapper: see
-    // `crate::agent_pty::AgentPtyRegistry::agent_spawned_as_wrapper_host` and its
-    // caller in `crate::state::dispatch_one_owned`.
+    // it. A privilege keyed on an interface origin has to be gated where it is
+    // USED, by asking whether this daemon spawned the named agent as a wrapper
+    // — see `crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`.
     if event_type == EventType::SessionStart
         && extra
             .get("metadata")
@@ -1717,10 +2117,6 @@ pub struct AgentEventDetail {
     pub prompt: Option<String>,
     pub tool_name: Option<String>,
     pub tool_detail: Option<String>,
-    /// Issue #1567: the reporter declares that it reports every prompt the
-    /// agent submits (`--reports-prompts`), stamped on the event as
-    /// [`crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY`].
-    pub reports_prompts: bool,
 }
 
 /// Build the raw [`AgentEvent`] `dot-agent-deck agent-event` sends for a pane
@@ -1737,10 +2133,6 @@ pub struct AgentEventDetail {
 /// the tool detail keeps only its first line, cut to the same 120 bytes as
 /// [`extract_tool_detail`]'s shell arms. The daemon scrubs both tool strings on
 /// ingest regardless.
-///
-/// [`AgentEventDetail::reports_prompts`] becomes the declaration marker on the
-/// event's metadata (issue #1567), on every `--type`: the deck reads it from
-/// whichever report it sees first, the session-start one included.
 pub fn build_agent_event_cli(
     pane_id: String,
     agent_id: Option<String>,
@@ -1751,14 +2143,9 @@ pub fn build_agent_event_cli(
     let tool_detail = non_blank(detail.tool_detail)
         .map(|d| truncate(d.lines().next().unwrap_or(&d), 120))
         .filter(|d| !d.trim().is_empty());
-    let mut metadata = std::collections::HashMap::new();
-    if detail.reports_prompts {
-        metadata.insert(
-            crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY.to_string(),
-            crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE.to_string(),
-        );
-    }
-    AgentEvent {
+    let metadata = std::collections::HashMap::new();
+    let prompt = non_blank(detail.prompt);
+    let mut event = AgentEvent {
         session_id: format!("{pane_id}-session"),
         agent_type: AgentType::Pi,
         event_type,
@@ -1766,7 +2153,7 @@ pub fn build_agent_event_cli(
         tool_detail,
         cwd: non_blank(detail.cwd),
         timestamp: Utc::now(),
-        user_prompt: non_blank(detail.prompt).map(|p| record_submitted_prompt(&p)),
+        user_prompt: prompt.as_deref().map(record_submitted_prompt),
         metadata,
         pane_id: Some(pane_id),
         agent_id,
@@ -1775,7 +2162,21 @@ pub fn build_agent_event_cli(
         live_target: None,
         background: None,
         background_revision: None,
+    };
+    // PRD #1666 (pi_001): the Pi extension hands a deck message over as a
+    // prompt of its own — the framing, then the blocks. It is the deck's, not
+    // the user's: the daemon labels the card `✉ <subject>` from the ids named
+    // here and keeps the text out of the prompt history. The extension
+    // acknowledges the message itself when Pi commits it, so every id counts as
+    // handed over and none is acknowledged again here.
+    if let Some(prompt) = prompt.as_deref() {
+        let ids = crate::inbox_prompt::scan(prompt);
+        if !ids.is_empty() {
+            let handed_over: Vec<String> = ids.opened.clone();
+            let _ = crate::inbox_prompt::mark_event(&mut event, &ids, &handed_over);
+        }
     }
+    event
 }
 
 /// How long `dot-agent-deck agent-event --turn-reply-stdin` waits for its
@@ -1946,36 +2347,15 @@ pub fn send_and_await_reply(json: &str) -> SocketReply {
 /// daemon is still carrying out.
 /// `handle_restart_role_with_state` blocks on
 /// [`crate::agent_pty::AgentPtyRegistry::pane_dispatch_lock`] *before* it
-/// respawns, and `dispatch_one_owned` takes that same per-pane lock as its
-/// first statement and holds it across `wait_for_session_start`
-/// (`SESSION_START_WAIT_TIMEOUT`, 30s) plus one readiness buffer. So a
-/// `pane restart <role>` issued while a `clear = true` delegate to that same
-/// role is mid-flight waits behind the lock, blows this 14s budget, and
-/// surfaces to the caller as [`SocketReply::NoReply`] — a reported failure
-/// for a restart the daemon is still holding and will carry out (or refuse,
-/// per the post-lock crash recheck) once the lock frees.
-///
-/// Issue #544 (PR #1398 review): the delegate's own wait for the worker's
-/// unsent draft — up to the draft-deferral cap — is NOT in that list. The
-/// pointer write sets the dispatch lock down while it waits
-/// ([`crate::agent_pty::PaneDispatchHold`]), so a restart landing then
-/// proceeds at once and the parked pointer is refused.
-///
-/// **Sizing the constant to cover that was considered and rejected**, because
-/// no compile-time constant can honestly bound it. The buffer term is not a
-/// fixed 1s: `dispatch_one_owned` pays one of `DELEGATE_READINESS_BUFFER`
-/// (1s), `WRAPPER_INTERFACE_READINESS_BUFFER` (5s) or
-/// `NO_SIGNAL_READINESS_BUFFER` (8s) depending on the readiness path — the
-/// 8s one is a SKIP of the wait rather than a release from it, and the 1s
-/// one also covers the timeout fallback and an unresolved agent. An
-/// operator can override the buffer via
-/// `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` up to
-/// `MAX_DELEGATE_READINESS_BUFFER` (30s) — a runtime value nothing here can
-/// see. The lock also has no cap on queue depth, so queued same-pane
-/// delegates compound. A derivation ending in
-/// `+ DELEGATE_READINESS_BUFFER` would therefore reproduce exactly the
-/// over-claim this paragraph exists to correct, while making a genuinely
-/// failing `pane restart` take ~45s to say so.
+/// respawns, and `dispatch_one_owned` holds that same per-pane lock while it
+/// hands a delegated task over — including a `clear = true` respawn of the
+/// worker. So a `pane restart <role>` issued while such a delegate to that same
+/// role is mid-flight waits behind the lock, can blow this 14s budget, and
+/// surfaces to the caller as [`SocketReply::NoReply`] — a reported failure for
+/// a restart the daemon is still holding and will carry out (or refuse, per the
+/// post-lock crash recheck) once the lock frees. The lock has no cap on queue
+/// depth, so queued same-pane delegates compound, which is why no compile-time
+/// constant here can honestly bound it.
 ///
 /// The mitigation is the caller-facing text instead: this verb's `NoReply`
 /// arm in `main.rs` is deliberately cause-agnostic — it tells the operator
@@ -2088,9 +2468,13 @@ fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
 /// no matter what the daemon is doing — `crate::wrap`'s interface-ready
 /// announcement, which fires from the wrapper's supervisory loop.
 ///
-/// Fire-and-forget by design: a failure is a lost readiness event, which costs
-/// the readiness gate its fast path and nothing else, so there is no outcome for
-/// a caller on a detached thread to act on.
+/// Fire-and-forget by design: a failure is a lost interface-ready event, which
+/// leaves the card and the doorbell waiting for the agent's own hooks to report.
+/// For Codex, whose own `SessionStart` arrives with its first turn, that can
+/// leave an inbox task pending until a native event or manual input starts a
+/// turn (see `crate::wrap`'s `INTERFACE_READY_SEND_TIMEOUT`). A caller on a
+/// detached thread has nothing it could do about either, so there is no outcome
+/// to return.
 pub fn send_to_socket_bounded(json: &str, timeout: std::time::Duration) {
     let _ = send_to_socket_bounded_at(&client_socket_path(), json, timeout);
 }
@@ -2755,10 +3139,10 @@ mod tests {
     #[test]
     fn an_ordinary_prompt_is_recorded_exactly_as_before() {
         assert_eq!(record_submitted_prompt("ls -la"), "ls -la");
-        let long = "x".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN + 40);
+        let long = "x".repeat(crate::submitted_prompt::USER_PROMPT_MAX_LEN + 40);
         assert_eq!(
             record_submitted_prompt(&long),
-            truncate(&long, crate::prompt_delivery::USER_PROMPT_MAX_LEN)
+            truncate(&long, crate::submitted_prompt::USER_PROMPT_MAX_LEN)
         );
     }
 
@@ -2767,11 +3151,11 @@ mod tests {
     /// have if the envelope had been truncated along with it.
     #[test]
     fn unwrapping_spends_the_budget_on_the_prompt() {
-        let long = "y".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN * 2);
+        let long = "y".repeat(crate::submitted_prompt::USER_PROMPT_MAX_LEN * 2);
         let enveloped = format!("<pasted_content id=\"239f\">\n{long}");
         assert_eq!(
             record_submitted_prompt(&enveloped),
-            truncate(&long, crate::prompt_delivery::USER_PROMPT_MAX_LEN)
+            truncate(&long, crate::submitted_prompt::USER_PROMPT_MAX_LEN)
         );
     }
 
@@ -2837,7 +3221,6 @@ mod tests {
                 prompt: None,
                 tool_name: Some("bash".into()),
                 tool_detail: Some("touch a.txt\necho second line".into()),
-                reports_prompts: false,
             },
         );
         assert_eq!(event.session_id, "pane-7-session");
@@ -2851,9 +3234,63 @@ mod tests {
         assert!(event.user_prompt.is_none());
     }
 
+    /// PRD #1666 (pi_001): the Pi extension hands a deck message over as
+    /// the framing followed by the block, and reports that prompt. It is the
+    /// deck's prompt, not the user's: the raw text is dropped and its ids are
+    /// named for the daemon to label the card `✉ <subject>` and keep it out
+    /// of the user's prompt history.
+    #[test]
+    fn a_pi_prompt_carrying_a_deck_message_is_marked_as_the_decks() {
+        let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+        let prompt = format!(
+            "{}\n\n[dot-agent-deck message {id} from dot-agent-deck (the prompt this session \
+             was started with)]\nSent by: the user.\ndo the task\n[end of dot-agent-deck \
+             message {id}]",
+            crate::inbox_hub::AGENT_FRAMING
+        );
+        for event_type in [EventType::Thinking, EventType::Idle] {
+            let event = build_agent_event_cli(
+                "pane-7".into(),
+                Some("agent-7".into()),
+                event_type,
+                AgentEventDetail {
+                    cwd: None,
+                    prompt: Some(prompt.clone()),
+                    tool_name: None,
+                    tool_detail: None,
+                },
+            );
+            assert_eq!(event.user_prompt, None, "{event:?}");
+            assert_eq!(
+                event.metadata[crate::inbox_prompt::DECK_MESSAGE_IDS_METADATA_KEY],
+                id
+            );
+        }
+        let ordinary = build_agent_event_cli(
+            "pane-7".into(),
+            Some("agent-7".into()),
+            EventType::Thinking,
+            AgentEventDetail {
+                cwd: None,
+                prompt: Some("please fix the build".into()),
+                tool_name: None,
+                tool_detail: None,
+            },
+        );
+        assert_eq!(
+            ordinary.user_prompt.as_deref(),
+            Some("please fix the build")
+        );
+        assert!(
+            !ordinary
+                .metadata
+                .contains_key(crate::inbox_prompt::DECK_MESSAGE_IDS_METADATA_KEY)
+        );
+    }
+
     #[test]
     fn agent_event_cli_prompt_is_recorded_like_any_producer_prompt() {
-        let long = "p".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN + 50);
+        let long = "p".repeat(crate::submitted_prompt::USER_PROMPT_MAX_LEN + 50);
         let event = build_agent_event_cli(
             "pane-7".into(),
             None,
@@ -2881,7 +3318,6 @@ mod tests {
                 prompt: Some("".into()),
                 tool_name: Some("\t".into()),
                 tool_detail: Some("\nsecond".into()),
-                reports_prompts: false,
             },
         );
         assert!(event.cwd.is_none());
@@ -2901,43 +3337,6 @@ mod tests {
         );
         assert_eq!(long.tool_name, Some(truncate(&"t".repeat(300), 80)));
         assert_eq!(long.tool_detail, Some(truncate(&"d".repeat(300), 120)));
-    }
-
-    /// Issue #1567: `--reports-prompts` becomes the declaration marker on any
-    /// report; without it the frame declares nothing, as every report from an
-    /// older extension. The marker the CLI stamps is not yet standing: only
-    /// once the daemon's hook-provenance gate attests the frame
-    /// (`ATTESTED_OWNER_METADATA_KEY`) does a Pi pane count as confirming.
-    #[test]
-    fn agent_event_cli_declares_prompt_reports_only_when_asked() {
-        for reports_prompts in [false, true] {
-            let mut event = build_agent_event_cli(
-                "pane-7".into(),
-                Some("agent-7".into()),
-                EventType::Idle,
-                AgentEventDetail {
-                    reports_prompts,
-                    ..Default::default()
-                },
-            );
-            assert_eq!(
-                event
-                    .metadata
-                    .get(crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY)
-                    .map(String::as_str),
-                reports_prompts.then_some(crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE)
-            );
-            assert!(
-                !event.declares_prompt_reports() && !event.reports_submitted_prompt(),
-                "reports_prompts={reports_prompts}: an unattested frame declares nothing"
-            );
-            event.metadata.insert(
-                crate::event::ATTESTED_OWNER_METADATA_KEY.to_string(),
-                "agent-7".to_string(),
-            );
-            assert_eq!(event.declares_prompt_reports(), reports_prompts);
-            assert_eq!(event.reports_submitted_prompt(), reports_prompts);
-        }
     }
 
     /// PRD #1497: `agent-event --turn-reply-stdin` reads the reply whole when
@@ -5716,6 +6115,108 @@ mod question_tests {
             );
         }
         assert!(opencode_question_event(r#"{"session_id":"s","event":"session.idle"}"#).is_none());
+    }
+
+    /// A stand-in daemon that answers one line per connection, the `n`th
+    /// connection with `replies[n]` (the last for every later one; `None`
+    /// closes without an answer), until the returned flag is set; the join
+    /// hands back each connection's line.
+    #[cfg(unix)]
+    fn scripted_daemon(
+        replies: Vec<Option<String>>,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<Vec<String>>,
+    ) {
+        use std::io::BufRead as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = done.clone();
+        let handle = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut reader = std::io::BufReader::new(stream);
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        let reply = replies[lines.len().min(replies.len() - 1)].clone();
+                        lines.push(line.trim().to_owned());
+                        if let Some(reply) = reply {
+                            let _ = writeln!(reader.get_mut(), "{reply}");
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            return lines;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+        });
+        (dir, path, done, handle)
+    }
+
+    /// PR #1735 third review: a hook's acknowledgement of what it handed its
+    /// agent is confirmed by the deck's answer. While the deck does not answer
+    /// it is asked again on a new connection, a bounded number of times; a
+    /// refusal by id stops at once. Either outcome without a record is written
+    /// to the hook's stderr, naming the message.
+    #[cfg(unix)]
+    #[test]
+    fn a_hooks_acknowledgement_is_asked_again_until_the_deck_records_it() {
+        use crate::event::{AckDelivery, SignalAck};
+        let id = "m-k3xzq2ab-0f3c9a71d2e4b850".to_owned();
+        let acks = vec![(
+            id.clone(),
+            format!(r#"{{"message_type":"ack","delivery_id":"{id}"}}"#),
+        )];
+        let recorded =
+            serde_json::to_string(&SignalAck::acknowledged(AckDelivery::Acknowledged)).unwrap();
+        let undeliverable =
+            serde_json::to_string(&SignalAck::acknowledged(AckDelivery::Undeliverable)).unwrap();
+        let run = |replies: Vec<Option<String>>| {
+            let (_dir, path, done, server) = scripted_daemon(replies);
+            let mut report = Vec::new();
+            acknowledge_at(&path, &acks, SIGNAL_ACK_TIMEOUT, &mut report);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            (server.join().unwrap(), String::from_utf8(report).unwrap())
+        };
+
+        let (asked, report) = run(vec![None, Some(recorded)]);
+        assert_eq!(
+            asked.len(),
+            2,
+            "asked again after no answer, then no more: {asked:?}"
+        );
+        assert!(asked.iter().all(|line| line.contains(&id)), "{asked:?}");
+        assert_eq!(report, "", "a recorded acknowledgement reports nothing");
+
+        let (asked, report) = run(vec![None]);
+        assert_eq!(
+            asked.len(),
+            HOOK_ACK_ATTEMPTS as usize,
+            "a silent deck is asked a bounded number of times"
+        );
+        assert!(
+            report.contains(&id),
+            "the hook says which message: {report:?}"
+        );
+
+        let (asked, report) = run(vec![Some(undeliverable)]);
+        assert_eq!(asked.len(), 1, "a refusal by id is final: {asked:?}");
+        assert!(
+            report.contains(&id) && report.contains("undeliverable"),
+            "{report:?}"
+        );
     }
 
     /// A one-shot stand-in daemon: accepts one connection, reads one line,

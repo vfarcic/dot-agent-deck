@@ -2696,7 +2696,32 @@ fn write_coordination_file_as(
         // open of a FIFO blocks inside the open, before any check could run.
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    // Audit D3: a file this call creates is its own until the content is in,
+    // and is removed again if anything after the create fails — never one
+    // that was already there.
+    let created = matches!(overwrite, Overwrite::Refuse);
     let mut file = options.open(&path)?;
+    let written = finish_coordination_write(&mut file, path.clone(), content, overwrite);
+    if written.is_err() && created {
+        remove_created_file(&path, &file);
+    }
+    written
+}
+
+/// The rest of [`write_coordination_file_as`], on the file it opened at
+/// `path`.
+fn finish_coordination_write(
+    file: &mut std::fs::File,
+    path: std::path::PathBuf,
+    content: &str,
+    overwrite: Overwrite<'_>,
+) -> std::io::Result<GuardedReplace> {
+    let refuse = |what: &str| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to write a coordination file: {what}"),
+        ))
+    };
     // `O_NOFOLLOW` refuses a symlink and nothing else, so the type is confirmed
     // from the open handle — an `fstat` on the descriptor already held, not a
     // second path lookup. This is also what carries the property to a platform
@@ -2707,18 +2732,54 @@ fn write_coordination_file_as(
     }
     if let Overwrite::ReplaceIf(may_replace) = overwrite {
         // Before the chmod below, so a declined file keeps its mode too.
-        if metadata.len() > 0 && !may_replace(&mut file)? {
+        if metadata.len() > 0 && !may_replace(file)? {
             return Ok(GuardedReplace::Kept(path));
         }
         use std::io::Seek as _;
         file.set_len(0)?;
         file.seek(std::io::SeekFrom::Start(0))?;
     }
-    crate::platform::fsperm::set_file_owner_only(&file)?;
+    crate::platform::fsperm::set_file_owner_only(file)?;
 
     use std::io::Write as _;
+    #[cfg(test)]
+    if FAIL_COORDINATION_WRITE.with(std::cell::Cell::get) {
+        file.write_all(&content.as_bytes()[..content.len() / 2])?;
+        return Err(std::io::Error::other("injected write failure"));
+    }
     file.write_all(content.as_bytes())?;
     Ok(GuardedReplace::Written(path))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: fail [`finish_coordination_write`] halfway through the content.
+    static FAIL_COORDINATION_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Audit D3: remove the file [`write_coordination_file_as`] created at `path`
+/// and then failed to fill. On Unix it first checks that `path` still names
+/// the file it holds open, so a file another process had moved into its place
+/// by the time of that check is left alone. The check and the unlink are two
+/// steps, not one conditional unlink: a file renamed over `path` between them
+/// is removed instead (audit A2-2, accepted — it takes a concurrent writer in
+/// the coordination directory). Other platforms do not check.
+fn remove_created_file(path: &std::path::Path, file: &std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let (Ok(held), Ok(named)) = (file.metadata(), std::fs::symlink_metadata(path)) else {
+            return;
+        };
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    if let Err(error) = std::fs::remove_file(path) {
+        tracing::warn!(path = %path.display(), %error, "could not remove a coordination file left half-written");
+    }
 }
 
 impl GuardedReplace {
@@ -2890,8 +2951,14 @@ pub struct SweepReport {
 /// Every other dotfile is excluded, which is what keeps the sweep out of
 /// anything a user or another tool parks there under a leading dot, and nothing
 /// without an `.md` extension is touched at all.
+///
+/// The deck's saved message bodies, `inbox-message-<deck>-<unique>.md`, are
+/// excluded by name too (PR #1735, RB2-02): the deck that saved one keeps it
+/// while its message is waiting or its task is running, whatever its age, and
+/// removes it on its own schedule ([`crate::inbox_spills`]). An age sweep here
+/// would delete the full body of a message still queued.
 pub(crate) fn is_sweepable_coordination_name(name: &str) -> bool {
-    if name == CONTEXT_FILE_NAME {
+    if name == CONTEXT_FILE_NAME || crate::inbox_spills::is_spill_file_name(name) {
         return false;
     }
     if let Some(rest) = name.strip_prefix('.') {
@@ -3665,6 +3732,44 @@ mod tests {
     use super::*;
     use crate::project_config::OrchestrationRoleConfig;
     use spec::spec;
+
+    /// Audit D3: a write that fails after it created its new file leaves no
+    /// file behind — and a failed rewrite of a file that was already there
+    /// does not remove it.
+    #[test]
+    fn a_failed_write_removes_only_the_file_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        FAIL_COORDINATION_WRITE.with(|fail| fail.set(true));
+        let minted = write_new_coordination_file(dir.path(), "inbox-message-x.md", "full body");
+        let replaced = write_coordination_file(dir.path(), "worker-task-coder.md", "new task");
+        FAIL_COORDINATION_WRITE.with(|fail| fail.set(false));
+        assert!(minted.is_err());
+        assert!(
+            !context_dir_of(dir.path())
+                .join("inbox-message-x.md")
+                .exists(),
+            "the half-written new file was left behind"
+        );
+        assert!(replaced.is_err());
+
+        std::fs::write(
+            context_dir_of(dir.path()).join("worker-task-coder.md"),
+            "old task",
+        )
+        .unwrap();
+        FAIL_COORDINATION_WRITE.with(|fail| fail.set(true));
+        assert!(write_coordination_file(dir.path(), "worker-task-coder.md", "new task").is_err());
+        FAIL_COORDINATION_WRITE.with(|fail| fail.set(false));
+        assert!(
+            context_dir_of(dir.path())
+                .join("worker-task-coder.md")
+                .exists(),
+            "a file that was already there was removed"
+        );
+        let written = write_new_coordination_file(dir.path(), "inbox-message-x.md", "full body")
+            .expect("the name is free again");
+        assert_eq!(std::fs::read_to_string(written).unwrap(), "full body");
+    }
 
     fn role(
         name: &str,
@@ -5448,6 +5553,8 @@ mod hygiene_tests {
             ".hidden.md",
             "README",
             "archive.md.bak",
+            // PR #1735 (RB2-02): a deck's saved message body is the deck's.
+            "inbox-message-0123abcd-1700000000000-1.md",
         ] {
             assert!(
                 !is_sweepable_coordination_name(name),

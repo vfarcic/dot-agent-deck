@@ -15,8 +15,7 @@
 //! text runs `dot-agent-deck dispatch` (other than `--list-targets`) links to
 //! `dispatch-base`, that the defining skill still carries its commands, and
 //! that no other skill carries the fast-forward command itself. It does not
-//! check that an agent follows them, and it does not look at
-//! `.claude/skills/dot-ai-*` (vendored mirrors, CLAUDE.md rule 13).
+//! check that an agent follows them.
 
 #[cfg(test)]
 mod tests {
@@ -52,16 +51,15 @@ mod tests {
             .any(|m| !m.as_str().contains("--list-targets"))
     }
 
-    /// Every project-local `SKILL.md`, as (skill directory name, contents).
+    /// Every `SKILL.md` under `.claude/skills/`, as (skill directory name,
+    /// contents). The `dot-ai-*` skills are included: they are project-owned
+    /// since syncing from `dot-ai` stopped (CLAUDE.md rule 13).
     fn project_skills() -> Vec<(String, String)> {
         let dir = repo_root().join(".claude/skills");
         let mut skills = Vec::new();
         for entry in fs::read_dir(&dir).expect("read .claude/skills") {
             let entry = entry.expect("read a .claude/skills entry");
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("dot-ai-") {
-                continue;
-            }
             let skill = entry.path().join("SKILL.md");
             if let Ok(text) = fs::read_to_string(&skill) {
                 skills.push((name, text));

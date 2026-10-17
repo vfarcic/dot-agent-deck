@@ -82,7 +82,7 @@ pub fn read_capped(reader: impl Read, max_bytes: u64, source: &str) -> Result<St
 /// adapter — Claude Code's `settings.json` entry, the Codex and Devin hook
 /// configs, the OpenCode plugin — funnels its payload through
 /// `dot-agent-deck hook`, which truncates `user_prompt` at
-/// [`crate::prompt_delivery::USER_PROMPT_MAX_LEN`] (200 chars) and sharpens
+/// [`crate::submitted_prompt::USER_PROMPT_MAX_LEN`] (200 chars) and sharpens
 /// `tool_detail` to a short label. The one field it copies through unbounded is
 /// `metadata["bash_command"]`, and that is a shell command line.
 ///

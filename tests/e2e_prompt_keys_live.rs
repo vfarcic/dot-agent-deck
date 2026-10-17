@@ -438,7 +438,7 @@ fn reading_reply_005_real_codex_delivers_sentinel_once_to_subscribed_client() {
         common::codex_test_model()
     );
     let builder = TuiDeck::builder()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_imported_codex_credentials();
     let (deck, agent_id, _) = launch_agent(builder, "codex-live", &launch, &command, SENTINEL);
     exercise_reading_reply(
@@ -451,7 +451,7 @@ fn reading_reply_005_real_codex_delivers_sentinel_once_to_subscribed_client() {
     );
 }
 
-/// Scenario: Open a real interactive Pi Haiku pane in a fixture containing a uniquely named sentinel, with the bundled extension installed by the daemon. Subscribe before asking Pi to discover the filename; its successful final reply must contain the sentinel, appear in the attached pane, and arrive exactly once during a five-second duplicate-delivery check.
+/// Scenario: Open a real interactive Pi pane in a fixture containing a uniquely named sentinel, with the bundled extension installed by the daemon. Subscribe before asking Pi to discover the filename; its successful final reply must contain the sentinel, appear in the attached pane, and arrive exactly once during a five-second duplicate-delivery check.
 #[spec("voice/reading-reply/006")]
 #[test]
 fn reading_reply_006_real_pi_delivers_sentinel_once_to_subscribed_client() {
@@ -464,16 +464,15 @@ fn reading_reply_006_real_pi_delivers_sentinel_once_to_subscribed_client() {
         .is_ok_and(|status| status.success());
     skip_unless!(if !pi_available {
         Err("pi CLI not installed (could not invoke pi --version)".to_string())
-    } else if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
-        Ok(())
     } else {
-        Err("ANTHROPIC_API_KEY not set — real Pi needs Anthropic auth".to_string())
+        common::check_pi_available()
     });
 
     const SENTINEL: &str = "reading_reply_sentinel_pi_a2f7.txt";
     let launch = AgentLaunch {
         name: "reading-reply-pi",
-        ready: "claude-haiku-4-5",
+        // Pi's footer names the model it runs.
+        ready: common::pi_test_model().model.as_str(),
         resubmit_until_empty: false,
     };
     // No initial prompt: subscribe before Pi starts the genuine turn. As in
@@ -481,14 +480,11 @@ fn reading_reply_006_real_pi_delivers_sentinel_once_to_subscribed_client() {
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
-        .with_env("PATH", path_with_binary_dir())
-        .with_env(
-            "ANTHROPIC_API_KEY",
-            std::env::var("ANTHROPIC_API_KEY").expect("checked by Pi preflight"),
-        )
+        .with_env("PATH", common::path_with_binary_dir())
+        .with_imported_pi_credentials()
         .with_continue_session(
             launch.name,
-            "pi --provider anthropic --model claude-haiku-4-5 --approve",
+            format!("pi {} --approve", common::pi_test_model().cli_args()),
         )
         .launch_with_fixture("minimal");
     std::fs::write(deck.workdir().join(SENTINEL), "reading reply Pi sentinel\n")
@@ -764,18 +760,6 @@ struct AgentLaunch {
     resubmit_until_empty: bool,
 }
 
-/// The freshly built binary's directory ahead of `PATH`, so an agent's own
-/// `dot-agent-deck` calls resolve to the build under test.
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let dir = std::path::Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
-
 /// Start `command` through the New agent dialog of a deck built by `builder`,
 /// wait for its input box, and read the keys the daemon serves for it.
 fn launch_agent(
@@ -967,7 +951,7 @@ fn prompt_voice_keys_004_codex_honours_the_served_keys() {
         common::codex_test_model()
     );
     let builder = TuiDeck::builder()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_imported_codex_credentials();
     let (deck, agent_id, keys) = launch_agent(builder, "codex-live", &launch, &command, SENTINEL);
     exercise_prompt_keys(&launch, &deck, &agent_id, &keys, SENTINEL);

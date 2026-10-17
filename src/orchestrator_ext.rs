@@ -144,7 +144,9 @@ pub fn default_extension_dir() -> Option<PathBuf> {
 /// discovers: `<target_dir>/index.ts` + `<target_dir>/orchestrator.ts`.
 ///
 /// Creates `target_dir` (and parents) if needed and (over)writes each embedded
-/// file, so re-running is idempotent and refreshes a stale copy. Returns the
+/// file, so re-running is idempotent and refreshes a stale copy. Each file is
+/// published by an atomic rename of an owner-only temp file, and a destination
+/// that is a symlink is refused (PRD #1666 hardening M8). Returns the
 /// list of paths written, in embed order. Hermetic — pass any directory
 /// (a temp dir in tests, the real `~/.pi/...` in the CLI); it never reads the
 /// environment.
@@ -160,9 +162,23 @@ pub fn materialize(target_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut written = Vec::with_capacity(EXTENSION_FILES.len());
     for (name, contents) in EXTENSION_FILES {
         let path = target_dir.join(name);
+        // PRD #1666 hardening M8: a destination that is a symlink is refused,
+        // so the extension is never written through a link to another file.
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is a symlink; remove it so the deck can write its Pi extension there",
+                    path.display()
+                ),
+            ));
+        }
         // An identical file is not rewritten (PRD #1487).
         if !std::fs::read(&path).is_ok_and(|existing| existing == contents.as_bytes()) {
-            std::fs::write(&path, contents)?;
+            // Hardening M8: an owner-only temp file created exclusively, then
+            // renamed over the destination, so Pi never loads a partial file
+            // and a concurrent refresh never truncates one in place.
+            crate::agent_hook_config::write_atomic(target_dir, &path, contents.as_bytes())?;
         }
         written.push(path);
     }
@@ -423,6 +439,62 @@ mod tests {
         }
     }
 
+    /// Hardening M8: a destination that is a symlink is refused, and the file
+    /// it points at is left exactly as it was — materialising never writes
+    /// through a link.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_refuses_a_symlinked_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("dot-agent-deck");
+        std::fs::create_dir_all(&target).unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, target.join("index.ts")).unwrap();
+        assert!(materialize(&target).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(
+            std::fs::symlink_metadata(target.join("index.ts"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// Hardening M8: a new file is published whole and owner-only, and a
+    /// stale copy is replaced by a rename over it, not truncated in place.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_publishes_owner_only_files_by_rename() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("fresh");
+        materialize(&fresh).unwrap();
+        for (name, contents) in EXTENSION_FILES {
+            let meta = std::fs::metadata(fresh.join(name)).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o077, 0, "{name} owner-only");
+            assert_eq!(
+                std::fs::read_to_string(fresh.join(name)).unwrap(),
+                *contents
+            );
+        }
+        let target = tmp.path().join("dot-agent-deck");
+        std::fs::create_dir_all(&target).unwrap();
+        let stale = target.join("index.ts");
+        std::fs::write(&stale, "stale").unwrap();
+        let before = std::fs::metadata(&stale).unwrap().ino();
+        materialize(&target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&stale).unwrap(),
+            EXTENSION_FILES[0].1
+        );
+        assert_ne!(
+            std::fs::metadata(&stale).unwrap().ino(),
+            before,
+            "the stale file was replaced by a rename, not rewritten in place"
+        );
+    }
+
     /// The materialized layout is exactly the two files Pi's subdirectory
     /// discovery needs: `index.ts` (the loaded entry point) and its
     /// `orchestrator.ts` sibling. Pins the layout the docs describe.
@@ -457,6 +529,55 @@ mod tests {
             .expect("index.ts must be embedded");
         assert!(index.contains("export default function"));
         assert!(index.contains("./orchestrator.ts"));
+    }
+
+    fn embedded(name: &str) -> &'static str {
+        EXTENSION_FILES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| *c)
+            .unwrap_or_else(|| panic!("{name} must be embedded"))
+    }
+
+    /// The extension prefixes every inbox delivery with its own copy of the
+    /// framing sentence, which must stay the deck's `AGENT_FRAMING` byte for
+    /// byte (PRD #1666): the copy is a single-line JSON string literal, so it
+    /// is the Rust constant's JSON encoding.
+    #[test]
+    fn embedded_inbox_framing_matches_agent_framing() {
+        let literal = serde_json::to_string(crate::inbox_hub::AGENT_FRAMING).unwrap();
+        assert!(
+            embedded("orchestrator.ts")
+                .contains(&format!("export const INBOX_FRAMING =\n\t{literal};")),
+            "pi-extension/src/orchestrator.ts INBOX_FRAMING drifted from inbox_hub::AGENT_FRAMING"
+        );
+    }
+
+    /// The extension recognises the doorbell line typed into Pi by the deck's
+    /// own prefix and suffix, and stops respawning its watcher on the exit
+    /// status `inbox wait --stream` gives outside a deck.
+    #[test]
+    fn embedded_doorbell_and_exit_constants_match_the_deck() {
+        let source = embedded("orchestrator.ts");
+        let prefix = crate::doorbell::LINE_PREFIX.trim();
+        assert!(
+            source.contains(&format!("export const DOORBELL_PREFIX = \"{prefix}\";")),
+            "DOORBELL_PREFIX drifted from doorbell::LINE_PREFIX"
+        );
+        assert!(
+            source.contains(&format!(
+                "export const DOORBELL_SUFFIX = \"{}\";",
+                crate::doorbell::LINE_SUFFIX
+            )),
+            "DOORBELL_SUFFIX drifted from doorbell::LINE_SUFFIX"
+        );
+        assert!(
+            source.contains(&format!(
+                "export const WATCHER_NOT_IN_DECK_EXIT = {};",
+                crate::inbox_cli::STREAM_NOT_IN_DECK_EXIT
+            )),
+            "WATCHER_NOT_IN_DECK_EXIT drifted from inbox_cli::STREAM_NOT_IN_DECK_EXIT"
+        );
     }
 
     /// Re-running materialization overwrites in place (idempotent refresh),
@@ -809,4 +930,41 @@ mod tests {
     /// file and exec bits are not consulted.
     #[cfg(not(unix))]
     fn set_mode(_path: &Path, _mode: u32) {}
+
+    /// The extension's own Node suites — its inbox delivery and
+    /// acknowledgement (`inbox.test.ts`) and its orchestrator helpers
+    /// (`orchestrator.test.ts`) — run here, so a change to the extension this
+    /// module embeds is checked by the fast tier and CI's `build` job.
+    /// `questions.test.ts` runs from `question_detect_008` in `src/hook.rs`.
+    /// They need a Node that strips TypeScript types (23.6+) and nothing from
+    /// `node_modules`; without one this prints `SKIP:` and passes.
+    #[test]
+    fn the_pi_extensions_node_suites_pass() {
+        const SUITES: [&str; 2] = ["test/inbox.test.ts", "test/orchestrator.test.ts"];
+        let Ok(node) = std::process::Command::new("node").arg("--version").output() else {
+            eprintln!("SKIP: node is not available for the pi-extension suites {SUITES:?}");
+            return;
+        };
+        let version = String::from_utf8_lossy(&node.stdout);
+        let mut parts = version.trim().trim_start_matches('v').split('.');
+        let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        if (major, minor) < (23, 6) {
+            eprintln!("SKIP: node {version} cannot strip TypeScript types");
+            return;
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pi-extension");
+        let out = std::process::Command::new("node")
+            .arg("--test")
+            .args(SUITES)
+            .current_dir(&dir)
+            .output()
+            .expect("run node --test");
+        assert!(
+            out.status.success(),
+            "pi-extension suites {SUITES:?} failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

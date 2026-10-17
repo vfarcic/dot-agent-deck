@@ -227,10 +227,6 @@ describe("agent pane deck identity", () => {
     const deck = harness(
       documentWithFleet(),
       {
-        terminalInputResults: {
-          planner: "wrong-session",
-          [agentKey(FIXTURE_DAEMON_ID, "planner")]: "wrong-session",
-        },
         appliedGeometry: {
           planner: { rows: 24, cols: 80 },
           [agentKey(FIXTURE_DAEMON_ID, "planner")]: { rows: 24, cols: 80 },
@@ -302,36 +298,27 @@ describe("agent pane deck identity", () => {
   });
 
   /**
-   * Scenario: the local deck's Planner has a `wrong-session` verdict recorded
-   * against it and a geometry the daemon applied to it — filed both under the
-   * bare agent id and under the local deck's composite key. Open build-box's
-   * Planner, on build-box, which is the same id on another machine. Its pane
-   * carries neither: no rejection notice, no disabled input, and no inherited
-   * grid to submit to that agent's PTY.
+   * Scenario: the local deck's Planner has a geometry the daemon applied to it —
+   * filed both under the bare agent id and under the local deck's composite
+   * key. Open build-box's Planner, on build-box, which is the same id on
+   * another machine. Its pane inherits no grid to submit to that agent's PTY.
    *
-   * The bare-keyed decoy is what makes this discriminate. Both maps are keyed
-   * by `agentKey(deckId, agentId)` in production, so a fixture holding only
+   * The bare-keyed decoy is what makes this discriminate. The map is keyed by
+   * `agentKey(deckId, agentId)` in production, so a fixture holding only
    * composite keys would pass against a bare-id lookup too — it would simply
    * find nothing. A bare `"planner"` entry is the state a reverted production
    * would read.
    */
-  it("reads neither the verdict nor the geometry recorded for another deck's namesake", async () => {
+  it("reads no geometry recorded for another deck's namesake", async () => {
     const deck = harness(
       documentWithFleet(),
       {
-        terminalInputResults: {
-          planner: "wrong-session",
-          [agentKey(FIXTURE_DAEMON_ID, "planner")]: "wrong-session",
-        },
         appliedGeometry: {
           planner: { rows: 24, cols: 80 },
           [agentKey(FIXTURE_DAEMON_ID, "planner")]: { rows: 24, cols: 80 },
         },
       },
-      // Writable and running on BOTH decks, so the notice below can only come
-      // from the leaked verdict: `terminalInputState` reads the lease first and
-      // the fixture's default `read` lease would print the same sentence for a
-      // reason that has nothing to do with this fix.
+      // Writable and running on BOTH decks, so the pane shows no input notice.
       (agent) => (agent.id === "planner" ? { ...agent, status: "running", writeLease: "write" } : agent),
     );
     render(<DeckShell runtime={deck.runtime("remote")} initialView={{ kind: "overview" }} />);
@@ -341,8 +328,6 @@ describe("agent pane deck identity", () => {
 
     const pane = screen.getByTestId("agent-pane-overlay");
     expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
-    // The verdict's whole user-visible consequence is this notice and the
-    // read-only input it goes with. Neither belongs to this agent.
     expect(screen.queryByTestId("terminal-input-status-planner")).not.toBeInTheDocument();
     const mounted = viewportProps.filter((props) => props.agentId === "planner");
     expect(mounted).not.toHaveLength(0);

@@ -162,6 +162,12 @@ pub(crate) enum FetchReason {
     /// it at all is the signal that the peer is ahead, which is exactly the
     /// pairing issue #801 is about.
     UnknownBroadcast,
+    /// PRD #1666 §2.8: a message in an agent's inbox changed state. The
+    /// counts a tile draws its `✉N` / `delivered` line from ride the record
+    /// (`AgentRecord::inbox`), which no event updates, so the next refresh
+    /// re-reads them — one `ListAgents` per coalescing window at most, as for
+    /// any other mark.
+    Inbox,
     /// The periodic reconciliation, which is the only thing that catches a
     /// silent removal.
     Reconcile,
@@ -283,6 +289,9 @@ impl AgentView {
             }
             BroadcastMsg::OrchestrationSurface(_) => self.mark(FetchReason::OrchestrationSurface),
             BroadcastMsg::WorktreeKept(_) => self.mark(FetchReason::WorktreeKept),
+            // PRD #1666 §2.8: an inbox message changed state, and the counts
+            // the tile shows ride the record; see `FetchReason::Inbox`.
+            BroadcastMsg::Inbox(_) => self.mark(FetchReason::Inbox),
             // Issue #1637: the notices ride the `Hello` reply, which the held
             // link captured once; re-read it, and the list with it.
             BroadcastMsg::HookBinaryNotice(_) => {
@@ -498,6 +507,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         }
     }
 
@@ -766,6 +776,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            delivery_notice: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,
@@ -814,6 +825,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            delivery_notice: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,
@@ -859,6 +871,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            delivery_notice: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,
@@ -1051,6 +1064,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            delivery_notice: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,

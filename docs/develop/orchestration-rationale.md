@@ -44,7 +44,7 @@ The deck cannot always tell whether Codex took a task, so typing a second copy c
 
 ## The readiness-buffer override (from "What `clear` does to delivery")
 
-The user page used to ask users whose machines need more than a second of `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` to open an issue, to help tune the default. That request is a project ask rather than user guidance; if the default needs revisiting, those reports are the evidence to look for.
+The user page used to ask users whose machines need more than a second of `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` to open an issue, to help tune the default. That request was a project ask rather than user guidance. PRD #1666 removed the buffer and its override with the typed delivery, so there is no default left to tune.
 
 ## Pane ids in worker reports (from `docs/idle-workers-and-notifications.md`)
 

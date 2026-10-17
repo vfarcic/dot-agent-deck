@@ -137,7 +137,8 @@ If a `shape` cannot be satisfied when the run comes due (the named orchestration
 
 An orchestration a run starts is named after the orchestration and its working directory, for example `team · my-repo`. The TUI shows that name on the run's tab, and the desktop app as the title of the run's group on the Dashboard. If another run of the same orchestration is still running in that directory, started by this schedule or another one, the new run gets the next free number instead (`team · my-repo · 2`, then `· 3`), so you can tell the runs apart in both clients. The run is never skipped because of its name.
 
-When a run reuses a tab you are typing in, its prompt waits until you have not typed for 5 seconds. If you left unsent text in that pane (in either client), it also waits until you press Enter or clear the text with `Ctrl+U` or `Ctrl+C`, so it is not submitted together with your text; see [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft). Either way the prompt is sent at the latest 60 seconds after the run started. To change the 5 seconds, set `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` (milliseconds) in the environment the daemon starts with.
+A run's prompt waits in the agent's inbox, including when the schedule reuses a tab. The TUI card and desktop tile show `✉N queued`, then `✉ delivered` after receipt, or `not delivered: …` with **Error** (desktop **error**) if delivery fails. Native delivery leaves your input box alone. When the doorbell is needed, it waits for an idle agent and a clear input box; it does not force submission after a timeout. See [Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app).
+
 
 ## Dispatch agents onto open GitHub issues
 
@@ -400,5 +401,4 @@ Every subcommand that changes the file (`add`, `update`, `remove`, `enable`, `di
 |---|---|---|
 | `DOT_AGENT_DECK_SCHEDULES` | CLI, TUI, daemon | Path of the schedules file. |
 | `XDG_CONFIG_HOME` | CLI, TUI, daemon (Linux, macOS) | Base directory of the default schedules file path. |
-| `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` | daemon | How long a reused tab must be free of typing before a run's prompt is sent. Default `5000`. |
 | `DOT_AGENT_DECK_STATE_DIR` | daemon | Where `daemon.log` goes. |

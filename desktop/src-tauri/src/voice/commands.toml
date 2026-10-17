@@ -189,7 +189,8 @@
 id          = "open_agent"
 description = """Open one agent's pane over the current screen, so the user can watch that one
 agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show, see, look at,
-select, go to or switch to ONE agent, or to see only that one ("everything except the tester") —
+select, go to or switch to ONE agent, or to see only that one ("see only the tester", "everything
+except the tester") —
 including "open tester agent", the accessible name of a dashboard row's open control, and "select
 dispatcher agent". The agent may be named as the screen shows it (a role like "tester", or a name
 the user gave it), by anything `agents_on_screen` says about it — its mode, agent type,
@@ -247,18 +248,47 @@ heard_as    = ["dashboard", "overview", "everything", "all", "fleet", "running",
 # (`outcome::FILTER_DASHBOARD_ROW`). A filter replaces the one before it, so
 # what was said is what is shown. Not over the New agent dialog, whose
 # directory browser has its own "filter" and "clear the filter" rows.
+#
+# The singular rule leads the description rather than trailing it: with "see
+# only the tester" named as `open_agent` only in the last sentence, after "or
+# filter by a name", `gpt-5-mini` answered it with this row and `text` =
+# "tester" in 8 of 10 runs of fixture
+# `dashboard-filter-control-see-only-the-tester`. With "the number decides"
+# stated first and `text` described as words the user asked to filter by, 20
+# of 20, and every `dashboard-*` and `open-agent*` fixture 3 of 3 — but
+# `dashboard-filter-agents-on-build-box` ("show the agents on build box", said
+# on the Daemons screen) then picked `switch_deck` in 2 of 34 runs, against 0
+# of 20 before. Naming its example as the `daemon` facet and not `switch_deck`
+# took it back to 20 of 20, and the full manifest to 289 of 289 (2026-10-13).
+#
+# "Which agents are running?" is named here as `open_overview` because this
+# row took it: fixture `open-overview-running` (said on the Daemons screen)
+# answered `filter_dashboard` with no status it could use in 8 of 10 runs, and
+# 7 of 10 with this row as it stood before the singular rule, so it was not
+# that change. A sentence calling it a question about the whole fleet that
+# "names no set to narrow to" fixed it, 10 of 10, but sent fixture
+# `dashboard-filter-agents-on-build-box` to `switch_deck` in 4 of 30 runs
+# against 0 of 30. The short form below held `open-overview-running` 20 of 20,
+# `dashboard-filter-agents-on-build-box` 20 of 20,
+# `dashboard-filter-control-see-only-the-tester` 20 of 20 and the full
+# manifest 289 of 289 (2026-10-14).
 [[commands]]
 id          = "filter_dashboard"
 description = """Filter the agent dashboard so it shows only a SET of agents: those of one kind
 (orchestration roles, single agents, or the dispatcher, schedule or schedule: issues mode), with a
 status (working, thinking, needs input, idle, blocked, error), of an agent type (Claude Code,
 Codex, OpenCode, Pi), on a daemon, or whose name, role, orchestration, directory or last prompt
-contains some text. Use for show only the dispatchers, show me all orchestration agents, show me
-all working agents, show Codex agents, show the agents on build box, show only agents waiting for
-input, or filter by a name. Set only the facets the user named and leave the rest out; `kind`
-is the kind, `status` the status, `agent_type` the type, `daemon` the daemon, and `text` a name
-or words to match. Opening ONE agent — "open tester", "see only the tester", or one named by what
-it is doing, "show me the one that's stuck" — is `open_agent`, not this one; "show everything" or "clear the filter" is `clear_dashboard_filter`.
+contains some text. The number decides: a request naming ONE agent by its name or role alone —
+"see only the tester", "show only the coder", "open tester" — or by what it is doing, "show me
+the one that's stuck", is `open_agent`, never this one, even with "only" in it. Use this one for
+a plural or a category: show only the dispatchers, show me all orchestration agents, show me all
+working agents, show Codex agents, show the agents on build box (the `daemon` facet: it filters,
+and is not `switch_deck`), show only agents waiting for input, or when the user says to filter by
+some text. Set only the facets the user named and leave
+the rest out; `kind` is the kind, `status` the status, `agent_type` the type, `daemon` the
+daemon, and `text` the words the user asked to filter by. "show everything" or "clear the filter"
+is `clear_dashboard_filter`. "Which agents are running?" is `open_overview`: running is not a
+status.
 While the New agent dialog shows a directory listing, "filter" is about its directories:
 `filter_directories`, not this one."""
 invoke      = "filterDashboard"
@@ -642,6 +672,22 @@ heard_as    = ["host", "resource", "usage", "disk", "machine", "memory", "cpu", 
 # Switching is undone by one more switch and stops nothing, so the residual
 # every `heard_as` row carries — "daemon" or "deck" said for another reason
 # while a steered pick is in flight — reaches a visible, reversible change.
+#
+# The last sentence of the description is for fixture
+# `dashboard-filter-agents-on-build-box` ("show the agents on build box", said
+# on the Daemons screen): once `origin/main`'s voice-question rows were merged
+# beside `filter_dashboard`'s singular rule, `gpt-5-mini` answered it with this
+# row in 6 of 10 runs (10 of 10 on `origin/main`, whose filter row has no
+# singular rule), and grounding refused it with "nothing in that asks to
+# switch daemon". Saying it here, on its own line so nothing above re-flows,
+# took it to 80 of 80 and the full manifest to 323 of 323 twice (2026-10-15).
+# It also sent a bare "start it" (fixture `start-new-agent-dialog-closed`) to
+# `stop_agent` more often, until the stop rule's quoted start words went (see
+# `stop_agent`'s comment). "build box" is the table's example daemon, and this is
+# `filter_dashboard`'s own example. Rewording the sentence round it measured
+# worse for that "start it": 6 to 27 stop picks in 60 replays against 0 to 5
+# (2026-10-15, with the instructions' start sentence removed), each answered as
+# the opener only by `outcome::UNGROUNDED_READS_AS`.
 [[commands]]
 id          = "switch_deck"
 description = """Switch which daemon the app is showing — the Daemon selector at the top of the
@@ -658,7 +704,8 @@ demon"); demon means daemon here too. This is
 not `open_deck`, which only moves from the agent dashboard to the Daemons screen without changing
 which daemon is shown, and it is not `open_overview`, which changes no selection. While the New agent dialog is open this cannot
 run: a request that names a daemon then means the dialog's Daemon field, which is `choose_deck`. It
-changes which daemon is shown and nothing else — it starts, stops and closes nothing."""
+changes which daemon is shown and nothing else — it starts, stops and closes nothing.
+Showing the AGENTS on a daemon — "show the agents on build box" — is `filter_dashboard`, not this one."""
 invoke      = "switchDeck"
 screens     = ["deck", "overview"]
 requires    = ["new_agent_dialog_closed"]
@@ -1947,6 +1994,25 @@ heard_as_whole = [
 # false` there, and `schema`'s tie-break sends a start-worded request to the
 # callable start. It narrows where a stop can run and changes nothing about
 # what one does: each still only opens a confirmation.
+#
+# **`stop_agent`'s description quotes no start word** (PRD #1666). It used to
+# end "and "start" is its opposite: "start it" is never this one, it is
+# `open_new_agent`" (#1495, measured 8 of 9 then). Beside the instructions' old
+# sentence about start words it drew a bare "start it" with the dialog closed to
+# this row instead (`schema::TOOL_INSTRUCTIONS` has the numbers). Without any
+# such sentence, "just launch the agent immediately" over an open dialog
+# (fixture `start-new-agent-adversarial-incomplete-form`) was answered `none`
+# in 9 of 50 harness runs, against 0 of 50 on `main`, and in 15 of 60 replays
+# of the captured request against `gpt-5-mini`, against 1 of 60 with `main`'s
+# prompt: that sentence was what sent it to a start. "A start is its opposite:
+# never this one, it is `open_new_agent`" keeps the pointer without quoting a
+# start word — 8 `none` in 180 replays there, and "start it" 3 in 120 against
+# 3 in 60 without the sentence — and passed 49 of 50 harness runs against
+# `main`'s 47, interleaved (2026-10-15). Quoting the word again ("start" is
+# its opposite: a start is never this one…) sent "start it" to `none` in 11
+# of 118 replays, against 3 of 116; naming `start_new_agent` there too sent it
+# to this row in 17 of 40. With the dialog open the opener cannot run, and
+# its `unavailable_redirects` presses Start instead.
 [[commands]]
 id          = "stop_agent"
 description = """Stop one running agent on the agent dashboard — the voice form of its row's close
@@ -1957,8 +2023,7 @@ does. It never stops anything by itself: the app shows the same confirmation the
 and the user confirms by hand, so pick it whenever the user asks to stop an agent, however
 urgently. It needs a word that can only mean stopping: "close" is NOT one — "close the agent" and
 "close the tester" close the VIEW (`close`) and stop nothing, on every screen and even with nothing
-open to close, although this row's button is labelled Close — and "start" is its opposite: "start
-it" is never this one, it is `open_new_agent`. Ending a whole orchestration is
+open to close, although this row's button is labelled Close — and a start is its opposite: never this one, it is `open_new_agent`. Ending a whole orchestration is
 `close_orchestration`. Never for isolating or hiding — "get rid of everything except the tester"
 means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmStopAgent"

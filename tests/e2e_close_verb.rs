@@ -232,16 +232,19 @@ os.execvp("cat", ["cat"])
             &["work-done", "--done", "--task", &marker],
         );
         assert_exit("attested work-done --done setup", &output, 0);
+        // PRD #1666: the completion is posted to the caller's inbox, not typed
+        // into its pane.
         assert!(
             common::wait_until(WAIT, || self.records().iter().any(|r| {
                 !self
                     .worktrees
                     .iter()
                     .any(|p| r.cwd.as_deref().is_some_and(|cwd| Path::new(cwd) == p))
-                    && common::pane_search_key_on(self.deck.attach_socket_path(), &r.id)
-                        .contains(&marker)
+                    && r.pane_id_env
+                        .as_deref()
+                        .is_some_and(|pane| self.inbox_text(pane).contains(&marker))
             })),
-            "terminal completion never reached caller\nwork-done output: {}\nUnit PTY:\n{}\nDaemon log:\n{}\nGrid:\n{}",
+            "terminal completion never reached caller's inbox\nwork-done output: {}\nUnit PTY:\n{}\nDaemon log:\n{}\nGrid:\n{}",
             output_text(&output),
             common::strip_ansi(&common::pane_snapshot_on(
                 self.deck.attach_socket_path(),
@@ -250,6 +253,24 @@ os.execvp("cat", ["cat"])
             std::fs::read_to_string(self.scratch.path().join("daemon.log")).unwrap_or_default(),
             self.deck.snapshot_grid()
         );
+    }
+
+    /// Every message in `pane`'s inbox, rendered whole, joined.
+    fn inbox_text(&self, pane: &str) -> String {
+        common::attach_request_on(
+            self.deck.attach_socket_path(),
+            &AttachRequest::ListInbox {
+                pane_id: Some(pane.to_string()),
+                bodies: true,
+            },
+        )
+        .ok()
+        .and_then(|response| response.inbox_messages)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|message| message.text)
+        .collect::<Vec<_>>()
+        .join("\n")
     }
 
     fn close(&self, caller: Option<&AgentRecord>, args: &[&str]) -> Output {

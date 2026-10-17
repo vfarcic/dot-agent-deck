@@ -11,7 +11,7 @@ use dot_agent_deck::authoring_seeds::AuthoringKind;
 use dot_agent_deck::daemon_client::Endpoint;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{
-    AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, SendResult, Writable,
+    AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, Writable,
 };
 use dot_agent_deck::state::SessionStatus;
 use serde::{Deserialize, Serialize};
@@ -233,7 +233,7 @@ impl HostMetricsReportDto {
                         .iter()
                         .take(dot_agent_deck::daemon_protocol::MAX_DISK_ROLES)
                         .map(|disk| DiskUsageDto {
-                            role: dot_agent_deck::prompt_delivery::truncate_on_char_boundary(
+                            role: dot_agent_deck::submitted_prompt::truncate_on_char_boundary(
                                 &disk.role,
                                 dot_agent_deck::daemon_protocol::MAX_ROLE_BYTES,
                             ),
@@ -761,6 +761,17 @@ pub struct DesktopAgent {
     /// whose authoring agents the webview then shows as single agents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authoring_kind: Option<AuthoringKind>,
+    /// PRD #1666 §2.8: the daemon's summary of this agent's inbox
+    /// (`AgentRecord::inbox`), which the tile's `✉N` / `delivered` line is
+    /// drawn from. Absent from a daemon predating it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<DesktopInbox>,
+    /// PRD #1666 §2.8: the deck's notice explaining an `error` status — a
+    /// message it could not deliver — from the daemon's session record
+    /// (`SessionSnapshot::delivery_notice`). Present only beside
+    /// `status: "error"`, and scrubbed here like every other daemon text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_notice: Option<String>,
     /// PRD #1631: the question this agent is waiting on
     /// (`SessionSnapshot.pending_question`), every text field made safe to
     /// show, with whether each option can be answered by voice. Absent when
@@ -775,6 +786,55 @@ pub struct DesktopAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<dot_agent_deck::pull_request_info::PullRequestInfo>,
     pub tab: DesktopTab,
+}
+
+/// PRD #1666 §2.8: the webview's view of an `InboxSummary`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopInbox {
+    pub queued: usize,
+    pub fetched: usize,
+    pub undeliverable: usize,
+    /// When the agent last acknowledged a message, RFC 3339.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_acked_at: Option<String>,
+    /// `native`, `turn_end`, `doorbell` or `none` — the daemon's wire value.
+    pub wake: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    /// PR #1735 fifth review (R5): nothing has woken the agent for its waiting
+    /// messages, so the tile shows them as waiting to wake.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub wake_stalled: bool,
+    /// PRD #1666 §6.5: the deck messages waiting on the user's Retry or
+    /// Cancel. Sender and subject are display copies.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<DesktopInboxAttention>,
+    /// PRD #1666 §11: `cli_too_old`, `adapter_too_old`, `not_armed` or
+    /// `refresh_failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
+    /// PRD #1666 §3: the deck's error recording receipts, a display copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipts_degraded: Option<String>,
+    /// PRD #1666 §7: delivered messages whose evidence pauses hand-outs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_paused: Option<usize>,
+}
+
+/// PRD #1666 §6.4: one deck message a tile lists with its own Retry and
+/// Cancel.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopInboxAttention {
+    pub message_id: String,
+    pub revision: u64,
+    /// `uncertain`, `out_of_attempts` or `held_long`.
+    pub kind: String,
+    pub from_label: String,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 /// PRD #1541: the webview's view of `agent_registry::PromptKeys` — the keys
@@ -1240,10 +1300,6 @@ pub enum DesktopAction {
     DetachTerminal {
         session_id: String,
     },
-    SubmitText {
-        agent_id: String,
-        text: String,
-    },
 }
 
 /// One role a [`DesktopAction::StopOrchestration`] stops: the deck's agent id,
@@ -1383,8 +1439,6 @@ pub struct DesktopActionResult {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub send_result: Option<SendResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalAttachResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2166,6 +2220,54 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     // PRD #1541: the daemon's keys, bounded — never this crate's own registry.
     let prompt_keys = record.prompt_keys.as_ref().and_then(map_prompt_keys);
     let tab = map_tab(record.tab_membership.as_ref());
+    // Inline rather than a helper naming `InboxSummary`'s module, which is the
+    // daemon's and outside what this crate reaches across (linkage-check rule 12).
+    let inbox = record.inbox.as_ref().map(|summary| DesktopInbox {
+        queued: summary.queued,
+        // PRD #1666 S11: a claimed job is taken and not yet acknowledged, which
+        // is what the card counts as fetched; the TUI counts it the same way.
+        fetched: summary.fetched + summary.claimed,
+        undeliverable: summary.undeliverable,
+        last_acked_at: summary.last_acked_at.map(|at| at.to_rfc3339()),
+        wake: serde_json::to_value(summary.wake)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "none".to_string()),
+        component: summary.component.as_deref().map(safe_display_text),
+        wake_stalled: summary.wake_stalled,
+        attention: summary
+            .notices
+            .attention
+            .iter()
+            .filter_map(|item| {
+                let kind = serde_json::to_value(item.kind).ok()?.as_str()?.to_string();
+                Some(DesktopInboxAttention {
+                    message_id: item.message_id.clone(),
+                    revision: item.revision,
+                    kind,
+                    from_label: safe_display_text(&item.from_label),
+                    subject: safe_display_text(&item.subject),
+                    task_id: item.task_id.clone(),
+                })
+            })
+            .collect(),
+        integration: summary
+            .notices
+            .integration
+            .and_then(|notice| serde_json::to_value(notice).ok())
+            .and_then(|value| value.as_str().map(str::to_string)),
+        receipts_degraded: summary
+            .notices
+            .receipts_degraded
+            .as_deref()
+            .map(safe_display_text),
+        evidence_paused: summary.notices.evidence_paused,
+    });
+    let delivery_notice = live
+        .filter(|snapshot| snapshot.status == SessionStatus::Error)
+        .and_then(|snapshot| snapshot.delivery_notice.as_deref())
+        .map(safe_display_text)
+        .filter(|notice| !notice.is_empty());
     let pending_question = live
         .and_then(|snapshot| snapshot.pending_question.as_ref())
         .map(map_pending_question);
@@ -2190,6 +2292,8 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         background,
         prompt_keys,
         authoring_kind: record.authoring_kind,
+        inbox,
+        delivery_notice,
         pending_question,
         pull_request,
         tab,
@@ -3915,6 +4019,7 @@ mod tests {
                 last_activity_ms: None,
                 blocked: None,
                 hook_generation: None,
+                delivery_notice: None,
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: None,
@@ -3929,6 +4034,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         }
     }
 
@@ -3942,6 +4048,71 @@ mod tests {
         assert_eq!(value["status"], "working");
         assert_eq!(value["activeTool"]["name"], "shell");
         assert_eq!(value["tab"]["kind"], "mode");
+    }
+
+    /// Scenario: Map a daemon record with queued and fetched messages into the desktop DTO; its inbox counts must survive for the card badge.
+    #[test]
+    fn agent_mapping_preserves_the_inbox_summary_for_cards() {
+        let mut record = fixture_record();
+        record.inbox = Some(dot_agent_deck::inbox_hub::InboxSummary {
+            queued: 2,
+            fetched: 1,
+            claimed: 0,
+            undeliverable: 1,
+            last_acked_at: None,
+            wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
+            component: None,
+            wake_stalled: false,
+            notices: Default::default(),
+        });
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(
+            value["inbox"]["queued"], 2,
+            "desktop DTO lost queued inbox messages: {value}"
+        );
+        assert_eq!(value["inbox"]["fetched"], 1);
+        assert_eq!(value["inbox"]["undeliverable"], 1);
+        assert_eq!(value["inbox"]["wake"], "doorbell");
+        assert!(
+            value["inbox"].get("attention").is_none(),
+            "absent while empty"
+        );
+    }
+
+    /// Scenario: Map a daemon record whose inbox summary lists an uncertain delivery, an integration notice, failed receipts and paused hand-outs into the desktop DTO; each survives, by its wire spelling, for the tile's notice row and its Retry and Cancel rows.
+    #[test]
+    fn agent_mapping_carries_the_inbox_card_notices() {
+        let mut record = fixture_record();
+        record.inbox = Some(
+            serde_json::from_value(serde_json::json!({
+                "queued": 0, "fetched": 1, "undeliverable": 0, "wake": "native",
+                "attention": [{"message_id": "m-k3xzq2ab-0f3c9a71d2e4b850", "revision": 6,
+                    "kind": "out_of_attempts", "from_label": "the orchestrator\u{1b}[31m",
+                    "subject": "review"}],
+                "integration": "not_armed",
+                "receipts_degraded": "disk full",
+                "evidence_paused": 3
+            }))
+            .unwrap(),
+        );
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        let inbox = &value["inbox"];
+        assert_eq!(
+            inbox["attention"][0]["messageId"],
+            "m-k3xzq2ab-0f3c9a71d2e4b850"
+        );
+        assert_eq!(inbox["attention"][0]["revision"], 6);
+        assert_eq!(inbox["attention"][0]["kind"], "out_of_attempts");
+        assert!(
+            !inbox["attention"][0]["fromLabel"]
+                .as_str()
+                .unwrap()
+                .contains('\u{1b}'),
+            "display copies only: {inbox}"
+        );
+        assert_eq!(inbox["integration"], "not_armed");
+        assert_eq!(inbox["receiptsDegraded"], "disk full");
+        assert_eq!(inbox["evidencePaused"], 3);
     }
 
     /// Issue #856: the CLI column is the DAEMON's answer, copied through

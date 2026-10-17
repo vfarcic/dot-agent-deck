@@ -37,9 +37,9 @@
 //!      and `start`, so command strings never cross the wire and the client
 //!      supplies the command; [`COORDINATOR_COMMAND`] is kept in lockstep with
 //!      the fixture's own `command` key.
-//!   4. `WriteAndSubmit` — the production guarded prompt-delivery RPC types the
-//!      one-line pointer into the coordinator's PTY. That line is all the agent
-//!      is ever told: it names the file and nothing else, so a coordinator that
+//!   4. `PostMessage` — the one-line pointer goes to the coordinator's inbox,
+//!      the way a launch hands it the coordinator prompt. That line is all the
+//!      agent is ever told: it names the file and nothing else, so a coordinator that
 //!      does not read the daemon's file has no task at all.
 //!
 //! ## What makes the assertion robust rather than lucky
@@ -70,7 +70,7 @@ use std::time::Duration;
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
 use dot_agent_deck::daemon_protocol::AttachRequest;
-use dot_agent_deck::event::{AgentType, SendResult};
+use dot_agent_deck::event::AgentType;
 use spec::spec;
 
 /// The fixture's `[[orchestrations]] name`. Named explicitly so nothing about
@@ -98,7 +98,7 @@ const COORDINATOR_COMMAND: &str =
 const SENTINEL: &str = "context_proof_9d4f2a.txt";
 
 /// `DOT_AGENT_DECK_PANE_ID` for the coordinator pane. The test mints it (as
-/// every spawning client does) because it is the handle both `WriteAndSubmit`
+/// every spawning client does) because it is the handle both `PostMessage`
 /// and the daemon's pane maps are keyed on.
 const PANE_ID: &str = "project-launch-coordinator";
 
@@ -123,9 +123,9 @@ const LAUNCH_TASK: &str = "Do this yourself and do not delegate - no other agent
 /// for the daemon's canonical path and config revision, then `PrepareWorkflow`,
 /// so the DAEMON composes and publishes the coordinator context carrying a
 /// directive list-files task, then `StartAgent` to bring a real coordinator up
-/// in that canonical directory, then the production `WriteAndSubmit` RPC to type
-/// the returned one-line "read `.dot-agent-deck/orchestrator-context-*.md` and carry out
-/// your task" pointer into its pane. Its pane is opened in the attached TUI so
+/// in that canonical directory, then `PostMessage` to post the returned one-line
+/// "read `.dot-agent-deck/orchestrator-context-*.md` and carry out your task"
+/// pointer to its inbox. Its pane is opened in the attached TUI so
 /// the live agent is visible while it works. HARD-ASSERT that the uniquely named
 /// fixture sentinel `context_proof_9d4f2a.txt` — which appears nowhere in the
 /// published context, only on disk — shows up in the coordinator's pane, which
@@ -287,10 +287,8 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
         .expect("a successful StartAgent must report the registry id it created");
 
     // ---- 4. The real agent boots. A genuine (non-wrapper) `SessionStart` from
-    // the pane is both the proof that claude actually came up and the generation
-    // the guarded delivery below binds to.
-    let session_id =
-        events.wait_for_session_start_on_pane(PANE_ID, &agent_id, Duration::from_secs(180));
+    // the pane is the proof that claude actually came up.
+    events.wait_for_session_start_on_pane(PANE_ID, &agent_id, Duration::from_secs(180));
 
     // Open the coordinator's pane in the already-attached TUI, so the live agent
     // is on screen (and on the cast) for the whole turn — the surface a user
@@ -312,24 +310,10 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
         eprintln!("warning: the coordinator pane never settled within 180s; delivering anyway");
     }
 
-    // ---- 5. Deliver the one-line pointer through the production guarded RPC —
-    // the same write-and-submit a real launch uses for the coordinator prompt.
-    let resp = common::write_and_submit_with_identity_on(
-        &socket,
-        PANE_ID,
-        &prepared.prompt,
-        &agent_id,
-        Some(&session_id),
-    )
-    .expect("WriteAndSubmit to the coordinator pane over the attach socket");
-    assert_eq!(
-        resp.send_result,
-        Some(SendResult::Applied),
-        "the daemon refused to deliver the coordinator prompt to pane {PANE_ID}: error={:?}, \
-         send_result={:?}",
-        resp.error,
-        resp.send_result
-    );
+    // ---- 5. Post the one-line pointer to the coordinator's inbox, the way a
+    // real launch hands it the coordinator prompt.
+    common::post_message_on(&socket, PANE_ID, &agent_id, &prepared.prompt)
+        .expect("post the coordinator prompt to its inbox");
 
     // ---- 6. THE claim. The coordinator was told only to read a file. If the
     // daemon's write is the one an agent actually reads, the fixture sentinel —

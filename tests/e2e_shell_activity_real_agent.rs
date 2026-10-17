@@ -145,8 +145,15 @@ fn background_007_real_background_command_clears_after_scoped_kill() {
     skip_unless!(common::check_claude_available());
     const SENTINEL_BG: &str = "background-007-ping-d960348b.txt";
     let (deck, events, agent_id) = background_live_fixture("background-007-haiku");
+    // PRD #1666: the absolute path, so the model need not infer its directory.
+    let sentinel_path = deck
+        .workdir()
+        .canonicalize()
+        .expect("absolute fixture directory")
+        .join(SENTINEL_BG);
     let prompt = format!(
-        "Use Bash exactly once as your first action, with run_in_background=true, to execute exactly: ping -c 180 127.0.0.1 > {SENTINEL_BG} 2>&1. Do not use timeout. Do not call TaskOutput, wait, inspect or stop the command. Immediately finish your turn with the single word STARTED after Bash returns the background task id."
+        "Use Bash exactly once as your first action, with run_in_background=true, to execute exactly: ping -c 180 127.0.0.1 > '{}' 2>&1. Do not use timeout. Do not call TaskOutput, wait, inspect or stop the command. Immediately finish your turn with the single word STARTED after Bash returns the background task id.",
+        sentinel_path.display()
     );
     let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL_BG);
     events.wait_for(
@@ -351,7 +358,13 @@ fn claude_prompt_001_long_prompt_is_pasted_and_submitted_whole() {
         "This sentence is padding for a long pasted prompt and asks for nothing. ".repeat(15);
     let prompt = format!(
         "{filler}Ignore the padding above. Your only task: use Bash exactly once to run touch \
-         {SENTINEL} in the current directory, then reply DONE. Do not use any other tool."
+         '{}', then reply DONE. Do not use any other tool.",
+        // PRD #1666: the absolute path, not "the current directory".
+        deck.workdir()
+            .canonicalize()
+            .expect("absolute fixture directory")
+            .join(SENTINEL)
+            .display()
     );
     assert!(
         prompt.chars().count() > common::CLAUDE_TYPED_PROMPT_MAX_CHARS,
@@ -457,10 +470,18 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
         .pane_id_env
         .expect("a real spawned pane must carry a pane_id_env — the daemon assigns it at spawn");
 
+    // PRD #1666: the absolute path, so the model need not infer its directory.
+    let sentinel = deck
+        .workdir()
+        .canonicalize()
+        .expect("absolute fixture directory")
+        .join(SENTINEL)
+        .display()
+        .to_string();
     let prompt = format!(
-        "There is a file named {SENTINEL} in the current directory. Use the Bash tool exactly \
-         once to run this single command: ping -c 20 127.0.0.1 > /dev/null; cat {SENTINEL}. Do \
-         not run any other command. After the tool call finishes, reply with only the exact \
+        "There is a file at {sentinel}. Use the Bash tool exactly once to run this single \
+         command: ping -c 20 127.0.0.1 > /dev/null; cat '{sentinel}'. Do not run any other \
+         command. After the tool call finishes, reply with only the exact \
          file contents and nothing else."
     );
     let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL);
@@ -618,9 +639,17 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_back
         });
     let agent_id = record.id;
 
+    // PRD #1666: the absolute path, so the model need not infer its directory.
+    let sentinel_006 = deck
+        .workdir()
+        .canonicalize()
+        .expect("absolute fixture directory")
+        .join(SENTINEL_006)
+        .display()
+        .to_string();
     let prompt = format!(
         "Use Bash exactly once as your first action. Set command to exactly: ping \
-         -c {PING_COUNT_006} 127.0.0.1 > {SENTINEL_006} 2>&1. Omit both timeout and \
+         -c {PING_COUNT_006} 127.0.0.1 > '{sentinel_006}' 2>&1. Omit both timeout and \
          run_in_background; let Bash use its default foreground timeout and automatically \
          move the command to the background if it reaches that timeout. This is a local \
          loopback ping whose output must be written to the named file. As soon as Bash \

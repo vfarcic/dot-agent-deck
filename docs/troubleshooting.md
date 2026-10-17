@@ -8,7 +8,7 @@ If you are not sure where to start, turn on logging ([Enabling Debug Logs](#enab
 dot-agent-deck daemon status
 ```
 
-`daemon status` prints each managed agent's pane id, label, working directory, orchestration role, status and active tool. It only reads: it never starts a daemon, and it reports a missing or unreachable daemon instead of starting one. Add `--json` for machine-readable output.
+`daemon status` prints each managed agent's pane id, label, working directory, orchestration role, status and active tool, and its inbox: INBOX counts the messages waiting for the agent and those it has taken but not yet acknowledged (`2q 1f`, or `-` when there are none), and WAKE says how a new message reaches it — `native` when the agent's own hooks, plugin or extension take it, `turn-end` when the agent takes it at the end of its turn, `doorbell` when the deck types a one-line notice into the pane once the agent is idle, and `none` when there is no native wake or reported idle moment for a doorbell. It only reads: it never starts a daemon, and it reports a missing or unreachable daemon instead of starting one. Add `--json` for machine-readable output.
 
 ## Logs and diagnostics
 
@@ -206,6 +206,45 @@ Once the hooks no longer call the old copy, the notice goes away within about a 
 
 At startup the same problems are logged instead of printed, and the hooks are not installed.
 
+### A message says not delivered
+
+The TUI card shows **Error** and the desktop tile shows **error**, with a `not delivered: …` line naming the problem. Open the pane first: the agent may have exited, or its integration may have repeatedly taken messages without acknowledging them. Run `dot-agent-deck daemon status` to inspect **INBOX** and **WAKE**. Inside the recipient's deck pane, ask the agent to run `dot-agent-deck inbox list` to inspect recent delivery states; `inbox fetch` reads and acknowledges waiting messages.
+
+Refresh the integration with `dot-agent-deck hooks install` on the machine running the agent, then restart the agent. Check that its command starts successfully. If a delegated task belonged to the exited agent, ask the orchestrator to delegate it again to the replacement. The desktop overview counts these agents under **FAILED**, while each tile uses **error**.
+
+### A message says delivery uncertain
+
+The deck handed a message to the agent, then lost track of whether the agent started on it, and either two marked repeats did not settle it or for a few minutes it could neither check nor hand the message to the agent again (for example because the agent's OpenCode integration stopped). Open the pane and look: if the agent is working on it, Cancel the delivery; if it never saw it, Retry. In the TUI press `i` on the card and then `r` or `c`; in the desktop app use the tile's **Retry** or **Cancel**. If a message is out of attempts, only Cancel is offered: post it again if it is still needed.
+
+### A card says the deck integration is out of date, too old, or not connected
+
+The notice under the card's directory says which:
+
+- `this agent's deck integration is out of date; restart the agent to update it` — the agent loaded an older copy of the deck's plugin. Restart the agent; the deck rewrites its integration from the running deck before the agent starts. When the plugin names another installed copy of `dot-agent-deck`, the deck usually keeps that copy and updates the plugin around it; a newer installed copy of the deck can replace it instead.
+- `the deck could not update this agent's deck integration: run dot-agent-deck hooks install --agent opencode to see why, then restart the agent` — the deck could not write the agent's plugin files when it started, so restarting again will not help by itself. The install command prints the file it cannot write; fix its permissions, then restart the agent.
+- `the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent` — the agent's integration runs an older `dot-agent-deck` than the deck. Upgrade it (or point `DOT_AGENT_DECK_BIN` at the current one), then restart the agent.
+- `this agent's deck integration has not connected yet; its messages wait until it does` — the agent is still starting, or its integration did not load. It clears by itself once the integration connects, and the waiting messages are then delivered; if it stays, restart the agent or run `dot-agent-deck hooks install --agent opencode`.
+
+While a notice stands, the agent's messages wait. When the integration connects without a restart, as it does for an agent that was still starting, they are then delivered. Restarting the agent is different: messages already waiting for it, uncertain ones included, are not handed to the restarted agent. They show as not delivered, an orchestrator is told about each of its tasks so it can delegate them again, and a job offered to the agent goes back to its pool. Post any other message again if it is still needed. [Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app) has the details.
+
+### A card says messages may repeat or deck messages are paused
+
+`messages may repeat: the deck cannot record message receipts for this agent (…)` means the deck could not write its receipts, usually because its state directory is full or not writable; the reason follows. Messages are still delivered, but one may be sent twice. Free the space or fix the permissions, then restart the agent. When the reason says `the receipt spool could not start`, the problem is the deck's, not this agent's: fix the state directory, then restart the deck itself, since restarting the agent does not start the spool.
+
+`deck messages paused: N delivered messages still wait for proof that older copies cannot run; restart the agent to clear them` means the deck stopped handing this agent new messages until it can account for ones it already delivered. Restarting the agent clears it, but the messages waiting for it are not handed to the restarted agent: they show as not delivered, and an orchestrator is told about each of its tasks so it can delegate them again. Post any other message again if it is still needed.
+
+### An agent shows the doorbell instead of waking
+
+A line such as `dot-agent-deck: message m-… waiting, run: dot-agent-deck inbox fetch` means a message is waiting and native wake is unavailable. It is expected for Codex while idle, Claude Code below 2.1.296, and Devin. Both clients use the same delivery paths. [Which agents wake for messages](orchestration.md#which-agents-wake-for-messages) lists the supported paths and the OpenCode configuration remedy.
+
+Run `dot-agent-deck hooks install` after upgrading, then restart the agent; for OpenCode you can use `dot-agent-deck hooks install --agent opencode`. Run those commands on the remote host when the agent runs there. If installation says it cannot edit OpenCode's `tui.json`, add the exact path it prints to that file's `plugin` list, preserve the other entries and restart OpenCode.
+
+The doorbell waits while the agent is busy, a permission or dialog answer is needed, or you have an unsent draft. Send or clear the draft and answer the prompt. When messages have waited a couple of minutes while the agent is not working, the TUI card and the desktop tile both say `waiting to wake: send it a prompt`: send the agent any prompt and it takes its messages at that turn. Codex also waits for a recognised empty input box; if a future Codex UI is not recognised, send the first prompt yourself so messages can arrive at turn end. With untrusted Codex hooks, the model must run `inbox fetch` and its sandbox needs `network_access = true`, as described below.
+
+### An inbox integration is refused with `inbox_not_agent_process`
+
+Run the agent inside its deck pane and restart it after `dot-agent-deck hooks install`. Run its inbox integration as part of that agent, for example through a command the agent executes; a separate terminal with a copy of the pane's environment can be refused. This applies to agents launched from either the TUI or desktop app. If a launcher moves the integration into a separate background service, keep it with the managed agent instead.
+
 ### Codex events not showing
 
 Codex only runs hooks it trusts. The deck records trust for its own hook entries, and only those, in the Codex home's `config.toml`, at startup and whenever it starts a Codex pane. This does not depend on how you launch Codex, so a launcher (`devbox run codex-big`, a script, an alias) needs nothing added.
@@ -230,7 +269,7 @@ Note: the deck's Codex hook for PreToolUse is turned off in Codex's /hooks list,
 
 The deck's log also records a warning naming those hooks each time the deck records trust. To get the detail back, turn the hook on again in Codex's `/hooks` list.
 
-While Codex's hooks are not trusted, or if you turn off the deck's `UserPromptSubmit` hook in Codex's `/hooks` list, Codex cannot confirm to the deck that it received an automatic prompt (the first prompt of a dispatcher or a schedule-authoring agent, an orchestration role's first task, a dispatched unit's task). The deck then types such a prompt once and does not retype it, so the prompt can go missing. Fixing trust fixes that as well.
+While Codex's hooks are not trusted, or if you turn off the deck's `UserPromptSubmit` hook in Codex's `/hooks` list, a doorbell asks Codex to run `dot-agent-deck inbox fetch` itself. That command acknowledges receipt and needs sandbox network access. Trust the hooks to restore automatic message hand-over, including at turn end.
 
 ### Codex as a role or worker: allow sandbox network access
 
@@ -357,7 +396,7 @@ A command an agent runs to talk to the daemon fails instead of returning quietly
 Error: the daemon did not accept this work-done report: refused: this pane was issued a hook capability token and the message presented none. The usual cause is that the `dot-agent-deck` binary invoked in this pane is older than the daemon that spawned it; set DOT_AGENT_DECK_HOOK_PROVENANCE=warn on the daemon to accept it anyway. [missing_token]
 ```
 
-The daemon gives each agent it starts a token in that pane's environment, and the commands an agent uses to act for its pane present it: `delegate`, `work-done`, `dispatch` (including `--list-targets`), `pane spawn`, `pane restart`, `get-seed` and `ack` (`ack` always exits 0, so it never shows this error). The daemon refuses one that names a token-bearing pane without that pane's token. The bracketed code says which case you have:
+The daemon gives each agent it starts a token in that pane's environment, and the commands an agent uses to act for its pane present it: `delegate`, `work-done`, `dispatch` (including `--list-targets`), `pane spawn`, `pane restart`, `inbox list`, `inbox fetch` and `ack` (`ack` always exits 0, so it never shows this error). The daemon refuses one that names a token-bearing pane without that pane's token. The bracketed code says which case you have:
 
 | Code | Message | Cause | Fix |
 | --- | --- | --- | --- |

@@ -60,6 +60,10 @@ fn invoke_hook(agent: &str, payload: &Value) -> AgentEvent {
         .env("DOT_AGENT_DECK_SOCKET", &socket)
         .env("DOT_AGENT_DECK_PANE_ID", PANE)
         .env_remove("DOT_AGENT_DECK_AGENT_ID")
+        // No token: run from inside a deck pane, an inherited one would make
+        // the SessionStart hook also send its inbox announce (PRD #1666) on
+        // the connection this reads as one event.
+        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1167,11 +1171,8 @@ fn background_003_snapshot_hydration_and_revision_ordering() {
         Some("successor-spawn".into()),
         Some(&successor),
     );
-    let generation_before = state.pane_hook_session_entry(PANE);
-    assert_eq!(
-        generation_before.as_ref().map(|(id, _)| id.as_str()),
-        Some(placeholder.as_str())
-    );
+    let generation_before = state.pane_hook_session_id(PANE);
+    assert_eq!(generation_before.as_deref(), Some(placeholder.as_str()));
     let closures_before = state.pane_generation_closures(PANE);
     state.apply_event(frame(
         &placeholder,
@@ -1185,18 +1186,14 @@ fn background_003_snapshot_hydration_and_revision_ordering() {
         Some("successor-spawn")
     );
     assert_eq!(
-        state.pane_hook_session_entry(PANE),
+        state.pane_hook_session_id(PANE),
         generation_before,
-        "AU-16: the successor's delivery generation survives the rejected end"
+        "AU-16: the successor's generation survives the rejected end"
     );
     assert_eq!(
         state.pane_generation_closures(PANE),
         closures_before,
         "AU-16: the rejected end counts no closure"
-    );
-    assert!(
-        !state.agent_generation_ended("ending-spawn"),
-        "AU-16: the rejected end records no generation as ended"
     );
 
     // The pane check: an end naming the key of a card on ANOTHER pane is
@@ -1285,7 +1282,6 @@ fn background_003_snapshot_hydration_and_revision_ordering() {
         assert!(state.sessions[&placeholder].recent_events.is_empty());
         assert_eq!(state.pane_hook_session_id(PANE), None);
         assert_eq!(state.pane_generation_closures(PANE), closures_before + 1);
-        assert!(state.agent_generation_ended("ending-spawn"));
     }
 }
 

@@ -165,7 +165,6 @@ fn older_peer_reply_without_the_new_fields_still_deserializes() {
 
     assert!(decoded.ok);
     assert_eq!(decoded.server_version, Some(8));
-    assert_eq!(decoded.guarded_send, Some(true));
     assert!(decoded.projects.is_none());
     assert!(decoded.project.is_none());
     assert!(decoded.workflow_prepared.is_none());

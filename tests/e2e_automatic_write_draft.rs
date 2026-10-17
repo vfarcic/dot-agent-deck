@@ -1,452 +1,142 @@
 #![cfg(all(feature = "e2e", unix))]
 
-//! Attached-TUI regressions for automatic daemon writes into a pane where a
-//! person is still drafting input. The fixture uses live `cat` PTYs so the
-//! submitted lines can be read without spending an agent credential.
+//! Attached-TUI draft regressions retargeted from typed task delivery to the
+//! inbox doorbell. Synthetic panes spend no real-agent credential.
 
 mod common;
-
-use std::cell::RefCell;
-use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
 
 use common::TuiDeck;
-use dot_agent_deck::agent_pty::AgentRecord;
-use dot_agent_deck::daemon_protocol::TabMembership;
-use dot_agent_deck::event::EventType;
+use inbox::*;
 use spec::spec;
+use std::time::Duration;
 
-const DRAFT: &str = "draft-544-sentinel";
-const POINTER: &str = "Read .dot-agent-deck/worker-task-worker.md for your task.";
-
-/// Issue #1383: the pointer ends in its delivery id, so the line the worker
-/// echoes back is `POINTER [delivery d-xxxxxxxx]`. Whether `text` holds that
-/// line submitted — followed by the CR the worker's terminal echoes as CRLF.
-fn pointer_line_submitted(text: &str) -> bool {
-    text.split("\r\n").any(|line| {
-        line.strip_prefix(POINTER)
-            .and_then(|rest| rest.strip_prefix(" [delivery d-"))
-            .and_then(|rest| rest.strip_suffix(']'))
-            .is_some_and(|id| id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit()))
-            && text.contains(&format!("{line}\r\n"))
-    })
-}
-const FEEDBACK: &str = "work-done-draft-544-feedback";
-const FIRST_REPORT: &str = "work-done-order-544-first";
-const SECOND_REPORT: &str = "work-done-order-544-second";
-
-fn launch_orchestration(cap_ms: &str) -> TuiDeck {
+fn launch() -> (TuiDeck, Pane) {
     let deck = TuiDeck::builder()
-        .impersonating_pane_signals()
-        .with_pty_size(120, 40)
-        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
-        .with_env("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", cap_ms)
-        .launch_with_fixture("orch-deck");
+        .with_pty_size(160, 45)
+        .with_env("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")
+        .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
+        // The tests fetch the stand-in's mail from the test process, outside
+        // its pane; inbox/protocol/014 and /015 pin the binding itself.
+        .with_env("DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS", "1")
+        .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
-    let config_path = deck.workdir().join(".dot-agent-deck.toml");
-    let original = std::fs::read_to_string(&config_path).expect("read orchestration fixture");
-    let configured = original.replace(
-        "name = \"worker\"\ncommand = \"cat\"",
-        "name = \"worker\"\ncommand = \"cat\"\nclear = false",
-    );
-    assert_ne!(
-        configured, original,
-        "worker must retain its pane on delegate"
-    );
-    std::fs::write(config_path, configured).expect("keep worker pane across delegation");
-    deck.send_keys(b"\x0e");
-    deck.send_keys(b" ");
-    deck.wait_for_string("No mode");
-    deck.send_keys(b"\x1b[C");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"\r");
-    deck.wait_for_string("worker");
-    assert!(
-        common::wait_until(Duration::from_secs(10), || {
-            let records = common::agent_records_on(deck.attach_socket_path());
-            ["orchestrator", "worker"].into_iter().all(|name| {
-                records.iter().any(|record| {
-                    matches!(
-                        &record.tab_membership,
-                        Some(TabMembership::Orchestration { role_name, .. }) if role_name == name
-                    )
-                })
-            })
-        }),
-        "orchestration role panes were not registered"
-    );
-    deck
+    let pane = pane(&deck, "draft-worker");
+    status(&deck, &pane, "session_start", "pi");
+    deck.wait_for_absence("No active agents");
+    deck.send_keys(b"1");
+    deck.wait_for_string("DOORBELL-STANDIN-READY");
+    (deck, pane)
 }
 
-fn role(deck: &TuiDeck, name: &str) -> AgentRecord {
-    let records = common::agent_records_on(deck.attach_socket_path());
-    records
-        .iter()
-        .find(|record| {
-            matches!(
-                &record.tab_membership,
-                Some(TabMembership::Orchestration { role_name, .. }) if role_name == name
-            )
-        })
-        .unwrap_or_else(|| panic!("{name} role absent from registry: {records:?}"))
-        .clone()
-}
-
-fn pane_text(deck: &TuiDeck, agent_id: &str) -> String {
-    common::strip_ansi(&common::pane_snapshot_on(
-        deck.attach_socket_path(),
-        agent_id,
-    ))
-}
-
-fn focus_worker(deck: &TuiDeck) {
-    deck.send_keys(b"\x04"); // pane input -> command mode
-    deck.send_keys(b"2"); // worker is the second role card
-    deck.wait_until_grid("worker pane focused", |grid| grid.contains("┌worker"));
-}
-
-fn delegate(deck: &TuiDeck) -> Output {
-    let orchestrator = role(deck, "orchestrator");
-    Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args([
-            "delegate",
-            "--to",
-            "worker",
-            "--task",
-            "Inspect the draft-deferral sentinel.",
-        ])
-        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-        .env(
-            "DOT_AGENT_DECK_PANE_ID",
-            orchestrator.pane_id_env.expect("orchestrator pane id"),
-        )
-        .env("HOME", deck.home_dir())
-        .current_dir(deck.workdir())
-        .output()
-        .expect("run delegate CLI")
-}
-
-fn assert_cli_success(output: &Output, name: &str) {
-    assert!(
-        output.status.success(),
-        "{name} exited {:?}; stdout={:?}; stderr={:?}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// Scenario: Type a draft into the focused worker pane, then delegate through
-/// the real CLI. The pointer must stay absent until Enter, and the worker PTY
-/// must show the user's draft and the pointer on separate submitted lines.
-#[spec("orchestration/delegate/041")]
-#[test]
-fn orchestration_delegate_041_pointer_waits_for_attached_worker_draft() {
-    let deck = launch_orchestration("60000");
-    focus_worker(&deck);
-    let worker = role(&deck, "worker");
+fn draft(deck: &TuiDeck, pane: &Pane) {
     deck.send_keys(DRAFT.as_bytes());
     assert!(
-        common::wait_until(Duration::from_secs(5), || pane_text(&deck, &worker.id)
-            .contains(DRAFT)),
-        "draft did not reach the worker PTY"
-    );
-    assert_cli_success(&delegate(&deck), "delegate");
-
-    assert!(
-        !common::wait_until(Duration::from_secs(3), || pane_text(&deck, &worker.id)
-            .contains(POINTER)),
-        "delegate pointer reached worker before the user submitted the draft: {:?}",
-        pane_text(&deck, &worker.id)
-    );
-    deck.send_keys(b"\r");
-    assert!(
-        common::wait_until(Duration::from_secs(10), || {
-            let text = pane_text(&deck, &worker.id);
-            text.contains(&format!("{DRAFT}\r\n")) && pointer_line_submitted(&text)
-        }),
-        "delegate pointer never arrived after Enter: {:?}",
-        pane_text(&deck, &worker.id)
-    );
-    let text = pane_text(&deck, &worker.id);
-    assert!(
-        text.contains(&format!("{DRAFT}\r\n"))
-            && pointer_line_submitted(&text)
-            && !text.contains(&format!("{DRAFT}{POINTER}")),
-        "draft and pointer were not separate submitted lines: {text:?}"
-    );
-}
-
-/// Scenario: Leave a draft in the focused orchestrator pane and send a real
-/// worker completion. Its feedback must wait, while a second daemon command
-/// still completes promptly; Ctrl+U then releases the feedback by itself.
-#[spec("orchestration/work-done/010")]
-#[test]
-fn orchestration_work_done_010_feedback_wait_does_not_stall_daemon() {
-    let deck = launch_orchestration("60000");
-    let orchestrator = role(&deck, "orchestrator");
-    let worker = role(&deck, "worker");
-    deck.send_keys(DRAFT.as_bytes());
-    assert!(
-        common::wait_until(Duration::from_secs(5), || pane_text(
-            &deck,
-            &orchestrator.id
-        )
-        .contains(DRAFT)),
-        "draft did not reach the orchestrator PTY"
-    );
-
-    let events = deck.subscribe_events();
-
-    let completion = RefCell::new(
-        Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-            .args(["work-done", "--task", FEEDBACK])
-            .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-            .env(
-                "DOT_AGENT_DECK_PANE_ID",
-                worker.pane_id_env.as_deref().expect("worker pane id"),
-            )
-            .env("HOME", deck.home_dir())
-            .current_dir(deck.workdir())
-            .spawn()
-            .expect("start work-done CLI"),
-    );
-
-    assert!(
-        !common::wait_until(Duration::from_secs(3), || pane_text(
-            &deck,
-            &orchestrator.id
-        )
-        .contains(FEEDBACK)),
-        "work-done feedback submitted the orchestrator's unsent draft: {:?}",
-        pane_text(&deck, &orchestrator.id)
-    );
-    let start = Instant::now();
-    let event = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args(["agent-event", "--type", "running"])
-        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
-        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-        .env(
-            "DOT_AGENT_DECK_PANE_ID",
-            worker.pane_id_env.as_deref().expect("worker pane id"),
-        )
-        .env("DOT_AGENT_DECK_AGENT_ID", &worker.id)
-        .env("HOME", deck.home_dir())
-        .current_dir(deck.workdir())
-        .output()
-        .expect("send worker status hook during feedback wait");
-    assert_cli_success(&event, "agent-event");
-    events.wait_for(
-        |event| {
-            event.pane_id.as_deref() == worker.pane_id_env.as_deref()
-                && event.agent_id.as_deref() == Some(worker.id.as_str())
-                && event.event_type == EventType::Thinking
-        },
-        Duration::from_secs(3),
-    );
-    let status = RefCell::new(
-        Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-            .args(["daemon", "status", "--json"])
-            .env("DOT_AGENT_DECK_ATTACH_SOCKET", deck.attach_socket_path())
-            .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-            .env("HOME", deck.home_dir())
-            .current_dir(deck.workdir())
-            .spawn()
-            .expect("query daemon status during feedback wait"),
-    );
-    let status_result = RefCell::new(None);
-    let responsive = common::wait_until(Duration::from_secs(3), || {
-        if let Some(result) = status.borrow_mut().try_wait().expect("poll daemon status") {
-            *status_result.borrow_mut() = Some(result);
-            true
-        } else {
-            false
-        }
-    });
-    if !responsive {
-        status
-            .borrow_mut()
-            .kill()
-            .expect("stop stalled daemon status");
-        panic!("daemon status stalled behind a deferred work-done write");
-    }
-    let status_result = status_result.into_inner().expect("completed daemon status");
-    assert!(
-        status_result.success() && start.elapsed() < Duration::from_secs(3),
-        "daemon status failed or stalled while work-done feedback waited: status={status_result:?}, elapsed={:?}",
-        start.elapsed(),
-    );
-
-    deck.send_keys(b"\x15");
-    assert!(
-        common::wait_until(Duration::from_secs(10), || pane_text(
-            &deck,
-            &orchestrator.id
-        )
-        .contains(FEEDBACK)),
-        "work-done feedback never arrived after Ctrl+U: {:?}",
-        pane_text(&deck, &orchestrator.id)
-    );
-    assert!(
-        common::wait_until(Duration::from_secs(5), || completion
-            .borrow_mut()
-            .try_wait()
-            .expect("poll work-done")
-            .is_some()),
-        "work-done CLI remained blocked after feedback was delivered"
-    );
-    let text = pane_text(&deck, &orchestrator.id);
-    assert!(
-        !text.contains(&format!("{DRAFT}Worker")),
-        "work-done feedback submitted the cleared draft: {text:?}"
-    );
-}
-
-/// Scenario: Two worker completions arrive while the orchestrator has an
-/// unsent draft. Clearing the draft must deliver both reports as separate
-/// turns in the order their hook requests arrived.
-#[spec("orchestration/work-done/010")]
-#[test]
-fn orchestration_work_done_010_deferred_reports_keep_arrival_order() {
-    let deck = launch_orchestration("60000");
-    let orchestrator = role(&deck, "orchestrator");
-    let worker = role(&deck, "worker");
-    deck.send_keys(DRAFT.as_bytes());
-    assert!(
-        common::wait_until(Duration::from_secs(5), || pane_text(
-            &deck,
-            &orchestrator.id
-        )
-        .contains(DRAFT)),
-        "draft did not reach the orchestrator PTY"
-    );
-
-    for report in [FIRST_REPORT, SECOND_REPORT] {
-        let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-            .args(["work-done", "--task", report])
-            .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-            .env(
-                "DOT_AGENT_DECK_PANE_ID",
-                worker.pane_id_env.as_deref().expect("worker pane id"),
-            )
-            .env("HOME", deck.home_dir())
-            .current_dir(deck.workdir())
-            .output()
-            .expect("run work-done CLI");
-        assert_cli_success(&output, "work-done");
-    }
-    assert!(
-        !common::wait_until(Duration::from_millis(800), || {
-            let text = pane_text(&deck, &orchestrator.id);
-            text.contains(FIRST_REPORT) || text.contains(SECOND_REPORT)
-        }),
-        "completion reached the orchestrator before the draft was cleared: {:?}",
-        pane_text(&deck, &orchestrator.id)
-    );
-
-    deck.send_keys(b"\x15");
-    assert!(
-        common::wait_until(Duration::from_secs(10), || pane_text(
-            &deck,
-            &orchestrator.id
-        )
-        .contains(SECOND_REPORT)),
-        "second completion never arrived after Ctrl+U: {:?}",
-        pane_text(&deck, &orchestrator.id)
-    );
-    let text = pane_text(&deck, &orchestrator.id);
-    let first = text.find(FIRST_REPORT).expect("first completion was lost");
-    let second = text
-        .find(SECOND_REPORT)
-        .expect("second completion was lost");
-    assert!(
-        first < second && text[first..second].contains("\r\n"),
-        "completion reports were reordered or joined into one turn: {text:?}"
-    );
-    assert!(
-        !text.contains(&format!("{DRAFT}Worker")),
-        "completion report submitted the cleared user draft: {text:?}"
-    );
-}
-
-/// Scenario: Leave a worker draft unsent beyond a short two-second deferral
-/// cap. The real delegate pointer must eventually arrive despite the draft,
-/// and the worker's card changes to Error when the cap delivers the pointer.
-#[spec("orchestration/delegate/040")]
-#[test]
-fn orchestration_delegate_040_cap_delivers_instead_of_dropping_pointer() {
-    let deck = launch_orchestration("2000");
-    focus_worker(&deck);
-    let worker = role(&deck, "worker");
-    let card_column = || {
+        common::wait_until(WAIT, || bytes(pane) == DRAFT.as_bytes()),
+        "attached TUI must forward the human draft: {}",
         deck.snapshot_grid()
-            .lines()
-            .map(|line| line.chars().take(40).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let event = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args(["agent-event", "--type", "running"])
-        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
-        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-        .env(
-            "DOT_AGENT_DECK_PANE_ID",
-            worker.pane_id_env.as_deref().expect("worker pane id"),
-        )
-        .env("DOT_AGENT_DECK_AGENT_ID", &worker.id)
-        .env("HOME", deck.home_dir())
-        .current_dir(deck.workdir())
-        .output()
-        .expect("announce worker session through hook socket");
-    assert_cli_success(&event, "worker agent-event");
-    assert!(
-        common::wait_until(Duration::from_secs(5), || card_column()
-            .contains("Pi · worker")),
-        "worker did not acquire a renderable session card: {}",
-        card_column()
     );
-    deck.send_keys(DRAFT.as_bytes());
-    assert!(
-        common::wait_until(Duration::from_secs(5), || pane_text(&deck, &worker.id)
-            .contains(DRAFT)),
-        "draft did not reach the worker PTY"
-    );
+    deck.wait_for_string(DRAFT);
+}
 
-    let start = Instant::now();
-    assert_cli_success(&delegate(&deck), "delegate");
-    assert!(
-        !common::wait_until(Duration::from_millis(900), || pane_text(&deck, &worker.id)
-            .contains(POINTER)),
-        "pointer arrived before the draft deferral cap: {:?}",
-        pane_text(&deck, &worker.id)
+/// Scenario: Type a human draft through the attached TUI and queue a task. Enter must leave the draft and fixed doorbell as separate submitted lines visibly in the pane, without typing the task content.
+#[spec("inbox/doorbell/009")]
+#[test]
+fn doorbell_009_attached_draft_enter_releases_fixed_line() {
+    let (deck, pane) = launch();
+    draft(&deck, &pane);
+    let id = enqueue(&deck, &pane, BODY);
+    unchanged(&pane, Duration::from_millis(700));
+    assert!(rings(&pane).is_empty());
+    deck.send_keys(b"\r");
+    ring(&deck, &pane, &id);
+    deck.wait_for_string(&format!("SUBMITTED:{}", fixed_line(&id)));
+    assert_eq!(
+        bytes(&pane),
+        format!("{DRAFT}\r{}\r", fixed_line(&id)).as_bytes()
     );
-    assert!(
-        card_column()
-            .lines()
-            .find(|line| line.contains("Pi · worker"))
-            .is_some_and(|line| !line.contains("Error")),
-        "worker card showed Error while the pointer was still deferred: {}",
-        card_column()
+    assert!(!deck.snapshot_grid().contains(BODY));
+}
+
+/// Scenario: Leave a human draft unsent through more than ten accelerated legacy cap periods. The doorbell must stay absent with the message Queued; Ctrl+U clears the draft and permits the fixed line without ever submitting the draft.
+#[spec("inbox/doorbell/010")]
+#[test]
+fn doorbell_010_draft_has_no_timeout_cap() {
+    let (deck, pane) = launch();
+    draft(&deck, &pane);
+    let id = enqueue(&deck, &pane, BODY);
+    unchanged(&pane, Duration::from_millis(1500));
+    assert_eq!(
+        bytes(&pane),
+        DRAFT.as_bytes(),
+        "legacy cap must never force-submit a user draft"
     );
-    assert!(
-        common::wait_until(Duration::from_secs(8), || pane_text(&deck, &worker.id)
-            .contains(POINTER)),
-        "pointer was lost after the draft deferral cap: {:?}",
-        pane_text(&deck, &worker.id)
+    state(&deck, &pane, &id, "queued");
+    deck.send_keys(b"\x15");
+    ring(&deck, &pane, &id);
+    deck.wait_for_string(&format!("SUBMITTED:{}", fixed_line(&id)));
+    assert_eq!(
+        bytes(&pane),
+        format!("{DRAFT}\x15{}\r", fixed_line(&id)).as_bytes()
     );
+    assert!(!turns(&pane).iter().any(|turn| turn["line"] == DRAFT));
+}
+
+/// Scenario: After a submitted doorbell, type a fresh human draft and fetch the task through another consumer. Cleanup must wait without submitting that draft; clearing it permits exactly one bare CR and no new doorbell.
+#[spec("inbox/doorbell/011")]
+#[test]
+fn doorbell_011_cleanup_cr_respects_a_new_human_draft() {
+    let (deck, pane) = launch();
+    let id = enqueue(&deck, &pane, BODY);
+    ring(&deck, &pane, &id);
+    deck.send_keys(DRAFT.as_bytes());
+    deck.wait_for_string(DRAFT);
+    assert!(common::wait_until(WAIT, || bytes(&pane).ends_with(DRAFT.as_bytes())));
+    fetch(&deck, &pane, true);
+    state(&deck, &pane, &id, "acknowledged");
+    unchanged(&pane, Duration::from_millis(700));
     assert!(
-        start.elapsed() >= Duration::from_millis(1800),
-        "pointer arrived before the configured two-second cap: {:?}",
-        start.elapsed()
+        bytes(&pane).ends_with(DRAFT.as_bytes()),
+        "cleanup submitted the human draft"
     );
+    deck.send_keys(b"\x15");
+    let expected = format!("{}\r{DRAFT}\x15\r", fixed_line(&id));
     assert!(
-        common::wait_until(Duration::from_secs(5), || {
-            card_column()
-                .lines()
-                .any(|line| line.contains("Pi · worker") && line.contains("Error"))
-        }),
-        "worker card did not show Error after the draft-deferral cap: {}",
-        card_column()
+        common::wait_until(WAIT, || bytes(&pane) == expected.as_bytes()),
+        "clearing draft must release one cleanup CR: {:?}",
+        bytes(&pane)
+    );
+    unchanged(&pane, Duration::from_millis(400));
+    assert_eq!(rings(&pane).len(), 1);
+    assert!(!turns(&pane).iter().any(|turn| turn["line"] == DRAFT));
+}
+
+/// Scenario: Hold two queued reports behind a draft in an attached pane. Clearing the draft must produce one coalesced fixed line; fetching must return both reports in arrival order with no report content typed into the pane.
+#[spec("inbox/doorbell/012")]
+#[test]
+fn doorbell_012_drafted_batch_fetch_preserves_arrival_order() {
+    let (deck, pane) = launch();
+    draft(&deck, &pane);
+    let first = enqueue(&deck, &pane, "first-worker-report-1666");
+    let second = enqueue(&deck, &pane, "second-worker-report-1666");
+    unchanged(&pane, Duration::from_millis(700));
+    deck.send_keys(b"\x15");
+    assert!(
+        common::wait_until(WAIT, || !rings(&pane).is_empty()),
+        "draft clear never released batch"
+    );
+    let reply = fetch(&deck, &pane, true).to_string();
+    assert!(
+        reply.find("first-worker-report-1666").unwrap()
+            < reply.find("second-worker-report-1666").unwrap(),
+        "fetch must preserve report arrival order: {reply}"
+    );
+    state(&deck, &pane, &first, "acknowledged");
+    state(&deck, &pane, &second, "acknowledged");
+    assert_eq!(rings(&pane).len(), 1);
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("first-worker-report-1666") && !grid.contains("second-worker-report-1666")
     );
 }

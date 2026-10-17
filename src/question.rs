@@ -493,7 +493,7 @@ pub fn mint_question_id() -> String {
 
 fn clean(raw: &str, max_bytes: usize, keep_newlines: bool) -> String {
     let stripped = crate::untrusted_text::strip_control_and_bidi(raw, keep_newlines);
-    crate::prompt_delivery::truncate_on_char_boundary(stripped.trim(), max_bytes)
+    crate::submitted_prompt::truncate_on_char_boundary(stripped.trim(), max_bytes)
 }
 
 fn clean_opt(raw: Option<String>, max_bytes: usize) -> Option<String> {

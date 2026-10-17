@@ -881,21 +881,26 @@ async fn pane_restart_011_force_bypasses_the_post_dispatch_lock_recheck_too() {
 }
 
 /// The pointer line `dispatch_one_owned` writes into the `coder` worker's PTY.
-const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
-
-/// Count `POINTER` in whatever agent currently owns the worker pane.
+/// PRD #1666 S5: how many delegated tasks the worker pane's inbox holds for
+/// whatever agent owns the pane now — what a delegate posts instead of typing
+/// a pointer.
 fn pointers_in_worker_pane(registry: &AgentPtyRegistry) -> usize {
+    let Some(agent) = registry.pane_current_agent_id(WORKER_PANE) else {
+        return 0;
+    };
     registry
-        .pane_current_agent_id(WORKER_PANE)
-        .and_then(|id| registry.snapshot(&id).ok())
-        .unwrap_or_default()
-        .windows(POINTER.len())
-        .filter(|w| *w == POINTER)
+        .inbox()
+        .list(WORKER_PANE)
+        .into_iter()
+        .filter(|message| {
+            message.bind_agent.as_deref() == Some(agent.as_str())
+                && message.subject.starts_with("task from the orchestrator")
+        })
         .count()
 }
 
-/// Poll until the worker pane's current agent has received at least `count`
-/// pointers, or `timeout` passes. Returns whether it got there.
+/// Poll until the worker pane's current agent has been posted at least `count`
+/// tasks, or `timeout` passes. Returns whether it got there.
 async fn wait_for_pointers(registry: &AgentPtyRegistry, count: usize, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -932,9 +937,9 @@ async fn delegate_to_worker(fx: &Fixture, supersede: bool) -> DelegateResponse {
 }
 
 /// Scenario: the orchestrator delegates to a healthy `cat` worker, waits for the
-/// task pointer to land, and delegates to it again before any work-done — that
-/// second delegate must be refused as busy and never reach the pane (issue
-/// #580). The orchestrator then cancels the task with `pane restart --force`,
+/// task to reach its inbox, and delegates to it again before any work-done —
+/// that second delegate must be refused as busy and never reach the worker
+/// (issue #580). The orchestrator then cancels the task with `pane restart --force`,
 /// and a plain delegate to the restarted role must go through, because the
 /// restart retired the commission only the replaced agent could have answered
 /// (issue #590).
@@ -968,13 +973,11 @@ async fn pane_restart_012_force_restart_cancels_the_task_a_busy_refusal_names() 
     assert!(
         wait_for_pointers(
             &fx.daemon.registry,
-            2,
+            1,
             common::load_scaled(Duration::from_secs(20))
         )
         .await,
-        "precondition: the first task pointer never reached the worker and came back from \
-         `cat`; pointers seen = {}",
-        pointers_in_worker_pane(&fx.daemon.registry)
+        "precondition: the first task never reached the worker"
     );
     let delivered_once = pointers_in_worker_pane(&fx.daemon.registry);
 
@@ -1006,7 +1009,7 @@ async fn pane_restart_012_force_restart_cancels_the_task_a_busy_refusal_names() 
     assert_eq!(
         pointers_in_worker_pane(&fx.daemon.registry),
         delivered_once,
-        "the refused delegate must not have written a second pointer into the busy pane"
+        "the refused delegate must not have posted a second task to the busy worker"
     );
 
     let restarted = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
@@ -1083,23 +1086,27 @@ impl Drop for EnvRestore {
     }
 }
 
-/// Whether the orchestrator pane shows the daemon's silent-worker notice.
+/// PRD #1666 S5: whether the orchestrator's inbox holds a notice that a task
+/// did not reach its worker — the undelivered notice that replaced the
+/// silent-worker watch, or the undeliverable one.
 fn orchestrator_shows_silence_notice(registry: &AgentPtyRegistry) -> bool {
-    let text = registry
-        .pane_current_agent_id(ORCH_PANE)
-        .and_then(|id| registry.snapshot(&id).ok())
-        .map(|s| String::from_utf8_lossy(&s).into_owned())
-        .unwrap_or_default();
-    text.contains("delegated worker went quiet (dot-agent-deck daemon report)")
+    registry
+        .inbox()
+        .rendered(ORCH_PANE)
+        .into_iter()
+        .any(|delivery| {
+            delivery.text.contains("has not reached the worker")
+                || delivery.text.contains("is undeliverable")
+        })
 }
 
-/// Scenario: with a short silent-worker window and the idle detector off, the
-/// orchestrator delegates to a `cat` worker (which never emits an agent event),
-/// the pointer lands, and the orchestrator cancels the task at once with
-/// `pane restart --force`. The daemon's "delegated worker went quiet" notice must
-/// never appear in the orchestrator's pane for that cancelled task. A second,
-/// uncancelled delegate afterwards must produce the notice, proving the detector
-/// was on and the notice observable all along (Greptile and Qodo on PR #1285).
+/// Scenario: with a short undelivered-notice window and the idle detector off,
+/// the orchestrator delegates to a `cat` worker (which never takes its task),
+/// the task reaches the worker's inbox, and the orchestrator cancels it at once
+/// with `pane restart --force`. No notice that the task did not reach the worker
+/// may appear in the orchestrator's inbox for that cancelled task. A second,
+/// uncancelled delegate afterwards must produce the notice, proving the notice
+/// was on and observable all along (Greptile and Qodo on PR #1285).
 #[test]
 #[spec("pane/restart/013")]
 fn pane_restart_013_force_restart_cancels_the_silent_worker_notice() {
@@ -1111,7 +1118,7 @@ fn pane_restart_013_force_restart_cancels_the_silent_worker_notice() {
     // in the same process; for them the values only switch the idle detector off
     // and shorten the silent-worker window, and none of them asserts on either.
     let _env = EnvRestore::set(&[
-        ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "1000"),
+        ("DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS", "1000"),
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ]);
     tokio::runtime::Builder::new_multi_thread()
@@ -1132,7 +1139,7 @@ fn pane_restart_013_force_restart_cancels_the_silent_worker_notice() {
             assert_eq!(first.delivered, vec![WORKER_ROLE.to_string()], "{first:?}");
             assert!(
                 wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(20)).await,
-                "precondition: the first task pointer never reached the worker"
+                "precondition: the first task never reached the worker"
             );
             let restarted = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
             assert!(restarted.restarted, "{restarted:?}");
@@ -1165,19 +1172,16 @@ fn pane_restart_013_force_restart_cancels_the_silent_worker_notice() {
         });
 }
 
-/// Scenario: Type an unsent draft into a worker pane and delegate a task while
-/// that draft holds the task pointer. A forced pane restart must reply promptly,
-/// and the waiting task must either reach the replacement worker as a submitted
-/// line or produce a delivery notice, without carrying the old draft forward.
+/// Scenario: Type an unsent draft into a worker pane and delegate a task. The
+/// draft holds back no post: the task reaches the worker's inbox at once and
+/// nothing is typed into the drafted pane. A forced pane restart must reply
+/// promptly; the task it cancelled is retired with the replaced agent rather
+/// than handed to the replacement, and the old draft does not reach the
+/// replacement pane.
 #[test]
 #[spec("pane/restart/015")]
 fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
-    let _env = EnvRestore::set(&[
-        ("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "60000"),
-        ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "0"),
-        ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0"),
-        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
-    ]);
+    let _env = EnvRestore::set(&[("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -1188,11 +1192,6 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
 
             const DRAFT: &str = "restart-draft-must-stay-with-old-worker";
             let fx = fixture("cat").await;
-            let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let captured = std::sync::Arc::clone(&notices);
-            fx.daemon.registry.set_delivery_notice_sink(std::sync::Arc::new(
-                move |notice| captured.lock().expect("lock delivery notices").push(notice),
-            ));
             tokio::fs::write(
                 fx._dir.path().join(".dot-agent-deck.toml"),
                 format!("{}clear = false\n", config("cat")),
@@ -1207,7 +1206,9 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
                 .expect("subscribe to worker input");
             {
                 let mut writer = handle.writer.lock().await;
-                writer.write_all(DRAFT.as_bytes()).expect("type worker draft");
+                writer
+                    .write_all(DRAFT.as_bytes())
+                    .expect("type worker draft");
                 writer.flush().expect("flush worker draft");
             }
             assert!(
@@ -1221,15 +1222,11 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
                 vec![WORKER_ROLE.to_string()],
                 "precondition: the delegate was not queued; response = {queued:?}"
             );
-            let task_file = fx
-                ._dir
-                .path()
-                .join(".dot-agent-deck/worker-task-coder.md");
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while !task_file.exists() && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            assert!(task_file.exists(), "precondition: dispatch never prepared the task file");
+            // PRD #1666 S5: posted at once, bound to the drafted worker.
+            assert!(
+                wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(5)).await,
+                "precondition: the task never reached the drafted worker's inbox"
+            );
             tokio::time::sleep(Duration::from_millis(300)).await;
             let old_snapshot = fx
                 .daemon
@@ -1237,9 +1234,11 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
                 .snapshot(&fx.worker_agent_id)
                 .expect("snapshot drafted worker");
             assert!(
-                old_snapshot.windows(DRAFT.len()).any(|bytes| bytes == DRAFT.as_bytes())
-                    && !old_snapshot.windows(POINTER.len()).any(|bytes| bytes == POINTER),
-                "precondition: pointer was not waiting behind the unsent draft; snapshot = {:?}",
+                old_snapshot
+                    .windows(DRAFT.len())
+                    .any(|bytes| bytes == DRAFT.as_bytes())
+                    && !String::from_utf8_lossy(&old_snapshot).contains("worker-task-coder.md"),
+                "nothing may be typed into the drafted pane; snapshot = {:?}",
                 String::from_utf8_lossy(&old_snapshot)
             );
 
@@ -1248,53 +1247,43 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
                 restart_role(&fx, ORCH_PANE, WORKER_ROLE, true),
             )
             .await
-            .expect("pane restart did not reply within eight seconds while a delegate waited on a draft");
+            .expect("pane restart did not reply within eight seconds while a task waited");
             assert!(
                 restarted.restarted && restarted.error.is_none(),
-                "pane restart must succeed while a delegate waits on a draft; response = {restarted:?}"
+                "pane restart must succeed while a task waits; response = {restarted:?}"
             );
             let replacement = fx
                 .daemon
                 .registry
                 .pane_current_agent_id(WORKER_PANE)
                 .expect("restart left no worker in the pane");
-            assert_ne!(replacement, fx.worker_agent_id, "restart did not replace the worker");
-
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-            let submitted_pointer = [POINTER, b"\r\n"].concat();
-            let replacement_snapshot = loop {
-                let snapshot = fx.daemon.registry.snapshot(&replacement).unwrap_or_default();
-                let delivered = snapshot
-                    .windows(submitted_pointer.len())
-                    .any(|bytes| bytes == submitted_pointer);
-                let reported = notices
-                    .lock()
-                    .expect("lock delivery notices")
-                    .iter()
-                    .any(|notice: &dot_agent_deck::agent_pty::DeliveryNotice| {
-                        notice.pane_id == WORKER_PANE
-                    });
-                if delivered || reported || tokio::time::Instant::now() >= deadline {
-                    break snapshot;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            };
-            let reported = notices
-                .lock()
-                .expect("lock delivery notices")
-                .iter()
-                .any(|notice: &dot_agent_deck::agent_pty::DeliveryNotice| {
-                    notice.pane_id == WORKER_PANE
-                });
-            assert!(
-                replacement_snapshot
-                    .windows(submitted_pointer.len())
-                    .any(|bytes| bytes == submitted_pointer)
-                    || reported,
-                "waiting delegate was silently lost; replacement snapshot = {:?}, notices = {:?}",
-                String::from_utf8_lossy(&replacement_snapshot),
-                notices.lock().expect("lock delivery notices")
+            assert_ne!(
+                replacement, fx.worker_agent_id,
+                "restart did not replace the worker"
             );
+
+            let tasks = fx.daemon.registry.inbox().list(WORKER_PANE);
+            assert!(
+                tasks
+                    .iter()
+                    .all(|message| { message.bind_agent.as_deref() != Some(replacement.as_str()) }),
+                "the cancelled task must not be handed to the replacement; inbox = {tasks:?}"
+            );
+            assert!(
+                tasks.iter().any(|message| {
+                    message.bind_agent.as_deref() == Some(fx.worker_agent_id.as_str())
+                        && message.undeliverable_reason
+                            == Some(dot_agent_deck::inbox::UndeliverableReason::Superseded)
+                }),
+                "the restart must retire the replaced worker's task as superseded, not leave it \
+                 waiting or report it undeliverable; inbox = {tasks:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let replacement_snapshot = fx
+                .daemon
+                .registry
+                .snapshot(&replacement)
+                .unwrap_or_default();
             assert!(
                 !replacement_snapshot
                     .windows(DRAFT.len())

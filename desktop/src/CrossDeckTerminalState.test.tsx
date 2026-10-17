@@ -313,28 +313,6 @@ describe("cross-deck terminal state", () => {
   });
 
   /**
-   * Scenario: a non-delivered verdict is recorded for deck A's Planner, and the
-   * app is then retargeted to deck B. Reading the verdict under B's Planner
-   * finds nothing — the record describes an attempt against another machine's
-   * agent, and letting it through would disable B's pane and print A's
-   * rejection notice under B's heading, with no bounded clear on a refused
-   * switch. (PRD #1105's security audit, should-fix: same root cause.)
-   */
-  it("keys recorded send verdicts by the composite identity too", async () => {
-    bridge.subscribe.mockImplementation(async () => () => {});
-    bridge.runAction.mockResolvedValue({ ok: false, sendResult: "wrong-session" });
-    const { result } = renderHook(() => useDeckRuntime());
-    await waitFor(() => expect(result.current.snapshot.connection.status).toBe("connected"));
-
-    await act(async () => {
-      await result.current.runAction({ type: "submit_text", agentId: "planner", text: "hello" });
-    });
-
-    expect(result.current.terminalInputResults?.[agentKey(FIXTURE_DAEMON_ID, "planner")]).toBe("wrong-session");
-    expect(result.current.terminalInputResults?.[agentKey(REMOTE_DECK_ID, "planner")]).toBeUndefined();
-  });
-
-  /**
    * Scenario: the daemon reports an applied geometry for deck A's Planner, then
    * the app is retargeted to deck B. B's Planner has no geometry of its own
    * yet, and must not inherit A's — a pane that applied it would submit another

@@ -191,6 +191,9 @@ windows-sys = { version = "0.61", features = [
     # PRD #163 M4: `OVERLAPPED` + `GetOverlappedResultEx`/`CancelIoEx`, the
     # deadline mechanism for the above.
     "Win32_System_IO",
+    # PR #1735 review: `CreateToolhelp32Snapshot`/`Process32*W`, the parent
+    # lookup behind the inbox's process-tree check (`platform::proc`).
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 # `%USERPROFILE%` / `%LOCALAPPDATA%` resolution for `src/platform/paths.rs`.
 dirs = "7"

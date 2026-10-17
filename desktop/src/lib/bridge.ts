@@ -4,7 +4,7 @@ import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./act
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
-import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
+import { applyHandoffEvent, mapDaemonEvent, metadataOf, MAX_LIVE_EVIDENCE, type DaemonHookEvent } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { agentTurn } from "./promptKeys";
 import { describeEndpoint } from "./endpoints";
@@ -20,6 +20,7 @@ import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
   AgentBlocked,
+  AgentInbox,
   HookBinaryNotice,
   AuthoringKind,
   AgentSession,
@@ -40,6 +41,9 @@ import type { HandoffEdge,
   DisconnectedReason,
   EvidenceItem,
   HostMetricsReport,
+  InboxActionResult,
+  InboxActionVerb,
+  InboxAttentionItem,
   NewAgentOptions,
   NewAgentOrchestrations,
   PromptKeys,
@@ -355,6 +359,31 @@ export interface DesktopAgentDto {
    */
   promptKeys?: PromptKeys;
   /**
+   * PRD #1666 — `AgentRecord.inbox`, the daemon's summary of this agent's
+   * inbox. Absent from a daemon predating the inbox.
+   */
+  inbox?: {
+    queued: number;
+    fetched: number;
+    undeliverable: number;
+    lastAckedAt?: string;
+    wake: string;
+    component?: string;
+    /** PR #1735 fifth review (R5): nothing has woken the agent for its waiting messages. */
+    wakeStalled?: boolean;
+    /** PRD #1666 §6.5: deck messages waiting on the user's Retry or Cancel. */
+    attention?: Array<{ messageId: string; revision: number; kind: string; fromLabel: string; subject: string; taskId?: string }>;
+    integration?: string;
+    receiptsDegraded?: string;
+    evidencePaused?: number;
+  };
+  /**
+   * PRD #1666 — the deck's notice explaining an `error` status (a message the
+   * deck could not deliver), from the daemon's session record. Daemon text;
+   * `agentFromDto` keeps it only beside `status: "error"` and as a display copy.
+   */
+  deliveryNotice?: string;
+  /**
    * PRD #1631: the question this agent is waiting on
    * (`SessionSnapshot.pending_question`), every text field scrubbed by the
    * crate and still the agent's own words. Absent when it waits on nothing,
@@ -435,7 +464,6 @@ export interface DesktopTerminalGeometryDto {
  */
 export interface DesktopActionResultDto {
   ok: boolean;
-  sendResult?: import("../types").SendResult;
   message?: string;
   /** The agent the action acted on; for `start_agent`, the id the target deck minted. */
   agentId?: string;
@@ -1663,7 +1691,6 @@ export type DesktopRunActionDto =
   | { type: "rename_agent"; agentId: string; displayName: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
   | { type: "detach_terminal"; sessionId: string }
-  | { type: "submit_text"; agentId: string; text: string }
   | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "allow_build_mismatch"; deckId?: string };
@@ -2127,6 +2154,13 @@ export interface DeckBridge {
    * asked again is refused.
    */
   decideUpgrade(upgradeId: string, questionId: number, choice: UpgradeChoice): Promise<void>;
+  /**
+   * PRD #1666 §6.4 — Retry or Cancel one deck message an agent card lists
+   * (`desktop_inbox_action`), at the revision the card shows. Optional: a
+   * bridge without it (the browser preview) offers no buttons. The daemon
+   * answers `stale` to the second of two clients acting at once.
+   */
+  inboxAction?(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult>;
   dispose(): Promise<void>;
 }
 
@@ -2279,6 +2313,80 @@ function blockedFromDto(blocked: NonNullable<DesktopAgentDto["blocked"]>): Agent
   };
 }
 
+/** PRD #1666: the card's view of `DesktopAgentDto.inbox`; counts the crate did not send read as zero. */
+function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox {
+  const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0);
+  const attention = attentionFromDto(inbox.attention ?? []);
+  const integration = inbox.integration && INTEGRATION_NOTICES.has(inbox.integration)
+    ? inbox.integration as NonNullable<AgentInbox["integration"]>
+    : undefined;
+  return {
+    queued: count(inbox.queued),
+    fetched: count(inbox.fetched),
+    undeliverable: count(inbox.undeliverable),
+    ...(inbox.lastAckedAt ? { lastAckedAt: inbox.lastAckedAt } : {}),
+    wake: inbox.wake,
+    ...(inbox.component ? { component: inbox.component } : {}),
+    ...(inbox.wakeStalled === true ? { wakeStalled: true } : {}),
+    ...(attention.length > 0 ? { attention } : {}),
+    ...(integration ? { integration } : {}),
+    ...(typeof inbox.receiptsDegraded === "string" ? { receiptsDegraded: displayText(inbox.receiptsDegraded, DISPLAY_LIMITS.prompt) } : {}),
+    ...(typeof inbox.evidencePaused === "number" && Number.isFinite(inbox.evidencePaused) ? { evidencePaused: count(inbox.evidencePaused) } : {}),
+  };
+}
+
+const ATTENTION_KINDS = new Set(["uncertain", "out_of_attempts", "held_long"]);
+const INTEGRATION_NOTICES = new Set(["cli_too_old", "adapter_too_old", "not_armed", "refresh_failed"]);
+
+/** PRD #1666 §6.5: the listed items the crate sent, an unknown kind dropped. */
+function attentionFromDto(items: NonNullable<NonNullable<DesktopAgentDto["inbox"]>["attention"]>): InboxAttentionItem[] {
+  return items.flatMap((item) => {
+    if (!ATTENTION_KINDS.has(item.kind) || typeof item.messageId !== "string") return [];
+    const revision = typeof item.revision === "number" && Number.isFinite(item.revision) ? item.revision : 0;
+    return [{
+      messageId: item.messageId,
+      revision,
+      kind: item.kind as InboxAttentionItem["kind"],
+      fromLabel: displayText(item.fromLabel ?? "", DISPLAY_LIMITS.prompt),
+      subject: displayText(item.subject ?? "", DISPLAY_LIMITS.prompt),
+      ...(item.taskId ? { taskId: item.taskId } : {}),
+    }];
+  });
+}
+
+/**
+ * PRD #1666: the notice a `delivery_notice` error event carries for an agent
+ * card, or `undefined` for any other payload. The daemon applies the same event
+ * to its own record, so the next snapshot carries the notice too
+ * (`DesktopAgentDto.deliveryNotice`); this is what shows it before that.
+ */
+function deliveryNoticeOf(payload: unknown): { agentId?: string; paneId?: string; notice: string } | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const event = payload as DaemonHookEvent;
+  if (event.kind !== undefined && event.kind !== "event") return undefined;
+  if (event.event_type !== "error") return undefined;
+  const notice = metadataOf(event).delivery_notice;
+  if (!notice?.trim()) return undefined;
+  const agentId = typeof event.agent_id === "string" ? event.agent_id : undefined;
+  const paneId = typeof event.pane_id === "string" ? event.pane_id : undefined;
+  if (!agentId && !paneId) return undefined;
+  return { agentId, paneId, notice: displayText(notice, DISPLAY_LIMITS.prompt) };
+}
+
+/**
+ * PRD #1666: `agents` with a `delivery_notice` error event applied to the card
+ * it names — Error, and the notice — or the same array for any other payload.
+ */
+function withDeliveryNotice(agents: AgentSession[], payload: unknown): AgentSession[] {
+  const found = deliveryNoticeOf(payload);
+  if (!found) return agents;
+  const index = agents.findIndex((agent) => (found.agentId ? agent.id === found.agentId : agent.paneId === found.paneId));
+  if (index === -1) return agents;
+  const next = agents.slice();
+  next[index] = { ...next[index], status: "failed", daemonStatus: "error", deliveryNotice: found.notice };
+  return next;
+}
+
 /** The largest value the daemon's `u32` counts can take. */
 const U32_MAX = 0xffff_ffff;
 
@@ -2367,6 +2475,10 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     spawnedAtMs: agent.spawnedAtMs,
     authoringKind: agent.authoringKind,
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
+    ...(agent.inbox ? { inbox: inboxFromDto(agent.inbox) } : {}),
+    ...(agent.status === "error" && agent.deliveryNotice
+      ? { deliveryNotice: displayText(agent.deliveryNotice, DISPLAY_LIMITS.prompt) }
+      : {}),
     ...(agent.pendingQuestion ? { pendingQuestion: agent.pendingQuestion } : {}),
     // PRD #1401 — the badge. Checked, not copied: see `pullRequestFromDto`.
     ...(pullRequest ? { pullRequest } : {}),
@@ -2788,9 +2900,6 @@ class FixtureDeckBridge implements DeckBridge {
       this.snapshot.stages = this.snapshot.stages.map((stage) => stage.id === action.stageId ? { ...stage, status: "active", attempt: stage.attempt === undefined ? undefined : stage.attempt + 1 } : stage);
     } else if (action.type === "rename_agent") {
       this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, displayName: action.displayName } : agent);
-    } else if (action.type === "submit_text") {
-      this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, transcript: `${agent.transcript}\r\n> ${action.text}\r\n` } : agent);
-      this.terminalListeners.forEach((listener) => listener({ agentId: action.agentId, deckId: this.snapshot.connection.deckId, data: new TextEncoder().encode(`\r\n> ${action.text}\r\n`), stream: "output", operation: "append" }));
     } else if (action.type === "advance_fixture") {
       this.fixtureStep = (this.fixtureStep + 1) % 3;
       if (this.fixtureStep === 1) {
@@ -2809,7 +2918,7 @@ class FixtureDeckBridge implements DeckBridge {
       }
     }
     this.emitSnapshot();
-    return { ok: true, sendResult: action.type === "submit_text" ? "applied" : undefined };
+    return { ok: true };
   }
 
   /**
@@ -3829,7 +3938,7 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   private recordDaemonEvent(payload: unknown): boolean {
-    const edges = applyHandoffEvent(this.handoffs, payload);
+    const edges = applyHandoffEvent(this.handoffs, payload, (agentId, paneId) => this.resolveAgent(agentId, paneId)?.role);
     const edgesChanged = edges !== this.handoffs;
     this.handoffs = edges;
     const item = mapDaemonEvent(payload, this.evidenceSequence, this.resolveAgent);
@@ -4548,7 +4657,7 @@ export class TauriDeckBridge implements DeckBridge {
       const selectedDeckId = this.selectedDeckId;
       const selected = selectedDeckId === undefined ? undefined : this.fleet.get(selectedDeckId);
       if (!changed || selectedDeckId === undefined || selected === undefined) return;
-      this.fleet.set(selectedDeckId, { ...selected, evidence: this.evidence, handoffs: this.handoffs });
+      this.fleet.set(selectedDeckId, { ...selected, agents: withDeliveryNotice(selected.agents, event.payload), evidence: this.evidence, handoffs: this.handoffs });
       onFleet(this.fleetView());
     });
     const stopTerminalState = await listen<DesktopTerminalStateDto>("desktop://terminal-state", (event) => {
@@ -4622,7 +4731,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
     const invoke = await this.getInvoke();
-    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "stop_orchestration" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "activate_orchestration" || action.type === "stop_daemon" || action.type === "allow_build_mismatch") {
+    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "stop_orchestration" || action.type === "rename_agent" || action.type === "activate_orchestration" || action.type === "stop_daemon" || action.type === "allow_build_mismatch") {
       // `desktop_run_action` resolves with `ok: false` for a non-delivered
       // send rather than raising, so the result must be returned, not dropped.
       //
@@ -4657,7 +4766,7 @@ export class TauriDeckBridge implements DeckBridge {
       // this dropped it, which left a started agent's id — the one thing the
       // caller needs to open its pane — unreadable (#1041).
       const agentId = typeof result?.agentId === "string" ? result.agentId : undefined;
-      return { ok: result?.ok !== false, sendResult: result?.sendResult, message: result?.message, ...(agentId === undefined ? {} : { agentId }) };
+      return { ok: result?.ok !== false, message: result?.message, ...(agentId === undefined ? {} : { agentId }) };
     }
     if (action.type === "start_daemon") {
       // Issue #1490: one command for every deck, local or remote. It resolves
@@ -5140,6 +5249,18 @@ export class TauriDeckBridge implements DeckBridge {
     // Issue #1240: `options` only when given, so a PRD #1223 listing is the
     // same invoke it always was.
     return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
+  }
+
+  async inboxAction(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult> {
+    const invoke = await this.getInvoke();
+    return invoke<InboxActionResult>("desktop_inbox_action", {
+      deckId: target.deckId,
+      agentId: target.agentId,
+      paneId: item.paneId,
+      messageId: item.messageId,
+      revision: item.revision,
+      verb,
+    });
   }
 
   async upgradeDaemon(deckId: string, onEvent: (event: UpgradeEvent) => void): Promise<UpgradeOutcome> {

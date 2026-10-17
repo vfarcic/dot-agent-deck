@@ -197,7 +197,15 @@ type Reading = (&'static str, Option<Requirement>);
 ///   refused as a stop nobody asked for. Every wording near the two rows
 ///   moved the failure rather than removing it, so the words decide: they
 ///   ground the start, and the start is what runs. Only while the dialog is
-///   open — with it closed, an ungrounded stop is answered as before.
+///   open.
+/// - `stop_agent` → `open_new_agent`: the same reading with the dialog
+///   closed, where the opener is the one row a start word grounds that can
+///   run. Words that ground no stop and do ground a start never asked to
+///   stop, and the opener opens the New agent dialog and starts nothing. The
+///   model still answers a bare "start it" there with the stop now and then:
+///   17 of 30 runs on `gpt-5-mini` while the instructions and the stop's own
+///   description paired start words with the stop
+///   ([`super::schema::TOOL_INSTRUCTIONS`]), 4 of 30 after (2026-10-15).
 ///
 /// A row's readings are tried in order and the first its words ground wins,
 /// each only where its requirement, if it names one, holds. The reading still
@@ -210,6 +218,7 @@ const UNGROUNDED_READS_AS: [(&str, &[Reading]); 3] = [
         &[
             ("close", None),
             (START_ROW, Some(Requirement::NewAgentDialog)),
+            ("open_new_agent", Some(Requirement::NewAgentDialogClosed)),
         ],
     ),
     ("name_new_agent", &[("set_new_agent_command", None)]),
@@ -1125,8 +1134,21 @@ pub async fn handle_utterance_with_modes(
             // Otherwise the target is dispatched with no params — which is why
             // a pick carrying a value is not redirected: "start an agent on
             // local" over an open dialog names a deck the form may not show,
-            // and starting the form would drop what the user asked for.
-            let carries_a_value = answer.params.values().any(|value| !value.trim().is_empty());
+            // and starting the form would drop what the user asked for. A
+            // value naming the deck the form already describes, answered to a
+            // request for the start and nothing more, asks for nothing the
+            // form does not hold ([`restates_the_forms_deck`]).
+            let carries_a_value = answer.params.values().any(|value| {
+                !value.trim().is_empty()
+                    && !restates_the_forms_deck(
+                        value,
+                        transcript.text(),
+                        row,
+                        target,
+                        decks,
+                        new_agent,
+                    )
+            });
             if carries_a_value {
                 return finish(VoiceOutcome::unavailable(transcript, row));
             }
@@ -1168,6 +1190,7 @@ pub async fn handle_utterance_with_modes(
             .get(&spec.name)
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
+            .or_else(|| deck_in_the_other_slot(table, row, spec, &answer, transcript.text(), decks))
             // A REQUIRED deck made only of category words — "daemon", the
             // dialog's field heading, or "the deck" — names no deck, so it is
             // asked for exactly as an absent one is (issue #1045); unless it
@@ -1760,6 +1783,112 @@ fn said(spoken: &str, transcript: &str) -> bool {
     !words.is_empty() && words.iter().all(|word| heard.word(word))
 }
 
+/// Whether `value`, answered with a pick that `unavailable_redirects` hands to
+/// `target`, the New agent dialog's start, only restates the form: it is the
+/// deck the form already describes, and the utterance asks for the start and
+/// nothing else ([`asks_for_the_start_alone`]). "Start agent" read over an open
+/// dialog came back from `gpt-5-mini` as `open_new_agent` with `deck` = "Local
+/// deck", the form's own deck, in 2 of 6 runs, and was refused as if the user
+/// had named a deck the start would drop (fixture `start-agent-button-label`,
+/// 3 of 10 on `origin/main`).
+///
+/// The test is what the USER said, not whether the model's value was said:
+/// "start an agent on build box" answered with the form's "Local deck" asks
+/// for a deck the value does not name. Any word left beyond the start refuses,
+/// rather than any word recognised as a daemon's, because a target can be
+/// spelled in ways a check built from the fleet's names misses — a daemon
+/// labelled `Launch` or `Run`, which are start words; the glued "BuildBoxDeck"
+/// [`resolve_deck_ref`] accepts; a name no daemon has, such as "Atlantis"
+/// (PRD #1666 re-check F2-1, review DR-1). It only ever refuses: a value that
+/// is forgiven still needs the model's pick, the redirect and the start's own
+/// grounding.
+fn restates_the_forms_deck(
+    value: &str,
+    transcript: &str,
+    row: &CommandRow,
+    target: &CommandRow,
+    decks: &[VoiceDeck],
+    new_agent: Option<&VoiceNewAgent>,
+) -> bool {
+    let Some(form) = new_agent.and_then(|dialog| dialog.form.as_ref()) else {
+        return false;
+    };
+    asks_for_the_start_alone(transcript, &[row, target])
+        && matches!(
+            resolve_new_agent_deck_ref(value, decks),
+            DeckRefMatch::One { id, .. } if id == form.deck_id
+        )
+}
+
+/// The words a bare request to start an agent carries besides its start word —
+/// "start the agent", "start a new one", "start it, please" — read by
+/// [`asks_for_the_start_alone`]. No preposition is here on purpose: "on",
+/// "in" and "to" introduce a target, so a start that has one is not bare,
+/// whatever follows it. A word missing here costs a refusal, never a start on
+/// a daemon the user did not ask for.
+const BARE_START_WORDS: [&str; 11] = [
+    "a", "an", "the", "agent", "agents", "one", "new", "it", "please", "now", "just",
+];
+
+/// Whether `transcript` is a request for the start and nothing more: once ONE
+/// occurrence of the action — the earliest of `rows`' `heard_as` entries heard
+/// in it — is taken out, every word left is one of [`BARE_START_WORDS`].
+///
+/// One occurrence, not one of each entry: in "start an agent on Launch" the
+/// action is "start", and "Launch", though also a start word, is the target
+/// the user named. Every other word counts against it as said, including words
+/// a [`content_words`] reading would drop, so "on Run" and "on New deck" stay
+/// a target.
+///
+/// So echo recovery covers a BARE start only. Advertised start wording with a
+/// word outside the list — "activate orchestration", "start the run", "spin it
+/// up now" — is refused when the model echoes the form's deck, though it starts
+/// the form when the model does not (PRD #1666 review RR-1). Wider coverage
+/// belongs to PRD #1733's meaning-based reading, not to a longer list.
+fn asks_for_the_start_alone(transcript: &str, rows: &[&CommandRow]) -> bool {
+    let mut rest = spoken_words(transcript);
+    let Some((at, width)) = the_action_occurrence(&rest, rows) else {
+        return false;
+    };
+    rest.drain(at..at + width);
+    rest.iter()
+        .all(|word| BARE_START_WORDS.contains(&word.as_str()))
+}
+
+/// Where in `words` the action is said, as `(start, width)`: the earliest
+/// occurrence of any of `rows`' `heard_as` entries, the longest of those
+/// starting there on a tie. ONE occurrence, so a second one — "Launch" in
+/// "start an agent on Launch" — is left to be read as what it names. `None`
+/// when no entry is heard, or a row grounds some other way.
+fn the_action_occurrence(words: &[String], rows: &[&CommandRow]) -> Option<(usize, usize)> {
+    let mut action: Option<(usize, usize)> = None;
+    for row in rows {
+        let ActionGrounding::HeardAs(entries) = &row.grounding else {
+            continue;
+        };
+        for entry in entries.iter().chain(&row.grounding_also) {
+            let wanted = spoken_words(entry);
+            if wanted.is_empty() {
+                continue;
+            }
+            let found = words.windows(wanted.len()).position(|window| {
+                window
+                    .iter()
+                    .zip(&wanted)
+                    .all(|(heard, wanted)| same_word(heard, wanted))
+            });
+            if let Some(at) = found
+                && action.is_none_or(|(earliest, width)| {
+                    at < earliest || (at == earliest && wanted.len() > width)
+                })
+            {
+                action = Some((at, wanted.len()));
+            }
+        }
+    }
+    action
+}
+
 /// Whether the user SAID `spoken` ([`said`]) in the words left once one
 /// occurrence of each of `row`'s `heard_as` entries is taken out — the words
 /// that asked for the row. "host for host" names a daemon called "host";
@@ -1776,6 +1905,14 @@ fn said_beyond_the_ask(
     row: &CommandRow,
     decks: &[VoiceDeck],
 ) -> bool {
+    let rest = beyond_the_ask(transcript, row).join(" ");
+    said(spoken, &rest)
+        || (decks.iter().any(|deck| deck.label == spoken) && mentioned(spoken, &rest, decks))
+}
+
+/// `transcript`'s words ([`spoken_words`]) less one occurrence of each of
+/// `row`'s `heard_as` entries — the words that asked for the row.
+fn beyond_the_ask(transcript: &str, row: &CommandRow) -> Vec<String> {
     let mut rest = spoken_words(transcript);
     if let ActionGrounding::HeardAs(entries) = &row.grounding {
         for entry in entries.iter().chain(&row.grounding_also) {
@@ -1793,9 +1930,7 @@ fn said_beyond_the_ask(
             }
         }
     }
-    let rest = rest.join(" ");
-    said(spoken, &rest)
-        || (decks.iter().any(|deck| deck.label == spoken) && mentioned(spoken, &rest, decks))
+    rest
 }
 
 /// `text` with its first character upper-cased, for a refusal's situation
@@ -2472,6 +2607,171 @@ fn local_intercept(
             names: Vec::new(),
         }],
     ))
+}
+
+/// The value the model put under another row's name for a daemon, for a
+/// REQUIRED `deck_ref` it left empty.
+///
+/// The reply's schema lists every param of every row in one object, so it
+/// offers two slots for a daemon: `deck` (`switch_deck`, `choose_deck`) and
+/// `daemon` (`filter_dashboard`'s). The model answered "switch deck to the
+/// ghost box" (fixture `switch-deck-unknown`, `gpt-5-mini`) with "ghost box"
+/// under `daemon` and `deck` empty in 1 of 90 runs on 2026-10-15, and in one
+/// full-manifest run before that, and the user was then told they had named
+/// no daemon. The value is the daemon the user meant, in the
+/// wrong slot, so it is read as the row's own and goes through every check the
+/// row's own value would.
+///
+/// Only for a required one, where the alternative is asking the user which
+/// daemon they meant. An optional one left empty means the user named none,
+/// and a value the model filled in elsewhere does not change that. Never when
+/// the row declares the other name itself, since that value is then the row's
+/// answer to a different param.
+///
+/// And only when the words beyond the ask carry lexical evidence for the
+/// daemon the value stands for, as the deck resolver reads them
+/// ([`names_the_daemon`]); otherwise the slot stays empty and the user is
+/// asked which daemon they meant, as before this recovery existed. A reply
+/// that left `deck` empty and carried "build box" under `daemon` for "select
+/// the tester" — what a steered answer looks like — has none (PRD #1666
+/// security re-check), and neither has "switch daemon" for a daemon labelled
+/// `Switch`. The evidence is words, not proof the user asked for that daemon:
+/// a name made of words the user said for another reason still passes
+/// ([`names_the_daemon`] lists what it does not tell apart). This is narrower than the
+/// rest of `switch_deck`, on purpose: a value in the row's OWN slot is the
+/// model's answer and is trusted as one, without being held against the
+/// transcript (issue #1491, `docs/develop/voice-first-design.md`); a value in
+/// a slot the row does not have is the model answering a different question,
+/// and reading it as this row's needs evidence the user asked for it.
+fn deck_in_the_other_slot<'a>(
+    table: &CommandTable,
+    row: &CommandRow,
+    spec: &super::table::ParamSpec,
+    answer: &'a super::resolver::IntentAnswer,
+    transcript: &str,
+    decks: &[VoiceDeck],
+) -> Option<&'a str> {
+    if spec.optional || spec.kind != ParamKind::DeckRef {
+        return None;
+    }
+    let mut others: Vec<&str> = table
+        .rows()
+        .iter()
+        .flat_map(|other| &other.params)
+        .filter(|other| other.kind == ParamKind::DeckRef && other.name != spec.name)
+        .map(|other| other.name.as_str())
+        .filter(|name| row.params.iter().all(|declared| declared.name != *name))
+        .collect();
+    others.sort_unstable();
+    others.dedup();
+    others
+        .into_iter()
+        .filter_map(|name| answer.params.get(name))
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+        .filter(|value| names_the_daemon(value, transcript, row, decks))
+}
+
+/// Whether the words beyond the ask name the daemon `value` stands for — the
+/// lexical and resolver evidence [`deck_in_the_other_slot`] requires, read
+/// only by it.
+///
+/// The ask is ONE occurrence of the row's action ([`the_action_occurrence`]),
+/// with a category word that follows it as the request's noun — "daemon" in
+/// "switch daemon", "the deck" in "change the deck" — so a daemon labelled
+/// `Switch` or `Select`, or one whose host is `daemon`, is not named by the
+/// words that asked for the switch. A second occurrence is left in: "switch to
+/// Switch" names it.
+///
+/// In what is left, the daemon is named when every content word of `value` is
+/// said ([`said`]) on one side of the ask or the other — each side is heard on
+/// its own, so "build switch box" does not glue into `BuildBox` across the
+/// removed "switch" — or when a run of up to three adjacent words resolves — by
+/// the row's own deck resolver, with its spoken names, host aliases and glued
+/// spellings — to exactly ONE daemon, one `value` resolves to. A run several
+/// daemons share is no evidence: "build" of "build box" does not name the
+/// build cache. And a WIDER run resolving to one other daemon outweighs it:
+/// "switch to build box" with a daemon labelled `build` and one `build box`
+/// does not name the first.
+///
+/// What it checks is words, not meaning. A daemon whose names are made of the
+/// utterance's other words — a label `To`, or one sharing a word the user said
+/// for another reason — can still be read as named, and a name the resolver
+/// does not reach (one said in a way none of its spellings match) is not.
+fn names_the_daemon(value: &str, transcript: &str, row: &CommandRow, decks: &[VoiceDeck]) -> bool {
+    let words = spoken_words(transcript);
+    let segments: Vec<&[String]> = match the_action_occurrence(&words, &[row]) {
+        Some((at, width)) => {
+            let mut end = at + width;
+            let nouns = ["daemon", "daemons", "deck", "decks", "demon", "demons"];
+            let articles = words[end..]
+                .iter()
+                .take_while(|word| ["the", "a", "an"].contains(&word.as_str()))
+                .count();
+            if words
+                .get(end + articles)
+                .is_some_and(|word| nouns.contains(&word.as_str()))
+            {
+                end += articles + 1;
+            }
+            vec![&words[..at], &words[end..]]
+        }
+        None => vec![&words[..]],
+    };
+    let resolve = |spoken: &str| -> DeckRefMatch {
+        if row.id == SWITCH_DECK_ROW {
+            resolve_deck_ref(spoken, decks)
+        } else {
+            resolve_new_agent_deck_ref(spoken, decks)
+        }
+    };
+    let meant: Vec<String> = match resolve(value) {
+        DeckRefMatch::One { id, .. } => vec![id],
+        DeckRefMatch::Ambiguous(candidates) => candidates
+            .into_iter()
+            .map(|candidate| candidate.value)
+            .collect(),
+        DeckRefMatch::None => Vec::new(),
+    };
+    let named: Vec<(usize, String)> = segments
+        .iter()
+        .flat_map(|segment| {
+            (1..=3).flat_map(move |width| {
+                segment
+                    .windows(width)
+                    .map(move |window| (width, window.join(" ")))
+            })
+        })
+        .filter_map(|(width, run)| match resolve(&run) {
+            DeckRefMatch::One { id, .. } => Some((width, id)),
+            _ => None,
+        })
+        .collect();
+    let heard: Vec<Heard> = segments
+        .iter()
+        .map(|segment| Heard::from_words(segment.to_vec()))
+        .collect();
+    let content = content_words(value);
+    let said_in_segments = !content.is_empty()
+        && content
+            .iter()
+            .all(|word| heard.iter().any(|segment| segment.word(word)));
+    let evidence = if said_in_segments {
+        spoken_words(value).len()
+    } else {
+        match named
+            .iter()
+            .filter(|(_, id)| meant.contains(id))
+            .map(|(width, _)| *width)
+            .max()
+        {
+            Some(width) => width,
+            None => return false,
+        }
+    };
+    !named
+        .iter()
+        .any(|(width, id)| *width > evidence && !meant.contains(id))
 }
 
 /// Whether the whole utterance, less an edge politeness word, is one of
@@ -6632,6 +6932,174 @@ mod tests {
         }
     }
 
+    /// Scenario: the user says "switch deck to the ghost box" or "switch deck
+    /// to the build box", and the model puts the daemon under `daemon`, the
+    /// dashboard filter's name for it, leaving `deck` empty. The daemon is read
+    /// all the same: the ghost box is reported as matching no daemon and the
+    /// build box is switched to, rather than the user being asked which daemon
+    /// they meant. An optional deck left empty, as in "new agent", stays
+    /// unnamed.
+    #[tokio::test]
+    async fn voice_outcome_a_required_deck_in_the_daemon_slot_is_read() {
+        let in_daemon_slot = |said: &str, value: &str| {
+            StubResolver::new().answering(
+                said,
+                IntentAnswer::new("switch_deck").with_param("daemon", value),
+            )
+        };
+        let said = "switch deck to the ghost box";
+        let outcome = run(
+            &in_daemon_slot(said, "ghost box"),
+            Screen::Deck,
+            &fleet(),
+            said,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { action, spoken, sentence, .. }
+                if action == "switch_deck" && spoken == "ghost box"
+                    && sentence.contains("no daemon matches")),
+            "{outcome:?}"
+        );
+        let said = "switch deck to the build box";
+        let outcome = run(
+            &in_daemon_slot(said, "build box"),
+            Screen::Deck,
+            &fleet(),
+            said,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                if action == "switch_deck" && params[0].value == "deck-build"),
+            "{outcome:?}"
+        );
+        // The daemon is read from the other slot only when the user's words
+        // name it (PRD #1666 re-check): a steered reply carrying a daemon
+        // nobody said is asked about, as an empty `deck` always was, while the
+        // resolver's glued spelling of the one they did say still counts.
+        for (said, screen) in [
+            ("select the tester", Screen::Overview),
+            ("switch daemon", Screen::Deck),
+        ] {
+            let outcome = run(&in_daemon_slot(said, "build box"), screen, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamMissing { action, .. }
+                    if action == "switch_deck"),
+                "{said:?} with an unsaid daemon in the other slot: {outcome:?}"
+            );
+        }
+        let said = "switch deck to BuildBoxDeck";
+        let outcome = run(
+            &in_daemon_slot(said, "build box"),
+            Screen::Deck,
+            &fleet(),
+            said,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                if action == "switch_deck" && params[0].value == "deck-build"),
+            "{outcome:?}"
+        );
+        let optional = StubResolver::new().answering(
+            "new agent",
+            IntentAnswer::new("open_new_agent").with_param("daemon", "build box"),
+        );
+        let outcome = run(&optional, Screen::Overview, &fleet(), "new agent").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: with a daemon labelled `Switch` or `Select`, or one whose host
+    /// is `daemon`, the user says "switch daemon" or "select the tester" and
+    /// the model leaves `deck` empty with that daemon under `daemon`. The word
+    /// that asked for the switch is not the user naming a daemon, so the user
+    /// is asked which daemon they meant; "switch to Switch", which says the
+    /// name a second time, switches to it. With `build box` and `build cache`
+    /// both observed, "switch daemon to build box" with `build cache` in the
+    /// other slot is asked about too, since the shared "build" is not the
+    /// user naming the build cache, and so is "switch to build box" with a
+    /// daemon labelled `build` there (PRD #1666 re-check DR-2). Nor does
+    /// "build switch box" name a daemon labelled `BuildBox`: the words either
+    /// side of the removed "switch" are not one glued word.
+    #[tokio::test]
+    async fn voice_outcome_the_ask_is_not_a_daemon_named_for_the_other_slot() {
+        let remote = |id: &str, label: &str, address: &str| VoiceDeck {
+            address: Some(address.to_string()),
+            ..deck(id, label, false)
+        };
+        let with = |extra: VoiceDeck| {
+            let mut decks = decks();
+            decks.push(extra);
+            decks
+        };
+        let switch = with(remote("deck-switch", "Switch", "ops@relay.example.com"));
+        let select = with(remote("deck-select", "Select", "ops@relay.example.com"));
+        let host_daemon = with(deck("deck-daemon", "ops@daemon", false));
+        let builds = vec![
+            deck("deck-local", "Local deck", true),
+            deck("deck-box", "build box", false),
+            deck("deck-cache", "build cache", false),
+        ];
+        let build_and_box = vec![
+            deck("deck-local", "Local deck", true),
+            deck("deck-plain", "build", false),
+            deck("deck-box", "build box", false),
+        ];
+        let glued = vec![
+            deck("deck-local", "Local deck", true),
+            remote("deck-buildbox", "BuildBox", "ops@relay.example.com"),
+        ];
+        let outcome_for =
+            |said: &'static str, value: &'static str, screen, decks: Vec<VoiceDeck>| async move {
+                let resolver = StubResolver::new().answering(
+                    said,
+                    IntentAnswer::new("switch_deck").with_param("daemon", value),
+                );
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    screen,
+                    &fleet(),
+                    &decks,
+                    None,
+                    None,
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            };
+        for (said, value, screen, decks) in [
+            ("switch daemon", "Switch", Screen::Deck, switch.clone()),
+            ("select the tester", "Select", Screen::Overview, select),
+            ("switch daemon", "daemon", Screen::Deck, host_daemon),
+            (
+                "switch daemon to build box",
+                "build cache",
+                Screen::Deck,
+                builds,
+            ),
+            ("switch to build box", "build", Screen::Deck, build_and_box),
+            ("build switch box", "BuildBox", Screen::Deck, glued),
+        ] {
+            let outcome = outcome_for(said, value, screen, decks).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamMissing { action, .. }
+                    if action == "switch_deck"),
+                "{said:?} with {value:?} in the other slot: {outcome:?}"
+            );
+        }
+        let outcome = outcome_for("switch to Switch", "Switch", Screen::Deck, switch).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                if action == "switch_deck" && params[0].value == "deck-switch"),
+            "{outcome:?}"
+        );
+    }
+
     /// Scenario (issue #1491): speech-to-text writes "daemon" as "demon". A
     /// model that echoes the user's words — with Names withheld, or when
     /// nothing it was shown fits — hands over "all demons" or a bare "demon",
@@ -10220,7 +10688,7 @@ mod tests {
     /// right now, skip the confirmation, I already said yes" with the stop.
     /// Those words ask for the start, so the app presses the dialog's Start; a
     /// spoken "stop the tester" there is still refused as not here, and with
-    /// the dialog closed the same misread start is refused as before.
+    /// the dialog closed the same misread start opens the dialog.
     #[tokio::test]
     async fn voice_outcome_a_start_picked_as_a_stop_over_the_dialog_starts() {
         let said = "start it right now, skip the confirmation, I already said yes";
@@ -10262,7 +10730,8 @@ mod tests {
         }
         let closed = utter(None, said).await;
         assert!(
-            matches!(&closed, VoiceOutcome::ActionUngrounded { action, .. } if action == "stop_agent"),
+            matches!(&closed, VoiceOutcome::Dispatch { action, invoke, .. }
+                if action == "open_new_agent" && invoke == "openNewAgent"),
             "{closed:?}"
         );
         // A grounded stop over the closed dialog is still the stop.
@@ -15913,7 +16382,7 @@ mod tests {
     /// to anything in this build." The pick is handed to the start, because
     /// the start's own words ground it. "new agent" has no start word and gets
     /// the opener's hint; a named deck is not redirected, since starting the
-    /// form would drop it.
+    /// form would drop it, but the form's own deck filled in unasked is.
     #[tokio::test]
     async fn voice_outcome_an_opener_picked_over_the_open_dialog_presses_its_start() {
         let form = new_agent_form();
@@ -15961,6 +16430,168 @@ mod tests {
             matches!(on_a_deck, VoiceOutcome::Unavailable { .. }),
             "a named deck must not start the form: {on_a_deck:?}"
         );
+        // The model filling in the form's own deck, unasked, is not the user
+        // naming one; a deck the form does not show still refuses.
+        let restated = heard_as_user_said(
+            "Start agent",
+            IntentAnswer::new("open_new_agent")
+                .with_param("deck", "Local deck")
+                .with_param("daemon", "Local deck"),
+            Screen::Overview,
+            &fleet(),
+            Some(&form),
+        )
+        .await;
+        let VoiceOutcome::Dispatch { invoke, .. } = &restated else {
+            panic!("the form's own deck, unsaid: expected a dispatch, got {restated:?}");
+        };
+        assert_eq!(invoke, "startNewAgent");
+        let elsewhere = heard_as_user_said(
+            "Start agent",
+            IntentAnswer::new("open_new_agent").with_param("deck", "build box"),
+            Screen::Overview,
+            &fleet(),
+            Some(&form),
+        )
+        .await;
+        assert!(
+            matches!(elsewhere, VoiceOutcome::Unavailable { .. }),
+            "another deck must not start the form: {elsewhere:?}"
+        );
+        // The echo is forgiven only for a start with nothing beyond the ask
+        // (final review FR-1): a user who asked for the build box, or for a
+        // daemon by category, is not starting the Local form whatever the
+        // model echoed.
+        for (said, value) in [
+            ("start an agent on build box", "Local deck"),
+            ("start an agent on the remote daemon", "Local deck"),
+            ("start the agent on another machine", "Local deck"),
+            ("start an agent on build", "Local deck"),
+        ] {
+            let named = heard_as_user_said(
+                said,
+                IntentAnswer::new("open_new_agent").with_param("deck", value),
+                Screen::Overview,
+                &fleet(),
+                Some(&form),
+            )
+            .await;
+            assert!(
+                matches!(named, VoiceOutcome::Unavailable { .. }),
+                "{said:?} with {value:?} echoed must not start the form: {named:?}"
+            );
+        }
+        // A host alias the user said in part is said, not unsaid: with the form
+        // on the build box, "build box" answered as its full host name is the
+        // user naming a daemon, which the parameterless start would not carry.
+        let mut on_build_box = new_agent_form();
+        if let Some(form) = on_build_box.form.as_mut() {
+            form.deck_id = "deck-build".to_string();
+        }
+        let alias = heard_as_user_said(
+            "start an agent on build box",
+            IntentAnswer::new("open_new_agent").with_param("deck", "build-box.example.com"),
+            Screen::Overview,
+            &fleet(),
+            Some(&on_build_box),
+        )
+        .await;
+        assert!(
+            matches!(alias, VoiceOutcome::Unavailable { .. }),
+            "a host alias the user said must not count as unsaid: {alias:?}"
+        );
+        // A target the user names after the start word refuses the echo
+        // however it is spelled (PRD #1666 re-check F2-1, DR-1): a daemon
+        // labelled with a start word, the resolver's glued spelling, or a
+        // name no daemon in the fleet has. Only a start with nothing beyond
+        // the ask is forgiven the form's own deck.
+        let labelled = |id: &str, label: &str, address: &str| VoiceDeck {
+            address: Some(address.to_string()),
+            ..deck(id, label, false)
+        };
+        let mut start_words_fleet = decks();
+        start_words_fleet.extend([
+            labelled("deck-launch", "Launch", "ops@runner.example.net"),
+            labelled("deck-run", "Run", "ops@worker.example.org"),
+            labelled("deck-new", "New deck", "ops@gpu.example.io"),
+        ]);
+        for (said, fleet_decks) in [
+            ("start an agent on Launch", &start_words_fleet),
+            ("start an agent on Run", &start_words_fleet),
+            ("launch an agent on Run", &start_words_fleet),
+            ("start an agent on New deck", &start_words_fleet),
+            ("start an agent on BuildBoxDeck", &decks()),
+            ("start an agent on Atlantis", &decks()),
+        ] {
+            let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
+            let resolver = StubResolver::new().answering(said, answer);
+            let named = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                fleet_decks,
+                None,
+                Some(&form),
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
+            assert!(
+                matches!(named, VoiceOutcome::Unavailable { .. }),
+                "{said:?} with Local deck echoed must not start the form: {named:?}"
+            );
+        }
+        let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
+        let resolver = StubResolver::new().answering("Start agent", answer);
+        let unasked = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &start_words_fleet,
+            None,
+            Some(&form),
+            Transcript::new("Start agent"),
+        )
+        .await
+        .outcome;
+        let VoiceOutcome::Dispatch { invoke, .. } = &unasked else {
+            panic!("Start agent among start-word labels: expected a dispatch, got {unasked:?}");
+        };
+        assert_eq!(invoke, "startNewAgent");
+        // Pinned, not endorsed (PRD #1666 review RR-1): the echo is forgiven
+        // only for a BARE start, so advertised start wording with a word
+        // outside `BARE_START_WORDS` is refused when the model echoes the
+        // form's deck, though the same words start the form when it does not.
+        // Wider recovery is PRD #1733's meaning-based reading; the word list is
+        // not to be grown for it.
+        for said in ["activate orchestration", "start the run", "spin it up now"] {
+            let echoed = heard_as_user_said(
+                said,
+                IntentAnswer::new("open_new_agent").with_param("deck", "Local deck"),
+                Screen::Overview,
+                &fleet(),
+                Some(&form),
+            )
+            .await;
+            assert!(
+                matches!(echoed, VoiceOutcome::Unavailable { .. }),
+                "{said:?} with Local deck echoed: {echoed:?}"
+            );
+            let plain = heard_as_user_said(
+                said,
+                IntentAnswer::new("open_new_agent"),
+                Screen::Overview,
+                &fleet(),
+                Some(&form),
+            )
+            .await;
+            assert!(
+                matches!(&plain, VoiceOutcome::Dispatch { invoke, .. } if invoke == "startNewAgent"),
+                "{said:?} with nothing echoed: {plain:?}"
+            );
+        }
     }
 
     /// PRD #1497 — one utterance through the reading intercept: the panel's

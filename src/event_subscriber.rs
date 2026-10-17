@@ -105,6 +105,11 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
                     Ok(Some(BroadcastMsg::WorktreeKept(kept))) => {
                         state.write().await.queue_worktree_kept(kept);
                     }
+                    // PRD #1666 §2.8: an inbox message changed state; the
+                    // card's `✉N` / `delivered` line follows it live.
+                    Ok(Some(BroadcastMsg::Inbox(notice))) => {
+                        state.write().await.apply_inbox_notice(&notice);
+                    }
                     // Issue #1637: the daemon's hook-binary notices changed.
                     // The whole list replaces what the dashboard footer shows.
                     Ok(Some(BroadcastMsg::HookBinaryNotice(payload))) => {

@@ -42,6 +42,69 @@ pub use windows::{
     set_endpoint_mode_owner_only, set_file_owner_only, verify_endpoint_trusted,
     verify_file_owner_is_current_user, verify_object_owner_is_current_user, with_socket_umask,
 };
+// Windows-only, for the receipt spool's trusted traversal (PRD #1666): a
+// directory created with its owner-only DACL in the same call, the stored DACL
+// read back from a handle, and the check that refuses anything wider. Their
+// Unix counterparts are `mkdirat(…, 0o700)` and an `fstat` mode check, which
+// the spool does itself.
+#[cfg(all(windows, test))]
+pub(crate) use windows::read_dacl;
+#[cfg(windows)]
+pub(crate) use windows::{create_dir_owner_only, verify_dacl_owner_only};
+
+/// An access-allowed ACE (`ACCESS_ALLOWED_ACE_TYPE`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const ACE_ALLOWED: u8 = 0;
+/// An access-denied ACE (`ACCESS_DENIED_ACE_TYPE`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const ACE_DENIED: u8 = 1;
+
+/// One ACE of a stored DACL: its type and, for an allow or deny ACE, its
+/// trustee's canonical SID string.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AceSummary {
+    pub(crate) kind: u8,
+    pub(crate) sid: String,
+}
+
+/// A stored DACL as data: whether one is present at all (a NULL DACL grants
+/// everyone everything), whether it is protected from inheritance, and its
+/// ACEs in order.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaclSummary {
+    pub(crate) present: bool,
+    pub(crate) protected: bool,
+    pub(crate) aces: Vec<AceSummary>,
+}
+
+/// Decide whether a stored DACL is owner-only (PRD #1666 §3): present,
+/// protected, and granting access to `our_sid` alone. A deny ACE only removes
+/// access, so it is accepted; any other ACE type is refused because it cannot
+/// be vouched for. The pure-data core of the spool's Windows directory check,
+/// testable on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn dacl_is_owner_only(dacl: &DaclSummary, our_sid: &str) -> Result<(), String> {
+    if our_sid.is_empty() {
+        return Err("the current user's SID is empty".to_string());
+    }
+    if !dacl.present {
+        return Err("it has no DACL, which grants everyone access".to_string());
+    }
+    if !dacl.protected {
+        return Err("its DACL is not protected, so it inherits its parent's ACEs".to_string());
+    }
+    for ace in &dacl.aces {
+        match ace.kind {
+            ACE_ALLOWED if ace.sid.eq_ignore_ascii_case(our_sid) => {}
+            ACE_ALLOWED => return Err(format!("its DACL grants access to {}", ace.sid)),
+            ACE_DENIED => {}
+            other => return Err(format!("its DACL holds an ACE of type {other}")),
+        }
+    }
+    Ok(())
+}
 
 /// Decide whether an endpoint owned by `owner_sid` is trusted, given that we are
 /// `our_sid` (PRD #163 M4). Both are canonical SID strings (`S-1-5-21-…`).
@@ -340,6 +403,50 @@ mod tests {
         assert!(endpoint_owner_is_trusted("", SID).is_err());
         assert!(endpoint_owner_is_trusted(SID, "").is_err());
         assert!(endpoint_owner_is_trusted("", "").is_err());
+    }
+
+    fn dacl(present: bool, protected: bool, aces: &[(u8, &str)]) -> DaclSummary {
+        DaclSummary {
+            present,
+            protected,
+            aces: aces
+                .iter()
+                .map(|(kind, sid)| AceSummary {
+                    kind: *kind,
+                    sid: sid.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The spool's Windows directory check accepts a present, protected DACL
+    /// that grants access to us alone (a deny ACE only narrows it).
+    #[test]
+    fn an_owner_only_protected_dacl_is_accepted() {
+        dacl_is_owner_only(&dacl(true, true, &[(ACE_ALLOWED, SID)]), SID).expect("owner only");
+        dacl_is_owner_only(
+            &dacl(true, true, &[(ACE_DENIED, OTHER_SID), (ACE_ALLOWED, SID)]),
+            SID,
+        )
+        .expect("a deny ACE only removes access");
+        dacl_is_owner_only(&dacl(true, true, &[]), SID).expect("an empty protected DACL");
+    }
+
+    /// …and refuses a missing or inheriting DACL, another principal's allow
+    /// ACE, any ACE type it cannot vouch for, and an unknown "us".
+    #[test]
+    fn a_wider_or_inheriting_dacl_is_refused() {
+        assert!(dacl_is_owner_only(&dacl(false, true, &[]), SID).is_err());
+        assert!(dacl_is_owner_only(&dacl(true, false, &[(ACE_ALLOWED, SID)]), SID).is_err());
+        let err = dacl_is_owner_only(
+            &dacl(true, true, &[(ACE_ALLOWED, SID), (ACE_ALLOWED, OTHER_SID)]),
+            SID,
+        )
+        .expect_err("another user's allow ACE");
+        assert!(err.contains(OTHER_SID), "{err}");
+        assert!(dacl_is_owner_only(&dacl(true, true, &[(ACE_ALLOWED, "S-1-1-0")]), SID).is_err());
+        assert!(dacl_is_owner_only(&dacl(true, true, &[(9, SID)]), SID).is_err());
+        assert!(dacl_is_owner_only(&dacl(true, true, &[(ACE_ALLOWED, SID)]), "").is_err());
     }
 
     /// `BUILTIN\Administrators`, the default owner of an elevated admin token.

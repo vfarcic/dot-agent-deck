@@ -92,7 +92,7 @@ worker_response_timeout_minutes = 120
 # every later worker is delegated to without its prompt_template and without its
 # clear flag — the daemon logs a warning saying so. Close the tab first.
 
-# Dogfood: mixed agents — orchestrator/coder=claude (Opus), release=claude (Sonnet), reviewer=pi (Opus, high thinking), and two GPT harnesses on gpt-5.6-sol: auditor=opencode, tester=codex — each at xhigh reasoning effort (opencode's comes from the `agent.build.variant` in opencode.json, since its TUI has no CLI flag for it). Flip any role via the commented alternative `command` and `agent` under it, or switch the whole team with `--orchestration 'anthropic'` / `--orchestration 'GPT'`.
+# Dogfood: mixed agents — orchestrator/coder=claude (Opus), release=claude (Sonnet), reviewer=pi on GPT (`pi-sol`, high thinking), and two GPT harnesses: auditor=opencode, tester=codex — each at xhigh reasoning effort (opencode's comes from the `agent.build.variant` in opencode.json, since its TUI has no CLI flag for it). Flip any role via the commented alternative `command` and `agent` under it, or switch the whole team with `--orchestration 'anthropic'` / `--orchestration 'GPT'`.
 # DO NOT commit a provider outage here. `mixed` has been flipped to all-Claude twice for exhausted OpenAI credits (2026-08-26/09-06, restored by #1024; 2026-09-13, restored by #1079) and each time it silently became a near-duplicate of `anthropic`, removing the cross-provider choice this file exists to offer. One machine's billing state is not a repo-wide default: if a provider is unavailable to you, dispatch with `--orchestration 'anthropic'` instead of editing this.
 [[orchestrations]]
 name = "mixed"
@@ -190,8 +190,10 @@ prompt_template = "Implement the requested change. If the task references a PRD 
 
 [[orchestrations.roles]]
 name = "reviewer"
-command = "devbox run pi-big"
+command = "devbox run pi-sol"   # pi on GPT (gpt-6.1-sol, high thinking)
 agent = "pi"
+# command = "devbox run pi-big"   # pi on Opus
+# agent = "pi"
 # command = "devbox run agent-reviewer"   # all-claude default
 # agent = "claude"
 description = "Reviews code changes for correctness, style, and edge cases"

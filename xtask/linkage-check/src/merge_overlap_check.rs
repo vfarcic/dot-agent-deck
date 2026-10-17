@@ -13,9 +13,8 @@
 //! **What this does NOT claim.** It reads text. It checks that a skill which
 //! tells an agent to run `gh pr merge` without `--auto` names the check, and
 //! that the defining section still carries its commands; it does not check
-//! that an agent follows them, and it does not look at `.claude/skills/dot-ai-*`
-//! (vendored mirrors, CLAUDE.md rule 13) or at merges written some other way
-//! than `gh pr merge`. Auto-merge is exempt because GitHub performs that merge
+//! that an agent follows them, and it does not look at merges written some
+//! other way than `gh pr merge`. Auto-merge is exempt because GitHub performs that merge
 //! with nobody present to run a check; the skills that allow arming say so.
 
 #[cfg(test)]
@@ -46,16 +45,15 @@ mod tests {
             .any(|m| !m.as_str().contains("--auto"))
     }
 
-    /// Every project-local `SKILL.md`, as (skill directory name, contents).
+    /// Every `SKILL.md` under `.claude/skills/`, as (skill directory name,
+    /// contents). The `dot-ai-*` skills are included: they are project-owned
+    /// since syncing from `dot-ai` stopped (CLAUDE.md rule 13).
     fn project_skills() -> Vec<(String, String)> {
         let dir = repo_root().join(".claude/skills");
         let mut skills = Vec::new();
         for entry in fs::read_dir(&dir).expect("read .claude/skills") {
             let entry = entry.expect("read a .claude/skills entry");
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("dot-ai-") {
-                continue;
-            }
             let skill = entry.path().join("SKILL.md");
             if let Ok(text) = fs::read_to_string(&skill) {
                 skills.push((name, text));

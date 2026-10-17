@@ -977,6 +977,46 @@ fn stage_orchestration() -> DashboardScene {
     DashboardScene { deck, capture_at }
 }
 
+/// Scenario: Start demo-loop's synthetic role panes with the planner's queued
+/// startup remit, then post a task to the builder while both are working.
+/// Capture their queued badges beside the work shown in the desktop scenario.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_agent_messaging() {
+    html_dir();
+    for attempt in 1..=DASHBOARD_ATTEMPTS {
+        let scene = stage_orchestration();
+        // Activation already queued the planner's startup remit. The stand-in
+        // deliberately leaves it pending, just as the builder leaves its task.
+        let builder = wait_for_record(&scene.deck, "builder", |_| true);
+        common::post_message_on(
+            scene.deck.attach_socket_path(),
+            builder.pane_id_env.as_deref().expect("builder's pane id"),
+            &builder.id,
+            "Check the checkout retry tests after the current task.",
+        )
+        .expect("post a synthetic queued task");
+        let ready = |grid: &str| {
+            grid.contains("demo-loop [×]")
+                && grid.contains("planner")
+                && grid.contains("builder")
+                && grid.matches("✉1 queued").count() == 2
+                && grid.matches("Working").count() == 2
+                && grid.matches('●').count() == 2
+                && grid.contains("Last: 2s ")
+                && grid.contains("Last: 3s ")
+                && grid.contains("Planning the checkout retry flow")
+                && !grid.contains("Activated orchestration")
+        };
+        let missed =
+            || attempt < DASHBOARD_ATTEMPTS && Utc::now().timestamp() >= scene.capture_at + 2;
+        if capture_unless(&scene.deck, "agent-messaging", ready, missed) {
+            return;
+        }
+    }
+    unreachable!("the final attempt captures or panics");
+}
+
 /// Scenario: Open the Schedules manager over an empty dashboard with one
 /// disabled nightly-triage task. Its longer name leaves a visible gap between
 /// the NAME and STATUS headers while keeping the next-fire field stable.
