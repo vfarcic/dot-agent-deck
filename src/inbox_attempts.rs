@@ -22,11 +22,11 @@
 //! | T1 | a hand-out (`Queued`, or a revalidated repeat token) | [`AttemptModel::issue`] |
 //! | T2 | a stage record for the current assignment | [`AttemptModel::stage`] |
 //! | T3 | a stage record for an earlier assignment | [`AttemptModel::stage`] |
-//! | T4 | lapse (no fresh possession) | [`AttemptModel::tick`] |
+//! | T4 | lapse (no fresh possession, and a spool check found no receipt) | [`AttemptModel::tick_cleared`] |
 //! | T5 | user Retry | [`AttemptModel::retry`] |
 //! | T6 | user Cancel | [`AttemptModel::cancel`] |
 //! | T7 | a revoke answer (`revoked_ack` / `already_handed`) | [`AttemptModel::stage`] |
-//! | T8 | registration, resume answer or its silence | [`AttemptModel::register`], [`AttemptModel::resume_answer`], [`AttemptModel::tick`] |
+//! | T8 | registration, resume answer or its silence, a closed stream nobody replaced | [`AttemptModel::register`], [`AttemptModel::resume_answer`], [`AttemptModel::tick_cleared`] |
 //! | T9 | generation exit | [`AttemptModel::exit`] |
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,6 +46,13 @@ pub const DEFAULT_EVIDENCE_LIMIT: usize = 1024;
 pub const HELD_LONG_AFTER: Duration = Duration::from_secs(60 * 60);
 /// Keepalives in one `POSSESS_TTL` (§4).
 pub const KEEPALIVES_PER_POSSESS_TTL: u32 = 3;
+/// `POSSESS_TTL`s a message may wait unpossessed for something that would
+/// let it go on — a spool check that can tell, or a receiver to take its
+/// scheduled repeat — before it is `Uncertain` and the user decides (§3, §6).
+pub const WAIT_TTLS_BEFORE_UNCERTAIN: u32 = 2;
+/// `POSSESS_TTL`s a stream incarnation whose connection closed stays its
+/// slot's, for its context to reconnect and resume what it holds.
+pub const CLOSED_RETIRE_TTLS: u32 = 3;
 
 /// The model's bounds and clocks.
 #[derive(Debug, Clone, Copy)]
@@ -59,6 +66,22 @@ pub struct Limits {
     /// A resume answer's window, and a once-waiter's idle grace.
     pub ack_wait: Duration,
     pub held_long_after: Duration,
+}
+
+impl Limits {
+    /// How long a message waits, unpossessed, for a spool check that can
+    /// tell or for a receiver to take its scheduled repeat, before it is
+    /// `Uncertain`.
+    pub fn uncertain_after(&self) -> Duration {
+        self.possess_ttl * WAIT_TTLS_BEFORE_UNCERTAIN
+    }
+
+    /// How long a stream incarnation whose connection closed stays its
+    /// slot's, waiting for its context to reconnect and resume what it
+    /// holds, before it is retired with no successor.
+    pub fn closed_retire_after(&self) -> Duration {
+        self.possess_ttl * CLOSED_RETIRE_TTLS
+    }
 }
 
 impl Default for Limits {
@@ -175,7 +198,13 @@ pub struct Attempt {
     pub d: u64,
     pub stage: Stage,
     pub kind: IssueKind,
-    pub lapsed: bool,
+    /// A spool check since the attempt last held possession found no
+    /// receipt for it (§3): only then does it count toward an automatic
+    /// repeat. Possession regained, a rebinding or a fence clears it.
+    pub cleared: bool,
+    /// Bumped whenever possession is regained, so a check begun before is
+    /// not taken as covering what was published after.
+    mark: u64,
     /// Its incarnation was retired and the resume answer is still owed.
     pub resume_pending: bool,
     pub revoked: bool,
@@ -191,6 +220,18 @@ pub struct Attempt {
 enum TokenKind {
     Auto,
     Manual,
+}
+
+/// An attempt the caller must look up in the spool before it may count as
+/// receipt-less (§3), with the possession mark the answer is valid for: the
+/// caller hands the checks it could answer back to
+/// [`AttemptModel::tick_cleared`], which revalidates each under its lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LapseCheck {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+    mark: u64,
 }
 
 /// A scheduled repeat, revalidated at hand-out (§2, auditor C2).
@@ -234,6 +275,10 @@ pub struct Delivery {
     pub requeues: u32,
     token: Option<RepeatToken>,
     possessed_since: Option<Instant>,
+    /// Since when rule 5 has found the message unpossessed and unable to go
+    /// on: waiting for a spool check that can tell, or for a receiver to
+    /// take its repeat.
+    waiting_since: Option<Instant>,
     held_long_sent: Option<u64>,
     last_action: Option<(u64, Verb, ActionOutcome)>,
     corrected: bool,
@@ -253,6 +298,7 @@ impl Delivery {
             requeues: 0,
             token: None,
             possessed_since: None,
+            waiting_since: None,
             held_long_sent: None,
             last_action: None,
             corrected: false,
@@ -457,6 +503,10 @@ struct Receiver {
     idle_since: Option<Instant>,
     /// A hook or `inbox fetch` receiver's open connection.
     connected: bool,
+    /// A stream receiver's connection closed at this instant; with no
+    /// successor registered, it is retired [`Limits::closed_retire_after`]
+    /// later.
+    closed_at: Option<Instant>,
     queue_survived: bool,
     next_d: u64,
 }
@@ -532,6 +582,7 @@ impl AttemptModel {
                 busy: slot == Slot::OnceWaiter,
                 idle_since: None,
                 connected: slot == Slot::Hook,
+                closed_at: None,
                 queue_survived,
                 next_d: 0,
             },
@@ -585,9 +636,16 @@ impl AttemptModel {
             let held = msg.attempts.iter().filter(|at| at.a == msg.a).any(|at| {
                 at.resume_pending || possessed(&self.receivers, &self.limits, id, at, now)
             });
+            // §3: an automatic repeat only once every possibly handed attempt
+            // of the assignment was checked in the spool and found no receipt.
+            let cleared = msg
+                .attempts
+                .iter()
+                .filter(|at| at.a == msg.a)
+                .all(|at| !needs_clearance(at) || at.cleared);
             let valid = token.a == msg.a
                 && token.revision == msg.revision
-                && (token.kind == TokenKind::Manual || !held);
+                && (token.kind == TokenKind::Manual || (!held && cleared));
             if !valid {
                 if let Some(msg) = self.messages.get_mut(id) {
                     msg.token = None;
@@ -635,7 +693,8 @@ impl AttemptModel {
             d,
             stage: Stage::Issued,
             kind,
-            lapsed: false,
+            cleared: false,
+            mark: 0,
             resume_pending: false,
             revoked: false,
             verifier: false,
@@ -773,6 +832,16 @@ impl AttemptModel {
             .iter()
             .map(|(id, a, e)| (id.to_string(), *a, *e))
             .collect();
+        for (id, a, e) in held {
+            if let Some(at) = self
+                .messages
+                .get_mut(*id)
+                .and_then(|msg| msg.attempt_mut(*a, *e))
+                .filter(|at| at.rx == rx)
+            {
+                at.regained();
+            }
+        }
         SnapshotOutcome::Applied
     }
 
@@ -787,6 +856,11 @@ impl AttemptModel {
             if busy {
                 r.busy = true;
                 r.idle_since = None;
+                for msg in self.messages.values_mut() {
+                    for at in msg.attempts.iter_mut().filter(|at| at.rx == rx) {
+                        at.regained();
+                    }
+                }
             } else if r.busy || r.idle_since.is_none() {
                 r.busy = false;
                 r.idle_since = Some(now);
@@ -805,26 +879,49 @@ impl AttemptModel {
         self.slots.get(&slot).copied().filter(|rx| self.live(*rx))
     }
 
-    /// The open attempts T4 would lapse at `now`: neither final, resuming,
-    /// lapsed already nor possessed. The caller may first check each for a
-    /// receipt (§3) and keep those it cannot yet call receipt-less.
-    pub fn lapse_candidates(&self, now: Instant) -> Vec<(String, u32, u32)> {
+    /// The attempts a spool check must clear before rule 5 may repeat their
+    /// message (§3): possibly handed, of a live message's current
+    /// assignment, not resuming, not possessed and not cleared since they
+    /// last were. Each carries its possession mark, for
+    /// [`Self::tick_cleared`] to revalidate.
+    pub fn lapse_candidates(&self, now: Instant) -> Vec<LapseCheck> {
         let mut out = Vec::new();
         if self.exited {
             return out;
         }
         for (id, msg) in &self.messages {
-            for at in &msg.attempts {
-                if !at.stage.is_final()
-                    && !at.resume_pending
-                    && !at.lapsed
+            if msg.state.is_terminal() {
+                continue;
+            }
+            for at in msg.attempts.iter().filter(|at| at.a == msg.a) {
+                if needs_clearance(at)
+                    && !at.cleared
                     && !possessed(&self.receivers, &self.limits, id, at, now)
                 {
-                    out.push((id.clone(), at.a, at.e));
+                    out.push(LapseCheck {
+                        id: id.clone(),
+                        a: at.a,
+                        e: at.e,
+                        mark: at.mark,
+                    });
                 }
             }
         }
         out
+    }
+
+    /// Whether any attempt could still have a commit receipt the deck has
+    /// not seen: not reclaimed and not committed. While one does, the spool
+    /// is worth scanning, so a commit published for any issued attempt —
+    /// fenced, lapsed, an earlier assignment's or a late-correction
+    /// verifier's — reaches T2 or T3.
+    pub fn watching_receipts(&self) -> bool {
+        !self.exited
+            && self.messages.values().any(|msg| {
+                msg.attempts
+                    .iter()
+                    .any(|at| !at.reclaimed && at.stage != Stage::Committed)
+            })
     }
 
     /// The message ids this model holds.
@@ -851,6 +948,22 @@ impl AttemptModel {
     pub fn connection_closed(&mut self, now: Instant, rx: Rx) {
         if let Some(r) = self.receivers.get_mut(&rx) {
             r.connected = false;
+        }
+        self.finalize_bound_to(now, rx);
+    }
+
+    /// A stream receiver's connection closed (§4). It decides nothing at
+    /// once: the incarnation stays its slot's so a reconnecting context can
+    /// resume what it holds, and its attempts lapse when `POSSESS_TTL` runs
+    /// out. With no successor registered within
+    /// [`Limits::closed_retire_after`], the clock retires it and fences its
+    /// open attempts: possibly handed, with no one left to answer for them.
+    pub fn stream_closed(&mut self, now: Instant, rx: Rx) {
+        if let Some(r) = self.receivers.get_mut(&rx)
+            && !r.retired
+            && matches!(r.slot, Slot::OpencodeServer | Slot::OpencodeTui | Slot::Pi)
+        {
+            r.closed_at.get_or_insert(now);
         }
         self.finalize_bound_to(now, rx);
     }
@@ -942,51 +1055,65 @@ impl AttemptModel {
                 at.rx = rx;
                 at.d = r.next_d;
                 at.issued_at = now;
-                at.lapsed = false;
+                at.regained();
             }
             ResumeAnswer::NotHanded if survived => at.stage = Stage::NotHanded,
-            _ => at.stage = Stage::Fenced,
+            _ => at.fence(),
         }
         self.finalize(now, id);
         StageOutcome::Applied
     }
 
-    /// T4 (lapse), T8 (resume silence) and held_long attention.
+    /// T4 (lapse), T8 (resume silence) and held_long attention, for a
+    /// generation with no receipt store to check: the declared degraded
+    /// policy (§3), under which no suppression is claimed, so every lapse
+    /// candidate counts as checked.
     pub fn tick(&mut self, now: Instant) {
-        self.tick_keeping(now, &BTreeSet::new());
+        let checks = self.lapse_candidates(now);
+        self.tick_cleared(now, &checks);
     }
 
-    /// [`Self::tick`], except that the attempts in `keep` are not lapsed yet:
-    /// those the caller could not yet show to have no receipt (§3 "Slow and
-    /// failed storage": only a completed, error-free scan and an exact lookup
-    /// that finds neither record name is absence).
-    pub fn tick_keeping(&mut self, now: Instant, keep: &BTreeSet<(String, u32, u32)>) {
+    /// T4 (lapse), T8 (resume silence) and held_long attention. `cleared`
+    /// are the lapse candidates whose spool check found no receipt (§3 "Slow
+    /// and failed storage": only a completed, error-free scan and an exact
+    /// lookup that finds neither record name is absence). Each is
+    /// revalidated here, under the caller's lock: one that regained
+    /// possession, was rebound or fenced, or reached a final stage while
+    /// the check ran is not cleared by it. A candidate left out stays
+    /// uncleared, so it cannot lead to an automatic repeat.
+    pub fn tick_cleared(&mut self, now: Instant, cleared: &[LapseCheck]) {
         if self.exited {
             return;
         }
-        let ids: Vec<String> = self.messages.keys().cloned().collect();
-        for id in &ids {
-            let Some(msg) = self.messages.get(id) else {
+        for check in cleared {
+            let Some(msg) = self.messages.get(&check.id) else {
                 continue;
             };
-            let held: Vec<bool> = msg
-                .attempts
-                .iter()
-                .map(|at| possessed(&self.receivers, &self.limits, id, at, now))
-                .collect();
+            let Some(at) = msg.attempt(check.a, check.e) else {
+                continue;
+            };
+            let valid = at.mark == check.mark
+                && at.a == msg.a
+                && needs_clearance(at)
+                && !possessed(&self.receivers, &self.limits, &check.id, at, now);
+            if valid
+                && let Some(at) = self
+                    .messages
+                    .get_mut(&check.id)
+                    .and_then(|msg| msg.attempt_mut(check.a, check.e))
+            {
+                at.cleared = true;
+            }
+        }
+        self.retire_closed(now);
+        let ids: Vec<String> = self.messages.keys().cloned().collect();
+        for id in &ids {
             if let Some(msg) = self.messages.get_mut(id) {
-                for (at, held) in msg.attempts.iter_mut().zip(held) {
-                    if at.resume_pending {
-                        if at.resume_deadline.is_some_and(|d| now >= d) {
-                            at.resume_pending = false;
-                            at.resume_deadline = None;
-                            at.stage = Stage::Fenced;
-                        }
-                    } else if !at.stage.is_final()
-                        && !held
-                        && !keep.contains(&(id.clone(), at.a, at.e))
-                    {
-                        at.lapsed = true;
+                for at in msg.attempts.iter_mut() {
+                    if at.resume_pending && at.resume_deadline.is_some_and(|d| now >= d) {
+                        at.resume_pending = false;
+                        at.resume_deadline = None;
+                        at.fence();
                     }
                 }
             }
@@ -1006,6 +1133,35 @@ impl AttemptModel {
                         id: id.clone(),
                         revision: msg.revision,
                     });
+                }
+            }
+        }
+    }
+
+    /// Retire every stream incarnation whose connection closed
+    /// [`Limits::closed_retire_after`] ago with no successor: its slot is
+    /// free, and its open attempts are fenced — possibly handed, with no
+    /// incarnation left to resume or revoke them.
+    fn retire_closed(&mut self, now: Instant) {
+        let after = self.limits.closed_retire_after();
+        let gone: Vec<Rx> = self
+            .receivers
+            .iter()
+            .filter(|(_, r)| !r.retired && r.closed_at.is_some_and(|at| now >= at + after))
+            .map(|(rx, _)| *rx)
+            .collect();
+        for rx in gone {
+            if let Some(r) = self.receivers.get_mut(&rx) {
+                r.retired = true;
+                if self.slots.get(&r.slot) == Some(&rx) {
+                    self.slots.remove(&r.slot);
+                }
+            }
+            for msg in self.messages.values_mut() {
+                for at in msg.attempts.iter_mut().filter(|at| at.rx == rx) {
+                    if !at.stage.is_final() && !at.resume_pending {
+                        at.fence();
+                    }
                 }
             }
         }
@@ -1082,6 +1238,7 @@ impl AttemptModel {
                         kind: TokenKind::Manual,
                     });
                     msg.possessed_since = None;
+                    msg.waiting_since = None;
                     msg.held_long_sent = None;
                     ActionOutcome::Applied { revision: 0 }
                 }
@@ -1170,6 +1327,7 @@ impl AttemptModel {
         let all_not_handed =
             !current.is_empty() && current.iter().all(|at| at.stage == Stage::NotHanded);
         let none_issued = current.is_empty();
+        let cleared = current.iter().all(|at| !needs_clearance(at) || at.cleared);
         let limits = self.limits;
         let Some(msg) = self.messages.get_mut(id) else {
             return;
@@ -1194,6 +1352,7 @@ impl AttemptModel {
                 msg.set_state(MessageState::Settled);
                 msg.token = None;
                 msg.possessed_since = None;
+                msg.waiting_since = None;
                 msg.held_long_sent = None;
                 for at in msg.attempts.iter_mut() {
                     if !at.stage.is_final() && !at.revoked {
@@ -1221,6 +1380,7 @@ impl AttemptModel {
             if msg.latch {
                 msg.token = None;
                 msg.possessed_since = None;
+                msg.waiting_since = None;
                 if all_final {
                     if msg.offer && all_not_handed {
                         effects.push(Effect::ReturnToPool {
@@ -1242,6 +1402,7 @@ impl AttemptModel {
             if all_not_handed {
                 msg.token = None;
                 msg.possessed_since = None;
+                msg.waiting_since = None;
                 if msg.state != MessageState::Queued {
                     msg.requeues += 1;
                     if msg.requeues >= limits.max_deliver || msg.issued >= limits.max_attempts {
@@ -1265,6 +1426,7 @@ impl AttemptModel {
                     msg.token = None;
                 }
                 msg.set_state(MessageState::Attempting);
+                msg.waiting_since = None;
                 if held {
                     msg.possessed_since.get_or_insert(now);
                 } else {
@@ -1272,12 +1434,31 @@ impl AttemptModel {
                 }
                 break 'rules;
             }
-            // Rule 5: possibly handed and nobody possesses it.
+            // Rule 5: possibly handed and nobody possesses it. An automatic
+            // repeat needs every such attempt cleared by a spool check (§3);
+            // a message that cannot go on — no check can tell, or no
+            // receiver takes its repeat — waits a bounded time and is then
+            // `Uncertain`, for the user to decide. Once uncertain it stays
+            // so: only the user, a receipt or regained possession moves it.
             msg.possessed_since = None;
+            let waiting = *msg.waiting_since.get_or_insert(now);
+            let waited = now >= waiting + limits.uncertain_after();
             if msg.token.is_some() {
-                msg.set_state(MessageState::Attempting);
+                if waited {
+                    msg.token = None;
+                    msg.set_state(MessageState::Uncertain(UncertainReason::Lapsed));
+                } else {
+                    msg.set_state(MessageState::Attempting);
+                }
+            } else if matches!(msg.state, MessageState::Uncertain(_)) {
             } else if msg.issued >= limits.max_attempts {
                 msg.set_state(MessageState::Uncertain(UncertainReason::OutOfAttempts));
+            } else if !cleared {
+                if waited {
+                    msg.set_state(MessageState::Uncertain(UncertainReason::Lapsed));
+                } else {
+                    msg.set_state(MessageState::Attempting);
+                }
             } else if msg.auto_repeats < limits.max_auto_repeats {
                 msg.set_state(MessageState::Attempting);
                 msg.token = Some(RepeatToken {
@@ -1347,6 +1528,34 @@ impl AttemptModel {
             }
         }
     }
+}
+
+impl Attempt {
+    /// Possession was regained: an earlier spool check covers nothing
+    /// published from here on.
+    fn regained(&mut self) {
+        self.cleared = false;
+        self.mark += 1;
+    }
+
+    /// Fenced: possibly handed, and checked in the spool again before it
+    /// leads to a repeat (§3), since its incarnation may have published a
+    /// receipt it never reported.
+    fn fence(&mut self) {
+        self.stage = Stage::Fenced;
+        self.regained();
+    }
+}
+
+/// Whether `at` must be cleared by a spool check before rule 5 may repeat
+/// its message: it may have been handed and may have a receipt the deck has
+/// not seen (§3).
+fn needs_clearance(at: &Attempt) -> bool {
+    !at.resume_pending
+        && matches!(
+            at.stage,
+            Stage::Issued | Stage::Handed | Stage::Fenced | Stage::HandedInert
+        )
 }
 
 /// Whether `at` is possessed right now (§4). A stream attempt is possessed
@@ -1525,6 +1734,12 @@ mod tests {
             m.delivery("m1").unwrap().attempt(1, e1.e).unwrap().stage,
             Stage::Fenced
         );
+        assert_eq!(
+            m.issue(t, "m1", reg.rx),
+            Err(IssueRefusal::NothingToIssue),
+            "a fenced attempt is checked in the spool before it repeats (§3)"
+        );
+        m.tick(t);
         let e2 = m.issue(t, "m1", reg.rx).expect("marked repeat");
         assert_eq!(e2.kind, IssueKind::AutoRepeat);
         assert!(e2.kind.marked());
@@ -1581,6 +1796,7 @@ mod tests {
         let f1 = issue_held(&mut m, t, "fenced", rx1, 1);
         let rx2 = m.register(t, Slot::Pi, false).rx;
         m.resume_answer(t, rx2, "fenced", 1, f1.e, ResumeAnswer::Unknown);
+        m.tick(t);
         let f2 = m.issue(t, "fenced", rx2).unwrap();
         m.drain_effects();
         assert_eq!(
@@ -1876,8 +2092,13 @@ mod tests {
         let e3 = m.issue(t, "m3", rx).unwrap();
         m.snapshot(t, rx, 7, e3.d, &[("m1", 1, e1.e), ("m2", 1, e2.e)]);
         assert!(
+            !m.delivery("m3").unwrap().repeat_scheduled(),
+            "an omission alone is no repeat: the spool is checked first (§3)"
+        );
+        m.tick(t);
+        assert!(
             m.delivery("m3").unwrap().repeat_scheduled(),
-            "omitted with d <= seen is not possessed"
+            "omitted with d <= seen is not possessed, and checked it repeats"
         );
 
         let late = past_ttl(t);
@@ -1885,14 +2106,14 @@ mod tests {
         m.tick(late);
         let d2 = m.delivery("m2").unwrap();
         assert!(
-            d2.attempt(1, e2.e).unwrap().lapsed,
+            d2.attempt(1, e2.e).unwrap().cleared,
             "issue grace ended at the TTL"
         );
         assert!(d2.repeat_scheduled());
 
         let paused = past_ttl(late);
         m.tick(paused);
-        assert!(m.delivery("m1").unwrap().attempt(1, e1.e).unwrap().lapsed);
+        assert!(m.delivery("m1").unwrap().attempt(1, e1.e).unwrap().cleared);
         let rep = m
             .issue(paused, "m1", rx)
             .expect("marked repeat after a pause");
@@ -1916,6 +2137,7 @@ mod tests {
         let w1 = m.issue(paused, "w1", rx2).unwrap();
         let w2 = m.issue(paused, "w2", rx2).unwrap();
         m.snapshot(paused, rx2, 1, w2.d, &[("w1", 1, w1.e)]);
+        m.tick(paused);
         assert!(m.delivery("w2").unwrap().repeat_scheduled());
         m.snapshot(paused, rx2, 2, 0, &[("w1", 1, w1.e)]);
         assert!(
@@ -2041,6 +2263,7 @@ mod tests {
                 .stage,
             Stage::Fenced
         );
+        m.tick(t);
         assert!(m.issue(t, "reloaded", rx3).unwrap().kind.marked());
 
         m.post("silent", false);

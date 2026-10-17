@@ -1773,6 +1773,14 @@ fn spawn_with_dir(
     // mode to point at.
     cmd.env_remove(DOT_AGENT_DECK_SOCKET);
     cmd.env_remove("DOT_AGENT_DECK_ATTACH_SOCKET");
+    // PRD #1666 §3: the receipt spool, on the same scrub-then-overlay rule. A
+    // daemon launched inside another deck's pane inherits that deck's spool;
+    // without this, a daemon whose own spool did not start (so `spawn_agent`
+    // overlays nothing) would hand its children the other deck's, and their
+    // watchers would publish receipts into a namespace this daemon never
+    // reads. Only `spawn_agent`'s overlay, this daemon's own value, reaches a
+    // child.
+    cmd.env_remove(crate::inbox_receipt::ENV_INBOX_SPOOL);
 
     for (k, v) in &opts.env {
         // PRD #127 C2: `SHELL` in `opts.env` is a wrapper-choice override only
@@ -5028,6 +5036,18 @@ impl QuestionAnswers {
         #[cfg(not(test))]
         let _ = name;
     }
+}
+
+/// PRD #1666 §11: whether a spawn starts OpenCode — by its declared agent
+/// type, or by the basename of its command when it declares none — and so
+/// owes the inbox its integration refresh and capability probe.
+fn opencode_spawn(agent_type: Option<&crate::event::AgentType>, command: Option<&str>) -> bool {
+    let basename = command
+        .and_then(|c| c.split_whitespace().next())
+        .and_then(|program| std::path::Path::new(program).file_name())
+        .and_then(|name| name.to_str())
+        .and_then(crate::agent_registry::detect_from_basename);
+    agent_type.cloned().or(basename) == Some(crate::event::AgentType::OpenCode)
 }
 
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
@@ -9526,6 +9546,12 @@ impl AgentPtyRegistry {
         // `agents.insert` below — where lock poisoning on `inner.lock()`
         // would otherwise drop the `AgentPty` without killing the child
         // (`AgentPty` has no `Drop`).
+        // PRD #1666 §11: an OpenCode generation's integration files are
+        // rewritten from this daemon's binary before its child starts, so the
+        // agent loads the integration the deck checks it against rather than
+        // a copy it read before a refresh on another thread caught up.
+        let inbox_refresh = opencode_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref())
+            .then(|| crate::inbox_hub::off_the_executor(crate::opencode_manage::refresh_for_spawn));
         let guard = PtyGuard::new(spawn_with_dir(opts, dir)?);
         #[cfg(test)]
         {
@@ -9789,8 +9815,8 @@ impl AgentPtyRegistry {
         // harmless — the monitor will re-check counters anyway.
         self.change_notify.notify_one();
         drop(inner);
-        if let (Some(pane), command, env) = inbox_spawn {
-            self.note_inbox_spawn(&pane, &id, inbox_agent_type, command.as_deref(), &env);
+        if let (Some(pane), Some(refresh)) = (inbox_spawn.0, inbox_refresh) {
+            self.note_inbox_spawn(&pane, &id, refresh, &inbox_spawn.2);
         }
         Ok(id)
     }
@@ -9798,29 +9824,24 @@ impl AgentPtyRegistry {
     /// PRD #1666 §11: what an OpenCode generation's start owes its inbox,
     /// after the registry lock is released. Its adapter declares the floor,
     /// so its card says the integration has not connected yet if nothing
-    /// registers by the readiness deadline. Off the executor, its integration
-    /// files are regenerated from this daemon's binary, so restarting the
-    /// agent really refreshes them, and the capability probe runs the CLI the
-    /// adapter will run: only clap refusing the flag marks the generation's CLI
-    /// too old.
+    /// registers by the readiness deadline; a refresh of its integration
+    /// files that failed before the child started ([`opencode_spawn`]'s
+    /// caller) is said on the card instead of promising that a restart
+    /// updates them. Off the executor, the capability probe runs the CLI the
+    /// adapter will run: only clap refusing the flag marks the generation's
+    /// CLI too old.
     fn note_inbox_spawn(
         &self,
         pane: &str,
         agent: &str,
-        agent_type: Option<crate::event::AgentType>,
-        command: Option<&str>,
+        (pins, failed): (Vec<crate::hook_binary::HookPin>, Vec<String>),
         env: &[(String, String)],
     ) {
-        let basename = command
-            .and_then(|c| c.split_whitespace().next())
-            .and_then(|program| std::path::Path::new(program).file_name())
-            .and_then(|name| name.to_str())
-            .and_then(crate::agent_registry::detect_from_basename);
-        if agent_type.or(basename) != Some(crate::event::AgentType::OpenCode) {
-            return;
-        }
         let hub = Arc::clone(self.inbox());
         hub.expect_integration(pane, agent);
+        if !failed.is_empty() {
+            hub.set_refresh_failed(pane, agent, &failed);
+        }
         let override_bin = env
             .iter()
             .find(|(k, _)| k == "DOT_AGENT_DECK_BIN")
@@ -9828,7 +9849,6 @@ impl AgentPtyRegistry {
             .filter(|path| path.is_absolute());
         let (pane, agent) = (pane.to_string(), agent.to_string());
         std::thread::spawn(move || {
-            let pins = crate::opencode_manage::auto_install();
             let binary = override_bin.or_else(|| {
                 pins.first()
                     .map(|pin| std::path::PathBuf::from(&pin.binary))
@@ -23868,6 +23888,93 @@ mod spawn_tests {
         assert_eq!(exported, vec![new_token]);
 
         registry.shutdown_all();
+    }
+
+    /// Scenario: A daemon is launched with another deck's receipt spool in its environment, and a caller asks for a forged one in the spawn options. A registry with no spool of its own gives its child no spool at all; one whose spool started gives its child exactly its own, and so does a respawn of that pane.
+    #[test]
+    fn the_child_sees_only_this_daemons_receipt_spool() {
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let spool_var = crate::inbox_receipt::ENV_INBOX_SPOOL;
+        let prior = std::env::var_os(spool_var);
+        // SAFETY: see `ENV_TEST_LOCK`; the prior value is restored below.
+        unsafe {
+            std::env::set_var(spool_var, "/elsewhere/inbox-spool/other-deck");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let seen = |name: &str| dir.path().join(name);
+        let command = |name: &str| {
+            format!(
+                "sh -c 'printf %s \"${{{spool_var}-unset}}\" > {}.tmp && mv {}.tmp {}; exec cat'",
+                seen(name).display(),
+                seen(name).display(),
+                seen(name).display()
+            )
+        };
+        let read = |name: &str| {
+            let path = seen(name);
+            for _ in 0..500 {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    return text;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "the child never reported its environment: {}",
+                path.display()
+            );
+        };
+        let forged = (spool_var.to_string(), "/forged/by/the/caller".to_string());
+
+        let bare = Arc::new(AgentPtyRegistry::new());
+        let without = command("without");
+        bare.spawn_agent(SpawnOptions {
+            command: Some(&without),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), "no-spool".to_string()),
+                forged.clone(),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn");
+        let without_spool = read("without");
+
+        let state = tempfile::tempdir().unwrap();
+        let healthy = Arc::new(AgentPtyRegistry::new());
+        healthy.inbox().set_spool(
+            crate::inbox_receipt::Spool::start(&state.path().canonicalize().unwrap()).unwrap(),
+        );
+        let own = healthy.inbox().spool_env().unwrap();
+        let with = command("with");
+        healthy
+            .spawn_agent(SpawnOptions {
+                command: Some(&with),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), "spooled".to_string()),
+                    forged.clone(),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let with_spool = read("with");
+        let respawned = command("respawned");
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(healthy.respawn_agent_for_pane("spooled", &respawned))
+            .expect("respawn");
+        let after_respawn = read("respawned");
+
+        // SAFETY: as above.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(spool_var, v),
+                None => std::env::remove_var(spool_var),
+            }
+        }
+        bare.shutdown_all();
+        healthy.shutdown_all();
+        assert_eq!(without_spool, "unset", "no spool of its own: none at all");
+        assert_eq!(with_spool, own.to_string_lossy(), "only its own");
+        assert_eq!(after_respawn, own.to_string_lossy(), "and after a respawn");
     }
 
     /// The token must not travel to any client. `AgentRecord` is what

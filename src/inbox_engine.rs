@@ -24,7 +24,7 @@
 //! registered, so nothing is handed to it, and its doorbell stays silent; mail
 //! waits queued.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,8 +42,8 @@ use crate::event::{
 };
 use crate::inbox::{AckHow, AssignmentOwner, Consumer, MessageState, UndeliverableReason};
 use crate::inbox_attempts::{
-    AttemptModel, Effect, HandOverRefusal, Limits, MessageState as Delivery, ResumeAnswer, Rx,
-    Slot, Stage, UncertainReason, UndeliverableReason as Verdict,
+    AttemptModel, Effect, HandOverRefusal, LapseCheck, Limits, MessageState as Delivery,
+    ResumeAnswer, Rx, Slot, Stage, UncertainReason, UndeliverableReason as Verdict,
 };
 use crate::inbox_display::{AttentionKind, IntegrationNotice};
 use crate::inbox_receipt::{EvidenceStore, GenerationSpool, RecordScanner};
@@ -101,12 +101,17 @@ pub(super) struct Floor {
     pub(super) cli_too_old: bool,
     /// A registration declared a missing or lower integration.
     pub(super) adapter_too_old: bool,
+    /// The deck could not rewrite the generation's integration files as it
+    /// started (`refresh_for_spawn`), so restarting does not update them.
+    pub(super) refresh_failed: bool,
 }
 
 impl Floor {
     fn notice(&self, now: Instant) -> Option<IntegrationNotice> {
         if self.cli_too_old {
             Some(IntegrationNotice::CliTooOld)
+        } else if self.refresh_failed && !self.registered {
+            Some(IntegrationNotice::RefreshFailed)
         } else if self.adapter_too_old {
             Some(IntegrationNotice::AdapterTooOld)
         } else if !self.registered && self.arm_by.is_some_and(|by| now >= by) {
@@ -162,6 +167,8 @@ pub(super) struct Receipts {
     /// Reclaimed attempts whose spool files go once the lock is released.
     pub(super) removals: Vec<(Arc<GenerationSpool>, String, u32, u32)>,
     pub(super) arm_deadline: Duration,
+    /// When the clock last read the spools ([`tick`]).
+    pub(super) last_check: Option<Instant>,
 }
 
 impl Receipts {
@@ -173,6 +180,7 @@ impl Receipts {
             told: HashMap::new(),
             removals: Vec::new(),
             arm_deadline,
+            last_check: None,
         }
     }
 
@@ -201,7 +209,22 @@ impl Receipts {
             .filter_map(|floor| floor.arm_by)
             .filter(|by| *by > now)
             .min();
-        [open.then(|| now + step), arm].into_iter().flatten().min()
+        // §3: an attempt that just lost possession is checked in the spool
+        // soon, so its repeat (or its settling receipt) is not left waiting
+        // for the next ordinary step; at most once a second while one waits.
+        let checking = self
+            .gens
+            .values()
+            .any(|generation| !generation.model.lapse_candidates(now).is_empty());
+        let check = checking.then(|| {
+            self.last_check
+                .map_or(now, |at| at + step.min(Duration::from_secs(1)))
+                .max(now)
+        });
+        [open.then(|| now + step), arm, check]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
 
@@ -225,12 +248,20 @@ pub(super) fn generation_mut<'a>(
         None => "the deck has no receipt spool".to_string(),
     };
     st.receipts.gens.entry(key.clone()).or_insert_with(|| {
-        let (spool, degraded) = match spool {
+        let (spool, mut degraded) = match spool {
             Some(Ok(spool)) => (Some(spool), None),
             Some(Err(error)) => (None, Some(error)),
             None => (None, Some(missing)),
         };
-        let scanner = spool.as_ref().and_then(|spool| spool.scanner().ok());
+        // §3: a generation the deck cannot read the receipts of is degraded,
+        // and its lapses follow the degraded policy rather than a check.
+        let scanner = spool.as_ref().and_then(|spool| match spool.scanner() {
+            Ok(scanner) => Some(scanner),
+            Err(error) => {
+                degraded.get_or_insert_with(|| format!("could not read receipts: {error}"));
+                None
+            }
+        });
         Gen {
             model: AttemptModel::new(limits, 1),
             spool,
@@ -265,6 +296,7 @@ pub(super) fn register(
     floor.registered = true;
     floor.adapter_too_old = false;
     floor.cli_too_old = false;
+    floor.refresh_failed = false;
     let generation = generation_mut(st, key, spool);
     let registration = generation.model.register(now, slot, resumed);
     generation.links.insert(
@@ -311,12 +343,15 @@ pub(super) fn refuse_adapter(st: &mut HubState, key: &AgentKey) {
         .adapter_too_old = true;
 }
 
-/// The stream `rx` of `key` ended. It decides nothing (§4: a stream
+/// The stream `rx` of `key` ended. It decides nothing at once (§4: a stream
 /// disconnect never requeues): the incarnation stays its slot's until the
 /// next registration of that slot retires it and asks it to resume what it
 /// still holds, and with no snapshot its attempts lapse when `POSSESS_TTL`
-/// runs out, which is §6's marked repeat.
-pub(super) fn closed(st: &mut HubState, key: &AgentKey, rx: Rx, conn_id: u64) {
+/// runs out, which is §6's marked repeat once the spool is checked. With no
+/// registration in its place for a while, the model retires it and fences
+/// what it held, so a Cancel can end those attempts and a message no
+/// receiver takes is `Uncertain` rather than waiting forever.
+pub(super) fn closed(st: &mut HubState, key: &AgentKey, rx: Rx, conn_id: u64, now: Instant) {
     let Some(generation) = st.receipts.gens.get_mut(key) else {
         return;
     };
@@ -326,6 +361,7 @@ pub(super) fn closed(st: &mut HubState, key: &AgentKey, rx: Rx, conn_id: u64) {
         .is_some_and(|link| link.conn_id == conn_id)
     {
         generation.links.remove(&rx);
+        generation.model.stream_closed(now, rx);
     }
 }
 
@@ -395,6 +431,23 @@ fn issue_to(
             return out;
         };
         generation.model.post(id, offer);
+        // Measured before it is issued: a message that would take the batch
+        // past the budget stays waiting for the next hand-out, unissued. The
+        // first is always taken, even over the budget on its own.
+        let marked = generation
+            .model
+            .delivery(id)
+            .is_some_and(|d| d.repeat_scheduled());
+        let len = budget.map(|budget| {
+            let text = render_marked(&message, Some(budget), marked).text;
+            budget.measure(&text) + budget.measure(super::BLOCK_SEPARATOR)
+        });
+        if let (Some(budget), Some(len)) = (budget, len)
+            && !out.is_empty()
+            && used + len > budget.limit()
+        {
+            break;
+        }
         let issued = match generation.model.issue(now, id, rx) {
             Ok(issued) => issued,
             Err(crate::inbox_attempts::IssueRefusal::EvidencePaused) => {
@@ -430,15 +483,7 @@ fn issue_to(
                 .take_receipt(now, id, &key.0, &key.1, consumer.clone());
         }
         let mut delivery = render_marked(&message, budget, issued.kind.marked());
-        if let Some(budget) = budget {
-            let len = budget.measure(&delivery.text) + budget.measure(super::BLOCK_SEPARATOR);
-            if !out.is_empty() && used + len > budget.limit() {
-                // Issued but over the budget: it goes in the next hand-out,
-                // where the attempt is handed out again as itself.
-                warn!(message_id = %id, "inbox: a receipt hand-out overran its budget");
-            }
-            used += len;
-        }
+        used += len.unwrap_or(0);
         delivery.attempt = Some(InboxDeliveryAttempt {
             a: issued.a,
             e: issued.e,
@@ -629,11 +674,24 @@ pub(super) fn control(
                 .and_then(|d| d.attempt(reply.a, reply.e))
             && at.rx == rx
         {
+            // §5: the new watcher publishes this attempt's receipts, so it is
+            // handed the attempt's caps again; it never passes them on.
+            let caps = generation
+                .evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .store
+                .caps(&reply.id, reply.a, reply.e)
+                .map(|caps| InboxAttemptCaps {
+                    handed: caps.handed.hex(),
+                    commit: caps.commit.hex(),
+                });
             rebound.push(InboxRebound {
                 id: reply.id.clone(),
                 a: reply.a,
                 e: reply.e,
                 d: at.d,
+                caps,
             });
         }
     }
@@ -707,29 +765,52 @@ pub(super) fn flush(out: Outbox) {
     }
 }
 
-/// T4/T8/held_long for every generation, `keep` naming the attempts whose
-/// receipt could not yet be ruled out (§3), `found` the commits the spool
-/// lookups found.
+/// What one generation's spool IO found, for [`tick`] to apply under the
+/// lock.
+#[derive(Default)]
+pub(super) struct Checked {
+    /// Commits the spool holds for issued attempts, whichever they are.
+    pub(super) committed: Vec<(String, u32, u32)>,
+    /// Lapse candidates a completed check found no receipt for.
+    pub(super) cleared: Vec<LapseCheck>,
+    /// The deck's own spool error, if the IO met one (§3).
+    pub(super) degraded: Option<String>,
+}
+
+/// T2/T3, then T4/T8/held_long, for every generation: `checked` holds what
+/// each generation's spool IO found. Every commit found is applied first, so
+/// a receipt published for any issued attempt settles (or corrects) before
+/// a lapse can repeat anything; only the candidates a completed check
+/// cleared may then count toward an automatic repeat.
 pub(super) fn tick(
     st: &mut HubState,
     now: Instant,
-    keep: &HashMap<AgentKey, BTreeSet<(String, u32, u32)>>,
-    found: &HashMap<AgentKey, Vec<(String, u32, u32)>>,
+    checked: &HashMap<AgentKey, Checked>,
     out: &mut Outbox,
 ) {
+    st.receipts.last_check = Some(now);
     let keys: Vec<AgentKey> = st.receipts.gens.keys().cloned().collect();
-    let empty = BTreeSet::new();
     for key in &keys {
         if let Some(generation) = st.receipts.gens.get_mut(key) {
-            for (id, a, e) in found.get(key).into_iter().flatten() {
-                info!(message_id = %id, a, e, "inbox: a receipt the stream never reported was found");
+            let checked = checked.get(key);
+            if let Some(error) = checked.and_then(|c| c.degraded.as_deref()) {
                 generation
-                    .model
-                    .stage(now, id, *a, *e, Stage::Committed, None);
+                    .degraded
+                    .get_or_insert_with(|| format!("could not read receipts: {error}"));
             }
-            generation
-                .model
-                .tick_keeping(now, keep.get(key).unwrap_or(&empty));
+            for (id, a, e) in checked.map(|c| c.committed.as_slice()).unwrap_or_default() {
+                if generation
+                    .model
+                    .stage(now, id, *a, *e, Stage::Committed, None)
+                    != crate::inbox_attempts::StageOutcome::NoOp
+                {
+                    info!(message_id = %id, a, e, "inbox: a receipt the stream never reported was found");
+                }
+            }
+            generation.model.tick_cleared(
+                now,
+                checked.map(|c| c.cleared.as_slice()).unwrap_or_default(),
+            );
         }
         apply(st, key, now, out);
         dispatch(st, key, now, out);
@@ -739,21 +820,28 @@ pub(super) fn tick(
     }
 }
 
-/// The lapse candidates a spool lookup must clear first, per generation, with
-/// the evidence to look them up in.
-#[allow(clippy::type_complexity)]
-pub(super) fn lapse_checks(
-    st: &HubState,
-    now: Instant,
-) -> Vec<(AgentKey, Arc<Mutex<Evidence>>, Vec<(String, u32, u32)>)> {
+/// One generation's spool IO for the clock (§3).
+pub(super) struct Check {
+    pub(super) key: AgentKey,
+    pub(super) evidence: Arc<Mutex<Evidence>>,
+    /// The lapse candidates the spool lookup must clear.
+    pub(super) candidates: Vec<LapseCheck>,
+}
+
+/// The generations whose spool the clock reads now: those with a lapse
+/// candidate to check, or with an attempt whose commit receipt could still
+/// turn up.
+pub(super) fn lapse_checks(st: &HubState, now: Instant) -> Vec<Check> {
     st.receipts
         .gens
         .iter()
-        .filter(|(_, generation)| generation.spool.is_some() && generation.degraded.is_none())
         .filter_map(|(key, generation)| {
             let candidates = generation.model.lapse_candidates(now);
-            (!candidates.is_empty())
-                .then(|| (key.clone(), Arc::clone(&generation.evidence), candidates))
+            (!candidates.is_empty() || generation.model.watching_receipts()).then(|| Check {
+                key: key.clone(),
+                evidence: Arc::clone(&generation.evidence),
+                candidates,
+            })
         })
         .collect()
 }
@@ -893,6 +981,19 @@ fn sync(st: &mut HubState, key: &AgentKey, now: Instant, returned: &HashSet<Stri
                     .retire(now, &id, &key.0, UndeliverableReason::MaxDeliver);
             }
             Delivery::Undeliverable(Verdict::Cancelled) => {
+                let handed = st
+                    .receipts
+                    .gens
+                    .get(key)
+                    .and_then(|generation| generation.model.delivery(&id))
+                    .is_some_and(|d| {
+                        d.attempts
+                            .iter()
+                            .any(|at| at.a == d.a && at.stage != Stage::NotHanded)
+                    });
+                if handed {
+                    st.cancelled_handed.insert(id.clone());
+                }
                 st.inbox
                     .retire(now, &id, &key.0, UndeliverableReason::Cancelled);
             }
@@ -1196,17 +1297,41 @@ pub fn probe_cli(binary: &std::path::Path, deadline: Duration) -> ProbeVerdict {
         }
     }
     let (stdout, stderr) = (stdout.unwrap_or_default(), stderr.unwrap_or_default());
-    let lists_flag = stdout
-        .lines()
-        .any(|line| line.trim_start().starts_with("--adapter-integration "));
+    let lists_flag = stdout.lines().any(|line| {
+        plain(line)
+            .trim_start()
+            .starts_with("--adapter-integration ")
+    });
+    let first = stderr.lines().next().map(plain);
     if status.success() && lists_flag {
         ProbeVerdict::Supported
-    } else if status.code() == Some(CLAP_USAGE_EXIT) && stderr.lines().next() == Some(CLAP_REFUSAL)
-    {
+    } else if status.code() == Some(CLAP_USAGE_EXIT) && first.as_deref() == Some(CLAP_REFUSAL) {
         ProbeVerdict::CliTooOld
     } else {
         ProbeVerdict::Unknown
     }
+}
+
+/// One line of the probe's output as clap means it, on every platform: a
+/// trailing carriage return (a CRLF the line split left behind, or a lone one)
+/// and any ANSI styling clap was told to force are dropped, and nothing else
+/// changes, so the comparison stays exact.
+fn plain(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.trim_end_matches('\r').chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// [`PROBE_DEADLINE`] or its override.

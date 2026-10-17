@@ -10,6 +10,10 @@
 //! between the two still leaves the receipt for the daemon's lookup to find.
 //! A publish still in flight is added to every possession snapshot the
 //! component sends meanwhile, so a slow spool write never reads as absence.
+//! An attempt the component retained across a watcher restart is rebound to
+//! the new watcher with its caps, so its receipts are still published; a
+//! stage report for an attempt whose cap this watcher lacks publishes nothing
+//! and says so, as a degraded report, rather than passing for a receipt.
 //!
 //! Every other control (`may`, `not_handed`, revoke answers, resume answers)
 //! is forwarded on this authenticated connection only: a spool record is
@@ -25,6 +29,11 @@
 /// test can hold one in flight across keepalives.
 pub const ENV_TEST_PUBLISH_DELAY_MS: &str = "DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS";
 
+/// TEST knob: the watcher publishes each `committed` receipt but never
+/// forwards the control, as if its stream died between the two, so a test can
+/// show the daemon settling from the spool alone.
+pub const ENV_TEST_DROP_COMMITTED: &str = "DOT_AGENT_DECK_INBOX_TEST_DROP_COMMITTED";
+
 #[cfg(not(unix))]
 pub fn wait_receipt_stream(_json: &str) -> std::process::ExitCode {
     eprintln!("inbox wait --stream is not supported on this platform.");
@@ -36,14 +45,14 @@ pub use unix::wait_receipt_stream;
 
 #[cfg(unix)]
 mod unix {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeMap, HashMap};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     use std::process::ExitCode;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use super::ENV_TEST_PUBLISH_DELAY_MS;
+    use super::{ENV_TEST_DROP_COMMITTED, ENV_TEST_PUBLISH_DELAY_MS};
     use crate::event::{InboxAttemptRef, InboxStreamControl, InboxWaitReply};
     use crate::inbox_receipt::{Cap, GenerationSpool, RecordKey, RecordStage};
 
@@ -57,7 +66,10 @@ mod unix {
     #[derive(Default)]
     struct Shared {
         caps: HashMap<Key, (Option<Cap>, Option<Cap>)>,
-        in_flight: BTreeSet<Key>,
+        /// Publications still being written, per attempt: one per stage
+        /// worker, so an attempt stays in every snapshot until the last of
+        /// its overlapping `handed` and `committed` publishes is done.
+        in_flight: BTreeMap<Key, u32>,
         last_snapshot: Option<Instant>,
         keepalive: Option<Duration>,
         spool: Option<Result<Arc<GenerationSpool>, String>>,
@@ -90,8 +102,9 @@ mod unix {
     }
 
     /// Publish `stage`'s receipt for each attempt, with the attempt's own
-    /// cap. The first failure is returned; a cap this watcher never received
-    /// publishes nothing and is not a failure.
+    /// cap. The first failure is returned. A cap this watcher was never handed
+    /// is a failure too: the receipt it would have protected is not there,
+    /// so the generation must read as degraded rather than protected.
     fn publish(
         shared: &Mutex<Shared>,
         stage: RecordStage,
@@ -133,6 +146,12 @@ mod unix {
         let mut failed = None;
         for ((msg, a, e), cap) in caps {
             let Some(cap) = cap else {
+                failed.get_or_insert_with(|| {
+                    format!(
+                        "no receipt cap for attempt {a}.{e} of {}",
+                        crate::untrusted_text::display_line(&msg, 80)
+                    )
+                });
                 continue;
             };
             let record = RecordKey { msg, a, e, stage };
@@ -187,7 +206,7 @@ mod unix {
                     if let Some(possess) = control.possess.as_mut() {
                         let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
                         shared.last_snapshot = Some(Instant::now());
-                        for (id, a, e) in &shared.in_flight {
+                        for (id, a, e) in shared.in_flight.keys() {
                             if !possess
                                 .held
                                 .iter()
@@ -213,7 +232,7 @@ mod unix {
                     {
                         let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
                         for at in handed.iter().chain(&committed) {
-                            shared.in_flight.insert(key(at));
+                            *shared.in_flight.entry(key(at)).or_default() += 1;
                         }
                     }
                     let writer = Arc::clone(&writer);
@@ -227,18 +246,31 @@ mod unix {
                             degraded =
                                 publish(&shared, RecordStage::Committed, &committed).or(degraded);
                         }
+                        let dropped = std::env::var_os(ENV_TEST_DROP_COMMITTED).is_some();
                         let stages = InboxStreamControl {
                             handed: handed.clone(),
-                            committed: committed.clone(),
+                            committed: if dropped {
+                                Vec::new()
+                            } else {
+                                committed.clone()
+                            },
                             degraded,
                             ..InboxStreamControl::default()
                         };
-                        if let Ok(text) = serde_json::to_string(&stages) {
+                        if stages != InboxStreamControl::default()
+                            && let Ok(text) = serde_json::to_string(&stages)
+                        {
                             let _ = write_line(&writer, &text);
                         }
                         let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
                         for at in handed.iter().chain(&committed) {
-                            shared.in_flight.remove(&key(at));
+                            let k = key(at);
+                            if let Some(count) = shared.in_flight.get_mut(&k) {
+                                *count -= 1;
+                                if *count == 0 {
+                                    shared.in_flight.remove(&k);
+                                }
+                            }
                         }
                     });
                 }
@@ -307,6 +339,18 @@ mod unix {
                 };
                 let _ = writeln!(stdout, "{text}").and_then(|()| stdout.flush());
                 break;
+            }
+            // §4, §5: a retained attempt rebound to this watcher comes with its
+            // caps, so its receipts can still be published from here.
+            if !reply.rebound.is_empty() {
+                let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+                for rebound in reply.rebound.iter_mut() {
+                    if let Some(caps) = rebound.caps.take() {
+                        shared
+                            .caps
+                            .insert((rebound.id.clone(), rebound.a, rebound.e), caps_of(&caps));
+                    }
+                }
             }
             if let Some(messages) = reply.messages.as_mut() {
                 let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());

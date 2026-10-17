@@ -22,6 +22,7 @@
   "adapterTooOld": "this agent's deck integration is out of date; restart the agent to update it",
   "cliTooOld": "the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent",
   "notArmed": "this agent's deck integration has not connected yet; its messages wait until it does",
+  "refreshFailed": "the deck could not update this agent's deck integration: run dot-agent-deck hooks install --agent opencode to see why, then restart the agent",
   "receiptsDegraded": "messages may repeat: the deck cannot record message receipts for this agent",
   "evidencePaused": "deck messages paused: {n} delivered messages still wait for proof that older copies cannot run; restart the agent to clear them",
   "actionUnsupported": "this deck cannot Retry or Cancel deck messages: upgrade dot-agent-deck",

@@ -312,3 +312,99 @@ fn boundary_018_an_opencode_role_named_by_its_command_gets_the_receipt_policy() 
         );
     }
 }
+
+/// Scenario: An OpenCode plugin from before the integration floor is installed, pinned to another live copy of the deck. An OpenCode stand-in reads the plugin the moment it starts: it finds the deck's current integration in it, still pinned to that other copy, so starting the agent really refreshes its adapter without taking over another install's pin. Then the plugin is stale again and its directory cannot be written: the next start says on the card that the deck could not update the integration, rather than promising that a restart will.
+#[spec("inbox/boundary/025")]
+#[test]
+fn boundary_025_a_start_refreshes_the_adapter_first_or_says_it_could_not() {
+    use std::os::unix::fs::PermissionsExt;
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_ARM_DEADLINE_MS", "600000")]);
+    let executable = |path: &std::path::Path, body: String| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let plugin_dir = daemon.home.join(".config").join("opencode").join("plugin");
+    let plugin = plugin_dir.join("dot-agent-deck.js");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    let foreign = daemon
+        .home
+        .join("foreign-install")
+        .join("bin")
+        .join("dot-agent-deck");
+    executable(
+        &foreign,
+        "#!/bin/sh\necho '      --adapter-integration <N>  The integration'\nexit 0\n".to_string(),
+    );
+    let pin_line = format!(
+        "const BINARY_PATH = {};",
+        serde_json::to_string(&foreign.to_string_lossy()).unwrap()
+    );
+    let stale = format!("{pin_line}\nconst INBOX_ADAPTER_INTEGRATION = 1;\n");
+    // A stand-in OpenCode that reads the plugin the moment it starts, before
+    // it becomes the pane's python stand-in.
+    let launcher = |name: &str| {
+        let path = daemon.home.join(format!("{name}-bin")).join("opencode");
+        executable(
+            &path,
+            format!(
+                "#!/bin/sh\ngrep -h 'INBOX_ADAPTER_INTEGRATION = \\|BINARY_PATH = ' '{plugin}' > '{seen}.tmp'\nmv '{seen}.tmp' '{seen}'\n(umask 077; printf '%s' \"$DOT_AGENT_DECK_PANE_CAPABILITY\" > \".test-capability-$DOT_AGENT_DECK_AGENT_ID\")\nexec python3 '{script}' '{base}'\n",
+                plugin = plugin.display(),
+                seen = daemon.home.join(format!("{name}.seen")).display(),
+                script = daemon.home.join(format!("{name}.py")).display(),
+                base = daemon.home.join(name).display(),
+            ),
+        );
+        (path, daemon.home.join(format!("{name}.seen")))
+    };
+    let seen = |out: &std::path::Path| {
+        assert!(
+            common::wait_until(WAIT, || out.is_file()),
+            "the stand-in read the plugin"
+        );
+        std::fs::read_to_string(out).unwrap()
+    };
+
+    std::fs::write(&plugin, &stale).unwrap();
+    let (command, first) = launcher("refreshed");
+    pane_with(
+        &daemon,
+        "refreshed",
+        json!({"command": command.to_string_lossy()}),
+    );
+    let read = seen(&first);
+    assert!(
+        read.contains(&format!(
+            "const INBOX_ADAPTER_INTEGRATION = {};",
+            dot_agent_deck::inbox_hub::ADAPTER_INTEGRATION
+        )),
+        "the agent loads the current integration, written before it started: {read}"
+    );
+    assert!(
+        read.contains(&pin_line),
+        "the other install's pin is kept: {read}"
+    );
+
+    std::fs::write(&plugin, &stale).unwrap();
+    std::fs::set_permissions(&plugin_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (command, second) = launcher("unwritable");
+    let pane = pane_with(
+        &daemon,
+        "unwritable",
+        json!({"command": command.to_string_lossy()}),
+    );
+    let read = seen(&second);
+    let notice = common::wait_until(WAIT, || {
+        record_inbox(&daemon, &pane)["integration"] == "refresh_failed"
+    });
+    std::fs::set_permissions(&plugin_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        read.contains("const INBOX_ADAPTER_INTEGRATION = 1;"),
+        "nothing could be written: {read}"
+    );
+    assert!(
+        notice,
+        "the card says the deck could not update it: {}",
+        record_inbox(&daemon, &pane)
+    );
+}

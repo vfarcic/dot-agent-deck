@@ -135,6 +135,14 @@ impl OpenCode {
                 .unwrap()
                 .push(json!(["DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS", ms]));
         }
+        // PRD #1666 §3: the watcher publishes each commit receipt and drops its
+        // control, as if its stream died between the two.
+        if config["dropCommitted"] == true {
+            start["env"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(["DOT_AGENT_DECK_INBOX_TEST_DROP_COMMITTED", "1"]));
+        }
         if let Some(pool) = pool {
             std::fs::write(
                 daemon.cwd().join(".dot-agent-deck.toml"),
@@ -1397,4 +1405,140 @@ fn opencode_036_server_and_tui_contexts_reconnect_separately() {
         "the TUI attempt is not repeated"
     );
     op.acknowledge(&delivered);
+}
+
+/// The last user message the plugin host recorded.
+fn last_user(op: &OpenCode) -> String {
+    op.events()
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "user-message")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Scenario: Under `opencode --mini`, a deck message is prompted and answered, so the plugin reports it committed; its watcher publishes the commit receipt but the control never reaches the deck. OpenCode then re-runs the server plugin, whose new instance knows nothing of the message and answers the resume `unknown`. The deck finds the published receipt and acknowledges the message, and OpenCode is never prompted with it a second time.
+#[spec("inbox/opencode/041")]
+#[test]
+fn opencode_041_a_published_commit_whose_control_was_lost_settles_after_a_reload() {
+    let op = OpenCode::new(
+        "session",
+        json!({"server":true,"argv":["--mini"],"dropCommitted":true}),
+    );
+    armed(&op.daemon, &op.pane, 1);
+    let id = op.post();
+    op.wait_kind("user-message");
+    op.assistant(&last_user(&op));
+    assert!(
+        common::wait_until(WAIT, || op.commits(&id) >= 1),
+        "the plugin reports the commit: {:?}",
+        op.controls()
+    );
+    op.control(json!({"reload": true}));
+    op.wait_kind("reloaded");
+    state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert!(
+        !common::wait_until(Duration::from_millis(1500), || op.prompts().len() > 1),
+        "no extra native call: {:?}",
+        op.prompts()
+    );
+}
+
+/// Scenario: The TUI plugin is handed a deck message and prompts it; its watcher is killed and respawns, and the new watcher's registration resumes the attempt, which the context retained. When OpenCode then answers, the replacement watcher publishes the commit receipt with the attempt's caps, rebound to it, while its control never reaches the deck. The deck settles the message from that receipt, with one prompt.
+#[spec("inbox/opencode/042")]
+#[test]
+fn opencode_042_a_replacement_watcher_publishes_a_retained_attempts_receipt() {
+    let op = OpenCode::new("session", json!({"dropCommitted":true,"keepaliveMs":"300"}));
+    armed(&op.daemon, &op.pane, 1);
+    let id = op.post();
+    op.wait_kind("user-message");
+    op.control(json!({"killWatcher":true}));
+    assert!(common::wait_until(WAIT, || op.watchers().len() >= 2));
+    assert!(
+        common::wait_until(WAIT, || op
+            .controls()
+            .iter()
+            .any(|c| c["resume_answers"][0]["answer"] == "retained")),
+        "{:?}",
+        op.controls()
+    );
+    op.assistant(&last_user(&op));
+    state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert_eq!(
+        op.prompts().len(),
+        1,
+        "settled from the receipt: {:?}",
+        op.prompts()
+    );
+}
+
+/// Scenario: The agent starts on a deck message while the watcher's `handed` receipt publish is still in flight, so the `handed` and `committed` publishes overlap, each taking two seconds. The `handed` publish finishing first does not drop the attempt from the snapshots while the `committed` one is still being written: across several keepalives it is never repeated, and the commit settles it with one prompt.
+#[spec("inbox/opencode/043")]
+#[test]
+fn opencode_043_overlapping_publishes_keep_the_attempt_possessed() {
+    let op = OpenCode::new(
+        "session",
+        json!({"keepaliveMs":"300","publishDelayMs":"2000"}),
+    );
+    let id = op.post();
+    op.wait_kind("user-message");
+    // The `handed` publish is in flight; the commit starts most of the way
+    // through it, so the two overlap and the first finishes first.
+    assert!(
+        !common::wait_until(Duration::from_millis(1200), || op.prompts().len() > 1),
+        "not repeated while the `handed` publish is in flight: {:?}",
+        op.events()
+    );
+    op.assistant(&last_user(&op));
+    assert!(
+        !common::wait_until(Duration::from_millis(2500), || op.prompts().len() > 1),
+        "an attempt with a publish still in flight is possessed: {:?}",
+        op.events()
+    );
+    state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert_eq!(op.prompts().len(), 1);
+}
+
+/// Scenario: The OpenCode pane is a worker taking jobs from a pool. The orchestrator offers it a job; OpenCode records the prompt and then the call fails, as a dropped connection does after OpenCode took it. The plugin does not report the job not handed: it stays with this worker, never back in its pool, and is prompted again marked as a possible repeat; when that one is answered the job is claimed.
+#[spec("inbox/opencode/044")]
+#[test]
+fn opencode_044_an_offer_whose_call_failed_after_it_began_stays_bound() {
+    let op = OpenCode::new(
+        "session",
+        json!({"offerPool":"review","keepaliveMs":"300","throwAfterPrompt":1}),
+    );
+    armed(&op.daemon, &op.pane, 1);
+    let orch = op.orchestrator.as_ref().unwrap();
+    let mut req = request(orch, "inbox_offer");
+    req["pool"] = json!("review");
+    req["body"] = json!(BODY);
+    req["claim_ttl_ms"] = json!(120_000);
+    let reply = hook(&op.daemon, req);
+    let id = reply["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the offer is accepted: {reply}"))
+        .to_string();
+    assert!(
+        common::wait_until(WAIT, || op.prompts().len() >= 2),
+        "the job is prompted again: {:?}",
+        op.events()
+    );
+    assert_eq!(
+        op.marked(&id),
+        1,
+        "the repeat is marked: {:?}",
+        op.prompts()
+    );
+    assert!(
+        !op.controls()
+            .iter()
+            .any(|c| c["not_handed"].as_array().is_some_and(|n| !n.is_empty())),
+        "no not-handed witness: {:?}",
+        op.controls()
+    );
+    assert_eq!(op.message_state(&id), "fetched", "still this worker's");
+    op.assistant(&last_user(&op));
+    state(&op.daemon, &op.pane, &id, "claimed");
 }

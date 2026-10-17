@@ -931,11 +931,42 @@ impl RecordScanner {
     /// otherwise. Directory enumeration is not a snapshot, so the lookup, not
     /// the scan, is what sees a record linked behind the cursor.
     pub fn presence(&mut self, store: &mut EvidenceStore, msg: &str, a: u32, e: u32) -> Presence {
+        self.presence_of(
+            store,
+            msg,
+            a,
+            e,
+            &[RecordStage::Handed, RecordStage::Committed],
+        )
+    }
+
+    /// [`Self::presence`] of the attempt's `Committed` receipt alone: what a
+    /// lapse needs ruled out before a repeat (§3). A `Handed` receipt says the
+    /// attempt reached the agent, which a marked repeat already allows for, so
+    /// it never stands in for this lookup.
+    pub fn commit_presence(
+        &mut self,
+        store: &mut EvidenceStore,
+        msg: &str,
+        a: u32,
+        e: u32,
+    ) -> Presence {
+        self.presence_of(store, msg, a, e, &[RecordStage::Committed])
+    }
+
+    fn presence_of(
+        &mut self,
+        store: &mut EvidenceStore,
+        msg: &str,
+        a: u32,
+        e: u32,
+        stages: &[RecordStage],
+    ) -> Presence {
         if !valid_component(msg) {
             return Presence::Unknown;
         }
         let mut unknown = !self.complete;
-        for stage in [RecordStage::Handed, RecordStage::Committed] {
+        for &stage in stages {
             let key = RecordKey {
                 msg: msg.to_string(),
                 a,
@@ -1091,14 +1122,18 @@ struct IssuedCaps {
 }
 
 /// The daemon's per-generation suppression evidence (§7): the hashes of every
-/// issued attempt's caps and the records admitted on them. It holds keys only
-/// for issued attempts, at most two records each, so its size follows the
-/// attempts issued. An attempt is forgotten ([`Self::forget`]) when the
+/// issued attempt's caps, which admit records, the caps themselves, kept only
+/// to hand a replacement watcher the attempts rebound to it (§4, §5), and the
+/// records admitted on them. It holds keys only for issued attempts, at most
+/// two records each, so its size follows the attempts issued. An attempt is forgotten ([`Self::forget`]) when the
 /// attempt model returns its evidence reservation, which is also when its
 /// spool files are removed ([`GenerationSpool::remove_attempt`]).
 #[derive(Debug, Default)]
 pub struct EvidenceStore {
     issued: BTreeMap<(String, u32, u32), IssuedCaps>,
+    /// The caps themselves, while the attempt is issued: a watcher that
+    /// replaces a dead one is handed its retained attempts' caps again.
+    caps: BTreeMap<(String, u32, u32), AttemptCaps>,
     admitted: BTreeSet<RecordKey>,
 }
 
@@ -1116,7 +1151,13 @@ impl EvidenceStore {
                 commit: Cap::hash_hex(&caps.commit.hex()),
             },
         );
+        self.caps.insert((msg.to_string(), a, e), caps.clone());
         Ok(caps)
+    }
+
+    /// An issued attempt's caps, to hand to the watcher it is rebound to.
+    pub fn caps(&self, msg: &str, a: u32, e: u32) -> Option<&AttemptCaps> {
+        self.caps.get(&(msg.to_string(), a, e))
     }
 
     /// Admit a record on bearer authority (§5): an issued `(msg, A, e)` and
@@ -1148,11 +1189,13 @@ impl EvidenceStore {
     /// admit a record, and its admitted records are dropped.
     pub fn forget(&mut self, msg: &str, a: u32, e: u32) {
         self.issued.remove(&(msg.to_string(), a, e));
+        self.caps.remove(&(msg.to_string(), a, e));
         self.admitted
             .retain(|key| !(key.msg == msg && key.a == a && key.e == e));
     }
 
-    /// Keys held: issued attempts plus admitted records.
+    /// Keys held: issued attempts plus admitted records (an issued attempt's
+    /// caps are kept under its key).
     pub fn entries(&self) -> usize {
         self.issued.len() + self.admitted.len()
     }

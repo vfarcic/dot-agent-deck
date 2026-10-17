@@ -3357,6 +3357,10 @@ pub struct InboxRebound {
     pub a: u32,
     pub e: u32,
     pub d: u64,
+    /// The attempt's caps, for the new watcher to publish its receipts with
+    /// (§5): the watcher strips them before the component sees the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<InboxAttemptCaps>,
 }
 
 /// PRD #1666 §5: an attempt's two capabilities, as the daemon hands them to

@@ -91,6 +91,9 @@ pub fn action_text(retry: bool, outcome: &str) -> &'static str {
 /// PRD #1666 §11: a registration declared an integration below the floor.
 pub const ADAPTER_TOO_OLD: &str =
     "this agent's deck integration is out of date; restart the agent to update it";
+/// PRD #1666 §11: the deck could not rewrite the agent's integration files
+/// as the agent started, so a restart does not update them.
+pub const REFRESH_FAILED: &str = "the deck could not update this agent's deck integration: run dot-agent-deck hooks install --agent opencode to see why, then restart the agent";
 /// PRD #1666 §11: the capability probe proved the agent's CLI lacks the flag.
 pub const CLI_TOO_OLD: &str = "the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent";
 /// PRD #1666 §11: a reversible readiness notice, cleared by a registration.
@@ -129,6 +132,7 @@ pub enum IntegrationNotice {
     CliTooOld,
     AdapterTooOld,
     NotArmed,
+    RefreshFailed,
 }
 
 impl IntegrationNotice {
@@ -137,6 +141,7 @@ impl IntegrationNotice {
             IntegrationNotice::CliTooOld => CLI_TOO_OLD,
             IntegrationNotice::AdapterTooOld => ADAPTER_TOO_OLD,
             IntegrationNotice::NotArmed => NOT_ARMED,
+            IntegrationNotice::RefreshFailed => REFRESH_FAILED,
         }
     }
 
@@ -145,6 +150,7 @@ impl IntegrationNotice {
             IntegrationNotice::CliTooOld => 1,
             IntegrationNotice::AdapterTooOld => 2,
             IntegrationNotice::NotArmed => 3,
+            IntegrationNotice::RefreshFailed => 4,
         }
     }
 
@@ -154,6 +160,7 @@ impl IntegrationNotice {
             1 => Some(Some(IntegrationNotice::CliTooOld)),
             2 => Some(Some(IntegrationNotice::AdapterTooOld)),
             3 => Some(Some(IntegrationNotice::NotArmed)),
+            4 => Some(Some(IntegrationNotice::RefreshFailed)),
             _ => None,
         }
     }
@@ -362,6 +369,7 @@ mod tests {
         assert_eq!(words["adapterTooOld"], ADAPTER_TOO_OLD);
         assert_eq!(words["cliTooOld"], CLI_TOO_OLD);
         assert_eq!(words["notArmed"], NOT_ARMED);
+        assert_eq!(words["refreshFailed"], REFRESH_FAILED);
         assert_eq!(words["receiptsDegraded"], RECEIPTS_DEGRADED);
         assert_eq!(
             words["evidencePaused"]
@@ -436,6 +444,11 @@ mod tests {
                 evidence_paused: Some(4),
                 ..CardInbox::default()
             },
+            CardInbox {
+                pending: 1,
+                integration: Some(IntegrationNotice::RefreshFailed),
+                ..CardInbox::default()
+            },
         ] {
             assert_eq!(CardInbox::decode(&inbox.encode()), Some(inbox.clone()));
         }
@@ -456,7 +469,7 @@ mod tests {
             "-1,0",
             "1,0,2",
             "1,0,1,0",
-            "1,0,0,0,0,4,-",
+            "1,0,0,0,0,5,-",
             "1,0,0,0,0,0,x",
         ] {
             assert_eq!(CardInbox::decode(bad), None, "{bad}");
@@ -508,6 +521,7 @@ mod tests {
             IntegrationNotice::CliTooOld,
             IntegrationNotice::AdapterTooOld,
             IntegrationNotice::NotArmed,
+            IntegrationNotice::RefreshFailed,
         ] {
             let blocked = CardInbox {
                 integration: Some(notice),

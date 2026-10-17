@@ -810,7 +810,8 @@ pub struct DesktopInbox {
     /// Cancel. Sender and subject are display copies.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attention: Vec<DesktopInboxAttention>,
-    /// PRD #1666 §11: `cli_too_old`, `adapter_too_old` or `not_armed`.
+    /// PRD #1666 §11: `cli_too_old`, `adapter_too_old`, `not_armed` or
+    /// `refresh_failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
     /// PRD #1666 §3: the deck's error recording receipts, a display copy.

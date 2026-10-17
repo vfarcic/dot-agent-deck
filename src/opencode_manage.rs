@@ -1560,6 +1560,16 @@ const inboxRef = (entry) => ({ id: entry.id, a: entry.a, e: entry.e });
 const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
   const held = new Map();
   const revoked = new Set();
+  // Attempts a callback took into OpenCode's API and that did not end in a
+  // positive refusal: possibly handed, whatever happens to their held entry
+  // afterwards (an abort, a revert, an ambiguous failure). A revoke of one is
+  // answered `already_handed` and it is never reported not handed. Bounded,
+  // oldest dropped first.
+  const called = new Set();
+  const call = (key) => {
+    called.add(key);
+    if (called.size > 4096) called.delete(called.values().next().value);
+  };
   const grants = new Map();
   let watermark = { seen: 0, above: new Set() };
   let child;
@@ -1591,7 +1601,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     const key = inboxKey(ref);
     revoked.add(key);
     const entry = held.get(key);
-    if (entry?.stage === "handed") {
+    if (entry?.stage === "handed" || called.has(key)) {
       inboxWrite(child, { already_handed: [ref] });
     } else {
       held.delete(key);
@@ -1736,6 +1746,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     calling: (ref) => {
       const entry = held.get(inboxKey(ref));
       if (entry) entry.stage = "handed";
+      call(inboxKey(ref));
     },
     handed: (refs) => {
       if (refs.length) inboxWrite(child, { handed: refs });
@@ -1744,7 +1755,10 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     // no longer held.
     committed: (refs) => {
       if (!refs.length) return;
-      for (const ref of refs) held.delete(inboxKey(ref));
+      for (const ref of refs) {
+        held.delete(inboxKey(ref));
+        called.delete(inboxKey(ref));
+      }
       inboxWrite(child, { committed: refs });
       snapshot();
     },
@@ -1755,21 +1769,26 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     // reach OpenCode once the deck believes it was not handed.
     notHanded: (ref) => {
       const key = inboxKey(ref);
-      if (held.get(key)?.stage === "handed") return;
+      if (held.get(key)?.stage === "handed" || called.has(key)) return;
       revoked.add(key);
       held.delete(key);
       inboxWrite(child, { not_handed: [ref] });
       snapshot();
     },
-    // The call this callback started failed: OpenCode did not take it.
-    callFailed: (ref) => {
-      held.delete(inboxKey(ref));
+    // OpenCode refused the call this callback made before accepting it
+    // (`inboxRefusedBeforeAcceptance`): positively not handed.
+    rejected: (ref) => {
+      const key = inboxKey(ref);
+      called.delete(key);
+      held.delete(key);
       inboxWrite(child, { not_handed: [ref] });
       snapshot();
     },
-    // Lost without a witness — an aborted turn, a reverted prompt: no longer
-    // held, so the deck may repeat it, marked as a possible repeat.
+    // Lost without a witness — an aborted turn, a reverted prompt, a call
+    // that failed after it began: no longer held, so the deck may repeat it,
+    // marked as a possible repeat. What was handed stays possibly handed.
     lost: (ref) => {
+      if (held.get(inboxKey(ref))?.stage === "handed") call(inboxKey(ref));
       if (held.delete(inboxKey(ref))) snapshot();
     },
     // The held attempts of deck message `id`.
@@ -1784,15 +1803,32 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     },
   };
 };
+// PRD #1666 §4: whether OpenCode answered a call by refusing it before
+// accepting it. Its prompt route accepts with 204 before it starts the turn,
+// and a 4xx answer (a request it would not take: a missing session, an invalid
+// body) comes before that. A thrown error (a lost connection, a timeout) or
+// any other answer may follow an accepted prompt, so it proves nothing.
+const inboxRefusedBeforeAcceptance = (result) => {
+  const status = result?.response?.status;
+  return typeof status === "number" && status >= 400 && status < 500;
+};
 // PRD #1666 §3: hand one attempt to OpenCode through `call`, behind the final
-// hand-over check: the deck's approval, then — with no await between it and
-// the call — this context's own synchronous check. An approval voided by a
-// watcher restart is asked for once more under the new incarnation; any other
-// refusal means the attempt was not handed. Returns whether it was handed.
-const inboxHandOver = async (receiver, ref, sessionID, call) => {
+// hand-over check: the deck's approval, then — with no await between them and
+// the call — this context's own synchronous check and the caller's `valid`,
+// which re-reads what the await may have changed (the session on screen, a
+// dialog). An approval voided by a watcher restart is asked for once more
+// under the new incarnation; any other refusal drops the callback before the
+// call, so the attempt was positively not handed. Once the call began, only
+// OpenCode's refusal before acceptance is a not-handed witness; any other
+// failure is lost, for a marked repeat. Returns whether it was handed.
+const inboxHandOver = async (receiver, ref, sessionID, call, valid = () => true) => {
   let granted = await receiver.may(ref);
   if (granted !== undefined && granted !== receiver.epoch()) granted = await receiver.may(ref);
-  if (!receiver.ready(ref, granted)) {
+  let still = false;
+  try {
+    still = receiver.ready(ref, granted) && valid();
+  } catch (_) {}
+  if (!still) {
     receiver.notHanded(ref);
     return false;
   }
@@ -1802,11 +1838,12 @@ const inboxHandOver = async (receiver, ref, sessionID, call) => {
   try {
     result = await call();
   } catch (_) {
-    receiver.callFailed(ref);
+    receiver.lost(ref);
     return false;
   }
   if (result?.error) {
-    receiver.callFailed(ref);
+    if (inboxRefusedBeforeAcceptance(result)) receiver.rejected(ref);
+    else receiver.lost(ref);
     return false;
   }
   receiver.handed([ref]);
@@ -1888,8 +1925,13 @@ const miniDeliver = async (client, message, generation) => {
     const body = { parts: [{ type: "text", text: inboxText(message) }] };
     if (selection.model) body.model = selection.model;
     if (selection.agent) body.agent = selection.agent;
-    await inboxHandOver(receiver, ref, sessionID, () =>
-      client.session.promptAsync({ path: { id: sessionID }, body }));
+    await inboxHandOver(
+      receiver,
+      ref,
+      sessionID,
+      () => client.session.promptAsync({ path: { id: sessionID }, body }),
+      () => generation === inboxGeneration() && miniTarget === sessionID,
+    );
   } catch (_) {
     if (generation === inboxGeneration()) receiver.notHanded(ref);
   }
@@ -2191,10 +2233,21 @@ const tui = async (api) => {
         // instance, and the screen not moved to another conversation. (A
         // navigation this delivery made may not have reached the route yet,
         // so the route may still show the subagent or the home screen.)
+        // Checked again after the deck's approval, which is awaited: the
+        // person may have switched sessions or opened a dialog meanwhile.
+        const onTarget = () => {
+          const now = shownSession();
+          return now === undefined || rootOf(now) === sessionID;
+        };
         stillActive();
-        const now = shownSession();
-        if (now !== undefined && rootOf(now) !== sessionID) throw new Error("the session changed");
-        await inboxHandOver(receiver, ref, sessionID, () => api.client.session.promptAsync(request));
+        if (!onTarget()) throw new Error("the session changed");
+        await inboxHandOver(
+          receiver,
+          ref,
+          sessionID,
+          () => api.client.session.promptAsync(request),
+          () => instance.active && !dialogOpen() && onTarget(),
+        );
       } catch (error) {
         if (!(error instanceof Retired)) receiver.notHanded(ref);
       }
@@ -2435,7 +2488,38 @@ fn uninstall_impl(path: &PathBuf) -> std::io::Result<()> {
 ///
 /// Returns the binary each existing root's plugin pins afterwards (issue
 /// #1637), so the daemon can name the binary OpenCode's events come from.
+#[cfg(test)]
 fn auto_install_to(roots: &[PathBuf], binary_path: &str) -> Vec<(PathBuf, String)> {
+    auto_install_to_reporting(roots, binary_path, &mut Vec::new())
+}
+
+/// The adapter integration a generated plugin file declares, `0` for a file
+/// that declares none (one from before the integration existed) and `None`
+/// when there is no file to read.
+fn template_integration(file: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let declared = text
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("const INBOX_ADAPTER_INTEGRATION = ")
+        })
+        .and_then(|rest| rest.trim_end_matches(';').trim().parse::<u32>().ok());
+    Some(declared.unwrap_or(0))
+}
+
+/// PRD #1666 §11: whether the plugin file at `file` is a template below the
+/// deck's integration floor, which a component would be refused for.
+fn below_floor(file: &Path) -> bool {
+    template_integration(file).is_some_and(|n| n < crate::inbox_hub::ADAPTER_INTEGRATION)
+}
+
+/// [`auto_install_to`], adding each root it could not write to `failed`.
+fn auto_install_to_reporting(
+    roots: &[PathBuf],
+    binary_path: &str,
+    failed: &mut Vec<String>,
+) -> Vec<(PathBuf, String)> {
     // Held across the read-preserve-write span, not just the write. See
     // [`PLUGIN_LOCK`].
     let _guard = lock_plugin();
@@ -2487,6 +2571,13 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) -> Vec<(PathBuf, String
                 } else if takeover.supersedes(&existing) {
                     taking_over = Some(existing);
                     (binary_path.to_string(), true)
+                } else if below_floor(&plugin_file(root)) {
+                    // PRD #1666 §11: the other install's pin is kept, but a
+                    // template below the integration floor would be refused,
+                    // so it is regenerated with that same pin. Only a stale
+                    // template is rewritten, so two installs that both meet
+                    // the floor still never rewrite each other's.
+                    (existing, false)
                 } else {
                     pins.push((root.clone(), existing));
                     continue;
@@ -2496,6 +2587,9 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) -> Vec<(PathBuf, String
             None => (binary_path.to_string(), false),
         };
         let written = write_plugin_reporting(root, &pinned);
+        if let Err(e) = &written {
+            failed.push(format!("{}: {e}", plugin_file(root).display()));
+        }
         // Reported only once it is what the plugin holds, as the Claude and
         // Devin installers do: a failed write leaves the old pin in place.
         if written.is_ok() {
@@ -2772,7 +2866,7 @@ fn install_tui_half(root: &Path, pin: Option<&str>) -> std::io::Result<TuiEntry>
 
 /// The automatic install's TUI half: the pin follows the server plugin's
 /// rules, and a refusal is one `warn!` and nothing on stdout.
-fn auto_install_tui(root: &Path, binary_path: &str) {
+fn auto_install_tui(root: &Path, binary_path: &str, failed: &mut Vec<String>) {
     let _guard = lock_plugin();
     // Issue #1637: a pin an eligible newer copy supersedes moves to this
     // install, as the server plugin's does in `auto_install_to`.
@@ -2783,13 +2877,22 @@ fn auto_install_tui(root: &Path, binary_path: &str) {
                 Some(existing)
             } else if takeover.supersedes(&existing) {
                 Some(binary_path.to_string())
+            } else if below_floor(&tui_plugin_file(root)) {
+                // PRD #1666 §11: as `auto_install_to` does — the other
+                // install's pin kept, its template below the floor
+                // regenerated.
+                Some(existing)
             } else {
                 None
             }
         }
         _ => Some(binary_path.to_string()),
     };
-    match install_tui_half(root, pin.as_deref()) {
+    let installed = install_tui_half(root, pin.as_deref());
+    if let Err(e) = &installed {
+        failed.push(format!("{}: {e}", tui_plugin_file(root).display()));
+    }
+    match installed {
         Ok(TuiEntry::Added(file)) => tracing::info!(
             "auto-install: added the OpenCode TUI plugin to {}",
             file.display()
@@ -2886,9 +2989,23 @@ fn left_unchanged(config: &Path, file: &Path, why: &str) -> std::io::Error {
 /// plugin into the XDG root whenever OpenCode is installed (PRD #1666 S8).
 /// Intended for dashboard startup — never prints to stdout, refusal included.
 pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
+    auto_install_reporting().0
+}
+
+/// PRD #1666 §11: [`auto_install`], run as an OpenCode generation starts and
+/// before its child does, so the agent loads the integration this deck checks
+/// it against. Returns the pins and every integration file it could not
+/// write, for the card to say so.
+pub fn refresh_for_spawn() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
+    auto_install_reporting()
+}
+
+fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
+    let mut failed = Vec::new();
     let roots = candidate_roots();
-    let (binary_path, pins) =
-        auto_install_resolved(&roots, crate::platform::paths::durable_binary_path);
+    let (binary_path, pins) = auto_install_resolved(&roots, &mut failed, || {
+        crate::platform::paths::durable_binary_path()
+    });
     // PRD #1666 S8: the TUI plugin, into the XDG root, from the same resolved
     // binary the server plugin was installed with. OpenCode reads `tui.json`
     // from the XDG root only, so a legacy-only layout gets its TUI half there
@@ -2903,11 +3020,14 @@ pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
         match crate::config_write_guard::ensure_config_write_allowed(&tui_plugin_file(xdg))
             .and_then(|()| std::fs::create_dir_all(xdg))
         {
-            Ok(()) => auto_install_tui(xdg, &binary_path),
-            Err(e) => tracing::warn!(
-                "auto-install: could not create the OpenCode config root {} for its TUI                  plugin: {e}; deck messages will reach OpenCode by the doorbell instead",
-                xdg.display()
-            ),
+            Ok(()) => auto_install_tui(xdg, &binary_path, &mut failed),
+            Err(e) => {
+                failed.push(format!("{}: {e}", xdg.display()));
+                tracing::warn!(
+                    "auto-install: could not create the OpenCode config root {} for its TUI                      plugin: {e}; deck messages will reach OpenCode by the doorbell instead",
+                    xdg.display()
+                );
+            }
         }
     }
     // One pin per binary: the roots of one machine name the same install.
@@ -2921,7 +3041,7 @@ pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
             });
         }
     }
-    out
+    (out, failed)
 }
 
 /// [`auto_install`] with the binary-path resolution injected, so the PRD #381 M6
@@ -2943,6 +3063,7 @@ pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
 /// the pin each existing root holds afterwards.
 fn auto_install_resolved(
     roots: &[PathBuf],
+    failed: &mut Vec<String>,
     resolve: impl FnOnce() -> Result<String, String>,
 ) -> (Option<String>, Vec<(PathBuf, String)>) {
     if !roots.iter().any(|root| root.exists()) {
@@ -2950,11 +3071,12 @@ fn auto_install_resolved(
     }
     match resolve() {
         Ok(binary_path) => {
-            let pins = auto_install_to(roots, &binary_path);
+            let pins = auto_install_to_reporting(roots, &binary_path, failed);
             (Some(binary_path), pins)
         }
         Err(e) => {
             tracing::warn!("auto-install: {e}");
+            failed.push(e);
             (None, Vec::new())
         }
     }
@@ -3210,6 +3332,66 @@ pub(crate) mod tests {
 
         assert_eq!(plugin_fingerprint(&path), before);
         assert_eq!(existing_binary_path(&root).as_deref(), Some(a.as_str()));
+    }
+
+    /// Scenario (PRD #1666 §11): the OpenCode plugin pins live install A with a template from before the integration floor, and copy B's automatic install runs as an OpenCode agent starts. A's pin is kept but the template is regenerated, so the agent loads the current integration; the TUI plugin, likewise pinned to A and stale, is regenerated with A's pin too. With the plugin directory unwritable, the same install reports the file it could not write.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_opencode_refreshes_a_stale_template_keeping_a_live_pin() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let root = fixture.path().join("fake-operator-home").join("opencode");
+        let a = seed_deck(&fixture.path().join("homebrew").join("dot-agent-deck"));
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+        let stale = |file: &Path, current: String| {
+            let floor = format!(
+                "const INBOX_ADAPTER_INTEGRATION = {};",
+                crate::inbox_hub::ADAPTER_INTEGRATION
+            );
+            assert!(current.contains(&floor), "the template declares the floor");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(
+                file,
+                current.replace(&floor, "const INBOX_ADAPTER_INTEGRATION = 1;"),
+            )
+            .unwrap();
+            assert!(below_floor(file));
+        };
+        stale(&plugin_file(&root), plugin_template(&a));
+        stale(&tui_plugin_file(&root), tui_plugin_template(&a));
+
+        let mut failed = Vec::new();
+        let pins = auto_install_to_reporting(std::slice::from_ref(&root), &b, &mut failed);
+        auto_install_tui(&root, &b, &mut failed);
+
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(pins, vec![(root.clone(), a.clone())], "A stays pinned");
+        assert_eq!(
+            std::fs::read_to_string(plugin_file(&root)).unwrap(),
+            plugin_template(&a),
+            "the server plugin is A's pin in the current template"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tui_plugin_file(&root)).unwrap(),
+            tui_plugin_template(&a),
+            "and so is the TUI plugin"
+        );
+
+        stale(&plugin_file(&root), plugin_template(&a));
+        let dir = plugin_file(&root).parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut failed = Vec::new();
+        auto_install_to_reporting(std::slice::from_ref(&root), &b, &mut failed);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: geteuid has no preconditions. Permissions do not bind for
+        // root, which can write the directory anyway.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(failed.len(), 1, "{failed:?}");
+            assert!(
+                failed[0].contains("dot-agent-deck.js"),
+                "the failure names the file: {failed:?}"
+            );
+        }
     }
 
     /// Scenario: an automatic install whose plugin write fails reports no pin, so the daemon never announces a binary the plugin does not hold (issue #1637).
@@ -3955,7 +4137,7 @@ pub(crate) mod tests {
         let root = tmp.path().join("opencode-root");
         std::fs::create_dir_all(&root).expect("create root");
 
-        auto_install_resolved(std::slice::from_ref(&root), || {
+        auto_install_resolved(std::slice::from_ref(&root), &mut Vec::new(), || {
             Err("no durable dot-agent-deck".to_string())
         });
 
@@ -3979,7 +4161,7 @@ pub(crate) mod tests {
         let absent = tmp.path().join("no-opencode-here");
         let asked = std::cell::Cell::new(false);
 
-        auto_install_resolved(std::slice::from_ref(&absent), || {
+        auto_install_resolved(std::slice::from_ref(&absent), &mut Vec::new(), || {
             asked.set(true);
             Ok("/opt/dot-agent-deck".to_string())
         });
@@ -4314,6 +4496,17 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
     /// plugin writes back; every call is logged.
     #[cfg(unix)]
     fn inbox_recorder(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        inbox_recorder_granting_after(dir, None)
+    }
+
+    /// [`inbox_recorder`], answering each final hand-over check after
+    /// `delay` seconds (`sleep`'s argument) when given.
+    #[cfg(unix)]
+    fn inbox_recorder_granting_after(
+        dir: &std::path::Path,
+        delay: Option<&str>,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let wait = delay.map(|d| format!("sleep {d}; ")).unwrap_or_default();
         let controls = dir.join("controls.log");
         let recorder = dir.join("recorder.sh");
         let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
@@ -4339,7 +4532,7 @@ case "$1 $2" in
       case "$line" in
         *'"may"'*)
           q=$(printf '%s' "$line" | sed -n 's/.*"q":\([0-9]*\).*/\1/p')
-          printf '{{"grant":{{"q":%s,"ok":true}}}}\n' "$q";;
+          {wait}printf '{{"grant":{{"q":%s,"ok":true}}}}\n' "$q";;
       esac
     done;;
 esac
@@ -4348,6 +4541,7 @@ exit 0
                 c = controls.display(),
                 r = registered,
                 m = message,
+                wait = wait,
             ),
         )
         .unwrap();
@@ -4824,6 +5018,179 @@ check(called, 1, "an approval after the refusal's local revoke never reaches Ope
 check(sent().filter((c) => c.handed).length, 1, "and nothing more is reported handed");
 "#,
         );
+    }
+
+    /// Scenario: Three attempts are approved and their calls reach OpenCode's API: the first call throws after it began (a lost connection), the second returns an error with no HTTP status, the third returns a 400 refusal. Only the third is reported not handed; the other two are dropped from the snapshots, so the deck repeats them marked, and a later revoke of either is answered `already_handed`.
+    #[spec("inbox/opencode/038")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_038_a_call_that_fails_after_it_began_is_lost_not_refused() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+const ref = (e) => ({ id, a: 1, e });
+feed({ messages: [1, 2, 3].map((e) => ({ ...ref(e), subject: "s", from: "x", text: "t", d: e })) });
+const prompts = [];
+const handOver = async (e, call) => {
+  const handing = inboxHandOver(receiver, ref(e), "s1", async () => { prompts.push(e); return call(); });
+  await tick();
+  feed({ grant: { q: sent().filter((c) => c.may).pop().may.q, ok: true } });
+  return handing;
+};
+check(await handOver(1, () => { throw new Error("socket hang up"); }), false, "a call that threw");
+check(await handOver(2, () => ({ error: { message: "fetch failed" } })), false, "an error with no status");
+check(await handOver(3, () => ({ error: { message: "no such session" }, response: { status: 400 } })), false, "a 400");
+check(prompts, [1, 2, 3], "every call reached the API");
+check(sent().filter((c) => c.not_handed).flatMap((c) => c.not_handed.map((r) => r.e)), [3],
+  "only the refusal before acceptance is a not-handed witness");
+check(sent().filter((c) => c.possess).pop().possess.held, [], "none is held, so the deck may repeat 1 and 2");
+feed({ revoke: [ref(1), ref(2), ref(3)] });
+check(sent().filter((c) => c.already_handed).flatMap((c) => c.already_handed.map((r) => r.e)), [1, 2],
+  "possibly handed");
+check(sent().filter((c) => c.revoked_ack).flatMap((c) => c.revoked_ack.map((r) => r.e)), [3], "never handed");
+"#,
+        );
+    }
+
+    /// Scenario: Two attempts reach OpenCode's API and are then lost: the first's turn is aborted (its session goes idle), the second's prompt is reverted. A late refusal path for either reports nothing; a Cancel's revoke of both is answered `already_handed`, never `revoked_ack`; and after a watcher restart the resume asks about the first and is answered `unknown`, never `not_handed`.
+    #[spec("inbox/opencode/039")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_039_a_lost_handed_attempt_stays_possibly_handed() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+const ref = (e) => ({ id, a: 1, e });
+feed({ messages: [1, 2].map((e) => ({ ...ref(e), subject: "s", from: "x", text: "t", d: e })) });
+receiver.calling(ref(1));
+receiver.session(ref(1), "aborted");
+receiver.calling(ref(2));
+receiver.session(ref(2), "reverted");
+// The aborted turn: its session went idle with the attempt handed.
+for (const lost of receiver.inSession("aborted")) receiver.lost(lost);
+// The reverted prompt: OpenCode removed its user message.
+for (const lost of receiver.of(id).filter((r) => r.e === 2)) receiver.lost(lost);
+check(receiver.of(id), [], "neither is held");
+receiver.notHanded(ref(1));
+receiver.notHanded(ref(2));
+check(sent().filter((c) => c.not_handed).length, 0, "a lost handed attempt is never reported not handed");
+feed({ revoke: [ref(1), ref(2)] });
+check(sent().filter((c) => c.already_handed).flatMap((c) => c.already_handed.map((r) => r.e)), [1, 2],
+  "answered already handed");
+check(sent().filter((c) => c.revoked_ack).length, 0, "never revoked_ack");
+receiver.stop();
+receiver.start();
+feed({ registered: { rx: 5, slot: "opencode_tui", keepalive_ms: 30000 }, resume: [ref(1)] });
+check(sent().filter((c) => c.resume_answers).pop().resume_answers.map((r) => r.answer), ["unknown"],
+  "a restart answers unknown");
+"#,
+        );
+    }
+
+    /// Scenario: The TUI plugin is handed a message for the session on screen, and the deck's approval of the hand-over takes most of a second. While it waits, the person switches to another session; in a second run, the person opens a dialog instead. In neither is the message prompted into the session it was meant for, and the plugin reports it positively not handed. Under `opencode --mini`, the root session changing during the wait does the same.
+    #[spec("inbox/opencode/040")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_040_a_slow_approval_rechecks_the_target_and_the_dialog() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        for (what, change) in [
+            (
+                "route",
+                r#"route = { name: "session", params: { sessionID: "rootB" } };"#,
+            ),
+            ("dialog", "dialog = true;"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (recorder, controls) = inbox_recorder_granting_after(dir.path(), Some("0.8"));
+            let plugin = dir.path().join("dot-agent-deck-tui.mjs");
+            std::fs::write(&plugin, tui_plugin_template(&recorder.to_string_lossy())).unwrap();
+            let driver = dir.path().join("driver.mjs");
+            std::fs::write(
+                &driver,
+                format!(
+                    r#"import fs from "fs";
+{FAKE_TUI_API_JS}
+const asked = () => {{ try {{ return fs.readFileSync("{controls}", "utf8").includes('"may"'); }} catch (_) {{ return false; }} }};
+route = {{ name: "session", params: {{ sessionID: "rootA" }} }};
+const {{ default: mod }} = await import("{plugin}");
+await mod.tui(api);
+for (let n = 0; n < 150 && !asked(); n++) await sleep(20);
+const waited = asked();
+{change}
+await sleep(1500);
+disposeCb?.();
+console.log(JSON.stringify({{ waited, prompts }}));
+process.exit(0);
+"#,
+                    controls = controls.display(),
+                    plugin = plugin.display(),
+                ),
+            )
+            .unwrap();
+            let result = run_inbox_driver(&driver);
+            assert_eq!(
+                result["waited"], true,
+                "{what}: the approval was asked for: {result}"
+            );
+            assert_eq!(result["prompts"], serde_json::json!([]), "{what}: {result}");
+            let written = std::fs::read_to_string(&controls).unwrap_or_default();
+            assert!(written.contains("\"not_handed\""), "{what}: {written}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, controls) = inbox_recorder_granting_after(dir.path(), Some("0.8"));
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import fs from "fs";
+process.argv = [process.argv[0], "opencode", "--mini"];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const asked = () => {{ try {{ return fs.readFileSync("{controls}", "utf8").includes('"may"'); }} catch (_) {{ return false; }} }};
+const prompts = [];
+const client = {{ session: {{
+  messages: async () => ({{ data: [] }}),
+  promptAsync: async (req) => {{ prompts.push(req.path.id); return {{}}; }},
+}} }};
+const {{ default: plugin }} = await import("{plugin}");
+const hooks = await plugin({{ directory: "/work", client }});
+await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1" }} }} }} }});
+for (let n = 0; n < 150 && !asked(); n++) await sleep(20);
+const waited = asked();
+await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s2" }} }} }} }});
+await sleep(1500);
+console.log(JSON.stringify({{ waited, prompts }}));
+process.exit(0);
+"#,
+                controls = controls.display(),
+                plugin = plugin.display(),
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(result["waited"], true, "mini: {result}");
+        assert_eq!(result["prompts"], serde_json::json!([]), "mini: {result}");
+        let written = std::fs::read_to_string(&controls).unwrap_or_default();
+        assert!(written.contains("\"not_handed\""), "mini: {written}");
     }
 
     /// Hardening M2: the server plugin swaps a submitted doorbell line for the

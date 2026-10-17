@@ -15,7 +15,7 @@
 //! pool ([`MAX_INBOX_WAITERS`]), never one of the hook-ingest slots, and past
 //! [`MAX_WAITERS_PER_AGENT`] for one agent the oldest is told it was superseded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -464,11 +464,11 @@ struct HubState {
     /// owing, collected for [`InboxHub::agent_exited`]'s caller.
     exited_ledgers: Vec<DelegateLedger>,
     /// Ids minted for a delegated task that is not yet posted, nor abandoned.
-    pending_posts: std::collections::HashSet<String>,
+    pending_posts: HashSet<String>,
     /// PRD #1666 delegate_021: worker panes that acknowledged a delegated task
     /// and have not reported `work-done` since
     /// ([`InboxHub::retire_answered_delegates_to`]).
-    received_since_done: std::collections::HashSet<String>,
+    received_since_done: HashSet<String>,
     /// PRD #1666 §2.8: where a recipient's card is told a message could not
     /// reach it — the daemon's delivery-notice channel, installed by
     /// [`InboxHub::set_card_notice_sink`]. Nothing is owed while it is unset.
@@ -488,6 +488,11 @@ struct HubState {
     /// orchestrator and role to correct when one commits after all. Oldest
     /// dropped past [`MAX_CANCELLED_TASKS`].
     cancelled_tasks: HashMap<String, (Recipient, String)>,
+    /// PRD #1666 §6.4: cancelled messages that may already have reached their
+    /// agent (an attempt was not positively not handed), so the notice their
+    /// retirement owes says so. Set as the cancel retires the message and
+    /// taken by [`settle_delegate`] in the same step.
+    cancelled_handed: HashSet<String>,
     /// This run's receipt spool, once the daemon started one.
     spool: Option<Arc<crate::inbox_receipt::Spool>>,
     /// Why this run's spool could not start, shown as every receipt
@@ -668,6 +673,7 @@ impl InboxHub {
                     arm_deadline_from_env(),
                 ),
                 cancelled_tasks: HashMap::new(),
+                cancelled_handed: HashSet::new(),
                 spool: None,
                 spool_error: None,
                 action_presses: HashMap::new(),
@@ -1807,7 +1813,9 @@ impl InboxHub {
     }
 
     /// PRD #1666 S4: the panes holding at least one `queued` message, for the
-    /// doorbell's tick.
+    /// doorbell's tick — and, PRD #1666 §6, those with a scheduled repeat
+    /// waiting for a receiver, whose inbox copy is still fetched: that is
+    /// waiting mail too ([`Self::doorbell_facts`]).
     pub fn panes_with_queued(&self) -> Vec<String> {
         let st = self.lock();
         let mut panes: Vec<String> = st
@@ -1817,6 +1825,11 @@ impl InboxHub {
             .filter(|m| m.state == MessageState::Queued)
             .filter_map(|m| m.recipient.as_ref().map(|r| r.pane_id.clone()))
             .collect();
+        for key in st.receipts.gens.keys() {
+            if !engine::candidates(&st, key).is_empty() {
+                panes.push(key.0.clone());
+            }
+        }
         panes.sort();
         panes.dedup();
         panes
@@ -2504,6 +2517,22 @@ impl InboxHub {
         engine::broadcast_notices(&mut st, &key, Instant::now());
     }
 
+    /// PRD #1666 §11: the deck could not rewrite `agent_id`'s integration
+    /// files as it started (`failed` names each), so until a registration
+    /// proves the integration current, its card says restarting will not
+    /// update it.
+    pub fn set_refresh_failed(&self, pane_id: &str, agent_id: &str, failed: &[String]) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        let floor = st.receipts.floors.entry(key.clone()).or_default();
+        if floor.registered {
+            return;
+        }
+        warn!(pane_id, agent_id, failed = ?failed, "inbox: could not refresh the agent's integration files");
+        floor.refresh_failed = true;
+        engine::broadcast_notices(&mut st, &key, Instant::now());
+    }
+
     /// PRD #1666 §11: the integration notice `agent_id`'s card shows now.
     pub fn integration_notice(
         &self,
@@ -2616,51 +2645,62 @@ impl InboxHub {
         self.post_owed_notices();
     }
 
-    /// PRD #1666 §3, §4: the receipt engine's clock. Lapse candidates are
-    /// first looked up in their generation's spool, off the lock: a found
-    /// commit settles, an unknown answer keeps the attempt from lapsing, and
-    /// only a confirmed absence lets it lapse.
+    /// PRD #1666 §3, §4: the receipt engine's clock. Each generation's spool
+    /// is read off the lock: a bounded number of scan passes, every commit
+    /// they admit applied whichever issued attempt it is for, then an exact
+    /// lookup of each lapse candidate's commit receipt. A found commit
+    /// settles; only a completed, error-free cycle and a lookup that finds
+    /// nothing clears a candidate for a repeat; anything else leaves it
+    /// uncleared, and the deck's own spool error degrades the generation.
     fn tick_receipts(&self) {
+        use crate::inbox_receipt::{Presence, RecordStage};
         let checks = {
             let st = self.lock();
             engine::lapse_checks(&st, Instant::now())
         };
-        let mut keep: HashMap<AgentKey, std::collections::BTreeSet<(String, u32, u32)>> =
-            HashMap::new();
-        let mut found: HashMap<AgentKey, Vec<(String, u32, u32)>> = HashMap::new();
+        let mut checked: HashMap<AgentKey, engine::Checked> = HashMap::new();
         if !checks.is_empty() {
             off_the_executor(|| {
-                for (key, evidence, candidates) in checks {
-                    let mut evidence = evidence.lock().unwrap_or_else(|e| e.into_inner());
+                for check in checks {
+                    let mut evidence = check.evidence.lock().unwrap_or_else(|e| e.into_inner());
                     let engine::Evidence { store, scanner } = &mut *evidence;
+                    let found = checked.entry(check.key).or_default();
                     let Some(scanner) = scanner.as_mut() else {
+                        // §3's degraded policy: a generation whose receipts
+                        // the deck cannot read claims no suppression, so its
+                        // candidates count as checked.
+                        found.cleared = check.candidates;
                         continue;
                     };
-                    // A completed, error-free cycle first; a bounded number
-                    // of passes, so a huge directory stays Unknown.
                     for _ in 0..8 {
-                        if scanner.pass(store).complete {
+                        let pass = scanner.pass(store);
+                        found.committed.extend(
+                            pass.admitted
+                                .iter()
+                                .filter(|key| key.stage == RecordStage::Committed)
+                                .map(|key| (key.msg.clone(), key.a, key.e)),
+                        );
+                        if pass.complete {
                             break;
                         }
                     }
-                    for (id, a, e) in candidates {
-                        let committed = crate::inbox_receipt::RecordKey {
-                            msg: id.clone(),
-                            a,
-                            e,
-                            stage: crate::inbox_receipt::RecordStage::Committed,
-                        };
-                        match scanner.presence(store, &id, a, e) {
-                            crate::inbox_receipt::Presence::Found if store.admitted(&committed) => {
-                                found.entry(key.clone()).or_default().push((id, a, e));
-                            }
-                            crate::inbox_receipt::Presence::Found
-                            | crate::inbox_receipt::Presence::Absent => {}
-                            crate::inbox_receipt::Presence::Unknown => {
-                                keep.entry(key.clone()).or_default().insert((id, a, e));
-                            }
+                    for candidate in check.candidates {
+                        match scanner.commit_presence(
+                            store,
+                            &candidate.id,
+                            candidate.a,
+                            candidate.e,
+                        ) {
+                            Presence::Found => found.committed.push((
+                                candidate.id.clone(),
+                                candidate.a,
+                                candidate.e,
+                            )),
+                            Presence::Absent => found.cleared.push(candidate),
+                            Presence::Unknown => {}
                         }
                     }
+                    found.degraded = scanner.degraded().map(str::to_string);
                 }
             });
         }
@@ -2668,7 +2708,7 @@ impl InboxHub {
         {
             let mut st = self.lock();
             let now = Instant::now();
-            engine::tick(&mut st, now, &keep, &found, &mut out);
+            engine::tick(&mut st, now, &checked, &mut out);
         }
         engine::flush(out);
         self.after_receipts();
@@ -2917,7 +2957,7 @@ impl InboxHub {
         {
             let mut st = self.lock();
             let now = Instant::now();
-            engine::closed(&mut st, key, rx, conn_id);
+            engine::closed(&mut st, key, rx, conn_id, now);
             if let Some(list) = st.waiters.get_mut(key) {
                 list.retain(|w| w.conn_id != conn_id);
                 if list.is_empty() {
@@ -3118,6 +3158,8 @@ fn drain_events(st: &mut HubState) {
             notices: InboxCardNotices::default(),
         }));
     }
+    // Each was for the retirement drained just now.
+    st.cancelled_handed.clear();
 }
 
 /// PR #1735 fifth review (B-03, B-04): tell attached clients that `agent_id`'s
@@ -3316,8 +3358,13 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent) {
     if reason == UndeliverableReason::AgentExited {
         st.exited_ledgers.push(watch.ledger);
     }
+    let handed = st.cancelled_handed.remove(id);
     if let Some(to) = watch.orchestrator {
-        let body = compose_undeliverable_notice(id, &watch.role, reason);
+        let body = if reason == UndeliverableReason::Cancelled {
+            compose_cancelled_notice(id, &watch.role, handed)
+        } else {
+            compose_undeliverable_notice(id, &watch.role, reason)
+        };
         if reason == UndeliverableReason::MaxDeliver {
             remember_late_ack(
                 st,
@@ -3522,7 +3569,7 @@ pub fn compose_undeliverable_notice(
         UndeliverableReason::InboxShut => "the deck is shutting down",
         UndeliverableReason::Superseded => "a newer task replaced it",
         UndeliverableReason::Cancelled => {
-            "the user cancelled its delivery; it may already have reached the worker"
+            "the user cancelled its delivery before it reached the worker"
         }
     };
     format!(
@@ -3531,6 +3578,30 @@ pub fn compose_undeliverable_notice(
          the user, notify the user; otherwise re-delegate or reassign the task.",
         crate::state::quote_untrusted_role(role),
     )
+}
+
+/// PRD #1666 §6.4: the notice an orchestrator gets when the user cancelled a
+/// task it delegated. `possibly_handed` when the deck cannot rule out that the
+/// task reached the worker before the cancel: then the worker may be working
+/// on it, and re-delegating it may run it twice.
+pub fn compose_cancelled_notice(message_id: &str, role: &str, possibly_handed: bool) -> String {
+    let role = crate::state::quote_untrusted_role(role);
+    if possibly_handed {
+        format!(
+            "Task {message_id} to the worker in role {role} was cancelled by the user after the \
+             deck had handed it over, so it may already have reached the worker, which may be \
+             working on it; its work-done can still arrive. The deck will not deliver it \
+             again. Check the worker's pane before you re-delegate or reassign it, or notify \
+             the user. If the deck learns the worker received it, you will be told."
+        )
+    } else {
+        format!(
+            "Task {message_id} to the worker in role {role} is undeliverable: the user cancelled \
+             its delivery before it reached the worker. The worker did not receive it, and no \
+             work-done can arrive for it. Decide how to proceed - if this needs the user, notify \
+             the user; otherwise re-delegate or reassign the task."
+        )
+    }
 }
 
 /// PRD #1666 long-turn delivery: which report about a delegated task a late

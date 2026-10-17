@@ -54,6 +54,9 @@ const api = {
   async promptAsync(request) {
     log('prompt', {request: config.server && request.path ? {sessionID:request.path.id,...request.body} : request, raw:request});
     if (config.reject) return {error:{message:'fixture rejects'}};
+    // PRD #1666 §4: the first `throwAfterPrompt` calls are taken and then fail,
+    // as a lost connection does after OpenCode accepted the prompt.
+    if ((config.throwAfterPrompt ?? 0) > 0) {config.throwAfterPrompt -= 1; throw new Error('socket hang up');}
     const sid = request.sessionID ?? request.path?.id;
     const body = request.body ?? request;
     const text = body.parts?.[0]?.text;
