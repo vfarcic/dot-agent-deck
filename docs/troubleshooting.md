@@ -214,13 +214,14 @@ Refresh the integration with `dot-agent-deck hooks install` on the machine runni
 
 ### A message says delivery uncertain
 
-The deck handed a message to the agent, then lost track of whether the agent started on it, and two marked repeats did not settle it. Open the pane and look: if the agent is working on it, Cancel the delivery; if it never saw it, Retry. In the TUI press `i` on the card and then `r` or `c`; in the desktop app use the tile's **Retry** or **Cancel**. If a message is out of attempts, only Cancel is offered: post it again if it is still needed.
+The deck handed a message to the agent, then lost track of whether the agent started on it, and either two marked repeats did not settle it or for a few minutes it could neither check nor hand the message to the agent again (for example because the agent's OpenCode integration stopped). Open the pane and look: if the agent is working on it, Cancel the delivery; if it never saw it, Retry. In the TUI press `i` on the card and then `r` or `c`; in the desktop app use the tile's **Retry** or **Cancel**. If a message is out of attempts, only Cancel is offered: post it again if it is still needed.
 
 ### A card says the deck integration is out of date, too old, or not connected
 
 The notice under the card's directory says which:
 
-- `this agent's deck integration is out of date; restart the agent to update it` — the agent loaded an older copy of the deck's plugin. Restart the agent; the deck rewrites its integration from the running deck when the agent starts.
+- `this agent's deck integration is out of date; restart the agent to update it` — the agent loaded an older copy of the deck's plugin. Restart the agent; the deck rewrites its integration from the running deck before the agent starts. When the plugin names another installed copy of `dot-agent-deck`, the deck keeps that copy and updates only the plugin around it.
+- `the deck could not update this agent's deck integration: run dot-agent-deck hooks install --agent opencode to see why, then restart the agent` — the deck could not write the agent's plugin files when it started, so restarting again will not help by itself. The install command prints the file it cannot write; fix its permissions, then restart the agent.
 - `the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent` — the agent's integration runs an older `dot-agent-deck` than the deck. Upgrade it (or point `DOT_AGENT_DECK_BIN` at the current one), then restart the agent.
 - `this agent's deck integration has not connected yet; its messages wait until it does` — the agent is still starting, or its integration did not load. It clears by itself once the integration connects, and the waiting messages are then delivered; if it stays, restart the agent or run `dot-agent-deck hooks install --agent opencode`.
 
@@ -230,7 +231,7 @@ In each case the agent's messages wait; none is lost.
 
 `messages may repeat: the deck cannot record message receipts for this agent (…)` means the deck could not write its receipts, usually because its state directory is full or not writable; the reason follows. Messages are still delivered, but one may be sent twice. Free the space or fix the permissions, then restart the agent. When the reason says `the receipt spool could not start`, the problem is the deck's, not this agent's: fix the state directory, then restart the deck itself, since restarting the agent does not start the spool.
 
-`deck messages paused: N delivered messages still wait for proof that older copies cannot run; restart the agent to clear them` means the deck stopped handing this agent new messages until it can account for ones it already delivered. Restart the agent to clear it; waiting messages are kept.
+`deck messages paused: N delivered messages still wait for proof that older copies cannot run; restart the agent to clear them` means the deck stopped handing this agent new messages until it can account for ones it already delivered. Restarting the agent clears it, but the messages waiting for it are not handed to the restarted agent: they show as not delivered, and an orchestrator is told about each of its tasks so it can delegate them again. Post any other message again if it is still needed.
 
 ### An agent shows the doorbell instead of waking
 
