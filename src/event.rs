@@ -444,6 +444,26 @@ pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 /// and the card falls back to the pane-id order, and an older TUI ignores it.
 pub const SURFACED_AGENT_ID_METADATA_KEY: &str = "surfaced_agent_id";
 
+/// `AgentEvent.metadata` key carrying, as JSON, the inbox summary
+/// ([`crate::inbox_hub::InboxSummary`]) of the agent a card-surfacing
+/// `SessionStart` draws (PRD #1666 §2.8), the agent named by
+/// [`SURFACED_AGENT_ID_METADATA_KEY`].
+///
+/// The daemon reads the summary and broadcasts the start under the inbox's
+/// lock ([`crate::inbox_hub::InboxHub::with_summary`]), the lock every
+/// [`BroadcastMsg::Inbox`] notice is sent under, so on the ordered event
+/// stream the summary includes every notice for the pane before the start and
+/// none after it. A client takes it as the pane's inbox at that point and
+/// applies the later notices on top; notices for a pane it has had no such
+/// account of are dropped. The notices the daemon raises while it spawns an
+/// agent — a failed integration refresh among them — therefore reach the card
+/// through this start, whether or not the agent ever sends a hook.
+///
+/// **Daemon-authoritative**: the hook socket strips it from every producer
+/// frame (`daemon::admit_producer_event`), and a client reads it only from a
+/// card-surfacing start. Additive on the wire: an older client ignores it.
+pub const SURFACED_INBOX_METADATA_KEY: &str = "surfaced_inbox";
+
 /// `AgentEvent.metadata` key carrying a DAEMON-AUTHORED report that an
 /// automatic prompt delivery failed on this pane (issue #424).
 ///

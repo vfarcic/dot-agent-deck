@@ -97,8 +97,9 @@ fn parent_pid() -> Option<u32> {
     }
 }
 
-/// Exit status of `inbox wait --stream` run outside a deck pane or without a
-/// capability token. The Pi extension stops respawning its watcher on it
+/// Exit status of `inbox wait --stream` run outside a deck pane, without a
+/// capability token, or without `--adapter-integration` — a stream this deck
+/// does not serve. The Pi extension stops respawning its watcher on it
 /// (`WATCHER_NOT_IN_DECK_EXIT` in `pi-extension/src/orchestrator.ts`, pinned by
 /// a test in `orchestrator_ext`), so a Pi started outside the deck does not
 /// retry forever.
@@ -114,10 +115,11 @@ pub const STREAM_NOT_IN_DECK_EXIT: u8 = 3;
 ///
 /// **Stream** (the OpenCode plugin, the Pi extension): prints each handed-over
 /// message as one JSON line on stdout and forwards the component's receipt
-/// controls from stdin to the deck, until either side closes. The deck serves
-/// a stream only with `--adapter-integration` at its floor. Run outside a deck pane, or without a capability token, it
-/// exits [`STREAM_NOT_IN_DECK_EXIT`] so the caller knows a respawn cannot
-/// succeed.
+/// controls from stdin to the deck, until either side closes
+/// ([`crate::inbox_watcher::wait_receipt_stream`]). The deck serves a stream
+/// only with `--adapter-integration` at its floor. Run outside a deck pane,
+/// without a capability token, or without `--adapter-integration`, it exits
+/// [`STREAM_NOT_IN_DECK_EXIT`] so the caller knows a respawn cannot succeed.
 /// PRD #1666 §4, §11: what a watcher's component declared on its command
 /// line beyond `--agent` and `--stream`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -129,6 +131,10 @@ pub struct Receipt {
 }
 
 pub fn wait(agent: &str, stream: bool, receipt: Receipt) -> ExitCode {
+    if unserved_stream(stream, receipt) {
+        eprintln!("inbox wait --stream needs --adapter-integration.");
+        return ExitCode::from(STREAM_NOT_IN_DECK_EXIT);
+    }
     let not_in_deck = if stream {
         ExitCode::from(STREAM_NOT_IN_DECK_EXIT)
     } else {
@@ -161,13 +167,17 @@ pub fn wait(agent: &str, stream: bool, receipt: Receipt) -> ExitCode {
     let Ok(json) = serde_json::to_string(&request) else {
         return ExitCode::SUCCESS;
     };
-    if stream && receipt.adapter_integration.is_some() {
+    if stream {
         crate::inbox_watcher::wait_receipt_stream(&json)
-    } else if stream {
-        wait_stream(&json)
     } else {
         wait_once(&json)
     }
+}
+
+/// PRD #1666 C5: whether `inbox wait` asks for a stream without receipts, one
+/// the deck refuses, so there is nothing to ask it.
+fn unserved_stream(stream: bool, receipt: Receipt) -> bool {
+    stream && receipt.adapter_integration.is_none()
 }
 
 /// PRD #1666 S8: `dot-agent-deck inbox announce --agent <agent>`. Tells the
@@ -274,82 +284,6 @@ fn wait_once(json: &str) -> ExitCode {
             ExitCode::FAILURE
         };
     }
-}
-
-#[cfg(unix)]
-fn wait_stream(json: &str) -> ExitCode {
-    let path = crate::endpoint_resolve::client_socket_path();
-    let Ok(socket) = std::os::unix::net::UnixStream::connect(&path) else {
-        return ExitCode::SUCCESS;
-    };
-    let Ok(mut writer) = socket.try_clone() else {
-        return ExitCode::SUCCESS;
-    };
-    if writer
-        .write_all(format!("{json}\n").as_bytes())
-        .and_then(|()| writer.flush())
-        .is_err()
-    {
-        return ExitCode::SUCCESS;
-    }
-    // Control lines from the component, forwarded as they come; a daemon from
-    // this build refuses a stream without `--adapter-integration` before it
-    // reads any. The component closing our stdin is how it says it is done
-    // (PRD #1666 S8: OpenCode's plugin on dispose), so the watcher then exits.
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            if writer
-                .write_all(format!("{}\n", line.trim()).as_bytes())
-                .and_then(|()| writer.flush())
-                .is_err()
-            {
-                break;
-            }
-        }
-        std::process::exit(0);
-    });
-    let reader = BufReader::new(socket);
-    let mut stdout = std::io::stdout().lock();
-    for line in reader.lines() {
-        let Ok(line) = line else {
-            break;
-        };
-        let Ok(reply) = serde_json::from_str::<InboxWaitReply>(&line) else {
-            continue;
-        };
-        if reply.keepalive {
-            continue;
-        }
-        let Some(messages) = reply.messages else {
-            // Superseded, refused or not in a deck: nothing more will come.
-            break;
-        };
-        for message in messages {
-            let Ok(line) = serde_json::to_string(&message) else {
-                continue;
-            };
-            if writeln!(stdout, "{line}")
-                .and_then(|()| stdout.flush())
-                .is_err()
-            {
-                return ExitCode::SUCCESS;
-            }
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-#[cfg(not(unix))]
-fn wait_stream(_json: &str) -> ExitCode {
-    eprintln!("inbox wait --stream is not supported on this platform.");
-    ExitCode::FAILURE
 }
 
 /// Send one inbox request and read its one-line answer.
@@ -820,6 +754,20 @@ pub fn parse_duration_ms(text: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD #1666 C5: a stream without `--adapter-integration` is one the deck
+    /// no longer serves, so `inbox wait` asks it nothing; a receipt stream and
+    /// a once waiter are asked as before.
+    #[test]
+    fn a_stream_without_receipts_is_not_asked_for() {
+        let receipts = Receipt {
+            adapter_integration: Some(2),
+            ..Receipt::default()
+        };
+        assert!(unserved_stream(true, Receipt::default()));
+        assert!(!unserved_stream(true, receipts));
+        assert!(!unserved_stream(false, Receipt::default()));
+    }
 
     /// A writer that refuses everything, as a closed stdout does.
     struct Closed;

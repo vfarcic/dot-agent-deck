@@ -78,8 +78,8 @@ const inboxStop = (child) => {
   }
 };
 // PRD #1666: DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS sets every watcher respawn
-// delay to that many milliseconds (a whole number, 1 to 3600000), as the Pi
-// extension's does; unset, the delay doubles from 1 s to 30 s.
+// delay to that many milliseconds (a whole number, 1 to 3600000); unset, the
+// delay doubles from 1 s to 30 s.
 const inboxFixedBackoff = () => {
   const raw = String(process.env.DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS ?? "").trim();
   if (!/^[0-9]+$/.test(raw)) return undefined;

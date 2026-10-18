@@ -6074,6 +6074,7 @@ async fn handle_connection(
                                     &event_tx,
                                     &record,
                                     command.as_deref(),
+                                    Some(registry.inbox()),
                                 );
                             }
                         }

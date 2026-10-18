@@ -820,6 +820,7 @@ async fn spawn_with_unit(
                     agent_type,
                     Some(&req.task_name),
                     &id,
+                    Some(registry.inbox()),
                 );
             }
             // PRD #1589 D5: the unit's record, before its task is delivered.
@@ -1287,6 +1288,7 @@ async fn spawn_with_unit(
                         role.agent_type.clone(),
                         Some(&role.role_name),
                         &agent.id,
+                        Some(registry.inbox()),
                     );
                 }
             }
@@ -1718,6 +1720,7 @@ fn seed_reason(req: &SpawnRequest) -> String {
 /// truncated pane id (`sched-<name>-<n>`'s 11-char prefix). The daemon already
 /// stores this name as the registry `display_name`, so a reconnect titled the
 /// card correctly; this brings the live path to parity.
+#[allow(clippy::too_many_arguments)]
 fn surface_spawned_pane(
     event_tx: &broadcast::Sender<BroadcastMsg>,
     pane_id: &str,
@@ -1736,6 +1739,10 @@ fn surface_spawned_pane(
     // Issue #1507: the registry id of the agent this card draws, for the TUI's
     // creation order only — see `SURFACED_AGENT_ID_METADATA_KEY`.
     agent_id: &str,
+    // PRD #1666 §2.8: the inbox whose summary for that agent the start
+    // carries, read and broadcast under its lock — see
+    // `SURFACED_INBOX_METADATA_KEY`. `None` sends none.
+    inbox: Option<&crate::inbox_hub::InboxHub>,
 ) {
     let mut metadata = HashMap::new();
     if let Some(task_name) = task_name {
@@ -1780,7 +1787,19 @@ fn surface_spawned_pane(
         background: None,
         background_revision: None,
     };
-    let _ = event_tx.send(BroadcastMsg::Event(event));
+    let Some(inbox) = inbox else {
+        let _ = event_tx.send(BroadcastMsg::Event(event));
+        return;
+    };
+    inbox.with_summary(pane_id, agent_id, |summary| {
+        let mut event = event;
+        if let Ok(json) = serde_json::to_string(&summary) {
+            event
+                .metadata
+                .insert(crate::event::SURFACED_INBOX_METADATA_KEY.to_string(), json);
+        }
+        let _ = event_tx.send(BroadcastMsg::Event(event));
+    });
 }
 
 /// PRD #1223: surface an agent started over the ATTACH socket (`StartAgent` /
@@ -1823,6 +1842,7 @@ pub(crate) fn surface_attach_started_agent(
     event_tx: &broadcast::Sender<BroadcastMsg>,
     record: &crate::agent_pty::AgentRecord,
     command: Option<&str>,
+    inbox: Option<&crate::inbox_hub::InboxHub>,
 ) {
     let Some(pane_id) = record.pane_id_env.as_deref() else {
         // No pane id means no hook routing and no TUI pane to attach by.
@@ -1838,6 +1858,7 @@ pub(crate) fn surface_attach_started_agent(
             record.agent_type.clone(),
             record.display_name.as_deref(),
             &record.id,
+            inbox,
         ),
         Some(TabMembership::Orchestration {
             name,
@@ -1880,6 +1901,7 @@ pub(crate) fn surface_attach_started_agent(
                 record.agent_type.clone(),
                 Some(role_name),
                 &record.id,
+                inbox,
             );
         }
         Some(_) => {}
@@ -4165,6 +4187,7 @@ mod tests {
             None,
             Some("morning-digest"),
             "42",
+            None,
         );
         let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued") else {
             panic!("expected a BroadcastMsg::Event");
@@ -4261,7 +4284,7 @@ mod tests {
     fn attach_started_dashboard_pane_surfaces_one_titled_card() {
         let (tx, mut rx) = broadcast::channel(8);
         let record = attach_record(Some("desktop-ab-0"), Some("my-agent"), None);
-        surface_attach_started_agent(&tx, &record, Some("opencode"));
+        surface_attach_started_agent(&tx, &record, Some("opencode"), None);
         let msgs = drain(&mut rx);
         let [BroadcastMsg::Event(e)] = msgs.as_slice() else {
             panic!("expected exactly one card event, got {msgs:?}");
@@ -4288,7 +4311,7 @@ mod tests {
     #[test]
     fn attach_started_unnamed_pane_carries_no_display_name() {
         let (tx, mut rx) = broadcast::channel(8);
-        surface_attach_started_agent(&tx, &attach_record(Some("p-0"), None, None), None);
+        surface_attach_started_agent(&tx, &attach_record(Some("p-0"), None, None), None, None);
         let msgs = drain(&mut rx);
         let [BroadcastMsg::Event(e)] = msgs.as_slice() else {
             panic!("expected exactly one card event, got {msgs:?}");
@@ -4306,7 +4329,7 @@ mod tests {
             Some("builder"),
             Some(orchestration_membership("builder")),
         );
-        surface_attach_started_agent(&tx, &record, None);
+        surface_attach_started_agent(&tx, &record, None, None);
         let msgs = drain(&mut rx);
         let [
             BroadcastMsg::OrchestrationSurface(surface),
@@ -4350,7 +4373,7 @@ mod tests {
             }
             let mut record = attach_record(Some("desktop-ab-0"), Some("lead"), Some(membership));
             record.orchestrator_context_path = Some(path.into());
-            surface_attach_started_agent(&tx, &record, None);
+            surface_attach_started_agent(&tx, &record, None, None);
             let msgs = drain(&mut rx);
             let Some(BroadcastMsg::OrchestrationSurface(surface)) = msgs.first() else {
                 panic!("expected a surface first, got {msgs:?}");
@@ -4379,7 +4402,7 @@ mod tests {
             ),
             attach_record(Some("role-0"), None, Some(orchestration_membership(""))),
         ] {
-            surface_attach_started_agent(&tx, &record, None);
+            surface_attach_started_agent(&tx, &record, None, None);
             assert!(drain(&mut rx).is_empty(), "nothing for {record:?}");
         }
     }
@@ -4389,7 +4412,12 @@ mod tests {
     #[test]
     fn attach_surfaced_card_and_tui_placeholder_are_one_card_in_either_order() {
         let (tx, mut rx) = broadcast::channel(8);
-        surface_attach_started_agent(&tx, &attach_record(Some("tui-p"), Some("mine"), None), None);
+        surface_attach_started_agent(
+            &tx,
+            &attach_record(Some("tui-p"), Some("mine"), None),
+            None,
+            None,
+        );
         let msgs = drain(&mut rx);
         let [BroadcastMsg::Event(event)] = msgs.as_slice() else {
             panic!("expected one card event, got {msgs:?}");
@@ -4469,7 +4497,7 @@ mod tests {
         // And the TUI side removes the card the matching start drew.
         let (tx, mut rx) = broadcast::channel(8);
         let dashboard = attach_record(Some("desktop-ab-0"), Some("mine"), None);
-        surface_attach_started_agent(&tx, &dashboard, None);
+        surface_attach_started_agent(&tx, &dashboard, None, None);
         surface_attach_stopped_agent(&tx, &dashboard, "desktop-ab-0");
         let mut state = crate::state::AppState::default();
         for msg in drain(&mut rx) {
@@ -4486,12 +4514,108 @@ mod tests {
         assert!(!state.managed_pane_ids.contains("desktop-ab-0"));
     }
 
+    /// PRD #1666 §2.8 (inbox/pi/021's TUI half): the daemon raises a new Pi
+    /// agent's failed integration refresh and posts its first message while it
+    /// spawns it, then surfaces its card, then posts again. The surfacing start
+    /// carries the pane's inbox as it stood between those notices, and a client
+    /// that applies the stream in order — knowing nothing of the pane before
+    /// the start, and getting no hook from the agent after it — shows the card
+    /// with the warning and both messages, the first counted once.
+    #[test]
+    fn a_surfacing_start_carries_the_inbox_its_pane_had_before_it() {
+        use crate::inbox::{BodyTrust, Content, DeckId, InboxLimits, Recipient, Sender};
+        use crate::inbox_display::IntegrationNotice::RefreshFailedPi;
+        let hub = crate::inbox_hub::InboxHub::new(
+            DeckId::generate(),
+            InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        let (tx, mut rx) = broadcast::channel(16);
+        hub.set_broadcast(tx.clone());
+        let post = |subject: &str| {
+            hub.post_direct(
+                Recipient::bound("sched-pi-0", "7"),
+                Content {
+                    from: Sender::Deck {
+                        reason: "seed".to_string(),
+                    },
+                    subject: subject.to_string(),
+                    body: "body".to_string(),
+                    body_trust: BodyTrust::Trusted,
+                    spill_path: None,
+                    id: None,
+                    preface: None,
+                },
+            )
+            .unwrap();
+        };
+        hub.set_refresh_failed("sched-pi-0", "7", &[], RefreshFailedPi);
+        post("first");
+        surface_spawned_pane(
+            &tx,
+            "sched-pi-0",
+            "/tmp/pi",
+            Some("pi"),
+            Some(AgentType::Pi),
+            Some("worker"),
+            "7",
+            Some(&hub),
+        );
+        post("second");
+
+        let msgs = drain(&mut rx);
+        let kinds: Vec<&str> = msgs
+            .iter()
+            .map(|msg| match msg {
+                BroadcastMsg::Inbox(_) => "inbox",
+                BroadcastMsg::Event(_) => "start",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["inbox", "inbox", "start", "inbox"]);
+        let BroadcastMsg::Event(start) = &msgs[2] else {
+            unreachable!()
+        };
+        let carried: crate::inbox_hub::InboxSummary = serde_json::from_str(
+            start
+                .metadata
+                .get(crate::event::SURFACED_INBOX_METADATA_KEY)
+                .expect("the start carries the pane's inbox"),
+        )
+        .unwrap();
+        assert_eq!(carried.queued, 1, "the message posted before the start");
+        assert_eq!(carried.notices.integration, Some(RefreshFailedPi));
+
+        let mut client = crate::state::AppState::default();
+        for msg in msgs {
+            match msg {
+                BroadcastMsg::Inbox(notice) => client.apply_inbox_notice(&notice),
+                BroadcastMsg::Event(event) => client.apply_event(event),
+                _ => {}
+            }
+        }
+        let card = client
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("sched-pi-0"))
+            .expect("the start drew the card");
+        let inbox = card.card_inbox().expect("the card shows the inbox");
+        assert_eq!(inbox.integration, Some(RefreshFailedPi));
+        assert_eq!(inbox.pending, 2, "each message once");
+        assert!(
+            !card.recent_events.iter().any(|e| e
+                .metadata
+                .contains_key(crate::event::SURFACED_INBOX_METADATA_KEY)),
+            "the card's journal does not keep the carried inbox"
+        );
+    }
+
     #[test]
     fn surface_spawned_pane_send_is_noop_without_subscribers() {
         // The standalone-daemon case (no attached TUI): `send` errs, swallowed.
         let (tx, rx) = broadcast::channel::<BroadcastMsg>(8);
         drop(rx);
-        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, None, Some("x"), "1");
+        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, None, Some("x"), "1", None);
     }
 
     #[test]

@@ -3130,6 +3130,9 @@ fn notify_orchestrator_of_quota_block(
 /// * `pull_request` (PRD #1401), the daemon's report of a card's pull request,
 ///   is stripped from every producer frame, and the hook loop drops a
 ///   producer's `pull_request` event outright;
+/// * `surfaced_inbox` (PRD #1666 §2.8), the inbox a card-surfacing start
+///   carries, which a client takes as the pane's, is stripped from every
+///   producer frame;
 /// * `quota_blocked_source` and `quota_blocked_lifted`, the daemon's own
 ///   markers (its Codex-rollout block, and the lift after a pane restart), are
 ///   stripped from every producer frame;
@@ -3190,6 +3193,11 @@ fn admit_producer_event(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::PULL_REQUEST_REVISION_METADATA_KEY);
+    // PRD #1666 §2.8: so is the inbox a card-surfacing start carries, which a
+    // client takes as the pane's inbox.
+    event
+        .metadata
+        .remove(crate::event::SURFACED_INBOX_METADATA_KEY);
     // Issue #1678: the background aggregate is the daemon's alone; a producer's
     // copy would otherwise reach every attached client's card.
     event.background = None;
@@ -7632,6 +7640,71 @@ mod quota_admission_tests {
         let card = &state.sessions["s"];
         assert_eq!(card.status, SessionStatus::Error);
         assert_eq!(card.delivery_notice(), Some(notice));
+    }
+
+    /// Scenario (PRD #1666 §2.8): a producer frame forges the daemon's
+    /// card-surfacing start for its pane, carrying an inbox with an
+    /// integration warning and queued messages. Unadmitted, a client would
+    /// take that inbox as the pane's and draw it on the card; after the hook
+    /// ingress's admission the inbox is gone and the card shows none.
+    #[test]
+    fn a_producer_frame_cannot_carry_a_surfaced_inbox() {
+        use crate::event::{
+            CARD_SURFACE_SESSION_START_ORIGIN, SESSION_START_ORIGIN_METADATA_KEY,
+            SURFACED_AGENT_ID_METADATA_KEY, SURFACED_INBOX_METADATA_KEY,
+        };
+        use crate::state::AppState;
+        let forged = || {
+            let mut event = quota_frame(crate::event::EventType::SessionStart);
+            let inbox = crate::inbox_hub::InboxSummary {
+                queued: 3,
+                fetched: 0,
+                claimed: 0,
+                undeliverable: 0,
+                last_acked_at: None,
+                wake: crate::inbox_hub::WakePath::Doorbell,
+                component: None,
+                wake_stalled: false,
+                notices: crate::inbox_hub::InboxCardNotices {
+                    integration: Some(crate::inbox_display::IntegrationNotice::RefreshFailedPi),
+                    ..Default::default()
+                },
+            };
+            for (key, value) in [
+                (
+                    SESSION_START_ORIGIN_METADATA_KEY,
+                    CARD_SURFACE_SESSION_START_ORIGIN.to_string(),
+                ),
+                (SURFACED_AGENT_ID_METADATA_KEY, "1".to_string()),
+                (
+                    SURFACED_INBOX_METADATA_KEY,
+                    serde_json::to_string(&inbox).unwrap(),
+                ),
+            ] {
+                event.metadata.insert(key.to_string(), value);
+            }
+            event
+        };
+        let shown = |event: AgentEvent| {
+            let mut state = AppState::default();
+            state.apply_event(event);
+            state
+                .sessions
+                .values()
+                .find_map(crate::state::SessionState::card_inbox)
+        };
+
+        // The control: unadmitted, the forged inbox reaches the card.
+        assert!(shown(forged()).is_some());
+
+        let mut admitted = forged();
+        admit_producer_event(&mut admitted);
+        assert!(
+            !admitted.metadata.contains_key(SURFACED_INBOX_METADATA_KEY),
+            "{:?}",
+            admitted.metadata
+        );
+        assert_eq!(shown(admitted), None);
     }
 
     /// Scenario (PRD #1666 audit M-A1): a producer frame carries the deck's

@@ -1641,51 +1641,22 @@ impl InboxHub {
     /// announcement is `turn_end`; otherwise the doorbell. (A `native`
     /// announcement with no waiter armed is the doorbell: that is what rings.)
     pub fn summary(&self, pane_id: &str, agent_id: &str) -> InboxSummary {
+        summary_of(&self.lock(), pane_id, agent_id)
+    }
+
+    /// PRD #1666 §2.8: run `f` with `agent_id` in `pane_id`'s [`Self::summary`]
+    /// while still holding the lock every [`BroadcastMsg::Inbox`] notice is
+    /// sent under, so a broadcast `f` sends is ordered with those notices: the
+    /// summary includes every notice sent before it and none sent after.
+    /// `f` must not call back into this hub.
+    pub fn with_summary<R>(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        f: impl FnOnce(InboxSummary) -> R,
+    ) -> R {
         let st = self.lock();
-        let key = (pane_id.to_string(), agent_id.to_string());
-        let now = Instant::now();
-        let mut summary = InboxSummary {
-            queued: 0,
-            fetched: 0,
-            claimed: 0,
-            undeliverable: 0,
-            last_acked_at: None,
-            wake: WakePath::Doorbell,
-            component: None,
-            wake_stalled: st.wake_stalled.contains_key(&key),
-            notices: engine::notices(&st, &key, now),
-        };
-        let mut last_acked: Option<Instant> = None;
-        for m in st.inbox.list(pane_id).into_iter().filter(|m| {
-            m.recipient
-                .as_ref()
-                .is_some_and(|r| r.admits(pane_id, agent_id))
-        }) {
-            match &m.state {
-                MessageState::Queued => summary.queued += 1,
-                MessageState::Fetched { .. } => summary.fetched += 1,
-                MessageState::Undeliverable { .. } => summary.undeliverable += 1,
-                MessageState::Acknowledged { at, .. } => {
-                    last_acked = Some(last_acked.map_or(*at, |t| t.max(*at)));
-                }
-                MessageState::Claimed { .. } => summary.claimed += 1,
-            }
-        }
-        summary.last_acked_at = last_acked.and_then(|at| {
-            chrono::Duration::from_std(now.saturating_duration_since(at))
-                .ok()
-                .map(|ago| chrono::Utc::now() - ago)
-        });
-        if let Some(waiter) = st.waiters.get(&key).and_then(|list| list.last()) {
-            summary.wake = WakePath::Native;
-            summary.component = component_name(waiter.component);
-        } else if let Some(announced) = st.announced.get(&key) {
-            if announced.wake == InboxWake::TurnEnd {
-                summary.wake = WakePath::TurnEnd;
-            }
-            summary.component = component_name(announced.component);
-        }
-        summary
+        f(summary_of(&st, pane_id, agent_id))
     }
 
     /// PRD #1666 S3: `agent_id` in `pane_id` exited. Its bound messages become
@@ -2332,6 +2303,54 @@ impl InboxHub {
             drain_events(&mut st);
         }
     }
+}
+
+/// [`InboxHub::summary`], under a lock the caller holds.
+fn summary_of(st: &HubState, pane_id: &str, agent_id: &str) -> InboxSummary {
+    let key = (pane_id.to_string(), agent_id.to_string());
+    let now = Instant::now();
+    let mut summary = InboxSummary {
+        queued: 0,
+        fetched: 0,
+        claimed: 0,
+        undeliverable: 0,
+        last_acked_at: None,
+        wake: WakePath::Doorbell,
+        component: None,
+        wake_stalled: st.wake_stalled.contains_key(&key),
+        notices: engine::notices(st, &key, now),
+    };
+    let mut last_acked: Option<Instant> = None;
+    for m in st.inbox.list(pane_id).into_iter().filter(|m| {
+        m.recipient
+            .as_ref()
+            .is_some_and(|r| r.admits(pane_id, agent_id))
+    }) {
+        match &m.state {
+            MessageState::Queued => summary.queued += 1,
+            MessageState::Fetched { .. } => summary.fetched += 1,
+            MessageState::Undeliverable { .. } => summary.undeliverable += 1,
+            MessageState::Acknowledged { at, .. } => {
+                last_acked = Some(last_acked.map_or(*at, |t| t.max(*at)));
+            }
+            MessageState::Claimed { .. } => summary.claimed += 1,
+        }
+    }
+    summary.last_acked_at = last_acked.and_then(|at| {
+        chrono::Duration::from_std(now.saturating_duration_since(at))
+            .ok()
+            .map(|ago| chrono::Utc::now() - ago)
+    });
+    if let Some(waiter) = st.waiters.get(&key).and_then(|list| list.last()) {
+        summary.wake = WakePath::Native;
+        summary.component = component_name(waiter.component);
+    } else if let Some(announced) = st.announced.get(&key) {
+        if announced.wake == InboxWake::TurnEnd {
+            summary.wake = WakePath::TurnEnd;
+        }
+        summary.component = component_name(announced.component);
+    }
+    summary
 }
 
 /// PRD #1666 §4: what a receipt stream's request declared beyond a plain
