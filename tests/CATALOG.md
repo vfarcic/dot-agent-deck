@@ -10298,6 +10298,14 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Doorbell fallback or message delivery after a crash.
 - **Platform coverage:** linux (uses /proc).
 
+##### inbox/pi/006 — The Pi extension's inbox receiver is the deck's generated copy.
+- **Layer:** Fast (`src/orchestrator_ext.rs`), reading the checked-in copy from the checkout.
+- **Agent:** none.
+- **Asserts:** `pi-extension/src/inbox-receiver.js` and `inbox-receiver.d.ts` equal `inbox_receiver::pi_module()` and `PI_MODULE_DTS` byte for byte, with every placeholder filled; the copy embedded for materialization is the same output; with Node available, the module imports and exports `inboxReceiver`, `inboxBinary`, `inboxKey`, `inboxRef` and the deck's adapter integration.
+- **Does not assert:** that Pi's extension uses the receiver (nothing imports it yet), or any receiver behaviour (the OpenCode receiver tests in `src/opencode_manage.rs` drive the same source).
+- **Platform coverage:** all (the import step prints `SKIP:` without Node).
+- **Cost:** none.
+
 #### inbox/publish
 
 ##### inbox/publish/001 — Subscription names are validated at every configuration seam.

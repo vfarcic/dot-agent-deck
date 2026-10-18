@@ -37,9 +37,14 @@ pub const ENV_PI_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 
 /// The embedded extension files, as `(filename, contents)` pairs.
 ///
-/// Only the two files Pi needs to load the extension are embedded:
-///   - `index.ts`        — the Pi-API glue (default-export factory), and
-///   - `orchestrator.ts` — the pure logic it imports via `./orchestrator.ts`.
+/// Only the files Pi needs to load the extension are embedded:
+///   - `index.ts`           — the Pi-API glue (default-export factory),
+///   - `orchestrator.ts`    — the pure logic it imports via `./orchestrator.ts`,
+///     and
+///   - `inbox-receiver.js`  — the deck's inbox receiver, generated from
+///     `src/inbox_receiver.js` ([`crate::inbox_receiver::pi_module`]; PRD
+///     #1666). Its `.d.ts` is for the extension's type check only, so Pi does
+///     not need it.
 ///
 /// A `package.json` is intentionally **not** embedded: the subdirectory
 /// `index.ts` discovery layout does not require one: the extension's one
@@ -54,6 +59,10 @@ pub const EXTENSION_FILES: &[(&str, &str)] = &[
     (
         "orchestrator.ts",
         include_str!("../pi-extension/src/orchestrator.ts"),
+    ),
+    (
+        "inbox-receiver.js",
+        include_str!("../pi-extension/src/inbox-receiver.js"),
     ),
 ];
 
@@ -141,7 +150,7 @@ pub fn default_extension_dir() -> Option<PathBuf> {
 }
 
 /// Materialize the bundled extension into `target_dir` in the layout Pi
-/// discovers: `<target_dir>/index.ts` + `<target_dir>/orchestrator.ts`.
+/// discovers: one `<target_dir>/<name>` per [`EXTENSION_FILES`] entry.
 ///
 /// Creates `target_dir` (and parents) if needed and (over)writes each embedded
 /// file, so re-running is idempotent and refreshes a stale copy. Each file is
@@ -408,6 +417,7 @@ fn is_executable_file(candidate: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     // ---- M3.1 (test-plan row 11): materialize into a temp dir -------------
 
@@ -495,9 +505,10 @@ mod tests {
         );
     }
 
-    /// The materialized layout is exactly the two files Pi's subdirectory
-    /// discovery needs: `index.ts` (the loaded entry point) and its
-    /// `orchestrator.ts` sibling. Pins the layout the docs describe.
+    /// The materialized layout is the files Pi's subdirectory discovery
+    /// needs: `index.ts` (the loaded entry point), its `orchestrator.ts`
+    /// sibling and the generated `inbox-receiver.js`. Pins the layout the
+    /// docs describe.
     #[test]
     fn materialize_layout_is_index_plus_orchestrator() {
         let tmp = tempfile::tempdir().unwrap();
@@ -512,6 +523,10 @@ mod tests {
         assert!(
             target.join("orchestrator.ts").is_file(),
             "orchestrator.ts is imported by index.ts via ./orchestrator.ts"
+        );
+        assert!(
+            target.join("inbox-receiver.js").is_file(),
+            "the generated inbox receiver ships beside them"
         );
         // The subdirectory layout needs no package.json.
         assert!(!target.join("package.json").exists());
@@ -577,6 +592,70 @@ mod tests {
                 crate::inbox_cli::STREAM_NOT_IN_DECK_EXIT
             )),
             "WATCHER_NOT_IN_DECK_EXIT drifted from inbox_cli::STREAM_NOT_IN_DECK_EXIT"
+        );
+    }
+
+    /// Scenario: The deck generates the Pi extension's copy of the inbox receiver from the receiver OpenCode's plugins inline, and the copy checked in under `pi-extension/src/`, with its type declarations, is compared with that output byte for byte, placeholders filled. The copy the deck embeds for Pi is that same output, and when Node is available the module is imported and exports the receiver.
+    #[spec("inbox/pi/006")]
+    #[test]
+    fn pi_006_the_generated_inbox_receiver_matches_its_generator() {
+        use crate::inbox_receiver::{PI_MODULE_DTS, PI_MODULE_DTS_PATH, PI_MODULE_PATH, pi_module};
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let generated = [
+            (PI_MODULE_PATH, pi_module()),
+            (PI_MODULE_DTS_PATH, PI_MODULE_DTS.to_string()),
+        ];
+        if std::env::var_os("DOT_AGENT_DECK_WRITE_PI_RECEIVER").is_some() {
+            for (path, contents) in &generated {
+                std::fs::write(root.join(path), contents).unwrap();
+            }
+        }
+        for (path, contents) in &generated {
+            let on_disk = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+            assert!(
+                on_disk == *contents,
+                "{path} differs from its generator in src/inbox_receiver.rs; regenerate it with \
+                 DOT_AGENT_DECK_WRITE_PI_RECEIVER=1 cargo test-fast pi_006"
+            );
+        }
+        for placeholder in [
+            "__FRAMING_JSON__",
+            "__DOORBELL_PREFIX_JSON__",
+            "__DOORBELL_SUFFIX_JSON__",
+            "__ADAPTER_INTEGRATION__",
+            "__RETIRE_KEEPALIVES__",
+        ] {
+            assert!(
+                !pi_module().contains(placeholder),
+                "{placeholder} left unfilled"
+            );
+        }
+        assert_eq!(embedded("inbox-receiver.js"), pi_module());
+
+        let Ok(node) = std::process::Command::new("node").arg("--version").output() else {
+            eprintln!("SKIP: node is not available to import {PI_MODULE_PATH}");
+            return;
+        };
+        assert!(node.status.success());
+        let out = std::process::Command::new("node")
+            .arg("--input-type=module")
+            .arg("-e")
+            .arg(
+                "import { pathToFileURL } from 'node:url';\n\
+                 const m = await import(pathToFileURL(process.argv[1]).href);\n\
+                 for (const name of ['inboxReceiver', 'inboxBinary', 'inboxKey', 'inboxRef']) {\n\
+                   if (typeof m[name] !== 'function') throw new Error(name + ' is not exported');\n\
+                 }\n\
+                 if (m.INBOX_ADAPTER_INTEGRATION !== Number(process.argv[2])) throw new Error('integration');\n",
+            )
+            .arg(root.join(PI_MODULE_PATH))
+            .arg(crate::inbox_hub::ADAPTER_INTEGRATION.to_string())
+            .output()
+            .expect("run node");
+        assert!(
+            out.status.success(),
+            "importing {PI_MODULE_PATH} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
