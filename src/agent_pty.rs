@@ -5260,25 +5260,32 @@ enum InboxIntegration {
     Pi,
 }
 
-/// PRD #1666 §11, G7: the CLI a generation's capability probe runs, the one
-/// its adapter will run. `DOT_AGENT_DECK_BIN` in the child's env when
-/// absolute; else for Pi this daemon's own binary (the extension's
-/// `DOT_AGENT_DECK_EXE`), and for OpenCode its first refreshed pin, else its
-/// first configured one. Blocking (the configured pins are read from disk):
-/// call it off the executor.
+/// PRD #1666 §11, G7: the CLI a generation's capability probe runs, chosen
+/// the way its adapter chooses: `DOT_AGENT_DECK_BIN` when absolute in the
+/// child's environment, the spawn's overlay `env` (last entry wins, as the
+/// overlay is applied) else the daemon's own `inherited` value, so an overlay
+/// entry that is empty or relative masks an inherited one; otherwise for Pi
+/// the binary this daemon exports as `DOT_AGENT_DECK_EXE`, and for OpenCode
+/// its first refreshed pin, else its first configured one. Blocking (the
+/// configured pins are read from disk): call it off the executor.
 fn inbox_probe_binary(
     integration: InboxIntegration,
     env: &[(String, String)],
+    inherited: impl Fn(&str) -> Option<std::ffi::OsString>,
     pins: &[crate::hook_binary::HookPin],
 ) -> Option<std::path::PathBuf> {
+    let key = crate::platform::paths::DOT_AGENT_DECK_BIN;
     let override_bin = env
         .iter()
-        .find(|(k, _)| k == "DOT_AGENT_DECK_BIN")
-        .map(|(_, v)| std::path::PathBuf::from(v))
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| std::ffi::OsString::from(v))
+        .or_else(|| inherited(key))
+        .map(std::path::PathBuf::from)
         .filter(|path| path.is_absolute());
     override_bin.or_else(|| {
         if integration == InboxIntegration::Pi {
-            return std::env::current_exe().ok();
+            return crate::platform::paths::executable_path().map(std::path::PathBuf::from);
         }
         pins.first()
             .map(|pin| std::path::PathBuf::from(&pin.binary))
@@ -9935,7 +9942,8 @@ impl AgentPtyRegistry {
         // a copy it read before a refresh on another thread caught up.
         // PRD #1666 G6: a Pi generation's extension is rewritten into the
         // directory the child resolves (its own `PI_CODING_AGENT_DIR`, else
-        // its `HOME`), likewise before it starts.
+        // its `HOME`; a relative one in its `cwd`, the pathname a prepared
+        // start verified), likewise before it starts.
         let inbox_refresh = if opencode_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {
             Some((
                 InboxIntegration::OpenCode,
@@ -9943,12 +9951,13 @@ impl AgentPtyRegistry {
             ))
         } else if pi_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {
             let env = opts.env.clone();
+            let cwd = opts.cwd.map(std::path::PathBuf::from);
             Some((
                 InboxIntegration::Pi,
                 (
                     Vec::new(),
                     crate::inbox_hub::off_the_executor(move || {
-                        crate::orchestrator_ext::refresh_for_spawn(&env)
+                        crate::orchestrator_ext::refresh_for_spawn(&env, cwd.as_deref())
                     }),
                 ),
             ))
@@ -10283,7 +10292,9 @@ impl AgentPtyRegistry {
         let env = env.to_vec();
         let (pane, agent) = (pane.to_string(), agent.to_string());
         std::thread::spawn(move || {
-            let Some(binary) = inbox_probe_binary(integration, &env, &pins) else {
+            let Some(binary) =
+                inbox_probe_binary(integration, &env, |key| std::env::var_os(key), &pins)
+            else {
                 return;
             };
             let verdict =
@@ -23523,7 +23534,7 @@ mod spawn_tests {
             .expect("no respawn is in flight")
     }
 
-    /// Scenario: A Pi agent is started with its own HOME and PI_CODING_AGENT_DIR, a stale extension in the directory the latter names. The deck rewrites the extension there before the agent starts, and leaves the directory its HOME alone would name untouched; a non-Pi agent's start writes nothing, and a Pi agent's capability probe runs the deck's own binary rather than an OpenCode pin. A Pi agent whose extension directory cannot be written gets the Pi-worded refresh notice, and one that never registers is reported not yet connected once the readiness deadline passes.
+    /// Scenario: A Pi agent is started with its own HOME and PI_CODING_AGENT_DIR, a stale extension in the directory the latter names. The deck rewrites the extension there before the agent starts, and leaves the directory its HOME alone would name untouched; a Pi agent whose PI_CODING_AGENT_DIR is relative gets it in its own working directory, not the deck's. A non-Pi agent's start writes nothing, and a Pi agent's capability probe runs the deck's own binary rather than an OpenCode pin, or the override its environment names, inherited or not. A Pi agent whose extension directory cannot be written gets the Pi-worded refresh notice, and one that never registers is reported not yet connected once the readiness deadline passes.
     #[spec("inbox/boundary/032")]
     #[cfg(unix)]
     #[test]
@@ -23574,6 +23585,49 @@ mod spawn_tests {
         );
         assert_eq!(registry.inbox().integration_notice("pane-pi", &pi), None);
 
+        // R3-06: a relative agent dir is the child's, so it is refreshed in
+        // the child's working directory, not the daemon's.
+        let child_cwd = root.path().join("child-cwd");
+        std::fs::create_dir_all(&child_cwd).unwrap();
+        let relative = format!(".pi-agent-boundary-032-{}", std::process::id());
+        let child_cwd_str = child_cwd.display().to_string();
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                agent_type: Some(AgentType::Pi),
+                cwd: Some(&child_cwd_str),
+                env: vec![
+                    (
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        "pane-pi-relative".to_string(),
+                    ),
+                    ("DOT_AGENT_DECK_BIN".to_string(), "/bin/true".to_string()),
+                    ("HOME".to_string(), home.display().to_string()),
+                    (
+                        crate::orchestrator_ext::ENV_PI_AGENT_DIR.to_string(),
+                        relative.clone(),
+                    ),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let in_daemon_cwd = std::env::current_dir().unwrap().join(&relative);
+        let landed_in_daemon_cwd = in_daemon_cwd.exists();
+        let _ = std::fs::remove_dir_all(&in_daemon_cwd);
+        assert!(
+            !landed_in_daemon_cwd,
+            "nothing is written in the daemon's own directory"
+        );
+        assert!(
+            child_cwd
+                .join(&relative)
+                .join("extensions")
+                .join("dot-agent-deck")
+                .join("inbox-receiver.js")
+                .exists(),
+            "the extension lands where the child resolves it"
+        );
+
         let other_home = root.path().join("other-home");
         std::fs::create_dir_all(&other_home).unwrap();
         spawn(
@@ -23612,28 +23666,62 @@ mod spawn_tests {
         );
         registry.shutdown_all();
 
-        // The probe runs the CLI the adapter will: an absolute override, else
-        // for Pi this daemon's own binary, never an OpenCode pin.
+        // The probe runs the CLI the adapter will: an absolute override from
+        // the child's environment, else for Pi this daemon's own binary, never
+        // an OpenCode pin. The child's environment is the overlay over the
+        // daemon's inherited one (R3-05).
         let pins = [crate::hook_binary::HookPin {
             agent: AgentType::OpenCode,
             config: root.path().join("opencode.json"),
             binary: "/opt/opencode-pin/dot-agent-deck".to_string(),
         }];
-        let own = std::env::current_exe().ok();
+        let own = crate::platform::paths::executable_path().map(std::path::PathBuf::from);
         let bin = |value: &str| vec![("DOT_AGENT_DECK_BIN".to_string(), value.to_string())];
-        assert_eq!(inbox_probe_binary(InboxIntegration::Pi, &[], &pins), own);
+        let none = |_: &str| None;
+        let inherited = |key: &str| {
+            (key == "DOT_AGENT_DECK_BIN").then(|| std::ffi::OsString::from("/opt/inherited-deck"))
+        };
         assert_eq!(
-            inbox_probe_binary(InboxIntegration::Pi, &bin("relative/deck"), &pins),
+            inbox_probe_binary(InboxIntegration::Pi, &[], none, &pins),
+            own
+        );
+        assert_eq!(
+            inbox_probe_binary(InboxIntegration::Pi, &bin("relative/deck"), none, &pins),
             own,
             "a relative override is not the adapter's"
         );
         assert_eq!(
-            inbox_probe_binary(InboxIntegration::Pi, &bin("/opt/deck"), &pins),
+            inbox_probe_binary(InboxIntegration::Pi, &bin("/opt/deck"), none, &pins),
             Some(std::path::PathBuf::from("/opt/deck"))
         );
         assert_eq!(
-            inbox_probe_binary(InboxIntegration::OpenCode, &[], &pins),
+            inbox_probe_binary(InboxIntegration::OpenCode, &[], none, &pins),
             Some(std::path::PathBuf::from("/opt/opencode-pin/dot-agent-deck"))
+        );
+        for integration in [InboxIntegration::Pi, InboxIntegration::OpenCode] {
+            assert_eq!(
+                inbox_probe_binary(integration, &[], inherited, &pins),
+                Some(std::path::PathBuf::from("/opt/inherited-deck")),
+                "{integration:?}: an override the child inherits from the daemon is the adapter's"
+            );
+            assert_eq!(
+                inbox_probe_binary(integration, &bin("/opt/deck"), inherited, &pins),
+                Some(std::path::PathBuf::from("/opt/deck")),
+                "{integration:?}: the overlay's value wins over the inherited one"
+            );
+        }
+        for masking in ["", "relative/deck"] {
+            assert_eq!(
+                inbox_probe_binary(InboxIntegration::Pi, &bin(masking), inherited, &pins),
+                own,
+                "an overlay entry {masking:?} masks the inherited override"
+            );
+        }
+        let twice = [bin("/opt/first"), bin("/opt/last")].concat();
+        assert_eq!(
+            inbox_probe_binary(InboxIntegration::Pi, &twice, none, &pins),
+            Some(std::path::PathBuf::from("/opt/last")),
+            "the overlay's last entry is the one the child gets"
         );
     }
 

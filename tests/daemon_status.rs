@@ -318,12 +318,9 @@ async fn wait_for_attach_socket(attach_socket: &Path, timeout: Duration) {
     }
 }
 
-/// Spawn a pane through the same attach request the TUI uses. The registry
-/// injects `DOT_AGENT_DECK_AGENT_ID`; the returned id is then replayed into the
-/// real `agent-event` subprocess exactly as it is inside the managed pane.
-#[cfg(unix)]
 /// PRD #1666 G6: the agent dir a Pi stand-in started in `cwd` resolves, so the
 /// deck's refresh of its extension lands in the test's scratch directory.
+#[cfg(unix)]
 fn pi_agent_dir(cwd: &std::path::Path) -> (String, String) {
     (
         "PI_CODING_AGENT_DIR".to_string(),
@@ -331,6 +328,10 @@ fn pi_agent_dir(cwd: &std::path::Path) -> (String, String) {
     )
 }
 
+/// Spawn a pane through the same attach request the TUI uses. The registry
+/// injects `DOT_AGENT_DECK_AGENT_ID`; the returned id is then replayed into the
+/// real `agent-event` subprocess exactly as it is inside the managed pane.
+#[cfg(unix)]
 async fn start_tui_managed_agent(
     daemon: &common::InProcDaemon,
     pane_id: &str,

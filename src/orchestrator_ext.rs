@@ -243,13 +243,22 @@ fn resolve_agent_dir_from_env(env: &[(String, String)]) -> Option<PathBuf> {
 }
 
 /// PRD #1666 G6: rewrite the extension into the directory a Pi child spawned
-/// with the env overlay `env` resolves (its `PI_CODING_AGENT_DIR`, else its
-/// `HOME`, each from the overlay first), before the child starts, so it loads
-/// the receiver this deck checks it against. Returns what failed: the target
-/// directory and the error, so the daemon's warning names where; empty when
-/// the files are current or no directory resolves (nothing to refresh).
-pub fn refresh_for_spawn(env: &[(String, String)]) -> Vec<String> {
-    let Some(target) = resolve_agent_dir_from_env(env).map(|dir| extension_dir_in(&dir)) else {
+/// with the env overlay `env` in the working directory `cwd` resolves (its
+/// `PI_CODING_AGENT_DIR`, else its `HOME`, each from the overlay first), before
+/// the child starts, so it loads the receiver this deck checks it against. A
+/// relative directory is the child's, so it is taken from `cwd`; with no `cwd`
+/// the child starts in the daemon's own directory and so does the relative
+/// path. Returns what failed: the target directory and the error, so the
+/// daemon's warning names where; empty when the files are current or no
+/// directory resolves (nothing to refresh).
+pub fn refresh_for_spawn(env: &[(String, String)], cwd: Option<&Path>) -> Vec<String> {
+    let Some(target) = resolve_agent_dir_from_env(env).map(|dir| {
+        let dir = match cwd {
+            Some(cwd) if dir.is_relative() => cwd.join(dir),
+            _ => dir,
+        };
+        extension_dir_in(&dir)
+    }) else {
         return Vec::new();
     };
     match materialize(&target) {
@@ -1114,10 +1123,10 @@ mod tests {
         node_pin("test/inbox.test.ts", "pi_005");
     }
 
-    /// Scenario: The deck hands one attempt to Pi's receiver, then the same attempt again, then a marked repeat of it. Pi gets one follow-up for the attempt and one for the repeat, each behind the deck's approval.
+    /// Scenario: The deck hands one attempt to Pi's receiver, then the same attempt again, then a marked repeat of it; and an attempt submitted but unseen by any gate is carried across a /new swap. Pi gets one follow-up for the repeated hand-out and one for the repeat, each behind the deck's approval; the swapped attempt is submitted again to the successor and passes a gate once.
     #[spec("inbox/pi/007")]
     #[test]
-    fn pi_007_one_sendusermessage_per_attempt_and_a_marked_repeat_is_sent_once() {
+    fn pi_007_a_repeated_hand_out_is_sent_once_and_a_swap_resubmits_what_no_gate_saw() {
         node_pin("test/inbox.test.ts", "pi_007");
     }
 
@@ -1205,7 +1214,7 @@ mod tests {
         node_pin("test/inbox.test.ts", "pi_025");
     }
 
-    /// Scenario: A hand-over approved for one session resumes after a successor took over, a session's delayed shutdown arrives after its successor started, and the outgoing session reports Thinking after it was replaced. The approval does not reach the successor's Pi and the attempt goes to it uncalled; the delayed shutdown leaves the successor current; the stale Thinking is not reported while the outgoing Idle is, in order.
+    /// Scenario: A hand-over approved for one session resumes after a successor took over, a session's delayed shutdown arrives after its successor started (once before and once after the successor's turn began), and the outgoing session reports Thinking after it was replaced. The approval does not reach the successor's Pi and the attempt goes to it uncalled; the delayed shutdown leaves the successor current and reports no Idle into its turn; the stale Thinking is not reported while an in-order outgoing Idle is.
     #[spec("inbox/pi/026")]
     #[test]
     fn pi_026_session_tokens_a_delayed_approval_shutdown_and_report() {
@@ -1219,7 +1228,7 @@ mod tests {
         node_pin("test/inbox.test.ts", "pi_027");
     }
 
-    /// Scenario: A reload evaluates a different version of the extension while the old receiver holds attempts. The old receiver is disposed before its watcher is drained, the drain is awaited (its exit, or forced at the deadline), two initializers share one replacement, compatible state is carried and answered retained, an incompatible one answers unknown and never not handed, and the old receiver's callbacks deliver nothing after disposal.
+    /// Scenario: A reload evaluates a different version of the extension while the old receiver holds attempts, one waiting for approval with another queued behind it. The old receiver is disposed before its drained watcher is awaited, keeps reading that watcher (a message, a revoke, and a commit by the reload's successor) without handing anything to Pi, and two initializers share one replacement. A compatible state is carried and answered retained, its waiting and drained messages go to the successor in order, the drained commit is published, and the reload's ownership of a passed attempt lets the successor release it lost; an incompatible state answers unknown and never not handed.
     #[spec("inbox/pi/028")]
     #[test]
     fn pi_028_a_version_replacement_dispose_drain_transfer() {
@@ -1233,7 +1242,7 @@ mod tests {
         node_pin("test/inbox.test.ts", "pi_029");
     }
 
-    /// Scenario: Hand-overs reach the gate late — after a /new swap, after a revoke and after the watcher restarted — and doorbell fetches return late across the same three. Each is consumed, never transformed; the swap's and the rebind's attempts are reported not handed when still held, and the revoke's answer stands alone.
+    /// Scenario: Hand-overs reach the gate late — after a /new swap, after a revoke and after the watcher restarted — and doorbell fetches return late across the same three; and a busy hand-over passes the gate while an earlier report holds the report queue, across a swap, a revoke, a rebind or an expiry. The late ones are consumed, never transformed, reported not handed when still held after a swap or rebind; the passed one returns its transform without waiting for the queue, and what follows treats it as handed.
     #[spec("inbox/pi/032")]
     #[test]
     fn pi_032_the_session_and_authorization_fence_at_both_hand_over_points() {

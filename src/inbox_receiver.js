@@ -75,11 +75,13 @@ const inboxRef = (entry) => ({ id: entry.id, a: entry.a, e: entry.e });
 // approval: a callback that resumes after any of them never reaches OpenCode.
 //
 // `exited` is told each watcher's exit code before the receiver decides
-// whether to respawn it. `state` is what another receiver's `exportState`
+// whether to respawn it, and `registered` each registration once its resume
+// answers, held reports and snapshot are sent. `state` is what another
+// receiver's `exportState`
 // gave up (the Pi extension's replacement across a reload of a different
 // version): this one starts holding it, and registers `--resumed` from its
 // first watcher, so the deck asks about those attempts.
-const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, state }) => {
+const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, registered, state }) => {
   const held = new Map((state?.held ?? []).map((entry) => [inboxKey(entry), { ...entry }]));
   const revoked = new Set(state?.revoked ?? []);
   // Attempts a callback took into OpenCode's API, or that the agent started
@@ -163,6 +165,8 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, s
   let runs = state ? 1 : 0;
   // A respawn is scheduled and has not started yet.
   let restarting = false;
+  // `drain` began: nothing more is handed over, and no watcher starts again.
+  let draining = false;
   const restart = (next, delay) => {
     restarting = true;
     setTimeout(() => {
@@ -231,6 +235,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, s
       if (answers.length) inboxWrite(child, { resume_answers: answers });
       flush();
       snapshot();
+      registered?.();
     }
     for (const rebound of Array.isArray(reply.rebound) ? reply.rebound : []) {
       const entry = held.get(inboxKey(rebound));
@@ -257,7 +262,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, s
     if (reply.keepalive || (Array.isArray(reply.rebound) && reply.rebound.length)) snapshot();
   };
   const start = (backoff) => {
-    if (!active()) return;
+    if (!active() || draining) return;
     const started = Date.now();
     const args = ["inbox", "wait", "--agent", agent, "--stream", "--adapter-integration", String(INBOX_ADAPTER_INTEGRATION)];
     if (doorbellOnly) args.push("--doorbell-only");
@@ -308,17 +313,25 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, s
     ensure: () => {
       if (!child && !restarting) start(inboxFirstBackoff());
     },
-    // Like `stop`, but resolves once the watcher exited ("exited"), or at
-    // the deadline after SIGTERM and then SIGKILL ("forced"): a successor
-    // may start only once this watcher can publish nothing more.
+    // Like `stop`, but this watcher is read until it exits. From the drain on
+    // nothing is handed over: no approval is asked for, outstanding ones are
+    // refused and `ready` holds for none. A message the watcher still hands
+    // out is held and given to `deliver`, a revoke is answered in this
+    // receiver's state, and a stage report made now is kept unsent (in
+    // `exportState`), because the watcher's ended stdin takes no more
+    // controls. Resolves once the watcher exited ("exited"), or at the
+    // deadline after SIGTERM and then SIGKILL ("forced"), when it stops being
+    // read: a successor may start only once this watcher can publish nothing
+    // more, as far as this receiver can tell.
     drain: () =>
       new Promise((resolve) => {
-        const gone = child;
-        child = undefined;
-        rx = undefined;
+        draining = true;
         for (const [, resolve] of grants) resolve(false);
         grants.clear();
+        const gone = child;
         if (!gone || typeof gone.exitCode === "number" || gone.signalCode) {
+          child = undefined;
+          rx = undefined;
           resolve("exited");
           return;
         }
@@ -330,6 +343,10 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, s
         const term = setTimeout(() => signal("SIGTERM"), INBOX_STOP_GRACE_MS);
         const kill = setTimeout(() => {
           signal("SIGKILL");
+          if (child === gone) {
+            child = undefined;
+            rx = undefined;
+          }
           resolve("forced");
         }, INBOX_STOP_GRACE_MS + 2000);
         term.unref?.();
@@ -372,7 +389,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, s
     // epoch and when it was asked for), or undefined when it was refused or
     // went unanswered.
     may: async (ref) => {
-      if (!child || rx === undefined) return undefined;
+      if (!child || rx === undefined || draining) return undefined;
       const asked = approval();
       q += 1;
       const id = q;
@@ -394,13 +411,14 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, s
     approval: () => approval(),
     // §2: whether a callback holding the approval `granted` may reach
     // OpenCode right now. Synchronous: call it with no await between it and
-    // the native call. One native call per attempt: once a callback has
-    // called, every other approval of the attempt is refused, so a call's
-    // outcome is the attempt's.
+    // the native call. Once a callback has marked the attempt `calling`,
+    // every other approval of it is refused, so that hand-over's outcome is
+    // the attempt's. (The Pi extension marks it at its own gate, after the
+    // submission, so a submission no gate passed can be followed by another.)
     ready: (ref, granted) => {
       const key = inboxKey(ref);
       const entry = held.get(key);
-      return active() && fresh(granted) && entry !== undefined &&
+      return active() && !draining && fresh(granted) && entry !== undefined &&
         entry.stage !== "handed" && !called.has(key) && !revoked.has(key);
     },
     // The callback is about to reach OpenCode: from here a revoke is

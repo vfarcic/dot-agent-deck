@@ -8744,7 +8744,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/032 — A Pi spawn refreshes the extension the child will load.
 - **Layer:** Fast (`src/agent_pty.rs`), real `cat` spawns typed Pi with a scratch HOME and PI_CODING_AGENT_DIR.
 - **Agent:** none.
-- **Asserts:** a stale extension in the child's `PI_CODING_AGENT_DIR` is rewritten before it starts and its HOME's `.pi` is untouched; a non-Pi start writes nothing; an unwritable directory gives the `refresh_failed_pi` notice; a Pi start nothing registers for is `not_armed` after the readiness deadline.
+- **Asserts:** a stale extension in the child's `PI_CODING_AGENT_DIR` is rewritten before it starts and its HOME's `.pi` is untouched; a relative `PI_CODING_AGENT_DIR` is refreshed in the child's working directory and nothing is written in the daemon's; a non-Pi start writes nothing; an unwritable directory gives the `refresh_failed_pi` notice; a Pi start nothing registers for is `not_armed` after the readiness deadline; the probe's binary is the child's absolute `DOT_AGENT_DECK_BIN` whether the overlay sets it or the daemon's environment passes it on, an empty or relative overlay entry masks an inherited one, and otherwise it is the deck's own binary for Pi and the first pin for OpenCode.
 - **Does not assert:** the capability probe's verdict, or a Pi started through a wrapper (not detected, by design).
 - **Platform coverage:** mac+linux.
 
@@ -10447,10 +10447,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Platform coverage:** all (the import step prints `SKIP:` without Node).
 - **Cost:** none.
 
-##### inbox/pi/007 — Pi gets one sendUserMessage per attempt.
+##### inbox/pi/007 — Pi submits a repeated hand-out once, and an unseen submission again after a swap.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** A repeated hand-out of one attempt is sent once, after one `may`; a marked repeat (new `e`) is sent once.
+- **Asserts:** A repeated hand-out of one attempt is sent once, after one `may`; a marked repeat (new `e`) is sent once; an attempt submitted and seen by no gate when `/new` replaces the session is submitted again to the successor behind a second `may` (two `sendUserMessage` calls for one attempt), the first submission's tag is consumed at either instance's gate, and one `handed` is reported.
 - **Does not assert:** The daemon's repeat policy.
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.
@@ -10554,7 +10554,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/026 — Pi session tokens fence a delayed approval, shutdown and report.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** An approval that resumes after a swap does not call the old `pi` and the attempt goes to the successor after a new `may`; a delayed shutdown leaves the successor current; a stale Thinking is not reported while the outgoing Idle is.
+- **Asserts:** An approval that resumes after a swap does not call the old `pi` and the attempt goes to the successor after a new `may`; a delayed shutdown leaves the successor current, and one arriving after the successor reported Thinking reports no Idle and leaves the successor's follow-up held; a stale Thinking is not reported while an in-order outgoing Idle is.
 - **Does not assert:** Report retries (orchestrator.test.ts).
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.
@@ -10570,7 +10570,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/028 — A Pi extension version replacement disposes, drains and transfers.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** The old receiver is disposed before its drain, the drain is awaited (exit, or SIGTERM then SIGKILL at the deadline), two initializers share one replacement, a compatible state answers `retained` and an incompatible one `unknown`, revokes answer `already_handed` and nothing is reported `not_handed`, and the disposed receiver delivers nothing.
+- **Asserts:** The old receiver is disposed before its drain, the drain is awaited (exit, or SIGTERM then SIGKILL at the deadline), two initializers share one replacement, a compatible state answers `retained` and an incompatible one `unknown`, revokes answer `already_handed` and nothing is reported `not_handed`, and the disposed receiver delivers nothing to Pi. During the drain the old receiver still takes a message and a revoke and keeps a commit the reload's successor witnessed; afterwards the message goes to the successor, the re-sent revoke is answered `revoked_ack` and the commit is published by the new watcher. An attempt waiting for approval and one queued behind it both reach the successor, in order, each behind a fresh `may`. A passed attempt's reload ownership is carried, so a later settle or the successor's `/new` releases it `lost`.
 - **Does not assert:** A real Pi reload (lane 2).
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.
@@ -10602,7 +10602,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/032 — The Pi session and authorization fence at both hand-over points.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** A tagged input delayed past a `/new` swap, a revoke or a watcher restart is consumed, never transformed, with `not_handed` for the swap and the restart and none after the revoke; a doorbell fetch returning after the same three is consumed, its attempts reported `not_handed` when still held.
+- **Asserts:** A tagged input delayed past a `/new` swap, a revoke or a watcher restart is consumed, never transformed, with `not_handed` for the swap and the restart and none after the revoke; a doorbell fetch returning after the same three is consumed, its attempts reported `not_handed` when still held. A busy hand-over that passes the gate while an earlier report holds the report queue returns its transform before the queue moves; a swap, revoke, rebind or approval expiry that follows treats it as handed (`lost`, `already_handed`, `retained`, a later commit), and its own report is still sent after the one ahead of it.
 - **Does not assert:** The timing of a real Pi's awaited input pipeline (lane 2).
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.

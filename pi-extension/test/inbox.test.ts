@@ -169,7 +169,7 @@ test("pi_005 the watcher and the doorbell fetch declare the receipt integration"
 });
 
 /// Scenario: The deck hands one attempt to Pi's receiver, then the same attempt again, then a marked repeat of it. Pi gets one follow-up for the attempt and one for the repeat, each behind the deck's approval.
-test("pi_007 one sendUserMessage per attempt, and a marked repeat is sent once", async () => {
+test("pi_007 a repeated hand-out is sent once, and a marked repeat is its own attempt", async () => {
 	const { pi, child } = await started();
 	child.hand(ref());
 	await settle();
@@ -184,6 +184,26 @@ test("pi_007 one sendUserMessage per attempt, and a marked repeat is sent once",
 	child.hand(ref(ID, 1, 2));
 	await settle();
 	assert.equal(pi.sends.length, 2, "the marked repeat is its own attempt, sent once");
+});
+
+/// Scenario: An attempt is submitted to Pi but no gate has seen it when the session is replaced by /new. The successor submits the same attempt again behind a fresh approval; the first submission's tag is consumed at either instance's gate, and the attempt passes a gate once.
+test("pi_007 a submission no gate saw is submitted again to a /new successor, and passes one gate", async () => {
+	const { pi, child } = await started();
+	child.hand(ref());
+	await settle();
+	const first = pi.sends[0].text;
+	await pi.emit("session_shutdown", { reason: "new" });
+	const next = instance();
+	await next.emit("session_start", { reason: "new" });
+	await settle();
+	assert.equal(pi.sends.length + next.sends.length, 2, "two sendUserMessage calls for one attempt");
+	assert.equal(next.sends.length, 1);
+	assert.deepEqual(child.refs("may"), [ref(), ref()], "each behind its own approval");
+	assert.deepEqual(await pi.emit("input", { text: first, source: "extension" }), { action: "handled" });
+	assert.deepEqual(await next.emit("input", { text: first, source: "extension" }), { action: "handled" });
+	assert.equal((await next.gate()).action, "transform");
+	assert.deepEqual(child.refs("handed"), [ref()], "one hand-over past a gate");
+	assert.deepEqual(child.refs("not_handed"), []);
 });
 
 /// Scenario: Hand-overs reach the gate after the deck revoked the attempt, after the watcher restarted, after the approval went stale, and twice. Each is consumed rather than passed to the model; the restarted and stale ones are reported not handed, and a revoked one is not reported a second time.
@@ -594,6 +614,30 @@ test("pi_026 session tokens: a delayed approval, shutdown and report", async () 
 	}
 });
 
+/// Scenario: A session's shutdown is delayed until its successor has started a turn (Thinking reported) and been handed a follow-up. The outgoing Idle is not reported, so it cannot end the successor's turn, and the follow-up stays held.
+test("pi_026 a delayed shutdown after the successor's Thinking reports no Idle", async () => {
+	const { pi, child } = await started();
+	const types: string[] = [];
+	const record = async (_bin: string, argv: string[]) => {
+		if (argv[0] === "agent-event") types.push(argv[argv.indexOf("--type") + 1]);
+		return { code: 0, stdout: "", stderr: "", killed: false };
+	};
+	pi.pi.exec = record;
+	const next = instance();
+	next.pi.exec = record;
+	next.ctx.isIdle = () => false;
+	await next.emit("session_start", { reason: "new" });
+	await next.emit("before_agent_start", { prompt: "keep working" });
+	await next.emit("agent_start", {});
+	child.hand(ref());
+	await settle();
+	assert.equal(next.sends.length, 1, "the follow-up is the successor's");
+	await pi.emit("session_shutdown", { reason: "new" });
+	await settle();
+	assert.deepEqual(types, ["finished", "prompt", "running"], "no Idle after the successor's Thinking");
+	assert.deepEqual(child.sent("possess").at(-1).held, [ref()], "the follow-up stays held");
+});
+
 /// Scenario: Inputs carrying a hand-over tag this process never issued, a tag from an older version's format and a well-formed tag for an unknown attempt reach the gate. Each is consumed, and nothing is reported to the deck.
 test("pi_027 unknown or older tags are consumed silently", async () => {
 	const { pi, child } = await started();
@@ -655,6 +699,96 @@ test("pi_028 a version replacement: dispose, drain, transfer", async (t) => {
 		assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
 		await start;
 		assert.equal(spawned.length, 2);
+	}
+});
+
+const ID3 = "m-k3xzq2ab-cccccccc54b742c9";
+
+/**
+ * A reload of a different version: `pi` shuts down for the reload, and its
+ * successor's session_start waits while the old receiver drains. `finish`
+ * lets the old watcher exit and resolves once the successor is current.
+ */
+async function replacing(pi: ReturnType<typeof instance>, child: Watcher) {
+	(globalThis as any)[PROCESS].version = 0;
+	await pi.emit("session_shutdown", { reason: "reload" });
+	const next = instance();
+	const start = next.emit("session_start", { reason: "reload" });
+	await settle();
+	assert.equal(child.ended, true, "the old watcher is draining");
+	const finish = async () => {
+		child.exit(0);
+		await start;
+		assert.equal(spawned.length, 2);
+		return watcher();
+	};
+	return { next, finish };
+}
+
+/// Scenario: While a version replacement drains the old watcher, that watcher hands out a message and a revoke, and the reload's successor starts on an attempt that passed the gate. Nothing reaches Pi during the drain; afterwards the successor's receiver hands the message to the successor, answers the re-sent revoke revoked_ack, and publishes the commit made during the drain.
+test("pi_028 drain: the outgoing receiver keeps reading its watcher until it exits", async () => {
+	const { pi, child } = await started();
+	child.hand(ref(ID));
+	await settle();
+	await pi.gate();
+	const { next, finish } = await replacing(pi, child);
+	child.hand(ref(ID2), ref(ID3));
+	child.say({ revoke: [ref(ID3)] });
+	await next.start(ID);
+	await settle();
+	assert.equal(pi.sends.length + next.sends.length, 1, "nothing handed to Pi during the drain");
+	const second = await finish();
+	second.register(8, { resume: [ref(ID), ref(ID2)] });
+	await settle();
+	assert.deepEqual(second.sent("resume_answers").flat().map((r: any) => r.answer), ["retained", "retained"]);
+	assert.deepEqual(second.refs("committed"), [ref(ID)], "the commit made during the drain is published");
+	assert.equal(next.sends.length, 1, "the message taken during the drain goes to the successor");
+	assert.ok(next.sends[0].text.includes(block(ID2)));
+	second.say({ revoke: [ref(ID3)] });
+	assert.deepEqual(second.refs("revoked_ack"), [ref(ID3)], "the revoke the drain took stands");
+	assert.deepEqual(second.refs("not_handed"), []);
+});
+
+/// Scenario: A version replacement starts while one attempt waits for the deck's approval and a second is queued behind it. Neither is lost: once the replacement's watcher registers, the successor is handed both, in order, each behind a fresh approval.
+test("pi_028 a replacement carries a hand-over waiting for approval and the queue behind it", async () => {
+	const { pi, child } = await started();
+	child.grant = undefined;
+	child.hand(ref(ID), ref(ID2));
+	await settle();
+	assert.deepEqual(child.refs("may"), [ref(ID)], "the second waits behind the first");
+	const { next, finish } = await replacing(pi, child);
+	const second = await finish();
+	second.register(8, { resume: [ref(ID), ref(ID2)] });
+	await settle();
+	assert.deepEqual(second.sent("resume_answers").flat().map((r: any) => r.answer), ["retained", "retained"]);
+	assert.deepEqual(second.refs("may"), [ref(ID), ref(ID2)]);
+	assert.equal(next.sends.length, 2, "both handed to the successor");
+	assert.ok(next.sends[0].text.includes(block(ID)) && next.sends[1].text.includes(block(ID2)), "in order");
+	assert.deepEqual(child.refs("not_handed").concat(second.refs("not_handed")), []);
+});
+
+/// Scenario: An attempt passes the gate, and a reload of a different version replaces the receiver. The reload's successor owns it: a later settle with nothing queued after a run releases it lost, and so does the successor's own /new; either way a revoke is answered already_handed, never not handed.
+test("pi_028 a replacement carries the reload's ownership of what passed", async () => {
+	for (const end of ["settle", "new"]) {
+		const { pi, child } = await started();
+		child.hand(ref());
+		await settle();
+		await pi.gate();
+		const { next, finish } = await replacing(pi, child);
+		const second = await finish();
+		second.register(8, { resume: [ref()] });
+		await settle();
+		assert.deepEqual(second.sent("possess").at(-1).held, [ref()], `${end}: still held after the replacement`);
+		if (end === "new") {
+			await next.emit("session_shutdown", { reason: "new" });
+		} else {
+			await next.emit("agent_start", {});
+			await next.emit("agent_settled", {});
+		}
+		assert.deepEqual(second.sent("possess").at(-1).held, [], `${end}: released lost`);
+		second.say({ revoke: [ref()] });
+		assert.deepEqual(second.refs("already_handed"), [ref()], `${end}: possibly handed`);
+		assert.deepEqual(second.refs("not_handed"), []);
 	}
 });
 
@@ -774,6 +908,86 @@ test("pi_032 the session and authorization fence at both hand-over points", asyn
 		assert.deepEqual(watcher().refs("handed"), []);
 		assert.deepEqual(watcher().refs("not_handed"), [ref()]);
 	}
+});
+
+/**
+ * A hand-over of a busy Pi passes the gate while an earlier report holds the
+ * process's report queue, then `during` runs, then the queue is let go.
+ */
+async function behindAHeldReport(t: any, during: (pi: ReturnType<typeof instance>, child: Watcher) => Promise<void>) {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const { pi, child } = await started();
+	const types: string[] = [];
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => { release = resolve; });
+	pi.pi.exec = async (_bin: string, argv: string[]) => {
+		if (argv[0] === "agent-event") {
+			types.push(argv[argv.indexOf("--type") + 1]);
+			await held;
+		}
+		return { code: 0, stdout: "", stderr: "", killed: false };
+	};
+	child.hand(ref());
+	await settle();
+	void pi.emit("agent_start", {});
+	await settle();
+	let answered: any = "waiting";
+	const answer = pi.emit("input", { text: pi.sends[0].text, source: "extension", streamingBehavior: "followUp" }).then((a) => { answered = a; });
+	await settle();
+	assert.equal(answered?.action, "transform", "the transform returns while the report queue is held");
+	await during(pi, child);
+	release();
+	await answer;
+	await settle();
+	assert.equal(answered.action, "transform");
+	assert.deepEqual(types.slice(0, 2), ["running", "prompt"], "the busy hand-over still reports, after the report ahead of it");
+	return { pi, child };
+}
+
+/// Scenario: A busy hand-over passes the gate while an earlier status report holds the report queue, and the session is replaced by /new before the queue moves. The transform has already gone back to Pi, so the swap releases the attempt lost and a revoke is answered already_handed, never not handed.
+test("pi_032 g a swap while a report holds the queue", async (t) => {
+	const { child } = await behindAHeldReport(t, async (pi) => {
+		void pi.emit("session_shutdown", { reason: "new" });
+		void instance().emit("session_start", { reason: "new" });
+		await settle();
+	});
+	assert.deepEqual(child.sent("possess").at(-1).held, [], "released lost");
+	child.say({ revoke: [ref()] });
+	assert.deepEqual(child.refs("already_handed"), [ref()]);
+	assert.deepEqual(child.refs("not_handed"), []);
+});
+
+/// Scenario: A busy hand-over passes the gate while an earlier status report holds the report queue, and the deck revokes the attempt before the queue moves. The transform has already gone back to Pi, so the revoke is answered already_handed.
+test("pi_032 h a revoke while a report holds the queue", async (t) => {
+	const { child } = await behindAHeldReport(t, async (_pi, child) => {
+		child.say({ revoke: [ref()] });
+	});
+	assert.deepEqual(child.refs("already_handed"), [ref()]);
+	assert.deepEqual(child.refs("not_handed"), []);
+});
+
+/// Scenario: A busy hand-over passes the gate while an earlier status report holds the report queue, and the watcher restarts and registers again before the queue moves. The new watcher is told the attempt was handed and hears it retained, never not handed.
+test("pi_032 i a rebind while a report holds the queue", async (t) => {
+	await behindAHeldReport(t, async (_pi, child) => {
+		child.exit(1);
+		t.mock.timers.tick(1000);
+		watcher().register(8, { resume: [ref()] });
+		await settle();
+	});
+	assert.deepEqual(watcher().sent("resume_answers").flat().map((r: any) => r.answer), ["retained"]);
+	assert.deepEqual(watcher().refs("handed"), [ref()]);
+	assert.deepEqual(watcher().refs("not_handed"), []);
+});
+
+/// Scenario: A busy hand-over passes the gate while an earlier status report holds the report queue, and its approval ages past its validity before the queue moves. The hand-over was decided under a fresh approval, so the attempt stays handed and its later start commits it.
+test("pi_032 j an approval expiring while a report holds the queue", async (t) => {
+	const { pi, child } = await behindAHeldReport(t, async () => {
+		const now = performance.now();
+		t.mock.method(performance, "now", () => now + 60000);
+	});
+	await pi.start(ID);
+	assert.deepEqual(child.refs("committed"), [ref()]);
+	assert.deepEqual(child.refs("not_handed"), []);
 });
 
 /// Scenario: Pi runs the gate inside sendUserMessage, as it does for an idle agent, and a callback throws synchronously. The inline gate passes the hand-over recorded before the call, and a throwing sendUserMessage is reported not handed without crashing Pi.

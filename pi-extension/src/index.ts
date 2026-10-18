@@ -119,7 +119,7 @@ inboxBinary(() => (isAbsoluteOverride(deckBin, process.platform) ? deckBin : und
  * Bumped whenever this file's inbox code changes: a reload that evaluates a
  * different version replaces the process's receiver (`replaceVersion`).
  */
-const INBOX_VERSION = 1;
+const INBOX_VERSION = 2;
 /**
  * The shape of what a replacement carries over (`Transfer`). Bumped only when
  * that shape changes; a replacement across a different one carries nothing.
@@ -196,9 +196,9 @@ interface InboxProcess {
 	tagPrefix: string;
 	/** Runs Pi started (`agent_start`), to date hand-overs. */
 	runs: number;
-	/** One hand-over at a time, in the order the deck handed them out. */
-	chain: Promise<void>;
-	/** Every status report, across instances, in the order Pi emitted them. */
+	/** `pending` is being handed over, one attempt at a time, oldest first (`pump`). */
+	pumping: boolean;
+	/** Every status report, across instances, in the order the handlers queued them. */
 	reportQueue: <T>(task: () => Promise<T>) => Promise<T>;
 	rechecks: Map<string, ReturnType<typeof setTimeout>>;
 	/** The instance a `reload` shut down, whose passed attempts its successor takes over. */
@@ -223,6 +223,8 @@ interface Transfer {
 	nextTag: number;
 	tagPrefix: string;
 	runs: number;
+	reloadedFrom: number | undefined;
+	reportQueue: InboxProcess["reportQueue"] | undefined;
 }
 
 const INBOX_PROCESS = Symbol.for("dot-agent-deck.pi-receiver");
@@ -330,67 +332,78 @@ function armRecheck(proc: InboxProcess, key: string): void {
 	proc.rechecks.set(key, timer);
 }
 
-/** The receiver handed out `message`: hand it to the current session, or keep it until one starts. */
+/**
+ * The receiver handed out `message`: it joins `pending`, which is handed to
+ * the current session in order, or kept until one starts. A disposed process
+ * keeps it there for the replacement that carries `pending` (§0.5).
+ */
 function deliver(proc: InboxProcess, message: InboxMessage): void {
-	if (proc.disposed) {
-		return;
-	}
 	const key = inboxKey(message as InboxRef);
 	if (proc.sent.has(key) || proc.passed.has(key) || proc.committed.has(key)) {
-		// One native call per attempt; a marked repeat is a new attempt.
+		// Its hand-over is under way or over; a marked repeat is a new attempt.
 		return;
 	}
 	if (proc.pending.some((held) => inboxKey(held as InboxRef) === key)) {
 		return;
 	}
-	if (proc.current === undefined) {
-		proc.pending.push(message);
+	proc.pending.push(message);
+	pump(proc);
+}
+
+/**
+ * Hand `pending` to the current session, oldest first, one attempt at a time.
+ * It stops while nothing can be handed over — the process disposed, no
+ * session current, no watcher registered — and a session start or a
+ * registration starts it again. The attempt in hand stays at the head of
+ * `pending` until it is sent or refused, so a session swap, a watcher restart
+ * or a version replacement during its approval finds it there, uncalled.
+ */
+function pump(proc: InboxProcess): void {
+	if (proc.pumping) {
 		return;
 	}
-	enqueue(proc, message);
-}
-
-function enqueue(proc: InboxProcess, message: InboxMessage): void {
-	proc.chain = proc.chain.then(() => handOver(proc, message)).catch(() => undefined);
-}
-
-/** Hand everything held while no session was current to the current one, in order. */
-function drainPending(proc: InboxProcess): void {
-	for (const message of proc.pending.splice(0)) {
-		enqueue(proc, message);
-	}
+	proc.pumping = true;
+	void (async () => {
+		try {
+			while (!proc.disposed && proc.current !== undefined && proc.receiver.rx() !== undefined && proc.pending.length > 0) {
+				const message = proc.pending[0];
+				if (await handOver(proc, message)) {
+					const at = proc.pending.indexOf(message);
+					if (at >= 0) {
+						proc.pending.splice(at, 1);
+					}
+				}
+			}
+		} catch {
+			// Never let a hand-over throw into Pi.
+		} finally {
+			proc.pumping = false;
+		}
+	})();
 }
 
 /**
  * Hand one attempt to the current session behind the final hand-over check:
  * the deck's approval, then — with no await before `sendUserMessage` — the
- * session that asked is still current, the process is not disposed, and the
- * receiver's own check. A session replaced meanwhile gets the attempt back at
- * the front of `pending`, uncalled, for its successor's fresh check.
+ * session that asked is still current, the process is not disposed, the
+ * watcher that gave the approval still runs, and the receiver's own check.
+ * Whether the attempt is done with: sent, or refused (a positive not-handed).
+ * One asked of a session, a watcher or a process that is gone was not
+ * refused: it stays in `pending`, uncalled, for a fresh check.
  */
-async function handOver(proc: InboxProcess, message: InboxMessage): Promise<void> {
+async function handOver(proc: InboxProcess, message: InboxMessage): Promise<boolean> {
 	const ref = inboxRef(message as InboxRef);
 	const key = inboxKey(ref);
 	const token = proc.current?.token;
+	const epoch = proc.receiver.epoch();
 	if (token === undefined) {
-		proc.pending.unshift(message);
-		return;
+		return false;
 	}
-	let granted = await proc.receiver.may(ref);
-	if (granted !== undefined && granted.epoch !== proc.receiver.epoch()) {
-		granted = await proc.receiver.may(ref);
-	}
+	const granted = await proc.receiver.may(ref);
 	// No await from here to the call.
-	if (proc.disposed) {
-		return;
-	}
 	const current = proc.current;
-	if (current?.token !== token) {
-		proc.pending.unshift(message);
-		if (current !== undefined) {
-			drainPending(proc);
-		}
-		return;
+	if (proc.disposed || current?.token !== token || proc.receiver.epoch() !== epoch) {
+		return false;
 	}
 	let ready = false;
 	try {
@@ -400,7 +413,7 @@ async function handOver(proc: InboxProcess, message: InboxMessage): Promise<void
 	}
 	if (!ready) {
 		refuse(proc, ref);
-		return;
+		return true;
 	}
 	proc.nextTag += 1;
 	const tag = `${proc.tagPrefix}.${proc.nextTag}`;
@@ -415,11 +428,12 @@ async function handOver(proc: InboxProcess, message: InboxMessage): Promise<void
 		// A synchronous throw (a stale `pi`): nothing reached Pi.
 		proc.sent.delete(key);
 		refuse(proc, ref);
-		return;
+		return true;
 	}
 	if (proc.sent.has(key)) {
 		armRecheck(proc, key);
 	}
+	return true;
 }
 
 /**
@@ -542,13 +556,31 @@ async function doorbell(proc: InboxProcess, instance: Instance, ids: string[], s
 }
 
 /**
+ * Whether `instance` witnesses a commit in `proc`: it has not shut down, and
+ * it is `proc`'s current session; or its `session_start` waits on a version
+ * replacement while no session is current there — the reload's successor,
+ * the one session Pi runs then (§0.5). A commit never comes from a change of
+ * session.
+ */
+function witness(proc: InboxProcess, instance: Instance): boolean {
+	if (instance.shutdown) {
+		return false;
+	}
+	if (instance.proc === proc) {
+		return !proc.disposed && instance.token !== undefined && proc.current?.token === instance.token;
+	}
+	return instance.proc === undefined && instance.starting && proc.current === undefined && proc.stateVersion === INBOX_STATE_VERSION;
+}
+
+/**
  * Pi committed `message` (`message_start`): every attempt of each deck id a
  * user message carries that passed a hand-over point, or that was sent and
- * reached Pi around the gate, is committed. Only a current instance that has
- * not shut down is a witness; a commit never comes from a change of session.
+ * reached Pi around the gate, is committed, when `instance` is a witness.
+ * One made while a replacement drains `proc` is kept by its receiver as an
+ * unsent report and carried to the successor, whose watcher publishes it.
  */
 function commit(proc: InboxProcess, instance: Instance, message: unknown): void {
-	if (proc.disposed || instance.shutdown || instance.token === undefined || proc.current?.token !== instance.token) {
+	if (!witness(proc, instance)) {
 		return;
 	}
 	const refs: InboxRef[] = [];
@@ -647,6 +679,14 @@ interface Instance {
 	token: number | undefined;
 	/** Its `session_shutdown` ran: no longer current, and no longer a witness. */
 	shutdown: boolean;
+	/**
+	 * The process's receiver it uses, bound at its `session_start`: a delayed
+	 * callback of this instance keeps acting on that one, never on a receiver
+	 * a later version put in its place.
+	 */
+	proc: InboxProcess | undefined;
+	/** Its `session_start` is waiting for the process's receiver (a version replacement). */
+	starting: boolean;
 }
 
 /** A session started in `instance`: it becomes the current one and is handed what waited. */
@@ -665,7 +705,7 @@ function sessionStart(proc: InboxProcess, instance: Instance, pi: ExtensionAPI, 
 	proc.reloadedFrom = undefined;
 	proc.current = { token: instance.token, pi, ctx };
 	proc.receiver.ensure();
-	drainPending(proc);
+	pump(proc);
 }
 
 /**
@@ -673,7 +713,8 @@ function sessionStart(proc: InboxProcess, instance: Instance, pi: ExtensionAPI, 
  * queue with the session (PRD #1666 §0.7), so what this instance passed and
  * Pi has not committed is released `lost` — possibly handed, never not handed
  * — and what it sent that the gate has not seen goes back, uncalled, to the
- * front of `pending` for the successor. A reload keeps the agent and its
+ * front of `pending` for the successor, which submits it again under a new
+ * tag (the old one is consumed at any gate). A reload keeps the agent and its
  * queue, so it releases nothing. The watcher is left running either way.
  */
 function sessionShutdown(proc: InboxProcess, instance: Instance, reason: unknown): void {
@@ -704,6 +745,23 @@ function sessionShutdown(proc: InboxProcess, instance: Instance, reason: unknown
 }
 
 /**
+ * Whether `instance` still reports `eventName` (§0.3): only while it is its
+ * process's current session, so a stale Thinking never claims a turn for a
+ * successor. Its own `session_shutdown` is reported while no session is
+ * current — in Pi's order, ahead of its successor's first report — and
+ * dropped once a successor is current, here or in a replacement's receiver:
+ * a delayed shutdown's Idle would land after the successor's Thinking and
+ * end its turn. The successor's own `session_start` reports Idle.
+ */
+function reporting(proc: InboxProcess, instance: Instance, eventName: string): boolean {
+	if (eventName !== "session_shutdown") {
+		return instance.token !== undefined && proc.current?.token === instance.token;
+	}
+	const latest = holder[INBOX_PROCESS] as { current?: { token?: unknown } } | undefined;
+	return [proc.current, latest?.current].every((current) => current === undefined || current.token === instance.token);
+}
+
+/**
  * A fresh process state, carrying `transfer` from a replaced one when there is
  * one. A replacement registers `--resumed`, so the deck asks about the
  * attempts the old receiver held; with nothing transferred, the new one
@@ -726,10 +784,13 @@ function createProcess(transfer?: Transfer, replaced = false): InboxProcess {
 		nextTag: transfer?.nextTag ?? 0,
 		tagPrefix: transfer?.tagPrefix ?? (Math.random().toString(36).slice(2, 10) || "0"),
 		runs: transfer?.runs ?? 0,
-		chain: Promise.resolve(),
-		reportQueue: createSerialQueue(),
+		pumping: false,
+		// The outgoing receiver's queue, so its instances' last reports and
+		// this one's stay in Pi's order.
+		reportQueue: transfer?.reportQueue ?? createSerialQueue(),
 		rechecks: new Map(),
-		reloadedFrom: undefined,
+		// A reload's successor takes over what the reloaded instance passed.
+		reloadedFrom: transfer?.reloadedFrom,
 		replacing: undefined,
 		disposed: false,
 		notInDeck: false,
@@ -743,6 +804,7 @@ function createProcess(transfer?: Transfer, replaced = false): InboxProcess {
 				proc.notInDeck = true;
 			}
 		},
+		registered: () => pump(proc),
 		state: (transfer?.receiver as InboxReceiverState | undefined) ?? (replaced ? { forgot: true } : undefined),
 	});
 	// What a sent attempt the old receiver never saw at the gate waits for now.
@@ -781,12 +843,16 @@ function inboxProcess(): InboxProcess {
 /**
  * PRD #1666 §0.5: the process's receiver came from a different version of this
  * file (a reload after the extension was refreshed). It is disposed at once —
- * it delivers nothing more and requests no grant, but answers revokes and
- * resumes from what it holds — and its watcher drained, awaited, so the two
- * never publish side by side. Then a new receiver starts: holding the old
- * one's attempts, reports and gate records when their shape is this
- * version's, so it answers the deck's resumes `retained`; holding nothing
- * otherwise, so the deck hears `unknown` — possibly handed, never not handed.
+ * it hands nothing more to Pi and requests no grant — and its watcher
+ * drained, awaited, so the two never publish side by side. While it drains,
+ * the outgoing receiver still reads its watcher (as that version's code
+ * does): a message is held and joins `pending`, a revoke is answered in its
+ * state, and a commit is kept as an unsent report. Then a new receiver
+ * starts, holding the old one's attempts, `pending`, reports, gate records
+ * and the reload's ownership of what passed when their shape is this
+ * version's: it answers the deck's resumes `retained`, hands `pending` to
+ * the successor and publishes the kept reports once it registers. Holding
+ * nothing otherwise, it answers `unknown` — possibly handed, never not handed.
  * One replacement serves every instance that asks while it runs.
  */
 async function replaceVersion(): Promise<InboxProcess> {
@@ -828,6 +894,8 @@ async function replaceVersion(): Promise<InboxProcess> {
 					nextTag: old.nextTag ?? 0,
 					tagPrefix: old.tagPrefix ?? "0",
 					runs: old.runs ?? 0,
+					reloadedFrom: old.reloadedFrom,
+					reportQueue: old.reportQueue,
 				};
 				for (const timer of old.rechecks?.values() ?? []) {
 					clearTimeout(timer);
@@ -911,10 +979,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	});
 
 	// --- PRD #1666: this instance of the extension -------------------------
-	// The process's receiver it uses, bound at its session_start: a delayed
-	// callback of this instance keeps acting on that one, never on a receiver
-	// a later version put in its place.
-	const instance: Instance & { proc: InboxProcess | undefined } = { token: undefined, shutdown: false, proc: undefined };
+	const instance: Instance = { token: undefined, shutdown: false, proc: undefined, starting: false };
 	/** Keep the current session's context fresh for the receiver's questions to Pi. */
 	const seen = (ctx: ExtensionContext): void => {
 		const current = instance.proc?.current;
@@ -944,15 +1009,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	const replies = createTurnReplyTracker();
 	// PRD #1666 §0.3: every instance in the process reports through one queue,
 	// each report with its retries run to completion before the next, so the
-	// deck receives them in the order Pi emitted them, across a session
-	// replacement too. An instance that is no longer current reports nothing
-	// but its own session_shutdown, which is queued before its successor's
-	// first report: a stale Thinking can never claim a turn for the successor.
+	// deck receives them in the order the handlers queued them, across a
+	// session replacement too; `reporting` decides which are sent.
 	const report = (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> => {
 		replies.observe(eventName, event);
 		const reply = eventName === "agent_settled" ? replies.take() : undefined;
 		const proc = instance.proc;
-		if (proc === undefined || (eventName !== "session_shutdown" && proc.current?.token !== instance.token)) {
+		if (proc === undefined || !reporting(proc, instance, eventName)) {
 			return Promise.resolve();
 		}
 		return proc.reportQueue(async () => {
@@ -994,7 +1057,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			// pane awaiting its first prompt is idle, matching every other
 			// backend's session-start).
 			wrapDialogs(ctx);
-			const proc = await replaceVersion();
+			instance.starting = true;
+			let proc: InboxProcess;
+			try {
+				proc = await replaceVersion();
+			} finally {
+				instance.starting = false;
+			}
 			instance.proc = proc;
 			sessionStart(proc, instance, pi, ctx, (event as { reason?: unknown } | undefined)?.reason);
 			try {
@@ -1045,27 +1114,43 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		if (answer?.action === "handled") {
 			return answer;
 		}
+		if (answer !== undefined) {
+			// R1-01: the gate's transform goes back to Pi with no await after
+			// its fence, so nothing the handler waits for can outlive the
+			// session or the approval it checked. The hand-over's own report
+			// is queued here, in Pi's order, and not waited for.
+			try {
+				seen(ctx);
+				void report("input", { ...event, text: answer.text }, ctx).catch(() => undefined);
+			} catch {
+				// Reporting never stops a hand-over.
+			}
+			return answer;
+		}
 		return guarded(async () => {
 			seen(ctx);
 			const proc = instance.proc;
 			const input = event as { text?: unknown; source?: unknown };
-			if (answer === undefined && proc !== undefined && input.source !== "extension") {
+			if (proc !== undefined && input.source !== "extension") {
 				const ids = doorbellIdsIn(input.text);
 				if (ids.length > 0) {
 					return doorbell(proc, instance, ids, ctx.signal);
 				}
 			}
-			await report("input", answer ? { ...event, text: answer.text } : event, ctx);
-			return answer;
+			await report("input", event, ctx);
+			return undefined;
 		})(event, ctx);
 	});
 	// PRD #1666 §2.4: the user message carrying deck messages started — their
-	// commit.
+	// commit. While this instance's session_start waits on a version
+	// replacement, the receiver it waits on (the draining one, then its
+	// successor) is the one that keeps it.
 	pi.on(
 		"message_start",
 		guarded((event) => {
-			if (instance.proc !== undefined) {
-				commit(instance.proc, instance, event.message);
+			const proc = instance.proc ?? (instance.starting ? (holder[INBOX_PROCESS] as InboxProcess | undefined) : undefined);
+			if (proc !== undefined) {
+				commit(proc, instance, event.message);
 			}
 		}),
 	);
