@@ -97,3 +97,5 @@ The p90-to-max spread is worth reading before planning around the median: a queu
 ## Where an agent is told this
 
 CLAUDE.md rule 5 carries the short version, next to the three tiers, because that is where a reader asks what they owe and on which machine. The three dispatch skills — [`issue-queue`](../../.claude/skills/issue-queue/SKILL.md), [`prd-queue`](../../.claude/skills/prd-queue/SKILL.md) and [`pr-review-queue`](../../.claude/skills/pr-review-queue/SKILL.md) — put a line in the task text they compose, so a dispatched unit learns it the same way it learns the gates. What those four carry is the relieves-nothing framing, the *when*, and the one or two numbers that make the case; the mechanism, the samples behind the numbers and the narrowings live here, and that is the split to preserve when any of them is edited.
+
+<!-- rwx-eval scenario S2-docs -->
