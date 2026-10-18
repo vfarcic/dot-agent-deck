@@ -3,12 +3,33 @@
 // generator. Regenerate it with
 // DOT_AGENT_DECK_WRITE_PI_RECEIVER=1 cargo test-fast pi_006
 import { spawn } from "node:child_process";
+import { accessSync, constants, statSync } from "node:fs";
 
 // The deck binary the watcher runs, resolved at each spawn; `inboxBinary`
-// sets how. Until it is set the spawn fails and the receiver retries on its
-// backoff, rather than running a bare name from the agent's PATH.
+// sets how. Only an absolute path to an executable file is run. Anything
+// else the resolver gives (nothing, a bare name the agent's PATH would look
+// up, a path relative to its working directory, a missing or non-executable
+// file) fails the spawn at once, so no watcher registers and nothing is
+// handed over, and the receiver tries again on its backoff. A spawn Node
+// fails later instead (a missing file) would report no exit, and the
+// receiver would not try again.
 let inboxBinaryOf = () => undefined;
-const hookBinary = () => inboxBinaryOf();
+const inboxAbsolute = (path) =>
+  process.platform === "win32" ? /^([A-Za-z]:[\\/]|[\\/]{2})/.test(path) : path.startsWith("/");
+const inboxRunnable = (path) => {
+  if (typeof path !== "string" || !inboxAbsolute(path)) return false;
+  try {
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch (_) {
+    return false;
+  }
+};
+const hookBinary = () => {
+  const path = inboxBinaryOf();
+  return inboxRunnable(path) ? path : undefined;
+};
 const INBOX_ADAPTER_INTEGRATION = 2;
 const INBOX_MAX_CALLED = 4096;
 const INBOX_GRANT_TIMEOUT_MS = 5000;

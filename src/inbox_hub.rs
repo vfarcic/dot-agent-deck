@@ -2533,6 +2533,24 @@ impl InboxHub {
         self.changed.notify_one();
     }
 
+    /// PRD #1666 G3 (R2-05): a spawn reserved as `agent_id` in `pane_id`
+    /// reported a turn and was then given up without publishing. Its turn
+    /// clock goes, and its key is remembered so a delayed edge cannot bring
+    /// it back, as at an exit.
+    pub fn turns_abandoned(&self, pane_id: &str, agent_id: &str) {
+        let mut st = self.lock();
+        engine::forget_turns(&mut st, &(pane_id.to_string(), agent_id.to_string()));
+    }
+
+    /// Whether the inbox keeps a turn clock for `agent_id` in `pane_id`.
+    #[cfg(test)]
+    pub(crate) fn has_turn_clock(&self, pane_id: &str, agent_id: &str) -> bool {
+        self.lock()
+            .receipts
+            .turns
+            .contains_key(&(pane_id.to_string(), agent_id.to_string()))
+    }
+
     /// PRD #1666 §11: the capability probe proved `agent_id`'s CLI rejects
     /// the integration flag. Its mail waits queued, its doorbell is silent
     /// and its card says to upgrade.

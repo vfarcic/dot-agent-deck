@@ -37,14 +37,15 @@ pub const ENV_PI_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 
 /// The embedded extension files, as `(filename, contents)` pairs.
 ///
-/// Only the files Pi needs to load the extension are embedded:
+/// The files materialized beside the entry point:
 ///   - `index.ts`           — the Pi-API glue (default-export factory),
 ///   - `orchestrator.ts`    — the pure logic it imports via `./orchestrator.ts`,
 ///     and
 ///   - `inbox-receiver.js`  — the deck's inbox receiver, generated from
 ///     `src/inbox_receiver.js` ([`crate::inbox_receiver::pi_module`]; PRD
-///     #1666). Its `.d.ts` is for the extension's type check only, so Pi does
-///     not need it.
+///     #1666), staged for the switch to the receipt stream: `index.ts` does
+///     not import it yet. Its `.d.ts` is for the extension's type check only
+///     and is not materialized.
 ///
 /// A `package.json` is intentionally **not** embedded: the subdirectory
 /// `index.ts` discovery layout does not require one: the extension's one
@@ -1009,6 +1010,50 @@ mod tests {
     /// file and exec bits are not consulted.
     #[cfg(not(unix))]
     fn set_mode(_path: &Path, _mode: u32) {}
+
+    /// Runs the tests of the extension's Node file `file` whose name starts
+    /// with `pin`, and fails unless at least one ran and none failed. Prints
+    /// `SKIP:` and passes without a Node that strips TypeScript types (23.6+).
+    fn node_pin(file: &str, pin: &str) {
+        let Ok(node) = std::process::Command::new("node").arg("--version").output() else {
+            eprintln!("SKIP: node is not available for {file} {pin}");
+            return;
+        };
+        let version = String::from_utf8_lossy(&node.stdout);
+        let mut parts = version.trim().trim_start_matches('v').split('.');
+        let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        if (major, minor) < (23, 6) {
+            eprintln!("SKIP: node {version} cannot strip TypeScript types");
+            return;
+        }
+        let out = std::process::Command::new("node")
+            .arg("--test")
+            .arg("--test-reporter=tap")
+            .arg(format!("--test-name-pattern=^{pin} "))
+            .arg(file)
+            .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("pi-extension"))
+            .output()
+            .expect("run node --test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let passed = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("# pass "))
+            .and_then(|n| n.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        assert!(
+            out.status.success() && passed > 0,
+            "{file} {pin}: {passed} passed\n{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Scenario: The generated receiver is given a resolver for the deck binary that returns a bare name a stand-in on the agent's PATH answers to, a relative path, nothing, a missing file or a non-executable file, and none of them runs: no watcher starts, nothing is delivered and the receiver tries again on its backoff. An absolute path to an executable, with spaces in it, does run.
+    #[spec("inbox/pi/031")]
+    #[test]
+    fn pi_031_the_receiver_runs_only_an_absolute_executable() {
+        node_pin("test/inbox-receiver.test.ts", "pi_031");
+    }
 
     /// The extension's own Node suites — its inbox delivery and
     /// acknowledgement (`inbox.test.ts`) and its orchestrator helpers

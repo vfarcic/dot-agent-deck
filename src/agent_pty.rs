@@ -6638,6 +6638,18 @@ struct RegistryInner {
     /// first turn reported that early would have no busy edge for its Idle to
     /// end. Removed with the reservation on both its release paths.
     pending_busy: HashSet<String>,
+    /// PRD #1666 G3: spawns in [`Self::pending_spawns`] whose turn edge
+    /// [`AgentPtyRegistry::note_turn`] accepted, by pre-allocated agent id,
+    /// with their pane: the inbox's turn clock may hold an entry for each.
+    /// Publication hands the entry to the agent, whose exit removes it; a
+    /// reservation given up without publishing moves its pane and id to
+    /// [`Self::abandoned_turns`].
+    pending_turned: HashMap<String, String>,
+    /// PRD #1666 G3 (R2-05): `(pane, agent id)` of reservations given up
+    /// after reporting a turn, whose clock entry
+    /// [`AgentPtyRegistry::release_abandoned_turns`] removes once this lock
+    /// is released (the inbox hub is never called under it).
+    abandoned_turns: Vec<(String, String)>,
     /// PRD #1666 G3: the number of the last turn edge
     /// [`AgentPtyRegistry::note_turn`] accepted ([`TurnSeen::seq`]).
     turn_seq: u64,
@@ -6761,6 +6773,9 @@ impl<'a> SpawnReservation<'a> {
         {
             self.prior_binding = None;
         }
+        if let Some(id) = &self.id {
+            inner.pending_turned.remove(id);
+        }
         self.give_up(inner);
     }
 
@@ -6776,6 +6791,9 @@ impl<'a> SpawnReservation<'a> {
             inner.pending_hook_tokens.remove(&id);
             inner.pending_spawn_dirs.remove(&id);
             inner.pending_busy.remove(&id);
+            if let Some(pane) = inner.pending_turned.remove(&id) {
+                inner.abandoned_turns.push((pane, id));
+            }
         }
         #[cfg(unix)]
         if let Some((pane, prior)) = self.prior_binding.take() {
@@ -6804,7 +6822,19 @@ impl Drop for SpawnReservation<'_> {
             if let Ok(mut inner) = self.registry.inner.lock() {
                 self.give_up(&mut inner);
             }
+            self.registry.release_abandoned_turns();
         }
+    }
+}
+
+/// PRD #1666 G3 (R2-05): runs [`AgentPtyRegistry::release_abandoned_turns`]
+/// when dropped. Declared before a scope takes the registry lock, so it is
+/// dropped after that guard and calls the inbox hub with the lock released.
+struct ReleaseAbandonedTurns<'a>(&'a AgentPtyRegistry);
+
+impl Drop for ReleaseAbandonedTurns<'_> {
+    fn drop(&mut self) {
+        self.0.release_abandoned_turns();
     }
 }
 
@@ -7151,6 +7181,8 @@ impl AgentPtyRegistry {
                 pending_hook_tokens: HashMap::new(),
                 pending_spawn_dirs: HashMap::new(),
                 pending_busy: HashSet::new(),
+                pending_turned: HashMap::new(),
+                abandoned_turns: Vec::new(),
                 turn_seq: 0,
                 removal_holds: Vec::new(),
                 closing_instances: HashSet::new(),
@@ -9117,6 +9149,9 @@ impl AgentPtyRegistry {
                     TurnEdge::Started => inner.pending_busy.insert(agent_id.to_string()),
                     TurnEdge::Ended => inner.pending_busy.remove(agent_id),
                 };
+                inner
+                    .pending_turned
+                    .insert(agent_id.to_string(), pane_id_env.to_string());
             }
         }
         inner.turn_seq += 1;
@@ -9124,6 +9159,23 @@ impl AgentPtyRegistry {
             seq: inner.turn_seq,
             edge,
         })
+    }
+
+    /// PRD #1666 G3 (R2-05): remove the inbox turn clock of every reservation
+    /// given up after reporting a turn ([`RegistryInner::abandoned_turns`]),
+    /// so a start that never publishes leaves no clock for the rest of the
+    /// daemon's run. Takes the registry lock only to collect them, and calls
+    /// the hub after releasing it.
+    fn release_abandoned_turns(&self) {
+        let abandoned = match self.inner.lock() {
+            Ok(mut inner) => std::mem::take(&mut inner.abandoned_turns),
+            Err(_) => return,
+        };
+        if let Some(hub) = self.inbox.get() {
+            for (pane, agent) in abandoned {
+                hub.turns_abandoned(&pane, &agent);
+            }
+        }
     }
 
     /// Issue #525: how long a guarded delivery waits on one PTY write.
@@ -9848,6 +9900,10 @@ impl AgentPtyRegistry {
         // daemon forked this process, never derived from an event and never
         // recomputed; see [`RunningAgent::spawned_at`].
         let spawned_at = chrono::Utc::now();
+        // PRD #1666 G3 (R2-05): dropped after `inner`, so a refusal below
+        // removes the turn clock of a reservation that reported a turn once
+        // the lock is released.
+        let _abandoned_turns = ReleaseAbandonedTurns(self);
         let mut inner = self.inner.lock().unwrap();
         // Issue #454: hand ownership over from the reservation to `agents`
         // WITHOUT releasing the lock in between — each early return below gives
@@ -15549,6 +15605,7 @@ mod tests {
 mod spawn_tests {
     use super::*;
     use crate::event::OrchestrationSurfaceRole;
+    use spec::spec;
     use std::time::Duration;
 
     // ---------------------------------------------------------------------
@@ -23397,6 +23454,68 @@ mod spawn_tests {
             .unwrap()
             .block_on(registry.freeze_admission())
             .expect("no respawn is in flight")
+    }
+
+    /// Scenario: A spawn reserved on a pane is parked after its child is forked, and its agent reports a turn starting, which reaches the inbox's turn clock. The start is then refused, once by a restart's reservation and once by the daemon shutting down, and the clock entry goes with it, a later edge included; a start that publishes keeps it.
+    #[spec("inbox/attempts/027")]
+    #[cfg(unix)]
+    #[test]
+    fn attempts_027_a_reservation_given_up_after_a_turn_leaves_no_turn_clock() {
+        for refusal in ["restart", "shutdown", "none"] {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let hub = Arc::clone(registry.inbox());
+            let pane = "pane-027";
+            let (reached, release) = registry.pause_next_publish_for_test();
+            let in_flight = {
+                let registry = registry.clone();
+                std::thread::spawn(move || {
+                    registry.spawn_agent(SpawnOptions {
+                        command: Some("cat"),
+                        env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                        ..SpawnOptions::default()
+                    })
+                })
+            };
+            reached
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the spawn forked its child");
+            let id = registry
+                .inner
+                .lock()
+                .unwrap()
+                .pending_spawns
+                .keys()
+                .next()
+                .cloned()
+                .expect("the reservation");
+            let seen = registry
+                .note_turn(pane, &id, TurnEdge::Started)
+                .expect("kept for the reservation");
+            hub.note_turn(pane, &id, seen, std::time::Instant::now());
+            assert!(hub.has_turn_clock(pane, &id), "{refusal}");
+            let freeze = (refusal == "restart").then(|| freeze_now(&registry));
+            if refusal == "shutdown" {
+                registry.shutting_down.store(true, Ordering::SeqCst);
+            }
+            release.send(()).unwrap();
+            let published = in_flight.join().unwrap().is_ok();
+            assert_eq!(published, refusal == "none", "{refusal}");
+            assert_eq!(
+                hub.has_turn_clock(pane, &id),
+                published,
+                "{refusal}: only a published agent keeps the clock"
+            );
+            if !published {
+                let late = TurnSeen {
+                    seq: seen.seq + 1,
+                    edge: TurnEdge::Ended,
+                };
+                hub.note_turn(pane, &id, late, std::time::Instant::now());
+                assert!(!hub.has_turn_clock(pane, &id), "{refusal}: a late edge");
+            }
+            drop(freeze);
+            registry.shutdown_all();
+        }
     }
 
     /// Scenario: a restart's reservation (PRD #1487 audit A2). A spawn whose

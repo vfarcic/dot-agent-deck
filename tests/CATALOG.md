@@ -7981,6 +7981,34 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Does not assert:** the clients' rendering (inbox/status/023, inbox/status/024).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/attempts/024 — The not-started window starts at the first reported possession, not the issue.
+- **Layer:** L1 unit (src/inbox_attempts.rs, injected time and turn view).
+- **Agent:** none.
+- **Asserts:** an attempt issued at t and first reported held at t+60 s becomes due at t+60 s plus the window and shows the row then, not before; with a window shorter than the issue grace, an issued attempt no receiver reported holding arms nothing.
+- **Does not assert:** the hub's turn clock (inbox/attempts/022).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/025 — After Retry the window starts at the repeat's own possession.
+- **Layer:** L1 unit (src/inbox_attempts.rs, injected time and turn view).
+- **Agent:** none.
+- **Asserts:** Retry on a raised row while the earlier copy is still reported held arms no window; the manual repeat, issued later and first reported held later still, is due one window after that report.
+- **Does not assert:** the clients' Retry press (inbox/status/024).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/026 — Possession regained after Uncertain starts a new window.
+- **Layer:** L1 unit (src/inbox_attempts.rs, injected time and turn view).
+- **Agent:** none.
+- **Asserts:** a Pi attempt that drops out of the possession reports, becomes `Uncertain(Lapsed)` with no repeat, and is then reported held again is Attempting with no row at once and due one window after the regained possession.
+- **Does not assert:** an automatic repeat's window (the lapse rules in inbox/attempts/001–019).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/027 — A reservation given up after reporting a turn leaves no turn clock.
+- **Layer:** L1 unit (src/agent_pty.rs, a parked real `cat` spawn and the registry's inbox hub).
+- **Agent:** none.
+- **Asserts:** a turn edge kept for a reserved spawn creates a clock entry; refusing the start through a restart's reservation (the reservation's drop) or the daemon's shutdown (the locked give-up) removes it and a later edge does not restore it; a start that publishes keeps it.
+- **Does not assert:** the daemon's ingest forwarding the edge (inbox/attempts/022).
+- **Platform coverage:** mac+linux.
+
 #### inbox/receipt
 
 The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the daemon's locked instance namespace under `<state_dir>/inbox-spool`, trusted one-component-at-a-time traversal from the state-directory anchor, immutable `Handed`/`Committed` bearer records, bounded resumable scans streamed to the cap-based evidence store, the exact lookup before absence, and the resumable sibling reaper, plus `platform::lock::try_lock_file`. It is library-only: nothing in the daemon calls it yet, records are published and read, nothing is pruned and no suppression decision is drawn from them.
@@ -8930,6 +8958,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Asserts:** the cursor's row explains in full that Retry may make the agent get the message twice, with Retry and Cancel offered; `r` and `c` send Retry and Cancel at the row's revision; the deck's answer to a Retry whose row a started turn withdrew renders as the shared "no longer needs a decision" words.
 - **Does not assert:** the daemon refusing that Retry (inbox/attempts/021).
 - **Platform coverage:** all.
+
+##### inbox/status/025 — The picker shows what Retry does before Retry, in any layout.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`, `TestBackend` + `insta`, and the production key funnel).
+- **Agent:** none.
+- **Asserts:** with the cursor on a not-started message among five at 100×16, ten at 100×24 and three at 50 columns, its whole explanation, the possible duplicate included, is on screen with the other messages windowed around it and Retry offered; in a picker too short for the explanation, `r` sends nothing and the picker says to make the window taller, and at a taller size `r` sends Retry at the row's revision.
+- **Does not assert:** the desktop tile (its list scrolls and shows each reason whole; vitest `InboxAttention`).
+- **Platform coverage:** mac+linux+windows.
 
 #### inbox/claude
 
@@ -10354,6 +10389,14 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** that Pi's extension uses the receiver (nothing imports it yet), or any receiver behaviour (the OpenCode receiver tests in `src/opencode_manage.rs` drive the same source).
 - **Platform coverage:** all (the import step prints `SKIP:` without Node).
 - **Cost:** none.
+
+##### inbox/pi/031 — The Pi extension's receiver runs only an absolute path to an executable deck binary.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox-receiver.test.ts` under Node).
+- **Agent:** none; stand-in shell scripts as the deck binary in a temporary directory.
+- **Asserts:** a resolver result that is a bare name found on PATH, a relative path, nothing, a missing file or a non-executable file runs nothing, starts no watcher, delivers nothing and is tried again on the backoff; an absolute path to an executable file containing spaces runs.
+- **Does not assert:** which binary the extension's resolver returns, or the deck's not-armed notice after no watcher registers.
+- **Platform coverage:** unix (skipped on Windows; prints `SKIP:` without Node 23.6+).
+- **Cost:** about two seconds.
 
 #### inbox/publish
 

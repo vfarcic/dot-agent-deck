@@ -328,15 +328,10 @@ fn status_024_the_picker_offers_retry_and_cancel_on_a_message_that_may_not_have_
         .take(60)
         .collect();
     assert!(rendered.contains(&reason), "{rendered}");
-    for said in [
-        "Retry sends it again, so the agent may get it",
-        "twice. Cancel stops",
-    ] {
-        assert!(
-            rendered.contains(said),
-            "the duplicate is said before the press, in full:\n{rendered}"
-        );
-    }
+    assert!(
+        flat(&rendered).contains(words["notStartedReason"].as_str().unwrap()),
+        "the duplicate is said before the press, in full:\n{rendered}"
+    );
     for button in ["retry", "cancel"] {
         assert!(
             rendered.contains(words[button].as_str().unwrap()),
@@ -376,4 +371,104 @@ fn status_024_the_picker_offers_retry_and_cancel_on_a_message_that_may_not_have_
     ));
     let head: String = answer.chars().take(40).collect();
     assert!(rendered.contains(&head), "{rendered}");
+}
+
+/// The picker's text with its border and padding gone and its rows joined by
+/// one space, so a wrapped explanation reads as one sentence.
+fn flat(rendered: &str) -> String {
+    rendered
+        .lines()
+        .map(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Scenario: Open the picker over five deck messages in a 100×16 terminal, over ten in a 100×24 one and over three in a 50-column one, the cursor on one that may not have reached the agent. Its whole explanation, the possible duplicate included, is on screen before Retry in each, with the other messages windowed around it. In a terminal too short for that explanation, `r` sends nothing and the picker asks for a taller window; once it is taller, `r` sends Retry.
+#[spec("inbox/status/025")]
+#[test]
+fn status_025_the_picker_shows_what_retry_does_before_retry_in_any_layout() {
+    let words = words();
+    let reason = words["notStartedReason"].as_str().unwrap();
+    let id = |n: usize| format!("m-k3xzq2ab-0f3c9a71d2e4b{n:03}");
+    let list = |count: usize, at: usize| -> Vec<InboxAttentionItem> {
+        (0..count)
+            .map(|n| {
+                let kind = if n == at {
+                    AttentionKind::NotStarted
+                } else {
+                    AttentionKind::Uncertain
+                };
+                item(&id(n), kind, 4)
+            })
+            .collect()
+    };
+    for (count, at, width, height) in [
+        (5, 2, 100, 16),
+        (5, 4, 100, 16),
+        (10, 6, 100, 24),
+        (3, 0, 50, 24),
+    ] {
+        let items = list(count, at);
+        let rendered = text(&render_inbox_attention_overlay_to_buffer(
+            &items, at, None, width, height,
+        ));
+        assert!(
+            flat(&rendered).contains(reason),
+            "{count} items at {width}×{height}: the cursor's whole explanation is shown:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "▸ the orchestrator · review {}",
+                &id(at)[id(at).len() - 3..]
+            )),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[Retry r]"), "{rendered}");
+        if (count, at) == (5, 2) {
+            insta::assert_snapshot!("status_025_crowded", rendered);
+        }
+        if width == 50 {
+            insta::assert_snapshot!("status_025_narrow", rendered);
+        }
+    }
+
+    // Too short for the explanation: `r` sends nothing and says why; taller,
+    // it sends Retry at the row's revision.
+    let items = list(1, 0);
+    let state = state_with(&items);
+    let short = inbox_attention_run(
+        &KeybindingConfig::default(),
+        &state,
+        "gen-q",
+        key(KeyCode::Char('i')),
+        &[key(KeyCode::Char('r'))],
+        (60, 8),
+    );
+    assert!(short.open);
+    assert_eq!(short.presses, vec![], "no Retry without its explanation");
+    let rendered = text(short.screen.as_ref().unwrap());
+    assert!(
+        flat(&rendered).contains("make the window taller to see what Retry does"),
+        "{rendered}"
+    );
+    insta::assert_snapshot!("status_025_short", rendered);
+    let tall = inbox_attention_run(
+        &KeybindingConfig::default(),
+        &state,
+        "gen-q",
+        key(KeyCode::Char('i')),
+        &[key(KeyCode::Char('r'))],
+        (60, 20),
+    );
+    assert_eq!(
+        tall.presses,
+        vec![InboxAttentionPress {
+            pane_id: "pane-q".into(),
+            agent_id: "agent-q".into(),
+            message_id: id(0),
+            revision: 4,
+            retry: true,
+        }]
+    );
 }

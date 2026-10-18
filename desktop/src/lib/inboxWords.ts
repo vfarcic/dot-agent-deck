@@ -27,7 +27,7 @@ export const INBOX_WORDS = {
   outOfAttempts: "out of attempts: the deck sent this message as many times as it allows. Cancel it, or post it again.",
   heldLong: "the agent has had a deck message for an hour without confirming it. It may still be working on it.",
   notStarted: "may not have reached the agent",
-  notStartedReason: "the agent has not started any work since it was given this deck message a few minutes ago, so the message may not have reached it. Retry sends it again, so the agent may get it twice. Cancel stops further delivery but cannot take back a copy the agent already has.",
+  notStartedReason: "the agent has been idle for a few minutes and the deck has not seen it start on this deck message, so the message may not have reached it. Retry sends it again, so the agent may get it twice. Cancel stops further delivery but cannot take back a copy the agent already has.",
   retry: "Retry",
   cancel: "Cancel",
   retryLimit: "retry limit reached; Cancel it, or post it again",

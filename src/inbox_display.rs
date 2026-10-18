@@ -52,13 +52,15 @@ pub const UNCERTAIN_REASON: &str = "a deck message may or may not have reached t
 pub const OUT_OF_ATTEMPTS: &str = "out of attempts: the deck sent this message as many times as it allows. Cancel it, or post it again.";
 /// PRD #1666 §6.3: one-shot attention, never a failure.
 pub const HELD_LONG: &str = "the agent has had a deck message for an hour without confirming it. It may still be working on it.";
-/// PRD #1666 G3: the card line for a deck message handed to the agent that
-/// has started no work since, after the glyph and any count
+/// PRD #1666 G3: the card line for a deck message the agent holds while it
+/// has been idle for the window, after the glyph and any count
 /// (`✉ may not have reached the agent`, `✉ 2 may not have reached the agent`).
 pub const NOT_STARTED: &str = "may not have reached the agent";
 /// PRD #1666 G3: what that line means and what the two actions do. It says
-/// what the deck saw, no turn starting, and that Retry may duplicate it.
-pub const NOT_STARTED_REASON: &str = "the agent has not started any work since it was given this deck message a few minutes ago, so the message may not have reached it. Retry sends it again, so the agent may get it twice. Cancel stops further delivery but cannot take back a copy the agent already has.";
+/// what the deck observes (the agent idle, and no start on the message
+/// reported) rather than what the agent did, and that Retry may duplicate
+/// it.
+pub const NOT_STARTED_REASON: &str = "the agent has been idle for a few minutes and the deck has not seen it start on this deck message, so the message may not have reached it. Retry sends it again, so the agent may get it twice. Cancel stops further delivery but cannot take back a copy the agent already has.";
 /// PRD #1666 §6.4: the two user actions, as both clients label them.
 pub const RETRY: &str = "Retry";
 pub const CANCEL: &str = "Cancel";
@@ -183,7 +185,8 @@ pub enum AttentionKind {
     OutOfAttempts,
     /// Possessed for an hour without a commit (§6.3).
     HeldLong,
-    /// PRD #1666 G3: handed to the agent, which has started no turn since.
+    /// PRD #1666 G3: held by the agent, uncommitted, while the agent has been
+    /// idle for the not-started window.
     NotStarted,
 }
 

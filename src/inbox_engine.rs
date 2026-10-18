@@ -984,6 +984,18 @@ pub(super) fn lapse_checks(st: &HubState, now: Instant) -> Vec<Check> {
         .collect()
 }
 
+/// PRD #1666 G3: `key`'s turn clock goes, and the key is remembered so a
+/// delayed edge cannot bring it back.
+pub(super) fn forget_turns(st: &mut HubState, key: &AgentKey) {
+    st.receipts.turns.remove(key);
+    if !st.receipts.exited_turns.contains(key) {
+        if st.receipts.exited_turns.len() >= EXITED_TURN_KEYS {
+            st.receipts.exited_turns.pop_front();
+        }
+        st.receipts.exited_turns.push_back(key.clone());
+    }
+}
+
 /// T9 for `key`: its open attempts are fenced and its evidence goes. The
 /// inbox's own exit already retired its messages.
 pub(super) fn exit(
@@ -992,15 +1004,7 @@ pub(super) fn exit(
     now: Instant,
 ) -> Option<Arc<GenerationSpool>> {
     st.receipts.floors.remove(key);
-    // PRD #1666 G3: the clock goes, and the key is remembered so a delayed
-    // edge cannot bring it back.
-    st.receipts.turns.remove(key);
-    if !st.receipts.exited_turns.contains(key) {
-        if st.receipts.exited_turns.len() >= EXITED_TURN_KEYS {
-            st.receipts.exited_turns.pop_front();
-        }
-        st.receipts.exited_turns.push_back(key.clone());
-    }
+    forget_turns(st, key);
     let told = st.receipts.told.remove(key);
     let generation = st.receipts.gens.remove(key);
     if told.is_some_and(|told| told != InboxCardNotices::default()) {

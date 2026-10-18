@@ -10666,6 +10666,17 @@ fn dispatch_action(
             }
         }
         Action::InboxAttentionAct(retry) => {
+            if let Some(dialog) = ui.inbox_attention.as_mut()
+                && retry
+                && dialog
+                    .items
+                    .get(dialog.selected)
+                    .is_some_and(|item| item.kind.retry_offered())
+                && !inbox_attention_retry_readable(dialog, frame_area)
+            {
+                dialog.answer = Some(RETRY_NEEDS_ROOM.to_string());
+                return Flow::Continue;
+            }
             let press = ui
                 .inbox_attention
                 .as_ref()
@@ -18336,20 +18347,22 @@ fn host_metrics_lines(view: &HostMetricsView, width: u16) -> Vec<Line<'static>> 
 /// rect for the mouse hit-test, as [`render_help_overlay`] does.
 /// PRD #1666 §6.4: the deck-messages picker's rows — each item's sender,
 /// subject and what it means, in the words the desktop tile uses — then the
-/// answer to the last press, within `rows` lines. A list longer than fits is
-/// shown as the window of items that keeps the cursor's row in view, and the
-/// answer is never pushed out by it: it takes its row first, and where two
-/// rows per item no longer fit, an item is its sender and subject alone.
-/// The cursor's row explains itself in full, wrapped onto the rows the list
-/// leaves spare (PRD #1666 G3: what Retry would do is read before the press,
-/// as the desktop tile shows it), and cut with `…` where they run out.
-/// Returns the lines and, when windowed, the first and last item shown
-/// (zero-based).
+/// answer to the last press, within `rows` lines. The answer takes its row
+/// first. The cursor's row then takes the rows its whole explanation needs,
+/// wrapped (PRD #1666 G3: what Retry would do is read before the press, as
+/// the desktop tile shows it), and the other items share what is left, two
+/// rows each, as the window of items that keeps the cursor's row in view.
+/// Where the cursor's explanation does not fit whole, the cursor's row is
+/// shown alone with it cut by `…`, and where two rows no longer fit, an item
+/// is its sender and subject alone. Returns the lines, when windowed the
+/// first and last item shown (zero-based), and whether the cursor's
+/// explanation is shown whole (true with no item), which Retry needs
+/// ([`inbox_attention_retry_readable`]).
 fn inbox_attention_lines(
     dialog: &InboxAttentionDialog,
     width: u16,
     rows: usize,
-) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+) -> (Vec<Line<'static>>, Option<(usize, usize)>, bool) {
     let width = usize::from(width);
     let mut lines = Vec::new();
     if dialog.items.is_empty() {
@@ -18365,15 +18378,26 @@ fn inbox_attention_lines(
         room -= 1;
     }
     let compact = room < 2;
-    let fits = if compact { room } else { room / 2 };
     let total = dialog.items.len();
+    let explanation = dialog
+        .items
+        .get(dialog.selected)
+        .map(|item| inbox_attention_reason_rows(item, width))
+        .unwrap_or_default();
+    let explained = total == 0 || (!compact && room > explanation.len());
+    let fits = if compact {
+        room
+    } else if explained {
+        1 + (room - 1 - explanation.len()) / 2
+    } else {
+        1
+    };
     let start = if total <= fits {
         0
     } else {
         (dialog.selected + 1).saturating_sub(fits).min(total - fits)
     };
     let shown = (total > fits && fits > 0).then(|| (start, start + fits - 1));
-    let mut spare = room.saturating_sub(2 * total.saturating_sub(start).min(fits));
     for (index, item) in dialog.items.iter().enumerate().skip(start).take(fits) {
         let cursor = if index == dialog.selected {
             "▸ "
@@ -18395,13 +18419,12 @@ fn inbox_attention_lines(
         if compact {
             continue;
         }
-        let reason = if index == dialog.selected {
-            inbox_attention_reason_rows(item, width)
+        let (reason, take) = if index == dialog.selected {
+            let take = explanation.len().min(room - 1).max(1);
+            (explanation.clone(), take)
         } else {
-            vec![item.kind.reason().to_string()]
+            (vec![item.kind.reason().to_string()], 1)
         };
-        let take = reason.len().min(1 + spare);
-        spare -= take - 1;
         for (row, text) in reason.iter().take(take).enumerate() {
             let text = if row + 1 == take {
                 reason[row..].join(" ")
@@ -18423,7 +18446,7 @@ fn inbox_attention_lines(
             width,
         )));
     }
-    (lines, shown)
+    (lines, shown, explained)
 }
 
 /// The cursor row's explanation wrapped to the picker's `width`, after its
@@ -18435,11 +18458,9 @@ fn inbox_attention_reason_rows(
     crate::upgrade_dialog::wrap(item.kind.reason(), width.saturating_sub(4))
 }
 
-fn render_inbox_attention_overlay(
-    frame: &mut Frame,
-    dialog: &InboxAttentionDialog,
-) -> Vec<(Action, Rect)> {
-    let area = frame.area();
+/// The picker's popup in `area`, and the height of its footer (the button
+/// row and the key hint under it).
+fn inbox_attention_geometry(dialog: &InboxAttentionDialog, area: Rect) -> (Rect, u16) {
     let popup_width = 96u16.min(area.width.saturating_sub(2));
     // Every row it would take unwindowed: two per item (or the one "gone"
     // line), the rest of the cursor row's explanation and the answer's two;
@@ -18457,11 +18478,9 @@ fn render_inbox_attention_overlay(
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
-    frame.render_widget(Clear, popup_area);
-    // The button row and the key hint under it. Short of room for both and
-    // the rows wanted, the hint goes first (the buttons name the same keys),
-    // and in the shortest picker the buttons too, so the answer and the
-    // cursor's row keep their place.
+    // Short of room for the footer and the rows wanted, the hint goes first
+    // (the buttons name the same keys), and in the shortest picker the
+    // buttons too, so the answer and the cursor's row keep their place.
     let inner_height = usize::from(popup_height.saturating_sub(2));
     let footer_height: u16 = if inner_height >= wanted + 2 || inner_height >= 6 {
         2
@@ -18470,12 +18489,51 @@ fn render_inbox_attention_overlay(
     } else {
         0
     };
-    let body_height = popup_height.saturating_sub(2).saturating_sub(footer_height);
-    let (lines, shown) = inbox_attention_lines(
+    (popup_area, footer_height)
+}
+
+/// The picker's body as drawn in `area`: [`inbox_attention_lines`] at the
+/// popup's inner width and the rows its footer leaves.
+fn inbox_attention_body(
+    dialog: &InboxAttentionDialog,
+    area: Rect,
+) -> (Vec<Line<'static>>, Option<(usize, usize)>, bool) {
+    let (popup_area, footer_height) = inbox_attention_geometry(dialog, area);
+    let body_height = popup_area
+        .height
+        .saturating_sub(2)
+        .saturating_sub(footer_height);
+    inbox_attention_lines(
         dialog,
-        popup_width.saturating_sub(2),
+        popup_area.width.saturating_sub(2),
         usize::from(body_height),
-    );
+    )
+}
+
+/// PRD #1666 G3: whether Retry may be pressed on the cursor's row of the
+/// picker drawn in `area`: it offers Retry and its whole explanation, which
+/// says what Retry does (a possible duplicate), is on screen. In a window
+/// too short for it Retry waits until the window is taller.
+fn inbox_attention_retry_readable(dialog: &InboxAttentionDialog, area: Rect) -> bool {
+    dialog
+        .items
+        .get(dialog.selected)
+        .is_some_and(|item| item.kind.retry_offered())
+        && inbox_attention_body(dialog, area).2
+}
+
+/// PRD #1666 G3: the TUI's answer to `r` in a picker too short to show what
+/// Retry does. The desktop tile has no such state: its list scrolls.
+const RETRY_NEEDS_ROOM: &str = "make the window taller to see what Retry does";
+
+fn render_inbox_attention_overlay(
+    frame: &mut Frame,
+    dialog: &InboxAttentionDialog,
+) -> Vec<(Action, Rect)> {
+    let area = frame.area();
+    let (popup_area, footer_height) = inbox_attention_geometry(dialog, area);
+    frame.render_widget(Clear, popup_area);
+    let (lines, shown, _) = inbox_attention_body(dialog, area);
     let title = match shown {
         Some((first, last)) => format!(
             " {} · {}–{} of {} ",
@@ -18520,16 +18578,12 @@ fn render_inbox_attention_overlay(
         ]),
         footer_area,
     );
-    let retry_offered = dialog
-        .items
-        .get(dialog.selected)
-        .is_some_and(|item| item.kind.retry_offered());
     let buttons = [
         Button::new(
             crate::inbox_display::RETRY,
             "r",
             Action::InboxAttentionAct(true),
-            retry_offered,
+            inbox_attention_retry_readable(dialog, area),
         ),
         Button::new(
             crate::inbox_display::CANCEL,

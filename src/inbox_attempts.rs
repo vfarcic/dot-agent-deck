@@ -315,11 +315,17 @@ pub struct Delivery {
     /// take its repeat.
     waiting_since: Option<Instant>,
     held_long_sent: Option<u64>,
-    /// PRD #1666 G3: the first possession or hand-over of the current
-    /// assignment. Unlike `possessed_since` a watcher gap does not clear it,
-    /// so a respawn cannot postpone or re-arm the not-started window; a
-    /// commit, the latch, a terminal state, a Retry or a new assignment does.
+    /// PRD #1666 G3: when the receiver first reported holding an attempt of
+    /// the current assignment issued since the last Retry (a possession
+    /// snapshot listing it, or its hand-over), never its issue grace. Unlike
+    /// `possessed_since` a watcher gap does not clear it, so a respawn cannot
+    /// postpone or re-arm the not-started window; a commit, the latch, any
+    /// state but Attempting, a Retry or a new assignment does.
     not_started_anchor: Option<Instant>,
+    /// PRD #1666 G3: the attempts a Retry left behind (every `e` up to this
+    /// one). Their possession does not anchor the window of the repeat it
+    /// asked for, which starts at the repeat's own.
+    not_started_after_e: u32,
     /// PRD #1666 G3: the revision at which the not-started attention stands,
     /// recomputed from the turn clock on every tick ([`AttemptModel::note_turn`]).
     not_started: Option<u64>,
@@ -344,6 +350,7 @@ impl Delivery {
             waiting_since: None,
             held_long_sent: None,
             not_started_anchor: None,
+            not_started_after_e: 0,
             not_started: None,
             last_action: None,
             corrected: false,
@@ -371,9 +378,9 @@ impl Delivery {
     }
 
     /// PRD #1666 G3: whether the not-started attention stands at the current
-    /// revision: a deck message handed to a Pi agent that has started no turn
-    /// for [`Limits::not_started_after`]. It yields to [`Self::held_long`], so
-    /// a message is one row.
+    /// revision: a deck message a Pi agent holds uncommitted while the deck's
+    /// turn clock has read it idle for [`Limits::not_started_after`]. It
+    /// yields to [`Self::held_long`], so a message is one row.
     pub fn not_started(&self) -> bool {
         self.state == MessageState::Attempting
             && self.not_started == Some(self.revision)
@@ -1314,7 +1321,7 @@ impl AttemptModel {
     /// `turn`, the generation's turn clock. It stands for a message handed to
     /// a Pi receiver, still attempting and uncommitted, once the agent has
     /// been idle for [`Limits::not_started_after`] since both the message's
-    /// first possession or hand-over and the end of its last turn. A turn
+    /// first reported possession or hand-over and the end of its last turn. A turn
     /// under way, a commit or ineligibility withdraws it, and only a turn that
     /// really ended re-arms it. Attention only: it changes no state, schedules
     /// no repeat and issues nothing.
@@ -1531,6 +1538,7 @@ impl AttemptModel {
                     msg.held_long_sent = None;
                     msg.not_started = None;
                     msg.not_started_anchor = None;
+                    msg.not_started_after_e = msg.attempts.len() as u32;
                     ActionOutcome::Applied { revision: 0 }
                 }
             }
@@ -1619,7 +1627,16 @@ impl AttemptModel {
         let all_not_handed =
             !current.is_empty() && current.iter().all(|at| at.stage == Stage::NotHanded);
         let none_issued = current.is_empty();
-        let handed = current.iter().any(|at| at.stage == Stage::Handed);
+        // G3's anchor: a receiver's own report that it holds an attempt of
+        // this delivery cycle, not the issue grace `held` also counts.
+        let witnessed = current
+            .iter()
+            .filter(|at| at.e > msg.not_started_after_e)
+            .any(|at| {
+                at.stage == Stage::Handed
+                    || (possessed(&self.receivers, &self.limits, id, at, now)
+                        && snapshot_holds(&self.receivers, &self.limits, id, at, now))
+            });
         let cleared = current.iter().all(|at| !needs_clearance(at) || at.cleared);
         let limits = self.limits;
         let Some(msg) = self.messages.get_mut(id) else {
@@ -1764,11 +1781,11 @@ impl AttemptModel {
                 msg.set_state(MessageState::Uncertain(UncertainReason::Lapsed));
             }
         }
-        // PRD #1666 G3: the not-started window runs from the assignment's
-        // first possession or hand-over; anything that ends the attempting
-        // ends it.
+        // PRD #1666 G3: the not-started window runs from the first reported
+        // possession or hand-over of this delivery cycle; anything that ends
+        // the attempting ends it.
         if msg.state == MessageState::Attempting && !msg.latch {
-            if held || handed {
+            if witnessed {
                 msg.not_started_anchor.get_or_insert(now);
             }
         } else {
@@ -1880,6 +1897,22 @@ fn needs_clearance(at: &Attempt) -> bool {
         )
 }
 
+/// Whether a fresh possession snapshot of `at`'s stream receiver lists it:
+/// [`possessed`] without the issue grace.
+fn snapshot_holds(
+    receivers: &BTreeMap<Rx, Receiver>,
+    limits: &Limits,
+    id: &str,
+    at: &Attempt,
+    now: Instant,
+) -> bool {
+    receivers.get(&at.rx).is_some_and(|r| {
+        matches!(r.slot, Slot::OpencodeServer | Slot::OpencodeTui | Slot::Pi)
+            && now < r.fresh_at + limits.possess_ttl
+            && r.held.contains(&(id.to_string(), at.a, at.e))
+    })
+}
+
 /// Whether `at` is possessed right now (§4). A stream attempt is possessed
 /// while its live incarnation's fresh snapshot holds it, or while it is in
 /// issue grace (`d` above the watermark, less than one TTL since issue). A
@@ -1908,11 +1941,8 @@ fn possessed(
     }
     match r.slot {
         Slot::OpencodeServer | Slot::OpencodeTui | Slot::Pi => {
-            let fresh = now < r.fresh_at + limits.possess_ttl;
-            if fresh && r.held.contains(&(id.to_string(), at.a, at.e)) {
-                return true;
-            }
-            at.d > r.seen && now < at.issued_at + limits.possess_ttl
+            snapshot_holds(receivers, limits, id, at, now)
+                || (at.d > r.seen && now < at.issued_at + limits.possess_ttl)
         }
         Slot::OnceWaiter => {
             r.busy
@@ -3592,10 +3622,12 @@ mod tests {
         let repeat = m.issue(now, "m", rx).expect("the manual repeat");
         assert_eq!(repeat.kind, IssueKind::ManualRetry);
         assert!(repeat.kind.marked());
+        // The repeat's window starts at its first possession (attempts/025).
         let held = [("m", i.a, i.e), ("m", repeat.a, repeat.e)];
         let mut seq = 2;
+        let first = now + STEP;
         let mut at = now;
-        while at < now + window - STEP {
+        while at < first + window - STEP {
             at += STEP;
             step(&mut m, at, rx, &mut seq, &held, idle());
             assert!(
@@ -3604,7 +3636,7 @@ mod tests {
                 at - now
             );
         }
-        step(&mut m, now + window, rx, &mut seq, &held, idle());
+        step(&mut m, first + window, rx, &mut seq, &held, idle());
         assert!(m.delivery("m").unwrap().not_started());
 
         // An older revision is stale.
@@ -3739,5 +3771,158 @@ mod tests {
         m.tick_turn(at + window, &[], idle());
         assert!(!m.delivery("m").unwrap().not_started(), "handed inert");
         assert_eq!(m.not_started_due_at(idle()), None);
+    }
+
+    /// Scenario: A deck message is issued to a Pi receiver that reports
+    /// holding it only a minute later, and the agent stays idle throughout.
+    /// The not-started window runs from that report, not from the issue, so
+    /// the row appears four minutes after the issue rather than three; with a
+    /// window shorter than the issue grace, an issued message nobody reported
+    /// holding never shows it.
+    #[spec("inbox/attempts/024")]
+    #[test]
+    fn attempts_024_the_window_starts_at_the_first_reported_possession_not_the_issue() {
+        let limits = Limits::default();
+        let window = limits.not_started_after;
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::Pi, false).rx;
+        m.post("m", false);
+        let i = m.issue(t, "m", rx).expect("issue");
+        let taken = t + Duration::from_secs(60);
+        for at in [t + Duration::from_secs(30), taken - Duration::from_secs(1)] {
+            m.tick_turn(at, &[], idle());
+            assert_eq!(
+                m.not_started_due_at(idle()),
+                None,
+                "issue grace is not possession, at {:?}",
+                at - t
+            );
+        }
+        m.snapshot(taken, rx, 1, i.d, &[("m", i.a, i.e)]);
+        assert_eq!(m.not_started_due_at(idle()), Some(taken + window));
+        let mut seq = 1;
+        let mut at = taken;
+        while at < taken + window - STEP {
+            at += STEP;
+            step(&mut m, at, rx, &mut seq, &[("m", i.a, i.e)], idle());
+            assert!(
+                !m.delivery("m").unwrap().not_started(),
+                "at {:?} after the issue",
+                at - t
+            );
+        }
+        step(
+            &mut m,
+            taken + window,
+            rx,
+            &mut seq,
+            &[("m", i.a, i.e)],
+            idle(),
+        );
+        assert!(m.delivery("m").unwrap().not_started());
+
+        // A window shorter than the issue grace: the issue alone arms nothing.
+        let short = Limits {
+            not_started_after: Duration::from_secs(30),
+            ..limits
+        };
+        let (mut m, t) = model_with(short);
+        let rx = m.register(t, Slot::Pi, false).rx;
+        m.post("m", false);
+        m.issue(t, "m", rx).expect("issue");
+        m.tick_turn(t + Duration::from_secs(60), &[], idle());
+        let d = m.delivery("m").unwrap();
+        assert_eq!(d.state, MessageState::Attempting, "still in issue grace");
+        assert!(!d.not_started());
+        assert_eq!(m.not_started_due_at(idle()), None);
+    }
+
+    /// Scenario: The user presses Retry on a Pi message the card says may
+    /// not have reached the agent, while the receiver still reports holding
+    /// the earlier copy. The repeat is issued a minute later and first
+    /// reported held thirty seconds after that, and the new window runs from
+    /// that report: the earlier copy's possession does not start it at the
+    /// press.
+    #[spec("inbox/attempts/025")]
+    #[test]
+    fn attempts_025_after_retry_the_window_starts_at_the_repeats_own_possession() {
+        let limits = Limits::default();
+        let window = limits.not_started_after;
+        let (mut m, rx, i, now, r) = raised(limits);
+        assert!(matches!(
+            m.retry(now, "m", GEN, r),
+            ActionOutcome::Applied { .. }
+        ));
+        let old = [("m", i.a, i.e)];
+        let mut seq = 2;
+        step(&mut m, now, rx, &mut seq, &old, idle());
+        assert_eq!(
+            m.not_started_due_at(idle()),
+            None,
+            "the earlier copy's possession does not anchor the repeat"
+        );
+        let issued_at = now + Duration::from_secs(60);
+        step(&mut m, issued_at, rx, &mut seq, &old, idle());
+        let repeat = m.issue(issued_at, "m", rx).expect("the manual repeat");
+        assert_eq!(repeat.kind, IssueKind::ManualRetry);
+        m.tick_turn(issued_at, &[], idle());
+        assert_eq!(m.not_started_due_at(idle()), None, "issued, not yet held");
+        let taken = issued_at + STEP;
+        let both = [("m", i.a, i.e), ("m", repeat.a, repeat.e)];
+        seq += 1;
+        m.snapshot(taken, rx, seq, repeat.d, &both);
+        assert_eq!(m.not_started_due_at(idle()), Some(taken + window));
+        let mut at = taken;
+        while at < taken + window - STEP {
+            at += STEP;
+            step(&mut m, at, rx, &mut seq, &both, idle());
+            assert!(
+                !m.delivery("m").unwrap().not_started(),
+                "at {:?} after the press",
+                at - now
+            );
+        }
+        step(&mut m, taken + window, rx, &mut seq, &both, idle());
+        assert!(m.delivery("m").unwrap().not_started());
+    }
+
+    /// Scenario: A Pi message's copy drops out of the receiver's possession
+    /// reports and, with no spool check able to clear it, the message becomes
+    /// uncertain; minutes later the receiver reports holding that same copy
+    /// again. The message is attempting again and its not-started window
+    /// starts at that report, so the row does not appear at once from the
+    /// first hand-over's anchor.
+    #[spec("inbox/attempts/026")]
+    #[test]
+    fn attempts_026_possession_regained_after_uncertain_starts_a_new_window() {
+        let limits = Limits::default();
+        let window = limits.not_started_after;
+        let (mut m, t) = model();
+        let (rx, i) = handed(&mut m, t, Slot::Pi, "m");
+        assert_eq!(m.not_started_due_at(idle()), Some(t + window));
+        let gone = t + STEP;
+        m.snapshot(gone, rx, 2, i.d, &[]);
+        let lapsed = gone + limits.uncertain_after() + window;
+        m.tick_turn(lapsed, &[], idle());
+        let d = m.delivery("m").unwrap();
+        assert_eq!(d.state, MessageState::Uncertain(UncertainReason::Lapsed));
+        assert!(!d.repeat_scheduled(), "no check cleared it, so no repeat");
+        let back = lapsed + STEP;
+        m.snapshot(back, rx, 3, i.d, &[("m", i.a, i.e)]);
+        m.tick_turn(back, &[], idle());
+        let d = m.delivery("m").unwrap();
+        assert_eq!(d.state, MessageState::Attempting, "possession regained");
+        assert!(!d.not_started(), "the old anchor is gone");
+        assert_eq!(m.not_started_due_at(idle()), Some(back + window));
+        let mut seq = 3;
+        step(
+            &mut m,
+            back + window,
+            rx,
+            &mut seq,
+            &[("m", i.a, i.e)],
+            idle(),
+        );
+        assert!(m.delivery("m").unwrap().not_started());
     }
 }

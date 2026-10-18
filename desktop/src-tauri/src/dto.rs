@@ -829,7 +829,7 @@ pub struct DesktopInbox {
 pub struct DesktopInboxAttention {
     pub message_id: String,
     pub revision: u64,
-    /// `uncertain`, `out_of_attempts` or `held_long`.
+    /// `uncertain`, `out_of_attempts`, `held_long` or `not_started`.
     pub kind: String,
     pub from_label: String,
     pub subject: String,

@@ -4,7 +4,7 @@ expression: rendered
 ---
 ┌ 1 ClaudeCode · api-svc ───────── ● Thinking ✉ may not have reached the agent ┐
 │Dir:  api-svc                                                                 │
-│the agent has not started any work since it was given this deck message a few…│
+│the agent has been idle for a few minutes and the deck has not seen it start …│
 │Prmt: move the stats into the border                                          │
 │                                                                              │
 │                                                                              │

@@ -1,0 +1,11 @@
+---
+source: tests/render_inbox_attention.rs
+expression: rendered
+---
+                                                            
+ ┌ Deck messages ─────────────────────────────────────────┐ 
+ │▸ the orchestrator · review 000                         │ 
+ │    the agent has been idle for a few minutes and the d…│ 
+ │  make the window taller to see what Retry does         │ 
+ │  [Retry r] [Cancel c] [Close]                          │ 
+ └────────────────────────────────────────────────────────┘
