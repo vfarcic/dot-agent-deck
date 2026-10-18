@@ -2966,3 +2966,94 @@ async fn boundary_035_a_lapsed_pi_offer_is_never_returned_from_a_lapse() {
     oc.close().await;
     pi.close().await;
 }
+
+/// Scenario: A message is handed to an OpenCode and then a Pi receipt stream, which holds it past the held_long span; the user presses Retry and a marked second copy is handed. The inbox listing counts two deliveries. A second message on each stream lapses through both automatic repeats and is counted once per copy handed, and a Retry from uncertain counts one more.
+#[spec("inbox/boundary/046")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_046_deliveries_counts_every_receipt_hand_out() {
+    use crate::daemon_protocol::InboxActionOutcome;
+    let deliveries = |hub: &InboxHub, pane: &str, id: &MessageId| -> u32 {
+        hub.list(pane)
+            .into_iter()
+            .find(|m| &m.id == id)
+            .expect("listed")
+            .deliveries
+    };
+    for (pane, component) in [
+        ("oc", InboxComponent::OpenCodePlugin),
+        ("pi", InboxComponent::PiExtension),
+    ] {
+        let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+        hub.lock().receipts.limits.held_long_after = Duration::ZERO;
+        let mut peer = Peer::open(&hub, pane, "a", component, INTEGRATION).await;
+        peer.next().await;
+        let id = hub
+            .post_direct(Recipient::bound(pane, "a"), content("held"))
+            .unwrap();
+        let handed = peer.handout().await;
+        assert_eq!(deliveries(&hub, pane, &id), 1, "{pane}: the first copy");
+        peer.send(serde_json::json!({"possess": {"seq": 1, "seen": attempt(&handed[0]).d, "held": [at(&handed[0])]}}))
+            .await;
+        let mut item = None;
+        until("held_long attention", || {
+            hub.tick();
+            item = hub
+                .summary(pane, "a")
+                .notices
+                .attention
+                .into_iter()
+                .find(|item| item.kind == AttentionKind::HeldLong);
+            item.is_some()
+        })
+        .await;
+        let revision = item.unwrap().revision;
+        let retry = hub.inbox_action(pane, "a", id.as_str(), revision, true, "tui-1");
+        assert_eq!(retry.outcome, InboxActionOutcome::Applied, "{pane}");
+        let manual = peer.handout().await;
+        assert!(attempt(&manual[0]).repeat, "{pane}: a marked repeat");
+        assert_eq!(state_of(&hub, pane, id.as_str()), StateName::Fetched);
+        assert_eq!(
+            deliveries(&hub, pane, &id),
+            2,
+            "{pane}: Retry's copy is counted"
+        );
+        peer.close().await;
+
+        let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+        let mut peer = Peer::open(&hub, pane, "a", component, INTEGRATION).await;
+        peer.next().await;
+        let id = hub
+            .post_direct(Recipient::bound(pane, "a"), content("lapsing"))
+            .unwrap();
+        let mut seq = 0;
+        let seen = lapse_until_uncertain(&hub, &mut peer, id.as_str(), &mut seq).await;
+        assert_eq!(
+            deliveries(&hub, pane, &id),
+            seen.len() as u32,
+            "{pane}: each automatic repeat is counted"
+        );
+        let mut item = None;
+        until("the card to list it", || {
+            hub.tick();
+            item = hub.summary(pane, "a").notices.attention.into_iter().next();
+            item.is_some()
+        })
+        .await;
+        let retry = hub.inbox_action(
+            pane,
+            "a",
+            id.as_str(),
+            item.unwrap().revision,
+            true,
+            "tui-1",
+        );
+        assert_eq!(retry.outcome, InboxActionOutcome::Applied, "{pane}");
+        peer.handout().await;
+        assert_eq!(
+            deliveries(&hub, pane, &id),
+            seen.len() as u32 + 1,
+            "{pane}: and so is the Retry from uncertain"
+        );
+        peer.close().await;
+    }
+}

@@ -579,6 +579,8 @@ fn issue_to(
         if message.state == MessageState::Queued {
             st.inbox
                 .take_receipt(now, id, &key.0, &key.1, consumer.clone());
+        } else {
+            st.inbox.count_receipt_repeat(id, &key.0, &key.1);
         }
         let mut delivery = render_marked(&message, budget, issued.kind.marked());
         used += len.unwrap_or(0);

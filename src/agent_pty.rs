@@ -919,6 +919,18 @@ impl AgentPtyError {
     }
 }
 
+/// The value of `key` in a spawn's env overlay as the child gets it:
+/// [`SpawnOptions::env`] is applied in order, so of repeated entries the last
+/// wins. `None` when the overlay does not set `key`. Every daemon-side reading
+/// of what a child will see goes through this, so none of them can pick a
+/// different entry from the one the child gets.
+pub(crate) fn overlay_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    env.iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
 /// How to spawn an agent.
 pub struct SpawnOptions<'a> {
     /// Command to run. `None` falls back to `$SHELL`. Strings containing spaces
@@ -1377,6 +1389,34 @@ fn prepared_spawn_cwd(
         }
         Ok(path.into())
     }
+}
+
+/// PRD #1666 G6: the directory a Pi child's relative agent dir is resolved
+/// in, which is where the child enters. For a prepared start that is
+/// [`prepared_spawn_cwd`], the value the spawn itself enters: on Linux the
+/// verified directory through its held descriptor, so a rename-and-replace of
+/// the pathname cannot redirect the refresh into another directory; on other
+/// Unix the pathname, once its identity still matches the verified one, so a
+/// replacement made before this check is refused (one made between this check
+/// and the write is caught only by the spawn's own check, after the write). A
+/// start that cannot enter its directory is refused here, as the spawn will
+/// refuse it, and nothing is written. Otherwise `cwd`, or `None` for a child
+/// that inherits the daemon's directory.
+fn pi_refresh_cwd(
+    cwd: Option<&str>,
+    dir: SpawnDir<'_>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    #[cfg(unix)]
+    if let Some(dir) = dir {
+        return prepared_spawn_cwd(cwd, dir)
+            .map(|entered| Some(std::path::PathBuf::from(entered)))
+            .map_err(|error| format!("{}: {error}", cwd.unwrap_or("(no working directory)")));
+    }
+    #[cfg(not(unix))]
+    if let Some(never) = dir {
+        match *never {}
+    }
+    Ok(cwd.map(std::path::PathBuf::from))
 }
 
 /// The inline program [`exec_program_from_child_cwd`] hands `/bin/sh`: exec the
@@ -5275,11 +5315,8 @@ fn inbox_probe_binary(
     pins: &[crate::hook_binary::HookPin],
 ) -> Option<std::path::PathBuf> {
     let key = crate::platform::paths::DOT_AGENT_DECK_BIN;
-    let override_bin = env
-        .iter()
-        .rev()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| std::ffi::OsString::from(v))
+    let override_bin = overlay_value(env, key)
+        .map(std::ffi::OsString::from)
         .or_else(|| inherited(key))
         .map(std::path::PathBuf::from)
         .filter(|path| path.is_absolute());
@@ -9942,8 +9979,8 @@ impl AgentPtyRegistry {
         // a copy it read before a refresh on another thread caught up.
         // PRD #1666 G6: a Pi generation's extension is rewritten into the
         // directory the child resolves (its own `PI_CODING_AGENT_DIR`, else
-        // its `HOME`; a relative one in its `cwd`, the pathname a prepared
-        // start verified), likewise before it starts.
+        // its `HOME`; a relative one where the child enters, see
+        // [`pi_refresh_cwd`]), likewise before it starts.
         let inbox_refresh = if opencode_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {
             Some((
                 InboxIntegration::OpenCode,
@@ -9951,16 +9988,13 @@ impl AgentPtyRegistry {
             ))
         } else if pi_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {
             let env = opts.env.clone();
-            let cwd = opts.cwd.map(std::path::PathBuf::from);
-            Some((
-                InboxIntegration::Pi,
-                (
-                    Vec::new(),
-                    crate::inbox_hub::off_the_executor(move || {
-                        crate::orchestrator_ext::refresh_for_spawn(&env, cwd.as_deref())
-                    }),
-                ),
-            ))
+            let failed = match pi_refresh_cwd(opts.cwd, dir) {
+                Ok(cwd) => crate::inbox_hub::off_the_executor(move || {
+                    crate::orchestrator_ext::refresh_for_spawn(&env, cwd.as_deref())
+                }),
+                Err(refused) => vec![refused],
+            };
+            Some((InboxIntegration::Pi, (Vec::new(), failed)))
         } else {
             None
         };
@@ -23534,7 +23568,7 @@ mod spawn_tests {
             .expect("no respawn is in flight")
     }
 
-    /// Scenario: A Pi agent is started with its own HOME and PI_CODING_AGENT_DIR, a stale extension in the directory the latter names. The deck rewrites the extension there before the agent starts, and leaves the directory its HOME alone would name untouched; a Pi agent whose PI_CODING_AGENT_DIR is relative gets it in its own working directory, not the deck's. A non-Pi agent's start writes nothing, and a Pi agent's capability probe runs the deck's own binary rather than an OpenCode pin, or the override its environment names, inherited or not. A Pi agent whose extension directory cannot be written gets the Pi-worded refresh notice, and one that never registers is reported not yet connected once the readiness deadline passes.
+    /// Scenario: A Pi agent is started with its own HOME and PI_CODING_AGENT_DIR, a stale extension in the directory the latter names. The deck rewrites the extension there before the agent starts, and leaves the directory its HOME alone would name untouched; a Pi agent whose PI_CODING_AGENT_DIR is relative gets it in its own working directory, not the deck's. Of repeated environment entries the last one decides, as it does for the agent, and a prepared start whose project directory was swapped after it was verified gets the extension in the directory it verified, never the replacement. A non-Pi agent's start writes nothing, and a Pi agent's capability probe runs the deck's own binary rather than an OpenCode pin, or the override its environment names, inherited or not. A Pi agent whose extension directory cannot be written gets the Pi-worded refresh notice, and one that never registers is reported not yet connected once the readiness deadline passes.
     #[spec("inbox/boundary/032")]
     #[cfg(unix)]
     #[test]
@@ -23627,6 +23661,131 @@ mod spawn_tests {
                 .exists(),
             "the extension lands where the child resolves it"
         );
+
+        // R3F-A01: of repeated overlay entries the child gets the last, and so
+        // does the refresh: a relative agent dir named twice, then an
+        // absolute one masked by a last empty entry, which leaves Pi on the
+        // last of two HOMEs.
+        let first = format!(".pi-agent-first-032-{}", std::process::id());
+        let last = format!(".pi-agent-last-032-{}", std::process::id());
+        let landed = |dir: &std::path::Path| {
+            dir.join("extensions")
+                .join("dot-agent-deck")
+                .join("inbox-receiver.js")
+                .exists()
+        };
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                agent_type: Some(AgentType::Pi),
+                cwd: Some(&child_cwd_str),
+                env: vec![
+                    (
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        "pane-pi-twice".to_string(),
+                    ),
+                    ("DOT_AGENT_DECK_BIN".to_string(), "/bin/true".to_string()),
+                    (
+                        crate::orchestrator_ext::ENV_PI_AGENT_DIR.to_string(),
+                        first.clone(),
+                    ),
+                    (
+                        crate::orchestrator_ext::ENV_PI_AGENT_DIR.to_string(),
+                        last.clone(),
+                    ),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let stray = [&first, &last].map(|dir| std::env::current_dir().unwrap().join(dir));
+        let strayed = stray.iter().any(|dir| dir.exists());
+        for dir in &stray {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        assert!(!strayed, "nothing is written in the daemon's own directory");
+        assert!(
+            landed(&child_cwd.join(&last)),
+            "the last relative entry, in the child's cwd"
+        );
+        assert!(!landed(&child_cwd.join(&first)), "not the first entry");
+        let masked = root.path().join("masked-agent");
+        let first_home = root.path().join("first-home");
+        let last_home = root.path().join("last-home");
+        for dir in [&first_home, &last_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        spawn(
+            "pane-pi-masked",
+            Some(AgentType::Pi),
+            vec![
+                (
+                    crate::orchestrator_ext::ENV_PI_AGENT_DIR.to_string(),
+                    masked.display().to_string(),
+                ),
+                (
+                    crate::orchestrator_ext::ENV_PI_AGENT_DIR.to_string(),
+                    String::new(),
+                ),
+                ("HOME".to_string(), first_home.display().to_string()),
+                ("HOME".to_string(), last_home.display().to_string()),
+            ],
+        );
+        assert!(
+            landed(&last_home.join(".pi").join("agent")),
+            "a last empty override leaves Pi on its last HOME"
+        );
+        assert!(!masked.exists(), "the masked override is not written");
+        assert!(!first_home.join(".pi").exists(), "nor the first HOME");
+
+        // R3F-A02: a prepared start's relative agent dir is refreshed in the
+        // directory object it verified, which the child enters, not in
+        // whatever now sits at its pathname; other Unix refuses the swap
+        // before writing anything.
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let verified = crate::project_resolve::VerifiedProjectDir::open(&project)
+            .expect("open the project dir");
+        let moved = root.path().join("project-moved");
+        std::fs::rename(&project, &moved).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let project_str = project.display().to_string();
+        let swapped = registry.spawn_agent_in(
+            SpawnOptions {
+                command: Some("cat"),
+                agent_type: Some(AgentType::Pi),
+                cwd: Some(&project_str),
+                env: vec![
+                    (
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        "pane-pi-swapped".to_string(),
+                    ),
+                    ("DOT_AGENT_DECK_BIN".to_string(), "/bin/true".to_string()),
+                    (
+                        crate::orchestrator_ext::ENV_PI_AGENT_DIR.to_string(),
+                        ".pi-agent".to_string(),
+                    ),
+                ],
+                ..SpawnOptions::default()
+            },
+            &verified,
+        );
+        assert!(
+            !project.join(".pi-agent").exists(),
+            "nothing is written into the replacement"
+        );
+        if cfg!(target_os = "linux") {
+            swapped.expect("Linux enters the verified directory");
+            assert!(
+                landed(&moved.join(".pi-agent")),
+                "the extension lands in the directory the child enters"
+            );
+        } else {
+            assert!(
+                matches!(swapped, Err(AgentPtyError::PreparedDirChanged(_))),
+                "other Unix refuses the swap: {swapped:?}"
+            );
+            assert!(!moved.join(".pi-agent").exists());
+        }
 
         let other_home = root.path().join("other-home");
         std::fs::create_dir_all(&other_home).unwrap();

@@ -220,12 +220,12 @@ pub fn materialize(target_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 // Guarded (only when pi is present), idempotent (overwrite), and unset-safe
 // (SKIP, never a `/tmp` guess).
 
-/// Look up `key` in the env overlay first (the value that wins in the child's
-/// environment), then the process env. `None` if absent in both.
+/// Look up `key` in the env overlay first, its last entry being the one the
+/// child gets ([`crate::agent_pty::overlay_value`]), then the process env.
+/// `None` if absent in both.
 fn lookup_env(env: &[(String, String)], key: &str) -> Option<String> {
-    env.iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.clone())
+    crate::agent_pty::overlay_value(env, key)
+        .map(str::to_string)
         .or_else(|| std::env::var(key).ok())
 }
 
@@ -246,9 +246,10 @@ fn resolve_agent_dir_from_env(env: &[(String, String)]) -> Option<PathBuf> {
 /// with the env overlay `env` in the working directory `cwd` resolves (its
 /// `PI_CODING_AGENT_DIR`, else its `HOME`, each from the overlay first), before
 /// the child starts, so it loads the receiver this deck checks it against. A
-/// relative directory is the child's, so it is taken from `cwd`; with no `cwd`
-/// the child starts in the daemon's own directory and so does the relative
-/// path. Returns what failed: the target directory and the error, so the
+/// relative directory is the child's, so it is taken from `cwd`, which the
+/// caller resolves to where the child enters (a prepared start's verified
+/// directory, `agent_pty`'s `pi_refresh_cwd`); with no `cwd` the child starts
+/// in the daemon's own directory and so does the relative path. Returns what failed: the target directory and the error, so the
 /// daemon's warning names where; empty when the files are current or no
 /// directory resolves (nothing to refresh).
 pub fn refresh_for_spawn(env: &[(String, String)], cwd: Option<&Path>) -> Vec<String> {
@@ -274,10 +275,8 @@ pub fn refresh_for_spawn(env: &[(String, String)], cwd: Option<&Path>) -> Vec<St
 /// `opts.env` — as the real-pi e2e tests do — is judged against the same PATH
 /// the child inherits.
 fn pi_present_for_env(env: &[(String, String)]) -> bool {
-    let path = env
-        .iter()
-        .find(|(k, _)| k == "PATH")
-        .map(|(_, v)| std::ffi::OsString::from(v))
+    let path = crate::agent_pty::overlay_value(env, "PATH")
+        .map(std::ffi::OsString::from)
         .or_else(|| std::env::var_os("PATH"));
     match path {
         Some(p) => path_contains_binary(&p, "pi"),
@@ -921,6 +920,12 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         let overlay_empty = vec![("PATH".to_string(), empty.to_string_lossy().into_owned())];
         assert!(!pi_present_for_env(&overlay_empty));
+
+        // Of repeated entries the child gets the last, and so does the check.
+        let twice = [overlay_empty.clone(), overlay.clone()].concat();
+        assert!(pi_present_for_env(&twice));
+        let twice = [overlay, overlay_empty].concat();
+        assert!(!pi_present_for_env(&twice));
     }
 
     #[test]
@@ -1214,7 +1219,7 @@ mod tests {
         node_pin("test/inbox.test.ts", "pi_025");
     }
 
-    /// Scenario: A hand-over approved for one session resumes after a successor took over, a session's delayed shutdown arrives after its successor started (once before and once after the successor's turn began), and the outgoing session reports Thinking after it was replaced. The approval does not reach the successor's Pi and the attempt goes to it uncalled; the delayed shutdown leaves the successor current and reports no Idle into its turn; the stale Thinking is not reported while an in-order outgoing Idle is.
+    /// Scenario: A hand-over approved for one session resumes after a successor took over, a session's delayed shutdown arrives after its successor started (before and after the successor's turn began, for a /new and for a reload), and the outgoing session reports Thinking after it was replaced. The approval does not reach the successor's Pi; the delayed shutdown leaves the successor current, reports no Idle into its turn and still releases the outgoing session's attempts (lost for a /new, the successor's for a reload); the stale Thinking is not reported while an in-order outgoing Idle is.
     #[spec("inbox/pi/026")]
     #[test]
     fn pi_026_session_tokens_a_delayed_approval_shutdown_and_report() {
@@ -1228,7 +1233,7 @@ mod tests {
         node_pin("test/inbox.test.ts", "pi_027");
     }
 
-    /// Scenario: A reload evaluates a different version of the extension while the old receiver holds attempts, one waiting for approval with another queued behind it. The old receiver is disposed before its drained watcher is awaited, keeps reading that watcher (a message, a revoke, and a commit by the reload's successor) without handing anything to Pi, and two initializers share one replacement. A compatible state is carried and answered retained, its waiting and drained messages go to the successor in order, the drained commit is published, and the reload's ownership of a passed attempt lets the successor release it lost; an incompatible state answers unknown and never not handed.
+    /// Scenario: A reload evaluates a different version of the extension while the old receiver holds attempts, one waiting for approval with another queued behind it. The old receiver is disposed before its drained watcher is awaited, keeps reading that watcher (a message, a revoke, and a commit by the reload's successor) without handing anything to Pi, and two initializers share one replacement. A compatible state is carried and answered retained, its waiting and drained messages go to the successor in order, the drained commit is published, and the reload's ownership of a passed attempt lets the successor release it lost; an incompatible state, or a never-released version 1, answers unknown and never not handed, and across it the outgoing session's delayed shutdown reports no Idle into the successor's turn.
     #[spec("inbox/pi/028")]
     #[test]
     fn pi_028_a_version_replacement_dispose_drain_transfer() {

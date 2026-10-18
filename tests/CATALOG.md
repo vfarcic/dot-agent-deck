@@ -8744,7 +8744,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/032 — A Pi spawn refreshes the extension the child will load.
 - **Layer:** Fast (`src/agent_pty.rs`), real `cat` spawns typed Pi with a scratch HOME and PI_CODING_AGENT_DIR.
 - **Agent:** none.
-- **Asserts:** a stale extension in the child's `PI_CODING_AGENT_DIR` is rewritten before it starts and its HOME's `.pi` is untouched; a relative `PI_CODING_AGENT_DIR` is refreshed in the child's working directory and nothing is written in the daemon's; a non-Pi start writes nothing; an unwritable directory gives the `refresh_failed_pi` notice; a Pi start nothing registers for is `not_armed` after the readiness deadline; the probe's binary is the child's absolute `DOT_AGENT_DECK_BIN` whether the overlay sets it or the daemon's environment passes it on, an empty or relative overlay entry masks an inherited one, and otherwise it is the deck's own binary for Pi and the first pin for OpenCode.
+- **Asserts:** a stale extension in the child's `PI_CODING_AGENT_DIR` is rewritten before it starts and its HOME's `.pi` is untouched; a relative `PI_CODING_AGENT_DIR` is refreshed in the child's working directory and nothing is written in the daemon's; of repeated overlay entries the last decides, as for the child (two relative agent dirs, then an absolute one masked by a last empty entry over two HOMEs, which lands under the last HOME); a prepared start whose project directory was renamed and replaced after it was verified gets the extension in the verified directory on Linux, and on other Unix is refused, with nothing written into the replacement either way; a non-Pi start writes nothing; an unwritable directory gives the `refresh_failed_pi` notice; a Pi start nothing registers for is `not_armed` after the readiness deadline; the probe's binary is the child's absolute `DOT_AGENT_DECK_BIN` whether the overlay sets it or the daemon's environment passes it on, an empty or relative overlay entry masks an inherited one, and otherwise it is the deck's own binary for Pi and the first pin for OpenCode.
 - **Does not assert:** the capability probe's verdict, or a Pi started through a wrapper (not detected, by design).
 - **Platform coverage:** mac+linux.
 
@@ -8837,6 +8837,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** the not-started attention is listed and pushed as `not_started`, which is not an uncertain delivery and offers Retry; a card hydrated from the summary counts it as not started only and says `✉ may not have reached the agent` with its reason; a turn starting withdraws it from the next push; held_long replaces it as one row once the hour is up; a commit clears it; a card listing one uncertain, one not-started and one held-long item counts 1/1/1 and leads with the uncertain delivery.
 - **Does not assert:** the rendered card (inbox/status/023).
+- **Platform coverage:** all.
+
+##### inbox/boundary/046 — An inbox message's deliveries count every copy a receipt stream was handed.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub with an OpenCode and a Pi receipt stream, read back through the inbox listing.
+- **Agent:** none.
+- **Asserts:** for each stream, a held message counts 1 delivery, and after Retry from held_long attention hands a marked repeat it counts 2 while still fetched; a message that lapses through both automatic repeats counts one per copy handed, and a Retry from uncertain counts one more.
+- **Does not assert:** offers, which count assignments rather than copies; a real Pi (inbox/pi/022, lane 2).
 - **Platform coverage:** all.
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
@@ -10554,7 +10561,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/026 — Pi session tokens fence a delayed approval, shutdown and report.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** An approval that resumes after a swap does not call the old `pi` and the attempt goes to the successor after a new `may`; a delayed shutdown leaves the successor current, and one arriving after the successor reported Thinking reports no Idle and leaves the successor's follow-up held; a stale Thinking is not reported while an in-order outgoing Idle is.
+- **Asserts:** An approval that resumes after a swap does not call the old `pi` and the attempt goes to the successor after a new `may`; a delayed shutdown leaves the successor current, and one arriving after the successor reported Thinking reports no Idle and leaves the successor's follow-up held; a delayed `/new` shutdown still releases the outgoing session's passed attempt `lost` (no `not_handed`) and submits its unseen one to the successor, and a delayed reload shutdown hands its passed attempt to the successor, whose settle releases it `lost`; a stale Thinking is not reported while an in-order outgoing Idle is.
 - **Does not assert:** Report retries (orchestrator.test.ts).
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.
@@ -10570,7 +10577,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/028 — A Pi extension version replacement disposes, drains and transfers.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** The old receiver is disposed before its drain, the drain is awaited (exit, or SIGTERM then SIGKILL at the deadline), two initializers share one replacement, a compatible state answers `retained` and an incompatible one `unknown`, revokes answer `already_handed` and nothing is reported `not_handed`, and the disposed receiver delivers nothing to Pi. During the drain the old receiver still takes a message and a revoke and keeps a commit the reload's successor witnessed; afterwards the message goes to the successor, the re-sent revoke is answered `revoked_ack` and the commit is published by the new watcher. An attempt waiting for approval and one queued behind it both reach the successor, in order, each behind a fresh `may`. A passed attempt's reload ownership is carried, so a later settle or the successor's `/new` releases it `lost`.
+- **Asserts:** The old receiver is disposed before its drain, the drain is awaited (exit, or SIGTERM then SIGKILL at the deadline), two initializers share one replacement, a compatible state answers `retained` and an incompatible one `unknown` (a different state shape, or version 1, never released), revokes answer `already_handed` and nothing is reported `not_handed`, and the disposed receiver delivers nothing to Pi. During the drain the old receiver still takes a message and a revoke and keeps a commit the reload's successor witnessed; afterwards the message goes to the successor, the re-sent revoke is answered `revoked_ack` and the commit is published by the new watcher. An attempt waiting for approval and one queued behind it both reach the successor, in order, each behind a fresh `may`. A passed attempt's reload ownership is carried, so a later settle or the successor's `/new` releases it `lost`. Across an incompatible replacement the successor's session number is above the outgoing one's, and the outgoing session's delayed shutdown reports no Idle after the successor's Thinking, also when the old state had no count to carry.
 - **Does not assert:** A real Pi reload (lane 2).
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.

@@ -534,7 +534,9 @@ pub struct Message {
     pub state: MessageState,
     /// Hand-overs so far: each fetch counts one, and for an offer each
     /// assignment to a holder. A redelivery its consumer holds is refunded
-    /// ([`Inbox::hold`]).
+    /// ([`Inbox::hold`]). For a receipt receiver each hand-out of a direct
+    /// message counts one, its automatic repeats and Retries included
+    /// ([`Inbox::count_receipt_repeat`]).
     pub deliveries: u32,
     /// When it was first fetched, which starts [`InboxLimits::hold_bound`];
     /// for an offer, first fetched by its current holder.
@@ -1548,6 +1550,26 @@ impl Inbox {
             },
         );
         Some(self.messages[index].clone())
+    }
+
+    /// PRD #1666 §2: another hand-out of message `id`'s current assignment —
+    /// an automatic repeat or a Retry — issued while a receipt receiver holds
+    /// it fetched. It counts one more delivery, as each fetch does for a
+    /// legacy consumer; an offer counts its assignments, so a repeat to the
+    /// same holder adds none. Returns whether it counted.
+    pub fn count_receipt_repeat(&mut self, id: &str, pane_id: &str, agent_id: &str) -> bool {
+        let Some(index) = self.find_for(id, pane_id, agent_id) else {
+            return false;
+        };
+        let message = &mut self.messages[index];
+        if message.owner != Some(AssignmentOwner::Receipt)
+            || !matches!(message.state, MessageState::Fetched { .. })
+            || message.is_offer()
+        {
+            return false;
+        }
+        message.deliveries += 1;
+        true
     }
 
     /// PRD #1666 §2 rule 3: a `Receipt`-owned message every attempt of which

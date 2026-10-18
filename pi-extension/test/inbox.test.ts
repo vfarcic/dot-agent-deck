@@ -23,7 +23,9 @@ const hooks = registerHooks({
 		return nextResolve(specifier, context);
 	},
 });
-const { default: extension, DOORBELL_REGISTER_WAIT_MS, INBOX_UNSEEN_RECHECK_MS } = await import("../src/index.ts");
+const { default: extension, DOORBELL_REGISTER_WAIT_MS, INBOX_UNSEEN_RECHECK_MS, INBOX_VERSION } = await import("../src/index.ts");
+/** Another released receipt version than this module's, as a reload that changes version finds it. */
+const OTHER_VERSION = INBOX_VERSION + 1;
 hooks.deregister();
 
 type Handler = (event: any, ctx: any) => unknown;
@@ -638,6 +640,49 @@ test("pi_026 a delayed shutdown after the successor's Thinking reports no Idle",
 	assert.deepEqual(child.sent("possess").at(-1).held, [ref()], "the follow-up stays held");
 });
 
+/// Scenario: A session passes an attempt through the gate and is replaced by /new, its shutdown arriving only after the successor started. The outgoing attempt is still released lost, and the successor's settle reports nothing not handed for it; a sent attempt the gate never saw is submitted again to the successor.
+test("pi_026 a delayed /new shutdown still releases the outgoing session's attempts", async () => {
+	const { pi, child } = await started();
+	child.hand(ref(ID));
+	await settle();
+	await pi.gate();
+	child.hand(ref(ID2));
+	await settle();
+	assert.equal(pi.sends.length, 2, "the second is sent and unseen by the gate");
+	const next = instance();
+	await next.emit("session_start", { reason: "new" });
+	await pi.emit("session_shutdown", { reason: "new" });
+	await settle();
+	assert.deepEqual(child.sent("possess").at(-1).held, [ref(ID2)], "the passed attempt is released lost");
+	assert.equal(next.sends.length, 1, "the unseen one goes to the successor");
+	assert.ok(next.sends[0].text.includes(block(ID2)));
+	await next.gate();
+	await next.start(ID2);
+	await next.emit("agent_start", {});
+	await next.emit("agent_settled", {});
+	assert.deepEqual(child.refs("committed"), [ref(ID2)]);
+	child.say({ revoke: [ref(ID)] });
+	assert.deepEqual(child.refs("already_handed"), [ref(ID)], "possibly handed");
+	assert.deepEqual(child.refs("not_handed"), []);
+});
+
+/// Scenario: A session passes an attempt through the gate and reloads, its shutdown arriving only after the reload's successor started. The successor owns the attempt: a settle after a run with nothing queued releases it lost.
+test("pi_026 a delayed reload shutdown hands what passed to the successor", async () => {
+	const { pi, child } = await started();
+	child.hand(ref());
+	await settle();
+	await pi.gate();
+	const next = instance();
+	await next.emit("session_start", { reason: "reload" });
+	await pi.emit("session_shutdown", { reason: "reload" });
+	await settle();
+	assert.deepEqual(child.sent("possess").at(-1).held, [ref()], "a reload releases nothing");
+	await next.emit("agent_start", {});
+	await next.emit("agent_settled", {});
+	assert.deepEqual(child.sent("possess").at(-1).held, [], "the successor released it lost");
+	assert.deepEqual(child.refs("not_handed"), []);
+});
+
 /// Scenario: Inputs carrying a hand-over tag this process never issued, a tag from an older version's format and a well-formed tag for an unknown attempt reach the gate. Each is consumed, and nothing is reported to the deck.
 test("pi_027 unknown or older tags are consumed silently", async () => {
 	const { pi, child } = await started();
@@ -649,14 +694,15 @@ test("pi_027 unknown or older tags are consumed silently", async () => {
 
 /// Scenario: A reload evaluates a different version of the extension while the old receiver holds attempts. The old receiver is disposed before its watcher is drained, the drain is awaited (its exit, or forced at the deadline), two initializers share one replacement, compatible state is carried and answered retained, an incompatible one answers unknown and never not handed, and the old receiver's callbacks deliver nothing after disposal.
 test("pi_028 a version replacement: dispose, drain, transfer", async (t) => {
-	for (const compatible of [true, false]) {
+	// Version 1 was never released: its state is not carried even in this shape.
+	for (const [version, stateVersion, compatible] of [[OTHER_VERSION, undefined, true], [OTHER_VERSION, 0, false], [1, undefined, false]] as const) {
 		const { pi, child } = await started();
 		child.hand(ref());
 		await settle();
 		await pi.gate();
 		const old = (globalThis as any)[PROCESS];
-		old.version = 0;
-		if (!compatible) old.stateVersion = 0;
+		old.version = version;
+		if (stateVersion !== undefined) old.stateVersion = stateVersion;
 		const order: string[] = [];
 		const drain = old.receiver.drain;
 		old.receiver.drain = () => { order.push(old.disposed ? "drain after dispose" : "drain before dispose"); return drain(); };
@@ -689,7 +735,7 @@ test("pi_028 a version replacement: dispose, drain, transfer", async (t) => {
 		t.mock.timers.enable({ apis: ["setTimeout"] });
 		const { child } = await started();
 		const old = (globalThis as any)[PROCESS];
-		old.version = 0;
+		old.version = OTHER_VERSION;
 		const next = instance();
 		const start = next.emit("session_start", { reason: "reload" });
 		await settle();
@@ -710,7 +756,7 @@ const ID3 = "m-k3xzq2ab-cccccccc54b742c9";
  * lets the old watcher exit and resolves once the successor is current.
  */
 async function replacing(pi: ReturnType<typeof instance>, child: Watcher) {
-	(globalThis as any)[PROCESS].version = 0;
+	(globalThis as any)[PROCESS].version = OTHER_VERSION;
 	await pi.emit("session_shutdown", { reason: "reload" });
 	const next = instance();
 	const start = next.emit("session_start", { reason: "reload" });
@@ -789,6 +835,38 @@ test("pi_028 a replacement carries the reload's ownership of what passed", async
 		second.say({ revoke: [ref()] });
 		assert.deepEqual(second.refs("already_handed"), [ref()], `${end}: possibly handed`);
 		assert.deepEqual(second.refs("not_handed"), []);
+	}
+});
+
+/// Scenario: A reload replaces the receiver with one of an incompatible state, and its successor reports Thinking before the outgoing session's delayed shutdown arrives, once with the outgoing token count carried and once from a state with no count to carry. The successor's session number is above the outgoing one's, and either way the outgoing shutdown reports no Idle into the successor's turn.
+test("pi_028 a delayed shutdown across an incompatible replacement reports no Idle", async () => {
+	for (const carried of [true, false]) {
+		const { pi, child } = await started();
+		const types: string[] = [];
+		const record = async (_bin: string, argv: string[]) => {
+			if (argv[0] === "agent-event") types.push(argv[argv.indexOf("--type") + 1]);
+			return { code: 0, stdout: "", stderr: "", killed: false };
+		};
+		pi.pi.exec = record;
+		const old = (globalThis as any)[PROCESS];
+		const outgoing = old.current.token;
+		old.version = OTHER_VERSION;
+		old.stateVersion = 0;
+		if (!carried) delete old.nextToken;
+		const next = instance();
+		next.pi.exec = record;
+		next.ctx.isIdle = () => false;
+		const start = next.emit("session_start", { reason: "reload" });
+		await settle();
+		child.exit(0);
+		await start;
+		const current = (globalThis as any)[PROCESS].current.token;
+		if (carried) assert.ok(current > outgoing, `the successor's token ${current} is above ${outgoing}`);
+		await next.emit("before_agent_start", { prompt: "keep working" });
+		await next.emit("agent_start", {});
+		await pi.emit("session_shutdown", { reason: "reload" });
+		await settle();
+		assert.deepEqual(types, ["finished", "prompt", "running"], `carried=${carried}: no Idle after the successor's Thinking`);
 	}
 });
 

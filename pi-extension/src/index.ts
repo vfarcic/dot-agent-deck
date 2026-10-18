@@ -119,7 +119,13 @@ inboxBinary(() => (isAbsoluteOverride(deckBin, process.platform) ? deckBin : und
  * Bumped whenever this file's inbox code changes: a reload that evaluates a
  * different version replaces the process's receiver (`replaceVersion`).
  */
-const INBOX_VERSION = 2;
+export const INBOX_VERSION = 2;
+/**
+ * The first receipt version a release carries. Version 1 was never released,
+ * so a receiver older than this one is replaced as incompatible: nothing is
+ * carried from it (`carriesState`).
+ */
+const FIRST_RECEIPT_VERSION = 2;
 /**
  * The shape of what a replacement carries over (`Transfer`). Bumped only when
  * that shape changes; a replacement across a different one carries nothing.
@@ -569,7 +575,7 @@ function witness(proc: InboxProcess, instance: Instance): boolean {
 	if (instance.proc === proc) {
 		return !proc.disposed && instance.token !== undefined && proc.current?.token === instance.token;
 	}
-	return instance.proc === undefined && instance.starting && proc.current === undefined && proc.stateVersion === INBOX_STATE_VERSION;
+	return instance.proc === undefined && instance.starting && proc.current === undefined && carriesState(proc);
 }
 
 /**
@@ -715,15 +721,31 @@ function sessionStart(proc: InboxProcess, instance: Instance, pi: ExtensionAPI, 
  * — and what it sent that the gate has not seen goes back, uncalled, to the
  * front of `pending` for the successor, which submits it again under a new
  * tag (the old one is consumed at any gate). A reload keeps the agent and its
- * queue, so it releases nothing. The watcher is left running either way.
+ * queue, so it releases nothing: what passed is the reload's successor's. The
+ * watcher is left running either way.
+ *
+ * A shutdown that arrives after its successor became current does all of
+ * this for its own attempts too — a reload's then go straight to the current
+ * session — and only leaves `current` alone; `reporting` drops its Idle.
  */
 function sessionShutdown(proc: InboxProcess, instance: Instance, reason: unknown): void {
 	instance.shutdown = true;
-	if (instance.token === undefined || proc.current?.token !== instance.token) {
+	if (instance.token === undefined) {
 		return;
 	}
+	const wasCurrent = proc.current?.token === instance.token;
 	if (reason === "reload") {
-		proc.reloadedFrom = instance.token;
+		if (wasCurrent) {
+			proc.reloadedFrom = instance.token;
+		} else if (proc.current === undefined) {
+			proc.reloadedFrom ??= instance.token;
+		} else {
+			for (const passed of proc.passed.values()) {
+				if (passed.token === instance.token) {
+					passed.token = proc.current.token;
+				}
+			}
+		}
 	} else {
 		for (const [key, passed] of proc.passed) {
 			if (passed.token === instance.token && !passed.lost && !proc.committed.has(key)) {
@@ -741,7 +763,11 @@ function sessionShutdown(proc: InboxProcess, instance: Instance, reason: unknown
 		}
 		proc.pending.unshift(...unseen);
 	}
-	proc.current = undefined;
+	if (wasCurrent) {
+		proc.current = undefined;
+	} else {
+		pump(proc);
+	}
 }
 
 /**
@@ -757,8 +783,21 @@ function reporting(proc: InboxProcess, instance: Instance, eventName: string): b
 	if (eventName !== "session_shutdown") {
 		return instance.token !== undefined && proc.current?.token === instance.token;
 	}
-	const latest = holder[INBOX_PROCESS] as { current?: { token?: unknown } } | undefined;
-	return [proc.current, latest?.current].every((current) => current === undefined || current.token === instance.token);
+	if (proc.current !== undefined && proc.current.token !== instance.token) {
+		return false;
+	}
+	// A token is only unique within one process's state, so a replacement's
+	// current session is a successor whatever its number.
+	const latest = holder[INBOX_PROCESS] as { current?: unknown } | undefined;
+	return latest === undefined || latest === proc || latest.current === undefined;
+}
+
+/**
+ * Whether a replacement carries `old`'s state: a released receipt version
+ * whose `Transfer` shape is this one's.
+ */
+function carriesState(old: Partial<InboxProcess>): boolean {
+	return typeof old.version === "number" && old.version >= FIRST_RECEIPT_VERSION && old.stateVersion === INBOX_STATE_VERSION;
 }
 
 /**
@@ -768,7 +807,7 @@ function reporting(proc: InboxProcess, instance: Instance, eventName: string): b
  * cannot say what the old one handed, so it answers every revoke
  * `already_handed` and resumes `unknown` — possibly handed, never not handed.
  */
-function createProcess(transfer?: Transfer, replaced = false): InboxProcess {
+function createProcess(transfer?: Transfer, replaced = false, tokenFloor = 0): InboxProcess {
 	const proc: InboxProcess = {
 		version: INBOX_VERSION,
 		stateVersion: INBOX_STATE_VERSION,
@@ -780,7 +819,7 @@ function createProcess(transfer?: Transfer, replaced = false): InboxProcess {
 		committed: transfer?.committed ?? new Set(),
 		pending: transfer?.pending ?? [],
 		current: undefined,
-		nextToken: transfer?.nextToken ?? 0,
+		nextToken: Math.max(transfer?.nextToken ?? 0, tokenFloor),
 		nextTag: transfer?.nextTag ?? 0,
 		tagPrefix: transfer?.tagPrefix ?? (Math.random().toString(36).slice(2, 10) || "0"),
 		runs: transfer?.runs ?? 0,
@@ -844,7 +883,9 @@ function inboxProcess(): InboxProcess {
  * PRD #1666 §0.5: the process's receiver came from a different version of this
  * file (a reload after the extension was refreshed). It is disposed at once —
  * it hands nothing more to Pi and requests no grant — and its watcher
- * drained, awaited, so the two never publish side by side. While it drains,
+ * drained, awaited: until the old watcher exits, or until the drain's
+ * deadline forces it (a kill is sent and this receiver stops reading it,
+ * without seeing the exit), no successor starts. While it drains,
  * the outgoing receiver still reads its watcher (as that version's code
  * does): a message is held and joins `pending`, a revoke is answered in its
  * state, and a commit is kept as an unsent report. Then a new receiver
@@ -852,8 +893,11 @@ function inboxProcess(): InboxProcess {
  * and the reload's ownership of what passed when their shape is this
  * version's: it answers the deck's resumes `retained`, hands `pending` to
  * the successor and publishes the kept reports once it registers. Holding
- * nothing otherwise, it answers `unknown` — possibly handed, never not handed.
- * One replacement serves every instance that asks while it runs.
+ * nothing otherwise — a different shape, or a version older than the first
+ * released one (`carriesState`) — it answers `unknown`: possibly handed,
+ * never not handed. Session tokens keep counting up across either, so no
+ * successor reuses an outgoing session's number. One replacement serves
+ * every instance that asks while it runs.
  */
 async function replaceVersion(): Promise<InboxProcess> {
 	for (;;) {
@@ -881,7 +925,7 @@ async function replaceVersion(): Promise<InboxProcess> {
 				// Gone already.
 			}
 			let transfer: Transfer | undefined;
-			if (old.stateVersion === INBOX_STATE_VERSION && typeof receiver?.exportState === "function") {
+			if (carriesState(old) && typeof receiver?.exportState === "function") {
 				transfer = {
 					receiver: receiver.exportState(),
 					sent: old.sent ?? new Map(),
@@ -901,7 +945,7 @@ async function replaceVersion(): Promise<InboxProcess> {
 					clearTimeout(timer);
 				}
 			}
-			holder[INBOX_PROCESS] = createProcess(transfer, true);
+			holder[INBOX_PROCESS] = createProcess(transfer, true, typeof old.nextToken === "number" ? old.nextToken : 0);
 		})();
 		await old.replacing;
 	}
