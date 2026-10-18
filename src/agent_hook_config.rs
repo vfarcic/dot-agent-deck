@@ -913,7 +913,7 @@ fn create_temp_excl(tmp: &Path) -> io::Result<std::fs::File> {
 /// not the quality of this tail — is what makes a squatted name unfollowable, so
 /// the tail carries only the weaker second-layer job of being unguessable to a
 /// writer that cannot observe the keys, which a keyed hash already is.
-fn temp_path(dir: &Path, name: &str) -> PathBuf {
+pub(crate) fn temp_path(dir: &Path, name: &str) -> PathBuf {
     use std::hash::{BuildHasher as _, Hasher as _, RandomState};
     use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -242,29 +242,299 @@ fn resolve_agent_dir_from_env(env: &[(String, String)]) -> Option<PathBuf> {
     )
 }
 
+/// Where a Pi child starts, which is where its relative agent dir resolves.
+pub enum ChildDir<'a> {
+    /// The daemon's own directory, which the child inherits.
+    Inherited,
+    /// The pathname the child enters.
+    Path(&'a Path),
+    /// A prepared start's verified directory object, held open, which the
+    /// child enters whatever its pathname `path` names by then.
+    #[cfg(unix)]
+    Held {
+        dir: std::os::fd::BorrowedFd<'a>,
+        path: &'a Path,
+    },
+}
+
 /// PRD #1666 G6: rewrite the extension into the directory a Pi child spawned
-/// with the env overlay `env` in the working directory `cwd` resolves (its
-/// `PI_CODING_AGENT_DIR`, else its `HOME`, each from the overlay first), before
-/// the child starts, so it loads the receiver this deck checks it against. A
-/// relative directory is the child's, so it is taken from `cwd`, which the
-/// caller resolves to where the child enters (a prepared start's verified
-/// directory, `agent_pty`'s `pi_refresh_cwd`); with no `cwd` the child starts
-/// in the daemon's own directory and so does the relative path. Returns what failed: the target directory and the error, so the
-/// daemon's warning names where; empty when the files are current or no
-/// directory resolves (nothing to refresh).
-pub fn refresh_for_spawn(env: &[(String, String)], cwd: Option<&Path>) -> Vec<String> {
-    let Some(target) = resolve_agent_dir_from_env(env).map(|dir| {
-        let dir = match cwd {
-            Some(cwd) if dir.is_relative() => cwd.join(dir),
-            _ => dir,
-        };
-        extension_dir_in(&dir)
-    }) else {
+/// with the env overlay `env` in `cwd` resolves (its `PI_CODING_AGENT_DIR`,
+/// else its `HOME`, each from the overlay first), before the child starts, so
+/// it loads the receiver this deck checks it against. A relative directory is
+/// the child's, so it is taken from `cwd`: for [`ChildDir::Held`] every
+/// directory and file is created relative to the held descriptor
+/// ([`materialize_beneath`]), so a rename-and-replace of the project's
+/// pathname cannot redirect a write into the replacement. Returns what
+/// failed: the target directory and the error, so the daemon's warning names
+/// where; empty when the files are current or no directory resolves (nothing
+/// to refresh).
+pub fn refresh_for_spawn(env: &[(String, String)], cwd: ChildDir<'_>) -> Vec<String> {
+    let Some(agent_dir) = resolve_agent_dir_from_env(env) else {
         return Vec::new();
     };
-    match materialize(&target) {
-        Ok(_) => Vec::new(),
+    let extension = extension_dir_in(&agent_dir);
+    let (target, written) = match cwd {
+        #[cfg(unix)]
+        ChildDir::Held { dir, path } if extension.is_relative() => {
+            let target = path.join(&extension);
+            let written = materialize_beneath(dir, &extension, &target);
+            (target, written)
+        }
+        #[cfg(unix)]
+        ChildDir::Held { .. } => {
+            let written = materialize(&extension).map(drop);
+            (extension, written)
+        }
+        ChildDir::Path(cwd) => {
+            let target = cwd.join(&extension);
+            let written = materialize(&target).map(drop);
+            (target, written)
+        }
+        ChildDir::Inherited => {
+            let written = materialize(&extension).map(drop);
+            (extension, written)
+        }
+    };
+    match written {
+        Ok(()) => Vec::new(),
         Err(error) => vec![format!("{}: {error}", target.display())],
+    }
+}
+
+/// [`materialize`], with `relative` (the extension directory) resolved
+/// beneath the directory `base` holds open rather than by pathname: each
+/// component is created (`mkdirat`) and opened (`openat`) from the one before
+/// it, and each file is judged, compared and published by an atomic rename
+/// (`renameat`) of an owner-only temp file in the directory reached that way.
+/// `shown` is the pathname the target had when it was resolved, for the test
+/// containment guard and for messages; nothing is written through it. A `..`
+/// or a symlinked component is followed, as the child following the same
+/// relative path would.
+#[cfg(unix)]
+pub fn materialize_beneath(
+    base: std::os::fd::BorrowedFd<'_>,
+    relative: &Path,
+    shown: &Path,
+) -> std::io::Result<()> {
+    use std::io::{Read as _, Write as _};
+
+    // PRD #1487: judged before anything exists, as `materialize` judges them.
+    crate::config_write_guard::ensure_config_write_allowed(shown)?;
+    for (name, _) in EXTENSION_FILES {
+        crate::config_write_guard::ensure_config_write_allowed(&shown.join(name))?;
+    }
+    let mut dir = beneath::open_dir(base, std::ffi::OsStr::new("."))?;
+    for component in relative.components() {
+        use std::path::Component;
+        let name = match component {
+            Component::CurDir => continue,
+            Component::ParentDir => std::ffi::OsStr::new(".."),
+            Component::Normal(name) => {
+                beneath::make_dir(&dir, name)?;
+                name
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} is not a relative directory", relative.display()),
+                ));
+            }
+        };
+        dir = beneath::open_dir(std::os::fd::AsFd::as_fd(&dir), name)?;
+    }
+    for (name, contents) in EXTENSION_FILES {
+        let name = std::ffi::OsStr::new(name);
+        let existing = beneath::lstat(&dir, name)?;
+        // PRD #1666 hardening M8, as in `materialize`.
+        if existing.is_some_and(|mode| mode & libc::S_IFMT == libc::S_IFLNK) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is a symlink; remove it so the deck can write its Pi extension there",
+                    shown.join(name).display()
+                ),
+            ));
+        }
+        // An identical file is not rewritten (PRD #1487).
+        if existing.is_some() {
+            let mut current = Vec::new();
+            if beneath::open_file(&dir, name)
+                .and_then(|mut file| file.read_to_end(&mut current))
+                .is_ok()
+                && current == contents.as_bytes()
+            {
+                continue;
+            }
+        }
+        let landed = existing.map_or(0o600, |mode| mode & 0o777);
+        let (mut file, tmp) = beneath::create_temp(&dir, name)?;
+        let written = (|| {
+            beneath::set_mode(&file, landed)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        })();
+        drop(file);
+        if let Err(error) = written.and_then(|()| beneath::rename(&dir, &tmp, name)) {
+            beneath::unlink(&dir, &tmp);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// The `*at` system calls [`materialize_beneath`] is made of, each relative
+/// to a directory descriptor.
+#[cfg(unix)]
+mod beneath {
+    use std::ffi::{CString, OsStr, OsString};
+    use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    fn c_name(name: &OsStr) -> std::io::Result<CString> {
+        CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "a name holds a NUL byte")
+        })
+    }
+
+    fn opened(fd: libc::c_int) -> std::io::Result<OwnedFd> {
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a descriptor `openat` just returned, owned by nothing else.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn checked(result: libc::c_int) -> std::io::Result<()> {
+        if result < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Open the directory `name` beneath `at`.
+    pub(super) fn open_dir(at: BorrowedFd<'_>, name: &OsStr) -> std::io::Result<OwnedFd> {
+        let name = c_name(name)?;
+        // SAFETY: a valid descriptor and a NUL-terminated name.
+        opened(unsafe {
+            libc::openat(
+                at.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        })
+    }
+
+    /// Create the directory `name` beneath `at` unless something is there.
+    pub(super) fn make_dir(at: &OwnedFd, name: &OsStr) -> std::io::Result<()> {
+        let name = c_name(name)?;
+        // SAFETY: a valid descriptor and a NUL-terminated name.
+        match checked(unsafe { libc::mkdirat(at.as_raw_fd(), name.as_ptr(), 0o777) }) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            other => other,
+        }
+    }
+
+    /// The mode of `name` beneath `at`, not following a symlink, or `None`
+    /// when nothing is there.
+    pub(super) fn lstat(at: &OwnedFd, name: &OsStr) -> std::io::Result<Option<libc::mode_t>> {
+        let name = c_name(name)?;
+        // SAFETY: `stat` is plain data, filled in by the call before it is read.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid descriptor, a NUL-terminated name and a buffer.
+        let result = unsafe {
+            libc::fstatat(
+                at.as_raw_fd(),
+                name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        match checked(result) {
+            Ok(()) => Ok(Some(stat.st_mode)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Open the file `name` beneath `at` to read it, never through a symlink.
+    pub(super) fn open_file(at: &OwnedFd, name: &OsStr) -> std::io::Result<std::fs::File> {
+        let name = c_name(name)?;
+        // SAFETY: a valid descriptor and a NUL-terminated name.
+        opened(unsafe {
+            libc::openat(
+                at.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        })
+        .map(std::fs::File::from)
+    }
+
+    /// Exclusively create an owner-only temp file for a publish of `name`
+    /// beneath `at`, under the name `agent_hook_config`'s publishes use,
+    /// redrawn on a collision.
+    pub(super) fn create_temp(
+        at: &OwnedFd,
+        name: &OsStr,
+    ) -> std::io::Result<(std::fs::File, OsString)> {
+        let mut last = None;
+        for _ in 0..16 {
+            let drawn = crate::agent_hook_config::temp_path(
+                std::path::Path::new(""),
+                &name.to_string_lossy(),
+            )
+            .into_os_string();
+            let tmp = c_name(&drawn)?;
+            // SAFETY: a valid descriptor and a NUL-terminated name.
+            let fd = unsafe {
+                libc::openat(
+                    at.as_raw_fd(),
+                    tmp.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600 as libc::c_uint,
+                )
+            };
+            match opened(fd) {
+                Ok(fd) => return Ok((std::fs::File::from(fd), drawn)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not create a temp file for the publish",
+            )
+        }))
+    }
+
+    /// Give `file` the mode `mode`, which no umask filters.
+    pub(super) fn set_mode(file: &std::fs::File, mode: libc::mode_t) -> std::io::Result<()> {
+        // SAFETY: a valid descriptor.
+        checked(unsafe { libc::fchmod(file.as_raw_fd(), mode) })
+    }
+
+    /// Rename `from` over `to`, both beneath `at`.
+    pub(super) fn rename(at: &OwnedFd, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+        let (from, to) = (c_name(from)?, c_name(to)?);
+        let fd = at.as_fd().as_raw_fd();
+        // SAFETY: a valid descriptor and NUL-terminated names.
+        checked(unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) })
+    }
+
+    /// Remove an abandoned temp file `name` beneath `at`, best effort.
+    pub(super) fn unlink(at: &OwnedFd, name: &OsStr) {
+        if let Ok(name) = c_name(name) {
+            // SAFETY: a valid descriptor and a NUL-terminated name.
+            unsafe { libc::unlinkat(at.as_raw_fd(), name.as_ptr(), 0) };
+        }
     }
 }
 
@@ -474,6 +744,74 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// Scenario: A Pi child's relative agent dir is refreshed for a prepared start whose project directory is renamed away and replaced after the start was checked, before the extension is written. The extension is created in the directory object the start verified and holds open, where the child will enter, and nothing is written into the replacement; a symlink planted at a file's name there is refused, and a current file is left as it is.
+    #[spec("inbox/boundary/032")]
+    #[cfg(unix)]
+    #[test]
+    fn boundary_032_a_prepared_refresh_writes_beneath_the_held_directory_after_a_swap() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let held = crate::project_resolve::VerifiedProjectDir::open(&project).unwrap();
+        // The swap lands after the start's own check, before the write.
+        let moved = root.path().join("project-moved");
+        std::fs::rename(&project, &moved).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let env = vec![(ENV_PI_AGENT_DIR.to_string(), ".pi-agent".to_string())];
+        let held_dir = || ChildDir::Held {
+            dir: std::os::fd::AsFd::as_fd(&held),
+            path: &project,
+        };
+        assert_eq!(refresh_for_spawn(&env, held_dir()), Vec::<String>::new());
+        let landed = moved
+            .join(".pi-agent")
+            .join("extensions")
+            .join(EXTENSION_DIR_NAME);
+        for (name, contents) in EXTENSION_FILES {
+            assert_eq!(
+                std::fs::read_to_string(landed.join(name)).unwrap(),
+                *contents
+            );
+            let mode = std::fs::metadata(landed.join(name)).unwrap().permissions();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+                0o600
+            );
+        }
+        assert!(
+            !project.join(".pi-agent").exists(),
+            "nothing is written into the replacement"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&landed)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file left: {leftovers:?}");
+
+        // A current file is not rewritten.
+        let (first, _) = EXTENSION_FILES[0];
+        let inode =
+            |path: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap());
+        let before = inode(&landed.join(first));
+        assert_eq!(refresh_for_spawn(&env, held_dir()), Vec::<String>::new());
+        assert_eq!(
+            inode(&landed.join(first)),
+            before,
+            "an identical file stays"
+        );
+
+        // A symlink at a file's name is refused, and its target kept.
+        let victim = root.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        std::fs::remove_file(landed.join(first)).unwrap();
+        std::os::unix::fs::symlink(&victim, landed.join(first)).unwrap();
+        let failed = refresh_for_spawn(&env, held_dir());
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].contains("is a symlink"), "{failed:?}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
     }
 
     /// Hardening M8: a destination that is a symlink is refused, and the file

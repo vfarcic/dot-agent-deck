@@ -921,9 +921,10 @@ impl AgentPtyError {
 
 /// The value of `key` in a spawn's env overlay as the child gets it:
 /// [`SpawnOptions::env`] is applied in order, so of repeated entries the last
-/// wins. `None` when the overlay does not set `key`. Every daemon-side reading
-/// of what a child will see goes through this, so none of them can pick a
-/// different entry from the one the child gets.
+/// wins. `None` when the overlay does not set `key`. Its readers — the
+/// capability probe's `DOT_AGENT_DECK_BIN`, and the Pi refresh's
+/// `PI_CODING_AGENT_DIR`, `HOME` and `PATH` — therefore pick the entry the
+/// child gets.
 pub(crate) fn overlay_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
     env.iter()
         .rev()
@@ -1392,31 +1393,38 @@ fn prepared_spawn_cwd(
 }
 
 /// PRD #1666 G6: the directory a Pi child's relative agent dir is resolved
-/// in, which is where the child enters. For a prepared start that is
-/// [`prepared_spawn_cwd`], the value the spawn itself enters: on Linux the
-/// verified directory through its held descriptor, so a rename-and-replace of
-/// the pathname cannot redirect the refresh into another directory; on other
-/// Unix the pathname, once its identity still matches the verified one, so a
-/// replacement made before this check is refused (one made between this check
-/// and the write is caught only by the spawn's own check, after the write). A
-/// start that cannot enter its directory is refused here, as the spawn will
-/// refuse it, and nothing is written. Otherwise `cwd`, or `None` for a child
-/// that inherits the daemon's directory.
-fn pi_refresh_cwd(
-    cwd: Option<&str>,
-    dir: SpawnDir<'_>,
-) -> Result<Option<std::path::PathBuf>, String> {
+/// in, which is where the child enters. For a prepared start, on every Unix,
+/// that is the verified directory object itself, held open: the refresh
+/// creates and writes everything relative to its descriptor
+/// ([`crate::orchestrator_ext::materialize_beneath`]), so a rename-and-replace
+/// of the pathname, before or after this check, cannot redirect a write into
+/// another directory. A start that cannot enter its directory
+/// ([`prepared_spawn_cwd`]) is refused here, as the spawn will refuse it, and
+/// nothing is written. Otherwise `cwd`, or the daemon's own directory for a
+/// child that inherits it.
+fn pi_refresh_cwd<'a>(
+    cwd: Option<&'a str>,
+    dir: SpawnDir<'a>,
+) -> Result<crate::orchestrator_ext::ChildDir<'a>, String> {
+    use crate::orchestrator_ext::ChildDir;
     #[cfg(unix)]
     if let Some(dir) = dir {
-        return prepared_spawn_cwd(cwd, dir)
-            .map(|entered| Some(std::path::PathBuf::from(entered)))
-            .map_err(|error| format!("{}: {error}", cwd.unwrap_or("(no working directory)")));
+        prepared_spawn_cwd(cwd, dir)
+            .map_err(|error| format!("{}: {error}", cwd.unwrap_or("(no working directory)")))?;
+        // `prepared_spawn_cwd` refuses a start with no working directory.
+        let path = std::path::Path::new(cwd.unwrap_or_default());
+        return Ok(ChildDir::Held {
+            dir: std::os::fd::AsFd::as_fd(dir),
+            path,
+        });
     }
     #[cfg(not(unix))]
     if let Some(never) = dir {
         match *never {}
     }
-    Ok(cwd.map(std::path::PathBuf::from))
+    Ok(cwd.map_or(ChildDir::Inherited, |cwd| {
+        ChildDir::Path(std::path::Path::new(cwd))
+    }))
 }
 
 /// The inline program [`exec_program_from_child_cwd`] hands `/bin/sh`: exec the
@@ -9990,7 +9998,7 @@ impl AgentPtyRegistry {
             let env = opts.env.clone();
             let failed = match pi_refresh_cwd(opts.cwd, dir) {
                 Ok(cwd) => crate::inbox_hub::off_the_executor(move || {
-                    crate::orchestrator_ext::refresh_for_spawn(&env, cwd.as_deref())
+                    crate::orchestrator_ext::refresh_for_spawn(&env, cwd)
                 }),
                 Err(refused) => vec![refused],
             };

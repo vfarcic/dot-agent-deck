@@ -358,6 +358,49 @@ test("pi_011 after the gate: already handed, lost on positive settle evidence, h
 	}
 });
 
+/// Scenario: A deck message is handed to Pi while a tool runs, passes the gate and waits in Pi's queue behind that run. One Escape takes it out of the queue into the editor and aborts the tool, and the run settles with nothing queued and no start for the message: it is released lost, never not handed. A follow-up still queued at the settle stays held, and so does one whose run ended before Pi could queue it, which goes on to a preflight of its own.
+test("pi_011 a busy follow-up Escape takes out of the queue is released lost at the settle", async () => {
+	for (const escaped of ["escape", "still-queued", "run-ended-first"]) {
+		const { pi, child } = await started();
+		let queue = 0;
+		pi.ctx.hasPendingMessages = () => queue > 0;
+		// A run with a tool active, as Pi 0.84.4 reports it.
+		pi.ctx.isIdle = () => false;
+		pi.ctx.signal = new AbortController().signal;
+		await pi.emit("before_agent_start", { prompt: "run the gated tool" });
+		await pi.emit("agent_start", {});
+		await pi.emit("tool_execution_start", { toolCallId: "t1", toolName: "bash", args: { command: "sleep 600" } });
+		child.hand(ref());
+		await settle();
+		await pi.gate();
+		if (escaped === "run-ended-first") {
+			// The run settles before Pi looks: the hand-over goes to a preflight.
+			pi.ctx.isIdle = () => true;
+			pi.ctx.signal = undefined;
+		} else {
+			queue = 1;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		if (escaped === "escape") {
+			// Escape: the queue goes to the editor, then the tool is aborted.
+			queue = 0;
+		}
+		await pi.emit("tool_execution_end", { toolCallId: "t1", toolName: "bash", isError: true, result: { content: [{ type: "text", text: "Command aborted" }] } });
+		pi.ctx.isIdle = () => true;
+		pi.ctx.signal = undefined;
+		await pi.emit("agent_settled", {});
+		if (escaped === "escape") {
+			assert.deepEqual(child.sent("possess").at(-1).held, [], "released lost");
+			assert.deepEqual(child.refs("not_handed"), [], "never not handed");
+			child.say({ revoke: [ref()] });
+			assert.deepEqual(child.refs("already_handed"), [ref()], "possibly handed");
+		} else {
+			assert.deepEqual(child.sent("possess").at(-1).held, [ref()], `${escaped}: still held`);
+			assert.deepEqual(child.refs("not_handed"), []);
+		}
+	}
+});
+
 /// Scenario: Two attempts of one message pass the gate, and the first is released lost before the user message carrying the message starts. The start commits both, the released one included; a revoke that races the commit's publication is answered already handed.
 test("pi_012 message_start commits every called attempt of the id", async () => {
 	const { pi, child } = await started();
@@ -832,6 +875,39 @@ test("pi_028 a replacement carries the reload's ownership of what passed", async
 			await next.emit("agent_settled", {});
 		}
 		assert.deepEqual(second.sent("possess").at(-1).held, [], `${end}: released lost`);
+		second.say({ revoke: [ref()] });
+		assert.deepEqual(second.refs("already_handed"), [ref()], `${end}: possibly handed`);
+		assert.deepEqual(second.refs("not_handed"), []);
+	}
+});
+
+/// Scenario: A session passes an attempt through the gate and reloads into a version replacement that carries its records, and the outgoing session's shutdown arrives only after the reload's successor started on the new receiver. The successor owns the attempt: a settle after a run with nothing queued releases it lost, and so does the successor's own /new, never not handed.
+test("pi_028 a delayed reload shutdown after a compatible replacement hands what passed to the successor", async () => {
+	for (const end of ["settle", "new"]) {
+		const { pi, child } = await started();
+		child.hand(ref());
+		await settle();
+		await pi.gate();
+		(globalThis as any)[PROCESS].version = OTHER_VERSION;
+		const next = instance();
+		const start = next.emit("session_start", { reason: "reload" });
+		await settle();
+		child.exit(0);
+		await start;
+		assert.equal(spawned.length, 2);
+		const second = watcher();
+		second.register(8, { resume: [ref()] });
+		await settle();
+		await pi.emit("session_shutdown", { reason: "reload" });
+		await settle();
+		assert.deepEqual(second.sent("possess").at(-1).held, [ref()], `${end}: a reload releases nothing`);
+		if (end === "new") {
+			await next.emit("session_shutdown", { reason: "new" });
+		} else {
+			await next.emit("agent_start", {});
+			await next.emit("agent_settled", {});
+		}
+		assert.deepEqual(second.sent("possess").at(-1).held, [], `${end}: the successor released it lost`);
 		second.say({ revoke: [ref()] });
 		assert.deepEqual(second.refs("already_handed"), [ref()], `${end}: possibly handed`);
 		assert.deepEqual(second.refs("not_handed"), []);

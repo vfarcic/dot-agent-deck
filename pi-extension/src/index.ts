@@ -162,6 +162,8 @@ interface Passed {
 	stage: "input" | "start";
 	/** `runs` when it passed. */
 	run: number;
+	/** At `input`: seen waiting in Pi's queue behind the run active when it passed (`watchQueue`). */
+	queued: boolean;
 	/** At `start`: a settle came while another run was active, the way Pi settles a prompt it refused. */
 	suspect: boolean;
 	/** Released `lost`: it waits for a commit only. */
@@ -452,7 +454,7 @@ async function handOver(proc: InboxProcess, message: InboxMessage): Promise<bool
  * silently; one that failed a check after a positive not-handed when the
  * receiver still holds it.
  */
-function gate(proc: InboxProcess, instance: Instance, event: unknown): InputAnswer {
+function gate(proc: InboxProcess, instance: Instance, event: unknown, ctx: ExtensionContext | undefined): InputAnswer {
 	const input = event as { text?: unknown; source?: unknown } | undefined;
 	if (input?.source !== "extension") {
 		return undefined;
@@ -485,9 +487,43 @@ function gate(proc: InboxProcess, instance: Instance, event: unknown): InputAnsw
 		return HANDLED;
 	}
 	proc.receiver.calling(sent.ref);
-	proc.passed.set(key, { ref: sent.ref, token: instance.token!, stage: "input", run: proc.runs, suspect: false, lost: false });
+	proc.passed.set(key, { ref: sent.ref, token: instance.token!, stage: "input", run: proc.runs, queued: false, suspect: false, lost: false });
+	watchQueue(proc, key, ctx);
 	proc.receiver.handed([sent.ref]);
 	return { action: "transform", text: tagged.text };
+}
+
+/**
+ * An attempt that passed a hand-over point while a run was active goes into
+ * Pi's queue behind that run — unless the run ended in the moment before Pi
+ * looked, when it goes on to start a run of its own, through a preflight that
+ * reads idle with nothing queued. Pi chooses in the microtasks after the
+ * gate returns, unless another extension's `input` hook makes it wait, so an
+ * attempt still at `input` at the next macrotask, with that run still active
+ * and something queued, is marked `queued`: a settle of that run leaving it
+ * uncommitted with nothing queued means Pi dropped it from the queue (Escape,
+ * or a dequeue to the editor), and `settled` releases it. Unmarked, it stays
+ * held until a run starts. The mark can be wrong when such a hook delays
+ * Pi's choice past that macrotask while something else is queued and the run
+ * then ends before Pi chooses: the attempt is released `lost` and still runs,
+ * which is possibly handed, so the deck's checked, marked repeat covers it.
+ */
+function watchQueue(proc: InboxProcess, key: string, ctx: ExtensionContext | undefined): void {
+	if (askIdle(ctx) !== false) {
+		return;
+	}
+	const run = proc.runs;
+	const timer = setTimeout(() => {
+		try {
+			const passed = proc.passed.get(key);
+			if (passed !== undefined && passed.stage === "input" && proc.runs === run && askIdle(ctx) === false && askQueued(ctx) === true) {
+				passed.queued = true;
+			}
+		} catch {
+			// Never let a timer callback throw into Pi.
+		}
+	}, 0);
+	(timer as { unref?: () => void }).unref?.();
 }
 
 /**
@@ -502,7 +538,7 @@ function gate(proc: InboxProcess, instance: Instance, event: unknown): InputAnsw
  * handed. With no registration, or a deck that cannot be asked, the line is
  * consumed and the mail stays queued for the watcher.
  */
-async function doorbell(proc: InboxProcess, instance: Instance, ids: string[], signal: AbortSignal | undefined): Promise<InputAnswer> {
+async function doorbell(proc: InboxProcess, instance: Instance, ids: string[], ctx: ExtensionContext): Promise<InputAnswer> {
 	const until = Date.now() + DOORBELL_REGISTER_WAIT_MS;
 	while (proc.receiver.rx() === undefined && Date.now() < until && !proc.disposed) {
 		await new Promise((resolve) => setTimeout(resolve, 100));
@@ -519,7 +555,7 @@ async function doorbell(proc: InboxProcess, instance: Instance, ids: string[], s
 	for (const id of ids) {
 		let outcome: { code: number; stdout: string };
 		try {
-			outcome = await current.pi.exec(deckBin, buildInboxDoorbellFetchArgv(id, rx, INBOX_ADAPTER_INTEGRATION), { signal, timeout: 5000 });
+			outcome = await current.pi.exec(deckBin, buildInboxDoorbellFetchArgv(id, rx, INBOX_ADAPTER_INTEGRATION), { signal: ctx.signal, timeout: 5000 });
 		} catch {
 			break;
 		}
@@ -554,7 +590,8 @@ async function doorbell(proc: InboxProcess, instance: Instance, ids: string[], s
 	}
 	for (const ref of refs) {
 		proc.receiver.calling(ref);
-		proc.passed.set(inboxKey(ref), { ref, token, stage: "input", run: proc.runs, suspect: false, lost: false });
+		proc.passed.set(inboxKey(ref), { ref, token, stage: "input", run: proc.runs, queued: false, suspect: false, lost: false });
+		watchQueue(proc, inboxKey(ref), ctx);
 		noteId(proc, ref);
 	}
 	proc.receiver.handed(refs);
@@ -640,7 +677,8 @@ function starting(proc: InboxProcess, instance: Instance, prompt: unknown): void
  *   with nothing queued;
  * - one past the gate, at a settle with no run active and nothing queued,
  *   after a run started since it passed (Escape pulled it back, or the run
- *   dropped it).
+ *   dropped it), or once it was seen queued behind the run this settle ends
+ *   (`watchQueue`: Escape or a dequeue took it out of the queue).
  * One still in preflight, or a Pi that cannot be asked, keeps it held. A sent
  * attempt the gate never saw, at a settle with nothing queued after a run
  * started since it was sent, never reached the gate: positively not handed.
@@ -662,7 +700,7 @@ function settled(proc: InboxProcess, instance: Instance, ctx: ExtensionContext):
 			} else if (running === false && (passed.suspect || queued === false)) {
 				release = true;
 			}
-		} else if (running === false && queued === false && passed.run < proc.runs) {
+		} else if (running === false && queued === false && (passed.run < proc.runs || passed.queued)) {
 			release = true;
 		}
 		if (release) {
@@ -726,13 +764,19 @@ function sessionStart(proc: InboxProcess, instance: Instance, pi: ExtensionAPI, 
  *
  * A shutdown that arrives after its successor became current does all of
  * this for its own attempts too — a reload's then go straight to the current
- * session — and only leaves `current` alone; `reporting` drops its Idle.
+ * session — and only leaves `current` alone; `reporting` drops its Idle. One
+ * that arrives after a version replacement carried its process's records
+ * (`holding`) does it in the successor, which now holds those attempts: a
+ * reload's go to the successor's current session, or to the next one to
+ * start, and a `/new`'s are released by the successor's receiver, never
+ * through the disposed one.
  */
-function sessionShutdown(proc: InboxProcess, instance: Instance, reason: unknown): void {
+function sessionShutdown(bound: InboxProcess, instance: Instance, reason: unknown): void {
 	instance.shutdown = true;
 	if (instance.token === undefined) {
 		return;
 	}
+	const proc = holding(bound);
 	const wasCurrent = proc.current?.token === instance.token;
 	if (reason === "reload") {
 		if (wasCurrent) {
@@ -768,6 +812,19 @@ function sessionShutdown(proc: InboxProcess, instance: Instance, reason: unknown
 	} else {
 		pump(proc);
 	}
+}
+
+/**
+ * The process state holding `proc`'s records: `proc` itself, or — once a
+ * version replacement disposed it and carried them (`Transfer` hands the same
+ * maps on) — the successor that holds them now.
+ */
+function holding(proc: InboxProcess): InboxProcess {
+	if (!proc.disposed) {
+		return proc;
+	}
+	const latest = holder[INBOX_PROCESS] as Partial<InboxProcess> | undefined;
+	return latest !== undefined && latest !== proc && latest.passed === proc.passed ? (latest as InboxProcess) : proc;
 }
 
 /**
@@ -1151,7 +1208,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		let answer: InputAnswer;
 		try {
 			const proc = instance.proc;
-			answer = proc === undefined ? (tagged ? HANDLED : undefined) : gate(proc, instance, event);
+			answer = proc === undefined ? (tagged ? HANDLED : undefined) : gate(proc, instance, event, ctx);
 		} catch {
 			answer = tagged ? HANDLED : undefined;
 		}
@@ -1178,7 +1235,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			if (proc !== undefined && input.source !== "extension") {
 				const ids = doorbellIdsIn(input.text);
 				if (ids.length > 0) {
-					return doorbell(proc, instance, ids, ctx.signal);
+					return doorbell(proc, instance, ids, ctx);
 				}
 			}
 			await report("input", event, ctx);
