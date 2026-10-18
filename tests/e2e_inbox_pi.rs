@@ -192,7 +192,7 @@ fn pi_023a_a_committed_message_in_a_long_silent_turn_shows_nothing() {
     never_shown(&deck, Duration::from_millis(2 * WINDOW_MS + 1000));
 }
 
-/// Scenario: A stand-in Pi runs a long turn on one deck message while a second is handed to it as a follow-up, which it never starts. Nothing shows while the turn runs, for more than twice the window; after the turn ends with the follow-up uncommitted, the card says it may not have reached the agent.
+/// Scenario: A stand-in Pi runs a long turn on one deck message while a second is handed to it as a follow-up, which stays queued without starting. Nothing shows while the turn runs, for more than twice the window; after the turn ends with the original follow-up still queued, the card says it may not have reached the agent and that message still has one delivery.
 #[spec("inbox/pi/023")]
 #[test]
 fn pi_023b_a_follow_up_behind_a_long_turn_shows_only_after_the_turn_ends() {
@@ -213,6 +213,21 @@ fn pi_023b_a_follow_up_behind_a_long_turn_shows_only_after_the_turn_ends() {
     wait_log(&path, &format!("handed {second}"));
     never_shown(&deck, Duration::from_millis(2 * WINDOW_MS));
     deck.wait_for_string(LINE);
+    let messages = inbox::listing(&deck, &pane)["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let follow_up = messages
+        .iter()
+        .find(|message| message["id"] == second)
+        .unwrap();
+    assert_eq!(follow_up["deliveries"], 1, "{follow_up}");
+    assert!(
+        !log(&path)
+            .iter()
+            .any(|line| line == &format!("handed repeat {second}")),
+        "the notice concerns the original queued follow-up"
+    );
 }
 
 /// Scenario: A stand-in Pi takes longer than the window to start on a deck message, as a slow preflight would. The card says the message may not have reached the agent, and the line goes once the turn starts, with no Retry.

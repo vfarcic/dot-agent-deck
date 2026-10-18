@@ -5975,8 +5975,8 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### chain-smoke/pi/002 — A clear=true real Pi worker receives an inbox delegate, writes a sentinel and reports work-done.
 - **Layer:** L2 lane 2 (`tests/e2e_pi_worker.rs`), in-process daemon, synthetic orchestrator signal and real interactive Pi worker; headless.
 - **Agent:** Real Pi worker (GPT, `common::pi_test_model()`) with scratch HOME and PI_CODING_AGENT_DIR.
-- **Asserts:** The configured worker respawn receives its native inbox task, appends once to the sentinel at the exact literal path specified by the shell directive, then reports work-done; bounded waits print phase and path evidence before the 300s nextest timeout; the task is Acknowledged with ExtensionConfirmed and one delivery. `DOT_AGENT_DECK_TEST_PI_BOOT_DELAY_SECS=35` holds the real replacement in a scratch launch command beyond issue #1662's old 15-second seed grace, with the same assertions and unchanged timeouts.
-- **Does not assert:** A real orchestrator model or rendered cards.
+- **Asserts:** The configured worker respawn receives its native inbox task, appends once to the sentinel at the exact literal path specified by the shell directive, then reports work-done; bounded waits print phase and path evidence before the 300s nextest timeout; the task is Acknowledged with ExtensionConfirmed and one delivery. `DOT_AGENT_DECK_TEST_PI_BOOT_DELAY_SECS=35` holds the replacement beyond the old 15-second seed grace. A stable-pane observer retains integration notice samples through work-done and rejects not_armed; passive CLI/native observers pin possession before hand-over before commit, one opener, unchanged default watcher argv and registration before any witnessed intercepted fetch. A persisted summary records the number of intercepted fetches, including zero for a purely native route.
+- **Does not assert:** A real orchestrator model, rendered cards, or that the default route necessarily intercepts a doorbell; zero intercepts do not prove registration/intercept ordering.
 - **Platform coverage:** mac+linux.
 
 #### pane/drift
@@ -10534,10 +10534,52 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.
 
+##### inbox/pi/017 — A real Pi long tool holds a follow-up without a repeat or not-started notice.
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), PTY-attached real binary, passive native event and receipt-stage observers.
+- **Agent:** Real interactive Pi on `common::pi_test_model()`, isolated HOME and agent directory.
+- **Asserts:** A gated bash tool stays active beyond three ack waits and two not-started windows after hand-over; one delivery, no premature opener/action/notice, then tool-end before the follow-up opener, one append and ExtensionConfirmed; possession precedes handed and committed.
+- **Does not assert:** An indefinitely busy turn or watcher failure.
+- **Platform coverage:** mac+linux.
+
+##### inbox/pi/018 — Escape removes a real Pi queued follow-up and one marked repeat acts once.
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), PTY-attached real binary and real Escape, native events plus per-attempt receipt history.
+- **Agent:** Real interactive Pi on `common::pi_test_model()`, isolated configuration.
+- **Asserts:** A follow-up is handed while a tool is gated; one Escape cancels and restores the queued draft, which is cleared without submission; the original is lost rather than not_handed, one marked repeat commits one opener, appends once and becomes ExtensionConfirmed with two deliveries; no third delivery during the subsequent lapse window.
+- **Does not assert:** /new cancellation, synthetic lost reports or a manually resubmitted draft.
+- **Platform coverage:** mac+linux.
+
+##### inbox/pi/019 — A real Pi handed follow-up survives its watcher's death.
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), PTY-attached binary and captured descendant watcher PID.
+- **Agent:** Real interactive Pi on `common::pi_test_model()`, isolated configuration.
+- **Asserts:** SIGKILL of the fixture's real watcher after hand-over is followed by a resumed registration, retained resume answer and rebound; release of the gated tool produces one opener/action and ExtensionConfirmed with one delivery, no lost report and an ordered receipt timeline.
+- **Does not assert:** Killing an unrelated watcher or arbitrary OS process recovery.
+- **Platform coverage:** linux (/proc ancestry).
+
+##### inbox/pi/020 — A real Pi doorbell transforms in place after the receiver sees registration.
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), PTY-attached binary with a labelled `--doorbell-only` watcher fixture and delayed registration reply. The fixture fixes the hand-out route so in-place substitution can be observed; it does not exercise the default boot route.
+- **Agent:** Real interactive Pi on `common::pi_test_model()`, isolated configuration.
+- **Asserts:** A composed doorbell is submitted before the receiver sees registration; registration precedes exactly one integration-2 fetch for that rx, then ordered possession/handed/commit, one native opener/action/delivery and ExtensionConfirmed; no raw doorbell reaches the model and no model tool invokes inbox fetch.
+- **Does not assert:** Automatic scheduler wake or default watcher argv, which chain-smoke/pi/002 retains; the registration-delay knob delays the reply, not daemon registration.
+- **Platform coverage:** mac+linux.
+
+##### inbox/pi/021 — A real Pi spawn refreshes a stale extension or shows the Pi repair remedy.
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), PTY-attached real spawn, stale and structurally obstructed scratch agent directories in separate test functions.
+- **Agent:** Real interactive Pi, `common::pi_test_model()` for the successful turn; the failure case makes no model request.
+- **Asserts:** Stale assets equal the bundled files before delegation, integration-2 Pi registration, one action/opener/delivery and ExtensionConfirmed with ordered receipts; a regular-file obstruction produces refresh_failed_pi and the rendered orchestrator setup remedy with HOME and PI_CODING_AGENT_DIR, without the OpenCode repair command.
+- **Does not assert:** Host configuration changes or successful Pi boot after a refresh failure.
+- **Platform coverage:** mac+linux.
+
+##### inbox/pi/022 — Real Pi without auth shows the may-not-have-reached notice and repeats only on Retry.
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), PTY-attached real binary, native/CLI/broadcast observation subscribed before delegation and continuous inbox samples.
+- **Agent:** Installed interactive Pi with an explicit Anthropic Haiku model, scratch HOME/agent directory without auth.json and an allowlisted child environment; no credentialed model call.
+- **Asserts:** Explicit missing-auth error and handed attempt; no native before-start/start/opener/settle, commit, daemon Thinking or acknowledgement through two notice windows; one delivery, visible card/picker warning, then one real r key issues one marked second attempt and no third automatic delivery through two more windows.
+- **Does not assert:** Successful model work, invalid-key behavior or a credentialed preflight.
+- **Platform coverage:** mac+linux; actual /proc environment verification on linux.
+
 ##### inbox/pi/023 — A message a Pi agent never starts on shows on the attached card; Retry repeats it, Cancel ends it.
 - **Layer:** L2 PTY lane 1 (`tests/e2e_inbox_pi.rs`), the real binary with an attached TuiDeck and a stand-in Pi (`tests/fixtures/pi-inbox/fake-pi.mjs`) running the real extension and receiver under Node, with a 2-second not-started window.
 - **Agent:** none: the stand-in plays Pi 0.84.4's event contract with no model.
-- **Asserts:** a message handed over and never started shows the not-started reason on the card; the picker explains Retry's possible duplicate and `r` hands it over once more as a marked repeat, while `c` removes the line for good. Healthy negatives, each its own function: a committed message in a silent turn longer than twice the window shows nothing; a follow-up handed behind a long turn shows nothing during the turn and the line after it ends uncommitted; a start slower than the window shows the line until the turn starts, with no repeat.
+- **Asserts:** a message handed over and never started shows the not-started reason on the card; the picker explains Retry's possible duplicate and `r` hands it over once more as a marked repeat, while `c` removes the line for good. Healthy negatives, each its own function: a committed message in a silent turn longer than twice the window shows nothing; a follow-up handed behind a long turn shows nothing during the turn and the line after it ends with the original follow-up still queued and one delivery; a start slower than the window shows the line until the turn starts, with no repeat.
 - **Does not assert:** a real Pi (inbox/pi/022, lane 2), or the desktop app.
 - **Platform coverage:** mac+linux (prints `SKIP:` without Node 23.6+).
 - **Cost:** about 30 seconds.

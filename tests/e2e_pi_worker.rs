@@ -1,4 +1,4 @@
-#![cfg(all(feature = "e2e", feature = "e2e-live"))]
+#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
 //! Real Pi worker receives a clear=true delegate through its native inbox,
 //! writes a sentinel, and reports work-done. A synthetic orchestrator routes
@@ -11,6 +11,10 @@ use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::DelegateSignal;
 
 mod common;
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[path = "support/pi_inbox_live.rs"]
+mod live;
 
 use spec::spec;
 
@@ -32,7 +36,7 @@ const SENTINEL_CONTENT: &str = "PI_WORKER_SENTINEL_OK";
 // chain-smoke/pi/002 — real-pi WORKER receives a delegate → work-done
 // ---------------------------------------------------------------------------
 
-/// Scenario: Configure a clear=true Pi worker, optionally delay its replacement boot with DOT_AGENT_DECK_TEST_PI_BOOT_DELAY_SECS, and delegate an exact shell command appending to an absolute sentinel path. The real Pi worker must acknowledge one inbox delivery, append once, and signal work-done after the configured boot delay.
+/// Scenario: Configure a clear=true Pi worker, optionally delay its replacement boot by 35 seconds, and delegate a shell command appending to an absolute sentinel. The worker must stay free of not-armed notices, register before any doorbell intercept, acknowledge one delivery, append once and signal work-done; its default watcher argv remains intact.
 #[spec("chain-smoke/pi/002")]
 #[test]
 fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done() {
@@ -47,6 +51,9 @@ fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done() {
 
 async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
+    let diagnostics = live::diagnostics_dir();
+    eprintln!("chain-smoke Pi diagnostics: {}", diagnostics.display());
+    let cli_observer = live::write_cli_observer(&diagnostics);
 
     // Shared orchestration cwd: the pi worker runs here, and the sentinel +
     // work-done file land here. A fresh tempdir → the sentinel name is unique by
@@ -108,6 +115,13 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         &dot_agent_deck::orchestrator_ext::extension_dir_under(pi_home.path()),
     )
     .expect("stage the bundled pi extension into the worker HOME");
+    std::fs::write(
+        pi_home
+            .path()
+            .join(".pi/agent/extensions/inbox-test-observer.ts"),
+        include_str!("fixtures/pi-inbox/observe-native.ts"),
+    )
+    .unwrap();
 
     // CRITICAL (harness caveat): this spawn does not go through
     // `TuiDeckBuilder::launch` — it builds `SpawnOptions.env` for an in-process
@@ -138,6 +152,24 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         ),
     ];
     pi_env.extend(common::pi_env_key());
+    pi_env.extend([
+        (
+            "DOT_AGENT_DECK_BIN".into(),
+            cli_observer.display().to_string(),
+        ),
+        (
+            "DECK_TEST_REAL_BIN".into(),
+            common::contained_deck_binary().display().to_string(),
+        ),
+        (
+            "DECK_TEST_PI_TIMELINE".into(),
+            diagnostics.join("timeline.jsonl").display().to_string(),
+        ),
+        (
+            "DECK_TEST_PI_EVENTS".into(),
+            diagnostics.join("native.jsonl").display().to_string(),
+        ),
+    ]);
 
     // Spawn a cheap placeholder (`cat`, blocks on stdin) as the worker pane, NOT
     // pi. The `clear = true` delegate below RESPAWNS this pane into the REAL pi
@@ -232,6 +264,8 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         token: None,
     };
     let delegated_at = Instant::now();
+    let mut observations =
+        GenerationSamples::start(daemon.registry.clone(), diagnostics.join("samples.jsonl"));
     daemon
         .state
         .read()
@@ -335,5 +369,154 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         delegated_at.elapsed() >= Duration::from_secs(boot_delay),
         "the real replacement must run after its configured boot delay"
     );
+    let samples = observations.finish();
+    assert!(
+        samples.len() > 1,
+        "current-generation observer must advance"
+    );
+    assert!(
+        samples.iter().all(|s| s["notice"] != "not_armed"),
+        "no not_armed through ack + work-done: {samples:?}"
+    );
+    let timeline = live::read_jsonl(&diagnostics.join("timeline.jsonl"));
+    let id = delivered.id.as_str();
+    let registration = timeline
+        .iter()
+        .position(|v| !v["registered"].is_null())
+        .expect("real watcher registration observed");
+    let fetches = timeline
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v["doorbell"] == id)
+        .collect::<Vec<_>>();
+    for (position, fetch) in &fetches {
+        assert!(
+            registration < *position,
+            "registration precedes intercept: {timeline:?}"
+        );
+        assert_eq!(
+            fetch["fetchRx"].as_str().unwrap().parse::<u64>().unwrap(),
+            timeline[registration]["registered"]["rx"].as_u64().unwrap()
+        );
+    }
+    let possessed = timeline
+        .iter()
+        .position(|v| {
+            v["possess"]["held"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|r| r["id"] == id))
+        })
+        .expect("native possession observed");
+    let handed = timeline
+        .iter()
+        .position(|v| {
+            v["handed"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|r| r["id"] == id))
+        })
+        .expect("native hand-over observed");
+    let committed = timeline
+        .iter()
+        .position(|v| {
+            v["committed"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|r| r["id"] == id))
+        })
+        .expect("native commit observed");
+    assert!(
+        possessed < handed && handed < committed,
+        "possession -> handed -> commit: {timeline:?}"
+    );
+    assert!(
+        timeline
+            .iter()
+            .filter(|v| v["verb"] == serde_json::json!(["inbox", "wait"]))
+            .all(|v| v["doorbellOnly"] == false),
+        "default watcher argv intact"
+    );
+    let users = live::read_jsonl(&diagnostics.join("native.jsonl"))
+        .into_iter()
+        .filter(|v| {
+            v["type"] == "message_start"
+                && v["event"]["message"]["role"] == "user"
+                && v["event"].to_string().contains(id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(users.len(), 1, "one tested native opener: {users:?}");
+    std::fs::write(
+        diagnostics.join("pane.txt"),
+        common::redact_credentials_for_output(&current_worker_pane()),
+    )
+    .unwrap();
+    std::fs::write(diagnostics.join("summary.json"),serde_json::json!({"boot_delay":boot_delay,"elapsed_ms":delegated_at.elapsed().as_millis(),"intercepts":fetches.len(),"delivery":delivered,"samples":samples.len()}).to_string()).unwrap();
+    eprintln!(
+        "chain-smoke: samples={} intercepted_fetches={} diagnostics={}",
+        samples.len(),
+        fetches.len(),
+        diagnostics.display()
+    );
     eprintln!("chain-smoke: acknowledged=1 acted=1 deliveries=1 boot_delay={boot_delay}s");
+}
+
+/// Observe the replacement by stable pane id, including the boot interval.
+/// Drop joins the sampler before the daemon tears down, even on assertion panic.
+struct GenerationSamples {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<Vec<serde_json::Value>>>,
+}
+impl GenerationSamples {
+    fn start(
+        registry: std::sync::Arc<dot_agent_deck::agent_pty::AgentPtyRegistry>,
+        path: std::path::PathBuf,
+    ) -> Self {
+        let (stop, halted) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            use std::io::Write;
+            let start = Instant::now();
+            let mut samples = Vec::new();
+            let mut file = std::fs::File::create(path).unwrap();
+            loop {
+                let current = registry
+                    .agent_records()
+                    .into_iter()
+                    .find(|r| r.pane_id_env.as_deref() == Some(WORKER_PANE));
+                let notice = current
+                    .as_ref()
+                    .and_then(|r| registry.inbox().integration_notice(WORKER_PANE, &r.id));
+                let sample = serde_json::json!({"elapsed_ms":start.elapsed().as_millis(),"agent":current.as_ref().map(|r|&r.id),"notice":notice,"messages":registry.inbox().list(WORKER_PANE)});
+                writeln!(
+                    file,
+                    "{}",
+                    common::redact_credentials_for_output(&sample.to_string())
+                )
+                .unwrap();
+                samples.push(sample);
+                match halted.recv_timeout(Duration::from_millis(100)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
+            }
+            samples
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+    fn finish(&mut self) -> Vec<serde_json::Value> {
+        let _ = self.stop.send(());
+        self.worker
+            .take()
+            .unwrap()
+            .join()
+            .expect("current-generation observer must stay healthy")
+    }
+}
+impl Drop for GenerationSamples {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }

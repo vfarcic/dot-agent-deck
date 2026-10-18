@@ -109,7 +109,9 @@ async function start(prompt, end) {
 
 async function settle() {
   run = undefined;
-  queued = 0;
+  // `behind` leaves its follow-up queued: settling the running turn does not
+  // mean Escape removed that follow-up. No replacement attempt should run.
+  if (mode !== "behind") queued = 0;
   await emit("agent_settled", {});
 }
 
