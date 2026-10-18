@@ -8364,16 +8364,64 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/doorbell/019 — An interrupt's Escapes stop holding the doorbell when the turn ends; drafts and an Idle agent's Escapes still hold it.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary, daemon-owned PTY and attach input stream.
 - **Agent:** none (raw Python stand-in announced as OpenCode, Claude Code, Codex and Pi; no agent credential).
-- **Asserts:** for each of the four agent types, Thinking, then Escape, 300 ms, Escape forwarded as the user's keys, then Idle: queued work rings the fixed doorbell after the two Escapes and a fetch delivers it. Text typed before or after the Escapes, and two Escapes pressed on an agent that is already Idle, each leave the pane untouched and the task Queued.
-- **Does not assert:** a real agent's interrupt, an Idle reported twice for one turn, or an Idle from an agent that has since been replaced (`inbox/doorbell/020`).
+- **Asserts:** for each of the four agent types, Thinking, then Escape, 300 ms, Escape forwarded as the user's keys, then Idle: queued work rings the fixed doorbell after the two Escapes and a fetch delivers it. Text typed before or after the Escapes, and two Escapes pressed on an agent that is already Idle followed by two more Idle reports (OpenCode's duplicate pair), each leave the pane untouched and the task Queued.
+- **Does not assert:** a real agent's interrupt, an Idle from an agent that has since been replaced (`inbox/doorbell/020`), or an Idle racing the PTY write (`inbox/doorbell/022`, `inbox/doorbell/023`).
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
 ##### inbox/doorbell/020 — A replaced agent's Idle cannot release its successor's Escapes.
 - **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path against a real registry and stand-in PTYs.
 - **Agent:** none (`/usr/bin/true` replaced by `cat` on one pane), events typed as Claude Code, Codex, OpenCode and Pi.
-- **Asserts:** with the successor's Escape pair recorded while it is Thinking, an Idle naming the replaced agent and an untagged Idle attested to its token each leave the doorbell held; so do the replaced agent's Thinking then Idle after a second pair on the Idle successor; the successor's own Idle releases the pair each time.
-- **Does not assert:** a successor published concurrently with the old agent's Idle (the owner check and the change are one registry hold; there is no seam between them to park at), or which Idle counts as the end of a turn.
+- **Asserts:** with the successor's Escape pair recorded while it is Thinking, an Idle naming the replaced agent and an untagged Idle attested to its token each leave the doorbell held, and the successor's own Idle releases the pair; after a second pair on the Idle successor, the replaced agent's Thinking then Idle, and the successor's own Idle with no Thinking of its before it, leave it held; the successor's Thinking then Idle releases it.
+- **Does not assert:** a successor published concurrently with the old agent's Idle (the owner check and the change are one registry hold; there is no seam between them to park at), or an Idle racing the PTY write (`inbox/doorbell/022`, `inbox/doorbell/023`).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/021 — A repeated Idle releases no menu's Escapes.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path against a real registry and a stand-in PTY.
+- **Agent:** none (`cat`), events typed as Claude Code, Codex, OpenCode and Pi.
+- **Asserts:** after a turn (Thinking, Idle), two Escapes pressed on the Idle agent and two more Idle reports leave the doorbell held; the agent's next Thinking then Idle releases them.
+- **Does not assert:** the doorbell ringing (`inbox/doorbell/019`'s duplicate-Idle control), or a real OpenCode's two Idle events.
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/022 — An interrupt recorded after the Idle that ended its turn holds nothing.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread, parked by `pause_next_pty_write_for_test` after the write returned and its turn count was read.
+- **Agent:** none (`cat`), events typed as OpenCode.
+- **Asserts:** with the agent Thinking, two Escapes the PTY took before the Idle was ingested, but recorded after it, do not hold the doorbell.
+- **Does not assert:** an Idle ingested between the write and its turn-count reading, which holds (`inbox/doorbell/023`'s side of the policy).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/023 — Escapes written after the Idle keep the menu held.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread: parked before the write by `pause_next_pty_write_for_test`, and a stand-in writer that takes one byte, then parks its second call.
+- **Agent:** none (`cat`, then the stand-in writer), events typed as OpenCode.
+- **Asserts:** with the agent Thinking, two Escapes whose write was parked before the PTY while the Idle was ingested hold the doorbell; so do the two Escapes of a three-Escape write the PTY took after the Idle, its first byte having gone before.
+- **Does not assert:** an agent that emits Idle before reading Escapes the daemon wrote first (the daemon orders by its own observation).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/024 — A first turn reported before any input is a turn.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path.
+- **Agent:** none (`cat`), events typed as Claude Code, Codex, OpenCode and Pi.
+- **Asserts:** a freshly spawned agent's Thinking, reported before any byte reached its pane, then two Escapes and Idle: the doorbell is not held.
+- **Does not assert:** a Thinking reported before the agent is published (`inbox/doorbell/025`).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/025 — A turn reported before publication is kept.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real spawn parked before publication by `pause_next_publish_for_test`.
+- **Agent:** none (a shell script that writes its agent id, then `cat`), events typed as OpenCode.
+- **Asserts:** a Thinking from the reserved, unpublished agent, then publication, two Escapes and Idle: the doorbell is not held.
+- **Does not assert:** a token-attested report (the event names the agent).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/026 — Split Escapes pair only within one turn.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread.
+- **Agent:** none (`cat`), events typed as OpenCode.
+- **Asserts:** an interrupt sent as two separate Escape writes while Thinking, then Idle, holds nothing; two separate Escape writes on the Idle agent hold; an Escape the PTY took before the Idle but recorded after it does not pair with the Escape written after the Idle, so nothing holds.
+- **Does not assert:** a real agent's interrupt timing.
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 

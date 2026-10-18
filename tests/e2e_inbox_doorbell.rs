@@ -399,7 +399,7 @@ fn doorbell_019_an_interrupts_escapes_do_not_hold_doorbell() {
     }
 }
 
-/// Scenario: Leave a typed draft followed by two Escapes, two Escapes followed by typing, and two Escapes pressed on an agent that is already Idle (a menu, not an interrupt), then report Idle where the agent was busy and queue a task in each pane. None of these is an interrupt that emptied the box, so each pane must receive nothing and its task must stay Queued.
+/// Scenario: Leave a typed draft followed by two Escapes, two Escapes followed by typing, and two Escapes pressed on an agent that is already Idle (a menu, not an interrupt) followed by two more Idle reports, as OpenCode sends, then report Idle where the agent was busy and queue a task in each pane. None of these is an interrupt that emptied the box, and a repeated Idle ends no turn, so each pane must receive nothing and its task must stay Queued.
 #[spec("inbox/doorbell/019")]
 #[test]
 fn doorbell_019_drafts_and_escapes_on_an_idle_agent_still_hold_doorbell() {
@@ -415,6 +415,13 @@ fn doorbell_019_drafts_and_escapes_on_an_idle_agent_still_hold_doorbell() {
         status(&daemon, &pane, "idle", "open_code");
         if !once_idle.is_empty() {
             user = Some(input(&daemon, &pane, once_idle));
+            assert!(
+                common::wait_until(WAIT, || bytes(&pane).ends_with(once_idle.as_bytes())),
+                "{name}: the Escapes were not received"
+            );
+            // OpenCode reports Idle twice for one turn's end.
+            status(&daemon, &pane, "idle", "open_code");
+            status(&daemon, &pane, "idle", "open_code");
         }
         let before = bytes(&pane);
         let id = enqueue(&daemon, &pane, BODY);

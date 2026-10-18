@@ -2295,26 +2295,50 @@ where
             registry.quota_note_work_event(pane_id, generation);
         }
     }
-    // PRD #1666: an Idle from the pane's own agent ends what a run of the
-    // user's Escape keys could have been holding, the interrupt of the turn
-    // it ends, so the doorbell stops reading those keys as a draft
-    // (`DraftTracker::turn_ended`). Under this lock, like the quota latch, so
-    // it reaches the tracker in the order the card sees it.
+    // PRD #1666: an Idle from the pane's own agent that ends a turn it
+    // reported starting ends what a run of the user's Escape keys could have
+    // been holding, the interrupt of that turn, so the doorbell stops reading
+    // those keys as a draft (`DraftTracker::turn_ended`). Under this lock,
+    // like the quota latch, so it reaches the tracker in the order the card
+    // sees it.
+    //
+    // A turn starts with a report that the agent is working: thinking, a
+    // tool, compacting or a permission request (r8k R8G-02). Every supported
+    // agent reports its turn's start as Thinking. An Idle with no turn under
+    // way releases nothing: a repeated Idle (OpenCode sends two) must not
+    // release the Escapes that opened a menu on an agent already Idle. A line
+    // `dot-agent-deck wrap` classified from the child's output proves only
+    // that it printed something, so it starts no turn; a wrapper-only agent
+    // therefore never releases, and its Escapes hold until the user's Enter.
     //
     // Only the generation that sent it counts, as for the quota latch: the
     // one it names, or the one its token was minted for, and the registry
-    // applies it only while that generation is the pane's live owner (r8g
-    // R8G-01). A report with neither touches nothing. An event the daemon
-    // authored ends no turn of the agent's, and a subagent's Idle ends the
-    // subagent's turn, not the main thread's the user interrupted.
+    // applies it only while that generation is the pane's live owner, or
+    // keeps it for a spawn reserved on the pane (r8g R8G-01). A report with
+    // neither touches nothing. An event the daemon authored is no turn of the
+    // agent's, and a subagent's turn is not the main thread's the user
+    // interrupted.
+    let turn_edge = match event.event_type {
+        crate::event::EventType::Idle => Some(crate::agent_pty::TurnEdge::Ended),
+        crate::event::EventType::Thinking
+        | crate::event::EventType::ToolStart
+        | crate::event::EventType::ToolEnd
+        | crate::event::EventType::Compacting
+        | crate::event::EventType::PermissionRequest
+            if !event.is_wrapper_output_classified() =>
+        {
+            Some(crate::agent_pty::TurnEdge::Started)
+        }
+        _ => None,
+    };
     if !unproven
-        && event.event_type == crate::event::EventType::Idle
+        && let Some(edge) = turn_edge
         && !event.is_daemon_synthetic()
         && !event.is_from_subagent()
         && let Some(pane_id) = event.pane_id.as_deref()
         && let Some(generation) = event.agent_id.as_deref().or(attested_agent)
     {
-        registry.note_turn(pane_id, generation, crate::agent_pty::TurnEdge::Ended);
+        registry.note_turn(pane_id, generation, edge);
     }
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?
@@ -14010,7 +14034,7 @@ mod legacy_alias_tests {
 #[cfg(all(test, unix))]
 mod hook_provenance_audit_tests {
     use super::*;
-    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, PtyWritePause, SpawnOptions};
     use crate::state::{AppState, MAX_UNPROVEN_SESSIONS, SessionStatus};
     use spec::spec;
     use std::os::unix::fs::PermissionsExt;
@@ -15287,7 +15311,8 @@ mod hook_provenance_audit_tests {
     /// user presses Escape twice into B. A's Idle naming A, and an Idle naming
     /// no agent but attested to A's token, must leave B's Escapes holding the
     /// doorbell, and so must A's Thinking then Idle after B's own Idle and a
-    /// second Escape pair; B's own Idle releases them each time.
+    /// second Escape pair, and B's own Idle with no Thinking of B's before it;
+    /// B's own Idle releases them once B has reported Thinking.
     #[spec("inbox/doorbell/020")]
     #[tokio::test]
     async fn doorbell_020_a_replaced_generations_idle_cannot_release_its_successors_escapes() {
@@ -15341,6 +15366,9 @@ mod hook_provenance_audit_tests {
             ingest("idle", Some(&old), None).await;
             let after_old_turn = registry.draft_pending(&pane);
             ingest("idle", Some(&new), None).await;
+            let after_own_idle_alone = registry.draft_pending(&pane);
+            ingest("thinking", Some(&new), None).await;
+            ingest("idle", Some(&new), None).await;
             let after_own_again = registry.draft_pending(&pane);
             registry.shutdown_all();
 
@@ -15364,10 +15392,441 @@ mod hook_provenance_audit_tests {
                  released the successor's Escapes on an Idle agent"
             );
             assert!(
+                after_own_idle_alone,
+                "{agent_type}: the successor's Idle with no turn under way \
+                 released the Escapes that opened a menu on an Idle agent"
+            );
+            assert!(
                 !after_own_again,
-                "{agent_type}: the successor's own Idle must release them again"
+                "{agent_type}: the successor's own turn ending must release them again"
             );
         }
+    }
+
+    /// PRD #1666 (r8k R8G-02): one pane with a live `cat` agent of
+    /// `agent_type`, and the daemon's own ingest path for its hook reports.
+    struct TurnPane {
+        registry: Arc<AgentPtyRegistry>,
+        state: SharedState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        pane: String,
+        agent: String,
+        agent_type: &'static str,
+    }
+
+    impl TurnPane {
+        fn new(pane: &str, agent_type: &'static str) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let agent = spawn(&registry, Some(pane), "cat");
+            Self::with(registry, pane, agent, agent_type)
+        }
+
+        fn with(
+            registry: Arc<AgentPtyRegistry>,
+            pane: &str,
+            agent: String,
+            agent_type: &'static str,
+        ) -> Self {
+            let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            Self {
+                registry,
+                state: Arc::new(tokio::sync::RwLock::new(AppState::default())),
+                event_tx,
+                pane: pane.to_string(),
+                agent,
+                agent_type,
+            }
+        }
+
+        /// The agent reports `kind` (`thinking`, `idle`, …) about itself.
+        async fn report(&self, kind: &str) {
+            let mut payload = line(
+                &format!("{}-session", self.pane),
+                Some(&self.pane),
+                Some(&self.agent),
+                kind,
+                None,
+            );
+            payload["agent_type"] = self.agent_type.into();
+            ingest_event_unless(
+                &self.state,
+                &self.event_tx,
+                &self.registry,
+                event_of(payload),
+                false,
+                None,
+                |_| false,
+            )
+            .await;
+        }
+
+        /// The user's keys `bytes`, through the agent's writer.
+        async fn keys(&self, bytes: &[u8]) {
+            let writer = self
+                .registry
+                .agent_writer(&self.agent)
+                .expect("the agent's writer");
+            writer
+                .lock()
+                .await
+                .write_user(bytes)
+                .await
+                .expect("the keys reach the agent");
+        }
+
+        /// [`Self::keys`] on a task of its own, for a write parked at a seam.
+        fn keys_in_background(&self, bytes: &'static [u8]) -> tokio::task::JoinHandle<()> {
+            let writer = self
+                .registry
+                .agent_writer(&self.agent)
+                .expect("the agent's writer");
+            tokio::spawn(async move {
+                writer
+                    .lock()
+                    .await
+                    .write_user(bytes)
+                    .await
+                    .expect("the keys reach the agent");
+            })
+        }
+
+        fn holds(&self) -> bool {
+            self.registry.draft_pending(&self.pane)
+        }
+    }
+
+    /// Wait, off the runtime, for a test seam's "reached" signal.
+    async fn reached(rx: std::sync::mpsc::Receiver<()>, what: &'static str) {
+        tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{what}"))
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, the agent
+    /// finishes a turn (Thinking, then Idle), the user presses Escape twice
+    /// on the Idle agent — a menu — and the agent then reports Idle twice
+    /// more, as OpenCode does. The repeated Idle ends no turn, so the Escapes
+    /// must keep holding the doorbell; the agent's next Thinking then Idle
+    /// releases them.
+    #[spec("inbox/doorbell/021")]
+    #[tokio::test]
+    async fn doorbell_021_a_repeated_idle_releases_no_menus_escapes() {
+        for agent_type in ["claude_code", "codex", "opencode", "pi"] {
+            let pane = TurnPane::new(&format!("repeated-idle-{agent_type}"), agent_type);
+            pane.report("thinking").await;
+            pane.report("idle").await;
+            pane.keys(&[0x1b, 0x1b]).await;
+            pane.report("idle").await;
+            pane.report("idle").await;
+            let after_repeats = pane.holds();
+            pane.report("thinking").await;
+            pane.report("idle").await;
+            let after_turn = pane.holds();
+            pane.registry.shutdown_all();
+
+            assert!(
+                after_repeats,
+                "{agent_type}: a repeated Idle released a menu's Escapes"
+            );
+            assert!(
+                !after_turn,
+                "{agent_type}: the agent's next turn ending must release them"
+            );
+        }
+    }
+
+    /// Scenario: The agent reports Thinking and the user presses Escape twice.
+    /// The PTY takes both keys, and the agent's Idle is ingested after the
+    /// write returned but before the keys are recorded. The Escapes reached
+    /// the agent before its turn ended, so they were the interrupt, and must
+    /// not hold the doorbell once recorded.
+    #[spec("inbox/doorbell/022")]
+    #[tokio::test]
+    async fn doorbell_022_an_interrupt_recorded_after_its_idle_holds_nothing() {
+        let pane = TurnPane::new("escape-recorded-late", "opencode");
+        pane.report("thinking").await;
+        let (at_record, release) = pane
+            .registry
+            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::BeforeRecord);
+        let write = pane.keys_in_background(&[0x1b, 0x1b]);
+        reached(at_record, "the write never reached its record").await;
+        pane.report("idle").await;
+        release.send(()).unwrap();
+        write.await.unwrap();
+        let holds = pane.holds();
+        pane.registry.shutdown_all();
+        assert!(
+            !holds,
+            "an interrupt recorded after the Idle that ended its turn held the doorbell"
+        );
+    }
+
+    /// Scenario: The agent reports Thinking and the user presses Escape twice,
+    /// and the agent's Idle is ingested before the PTY write: once with the
+    /// whole write parked before it, and once while the second part of a
+    /// write the PTY took one byte at a time is still in progress (three
+    /// Escapes, the last two after the Idle). Escapes that reach an agent
+    /// already Idle open a menu, so in both the Escapes must hold the doorbell.
+    #[spec("inbox/doorbell/023")]
+    #[tokio::test]
+    async fn doorbell_023_escapes_written_after_the_idle_keep_the_menu_held() {
+        let pane = TurnPane::new("escape-written-late", "opencode");
+        pane.report("thinking").await;
+        let (at_write, release) = pane
+            .registry
+            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::BeforeWrite);
+        let write = pane.keys_in_background(&[0x1b, 0x1b]);
+        reached(at_write, "the write never reached the PTY").await;
+        pane.report("idle").await;
+        release.send(()).unwrap();
+        write.await.unwrap();
+        let whole_write_holds = pane.holds();
+        pane.registry.shutdown_all();
+
+        let pane = TurnPane::new("escape-partial-write", "opencode");
+        let second_part = Arc::new(SecondPartGate::default());
+        let _displaced = pane
+            .registry
+            .replace_agent_writer_for_test(
+                &pane.agent,
+                Box::new(OneByteThenGated {
+                    calls: 0,
+                    gate: second_part.clone(),
+                }),
+            )
+            .await;
+        pane.report("thinking").await;
+        let write = pane.keys_in_background(&[0x1b, 0x1b, 0x1b]);
+        second_part.wait_until_reached().await;
+        pane.report("idle").await;
+        second_part.release();
+        write.await.unwrap();
+        let partial_write_holds = pane.holds();
+        pane.registry.shutdown_all();
+
+        assert!(
+            whole_write_holds,
+            "Escapes written after the Idle were read as the ended turn's interrupt"
+        );
+        assert!(
+            partial_write_holds,
+            "the part of a write the PTY took after the Idle was read as the \
+             ended turn's interrupt"
+        );
+    }
+
+    /// A writer that takes one byte on its first call, then parks its second
+    /// call until [`SecondPartGate::release`] and takes the rest.
+    struct OneByteThenGated {
+        calls: usize,
+        gate: Arc<SecondPartGate>,
+    }
+
+    impl std::io::Write for OneByteThenGated {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Ok(buf.len().min(1));
+            }
+            if self.calls == 2 {
+                self.gate.park();
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct SecondPartGate {
+        state: std::sync::Mutex<(bool, bool)>,
+        wake: std::sync::Condvar,
+    }
+
+    impl SecondPartGate {
+        fn park(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.wake.notify_all();
+            while !state.1 {
+                state = self.wake.wait(state).unwrap();
+            }
+        }
+
+        async fn wait_until_reached(self: &Arc<Self>) {
+            let gate = self.clone();
+            tokio::task::spawn_blocking(move || {
+                let state = gate.state.lock().unwrap();
+                let (state, timeout) = gate
+                    .wake
+                    .wait_timeout_while(state, Duration::from_secs(10), |state| !state.0)
+                    .unwrap();
+                assert!(
+                    !timeout.timed_out() && state.0,
+                    "the write's second part never started"
+                );
+            })
+            .await
+            .unwrap();
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, a freshly
+    /// started agent reports Thinking before the user has typed anything into
+    /// its pane, the user presses Escape twice, and the agent reports Idle.
+    /// That first turn counts, so the interrupt must not hold the doorbell.
+    #[spec("inbox/doorbell/024")]
+    #[tokio::test]
+    async fn doorbell_024_a_first_turn_reported_before_any_input_is_a_turn() {
+        for agent_type in ["claude_code", "codex", "opencode", "pi"] {
+            let pane = TurnPane::new(&format!("fresh-stream-{agent_type}"), agent_type);
+            pane.report("thinking").await;
+            pane.keys(&[0x1b, 0x1b]).await;
+            pane.report("idle").await;
+            let holds = pane.holds();
+            pane.registry.shutdown_all();
+            assert!(
+                !holds,
+                "{agent_type}: the first turn's Thinking, reported before any \
+                 input, was lost and its interrupt held the doorbell"
+            );
+        }
+    }
+
+    /// Scenario: An agent is started on a pane and reports Thinking while its
+    /// start is still being registered, before the deck publishes it. Once
+    /// it is published, the user presses Escape twice and the agent reports
+    /// Idle: the early Thinking began that turn, so the interrupt must not
+    /// hold the doorbell.
+    #[spec("inbox/doorbell/025")]
+    #[tokio::test]
+    async fn doorbell_025_a_turn_reported_before_publication_is_kept() {
+        let temp = crate::test_temp::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        let script = temp.path().join("reserved-agent.sh");
+        crate::test_isolation::write_script(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$DOT_AGENT_DECK_AGENT_ID\" > \"$TURN_TEST_IDENTITY\"\nexec /bin/cat\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (forked, publish) = registry.pause_next_publish_for_test();
+        let spawning = tokio::task::spawn_blocking({
+            let registry = registry.clone();
+            let identity = identity.clone();
+            move || {
+                registry.spawn_agent(SpawnOptions {
+                    command: Some(script.to_str().unwrap()),
+                    env: vec![
+                        (
+                            DOT_AGENT_DECK_PANE_ID.into(),
+                            "busy-before-publication".into(),
+                        ),
+                        (
+                            "TURN_TEST_IDENTITY".into(),
+                            identity.to_string_lossy().into_owned(),
+                        ),
+                    ],
+                    ..Default::default()
+                })
+            }
+        });
+        reached(forked, "the child never forked").await;
+        let agent = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&identity)
+                    && text.ends_with('\n')
+                {
+                    break text.trim().to_string();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the child never wrote its id"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .await
+        .unwrap();
+        let pane = TurnPane::with(registry, "busy-before-publication", agent, "opencode");
+        assert!(
+            pane.registry.agent_writer(&pane.agent).is_none(),
+            "precondition: the agent is not published yet"
+        );
+        pane.report("thinking").await;
+        publish.send(()).unwrap();
+        let published = spawning.await.unwrap().expect("the spawn publishes");
+        assert_eq!(published, pane.agent);
+        pane.keys(&[0x1b, 0x1b]).await;
+        pane.report("idle").await;
+        let holds = pane.holds();
+        pane.registry.shutdown_all();
+        assert!(
+            !holds,
+            "a Thinking reported before publication was lost and the first \
+             turn's interrupt held the doorbell"
+        );
+    }
+
+    /// Scenario: The agent reports Thinking and the user's interrupt arrives
+    /// as two separate Escape writes; the agent reports Idle and the
+    /// interrupt must not hold the doorbell. On an Idle agent two separate
+    /// Escape writes are a menu and hold it. And when the first of two
+    /// Escapes is recorded only after the Idle that ended its turn (it
+    /// reached the agent before), the second Escape, written after, does not
+    /// pair with it and holds nothing.
+    #[spec("inbox/doorbell/026")]
+    #[tokio::test]
+    async fn doorbell_026_split_escapes_pair_only_within_one_turn() {
+        let pane = TurnPane::new("split-interrupt", "opencode");
+        pane.report("thinking").await;
+        pane.keys(&[0x1b]).await;
+        pane.keys(&[0x1b]).await;
+        pane.report("idle").await;
+        let interrupt_holds = pane.holds();
+        pane.keys(&[0x1b]).await;
+        pane.keys(&[0x1b]).await;
+        let menu_holds = pane.holds();
+        pane.registry.shutdown_all();
+
+        let pane = TurnPane::new("split-across-the-idle", "opencode");
+        pane.report("thinking").await;
+        let (at_record, release) = pane
+            .registry
+            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::BeforeRecord);
+        let write = pane.keys_in_background(&[0x1b]);
+        reached(at_record, "the first Escape never reached its record").await;
+        pane.report("idle").await;
+        release.send(()).unwrap();
+        write.await.unwrap();
+        pane.keys(&[0x1b]).await;
+        let across_holds = pane.holds();
+        pane.registry.shutdown_all();
+
+        assert!(
+            !interrupt_holds,
+            "an interrupt split across two writes held the doorbell"
+        );
+        assert!(
+            menu_holds,
+            "two Escape writes on an Idle agent are a menu and must hold"
+        );
+        assert!(
+            !across_holds,
+            "an Escape after the Idle paired with one that reached the agent \
+             before it"
+        );
     }
 
     /// Scenario: Agent A exits and agent B replaces it on a pane, and an

@@ -538,7 +538,7 @@ Native inbox delivery does not type a task into your input box. When native wake
 dot-agent-deck: message m-… waiting, run: dot-agent-deck inbox fetch
 ```
 
-The message stays queued while you have an unsent draft or the agent needs a permission or dialog answer. Send or clear your draft, or answer the prompt, to let the doorbell proceed. In either client, no timeout forces the doorbell over your draft. The installed integration can replace this line with the message; otherwise the agent runs the fetch command.
+The message stays queued while you have an unsent draft or the agent needs a permission or dialog answer. Send or clear your draft, or answer the prompt, to let the doorbell proceed. Pressing Escape to interrupt the agent stops counting as a draft once the agent finishes the turn you interrupted. Escape pressed while the agent is idle can open one of its menus, so it keeps the doorbell waiting until the agent finishes its next turn or you press Enter. If the deck cannot see the agent start working, as with Codex when its hooks are not trusted, Escape keeps the doorbell waiting until you press Enter. In either client, no timeout forces the doorbell over your draft. The installed integration can replace this line with the message; otherwise the agent runs the fetch command.
 
 ### Inspect delivery
 

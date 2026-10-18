@@ -13,10 +13,16 @@
 //! edits nothing (a menu answer with no Enter, a draft backspaced to empty)
 //! sets it until the user's next Enter. The one exception is a run of Escape
 //! keys and nothing else, the way the user interrupts a turn (OpenCode's
-//! interrupt is Escape twice): it holds the bit only until the agent next
-//! reports Idle ([`DraftTracker::turn_ended`]). An Escape run on an agent
-//! that is already Idle opens a menu in some agents, and holds it until the
-//! user's next Enter like any other key.
+//! interrupt is Escape twice): it holds the bit only until the turn it
+//! interrupted ends ([`DraftTracker::turn_ended`]). A turn ends when the
+//! pane's own agent reports Idle after reporting itself working, and
+//! `crate::agent_pty` applies that end only to the bytes that reached the PTY
+//! before it (PRD #1666 r8k R8G-02). An Escape run on an agent that is already
+//! Idle opens a menu in some agents, and holds the bit until that agent next
+//! finishes a turn or the user presses Enter: a repeated Idle releases
+//! nothing. Where the deck cannot tell whether an Idle came before the
+//! Escapes reached the agent or after, it holds. An agent whose busy reports
+//! never reach the deck releases nothing, and its Escapes hold until Enter.
 
 use std::time::Duration;
 
@@ -132,7 +138,9 @@ const MAX_STRING_LEN: u16 = 4096;
 pub(crate) struct DraftTracker {
     pending: bool,
     /// Set instead of `pending` by the user's lone Escape keys (`ESC ESC`):
-    /// held only until [`Self::turn_ended`].
+    /// held only until [`Self::turn_ended`], which `crate::agent_pty` calls
+    /// for the end of a turn of the pane's own agent that came after these
+    /// keys reached it.
     escapes: bool,
     escape: Escape,
     /// Whether a USER byte is part of the sequence being parsed, counting the
@@ -166,12 +174,17 @@ impl DraftTracker {
         self.pending || self.escapes
     }
 
-    /// The agent reported Idle. Escape keys the user sent before it, with
-    /// nothing else since the last submit or clear, were the interrupt that
-    /// ended its turn, which leaves the box as it was; they hold the bit no
-    /// longer. Anything else the user sent still holds it, and so does a lone
-    /// Escape still waiting for its next byte, but it is no longer counted as
-    /// half of `ESC ESC`, so an Escape after this one does not inherit it.
+    /// A turn of the agent's ended after everything fed so far reached it:
+    /// the agent reported Idle having reported itself working. The caller
+    /// decides that (`crate::agent_pty`'s turn edges, and its ordering of the
+    /// end against the PTY write that carried each byte), and calls this for
+    /// no other Idle. Escape keys the user sent before it, with nothing else
+    /// since the last submit or clear, were that turn's interrupt, which
+    /// leaves the box as it was, or a menu the agent has since left by
+    /// working a turn; they hold the bit no longer. Anything else the user
+    /// sent still holds it, and so does a lone Escape still waiting for its
+    /// next byte, but it is no longer counted as half of `ESC ESC`, so an
+    /// Escape after this one does not inherit it.
     pub(crate) fn turn_ended(&mut self) {
         self.escapes = false;
         if self.escape == (Escape::Esc { paste: false }) {

@@ -3321,6 +3321,16 @@ struct PaneInputStream {
     /// two can never disagree about what a byte did. See
     /// [`crate::draft_deferral::DraftTracker`].
     draft: crate::draft_deferral::DraftTracker,
+    /// PRD #1666 (r8k R8G-02): the pane's own agent reported a turn starting
+    /// ([`TurnEdge::Started`]) and has not reported it ended since. Only an
+    /// Idle that ends such a turn releases anything, so a repeated Idle, or
+    /// an Idle with no busy report before it, releases nothing.
+    busy: bool,
+    /// PRD #1666 (r8k R8G-02): how many turns of the pane's own agent have
+    /// ended on this stream — busy, then Idle. A PTY write reads it once the
+    /// write has returned, and its record compares that reading with the
+    /// count then ([`PaneInputState::settle_written_bytes`]).
+    turns: u64,
 }
 
 impl PaneInputStream {
@@ -3421,9 +3431,17 @@ impl DraftTestStream {
 /// [`AgentPtyRegistry::note_turn`] applies to the pane's input stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnEdge {
-    /// The agent reported Idle: what a run of the user's Escape keys could
-    /// have been holding, the interrupt of the turn it ends, is released. See
-    /// [`crate::draft_deferral::DraftTracker::turn_ended`].
+    /// The agent reported working — thinking, a tool, compacting or a
+    /// permission request: a turn is under way (r8k R8G-02). Creates the
+    /// pane's stream when it has none yet, so a first turn reported before
+    /// any input is still a turn.
+    Started,
+    /// The agent reported Idle. When a turn was under way it has ended: what
+    /// a run of the user's Escape keys could have been holding, the interrupt
+    /// of that turn, is released. See
+    /// [`crate::draft_deferral::DraftTracker::turn_ended`]. With no turn under
+    /// way — a repeated Idle, or an agent whose busy reports the deck never
+    /// receives — it releases nothing.
     Ended,
 }
 
@@ -3458,6 +3476,9 @@ struct PaneInputState {
     /// newline inside a paste nor a newline KEY is read as a submission. See
     /// [`PaneInputStream`].
     input: HashMap<String, PaneInputStream>,
+    /// Test seam: see [`InputRecorder::pause_at`].
+    #[cfg(test)]
+    write_pause: Option<PtyWritePauseArm>,
 }
 
 /// A pane id the clocks deliberately ignore: empty, or one of the
@@ -3563,12 +3584,49 @@ impl PaneInputState {
     /// caller has already checked the edge came from the pane's live owner —
     /// see [`AgentPtyRegistry::note_turn`].
     fn note_turn(&mut self, pane_id_env: &str, edge: TurnEdge) {
+        if is_sentinel_pane_id(pane_id_env) {
+            return;
+        }
         match edge {
+            TurnEdge::Started => {
+                self.input.entry(pane_id_env.to_string()).or_default().busy = true;
+            }
             TurnEdge::Ended => {
-                if let Some(stream) = self.input.get_mut(pane_id_env) {
+                if let Some(stream) = self.input.get_mut(pane_id_env)
+                    && stream.busy
+                {
+                    stream.busy = false;
+                    stream.turns += 1;
                     stream.draft.turn_ended();
                 }
             }
+        }
+    }
+
+    /// PRD #1666 (r8k R8G-02): the pane's turn count, read by
+    /// [`InputRecorder::turns_after_write`] once a PTY write has returned.
+    fn turns(&self, pane_id_env: &str) -> u64 {
+        self.input.get(pane_id_env).map_or(0, |stream| stream.turns)
+    }
+
+    /// PRD #1666 (r8k R8G-02): bytes just recorded into `pane_id_env` reached
+    /// the PTY before its turn count read `turns_after_write`. If a turn has
+    /// ended since that reading, it ended AFTER these bytes reached the agent,
+    /// and is applied to them as it was to everything recorded before it: an
+    /// interrupt's Escapes recorded late are released, not held.
+    ///
+    /// A turn that ended between the write and the reading is not known to
+    /// have come after the bytes — it may have come before them, and Escapes
+    /// written to an agent that had just gone Idle open a menu there — so it
+    /// is not applied, and the Escapes hold until the next turn ends or the
+    /// user's Enter. That ambiguous window is decided towards holding. A reset
+    /// stream (a new owner since the reading) has a lower count and is also
+    /// left alone.
+    fn settle_written_bytes(&mut self, pane_id_env: &str, turns_after_write: u64) {
+        if let Some(stream) = self.input.get_mut(pane_id_env)
+            && stream.turns > turns_after_write
+        {
+            stream.draft.turn_ended();
         }
     }
 
@@ -3779,7 +3837,20 @@ struct InputRecorder {
 }
 
 impl InputRecorder {
-    fn record(&self, source: ByteSource, accepted: &[u8]) {
+    /// PRD #1666 (r8k R8G-02): the pane's turn count, read right after a PTY
+    /// write returned and before its bytes are recorded — see
+    /// [`PaneInputState::settle_written_bytes`]. Read under `state`'s lock,
+    /// which is not held across the write: a write can block for as long as
+    /// the agent does not read (issue #525), and that lock serves every pane.
+    fn turns_after_write(&self) -> u64 {
+        self.pane_id_env
+            .as_deref()
+            .map_or(0, |pane_id| self.state.lock().unwrap().turns(pane_id))
+    }
+
+    /// Record `accepted`, the bytes ONE PTY write took, given the pane's turn
+    /// count read after that write ([`Self::turns_after_write`]).
+    fn record(&self, source: ByteSource, accepted: &[u8], turns_after_write: u64) {
         if accepted.is_empty() {
             return;
         }
@@ -3796,7 +3867,51 @@ impl InputRecorder {
             ByteSource::User => state.note_user_bytes(pane_id, accepted),
             ByteSource::Answer => state.note_user_bytes_as(pane_id, accepted, false),
         }
+        state.settle_written_bytes(pane_id, turns_after_write);
     }
+
+    /// Test seam: park this writer's thread at `at` when a test asked for it
+    /// on this pane — see [`AgentPtyRegistry::pause_next_pty_write_for_test`].
+    #[cfg(test)]
+    fn pause_at(&self, at: PtyWritePause) {
+        let Some(pane_id) = self.pane_id_env.as_deref() else {
+            return;
+        };
+        let parked = {
+            let mut state = self.state.lock().unwrap();
+            match state.write_pause.take() {
+                Some(pause) if pause.at == at && pause.pane_id_env == pane_id => Some(pause),
+                other => {
+                    state.write_pause = other;
+                    None
+                }
+            }
+        };
+        if let Some(pause) = parked {
+            let _ = pause.reached.send(());
+            let _ = pause.release.recv();
+        }
+    }
+}
+
+/// Test seam: where [`InputRecorder::pause_at`] parks a PTY writer's thread.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtyWritePause {
+    /// Before a PTY write.
+    BeforeWrite,
+    /// After the write returned and its turn count was read, before its
+    /// bytes are recorded.
+    BeforeRecord,
+}
+
+/// Test seam: one armed [`PtyWritePause`].
+#[cfg(test)]
+struct PtyWritePauseArm {
+    pane_id_env: String,
+    at: PtyWritePause,
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 /// Issue #525: one job for [`PtyWriterThread`].
@@ -3975,25 +4090,23 @@ impl PtyWriterThread {
                         continue;
                     }
                     let done = match job.op {
-                        PtyOp::Write(buf, source) => match inner.write(&buf) {
-                            Ok(n) => {
-                                recorder.record(source, &buf[..n]);
-                                PtyJobDone {
+                        PtyOp::Write(buf, source) => {
+                            match write_once_recorded(inner.as_mut(), &buf, &recorder, source) {
+                                Ok(n) => PtyJobDone {
                                     accepted: n,
                                     result: Ok(()),
                                     flushed: None,
-                                }
+                                },
+                                Err(e) => PtyJobDone {
+                                    accepted: 0,
+                                    result: Err(e),
+                                    flushed: None,
+                                },
                             }
-                            Err(e) => PtyJobDone {
-                                accepted: 0,
-                                result: Err(e),
-                                flushed: None,
-                            },
-                        },
+                        }
                         PtyOp::WriteAll(buf, source, flush) => {
-                            let mut done = write_all_recorded(inner.as_mut(), &buf, |accepted| {
-                                recorder.record(source, accepted)
-                            });
+                            let mut done =
+                                write_all_recorded(inner.as_mut(), &buf, &recorder, source);
                             if flush {
                                 done.flushed = Some(inner.flush());
                             }
@@ -4001,10 +4114,12 @@ impl PtyWriterThread {
                         }
                         PtyOp::Answer(buf, mut gate) => {
                             if gate.still_pending() {
-                                let mut done =
-                                    write_all_recorded(inner.as_mut(), &buf, |accepted| {
-                                        recorder.record(ByteSource::Answer, accepted)
-                                    });
+                                let mut done = write_all_recorded(
+                                    inner.as_mut(),
+                                    &buf,
+                                    &recorder,
+                                    ByteSource::Answer,
+                                );
                                 done.flushed = Some(inner.flush());
                                 done
                             } else {
@@ -4227,16 +4342,43 @@ fn real_time_alarm(after: Duration) -> oneshot::Receiver<()> {
     rx
 }
 
-/// Issue #525: [`write_all_tracked`]'s loop, reporting each accepted slice to
-/// `accepted` as the PTY takes it.
+/// Issue #525: one `write` call into the PTY, whose accepted bytes `recorder`
+/// records as `source`'s before this returns.
+///
+/// PRD #1666 (r8k R8G-02): the pane's turn count is read after the write
+/// returns, for THIS write's bytes alone, and handed to the record — so an
+/// agent's Idle ingested while the write was in progress or before the bytes
+/// were recorded is ordered against these bytes, not against the job they
+/// belong to. See [`PaneInputState::settle_written_bytes`] for the rule and
+/// the side its ambiguous window is decided towards.
+fn write_once_recorded(
+    w: &mut (dyn std::io::Write + Send),
+    buf: &[u8],
+    recorder: &InputRecorder,
+    source: ByteSource,
+) -> std::io::Result<usize> {
+    #[cfg(test)]
+    recorder.pause_at(PtyWritePause::BeforeWrite);
+    let n = w.write(buf)?;
+    let turns = recorder.turns_after_write();
+    #[cfg(test)]
+    recorder.pause_at(PtyWritePause::BeforeRecord);
+    recorder.record(source, &buf[..n], turns);
+    Ok(n)
+}
+
+/// Issue #525: [`write_all_tracked`]'s loop, recording each accepted slice as
+/// the PTY takes it — each one ordered against the agent's turns on its own
+/// ([`write_once_recorded`]), a partial write included.
 fn write_all_recorded(
     w: &mut (dyn std::io::Write + Send),
     buf: &[u8],
-    mut accepted: impl FnMut(&[u8]),
+    recorder: &InputRecorder,
+    source: ByteSource,
 ) -> PtyJobDone {
     let mut written = 0usize;
     while written < buf.len() {
-        match w.write(&buf[written..]) {
+        match write_once_recorded(w, &buf[written..], recorder, source) {
             Ok(0) => {
                 return PtyJobDone {
                     accepted: written,
@@ -4247,10 +4389,7 @@ fn write_all_recorded(
                     flushed: None,
                 };
             }
-            Ok(n) => {
-                accepted(&buf[written..written + n]);
-                written += n;
-            }
+            Ok(n) => written += n,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 return PtyJobDone {
@@ -6468,6 +6607,14 @@ struct RegistryInner {
     /// not been published yet. [`AgentPtyRegistry::hold_dir_for_removal`]
     /// reads this too, under the same lock.
     pending_spawn_dirs: HashMap<String, Vec<PathBuf>>,
+    /// PRD #1666 (r8k R8G-02): spawns in [`Self::pending_spawns`] whose own
+    /// agent reported a turn starting before its record was published, keyed
+    /// by the same pre-allocated agent id. Publication clears the pane's input
+    /// stream for the new owner, so the busy report is kept here and applied
+    /// to the fresh stream under the same lock that publishes it; otherwise a
+    /// first turn reported that early would have no busy edge for its Idle to
+    /// end. Removed with the reservation on both its release paths.
+    pending_busy: HashSet<String>,
     /// Issue #1612: directories a removal is holding — found unused under this
     /// lock and not yet deleted. [`AgentPtyRegistry::reserve_spawn`] refuses a
     /// spawn whose working directory lies inside one, so a spawn can never
@@ -6602,6 +6749,7 @@ impl<'a> SpawnReservation<'a> {
             inner.pending_spawns.remove(&id);
             inner.pending_hook_tokens.remove(&id);
             inner.pending_spawn_dirs.remove(&id);
+            inner.pending_busy.remove(&id);
         }
         #[cfg(unix)]
         if let Some((pane, prior)) = self.prior_binding.take() {
@@ -6976,6 +7124,7 @@ impl AgentPtyRegistry {
                 pending_spawns: HashMap::new(),
                 pending_hook_tokens: HashMap::new(),
                 pending_spawn_dirs: HashMap::new(),
+                pending_busy: HashSet::new(),
                 removal_holds: Vec::new(),
                 closing_instances: HashSet::new(),
                 closing_generations: HashSet::new(),
@@ -8905,17 +9054,37 @@ impl AgentPtyRegistry {
     /// the order publication (`forget_pane_input`) and `close_agent` take the
     /// two locks in, so a successor published between the check and the change
     /// cannot have its fresh stream touched.
+    ///
+    /// A spawn reserved on the pane and not yet published has no stream of its
+    /// own yet — publication clears the pane's — so its edges are kept on the
+    /// reservation instead ([`RegistryInner::pending_busy`]) and the busy one
+    /// is applied as the stream is cleared for it (r8k R8G-02).
     pub fn note_turn(&self, pane_id_env: &str, agent_id: &str, edge: TurnEdge) {
-        let inner = self.inner.lock().unwrap();
-        let owns = inner
+        let mut inner = self.inner.lock().unwrap();
+        let owner = inner
             .agents
             .iter()
             .find(|(_, a)| {
                 a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
             })
-            .is_some_and(|(id, _)| id == agent_id);
-        if owns {
-            self.pane_input.lock().unwrap().note_turn(pane_id_env, edge);
+            .map(|(id, _)| id.clone());
+        match owner {
+            Some(owner) if owner == agent_id => {
+                self.pane_input.lock().unwrap().note_turn(pane_id_env, edge);
+            }
+            Some(_) => {}
+            None => {
+                let reserved_here = inner
+                    .pending_spawns
+                    .get(agent_id)
+                    .is_some_and(|pane| pane.as_deref() == Some(pane_id_env));
+                if reserved_here {
+                    match edge {
+                        TurnEdge::Started => inner.pending_busy.insert(agent_id.to_string()),
+                        TurnEdge::Ended => inner.pending_busy.remove(agent_id),
+                    };
+                }
+            }
         }
     }
 
@@ -8951,6 +9120,28 @@ impl AgentPtyRegistry {
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         *self.publish_pause.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// PRD #1666 (r8k R8G-02) test seam: park the next PTY write into
+    /// `pane_id_env` at `at` — before it, or after it returned and its turn
+    /// count was read but before its bytes are recorded. The first receiver
+    /// yields once the writer's thread is parked; sending on (or dropping) the
+    /// returned sender lets it go on.
+    #[cfg(test)]
+    pub(crate) fn pause_next_pty_write_for_test(
+        &self,
+        pane_id_env: &str,
+        at: PtyWritePause,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        self.pane_input.lock().unwrap().write_pause = Some(PtyWritePauseArm {
+            pane_id_env: pane_id_env.to_string(),
+            at,
+            reached,
+            release,
+        });
         (reached_rx, release_tx)
     }
 
@@ -9706,7 +9897,10 @@ impl AgentPtyRegistry {
             return Err(AgentPtyError::DuplicatePaneId(candidate.clone()));
         }
         // Every refusal is behind us and the insert below cannot fail, so the
-        // pane keeps the binding this start recorded.
+        // pane keeps the binding this start recorded. A turn this agent
+        // reported starting while reserved is carried onto its fresh stream
+        // below (r8k R8G-02).
+        let busy_before_publication = inner.pending_busy.remove(&preallocated_id);
         reservation.publish_locked(&mut inner);
         // Issue #424 H3: this agent is the pane's new occupant, so whatever the
         // previous one's guarded sends recorded about that input box describes a
@@ -9716,6 +9910,12 @@ impl AgentPtyRegistry {
         // check, so the record cannot outlive the handover.
         if let Some(ref claimed) = pane_id_env {
             self.forget_pane_input(claimed);
+            if busy_before_publication {
+                self.pane_input
+                    .lock()
+                    .unwrap()
+                    .note_turn(claimed, TurnEdge::Started);
+            }
             // Issue #454 round-3 audit (finding 4): the pane changes hands HERE,
             // under the same lock as the duplicate check and the insert below.
             // Every record still sitting on this pane is a retired generation
