@@ -211,6 +211,10 @@ pub struct Attempt {
     /// Its incarnation was retired and the resume answer is still owed.
     pub resume_pending: bool,
     pub revoked: bool,
+    /// When a revoke of this attempt was last sent (r8k R8G-04): the line can
+    /// be lost — no link, or a full queue — so until the attempt is final
+    /// [`AttemptModel::revokes_due`] sends it again one ack-wait later.
+    revoke_sent: Option<Instant>,
     /// Kept for an attempt whose late commit can still correct the sender
     /// (§7): a `HandedInert` one, and a `Fenced` one until a spool check
     /// after its message ended found no commit for it.
@@ -706,6 +710,7 @@ impl AttemptModel {
             mark: 0,
             resume_pending: false,
             revoked: false,
+            revoke_sent: None,
             verifier: false,
             reclaimed: false,
             issued_at: now,
@@ -1115,6 +1120,17 @@ impl AttemptModel {
                 at.d = r.next_d;
                 at.issued_at = now;
                 at.regained();
+                // r8k R8G-04: a revoke sent to the retired incarnation may
+                // never have reached the context, which now answers on this
+                // one; it is sent again here, to the new incarnation.
+                if at.revoked {
+                    at.revoke_sent = Some(now);
+                    self.effects.push(Effect::Revoke {
+                        id: id.to_string(),
+                        a,
+                        e,
+                    });
+                }
             }
             ResumeAnswer::NotHanded if survived => at.stage = Stage::NotHanded,
             _ => at.fence(),
@@ -1195,6 +1211,60 @@ impl AttemptModel {
                 }
             }
         }
+        self.revokes_due(now);
+    }
+
+    /// r8k R8G-04: send again every revoke still owed an answer one ack-wait
+    /// after it was last sent. A revoke line can be lost on its way — the
+    /// attempt's incarnation had no link, or its queue was full — and nothing
+    /// else would send it again: a terminal message is no lapse candidate, and
+    /// a healthy stream is never retired.
+    ///
+    /// Owed while the attempt is revoked and not final, not waiting for a
+    /// resume answer (the answer re-sends it, [`Self::resume_answer`]) and not
+    /// reclaimed. It stops only when the attempt is final: the receiver's
+    /// answer (`revoked_ack`, `already_handed`), a commit, a resume answer or
+    /// its silence, the stream's retirement, or exit. A send proves nothing
+    /// and neither does an absence, so neither makes it final.
+    ///
+    /// That bounds the RATE — one line per owed attempt per ack-wait — and,
+    /// through the evidence budget, how many attempts can be owed at once. It
+    /// does not bound the number of re-sends: a live receiver that never
+    /// answers is sent one per ack-wait for as long as it lives, and its
+    /// attempt keeps its evidence reserved all that time.
+    pub fn revokes_due(&mut self, now: Instant) {
+        if self.exited {
+            return;
+        }
+        let ack_wait = self.limits.ack_wait;
+        for (id, msg) in self.messages.iter_mut() {
+            for at in msg.attempts.iter_mut().filter(|at| owes_revoke(at)) {
+                if at.revoke_sent.is_none_or(|sent| now >= sent + ack_wait) {
+                    at.revoke_sent = Some(now);
+                    self.effects.push(Effect::Revoke {
+                        id: id.clone(),
+                        a: at.a,
+                        e: at.e,
+                    });
+                }
+            }
+        }
+    }
+
+    /// r8k R8G-04: when the next owed revoke is due to be sent again
+    /// ([`Self::revokes_due`]), so the clock runs while one is owed even when
+    /// its message is terminal.
+    pub fn revoke_due_at(&self) -> Option<Instant> {
+        if self.exited {
+            return None;
+        }
+        let ack_wait = self.limits.ack_wait;
+        self.messages
+            .values()
+            .flat_map(|msg| msg.attempts.iter())
+            .filter(|at| owes_revoke(at))
+            .map(|at| at.revoke_sent.map_or(at.issued_at, |sent| sent + ack_wait))
+            .min()
     }
 
     /// Retire every stream incarnation whose connection closed
@@ -1310,6 +1380,7 @@ impl AttemptModel {
                 for at in msg.attempts.iter_mut() {
                     if at.a == current && !at.stage.is_final() && !at.revoked {
                         at.revoked = true;
+                        at.revoke_sent = Some(now);
                         self.effects.push(Effect::Revoke {
                             id: id.to_string(),
                             a: at.a,
@@ -1416,6 +1487,7 @@ impl AttemptModel {
                 for at in msg.attempts.iter_mut() {
                     if !at.stage.is_final() && !at.revoked {
                         at.revoked = true;
+                        at.revoke_sent = Some(now);
                         effects.push(Effect::Revoke {
                             id: id.to_string(),
                             a: at.a,
@@ -1616,6 +1688,11 @@ impl Attempt {
         self.verifier = true;
         self.regained();
     }
+}
+
+/// Whether a revoke of `at` is still owed an answer ([`AttemptModel::revokes_due`]).
+fn owes_revoke(at: &Attempt) -> bool {
+    at.revoked && !at.stage.is_final() && !at.resume_pending && !at.reclaimed
 }
 
 /// Whether `at` must be cleared by a spool check before rule 5 may repeat
@@ -2984,5 +3061,127 @@ mod tests {
             "a refusal for a committed assignment is not a witness either"
         );
         assert_eq!(m.evidence_reserved(), reserved);
+    }
+
+    /// The revokes in `effects`, as `(a, e)` pairs of message `id`.
+    fn revokes(effects: &[Effect], id: &str) -> Vec<(u32, u32)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Revoke { id: of, a, e } if of == id => Some((*a, *e)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A message handed to a live receiver and cancelled, its revoke sent
+    /// and never answered. Possession lasts far longer than the ack-wait, so
+    /// nothing else moves while the clock runs.
+    fn cancelled_unanswered() -> (AttemptModel, Instant, Rx, Issued) {
+        let limits = Limits {
+            possess_ttl: Duration::from_secs(24 * 60 * 60),
+            ..Limits::default()
+        };
+        let (mut m, t) = model_with(limits);
+        m.post("m1", false);
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        let issued = issue_held(&mut m, t, "m1", rx, 1);
+        let r = m.delivery("m1").unwrap().revision;
+        assert!(matches!(
+            m.cancel(t, "m1", GEN, r),
+            ActionOutcome::Applied { .. }
+        ));
+        assert_eq!(revokes(&m.drain_effects(), "m1"), vec![(1, issued.e)]);
+        (m, t, rx, issued)
+    }
+
+    /// Scenario: A cancelled message's revoke is never answered by its live
+    /// receiver. The clock runs through several ack-waits, ticking twice in
+    /// each: the revoke is sent again exactly once per ack-wait, the attempt
+    /// stays open and keeps its evidence reserved, nothing is reclaimed, and
+    /// the message stays held for the answer.
+    #[spec("inbox/boundary/041")]
+    #[test]
+    fn boundary_041_an_unanswered_revoke_is_resent_once_per_ack_wait_with_nothing_made_final() {
+        let (mut m, t, _rx, issued) = cancelled_unanswered();
+        let ack_wait = Limits::default().ack_wait;
+        let reserved = m.evidence_reserved();
+        for round in 1..=4u32 {
+            let due = t + ack_wait * round;
+            m.tick(due);
+            m.tick(due + ack_wait / 2);
+            let effects = m.drain_effects();
+            assert_eq!(
+                revokes(&effects, "m1"),
+                vec![(1, issued.e)],
+                "round {round}: one re-send per ack-wait"
+            );
+            assert!(
+                !effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::Reclaimed { .. })),
+                "round {round}: a re-send reclaims nothing"
+            );
+            let at = m.delivery("m1").unwrap().attempt(1, issued.e).unwrap();
+            assert!(!at.stage.is_final(), "round {round}: a send is no answer");
+            assert!(!at.reclaimed, "round {round}");
+            assert_eq!(m.evidence_reserved(), reserved, "round {round}");
+            assert_eq!(m.state("m1"), Some(MessageState::CancelHeld));
+        }
+    }
+
+    /// Scenario: A cancelled message's revoke is sent and the clock ticks
+    /// just short of one ack-wait later: nothing is sent again. At the
+    /// ack-wait, it is.
+    #[spec("inbox/boundary/042")]
+    #[test]
+    fn boundary_042_no_revoke_is_resent_before_its_ack_wait() {
+        let (mut m, t, _rx, issued) = cancelled_unanswered();
+        let ack_wait = Limits::default().ack_wait;
+        m.tick(t);
+        m.tick(t + ack_wait - Duration::from_millis(1));
+        assert!(
+            revokes(&m.drain_effects(), "m1").is_empty(),
+            "re-sent before its ack-wait"
+        );
+        m.tick(t + ack_wait);
+        assert_eq!(revokes(&m.drain_effects(), "m1"), vec![(1, issued.e)]);
+    }
+
+    /// Scenario: A cancelled message's revoke is sent again once, and the
+    /// receiver then answers it — `already_handed` for one message,
+    /// `revoked_ack` for another — or the attempt's own commit arrives for a
+    /// third. Each attempt is final, the clock runs on through several
+    /// ack-waits, and no revoke is sent again.
+    #[spec("inbox/boundary/043")]
+    #[test]
+    fn boundary_043_revokes_stop_once_the_attempt_is_final() {
+        let ack_wait = Limits::default().ack_wait;
+        for answer in [Stage::HandedInert, Stage::NotHanded, Stage::Committed] {
+            let (mut m, t, rx, issued) = cancelled_unanswered();
+            m.tick(t + ack_wait);
+            assert_eq!(revokes(&m.drain_effects(), "m1"), vec![(1, issued.e)]);
+            let from = (answer != Stage::Committed).then_some(rx);
+            assert_eq!(
+                m.stage(t + ack_wait, "m1", 1, issued.e, answer, from),
+                StageOutcome::Applied,
+                "{answer:?}"
+            );
+            for round in 2..=5u32 {
+                m.tick(t + ack_wait * round);
+            }
+            assert!(
+                revokes(&m.drain_effects(), "m1").is_empty(),
+                "{answer:?}: a final attempt was revoked again"
+            );
+            assert_eq!(
+                m.delivery("m1")
+                    .unwrap()
+                    .attempt(1, issued.e)
+                    .unwrap()
+                    .stage,
+                answer
+            );
+        }
     }
 }

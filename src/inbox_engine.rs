@@ -50,7 +50,8 @@ use crate::inbox_receipt::{EvidenceStore, GenerationSpool, RecordScanner};
 
 /// How many lines may wait for one receipt stream's connection task. A line
 /// that finds the queue full is dropped ([`flush`]); the stream itself stays
-/// open.
+/// open, so a dropped revoke is sent again by the clock
+/// ([`AttemptModel::revokes_due`]).
 pub(super) const RECEIPT_SIGNAL_CAPACITY: usize = 64;
 
 /// PRD #1666 §11: how long after spawn a generation whose adapter declares
@@ -221,7 +222,15 @@ impl Receipts {
                 .map_or(now, |at| at + step.min(Duration::from_secs(1)))
                 .max(now)
         });
-        [open.then(|| now + step), arm, check]
+        // r8k R8G-04: a revoke still owed an answer is sent again by the
+        // clock, also for a terminal message, which `open` does not count.
+        let revoke = self
+            .gens
+            .values()
+            .filter_map(|generation| generation.model.revoke_due_at())
+            .min()
+            .map(|due| due.max(now));
+        [open.then(|| now + step), arm, check, revoke]
             .into_iter()
             .flatten()
             .min()
@@ -755,8 +764,10 @@ pub(super) fn explicit_commit(st: &mut HubState, key: &AgentKey, id: &str, now: 
     true
 }
 
-/// Write `out`'s lines; a stream whose queue is full or gone is left to its
-/// own connection task to notice.
+/// Write `out`'s lines. A line for a stream whose queue is full is dropped
+/// and the stream stays open (a dropped revoke is sent again by the clock,
+/// [`AttemptModel::revokes_due`]); a stream that is gone is left to its own
+/// connection task to notice.
 pub(super) fn flush(out: Outbox) {
     for (tx, reply) in out {
         if tx.try_send(WaiterSignal::Line(Box::new(reply))).is_err() {

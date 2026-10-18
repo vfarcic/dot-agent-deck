@@ -57,7 +57,20 @@ impl Peer {
         component: InboxComponent,
         arm: ReceiptArm,
     ) -> Peer {
-        let (client, server) = tokio::io::duplex(1 << 16);
+        Self::open_buffered(hub, pane, agent, component, arm, 1 << 16).await
+    }
+
+    /// [`Self::open`] over a connection that buffers only `buffer` bytes, so
+    /// the daemon's writer stops while the test is not reading.
+    async fn open_buffered(
+        hub: &Arc<InboxHub>,
+        pane: &str,
+        agent: &str,
+        component: InboxComponent,
+        arm: ReceiptArm,
+        buffer: usize,
+    ) -> Peer {
+        let (client, server) = tokio::io::duplex(buffer);
         let (read, write) = tokio::io::split(server);
         let serve = tokio::spawn(serve_waiter(
             Arc::clone(hub),
@@ -1842,4 +1855,349 @@ async fn boundary_029_an_earlier_absence_check_never_licenses_a_later_repeat() {
         assert_eq!(attempts_of(&hub, "p", "a", id.as_str()), 2, "{what}");
         peer.close().await;
     }
+}
+
+/// The revokes on the lines `peer` receives within `span`, keepalives
+/// skipped; empty when none arrives.
+async fn revokes_within(peer: &mut Peer, span: Duration) -> Vec<crate::event::InboxAttemptRef> {
+    let deadline = tokio::time::Instant::now() + span;
+    loop {
+        match tokio::time::timeout_at(deadline, peer.next()).await {
+            Ok(reply) if !reply.revoke.is_empty() => return reply.revoke,
+            Ok(_) => {}
+            Err(_) => return Vec::new(),
+        }
+    }
+}
+
+/// Fill the queue of lines waiting for `pane`/`agent`'s stream `rx` while its
+/// writer is stopped (a connection that buffers little, nobody reading), so
+/// the next line the engine sends it is dropped. Answers how many were queued.
+async fn fill_the_queue(hub: &InboxHub, pane: &str, agent: &str, rx: u64) -> usize {
+    let tx = hub.lock().receipts.gens[&(pane.to_string(), agent.to_string())].links
+        [&crate::inbox_attempts::Rx(rx)]
+        .tx
+        .clone();
+    let mut queued = 0;
+    let started = Instant::now();
+    loop {
+        match tx.try_send(WaiterSignal::Line(Box::new(InboxWaitReply::keepalive()))) {
+            Ok(()) => queued += 1,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) if tx.capacity() == 0 => {
+                // Full, and still full a moment later: the writer is stopped.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if tx.capacity() == 0 {
+                    return queued;
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            Err(error) => panic!("the stream's queue is gone: {error}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the queue never filled"
+        );
+    }
+}
+
+fn queue_capacity(hub: &InboxHub, pane: &str, agent: &str, rx: u64) -> usize {
+    hub.lock().receipts.gens[&(pane.to_string(), agent.to_string())].links
+        [&crate::inbox_attempts::Rx(rx)]
+        .tx
+        .capacity()
+}
+
+/// One attempt's stage and whether its evidence was returned.
+fn attempt_state(
+    hub: &InboxHub,
+    pane: &str,
+    agent: &str,
+    id: &str,
+    a: u32,
+    e: u32,
+) -> (crate::inbox_attempts::Stage, bool) {
+    let st = hub.lock();
+    let at = st.receipts.gens[&(pane.to_string(), agent.to_string())]
+        .model
+        .delivery(id)
+        .unwrap()
+        .attempt(a, e)
+        .unwrap()
+        .clone();
+    (at.stage, at.reclaimed)
+}
+
+fn evidence_reserved(hub: &InboxHub, pane: &str, agent: &str) -> usize {
+    hub.lock().receipts.gens[&(pane.to_string(), agent.to_string())]
+        .model
+        .evidence_reserved()
+}
+
+/// Hand `id` to `peer`, then let that hand-out lapse unpossessed and take its
+/// marked repeat: answers both hand-outs.
+async fn first_and_repeat(hub: &InboxHub, peer: &mut Peer) -> (InboxDelivery, InboxDelivery) {
+    let first = peer.handout().await.remove(0);
+    peer.send(serde_json::json!({"possess": {"seq": 1, "seen": attempt(&first).d, "held": []}}))
+        .await;
+    let repeat = peer.handout_ticking(hub).await.remove(0);
+    assert!(attempt(&repeat).repeat, "the second hand-out is the repeat");
+    peer.send(serde_json::json!({"possess": {"seq": 2, "seen": attempt(&repeat).d, "held": [at(&repeat)]}}))
+        .await;
+    (first, repeat)
+}
+
+/// Scenario: A message's first hand-out lapses and its marked repeat goes to the same OpenCode receiver, whose watcher then disconnects. The repeat's commit receipt settles the message while no stream is connected, so the revoke of the first hand-out has nowhere to go. The watcher reconnects for the same context and answers the first hand-out retained: the revoke is sent to it at once, the context answers that it was already handed (the call was aborted without a commit), and the attempt is final and its evidence returned.
+#[spec("inbox/boundary/038")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_038_a_revoke_with_no_link_is_sent_again_on_the_retained_rebind() {
+    let (hub, _state) = hub_with_spool(Duration::from_millis(300), Duration::from_secs(2));
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    let old_rx = peer.next().await.registered.unwrap().rx;
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("revoke me"))
+        .unwrap();
+    let (first, repeat) = first_and_repeat(&hub, &mut peer).await;
+    peer.close().await;
+    until("the watcher's link to go", || {
+        !hub.lock().receipts.gens[&("p".to_string(), "a".to_string())]
+            .links
+            .contains_key(&crate::inbox_attempts::Rx(old_rx))
+    })
+    .await;
+    publish_receipt(
+        &hub,
+        "p",
+        "a",
+        &repeat,
+        crate::inbox_receipt::RecordStage::Committed,
+    );
+    until("the repeat's receipt to settle it", || {
+        hub.tick();
+        state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
+    })
+    .await;
+    let (a, e) = (attempt(&first).a, attempt(&first).e);
+    assert!(
+        !attempt_state(&hub, "p", "a", id.as_str(), a, e)
+            .0
+            .is_final(),
+        "precondition: the first hand-out's revoke had no link and is unanswered"
+    );
+
+    let mut peer = Peer::open(
+        &hub,
+        "p",
+        "a",
+        InboxComponent::OpenCodePlugin,
+        ReceiptArm {
+            resumed: true,
+            ..INTEGRATION
+        },
+    )
+    .await;
+    let registered = peer.next().await;
+    assert_eq!(
+        registered
+            .resume
+            .iter()
+            .map(|r| (r.id.as_str(), r.a, r.e))
+            .collect::<Vec<_>>(),
+        vec![(id.as_str(), a, e)]
+    );
+    peer.send(serde_json::json!({"resume_answers": [{"id": id.as_str(), "a": a, "e": e, "answer": "retained"}]}))
+        .await;
+    // Well inside the ack-wait, with no clock running: only the rebind can
+    // have sent it.
+    let revoked = revokes_within(&mut peer, Duration::from_secs(1)).await;
+    assert_eq!(
+        revoked
+            .iter()
+            .map(|r| (r.id.as_str(), r.a, r.e))
+            .collect::<Vec<_>>(),
+        vec![(id.as_str(), a, e)],
+        "the retained rebind sends the owed revoke again"
+    );
+    peer.send(serde_json::json!({"already_handed": [{"id": id.as_str(), "a": a, "e": e}]}))
+        .await;
+    until(
+        "the answer to end the attempt and return its evidence",
+        || {
+            attempt_state(&hub, "p", "a", id.as_str(), a, e)
+                == (crate::inbox_attempts::Stage::HandedInert, true)
+        },
+    )
+    .await;
+    assert_eq!(evidence_reserved(&hub, "p", "a"), 0);
+    peer.close().await;
+}
+
+/// Scenario: A message is handed to an OpenCode receiver whose connection stops taking lines, so its queue of waiting lines fills; Cancel's revoke finds the queue full and is dropped, while the stream stays connected. The test reads the queue out: no revoke arrives before one ack-wait has passed, and the clock's next pass after it sends the revoke again on the same stream, which answers it; the message ends cancelled and its evidence is returned.
+#[spec("inbox/boundary/039")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_039_a_revoke_dropped_by_a_full_queue_is_sent_again() {
+    let ack_wait = Duration::from_millis(600);
+    let hub = hub_with(Duration::from_secs(30), ack_wait);
+    let mut peer = Peer::open_buffered(
+        &hub,
+        "p",
+        "a",
+        InboxComponent::OpenCodePlugin,
+        INTEGRATION,
+        256,
+    )
+    .await;
+    let rx = peer.next().await.registered.unwrap().rx;
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("cancel me"))
+        .unwrap();
+    let handed = peer.handout().await.remove(0);
+    assert!(fill_the_queue(&hub, "p", "a", rx).await > 0);
+    let revision = hub.lock().receipts.gens[&("p".to_string(), "a".to_string())]
+        .model
+        .delivery(id.as_str())
+        .unwrap()
+        .revision;
+    let cancelled = Instant::now();
+    let cancel = hub.inbox_action("p", "a", id.as_str(), revision, false, "desktop");
+    assert_eq!(
+        cancel.outcome,
+        crate::daemon_protocol::InboxActionOutcome::Applied
+    );
+    assert_eq!(
+        queue_capacity(&hub, "p", "a", rx),
+        0,
+        "precondition: the queue was full when the revoke was sent, so it was dropped"
+    );
+    hub.tick();
+    let early = revokes_within(&mut peer, Duration::from_millis(250)).await;
+    assert!(
+        early.is_empty() && cancelled.elapsed() < ack_wait,
+        "a revoke arrived before the ack-wait: {early:?}"
+    );
+    tokio::time::sleep(ack_wait.saturating_sub(cancelled.elapsed())).await;
+    hub.tick();
+    let (a, e) = (attempt(&handed).a, attempt(&handed).e);
+    let revoked = revokes_within(&mut peer, Duration::from_secs(2)).await;
+    assert_eq!(
+        revoked
+            .iter()
+            .map(|r| (r.id.as_str(), r.a, r.e))
+            .collect::<Vec<_>>(),
+        vec![(id.as_str(), a, e)],
+        "the clock sends the dropped revoke again"
+    );
+    assert!(
+        hub.lock().receipts.gens[&("p".to_string(), "a".to_string())]
+            .links
+            .contains_key(&crate::inbox_attempts::Rx(rx)),
+        "the stream stayed connected throughout"
+    );
+    peer.send(serde_json::json!({"revoked_ack": [{"id": id.as_str(), "a": a, "e": e}]}))
+        .await;
+    until("the answer to end the message", || {
+        state_of(&hub, "p", id.as_str()) == StateName::Undeliverable
+    })
+    .await;
+    assert_eq!(
+        attempt_state(&hub, "p", "a", id.as_str(), a, e),
+        (crate::inbox_attempts::Stage::NotHanded, true)
+    );
+    assert_eq!(evidence_reserved(&hub, "p", "a"), 0);
+    peer.close().await;
+}
+
+/// Scenario: With the hub's own clock running and no test driving it, a message's first hand-out lapses and its marked repeat goes to the same OpenCode receiver; the receiver's queue then fills, and the repeat's commit receipt settles the message, so the revoke of the first hand-out is dropped. With only that settled message and its open, revoked first attempt left, the clock still has a deadline, and through it the revoke is sent again; the receiver answers already handed, the attempt's evidence is returned, and no further revoke follows.
+#[spec("inbox/boundary/040")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_040_an_owed_revoke_keeps_the_clock_running_for_a_settled_message() {
+    let ack_wait = Duration::from_millis(400);
+    let (hub, _state) = hub_with_spool(Duration::from_millis(300), ack_wait);
+    let ticker = hub.spawn_ticker();
+    let mut peer = Peer::open_buffered(
+        &hub,
+        "p",
+        "a",
+        InboxComponent::OpenCodePlugin,
+        INTEGRATION,
+        256,
+    )
+    .await;
+    let rx = peer.next().await.registered.unwrap().rx;
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("settle me"))
+        .unwrap();
+    let first = peer.handout().await.remove(0);
+    peer.send(serde_json::json!({"possess": {"seq": 1, "seen": attempt(&first).d, "held": []}}))
+        .await;
+    let repeat = peer.handout().await.remove(0);
+    assert!(
+        attempt(&repeat).repeat,
+        "the clock repeated the first hand-out"
+    );
+    // The snapshot holding the repeat rides with a final hand-over check, so
+    // the grant that answers it proves the snapshot was applied before the
+    // queue stops moving.
+    peer.send(serde_json::json!({
+        "possess": {"seq": 2, "seen": attempt(&repeat).d, "held": [at(&repeat)]},
+        "may": {"q": 1, "id": repeat.id, "a": attempt(&repeat).a, "e": attempt(&repeat).e},
+    }))
+    .await;
+    loop {
+        if peer.next().await.grant.is_some() {
+            break;
+        }
+    }
+    assert!(fill_the_queue(&hub, "p", "a", rx).await > 0);
+    publish_receipt(
+        &hub,
+        "p",
+        "a",
+        &repeat,
+        crate::inbox_receipt::RecordStage::Committed,
+    );
+    until("the clock to find the receipt and settle it", || {
+        state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
+    })
+    .await;
+    assert_eq!(
+        queue_capacity(&hub, "p", "a", rx),
+        0,
+        "precondition: the queue was full when the revoke was sent, so it was dropped"
+    );
+    let (a, e) = (attempt(&first).a, attempt(&first).e);
+    assert!(
+        !attempt_state(&hub, "p", "a", id.as_str(), a, e)
+            .0
+            .is_final()
+    );
+    assert!(
+        hub.lock().receipts.next_deadline(Instant::now()).is_some(),
+        "a settled message with an owed revoke keeps a deadline"
+    );
+    let revoked = revokes_within(&mut peer, ack_wait * 5).await;
+    assert_eq!(
+        revoked
+            .iter()
+            .map(|r| (r.id.as_str(), r.a, r.e))
+            .collect::<Vec<_>>(),
+        vec![(id.as_str(), a, e)],
+        "the clock sends the dropped revoke again"
+    );
+    peer.send(serde_json::json!({"already_handed": [{"id": id.as_str(), "a": a, "e": e}]}))
+        .await;
+    until(
+        "the answer to end the attempt and return its evidence",
+        || {
+            attempt_state(&hub, "p", "a", id.as_str(), a, e)
+                == (crate::inbox_attempts::Stage::HandedInert, true)
+        },
+    )
+    .await;
+    assert_eq!(evidence_reserved(&hub, "p", "a"), 0);
+    assert!(
+        revokes_within(&mut peer, ack_wait * 3).await.is_empty(),
+        "a revoke after the answer"
+    );
+    ticker.abort();
+    peer.close().await;
 }

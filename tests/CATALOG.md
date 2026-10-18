@@ -8640,6 +8640,54 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** all.
 - **Cost:** none.
 
+##### inbox/boundary/038 — A revoke with no link is sent again on the retained rebind.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
+- **Agent:** none.
+- **Asserts:** with a message's repeat committed (from its receipt) while the receiver's watcher is disconnected, so the first hand-out's revoke had no link, the reconnecting watcher is asked to resume only the first hand-out; answering it retained brings its revoke at once, well inside the ack-wait and with no clock running; answering that `already_handed` makes the attempt HandedInert, returns its evidence and leaves none reserved.
+- **Does not assert:** a real watcher or plugin.
+- **Platform coverage:** all.
+- **Cost:** none.
+
+##### inbox/boundary/039 — A revoke dropped by a full queue is sent again.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex that buffers 256 bytes, its stream's line queue filled while the test does not read.
+- **Agent:** none.
+- **Asserts:** Cancel's revoke finds the queue full and is dropped; draining the queue and ticking before the ack-wait brings no revoke; the first tick after it sends the revoke on the same, still connected stream; `revoked_ack` ends the message cancelled with the attempt NotHanded and its evidence returned.
+- **Does not assert:** the clock's own scheduling (`inbox/boundary/040`).
+- **Platform coverage:** all.
+- **Cost:** none.
+
+##### inbox/boundary/040 — An owed revoke keeps the clock running for a settled message.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's own ticker (`spawn_ticker`) and a real spool; the test calls no `tick`.
+- **Agent:** none.
+- **Asserts:** with a repeat's receipt settling the message while the receiver's queue is full, so the first hand-out's revoke is dropped, `next_deadline` is still scheduled with only that settled message and its open revoked attempt left; through it the clock sends the revoke again; `already_handed` returns the attempt's evidence and no revoke follows for three ack-waits.
+- **Does not assert:** a revoke owed for an attempt waiting for a resume answer (the answer re-sends it).
+- **Platform coverage:** all.
+- **Cost:** none.
+
+##### inbox/boundary/041 — An unanswered revoke is sent again once per ack-wait, with nothing made final.
+- **Layer:** L1 unit (`src/inbox_attempts.rs`, injected time).
+- **Agent:** none.
+- **Asserts:** over four ack-waits with two ticks each, a cancelled attempt's unanswered revoke is sent again exactly once per ack-wait; the attempt stays open and unreclaimed, the evidence reserved does not change and the message stays held for the answer.
+- **Does not assert:** a total bound on re-sends, which there is not: a live receiver that never answers is sent one per ack-wait for as long as it lives.
+- **Platform coverage:** all.
+- **Cost:** none.
+
+##### inbox/boundary/042 — No revoke is sent again before its ack-wait.
+- **Layer:** L1 unit (`src/inbox_attempts.rs`, injected time).
+- **Agent:** none.
+- **Asserts:** ticks at the revoke and one millisecond short of its ack-wait send nothing; the tick at the ack-wait sends it.
+- **Does not assert:** the hub's clock (`inbox/boundary/040`).
+- **Platform coverage:** all.
+- **Cost:** none.
+
+##### inbox/boundary/043 — Revokes stop once the attempt is final.
+- **Layer:** L1 unit (`src/inbox_attempts.rs`, injected time).
+- **Agent:** none.
+- **Asserts:** after one re-send, an `already_handed` answer, a `revoked_ack` answer or the attempt's own commit each leave it final, and four more ack-waits send no revoke.
+- **Does not assert:** a resume answer, the stream's retirement or exit, which also end it.
+- **Platform coverage:** all.
+- **Cost:** none.
+
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
 - **Agent:** none.
