@@ -1404,7 +1404,7 @@ jobs:
     # setting the Linux `test` and `e2e-build` jobs use. JOB-wide rather than on
     # the nextest step: `cargo build`, clippy and nextest below share one
     # profile, and setting it on the nextest step alone would make nextest
-    # rebuild what `cargo build` had just compiled. Measured on 2026-10-19 over
+    # rebuild what `cargo build` had just compiled. Measured on 2026-10-18 over
     # three warm runs against the eleven before: the job's median went from
     # ~17.0 to ~14.1 minutes (nextest step ~850s -> ~718s). macOS runners vary
     # by several minutes run to run, so read that as ~2-3 minutes, not exact.
