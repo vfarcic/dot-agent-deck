@@ -669,8 +669,8 @@ jobs:
           failed="$(printf '%s' "$NEEDS_JSON" | jq -r '[to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"] | join(", ")')"
           if [ -n "$failed" ]; then echo "not green: $failed"; exit 1; fi
 
-  # The e2e tier, compiled once into a nextest archive that the four
-  # partitions below run. Partitions running `cargo` themselves would each
+  # The e2e tier, compiled once into a nextest archive that the five
+  # shards below run. Partitions running `cargo` themselves would each
   # rebuild the workspace crates, whose sources get fresh mtimes on checkout.
   e2e-build:
     needs: changes
@@ -710,7 +710,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3, 4]
+        shard: ["1", "2", "3", "4", version]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -733,15 +733,24 @@ jobs:
           name: e2e-archive-attempt-${{ github.run_attempt }}
       # Extracted into the checkout, so `target/` lands where the tests'
       # compile-time paths (`env!("CARGO_BIN_EXE_dot-agent-deck")`) point.
-      - run: |
+      - env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          # `lifecycle/version/001` runs a nested cold `cargo build` (72-370s in CI)
+          # and set the floor of whichever partition drew it, so it runs alone in
+          # its own shard and the other four split the rest of the tier.
+          if [ "$SHARD" = version ]; then
+            set -- -E 'test(=version_001_injected_build_env_reaches_the_binary)'
+          else
+            set -- --partition "count:$SHARD/4" -E 'not test(=version_001_injected_build_env_reaches_the_binary)'
+          fi
           cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
-            --extract-to . --extract-overwrite --retries 1 \
-            --partition count:${{ matrix.partition }}/4
+            --extract-to . --extract-overwrite --retries 1 "$@"
       - name: Preserve this attempt's test results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: nextest-e2e-p${{ matrix.partition }}-attempt-${{ github.run_attempt }}
+          name: nextest-e2e-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
           if-no-files-found: warn
 

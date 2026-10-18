@@ -35,7 +35,7 @@ tasks:
       sudo apt-get update
       sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
         libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
-        build-essential pkg-config
+        build-essential pkg-config jq
       sudo apt-get clean
 
   - key: code
@@ -70,15 +70,17 @@ tasks:
 
   - key: clippy
     use: [system-packages, code, rust]
-    tool-cache: ci-clippy
+    tool-cache: ci-clippy-v2
     runner:
       cpus: 16
       memory: 64gb
+    env:
+      CARGO_INCREMENTAL: "0"
     run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
 
   - key: build-release
     use: [system-packages, code, rust]
-    tool-cache: ci-build-release
+    tool-cache: ci-build-release-v2
     runner:
       cpus: 16
       memory: 64gb
@@ -90,7 +92,7 @@ tasks:
 
   - key: test
     use: [system-packages, code, rust, nextest, go-task]
-    tool-cache: ci-test
+    tool-cache: ci-test-v2
     runner:
       cpus: 16
       memory: 64gb
@@ -99,7 +101,14 @@ tasks:
       # Line tables keep file:line in panics and backtraces but drop the rest
       # of the debug info, which is most of `target/`'s size and link time.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-    run: cargo test-fast
+      CARGO_INCREMENTAL: "0"
+    run: |
+      cargo test-fast
+      # Keep only the dependencies in the tool cache, as Swatinem/rust-cache
+      # does on GitHub: the workspace crates rebuild every run anyway (fresh
+      # source mtimes), and keeping them grew the cache by tens of GB a run.
+      cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' \
+        | while read -r pkg; do cargo clean -q -p "$pkg"; done
     outputs:
       test-results:
         - path: target/nextest/default/junit.xml
@@ -112,7 +121,7 @@ tasks:
   # workspace crates, whose sources get fresh mtimes in every task.
   - key: e2e-build
     use: [system-packages, code, rust, nextest]
-    tool-cache: ci-e2e-build
+    tool-cache: ci-e2e-build-v2
     # The e2e `target/` plus its archive needs well over the default 50 GB.
     runner:
       cpus: 16
@@ -120,21 +129,46 @@ tasks:
       disk: 150gb
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-    run: cargo nextest archive --workspace --features e2e --archive-file e2e.tar.zst
+      CARGO_INCREMENTAL: "0"
+    run: |
+      cargo nextest archive --workspace --features e2e --archive-file e2e.tar.zst
+      # Keep only the dependencies in the tool cache, as Swatinem/rust-cache
+      # does on GitHub: the workspace crates rebuild every run anyway (fresh
+      # source mtimes), and keeping them grew the cache by tens of GB a run.
+      cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' \
+        | while read -r pkg; do cargo clean -q -p "$pkg"; done
 
-  # Four runners the size of a GitHub `ubuntu-latest` (4 vCPU / 16 GB), so the
+  # Five runners the size of a GitHub `ubuntu-latest` (4 vCPU / 16 GB), so the
   # timing-sensitive e2e tests see the per-runner load they see in ci.yml, and
   # the speed-up comes from partitioning rather than from bigger machines.
   - key: e2e
     use: e2e-build
-    parallel: 4
+    parallel:
+      values:
+        - shard: "1"
+        - shard: "2"
+        - shard: "3"
+        - shard: "4"
+        - shard: version
     runner:
       cpus: 4
       memory: 16gb
       disk: 150gb
+    env:
+      SHARD: ${{ parallel.shard }}
     run: |
-      cargo nextest run --archive-file e2e.tar.zst --workspace-remap . --retries 1 \
-        --partition "count:$((RWX_PARALLEL_INDEX + 1))/$RWX_PARALLEL_TOTAL"
+      # `lifecycle/version/001` runs a nested cold `cargo build` (72-370s in CI)
+      # and set the floor of whichever partition drew it, so it runs alone in
+      # its own shard and the other four split the rest of the tier.
+      if [ "$SHARD" = version ]; then
+        set -- -E 'test(=version_001_injected_build_env_reaches_the_binary)'
+      else
+        set -- --partition "count:$SHARD/4" -E 'not test(=version_001_injected_build_env_reaches_the_binary)'
+      fi
+      # Extracted into the workspace, so `target/` lands where the tests'
+      # compile-time paths (`env!("CARGO_BIN_EXE_dot-agent-deck")`) point.
+      cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
+        --extract-to . --extract-overwrite --retries 1 "$@"
     outputs:
       # Nothing uses a partition's filesystem; uploading it cost 5 minutes.
       filesystem: false
