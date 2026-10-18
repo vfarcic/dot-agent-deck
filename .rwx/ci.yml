@@ -1,0 +1,125 @@
+# RWX port of the Linux `build` and `e2e-deterministic` jobs in
+# .github/workflows/ci.yml — an evaluation on branch `rwx-eval`, not a
+# replacement. Same commands, split into a DAG so fmt, clippy, the release
+# build, the fast tier and the e2e tier run in parallel.
+#
+# Runs only on pushes to `rwx-eval`. Keep the versions below in step with
+# ci.yml (Renovate does not update this file).
+
+on:
+  github:
+    push:
+      if: ${{ event.git.branch == 'rwx-eval' }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.2.0
+
+# Incremental `target/` and `~/.cargo` between runs — the counterpart of
+# Swatinem/rust-cache in ci.yml. Without it every content-cache miss compiles
+# from scratch. The vault holds no secrets; it must be unlocked for `rwx-eval`
+# and have "Allow public repositories" on.
+tool-cache:
+  vault: dot_agent_deck_rwx_eval
+
+tasks:
+  - key: system-packages
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+        libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
+        build-essential pkg-config
+      sudo apt-get clean
+
+  - key: code
+    call: git/clone 2.2.0
+    with:
+      repository: https://github.com/vfarcic/dot-agent-deck.git
+      ref: ${{ init.commit-sha }}
+
+  - key: rust
+    call: rust-lang/install 1.1.1
+    with:
+      rust-version: 1.98.1
+
+  - key: nextest
+    use: rust
+    run: |
+      mkdir -p "$HOME/.cargo/bin"
+      curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "$HOME/.cargo/bin"
+      cargo nextest --version
+
+  - key: go-task
+    run: |
+      curl -LsSf https://github.com/go-task/task/releases/download/v3.53.1/task_linux_amd64.tar.gz \
+        | sudo tar zxf - -C /usr/local/bin task
+      task --version
+
+  - key: fmt
+    use: [code, rust]
+    run: cargo fmt --check
+
+  - key: clippy
+    use: [system-packages, code, rust]
+    tool-cache: ci-clippy
+    runner:
+      cpus: 16
+      memory: 64gb
+    run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
+
+  - key: build-release
+    use: [system-packages, code, rust]
+    tool-cache: ci-build-release
+    runner:
+      cpus: 16
+      memory: 64gb
+    run: cargo build --release
+
+  - key: linkage-check
+    use: build-release
+    run: cargo xtask linkage-check
+
+  - key: test
+    use: [system-packages, code, rust, nextest, go-task]
+    tool-cache: ci-test
+    runner:
+      cpus: 16
+      memory: 64gb
+    env:
+      DAD_REQUIRE_GO_TASK: "1"
+    run: cargo test-fast
+    outputs:
+      test-results:
+        - path: target/nextest/default/junit.xml
+          options:
+            language: Rust
+            framework: cargo-nextest
+
+  # Compile the e2e tier once; the partitions below inherit this task's
+  # `target/` through `use` instead of each compiling it again.
+  - key: e2e-build
+    use: [system-packages, code, rust, nextest]
+    tool-cache: ci-e2e-build
+    runner:
+      cpus: 16
+      memory: 64gb
+    run: cargo nextest list --workspace --features e2e > /dev/null
+
+  # Four runners the size of a GitHub `ubuntu-latest` (4 vCPU / 16 GB), so the
+  # timing-sensitive e2e tests see the per-runner load they see in ci.yml, and
+  # the speed-up comes from partitioning rather than from bigger machines.
+  - key: e2e
+    use: e2e-build
+    parallel: 4
+    runner:
+      cpus: 4
+      memory: 16gb
+    run: cargo test-e2e --retries 1 --partition "count:$((RWX_PARALLEL_INDEX + 1))/$RWX_PARALLEL_TOTAL"
+    outputs:
+      test-results:
+        - path: target/nextest/default/junit.xml
+          options:
+            language: Rust
+            framework: cargo-nextest
