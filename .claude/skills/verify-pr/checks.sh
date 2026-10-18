@@ -184,7 +184,7 @@ build_ok=true
 # CI: `cargo fmt --check` (CLAUDE.md rule 2).
 wanted fmt && { run_step fmt "cargo fmt --check" || true; } || skip fmt "not in --only"
 
-# CLAUDE.md rule 2, and the Linux `build` job in ci.yml matches this exactly.
+# CLAUDE.md rule 2, and the Linux `clippy` job in ci.yml matches this exactly.
 # All four flags matter. Both of #407's: without `--all-targets` no test
 # target is built at all, and without `--features e2e` every `tests/e2e_*.rs`
 # compiles to an empty crate — so the bare `cargo clippy` this used to run
