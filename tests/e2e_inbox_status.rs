@@ -160,27 +160,24 @@ fn transition(socket: &mut UnixStream, pane: &Pane, id: &str, expected: &str) {
     }
 }
 
-/// Scenario: Subscribe an attached client before posting a message, then fetch, nack, fetch and acknowledge it, and stop an agent with another queued message. The client must observe each Queued, Fetched, Acknowledged and Undeliverable transition in order with the message identity, subject and sender label.
+/// Scenario: Subscribe an attached client before posting a message, then fetch it without acknowledging, let its ack-wait run out, fetch it again and acknowledge it, and stop an agent with another queued message. The client must observe each Queued, Fetched, Acknowledged and Undeliverable transition in order with the message identity, subject and sender label.
 #[spec("inbox/status/004")]
 #[test]
 fn status_004_attached_client_receives_each_inbox_state_change() {
-    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "60000")]);
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500")]);
     let worker = pane(&daemon, "broadcast-worker");
     let mut events = subscribe(&daemon);
-    let mut stream = waiter(&daemon, &worker);
-    armed(&daemon, &worker, 1);
     let id = enqueue(&daemon, &worker, "broadcast task");
     transition(&mut events, &worker, &id, "queued");
-    assert!(line(&mut stream)["messages"].is_array());
+    fetch(&daemon, &worker, false);
     transition(&mut events, &worker, &id, "fetched");
-    writeln!(stream.get_mut(), "{}", json!({"nack":[id]})).unwrap();
     transition(&mut events, &worker, &id, "queued");
-    assert!(line(&mut stream)["messages"].is_array());
+    fetch(&daemon, &worker, false);
     transition(&mut events, &worker, &id, "fetched");
-    writeln!(stream.get_mut(), "{}", json!({"ack":[id]})).unwrap();
+    let mut ack = request(&worker, "ack");
+    ack["delivery_id"] = json!(id);
+    assert_eq!(hook(&daemon, ack)["accepted"], true);
     transition(&mut events, &worker, &id, "acknowledged");
-    drop(stream);
-    armed(&daemon, &worker, 0);
     let lost = enqueue(&daemon, &worker, "lost task");
     transition(&mut events, &worker, &lost, "queued");
     assert_eq!(

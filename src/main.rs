@@ -812,8 +812,8 @@ enum InboxAction {
         /// `pi`, `codex`, `devin`).
         #[arg(long)]
         agent: String,
-        /// Stay connected and print each message as a JSON line, reading
-        /// `{"ack":[…]}` / `{"nack":[…]}` lines from stdin.
+        /// Stay connected and print each message as a JSON line, reading the
+        /// component's receipt controls from stdin.
         #[arg(long)]
         stream: bool,
         /// The deck integration the component that runs this watcher

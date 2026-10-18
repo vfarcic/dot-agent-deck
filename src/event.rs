@@ -3263,8 +3263,9 @@ impl InboxBudget {
 pub enum InboxWaitMode {
     /// Single use: one batch, then the connection ends (Claude's waiter).
     Once,
-    /// Long-lived: a batch line per hand-over, with `{"ack":[…]}` and
-    /// `{"nack":[…]}` lines written back on the same connection.
+    /// Long-lived: a receipt receiver's hand-overs, with its controls
+    /// ([`InboxStreamControl`]) written back on the same connection. Served
+    /// only for a component the receipt policy covers.
     Stream,
 }
 
@@ -3757,32 +3758,18 @@ impl InboxWaitReply {
     }
 }
 
-/// A line a [`InboxWaitMode::Stream`] component writes back: the ids it
-/// handed over (`ack`) or could not (`nack`).
+/// A line a [`InboxWaitMode::Stream`] component — a receipt receiver —
+/// writes back.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxStreamControl {
-    #[serde(default)]
-    pub ack: Vec<String>,
-    #[serde(default)]
-    pub nack: Vec<String>,
     /// PRD #1666 S8: ask the daemon to make the agent's pane repaint (a
     /// one-column shrink and restore of its PTY). Honoured only from an
     /// [`InboxComponent::OpenCodeMini`] stream; a daemon that predates it
-    /// reads the line as an empty ack and ignores it.
+    /// ignores it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub repaint: bool,
-    /// PRD #1666 long-turn delivery: ids the deck handed over again that the
-    /// component still holds — queued in the agent behind the turn in
-    /// progress — and did not hand over again. The deck refunds each such
-    /// redelivery ([`crate::inbox::Inbox::hold`]) so a long turn does not use
-    /// up `max_deliver`. A daemon that predates it reads the line as an empty
-    /// ack and counts the redelivery, as before. Legacy streams only (Pi's
-    /// extension, until it moves to receipts): a receipt stream's possession
-    /// is its snapshots.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hold: Vec<String>,
     /// PRD #1666 §4: the receipt stream's controls. A daemon that predates
-    /// them reads the line as an empty ack.
+    /// them ignores them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub possess: Option<InboxPossess>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

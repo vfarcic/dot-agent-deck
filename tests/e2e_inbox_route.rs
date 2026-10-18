@@ -13,7 +13,6 @@ mod route;
 use inbox::*;
 use serde_json::json;
 use spec::spec;
-use std::io::Write;
 use std::time::Duration;
 
 /// Scenario: An attested orchestrator delegates a multiline task to a synthetic worker. One bound inbox message and a task file without an ack-first header must result; the worker fetches the framed task after the fixed doorbell, without receiving task bytes on stdin.
@@ -505,45 +504,23 @@ fn idle_worker_030_a_waiting_notice_survives_its_own_pointer_landing_while_it_wa
     route::idle_clock(30);
 }
 
-/// The daemon for a long-turn test: a 1500 ms ack-wait gives a loaded runner
-/// more time to answer, with max-delivery at 3000 ms and a notice at 4500 ms.
-fn long_turn_daemon() -> common::DaemonProc {
-    daemon_unbound(&[
-        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500"),
-        ("DOT_AGENT_DECK_INBOX_MAX_DELIVER", "2"),
-        (route::UNDELIVERED_MS, "4500"),
-        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
-    ])
-}
-
-/// A stand-in for a worker's legacy stream, armed from the test process. No
-/// component the deck ships arms one since Pi moved to the receipt stream
-/// (PRD #1666), so it names none (`other`).
-fn worker_stream(
-    daemon: &common::DaemonProc,
-    worker: &Pane,
-) -> std::io::BufReader<std::os::unix::net::UnixStream> {
-    let mut req = request(worker, "inbox_wait");
-    req["component"] = json!("other");
-    req["component_version"] = json!("synthetic-long-turn");
-    req["mode"] = json!("stream");
-    req["pid"] = json!(worker.pid);
-    let stream = connect(daemon, &req);
-    armed(daemon, worker, 1);
-    stream
-}
-
-/// Read the stream until it hands over `id`, skipping keepalives.
-fn handed_over(stream: &mut std::io::BufReader<std::os::unix::net::UnixStream>, id: &str) {
-    loop {
-        let reply = line(stream);
-        if reply["messages"]
+/// The worker fetches its task through `inbox fetch` without acknowledging
+/// it, as a hook does, and returns it.
+fn fetched_unacknowledged(daemon: &common::DaemonProc, worker: &Pane, id: &str) {
+    let reply = fetch(daemon, worker, false);
+    assert!(
+        reply["messages"]
             .as_array()
-            .is_some_and(|messages| messages.iter().any(|m| m["id"] == id))
-        {
-            return;
-        }
-    }
+            .is_some_and(|messages| messages.iter().any(|m| m["id"] == id)),
+        "the worker fetches the task: {reply}"
+    );
+}
+
+/// The worker acknowledges `id` through the explicit ack route.
+fn acknowledge(daemon: &common::DaemonProc, worker: &Pane, id: &str) {
+    let mut ack = request(worker, "ack");
+    ack["delivery_id"] = json!(id);
+    assert_eq!(hook(daemon, ack)["accepted"], true);
 }
 
 fn message_state(daemon: &common::DaemonProc, worker: &Pane, id: &str) -> serde_json::Value {
@@ -554,37 +531,6 @@ fn message_state(daemon: &common::DaemonProc, worker: &Pane, id: &str) -> serde_
         .find(|m| m["id"] == id)
         .map(|m| m["state"].clone())
         .unwrap_or_default()
-}
-
-/// Scenario: A worker's streaming component holds a delegated task queued behind a long turn, and answers every redelivery with hold. For ten ack-waits — five times ack-wait × max_deliver, and past the undelivered-notice deadline — the task is never undeliverable and the orchestrator gets no notice; when the component acknowledges it, it is delivered and the orchestrator still hears nothing.
-#[spec("inbox/route/009")]
-#[test]
-fn route_009_a_task_held_through_a_long_turn_raises_no_false_notice() {
-    let daemon = long_turn_daemon();
-    let (orch, worker) = route::team(&daemon, false);
-    let mut stream = worker_stream(&daemon, &worker);
-    let id = route::delegate(&daemon, &orch, route::TASK, false);
-    handed_over(&mut stream, &id);
-    let until = std::time::Instant::now() + Duration::from_millis(15000);
-    let mut redeliveries = 0;
-    while std::time::Instant::now() < until {
-        handed_over(&mut stream, &id);
-        redeliveries += 1;
-        writeln!(stream.get_mut(), "{}", json!({"hold":[id]})).unwrap();
-        assert_ne!(
-            message_state(&daemon, &worker, &id),
-            "undeliverable",
-            "a held task must outlive ack-wait × max_deliver"
-        );
-    }
-    assert!(
-        redeliveries >= 5,
-        "the deck kept handing the task over: {redeliveries}"
-    );
-    route::no_messages(&daemon, &orch, Duration::from_millis(300));
-    writeln!(stream.get_mut(), "{}", json!({"ack":[id]})).unwrap();
-    state(&daemon, &worker, &id, "acknowledged");
-    route::no_messages(&daemon, &orch, Duration::from_millis(1200));
 }
 
 /// Scenario: A worker's OpenCode receipt stream holds a delegated task queued behind a long turn, naming it in a fresh snapshot every keepalive. For ten seconds — past ack-wait × max_deliver and past the undelivered-notice deadline — the task is never repeated nor undeliverable and the orchestrator gets no notice; when the stream commits it, it is delivered and the orchestrator still hears nothing.
@@ -619,18 +565,22 @@ fn route_013_a_task_possessed_through_a_long_turn_raises_no_false_notice() {
     route::no_messages(&daemon, &orch, Duration::from_millis(1200));
 }
 
-/// Scenario: A worker's component holds a delegated task without answering the deck's redeliveries, so after max_deliver hand-overs the task is undeliverable and the orchestrator is told so. The component then acknowledges it: the task is recorded as delivered and the orchestrator gets a correction naming the task, saying it reached the worker after all.
+/// Scenario: A worker fetches a delegated task without acknowledging it, so when its one allowed hand-over's ack-wait runs out the task is undeliverable and the orchestrator is told so. The worker then acknowledges it: the task is recorded as delivered and the orchestrator gets a correction naming the task, saying it reached the worker after all.
 #[spec("inbox/route/010")]
 #[test]
 fn route_010_a_late_ack_after_max_deliver_corrects_the_orchestrator() {
-    let daemon = long_turn_daemon();
+    let daemon = daemon_unbound(&[
+        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500"),
+        ("DOT_AGENT_DECK_INBOX_MAX_DELIVER", "1"),
+        (route::UNDELIVERED_MS, "4500"),
+        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
+    ]);
     let (orch, worker) = route::team(&daemon, false);
-    let mut stream = worker_stream(&daemon, &worker);
     let id = route::delegate(&daemon, &orch, route::TASK, false);
-    handed_over(&mut stream, &id);
+    fetched_unacknowledged(&daemon, &worker, &id);
     state(&daemon, &worker, &id, "undeliverable");
     route::notice(&daemon, &orch, "is undeliverable");
-    writeln!(stream.get_mut(), "{}", json!({"ack":[id]})).unwrap();
+    acknowledge(&daemon, &worker, &id);
     state(&daemon, &worker, &id, "acknowledged");
     let correction = route::notice(&daemon, &orch, "after all").to_string();
     assert!(
@@ -639,7 +589,7 @@ fn route_010_a_late_ack_after_max_deliver_corrects_the_orchestrator() {
     );
 }
 
-/// Scenario: A worker's component holds a delegated task without answering the deck's redeliveries, so the orchestrator is told the task has not reached the worker. The component then acknowledges it before the deck stops trying: the task is recorded as delivered, and the orchestrator gets exactly one correction naming the task and the worker's role, saying it reached the worker after all.
+/// Scenario: A worker fetches a delegated task without acknowledging it, so the orchestrator is told the task has not reached the worker. The worker then acknowledges it before the deck stops trying: the task is recorded as delivered, and the orchestrator gets exactly one correction naming the task and the worker's role, saying it reached the worker after all.
 #[spec("inbox/route/011")]
 #[test]
 fn route_011_an_ack_after_the_not_reached_notice_corrects_the_orchestrator_once() {
@@ -650,12 +600,11 @@ fn route_011_an_ack_after_the_not_reached_notice_corrects_the_orchestrator_once(
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ]);
     let (orch, worker) = route::team(&daemon, false);
-    let mut stream = worker_stream(&daemon, &worker);
     let id = route::delegate(&daemon, &orch, route::TASK, false);
-    handed_over(&mut stream, &id);
+    fetched_unacknowledged(&daemon, &worker, &id);
     let notice = route::notice(&daemon, &orch, "has not reached the worker").to_string();
     assert!(notice.contains(&id), "the notice names the task: {notice}");
-    writeln!(stream.get_mut(), "{}", json!({"ack":[id]})).unwrap();
+    acknowledge(&daemon, &worker, &id);
     state(&daemon, &worker, &id, "acknowledged");
     let correction = route::notice(&daemon, &orch, "after all").to_string();
     assert!(

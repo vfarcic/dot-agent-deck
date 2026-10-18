@@ -20,15 +20,11 @@ import { describe, test } from "node:test";
 import {
 	tagHandOver,
 	untagHandOver,
-	watcherBackoffOverride,
-	WATCHER_BACKOFF_ENV,
-	WATCHER_BACKOFF_OVERRIDE_MAX_MS,
 	AGENT_EVENT_TYPES,
 	AGENT_STATES,
 	buildAgentEventArgv,
 	DETAIL_EVENTS,
 	buildDelegateArgv,
-	buildGetSeedArgv,
 	buildWorkDoneArgv,
 	createReporter,
 	createSerialQueue,
@@ -52,8 +48,6 @@ import {
 	reportArgvAt,
 	resolveDeckBin,
 	isAbsoluteOverride,
-	SEED_DELIVER_AS,
-	seedToDeliver,
 	spawnFailureMessage,
 	STATUS_EVENTS,
 	TURN_REPLY_FAILED_FLAG,
@@ -446,48 +440,6 @@ describe("row 8: exec error classification", () => {
 		assert.match(spawnFailureMessage(["work-done", "--task", "x"], new Error("EACCES")), /EACCES/);
 		assert.doesNotMatch(spawnFailureMessage(["work-done", "--task", "x"], new Error("EACCES")), /on PATH\?/);
 		assert.match(spawnFailureMessage(["work-done", "--task", "x"], "weird"), /weird/);
-	});
-});
-
-// ---------------------------------------------------------------------------
-// PRD #201 native prompt delivery — get-seed argv + seed decision
-// ---------------------------------------------------------------------------
-
-describe("native seed delivery: get-seed argv", () => {
-	test("builds the read-only get-seed argv", () => {
-		assert.deepEqual(buildGetSeedArgv(), ["get-seed"]);
-	});
-});
-
-describe("native seed delivery: seedToDeliver", () => {
-	test("returns the trimmed seed when the CLI printed a real one", () => {
-		assert.equal(
-			seedToDeliver("Read .dot-agent-deck/worker-task-coder.md for your task."),
-			"Read .dot-agent-deck/worker-task-coder.md for your task.",
-		);
-	});
-
-	test("trims a trailing newline a shell layer might add", () => {
-		assert.equal(seedToDeliver("Acknowledge your role and wait.\n"), "Acknowledge your role and wait.");
-	});
-
-	test("returns null for an empty seed (no seed pending → no send)", () => {
-		assert.equal(seedToDeliver(""), null);
-	});
-
-	test("returns null for whitespace-only output", () => {
-		assert.equal(seedToDeliver("   \n\t "), null);
-	});
-
-	test("returns null for missing stdout (undefined / null)", () => {
-		assert.equal(seedToDeliver(undefined), null);
-		assert.equal(seedToDeliver(null), null);
-	});
-});
-
-describe("native seed delivery: deliverAs mode", () => {
-	test("delivers as followUp — triggers a turn, never steers an in-flight one", () => {
-		assert.equal(SEED_DELIVER_AS, "followUp");
 	});
 });
 
@@ -992,18 +944,6 @@ describe("PRD #1497: a reply reaches the CLI on stdin, never on its command line
 		const outcome = await execWithStdin(spawn, node, ["-e", "setTimeout(() => {}, 60000)"], "x", { timeout: 50 });
 		assert.equal(outcome.killed, true);
 		assert.notEqual(outcome.code, 0);
-	});
-});
-
-describe("watcherBackoffOverride (PRD #1666)", () => {
-	test("reads a whole number of milliseconds within bounds, and nothing else", () => {
-		const read = (value: string | undefined) => watcherBackoffOverride({ [WATCHER_BACKOFF_ENV]: value });
-		assert.equal(read("45000"), 45000);
-		assert.equal(read(" 1 "), 1);
-		assert.equal(read(String(WATCHER_BACKOFF_OVERRIDE_MAX_MS)), WATCHER_BACKOFF_OVERRIDE_MAX_MS);
-		for (const bad of [undefined, "", "0", "-5", "1.5", "1e3", "soon", String(WATCHER_BACKOFF_OVERRIDE_MAX_MS + 1)]) {
-			assert.equal(read(bad), undefined, `${bad} must leave the default backoff`);
-		}
 	});
 });
 

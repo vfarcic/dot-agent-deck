@@ -10,10 +10,11 @@
 //! generation (pane plus agent id). A message for an agent with armed waiters is
 //! handed, together with every other queued message for that agent that fits the
 //! component's budget, to the most recently armed one. A `once` waiter is spent by
-//! that hand-over; a `stream` waiter stays armed and acknowledges (or hands back)
-//! what it was given on the same connection. Waiters hold a slot in their own
-//! pool ([`MAX_INBOX_WAITERS`]), never one of the hook-ingest slots, and past
-//! [`MAX_WAITERS_PER_AGENT`] for one agent the oldest is told it was superseded.
+//! that hand-over. A `stream` is a receipt receiver's, served by the receipt
+//! engine (`serve_receipt`); one from any other component is refused.
+//! Waiters hold a slot in their own pool ([`MAX_INBOX_WAITERS`]), never one of
+//! the hook-ingest slots, and past [`MAX_WAITERS_PER_AGENT`] for one agent the
+//! oldest is told it was superseded.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -105,9 +106,8 @@ pub const ENV_UNDELIVERED_NOTICE_AFTER_MS: &str =
 /// ([`InboxHub::ack`]). The oldest is forgotten first.
 pub const LATE_ACK_MAX_RECORDS: usize = 256;
 /// PRD #1666 long-turn delivery: how long a message that ran out of
-/// hand-overs is remembered for a late ack; the same span as
-/// [`crate::inbox::DEFAULT_HOLD_BOUND`].
-pub const LATE_ACK_MEMORY: Duration = crate::inbox::DEFAULT_HOLD_BOUND;
+/// hand-overs is remembered for a late ack.
+pub const LATE_ACK_MEMORY: Duration = Duration::from_secs(60 * 60);
 
 /// PRD #1666 §11: the integration the deck's hand-over components declare
 /// (`--adapter-integration`). A component the receipt policy covers that
@@ -286,9 +286,6 @@ pub enum WaiterSignal {
 pub enum ArmError {
     /// Every slot of [`MAX_INBOX_WAITERS`] is held.
     NoSlots,
-    /// The agent already has a live stream from another component instance;
-    /// one stream per agent generation.
-    StreamAlreadyArmed,
     /// Audit F3: another component instance is this agent generation's
     /// native receiver.
     OtherInstance,
@@ -298,7 +295,7 @@ impl ArmError {
     pub fn code(self) -> &'static str {
         match self {
             ArmError::NoSlots => "too_many_waiters",
-            ArmError::StreamAlreadyArmed | ArmError::OtherInstance => "another_component_armed",
+            ArmError::OtherInstance => "another_component_armed",
         }
     }
 
@@ -307,9 +304,6 @@ impl ArmError {
             ArmError::NoSlots => format!(
                 "the deck already holds {MAX_INBOX_WAITERS} inbox waiters; this one was not armed"
             ),
-            ArmError::StreamAlreadyArmed => {
-                "another inbox component is already streaming for this agent".to_string()
-            }
             ArmError::OtherInstance => "another process is this agent's inbox receiver; this one \
                                         was not armed"
                 .to_string(),
@@ -329,9 +323,6 @@ struct Waiter {
     conn_id: u64,
     mode: InboxWaitMode,
     component: InboxComponent,
-    /// The component instance that armed it — the process that runs the
-    /// watcher (hardening M2). A stream from the same instance supersedes it.
-    instance: Option<u32>,
     tx: mpsc::Sender<WaiterSignal>,
 }
 
@@ -830,6 +821,15 @@ impl InboxHub {
     #[cfg(test)]
     pub fn reserved_replies(&self) -> usize {
         self.lock().inbox.reserved_replies()
+    }
+
+    /// TEST: the ack-wait of message `id`, fetched in `pane_id`, runs out and
+    /// the hub ticks: the legacy policy redelivers it, or makes it
+    /// undeliverable at `max_deliver`.
+    #[cfg(test)]
+    pub fn run_out_ack_wait(&self, id: &str, pane_id: &str) {
+        self.lock().inbox.run_out_ack_wait(id, pane_id);
+        self.tick();
     }
 
     /// [`Inbox::admit_reserved_reply`]: the refusal posting `content` under a
@@ -1530,10 +1530,9 @@ impl InboxHub {
     /// waiter past [`MAX_WAITERS_PER_AGENT`], then hands over anything already
     /// queued.
     ///
-    /// A stream is one per agent generation (design §6.4): a new one from the
-    /// same component `instance` as the live stream supersedes it — the old
-    /// connection is told so, and what it was handed goes back to the queue
-    /// when it ends — while one from any other instance is refused.
+    /// [`serve_waiter`] arms only once-waiters here: it hands a stream from a
+    /// receipt component to the receipt engine and refuses one from any other
+    /// component before it arms.
     ///
     /// Audit F3: the first instance to arm or announce is the generation's
     /// receiver from then on, whatever is armed at the moment
@@ -1553,32 +1552,7 @@ impl InboxHub {
         let conn_id = {
             let mut st = self.lock();
             let key = (pane_id.to_string(), agent_id.to_string());
-            if let Err(error) = st.admit_receiver(&key, instance) {
-                let streaming = mode == InboxWaitMode::Stream
-                    && st
-                        .waiters
-                        .get(&key)
-                        .is_some_and(|list| list.iter().any(|w| w.mode == InboxWaitMode::Stream));
-                return Err(if streaming {
-                    ArmError::StreamAlreadyArmed
-                } else {
-                    error
-                });
-            }
-            if mode == InboxWaitMode::Stream
-                && let Some(list) = st.waiters.get_mut(&key)
-                && let Some(at) = list.iter().position(|w| w.mode == InboxWaitMode::Stream)
-            {
-                if instance.is_none() || list[at].instance != instance {
-                    return Err(ArmError::StreamAlreadyArmed);
-                }
-                let old = list.remove(at);
-                debug!(
-                    conn_id = old.conn_id,
-                    "inbox: a stream from the same component instance supersedes the live one"
-                );
-                let _ = old.tx.try_send(WaiterSignal::Superseded);
-            }
+            st.admit_receiver(&key, instance)?;
             let conn_id = st.next_conn;
             st.next_conn += 1;
             let list = st.waiters.entry(key).or_default();
@@ -1594,7 +1568,6 @@ impl InboxHub {
                 conn_id,
                 mode,
                 component,
-                instance,
                 tx,
             });
             conn_id
@@ -2011,48 +1984,6 @@ impl InboxHub {
         // told of now rather than at the next deadline.
         self.post_owed_notices();
         outcome
-    }
-
-    /// PRD #1666 long-turn delivery: `consumer`, a stream, still holds message
-    /// `id` — queued in the agent behind the turn in progress — and answered
-    /// its redelivery with `hold` instead of handing it over again. The
-    /// redelivery is refunded, or an offer kept with its holder
-    /// ([`Inbox::hold`]), and while it is, a delegated task's "has not reached
-    /// the worker" notice waits a full [`ENV_UNDELIVERED_NOTICE_AFTER_MS`] past
-    /// the hold. Returns whether the hold was honoured.
-    pub fn hold(&self, id: &str, pane_id: &str, agent_id: &str, consumer: &Consumer) -> bool {
-        let refunded = {
-            let mut st = self.lock();
-            let now = Instant::now();
-            let refunded = st.inbox.hold(now, id, pane_id, agent_id, consumer);
-            if refunded
-                && let Some(watch) = st.delegates.get_mut(id)
-                && !watch.notified
-            {
-                watch.due = watch.due.max(now + self.undelivered_after);
-            }
-            refunded
-        };
-        if refunded {
-            self.changed.notify_one();
-        }
-        refunded
-    }
-
-    /// A component handing message `id` back unread: it is queued again and
-    /// offered to the agent's newest waiter.
-    pub fn nack(&self, id: &str, pane_id: &str, agent_id: &str) -> bool {
-        let requeued = {
-            let mut st = self.lock();
-            let requeued = st.inbox.nack(Instant::now(), id, pane_id, agent_id);
-            drain_events(&mut st);
-            requeued
-        };
-        self.post_owed_notices();
-        if requeued {
-            self.dispatch_agent(pane_id, agent_id);
-        }
-        requeued
     }
 
     /// A consumer whose connection ended before it handed its messages over:
@@ -2906,7 +2837,6 @@ async fn serve_receipt<R, W, P>(
                     conn_id,
                     mode: InboxWaitMode::Stream,
                     component,
-                    instance,
                     tx: tx.clone(),
                 });
             }
@@ -3740,11 +3670,9 @@ fn fits_every_hand_over(deck: &DeckId, pane_id: &str, content: &Content) -> bool
         created_at: Instant::now(),
         state: MessageState::Queued,
         deliveries: 0,
-        first_fetched_at: None,
         history: Vec::new(),
         excluded: Vec::new(),
         assign_deadline: None,
-        offer_hold: crate::inbox::OfferHold::NotAsked,
         owner: None,
     };
     // Counted with the separator a hand-over puts before each block.
@@ -4291,6 +4219,9 @@ pub fn render_marked(
 /// the hook-ingest pool, until the waiter is spent, superseded or its peer goes
 /// away.
 ///
+/// A stream is served by the receipt engine; one from a component the receipt
+/// policy does not cover is refused `unsupported`.
+///
 /// `repaint` is called with the agent id when the stream asks for a repaint
 /// (PRD #1666 S8) — only from an [`InboxComponent::OpenCodeMini`] stream; the
 /// daemon passes [`crate::agent_pty::AgentPtyRegistry::nudge_repaint`].
@@ -4342,6 +4273,20 @@ pub async fn serve_waiter<R, W, P>(
         .await;
         return;
     }
+    // PRD #1666 step 4: only a receipt receiver streams. A legacy stream's
+    // ack/nack/hold loop went with the last component that used it (Pi's old
+    // extension, refused above), so a stream from any other component is
+    // refused before it arms and its mail stays queued.
+    if mode == InboxWaitMode::Stream {
+        warn!(pane_id = %pane_id, ?component, "inbox: refused a stream from a component that cannot stream");
+        let _ = write_line_within(
+            deadline,
+            &mut writer,
+            &InboxWaitReply::refused("unsupported", crate::inbox_display::STREAM_UNSUPPORTED),
+        )
+        .await;
+        return;
+    }
     let armed = match hub.arm(&pane_id, &agent_id, mode, component, instance) {
         Ok(armed) => armed,
         Err(error) => {
@@ -4377,11 +4322,6 @@ pub async fn serve_waiter<R, W, P>(
             }
         }
     });
-    let ack_how = match component {
-        InboxComponent::OpenCodePlugin | InboxComponent::OpenCodeMini => AckHow::PluginConfirmed,
-        InboxComponent::PiExtension => AckHow::ExtensionConfirmed,
-        _ => AckHow::Explicit,
-    };
     let mut keepalive = tokio::time::interval(hub.keepalive());
     keepalive.tick().await;
     // Whether a Once waiter's hand-over reached its peer: only then is its
@@ -4411,32 +4351,6 @@ pub async fn serve_waiter<R, W, P>(
                 None => break,
             },
             line = lines.recv() => match line {
-                Some(line) if mode == InboxWaitMode::Stream => {
-                    match serde_json::from_str::<InboxStreamControl>(&line) {
-                        Ok(control) => {
-                            for id in &control.ack {
-                                let outcome = hub.ack(id, &pane_id, &agent_id, ack_how);
-                                debug!(conn_id, %id, ?outcome, "inbox: stream ack");
-                            }
-                            for id in &control.nack {
-                                let requeued = hub.nack(id, &pane_id, &agent_id);
-                                debug!(conn_id, %id, requeued, "inbox: stream nack");
-                            }
-                            for id in &control.hold {
-                                let refunded = hub.hold(id, &pane_id, &agent_id, &consumer);
-                                debug!(conn_id, %id, refunded, "inbox: stream hold");
-                            }
-                            if control.repaint {
-                                if component == InboxComponent::OpenCodeMini {
-                                    repaint(&agent_id);
-                                } else {
-                                    debug!(conn_id, ?component, "inbox: ignoring a repaint request from a component that may not ask for one");
-                                }
-                            }
-                        }
-                        Err(_) => debug!(conn_id, "inbox: ignoring a stream line that is not ack/nack"),
-                    }
-                }
                 // A once waiter has nothing to say after its request.
                 Some(_) => {}
                 None => {
@@ -4455,8 +4369,7 @@ pub async fn serve_waiter<R, W, P>(
     read_task.abort();
     hub.disarm(&pane_id, &agent_id, conn_id);
     if !handed_over {
-        // A stream's unacknowledged messages, or a once batch that never
-        // reached its peer, go back to the queue.
+        // A once batch that never reached its peer goes back to the queue.
         hub.requeue_consumer(&pane_id, &agent_id, &consumer);
     }
     let _ = tokio::time::timeout(deadline, writer.shutdown()).await;
@@ -4522,10 +4435,10 @@ mod tests {
 
     /// Audit F3 (a): the first process to arm or announce for an agent
     /// generation is its native receiver for the rest of that generation.
-    /// Any other instance is refused — between arms as much as while a stream
+    /// Any other instance is refused — between arms as much as while a waiter
     /// is live, so a second instance cannot arm while the pinned one's waiter
-    /// re-arms — while the pinned instance may still supersede its own stream.
-    /// The pin goes with the generation.
+    /// re-arms — while the pinned instance may arm again. The pin goes with
+    /// the generation.
     #[tokio::test]
     async fn the_first_receiver_instance_is_pinned_for_the_generation() {
         let hub = hub();
@@ -4547,12 +4460,12 @@ mod tests {
             )
             .err()
         };
-        let stream = |instance| {
+        let again = |instance| {
             hub.arm(
                 "p",
                 "a",
-                InboxWaitMode::Stream,
-                InboxComponent::PiExtension,
+                InboxWaitMode::Once,
+                InboxComponent::ClaudeWaiter,
                 instance,
             )
         };
@@ -4572,14 +4485,14 @@ mod tests {
             Some(InboxWake::TurnEnd),
             "a refused announcement must not change how the pane is woken"
         );
-        let first = stream(Some(100)).expect("the pinned instance arms");
-        let second = stream(Some(100)).expect("and supersedes its own stream");
-        assert!(stream(Some(200)).is_err());
+        let first = again(Some(100)).expect("the pinned instance arms");
+        let second = again(Some(100)).expect("and arms again");
+        assert!(again(Some(200)).is_err());
         hub.disarm("p", "a", first.conn_id);
         hub.disarm("p", "a", second.conn_id);
         assert_eq!(hub.armed("p", "a"), 0);
-        assert_eq!(stream(Some(200)).err(), Some(ArmError::OtherInstance));
-        assert_eq!(stream(None).err(), Some(ArmError::OtherInstance));
+        assert_eq!(again(Some(200)).err(), Some(ArmError::OtherInstance));
+        assert_eq!(again(None).err(), Some(ArmError::OtherInstance));
 
         hub.agent_exited("p", "a");
         assert!(
@@ -4657,8 +4570,8 @@ mod tests {
             .to_string();
         hub.fetch("p", "a", Consumer::FetchCli, None, None);
         assert!(told.lock().unwrap().is_empty(), "a fetch owes no notice");
-        // Handed back after its one allowed hand-over: undeliverable.
-        hub.nack(&id, "p", "a");
+        // Unacknowledged after its one allowed hand-over: undeliverable.
+        hub.run_out_ack_wait(&id, "p");
         assert_eq!(
             *told.lock().unwrap(),
             [format!(
@@ -4672,8 +4585,8 @@ mod tests {
 
     /// PRD #1666 S8 (FT-18): a stream's `{"repaint":true}` line reaches the
     /// repaint nudge, for the stream's own agent, only from an `opencode_mini`
-    /// stream; from the full TUI's plugin, Pi's extension or Claude's waiter it
-    /// is ignored.
+    /// stream; from the full TUI's plugin or Pi's extension it is ignored, and
+    /// a stream from Claude's waiter is refused before it reads a line.
     #[tokio::test]
     async fn repaint_requests_reach_the_nudge_only_from_a_mini_stream() {
         use tokio::io::AsyncReadExt;
@@ -4687,7 +4600,7 @@ mod tests {
             let (read, write) = tokio::io::split(server);
             let calls = Arc::new(Mutex::new(Vec::<String>::new()));
             let seen = Arc::clone(&calls);
-            // PRD #1666 §11: the OpenCode streams declare the floor.
+            // PRD #1666 §11: the receipt streams declare the floor.
             let arm = ReceiptArm {
                 adapter_integration: Some(ADAPTER_INTEGRATION),
                 ..ReceiptArm::default()
@@ -4705,17 +4618,22 @@ mod tests {
                 move |agent: &str| seen.lock().unwrap().push(agent.to_string()),
             ));
             let (mut from_daemon, mut to_daemon) = tokio::io::split(client);
-            to_daemon
-                .write_all(b"{\"repaint\":true}\n{\"ack\":[],\"repaint\":true}\n")
-                .await
-                .unwrap();
-            to_daemon.shutdown().await.unwrap();
+            // A refused stream may have closed before these lines are written.
+            let _ = to_daemon
+                .write_all(b"{\"repaint\":true}\n{\"possess\":null,\"repaint\":true}\n")
+                .await;
+            let _ = to_daemon.shutdown().await;
             let mut sink = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), from_daemon.read_to_end(&mut sink))
                 .await
                 .expect("the waiter ends at its peer's EOF")
                 .unwrap();
             serve.await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&sink).contains("\"unsupported\""),
+                component == InboxComponent::ClaudeWaiter,
+                "{component:?}"
+            );
             let expected: Vec<String> = if nudged {
                 vec!["a".to_string(), "a".to_string()]
             } else {
@@ -4772,19 +4690,21 @@ mod tests {
         assert_eq!(s.wake, WakePath::TurnEnd);
         assert_eq!(s.component.as_deref(), Some("codex_hooks"));
 
-        // An armed waiter wins over any announcement, and names itself.
+        // An armed waiter wins over any announcement, and names itself. A
+        // once-waiter is spent by a hand-over, so nothing is left queued for it.
+        hub.fetch("p", "a", Consumer::FetchCli, None, None);
         let waiter = hub
             .arm(
                 "p",
                 "a",
-                InboxWaitMode::Stream,
-                InboxComponent::PiExtension,
+                InboxWaitMode::Once,
+                InboxComponent::ClaudeWaiter,
                 None,
             )
             .unwrap();
         let s = hub.summary("p", "a");
         assert_eq!(s.wake, WakePath::Native);
-        assert_eq!(s.component.as_deref(), Some("pi_extension"));
+        assert_eq!(s.component.as_deref(), Some("claude_waiter"));
         assert!(hub.disarm("p", "a", waiter.conn_id));
         assert_eq!(hub.summary("p", "a").wake, WakePath::TurnEnd);
 
@@ -4821,7 +4741,7 @@ mod tests {
         assert_eq!(posted.state, StateName::Queued);
         hub.fetch("p", "a", Consumer::FetchCli, None, None);
         assert_eq!(next().state, StateName::Fetched);
-        assert!(hub.nack(&id, "p", "a"));
+        hub.run_out_ack_wait(&id, "p");
         assert_eq!(next().state, StateName::Queued);
 
         let other = hub
@@ -5365,8 +5285,8 @@ mod tests {
             Arc::clone(&hub),
             "p".to_string(),
             "a".to_string(),
-            InboxWaitMode::Stream,
-            InboxComponent::Other,
+            InboxWaitMode::Once,
+            InboxComponent::ClaudeWaiter,
             None,
             ReceiptArm::default(),
             tokio::io::BufReader::new(read),
@@ -6151,38 +6071,11 @@ mod tests {
         }
     }
 
-    fn arm_instance(hub: &InboxHub, pid: u32) -> Result<ArmedWaiter, ArmError> {
-        hub.arm(
-            "p",
-            "a",
-            InboxWaitMode::Stream,
-            InboxComponent::PiExtension,
-            Some(pid),
-        )
-    }
-
-    /// Hardening M2 / review N-1 (design §6.4): a new stream from the SAME
-    /// component instance supersedes the live one, whose connection is told
-    /// so; a stream from another instance is refused while one is live.
+    /// Hardening M4: a waiter whose peer stops reading cannot hold on to what
+    /// it was given: the write that cannot finish times out, the waiter ends
+    /// and the batch it never handed over goes back to the queue.
     #[tokio::test]
-    async fn a_stream_from_the_same_instance_supersedes_and_another_is_refused() {
-        let hub = hub();
-        let mut first = arm_instance(&hub, 100).expect("first stream");
-        let _second = arm_instance(&hub, 100).expect("the same instance supersedes");
-        assert!(matches!(first.rx.try_recv(), Ok(WaiterSignal::Superseded)));
-        assert_eq!(hub.armed("p", "a"), 1);
-        assert_eq!(
-            arm_instance(&hub, 200).err(),
-            Some(ArmError::StreamAlreadyArmed),
-            "another instance is refused while one streams"
-        );
-    }
-
-    /// Hardening M4: a stream whose peer stops reading cannot hold the agent
-    /// armed: the write that cannot finish times out, the waiter is disarmed
-    /// and what it was handed goes back to the queue.
-    #[tokio::test]
-    async fn a_stream_that_stops_reading_is_disarmed_and_its_message_requeued() {
+    async fn a_waiter_that_stops_reading_is_disarmed_and_its_message_requeued() {
         let hub = Arc::new(hub().with_write_deadline(Duration::from_millis(300)));
         let (peer_reads, daemon_writes) = tokio::io::duplex(64);
         let (_peer_writes, daemon_reads) = tokio::io::duplex(64);
@@ -6190,8 +6083,8 @@ mod tests {
             Arc::clone(&hub),
             "p".to_string(),
             "a".to_string(),
-            InboxWaitMode::Stream,
-            InboxComponent::Other,
+            InboxWaitMode::Once,
+            InboxComponent::ClaudeWaiter,
             Some(4242),
             ReceiptArm::default(),
             tokio::io::BufReader::new(daemon_reads),
@@ -6202,7 +6095,11 @@ mod tests {
         let id = hub
             .post_direct(Recipient::bound("p", "a"), content(&"x".repeat(32_000)))
             .unwrap();
-        until(|| hub.armed("p", "a") == 0, Duration::from_secs(5)).await;
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("the write deadline ends the waiter")
+            .unwrap();
+        assert_eq!(hub.armed("p", "a"), 0);
         let state = hub
             .list("p")
             .into_iter()
@@ -6211,7 +6108,6 @@ mod tests {
             .state;
         assert_eq!(state, StateName::Queued, "handed back to the queue");
         drop(peer_reads);
-        let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
     }
 
     fn worker_report(body: &str) -> Content {
@@ -6590,53 +6486,6 @@ mod tests {
         );
     }
 
-    /// PRD #1666 long-turn delivery: a stream that answers each redelivery of
-    /// a delegated task with `hold` keeps the task alive past ack-wait ×
-    /// `max_deliver`, and keeps the "has not reached the worker" notice from
-    /// being posted while it holds; its ack then ends the watch with no notice.
-    #[tokio::test]
-    async fn a_held_delegate_is_neither_undeliverable_nor_reported() {
-        let limits = InboxLimits {
-            ack_wait: Duration::ZERO,
-            max_deliver: 2,
-            ..InboxLimits::default()
-        };
-        let mut hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
-        hub.undelivered_after = Duration::from_secs(3600);
-        let id = delegate(&hub, "LONG-TURN-TASK");
-        let stream = Consumer::Stream { conn_id: 41 };
-        for round in 0..8 {
-            assert_eq!(
-                hub.fetch("w", "wa", stream.clone(), None, None).len(),
-                1,
-                "round {round}"
-            );
-            // The notice deadline has passed by the time the worker holds:
-            // only the hold keeps the next tick from posting the notice.
-            let before = Instant::now();
-            hub.lock().delegates.get_mut(id.as_str()).unwrap().due = before;
-            assert!(hub.hold(id.as_str(), "w", "wa", &stream), "round {round}");
-            assert!(
-                hub.lock().delegates[id.as_str()].due >= before + hub.undelivered_after,
-                "round {round}: the hold moves the notice a full window past it"
-            );
-            hub.tick();
-            assert_eq!(state_in(&hub, "w", &id), StateName::Queued, "round {round}");
-        }
-        assert!(
-            hub.list("o").is_empty(),
-            "a task its worker holds is not reported as undelivered"
-        );
-        hub.fetch("w", "wa", stream.clone(), None, None);
-        assert_eq!(
-            hub.ack(id.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
-            AckOutcome::Acknowledged
-        );
-        hub.undelivered_after = Duration::ZERO;
-        hub.tick();
-        assert!(hub.list("o").is_empty());
-    }
-
     /// PRD #1666 long-turn delivery: a delegated task its orchestrator was told
     /// has not reached the worker, then acknowledged by the worker before the
     /// deck stops trying, gets one correction naming it. The card was never
@@ -6706,7 +6555,7 @@ mod tests {
         let task = delegate(&hub, "TASK-TOLD-TWICE");
         hub.fetch("w", "wa", Consumer::FetchCli, None, None);
         hub.tick();
-        assert!(hub.nack(task.as_str(), "w", "wa"));
+        hub.run_out_ack_wait(task.as_str(), "w");
         assert_eq!(state_in(&hub, "w", &task), StateName::Undeliverable);
         assert_eq!(
             hub.ack(task.as_str(), "w", "wa", AckHow::ExtensionConfirmed),
@@ -6768,8 +6617,8 @@ mod tests {
             hub.fetch("w", "wa", Consumer::FetchCli, None, None).len(),
             2
         );
-        assert!(hub.nack(task.as_str(), "w", "wa"));
-        assert!(hub.nack(report.as_str(), "w", "wa"));
+        hub.run_out_ack_wait(task.as_str(), "w");
+        hub.run_out_ack_wait(report.as_str(), "w");
         let notices = hub.list("o");
         assert_eq!(notices.len(), 1, "the orchestrator is told: {notices:?}");
         assert_eq!(

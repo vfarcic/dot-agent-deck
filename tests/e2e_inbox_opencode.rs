@@ -822,7 +822,7 @@ fn opencode_008_mini_targets_root_and_requests_ack_and_idle_repaint() {
     );
 }
 
-/// Scenario: Send repaint controls from mini and three other components to a PTY size probe. Only mini may shrink and restore the PTY; its scrollback and recorded geometry must stay unchanged, and a genuine resize during the gap must win.
+/// Scenario: Send repaint controls from mini and the full OpenCode plugin to a PTY size probe, and open a stream from two components that cannot stream. Only mini may shrink and restore the PTY, its scrollback and recorded geometry unchanged and a genuine resize during the gap winning; the two other streams are refused and nudge nothing.
 #[spec("inbox/opencode/009")]
 #[test]
 fn opencode_009_only_mini_stream_nudges_without_losing_scrollback_or_geometry() {
@@ -887,6 +887,18 @@ while os.read(0,4096):pass
             req["adapter_integration"] = json!(2);
         }
         let mut stream = connect(&daemon, &req);
+        if !component.starts_with("opencode") {
+            // PRD #1666 step 4: only a receipt receiver streams, so a stream
+            // from any other component is refused before it reads a line.
+            assert_eq!(line(&mut stream)["refused"], "unsupported", "{component}");
+            armed(&daemon, &pane, 0);
+            assert!(
+                !common::wait_until(Duration::from_millis(650), || sizes().len() != 1),
+                "a refused stream nudges nothing: {component} {:?}",
+                sizes()
+            );
+            continue;
+        }
         armed(&daemon, &pane, 1);
         writeln!(stream.get_mut(), "{{\"repaint\":true}}").unwrap();
         if component == "opencode_mini" {

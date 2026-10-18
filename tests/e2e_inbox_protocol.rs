@@ -544,47 +544,6 @@ fn inbox_protocol_009_waiters_do_not_exhaust_hook_ingest_pool() {
     }
 }
 
-/// Scenario: Open a native component's Stream waiter from a stand-in's process identity, receive a task, and nack it on the same connection. The task must be delivered again, then an ack line must make it Acknowledged; closing the stream removes its armed registration.
-#[spec("inbox/protocol/010")]
-#[test]
-fn inbox_protocol_010_stream_nack_redelivers_and_ack_confirms() {
-    let daemon = daemon();
-    let pane = pane(&daemon, "stream", "exec /bin/cat");
-    let mut req = request(&pane, "inbox_wait");
-    // A legacy stream: no component the deck ships arms one since PRD #1666.
-    req["component"] = json!("other");
-    req["component_version"] = json!("synthetic-s2");
-    req["mode"] = json!("stream");
-    req["pid"] = json!(pane.pid);
-    let mut stream = connect(&daemon, &req);
-    armed(&daemon, &pane, 1);
-    let id = enqueue(&daemon, &pane);
-    blocks(&line(&mut stream), &id);
-    state(&daemon, &pane, &id, "fetched");
-    writeln!(stream.get_mut(), "{}", json!({"nack":[id]})).unwrap();
-    blocks(&line(&mut stream), &id);
-    state(&daemon, &pane, &id, "fetched");
-    writeln!(stream.get_mut(), "{}", json!({"ack":[id]})).unwrap();
-    assert!(
-        common::wait_until(WAIT, || {
-            listing(&daemon, &pane)["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|message| {
-                    message["id"] == id
-                        && message["state"]
-                            .to_string()
-                            .to_ascii_lowercase()
-                            .contains("acknowledged")
-                })
-        }),
-        "stream ack must confirm the message"
-    );
-    drop(stream);
-    armed(&daemon, &pane, 0);
-}
-
 fn post(daemon: &DaemonProc, pane: &Pane, body: &str) -> String {
     let reply = attach(
         daemon,

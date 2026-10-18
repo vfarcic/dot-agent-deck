@@ -242,49 +242,6 @@ export function buildAgentEventArgv(type: string, detail: AgentEventDetail = {},
 	return argv;
 }
 
-/**
- * Build the argv for the read-only `dot-agent-deck get-seed` verb (PRD #201).
- *
- * `get-seed` asks the daemon (over the hook socket, scoped by
- * `DOT_AGENT_DECK_PANE_ID`) for the seed/prompt it prepared for this pane and
- * prints it to stdout (empty = nothing pending). The extension shells this on
- * `session_start` and, if the output is a real seed, delivers it NATIVELY via
- * `pi.sendUserMessage` — dissolving the last workaround (PTY keystroke
- * injection) for a Pi pane's first prompt.
- *
- * @example buildGetSeedArgv() → ["get-seed"]
- */
-export function buildGetSeedArgv(): string[] {
-	return ["get-seed"];
-}
-
-/**
- * How the native seed is queued into Pi. `"followUp"` means "deliver the
- * message and, if a turn is already streaming, queue it until the agent
- * finishes" — and `sendUserMessage` "always triggers a turn", so on
- * `session_start` (the agent is idle) this seeds AND runs the prompt
- * deterministically, with none of the keystroke-timing fragility the PTY
- * injection path had (no SUBMIT_DELAY, no readiness guess, no discarded early
- * CR). `"steer"` would interrupt an in-flight turn — wrong for a first prompt.
- */
-export const SEED_DELIVER_AS = "followUp" as const;
-
-/**
- * Decide what to deliver from a `get-seed` result. Returns the trimmed seed
- * when the CLI printed a non-blank one, or `null` when there is nothing to
- * deliver (empty output, whitespace-only, or the CLI produced no stdout) — in
- * which case the extension sends nothing and the daemon's PTY-injection safety
- * net remains responsible for delivery. Trimming drops any trailing newline a
- * shell layer might add without altering a single-line prompt's meaning.
- */
-export function seedToDeliver(stdout: string | undefined | null): string | null {
-	if (typeof stdout !== "string") {
-		return null;
-	}
-	const seed = stdout.trim();
-	return seed.length > 0 ? seed : null;
-}
-
 /** The Pi lifecycle events the extension subscribes to for status reporting. */
 export const STATUS_EVENTS = [
 	"session_start",
@@ -922,11 +879,6 @@ export const DOORBELL_SUFFIX = " waiting, run: dot-agent-deck inbox fetch";
 const MESSAGE_ID = "(m-[a-z2-7]{8}-[0-9a-f]{16})";
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** argv for the watcher that holds this agent's stream open. */
-export function buildInboxWaitArgv(): string[] {
-	return ["inbox", "wait", "--agent", "pi", "--stream"];
-}
-
 /** argv telling the deck Pi's extension is here, so it waits for the watcher before ringing. */
 export function buildInboxAnnounceArgv(): string[] {
 	return ["inbox", "announce", "--agent", "pi"];
@@ -992,18 +944,6 @@ function asInboxMessage(value: unknown): InboxMessage | undefined {
 		}
 	}
 	return message;
-}
-
-/** A watcher stdout line as a message, or `undefined` when it is not one. */
-export function parseInboxLine(line: string): InboxMessage | undefined {
-	if (line.trim() === "") {
-		return undefined;
-	}
-	try {
-		return asInboxMessage(JSON.parse(line));
-	} catch {
-		return undefined;
-	}
 }
 
 /**
@@ -1086,37 +1026,6 @@ export function untagHandOver(text: unknown): { attempt: string; text: string } 
 		return undefined;
 	}
 	return { attempt, text: text.slice(end + 2) };
-}
-
-/**
- * PRD #1666: sets every watcher respawn delay to this many milliseconds instead
- * of the doubling backoff — so a test can stop a watcher and know it stays
- * down for longer than the deck's arm grace. Unset, or not a whole number from
- * 1 to {@link WATCHER_BACKOFF_OVERRIDE_MAX_MS}, leaves the backoff as it is.
- * The OpenCode plugin reads the same variable.
- */
-export const WATCHER_BACKOFF_ENV = "DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS";
-export const WATCHER_BACKOFF_OVERRIDE_MAX_MS = 3_600_000;
-
-/** The fixed respawn delay {@link WATCHER_BACKOFF_ENV} sets, or `undefined`. */
-export function watcherBackoffOverride(env: Record<string, string | undefined>): number | undefined {
-	const raw = env[WATCHER_BACKOFF_ENV]?.trim();
-	if (!raw || !/^\d+$/.test(raw)) {
-		return undefined;
-	}
-	const ms = Number(raw);
-	return ms >= 1 && ms <= WATCHER_BACKOFF_OVERRIDE_MAX_MS ? ms : undefined;
-}
-
-/** Splits a stream into lines across chunk boundaries; `push` returns the complete ones. */
-export function createLineSplitter(): (chunk: string) => string[] {
-	let buffer = "";
-	return (chunk: string) => {
-		buffer += chunk;
-		const lines = buffer.split("\n");
-		buffer = lines.pop() ?? "";
-		return lines;
-	};
 }
 
 // ---------------------------------------------------------------------------

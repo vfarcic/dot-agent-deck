@@ -1132,7 +1132,8 @@ mod tests {
     }
 
     /// Offer a job from `o` and put it back in its pool: the first taker
-    /// fetches it and hands it back, so it is now never offered to that taker.
+    /// fetches it and its ack-wait runs out, so it is now never offered to that
+    /// taker.
     async fn pooled_offer(
         registry: &Arc<AgentPtyRegistry>,
         state: &SharedState,
@@ -1146,7 +1147,7 @@ mod tests {
                 .inbox()
                 .fetch(&t1.0, &t1.1, crate::inbox::Consumer::FetchCli, None, None);
         assert_eq!(fetched.len(), 1, "the first taker holds the job");
-        assert!(registry.inbox().nack(&fetched[0].id, &t1.0, &t1.1));
+        registry.inbox().run_out_ack_wait(&fetched[0].id, &t1.0);
         let pooled = registry.inbox().pooled_offers();
         assert_eq!(pooled.len(), 1, "the job is back in its pool");
         pooled.into_iter().next().unwrap()

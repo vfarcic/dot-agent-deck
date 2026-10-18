@@ -395,14 +395,15 @@ pub fn possess_for(stream: &mut BufReader<UnixStream>, held: &Value, span: Durat
     written
 }
 
-/// A legacy stream waiter, armed from the test process. No component the deck
-/// ships arms one since Pi moved to the receipt stream (PRD #1666), so it names
-/// none (`other`).
+/// A Claude Code once-waiter, armed from the test process: the native
+/// waiter that is not on receipts. Only a receipt receiver streams since
+/// PRD #1666.
 pub fn waiter(daemon: &impl Endpoint, pane: &Pane) -> BufReader<UnixStream> {
     let mut req = request(pane, "inbox_wait");
-    req["component"] = json!("other");
+    req["component"] = json!("claude_waiter");
     req["component_version"] = json!("synthetic-doorbell");
-    req["mode"] = json!("stream");
+    req["mode"] = json!("once");
+    req["session"] = json!({"source":"startup", "session_id":"doorbell-waiter"});
     req["pid"] = json!(pane.pid);
     connect(daemon, &req)
 }

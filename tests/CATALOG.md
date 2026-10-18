@@ -7795,25 +7795,11 @@ The inbox's pure in-memory data model (`src/inbox.rs`, `src/deck_identity.rs`). 
 - **Does not assert:** NATS subject compatibility beyond the character set (#1264).
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/core/018 — A streaming consumer's hold refunds a redelivery until the hold bound.
-- **Layer:** L1 unit (src/inbox.rs).
-- **Agent:** none.
-- **Asserts:** a stream that answers each redelivery with `hold` keeps the message alive through ten ack-waits with `max_deliver` 2 (the count never drops below one); a hold from another consumer or agent, or for a queued message, refunds nothing; past `hold_bound` from the first fetch a hold refunds nothing and the message becomes undeliverable at `max_deliver`; the default bound is one hour.
-- **Does not assert:** the stream wire (inbox/route/009) or the consumer that answers hold (the Pi extension's node tests).
-- **Platform coverage:** mac+linux+windows.
-
 ##### inbox/core/019 — A late ack after max_deliver is recorded.
 - **Layer:** L1 unit (src/inbox.rs).
 - **Agent:** none.
 - **Asserts:** an ack from the bound agent for a message undeliverable for `max_deliver` answers acknowledged, moves it to acknowledged with one event, and a repeat answers already acknowledged; another agent's ack is refused; a message undeliverable because its agent exited still answers undeliverable; an offer that ran out of hand-overs is not acknowledged.
 - **Does not assert:** the corrections the daemon posts (inbox/route/010 and the `inbox_hub` unit tests).
-- **Platform coverage:** mac+linux+windows.
-
-##### inbox/core/020 — A held offer stays with its holder until the bound.
-- **Layer:** L1 unit (src/inbox.rs).
-- **Agent:** none.
-- **Asserts:** an offer a stream fetched is handed to the same holder again at each ack-wait while the stream answers with `hold`, never reassigned and with its assignment count unchanged, and the holder's ack still claims it; it returns to its pool, excluding the holder, once the claim TTL or the hold bound (whichever is shorter) has passed since the assignment's first fetch, or when a re-hand-over goes unanswered; a once waiter's offer returns at the first ack-wait.
-- **Does not assert:** the stream wire (inbox/offer/007) or the consumer that answers hold (the Pi extension's node tests).
 - **Platform coverage:** mac+linux+windows.
 
 #### inbox/attempts
@@ -8195,12 +8181,6 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Asserts:** list and announce continue answering above the ordinary thirty-two hook-connection limit, and closing the waiters removes their armed registrations.
 - **Platform coverage:** mac+linux.
 
-##### inbox/protocol/010 — Stream nack redelivers and stream ack confirms.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), native component's JSON-lines stream using a daemon-owned process identity.
-- **Agent:** none (`cat` stand-in identified as a Pi extension).
-- **Asserts:** rendered task is Fetched, nack returns it to the stream, ack changes it to Acknowledged, and EOF removes the stream's armed registration.
-- **Platform coverage:** mac+linux.
-
 ##### inbox/protocol/011 — An oversized post is saved whole and named.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), attach PostMessage and a byte-budgeted hook-socket fetch.
 - **Agent:** none (`cat` stand-in).
@@ -8313,7 +8293,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/003 — An armed native waiter suppresses typing and EOF restores fallback.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay; the armed waiter is a Claude once-waiter opened from the test process.
 - **Agent:** none (raw Python stand-in; no agent executable or credential).
 - **Asserts:** with `DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY=1` preserving registration/EOF but pausing native hand-over, the task remains Queued while armed and no bytes arrive beyond native grace; EOF drops armed to zero and the same still-Queued task rings. This isolates the armed guard from the separate Fetched guard.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
@@ -8525,8 +8505,8 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/001 — The legacy ack-wait touches only legacy-owned assignments.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex
 - **Agent:** none.
-- **Asserts:** with the ack-wait elapsed, a message `inbox fetch` took is redelivered and a receipt-owned hand-out is not; the legacy `hold` and `nack` refuse the receipt-owned one even from its own consumer; a receipt receiver never takes the legacy-owned one back.
-- **Does not assert:** Pi, which stays on the legacy policy in this slice.
+- **Asserts:** with the ack-wait elapsed, a message `inbox fetch` took is redelivered and a receipt-owned hand-out is not, even with its own ack deadline run out; a receipt receiver never takes the legacy-owned one back.
+- **Does not assert:** a legacy stream, which the deck no longer serves (inbox/boundary/036).
 - **Platform coverage:** all.
 
 ##### inbox/boundary/002 — Returning a reservation removes the attempt's files.
@@ -8707,7 +8687,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/027 — An offer moved from a legacy-fetch worker to OpenCode is not settled by a late ack.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
 - **Agent:** none.
-- **Asserts:** a job a Claude worker's hook fetched and handed back goes to the OpenCode worker's receipt stream; the hook's late acknowledgement claims nothing, the OpenCode copy keeps its one open attempt, and the OpenCode commit claims it.
+- **Asserts:** a job a Claude worker's hook fetched, whose ack-wait then ran out, goes to the OpenCode worker's receipt stream; the hook's late acknowledgement claims nothing, the OpenCode copy keeps its one open attempt, and the OpenCode commit claims it.
 - **Does not assert:** Pi, which is on receipts (inbox/boundary/035).
 - **Platform coverage:** all.
 
@@ -8767,6 +8747,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** an offer whose Pi hand-out lapses unpossessed is never back in its pool while it lapses; Pi's positive not-handed returns it and it goes to OpenCode; Pi's late report then settles nothing of OpenCode's copy.
 - **Does not assert:** the uncertain notice a lapse can end in (inbox/boundary/021).
+- **Platform coverage:** all.
+
+##### inbox/boundary/036 — A legacy stream is refused, and an unhanded once batch still requeues.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` over in-memory duplexes.
+- **Agent:** none.
+- **Asserts:** a stream from each component the receipt policy does not cover (Claude's waiter and hooks, Codex and Devin hooks, an unknown component) is answered `refused: unsupported`, arms nothing and leaves the queued task queued; a Claude once-waiter that took the task but whose peer never read the hand-over gives it back to the queue when the write deadline ends it.
+- **Does not assert:** the refusal over the real hook socket (inbox/opencode/009).
 - **Platform coverage:** all.
 
 ##### inbox/boundary/037 — A late clock pass's fence leaves the hand-out's own clearance check as the only guard.
@@ -8870,7 +8857,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/status/004 — Attached clients receive each direct-message lifecycle transition as a recognized Inbox broadcast.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), real binary and streaming attach subscription.
 - **Agent:** none (raw Python stand-in; no credential).
-- **Asserts:** Queued → Fetched → Queued (stream nack) → Fetched → Acknowledged and Queued → Undeliverable (agent stop) arrive in order with pane_id, message_id, subject and from_label; BroadcastMsg recognizes and preserves the inbox payload.
+- **Asserts:** Queued → Fetched → Queued (ack-wait run out) → Fetched → Acknowledged (explicit `ack`) and Queued → Undeliverable (agent stop) arrive in order with pane_id, message_id, subject and from_label; BroadcastMsg recognizes and preserves the inbox payload.
 - **Does not assert:** offers, publishes, real agent adapters or frontend rendering.
 - **Platform coverage:** mac+linux.
 
@@ -9139,24 +9126,17 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the private unresolved-worker dispatch branch or commission expiry arithmetic; the ledger unit tests retain those arithmetic checks.
 - **Platform coverage:** mac+linux.
 
-##### inbox/route/009 — A task held through a long turn raises no false notice.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms, `max_deliver` 2 and the undelivered notice at 4500 ms.
-- **Agent:** scripted stand-ins; a stream component (`pi_extension`) armed from the test process answers each redelivery with `hold`.
-- **Asserts:** over ten ack-waits the delegated task is never undeliverable and the orchestrator receives no notice; the component's ack makes it acknowledged and the orchestrator still receives nothing.
-- **Does not assert:** that a real consumer withholds the duplicate hand-over (the Pi extension's node tests; OpenCode's possession: inbox/opencode/024, inbox/opencode/026).
-- **Platform coverage:** mac+linux.
-
 ##### inbox/route/010 — A late ack after max_deliver corrects the orchestrator.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms and `max_deliver` 2.
-- **Agent:** scripted stand-ins; a stream component (`pi_extension`) armed from the test process that never answers the redeliveries.
-- **Asserts:** the task becomes undeliverable and the orchestrator is told so; the component's later ack makes it acknowledged and the orchestrator receives a correction naming the task and the worker's role.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms and `max_deliver` 1.
+- **Agent:** scripted stand-ins; the worker fetches through `inbox fetch` without acknowledging, as a hook does, and later acknowledges through the explicit `ack` route.
+- **Asserts:** the task becomes undeliverable and the orchestrator is told so; the worker's later ack makes it acknowledged and the orchestrator receives a correction naming the task and the worker's role.
 - **Does not assert:** the recipient card's cleared notice (the `inbox_hub` and `state` unit tests).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/route/011 — An ack after the "has not reached the worker" notice corrects the orchestrator once.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), real sandbox daemon with ack-wait 1500 ms, `max_deliver` 100 and the undelivered notice at 3000 ms.
-- **Agent:** scripted stand-ins; a stream component (`pi_extension`) armed from the test process that does not answer the redeliveries until it acknowledges.
-- **Asserts:** the orchestrator is told the task has not reached the worker; the component's ack makes it acknowledged and the orchestrator receives one correction naming the task and the worker's role, and no second one.
+- **Agent:** scripted stand-ins; the worker fetches through `inbox fetch` without acknowledging and later acknowledges through the explicit `ack` route.
+- **Asserts:** the orchestrator is told the task has not reached the worker; the worker's ack makes it acknowledged and the orchestrator receives one correction naming the task and the worker's role, and no second one.
 - **Does not assert:** the correction after "is undeliverable" (inbox/route/010) or the told-both case (the `inbox_hub` unit tests).
 - **Platform coverage:** mac+linux.
 
@@ -9170,7 +9150,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`), keepalive 300 ms, ack-wait 1.5 s, `max_deliver` 2.
 - **Agent:** an OpenCode receipt stream armed from the test process.
 - **Asserts:** fresh snapshots for ten seconds keep the delegated task fetched with no repeat and no orchestrator notice; its commit acknowledges it and the orchestrator still hears nothing.
-- **Does not assert:** the legacy `hold` path (inbox/route/009).
+- **Does not assert:** a legacy consumer, whose stream the deck no longer serves (inbox/boundary/036).
 - **Platform coverage:** mac+linux.
 
 #### inbox/codex
@@ -10312,7 +10292,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/opencode/009 — Only mini controls nudge PTY geometry while preserving scrollback.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`).
 - **Agent:** raw PTY SIGWINCH probe, no OpenCode or model.
-- **Asserts:** shrink by one, gap, restore, recorded rows/cols and scrollback unchanged, coalescing, real resize winning during the gap; full OpenCode, Pi and Claude controls ignored.
+- **Asserts:** shrink by one, gap, restore, recorded rows/cols and scrollback unchanged, coalescing, real resize winning during the gap; the full OpenCode plugin's control ignored; a stream from Claude's waiter or an unknown component refused `unsupported`, armed nowhere and nudging nothing.
 - **Does not assert:** private geometry_changes or geometry_tx counters (needs an in-process registry seam).
 - **Cost:** none.
 
@@ -10744,18 +10724,11 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Release, expiry or more than one competing live worker.
 - **Platform coverage:** mac+linux; developer credentials required.
 
-##### inbox/offer/007 — A job held behind a long turn is not reassigned.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_pubsub.rs`), real sandbox daemon with ack-wait 1500 ms and `max_deliver` 2.
-- **Agent:** synthetic PTY recorders; stream components (`pi_extension`) for both workers armed from the test process.
-- **Asserts:** the holder's component is handed the job again at each ack-wait over ten ack-waits and answers with hold; the other worker never lists it and its component is never handed it; the holder's ack claims it and the offerer is told it was claimed.
-- **Does not assert:** the bound past which a held job returns to its pool (inbox/core/020) or a real consumer (the Pi extension's node tests).
-- **Platform coverage:** mac+linux.
-
 ##### inbox/offer/008 — A job possessed behind a long turn is not reassigned.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_pubsub.rs`), keepalive 300 ms.
 - **Agent:** two OpenCode receipt streams armed from the test process.
 - **Asserts:** the holder's fresh snapshots for ten seconds keep the job with it, unrepeated and never handed to the other worker; its commit claims it.
-- **Does not assert:** the legacy `hold` path (inbox/offer/007).
+- **Does not assert:** a legacy consumer, whose stream the deck no longer serves (inbox/boundary/036).
 - **Platform coverage:** mac+linux.
 
 #### inbox/load

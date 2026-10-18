@@ -498,72 +498,6 @@ fn offer_005_release_returns_to_pool_and_complete_notifies_offerer() {
     );
 }
 
-/// Scenario: Offer a job to two subscribed workers whose streaming components are armed from the test process. The worker it is assigned to holds it queued behind a long turn and answers each of the deck's redeliveries with hold: over ten ack-waits the job is never reassigned and the other worker's component is never handed it. The holder's acknowledgement then claims it, so the job runs once.
-#[spec("inbox/offer/007")]
-#[test]
-fn offer_007_a_job_held_behind_a_long_turn_is_not_reassigned() {
-    let daemon = inbox::daemon_unbound(&[
-        ("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "1500"),
-        ("DOT_AGENT_DECK_INBOX_MAX_DELIVER", "2"),
-        (route::UNDELIVERED_MS, "4500"),
-    ]);
-    let (orch, first, second) = team(&daemon, "held");
-    let mut first_stream = inbox::waiter(&daemon, &first);
-    let mut second_stream = inbox::waiter(&daemon, &second);
-    inbox::armed(&daemon, &first, 1);
-    inbox::armed(&daemon, &second, 1);
-    let mut req = inbox::request(&orch, "inbox_offer");
-    req["pool"] = json!("review");
-    req["body"] = json!(BODY);
-    req["claim_ttl_ms"] = json!(60_000);
-    let id = accepted(&hook(&daemon, req));
-    let (chosen, other) = holder(&daemon, &first, &second, &id);
-    let (stream, other_stream) = if chosen.id == first.id {
-        (&mut first_stream, &mut second_stream)
-    } else {
-        (&mut second_stream, &mut first_stream)
-    };
-    assert!(
-        handed(stream, &id),
-        "the holder's component is handed the job"
-    );
-    let until = std::time::Instant::now() + Duration::from_millis(15000);
-    let mut redeliveries = 0;
-    while std::time::Instant::now() < until {
-        assert!(
-            handed(stream, &id),
-            "a held job is handed to its holder again, not returned to its pool (after {redeliveries} holds): {:?}",
-            route::messages(&daemon, other)
-        );
-        redeliveries += 1;
-        use std::io::Write;
-        writeln!(stream.get_mut(), "{}", json!({"hold":[id]})).unwrap();
-        assert!(
-            !contains(&daemon, other, &id),
-            "a held job is not reassigned"
-        );
-    }
-    assert!(
-        redeliveries >= 5,
-        "the deck kept handing the job over: {redeliveries}"
-    );
-    {
-        use std::io::Write;
-        writeln!(stream.get_mut(), "{}", json!({"ack":[id]})).unwrap();
-    }
-    inbox::state(&daemon, chosen, &id, "claimed");
-    notice(&daemon, &orch, &id, "claim");
-    other_stream
-        .get_mut()
-        .set_read_timeout(Some(Duration::from_millis(300)))
-        .unwrap();
-    assert!(
-        !handed_within(other_stream, &id),
-        "the other worker's component was never handed the job"
-    );
-    assert!(!contains(&daemon, other, &id));
-}
-
 /// Scenario: Offer a job to two subscribed workers whose OpenCode receipt streams are armed from the test process. The worker it is assigned to holds it queued behind a long turn, naming it in a fresh snapshot every keepalive: for ten seconds the job is never repeated, never reassigned, and the other worker's stream is never handed it. The holder's commit then claims it, so the job runs once.
 #[spec("inbox/offer/008")]
 #[test]
@@ -617,38 +551,6 @@ fn offer_008_a_job_possessed_behind_a_long_turn_is_not_reassigned() {
         "the other worker's stream was never handed the job"
     );
     assert!(!contains(&daemon, other, &id));
-}
-
-/// Read `stream` until it hands over `id` (true), skipping keepalives and
-/// other hand-overs, or until its read times out or it closes (false).
-fn handed(stream: &mut std::io::BufReader<std::os::unix::net::UnixStream>, id: &str) -> bool {
-    stream
-        .get_mut()
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .ok();
-    handed_within(stream, id)
-}
-
-fn handed_within(
-    stream: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
-    id: &str,
-) -> bool {
-    loop {
-        let mut text = String::new();
-        match stream.read_line(&mut text) {
-            Ok(n) if n > 0 => {}
-            _ => return false,
-        }
-        let Ok(reply) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        if reply["messages"]
-            .as_array()
-            .is_some_and(|messages| messages.iter().any(|m| m["id"] == id))
-        {
-            return true;
-        }
-    }
 }
 
 fn subscribe(daemon: &impl Endpoint) -> std::os::unix::net::UnixStream {

@@ -113,9 +113,9 @@ pub const STREAM_NOT_IN_DECK_EXIT: u8 = 3;
 /// global hook never disturbs a session the deck does not manage.
 ///
 /// **Stream** (the OpenCode plugin, the Pi extension): prints each handed-over
-/// message as one JSON line on stdout and forwards `{"ack":[…]}`,
-/// `{"nack":[…]}` and `{"hold":[…]}` lines from stdin to the deck, until either
-/// side closes. Run outside a deck pane, or without a capability token, it
+/// message as one JSON line on stdout and forwards the component's receipt
+/// controls from stdin to the deck, until either side closes. The deck serves
+/// a stream only with `--adapter-integration` at its floor. Run outside a deck pane, or without a capability token, it
 /// exits [`STREAM_NOT_IN_DECK_EXIT`] so the caller knows a respawn cannot
 /// succeed.
 /// PRD #1666 §4, §11: what a watcher's component declared on its command

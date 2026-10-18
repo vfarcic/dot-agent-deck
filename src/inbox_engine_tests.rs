@@ -203,7 +203,7 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// Scenario: One pane holds a message an `inbox fetch` took (legacy) and one an OpenCode receipt stream took. With the ack-wait elapsed, the legacy ack-wait redelivers only its own; the receipt-owned hand-out stays where its attempt model put it, the legacy hold and nack refuse it even from its own consumer, and a receipt receiver never takes the legacy-owned one back.
+/// Scenario: One pane holds a message an `inbox fetch` took (legacy) and one an OpenCode receipt stream took. With the ack-wait elapsed, the legacy ack-wait redelivers only its own; the receipt-owned hand-out stays where its attempt model put it even with its own ack deadline run out, and a receipt receiver never takes the legacy-owned one back.
 #[spec("inbox/boundary/001")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boundary_001_legacy_ack_wait_touches_only_legacy_owned_assignments() {
@@ -264,14 +264,9 @@ async fn boundary_001_legacy_ack_wait_touches_only_legacy_owned_assignments() {
             .is_none_or(|d| d.attempts.is_empty()),
         "no attempt is issued for a legacy-owned message"
     );
-    // Nor does the legacy hold, or nack, touch the receipt-owned hand-out,
-    // even sent as its own consumer.
-    let consumer = match &hub.lock().inbox.get(receipt.as_str(), "p").unwrap().state {
-        MessageState::Fetched { by, .. } => by.clone(),
-        other => panic!("fetched: {other:?}"),
-    };
-    assert!(!hub.hold(receipt.as_str(), "p", "a", &consumer));
-    assert!(!hub.nack(receipt.as_str(), "p", "a"));
+    // Nor does the legacy ack-wait touch the receipt-owned hand-out, even
+    // with its deadline run out.
+    hub.run_out_ack_wait(receipt.as_str(), "p");
     assert_eq!(state_of(&hub, "p", receipt.as_str()), StateName::Fetched);
     peer.close().await;
 }
@@ -1534,7 +1529,7 @@ fn offer_to(hub: &InboxHub, body: &str, candidates: &[(Recipient, String)]) -> M
 }
 
 fn live_all() -> Vec<(String, String)> {
-    ["orch:oa", "oc:a", "pi:b"]
+    ["orch:oa", "oc:a", "pi:b", "claude:c"]
         .iter()
         .map(|pair| {
             let (pane, agent) = pair.split_once(':').unwrap();
@@ -1543,16 +1538,17 @@ fn live_all() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Scenario: A job is offered first to an OpenCode worker and then to a Pi worker. The OpenCode worker positively did not hand it over, so the job goes back to its pool and on to Pi, which takes it through its legacy fetch. The OpenCode worker's watcher then publishes a commit receipt for its own earlier attempt: the deck tells the offerer the job also reached the earlier holder, and Pi's copy stays Pi's — not settled by that receipt — until Pi acknowledges it.
+/// Scenario: A job is offered first to an OpenCode worker and then to a Claude worker. The OpenCode worker positively did not hand it over, so the job goes back to its pool and on to the Claude worker, whose hook takes it through the legacy fetch. The OpenCode worker's watcher then publishes a commit receipt for its own earlier attempt: the deck tells the offerer the job also reached the earlier holder, and the Claude worker's copy stays its own — not settled by that receipt — until its hook acknowledges it.
 #[spec("inbox/boundary/026")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn boundary_026_an_offer_moved_from_opencode_to_pi_is_not_settled_by_a_late_receipt() {
+async fn boundary_026_an_offer_moved_from_opencode_to_a_legacy_fetch_worker_is_not_settled_by_a_late_receipt()
+ {
     let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
     let mut oc = Peer::open(&hub, "oc", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
     oc.next().await;
     let candidates = [
         (Recipient::bound("oc", "a"), "opencode-worker".to_string()),
-        (Recipient::bound("pi", "b"), "pi-worker".to_string()),
+        (Recipient::bound("claude", "c"), "claude-worker".to_string()),
     ];
     let id = offer_to(&hub, "mixed job", &candidates);
     let handed = oc.handout().await;
@@ -1565,13 +1561,13 @@ async fn boundary_026_an_offer_moved_from_opencode_to_pi_is_not_settled_by_a_lat
     .await;
     assert_eq!(
         hub.assign_offer(&id, &candidates, &live_all),
-        Some(Recipient::bound("pi", "b")),
-        "the next holder is Pi"
+        Some(Recipient::bound("claude", "c")),
+        "the next holder is the Claude worker"
     );
-    let fetched = hub.fetch("pi", "b", Consumer::FetchCli, None, None);
+    let fetched = hub.fetch("claude", "c", Consumer::FetchCli, None, None);
     assert_eq!(fetched.len(), 1);
     assert_eq!(
-        hub.lock().inbox.owner_of(id.as_str(), "pi", "b"),
+        hub.lock().inbox.owner_of(id.as_str(), "claude", "c"),
         Some(crate::inbox::AssignmentOwner::Legacy)
     );
     publish_receipt(
@@ -1593,32 +1589,37 @@ async fn boundary_026_an_offer_moved_from_opencode_to_pi_is_not_settled_by_a_lat
     })
     .await;
     assert_eq!(
-        state_of(&hub, "pi", id.as_str()),
+        state_of(&hub, "claude", id.as_str()),
         StateName::Fetched,
-        "Pi's copy is not settled by the earlier holder's receipt"
+        "the Claude copy is not settled by the earlier holder's receipt"
     );
     assert!(matches!(
-        hub.ack(id.as_str(), "pi", "b", AckHow::ExtensionConfirmed),
+        hub.ack(id.as_str(), "claude", "c", AckHow::Explicit),
         AckOutcome::Claimed { .. }
     ));
     oc.close().await;
 }
 
-/// Scenario: A job is offered first to a Pi worker, which takes it through its legacy fetch and hands it back, and then to an OpenCode worker, whose receipt stream is handed it. Pi's late acknowledgement of its earlier copy settles nothing: the OpenCode worker's copy stays with its open attempt until the OpenCode worker commits it.
+/// Scenario: A job is offered first to a Claude worker, whose hook takes it through the legacy fetch and lets its ack-wait run out, and then to an OpenCode worker, whose receipt stream is handed it. The hook's late acknowledgement of its earlier copy settles nothing: the OpenCode worker's copy stays with its open attempt until the OpenCode worker commits it.
 #[spec("inbox/boundary/027")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn boundary_027_an_offer_moved_from_pi_to_opencode_is_not_settled_by_a_late_ack() {
+async fn boundary_027_an_offer_moved_from_a_legacy_fetch_worker_to_opencode_is_not_settled_by_a_late_ack()
+ {
     let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
     let mut oc = Peer::open(&hub, "oc", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
     oc.next().await;
     let candidates = [
-        (Recipient::bound("pi", "b"), "pi-worker".to_string()),
+        (Recipient::bound("claude", "c"), "claude-worker".to_string()),
         (Recipient::bound("oc", "a"), "opencode-worker".to_string()),
     ];
     let id = offer_to(&hub, "mixed job", &candidates);
-    let fetched = hub.fetch("pi", "b", Consumer::FetchCli, None, None);
-    assert_eq!(fetched.len(), 1, "Pi holds it first");
-    assert!(hub.nack(id.as_str(), "pi", "b"), "and hands it back");
+    let fetched = hub.fetch("claude", "c", Consumer::FetchCli, None, None);
+    assert_eq!(fetched.len(), 1, "the Claude worker holds it first");
+    hub.run_out_ack_wait(id.as_str(), "claude");
+    assert!(
+        hub.lock().inbox.unassigned_offers().contains(&id),
+        "and its ack-wait returns it to the pool"
+    );
     assert_eq!(
         hub.assign_offer(&id, &candidates, &live_all),
         Some(Recipient::bound("oc", "a")),
@@ -1628,10 +1629,10 @@ async fn boundary_027_an_offer_moved_from_pi_to_opencode_is_not_settled_by_a_lat
     assert_eq!(handed[0].id, id.as_str());
     assert!(
         !matches!(
-            hub.ack(id.as_str(), "pi", "b", AckHow::ExtensionConfirmed),
+            hub.ack(id.as_str(), "claude", "c", AckHow::Explicit),
             AckOutcome::Claimed { .. } | AckOutcome::Acknowledged
         ),
-        "Pi's late ack is not the job's"
+        "the hook's late ack is not the job's"
     );
     assert_eq!(state_of(&hub, "oc", id.as_str()), StateName::Fetched);
     assert_eq!(attempts_of(&hub, "oc", "a", id.as_str()), 1);
@@ -3056,4 +3057,94 @@ async fn boundary_046_deliveries_counts_every_receipt_hand_out() {
         );
         peer.close().await;
     }
+}
+
+/// Scenario: Each component the receipt policy does not cover opens a stream for an agent with a task queued, then a Claude waiter waits once on a connection that never reads its hand-over. Every stream is refused `unsupported`, arms nothing and leaves the task queued; the once-waiter's batch, which never reached its peer, goes back to the queue.
+#[spec("inbox/boundary/036")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_036_a_legacy_stream_is_refused_and_an_unhanded_once_batch_requeues() {
+    use tokio::io::AsyncReadExt;
+    let hub = Arc::new(
+        InboxHub::new(deck(), InboxLimits::default(), Duration::from_secs(30))
+            .with_write_deadline(Duration::from_millis(300)),
+    );
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content(&"x".repeat(32_000)))
+        .unwrap();
+    for component in [
+        InboxComponent::ClaudeWaiter,
+        InboxComponent::ClaudeHooks,
+        InboxComponent::CodexHooks,
+        InboxComponent::DevinHooks,
+        InboxComponent::Other,
+    ] {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(server);
+        let serve = tokio::spawn(serve_waiter(
+            Arc::clone(&hub),
+            "p".to_string(),
+            "a".to_string(),
+            InboxWaitMode::Stream,
+            component,
+            Some(4242),
+            INTEGRATION,
+            BufReader::new(read),
+            write,
+            |_: &str| {},
+        ));
+        let mut answer = String::new();
+        let (mut from_daemon, _to_daemon) = tokio::io::split(client);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            from_daemon.read_to_string(&mut answer),
+        )
+        .await
+        .expect("a refused stream ends")
+        .unwrap();
+        serve.await.unwrap();
+        let reply: InboxWaitReply = serde_json::from_str(answer.trim()).unwrap();
+        assert_eq!(
+            reply.refused.as_deref(),
+            Some("unsupported"),
+            "{component:?}"
+        );
+        assert_eq!(hub.armed("p", "a"), 0, "{component:?} arms nothing");
+        assert_eq!(
+            state_of(&hub, "p", id.as_str()),
+            StateName::Queued,
+            "{component:?}"
+        );
+    }
+    // A once-waiter whose peer never reads: the hand-over cannot finish, so
+    // the batch was never the peer's and goes back to the queue.
+    let (peer_reads, daemon_writes) = tokio::io::duplex(64);
+    let (_peer_writes, daemon_reads) = tokio::io::duplex(64);
+    let serve = tokio::spawn(serve_waiter(
+        Arc::clone(&hub),
+        "p".to_string(),
+        "a".to_string(),
+        InboxWaitMode::Once,
+        InboxComponent::ClaudeWaiter,
+        Some(4242),
+        ReceiptArm::default(),
+        BufReader::new(daemon_reads),
+        daemon_writes,
+        |_: &str| {},
+    ));
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("the hand-over's write deadline ends the waiter")
+        .unwrap();
+    assert_eq!(hub.armed("p", "a"), 0);
+    assert_eq!(
+        hub.lock().inbox.get(id.as_str(), "p").unwrap().deliveries,
+        1,
+        "the once-waiter took the batch"
+    );
+    assert_eq!(
+        state_of(&hub, "p", id.as_str()),
+        StateName::Queued,
+        "an unhanded once batch goes back to the queue"
+    );
+    drop(peer_reads);
 }

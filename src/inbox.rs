@@ -42,12 +42,6 @@ pub use crate::deck_identity::{DeckId, is_valid_deck_id};
 pub const DEFAULT_ACK_WAIT: Duration = Duration::from_secs(60);
 /// Hand-overs after which an unacknowledged message is undeliverable.
 pub const DEFAULT_MAX_DELIVER: u32 = 5;
-/// PRD #1666 long-turn delivery: how long after a message's first fetch a
-/// streaming consumer's `hold` still refunds a redelivery ([`Inbox::hold`]).
-/// Past it, `max_deliver` applies as it does to every other consumer.
-/// Documented in `docs/develop/agent-messaging.md` ("Long turns: hold and the
-/// late ack").
-pub const DEFAULT_HOLD_BOUND: Duration = Duration::from_secs(60 * 60);
 /// Queued plus fetched messages one recipient pane may hold.
 pub const DEFAULT_MAX_PER_RECIPIENT: usize = 256;
 /// Live (not yet acknowledged or undeliverable) messages in the whole daemon.
@@ -533,28 +527,21 @@ pub struct Message {
     pub created_at: Instant,
     pub state: MessageState,
     /// Hand-overs so far: each fetch counts one, and for an offer each
-    /// assignment to a holder. A redelivery its consumer holds is refunded
-    /// ([`Inbox::hold`]). For a receipt receiver each hand-out of a direct
+    /// assignment to a holder. For a receipt receiver each hand-out of a direct
     /// message counts one, its automatic repeats and Retries included
     /// ([`Inbox::count_receipt_repeat`]).
     pub deliveries: u32,
-    /// When it was first fetched, which starts [`InboxLimits::hold_bound`];
-    /// for an offer, first fetched by its current holder.
-    pub first_fetched_at: Option<Instant>,
     pub history: Vec<(Instant, StateName)>,
     /// Offers only: everyone who has held the offer, never offered it again.
     pub excluded: Vec<Recipient>,
     /// Offers only: when an offer assigned to a holder that has not fetched
     /// it goes back to its pool ([`InboxLimits::offer_assign_wait`]).
     pub assign_deadline: Option<Instant>,
-    /// Offers only: whether the holder's stream has said it holds the offer
-    /// since it was last handed to it again ([`Inbox::hold`]).
-    pub offer_hold: OfferHold,
     /// PRD #1666 §13 step 4: which policy owns this assignment, fixed at its
     /// first issuance by the receiver that took it. A direct message has one
     /// assignment for life; an offer has one per holder, so this is cleared
-    /// when it returns to its pool. The legacy ack-wait, requeue, nack and
-    /// hold act only on `Legacy`-owned messages, and only a receipt receiver
+    /// when it returns to its pool. The legacy ack-wait and requeue act only
+    /// on `Legacy`-owned messages, and only a receipt receiver
     /// takes a `Receipt`-owned one, so the two policies never run for one
     /// assignment.
     pub owner: Option<AssignmentOwner>,
@@ -563,29 +550,12 @@ pub struct Message {
 /// PRD #1666 §13 step 4: the policy that owns an assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssignmentOwner {
-    /// Ack-wait redelivery, `hold` and `max_deliver`, for a consumer not yet
-    /// switched to receipts.
+    /// Ack-wait redelivery and `max_deliver`, for a consumer not on
+    /// receipts: a hook or a once-waiter.
     Legacy,
     /// The attempt model (`crate::inbox_attempts`) through the hub's receipt
     /// engine.
     Receipt,
-}
-
-/// PRD #1666 long-turn delivery: where an offer's holder stands on holding it.
-/// An offer fetched by a stream is handed to that stream again at the end of
-/// its ack-wait instead of going back to its pool, for as long as the stream
-/// answers each of those hand-overs with `hold` — bounded by the offer's claim
-/// TTL and by [`InboxLimits::hold_bound`] from this assignment's first fetch.
-/// Reset whenever the offer leaves its holder.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum OfferHold {
-    /// Not handed to the holder again yet on this assignment.
-    #[default]
-    NotAsked,
-    /// Handed to the holder's stream again; it has not answered with `hold`.
-    Asked,
-    /// The holder's stream answered with `hold`.
-    Held,
 }
 
 impl Message {
@@ -733,8 +703,6 @@ pub enum ReturnCause {
 pub struct InboxLimits {
     pub ack_wait: Duration,
     pub max_deliver: u32,
-    /// See [`DEFAULT_HOLD_BOUND`].
-    pub hold_bound: Duration,
     pub max_per_recipient: usize,
     pub max_messages: usize,
     pub max_body_bytes: usize,
@@ -764,7 +732,6 @@ impl Default for InboxLimits {
         Self {
             ack_wait: DEFAULT_ACK_WAIT,
             max_deliver: DEFAULT_MAX_DELIVER,
-            hold_bound: DEFAULT_HOLD_BOUND,
             max_per_recipient: DEFAULT_MAX_PER_RECIPIENT,
             max_messages: DEFAULT_MAX_MESSAGES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
@@ -812,7 +779,6 @@ impl InboxLimits {
         Self {
             ack_wait: ms(ENV_ACK_WAIT_MS).unwrap_or(d.ack_wait),
             max_deliver: small(ENV_MAX_DELIVER).unwrap_or(d.max_deliver),
-            hold_bound: d.hold_bound,
             max_per_recipient: count(ENV_MAX_PER_RECIPIENT).unwrap_or(d.max_per_recipient),
             max_messages: count(ENV_MAX_MESSAGES).unwrap_or(d.max_messages),
             max_body_bytes: count(ENV_MAX_BODY_BYTES).unwrap_or(d.max_body_bytes),
@@ -1092,6 +1058,25 @@ impl Inbox {
         self.reserved_replies
     }
 
+    /// TEST: the ack-wait of message `id`, fetched in `pane_id`, has run out,
+    /// so the next [`Self::tick`] treats it as unacknowledged.
+    #[cfg(test)]
+    pub fn run_out_ack_wait(&mut self, id: &str, pane_id: &str) {
+        for message in &mut self.messages {
+            if message.id.as_str() == id
+                && message
+                    .recipient
+                    .as_ref()
+                    .is_some_and(|r| r.pane_id == pane_id)
+                && let MessageState::Fetched {
+                    at, ack_deadline, ..
+                } = &mut message.state
+            {
+                *ack_deadline = *at;
+            }
+        }
+    }
+
     /// Give back one reservation [`Self::reserve_reply`] made, unused.
     pub fn release_reply(&mut self) {
         self.reserved_replies = self.reserved_replies.saturating_sub(1);
@@ -1348,7 +1333,6 @@ impl Inbox {
             self.messages[index]
                 .owner
                 .get_or_insert(AssignmentOwner::Legacy);
-            self.messages[index].first_fetched_at.get_or_insert(now);
             self.transition(
                 index,
                 now,
@@ -1447,76 +1431,6 @@ impl Inbox {
         }
     }
 
-    /// PRD #1666 long-turn delivery: the streaming consumer holding message
-    /// `id` answered its redelivery with `hold` — the agent still has the
-    /// message queued behind the turn in progress, and it was not handed over
-    /// again. That redelivery's hand-over is refunded (`deliveries` never drops
-    /// below one), so a turn longer than ack-wait × `max_deliver` does not make
-    /// the message undeliverable. For an offer, whose count is assignments
-    /// rather than fetches, nothing is refunded: the hold keeps the offer with
-    /// its holder at the end of the ack-wait ([`OfferHold`]). Honoured only
-    /// while the message is fetched by `consumer` and was first fetched less
-    /// than [`InboxLimits::hold_bound`] ago — for an offer, less than its claim
-    /// TTL too, from this assignment's first fetch; past that bound
-    /// `max_deliver` applies, and an offer returns to its pool, as for every
-    /// other consumer. Returns whether the hold was honoured.
-    pub fn hold(
-        &mut self,
-        now: Instant,
-        id: &str,
-        pane_id: &str,
-        agent_id: &str,
-        consumer: &Consumer,
-    ) -> bool {
-        let Some(index) = self.find_for(id, pane_id, agent_id) else {
-            return false;
-        };
-        let within_bound = self.within_hold_bound(index, now);
-        let message = &mut self.messages[index];
-        let fetched_by_consumer =
-            matches!(&message.state, MessageState::Fetched { by, .. } if by == consumer);
-        if !fetched_by_consumer || !within_bound || message.owner == Some(AssignmentOwner::Receipt)
-        {
-            return false;
-        }
-        if message.is_offer() {
-            message.offer_hold = OfferHold::Held;
-        } else {
-            message.deliveries = message.deliveries.saturating_sub(1).max(1);
-        }
-        true
-    }
-
-    /// Message `index` was first fetched less than its hold bound ago:
-    /// [`InboxLimits::hold_bound`], and for an offer its claim TTL too.
-    fn within_hold_bound(&self, index: usize, now: Instant) -> bool {
-        let message = &self.messages[index];
-        let bound = match message.kind {
-            MessageKind::Offer { claim_ttl, .. } => claim_ttl.min(self.limits.hold_bound),
-            _ => self.limits.hold_bound,
-        };
-        message
-            .first_fetched_at
-            .is_some_and(|first| now.saturating_duration_since(first) < bound)
-    }
-
-    /// PRD #1666 long-turn delivery: an offer whose ack-wait ran out stays with
-    /// its holder when a stream fetched it, the stream has not left a hand-over
-    /// of it unanswered, and it is within its hold bound ([`OfferHold`]).
-    fn offer_stays_with_holder(&self, index: usize, now: Instant) -> bool {
-        let message = &self.messages[index];
-        message.is_offer()
-            && matches!(
-                &message.state,
-                MessageState::Fetched {
-                    by: Consumer::Stream { .. },
-                    ..
-                }
-            )
-            && message.offer_hold != OfferHold::Asked
-            && self.within_hold_bound(index, now)
-    }
-
     /// PRD #1666 §13 step 4: hand message `id`, queued for `agent_id` in
     /// `pane_id`, to a receipt receiver: it becomes fetched by `consumer` and
     /// its assignment `Receipt`-owned. `None` unless it is queued, admits the
@@ -1538,7 +1452,6 @@ impl Inbox {
             message.deliveries += 1;
         }
         message.owner = Some(AssignmentOwner::Receipt);
-        message.first_fetched_at.get_or_insert(now);
         let ack_deadline = now + self.limits.ack_wait;
         self.transition(
             index,
@@ -1601,23 +1514,6 @@ impl Inbox {
     pub fn owner_of(&self, id: &str, pane_id: &str, agent_id: &str) -> Option<AssignmentOwner> {
         self.find_for(id, pane_id, agent_id)
             .and_then(|index| self.messages[index].owner)
-    }
-
-    /// A consumer handing a fetched message back unread. It is redelivered
-    /// (or becomes undeliverable at `max_deliver`). Returns whether the
-    /// message was fetched by this agent.
-    pub fn nack(&mut self, now: Instant, id: &str, pane_id: &str, agent_id: &str) -> bool {
-        let Some(index) = self.find_for(id, pane_id, agent_id) else {
-            return false;
-        };
-        if !matches!(self.messages[index].state, MessageState::Fetched { .. })
-            || self.messages[index].owner == Some(AssignmentOwner::Receipt)
-        {
-            return false;
-        }
-        self.redeliver(index, now);
-        self.trim_history(now);
-        true
     }
 
     /// A consumer whose connection dropped before it handed its messages
@@ -1757,16 +1653,7 @@ impl Inbox {
                     if *ack_deadline <= now
                         && self.messages[index].owner != Some(AssignmentOwner::Receipt) =>
                 {
-                    if self.offer_stays_with_holder(index, now) {
-                        // Handed to the same holder again, uncounted: an
-                        // offer counted its delivery when it was assigned.
-                        let message = &mut self.messages[index];
-                        message.offer_hold = OfferHold::Asked;
-                        message.assign_deadline = Some(now + self.limits.offer_assign_wait);
-                        self.transition(index, now, MessageState::Queued);
-                    } else {
-                        self.redeliver(index, now);
-                    }
+                    self.redeliver(index, now);
                 }
                 MessageState::Claimed { expires, .. } if *expires <= now => {
                     self.return_offer(index, now, ReturnCause::ClaimExpired);
@@ -2011,11 +1898,9 @@ impl Inbox {
             created_at: now,
             state: MessageState::Queued,
             deliveries: 0,
-            first_fetched_at: None,
             history: Vec::new(),
             excluded: Vec::new(),
             assign_deadline: None,
-            offer_hold: OfferHold::NotAsked,
             owner: None,
         };
         self.messages.push(message);
@@ -2098,8 +1983,6 @@ impl Inbox {
     fn return_offer(&mut self, index: usize, now: Instant, cause: ReturnCause) {
         let message = &mut self.messages[index];
         message.assign_deadline = None;
-        message.first_fetched_at = None;
-        message.offer_hold = OfferHold::NotAsked;
         message.owner = None;
         let previous = message.recipient.take();
         if let Some(holder) = &previous {
@@ -2753,212 +2636,6 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(inbox.counts("2").undeliverable, 1);
-    }
-
-    /// Scenario: A streaming consumer keeps a fetched message queued behind a
-    /// long turn and answers each redelivery with `hold`. Every redelivery's
-    /// hand-over is refunded, so the message outlives `max_deliver` ack-waits
-    /// while the consumer holds it; a hold from another consumer, or for a
-    /// queued message, refunds nothing; past the hold bound the redeliveries
-    /// count again and it becomes undeliverable at `max_deliver`.
-    #[spec("inbox/core/018")]
-    #[test]
-    fn inbox_core_018_a_held_redelivery_is_refunded_until_the_bound() {
-        let t0 = Instant::now();
-        let ack_wait = Duration::from_secs(1);
-        let limits = InboxLimits {
-            ack_wait,
-            max_deliver: 2,
-            hold_bound: Duration::from_secs(30),
-            ..InboxLimits::default()
-        };
-        let mut inbox = inbox_with(limits);
-        let id = inbox.post_direct(t0, worker(), from_deck()).unwrap();
-        let stream = Consumer::Stream { conn_id: 9 };
-        let mut now = t0;
-        assert_eq!(
-            inbox
-                .fetch(now, "2", "agent-w1", stream.clone(), None)
-                .len(),
-            1
-        );
-        // A first hand-over held is never refunded below one.
-        assert!(inbox.hold(now, id.as_str(), "2", "agent-w1", &stream));
-        assert_eq!(inbox.get(id.as_str(), "2").unwrap().deliveries, 1);
-        // Ten ack-waits, five times `max_deliver`, each redelivery held.
-        for round in 0..10 {
-            now += ack_wait;
-            inbox.tick(now);
-            assert_eq!(
-                state_of(&inbox, &id, "2"),
-                StateName::Queued,
-                "round {round}"
-            );
-            assert_eq!(
-                inbox
-                    .fetch(now, "2", "agent-w1", stream.clone(), None)
-                    .len(),
-                1,
-                "round {round}"
-            );
-            assert_eq!(inbox.get(id.as_str(), "2").unwrap().deliveries, 2);
-            assert!(
-                !inbox.hold(
-                    now,
-                    id.as_str(),
-                    "2",
-                    "agent-w1",
-                    &Consumer::Stream { conn_id: 10 }
-                ),
-                "another consumer's hold refunds nothing"
-            );
-            assert!(
-                !inbox.hold(now, id.as_str(), "2", "agent-other", &stream),
-                "another agent's hold refunds nothing"
-            );
-            assert!(inbox.hold(now, id.as_str(), "2", "agent-w1", &stream));
-            assert_eq!(inbox.get(id.as_str(), "2").unwrap().deliveries, 1);
-        }
-        now += ack_wait;
-        inbox.tick(now);
-        assert!(
-            !inbox.hold(now, id.as_str(), "2", "agent-w1", &stream),
-            "a queued message is not held"
-        );
-        // Past the bound a hold no longer refunds, and max_deliver applies.
-        now = t0 + Duration::from_secs(30);
-        inbox.fetch(now, "2", "agent-w1", stream.clone(), None);
-        assert!(!inbox.hold(now, id.as_str(), "2", "agent-w1", &stream));
-        assert_eq!(inbox.get(id.as_str(), "2").unwrap().deliveries, 2);
-        now += ack_wait;
-        inbox.tick(now);
-        assert_eq!(
-            inbox.get(id.as_str(), "2").unwrap().state,
-            MessageState::Undeliverable {
-                at: now,
-                reason: UndeliverableReason::MaxDeliver,
-            }
-        );
-        assert_eq!(DEFAULT_HOLD_BOUND, Duration::from_secs(60 * 60));
-        assert_eq!(InboxLimits::default().hold_bound, DEFAULT_HOLD_BOUND);
-    }
-
-    /// Scenario: An offer assigned to a worker whose stream fetched it is not
-    /// claimed within the ack-wait. At each ack-wait the offer is handed to
-    /// the same stream again rather than back to its pool, for as long as the
-    /// stream answers with `hold`: it is never reassigned and its assignment
-    /// count does not move, and the holder's ack still claims it. Once the
-    /// claim TTL or the hold bound has passed since that assignment's first
-    /// fetch, or a redelivery goes unanswered, it returns to its pool as it
-    /// does for a consumer that cannot hold.
-    #[spec("inbox/core/020")]
-    #[test]
-    fn inbox_core_020_a_held_offer_stays_with_its_holder_until_the_bound() {
-        let t0 = Instant::now();
-        let ack_wait = Duration::from_secs(10);
-        let claim_ttl = Duration::from_secs(60);
-        let alice = Recipient::bound("5", "agent-a");
-        let bob = Recipient::bound("6", "agent-b");
-        let stream = Consumer::Stream { conn_id: 9 };
-        let offer = |inbox: &mut Inbox, now| {
-            let offered = inbox
-                .offer(
-                    now,
-                    scope(),
-                    "review",
-                    Some(claim_ttl),
-                    from_agent("1", "agent-o"),
-                    &[alice.clone(), bob.clone()],
-                )
-                .unwrap();
-            assert_eq!(offered.offered_to, Some(alice.clone()));
-            offered.id
-        };
-        // Held through every ack-wait: re-handed to the same stream, held, and
-        // finally claimed by its holder, never by anyone else.
-        let held_rounds = |inbox: &mut Inbox, id: &MessageId, from: Instant, rounds: u32| {
-            let mut now = from;
-            for round in 0..rounds {
-                now += ack_wait;
-                inbox.tick(now);
-                assert!(inbox.unassigned_offers().is_empty(), "round {round}");
-                let message = inbox.get(id.as_str(), "5").unwrap();
-                assert_eq!(message.recipient, Some(alice.clone()), "round {round}");
-                assert_eq!(message.deliveries, 1, "round {round}");
-                assert_eq!(
-                    inbox.fetch(now, "5", "agent-a", stream.clone(), None).len(),
-                    1,
-                    "the holder's stream is handed the offer again (round {round})"
-                );
-                assert!(
-                    inbox
-                        .fetch(now, "6", "agent-b", Consumer::FetchCli, None)
-                        .is_empty()
-                );
-                assert!(inbox.hold(now, id.as_str(), "5", "agent-a", &stream));
-            }
-            now
-        };
-        let limits = InboxLimits {
-            ack_wait,
-            ..InboxLimits::default()
-        };
-        let mut inbox = inbox_with(limits.clone());
-        let id = offer(&mut inbox, t0);
-        inbox.fetch(t0, "5", "agent-a", stream.clone(), None);
-        let now = held_rounds(&mut inbox, &id, t0, 4);
-        assert_eq!(
-            inbox.ack(now, id.as_str(), "5", "agent-a", AckHow::PluginConfirmed),
-            AckOutcome::Claimed {
-                expires_in_ms: millis(claim_ttl)
-            }
-        );
-
-        // Past the claim TTL since the first fetch, the next ack-wait returns
-        // it to the pool, excluding its holder.
-        let mut inbox = inbox_with(limits.clone());
-        let id = offer(&mut inbox, t0);
-        inbox.fetch(t0, "5", "agent-a", stream.clone(), None);
-        let now = held_rounds(&mut inbox, &id, t0, 5);
-        inbox.tick(now + ack_wait);
-        assert_eq!(inbox.unassigned_offers(), vec![id.clone()]);
-        assert_eq!(
-            inbox.assign_offer(now + ack_wait, &id, &[alice.clone(), bob.clone()]),
-            Some(bob.clone())
-        );
-
-        // A hold bound shorter than the claim TTL ends it first.
-        let mut inbox = inbox_with(InboxLimits {
-            hold_bound: Duration::from_secs(30),
-            ..limits.clone()
-        });
-        let id = offer(&mut inbox, t0);
-        inbox.fetch(t0, "5", "agent-a", stream.clone(), None);
-        let now = held_rounds(&mut inbox, &id, t0, 2);
-        inbox.tick(now + ack_wait);
-        assert_eq!(inbox.unassigned_offers(), vec![id.clone()]);
-        assert!(
-            !inbox.hold(now + ack_wait, id.as_str(), "5", "agent-a", &stream),
-            "an offer back in its pool is not held"
-        );
-
-        // A redelivery the stream does not answer with hold ends it.
-        let mut inbox = inbox_with(limits.clone());
-        let id = offer(&mut inbox, t0);
-        inbox.fetch(t0, "5", "agent-a", stream.clone(), None);
-        inbox.tick(t0 + ack_wait);
-        assert!(inbox.unassigned_offers().is_empty());
-        inbox.fetch(t0 + ack_wait, "5", "agent-a", stream.clone(), None);
-        inbox.tick(t0 + 2 * ack_wait);
-        assert_eq!(inbox.unassigned_offers(), vec![id.clone()]);
-
-        // A consumer that cannot hold — a once waiter — loses it at the first
-        // ack-wait, as before.
-        let mut inbox = inbox_with(limits);
-        let id = offer(&mut inbox, t0);
-        inbox.fetch(t0, "5", "agent-a", Consumer::Waiter { conn_id: 3 }, None);
-        inbox.tick(t0 + ack_wait);
-        assert_eq!(inbox.unassigned_offers(), vec![id]);
     }
 
     /// Scenario: A message runs out of hand-overs and becomes undeliverable,

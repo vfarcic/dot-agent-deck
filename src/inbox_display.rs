@@ -112,6 +112,11 @@ pub const CLI_TOO_OLD: &str = "the dot-agent-deck command this agent runs does n
 /// PRD #1666 §11: a reversible readiness notice, cleared by a registration.
 pub const NOT_ARMED: &str =
     "this agent's deck integration has not connected yet; its messages wait until it does";
+/// PRD #1666 step 4: an `inbox wait --stream` from a component the receipt
+/// policy does not cover. Only a receipt receiver streams; hooks and the Claude
+/// waiter take their mail once at a time.
+pub const STREAM_UNSUPPORTED: &str =
+    "this inbox component cannot stream; only a deck integration on message receipts can";
 /// PRD #1666 §3: receipts cannot be recorded for this generation; `({error})`
 /// follows.
 pub const RECEIPTS_DEGRADED: &str =
