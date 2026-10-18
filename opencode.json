@@ -20,8 +20,9 @@
     "webfetch": "allow",
     "websearch": "allow",
     "external_directory": {
-      "/home/vfarcic/.cargo/**": "allow",
-      "/home/vfarcic/.rustup/toolchains/**": "allow"
+      "{env:HOME}/.cargo/**": "allow",
+      "{env:HOME}/.rustup/toolchains/**": "allow",
+      "*/node_modules/@earendil-works/pi-coding-agent/**": "allow"
     }
   }
 }
