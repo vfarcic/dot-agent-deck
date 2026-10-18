@@ -189,6 +189,7 @@ These are developer and test tunings, not ordinary setup requirements. Daemon-re
 | `DOT_AGENT_DECK_INBOX_KEEPALIVE_MS` | `30000` | Daemon: idle waiter keepalive; zero/invalid retains default. `POSSESS_TTL` is three of it. |
 | `DOT_AGENT_DECK_INBOX_ARM_DEADLINE_MS` | `120000` | Daemon: how long after an OpenCode spawn with no registration before the card says its integration has not connected yet. |
 | `DOT_AGENT_DECK_INBOX_PROBE_DEADLINE_MS` | `5000` | Daemon: the capability probe's deadline. |
+| `DOT_AGENT_DECK_INBOX_NOT_STARTED_MS` | `180000` | Daemon: how long a deck message handed to a Pi agent may go with the agent idle and no turn started before both clients say it may not have reached the agent (PRD #1666 G3); zero/invalid retains default. Inert until Pi registers a receipt receiver. |
 | `DOT_AGENT_DECK_INBOX_SPOOL` | set by the daemon | The absolute `<state-dir>/inbox-spool/<instance>` the daemon pins into every spawn, replacing a caller's value; the receipt watcher publishes under it. |
 | `DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS` | unset | Test-only, read by the receipt watcher: every receipt publish waits this long first. |
 | `DOT_AGENT_DECK_REPAINT_NUDGE_GAP_MS` | `300` | PTY registry: mini repaint interval; parsed as `u64`, invalid retains default. |

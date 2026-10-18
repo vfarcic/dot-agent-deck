@@ -772,6 +772,62 @@ fn status_018_card_warns_that_messages_may_repeat() {
     assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
 }
 
+/// Scenario: The daemon's snapshot lists deck messages a Pi agent may not have received: one alone, two together, and one beside an uncertain delivery and a held-long one. The card says `may not have reached the agent` ahead of the queued count, with its count for two and the reason under it, never as an error, and an uncertain delivery still leads.
+#[spec("inbox/status/023")]
+#[test]
+fn status_023_card_says_a_message_may_not_have_reached_the_agent() {
+    let words = inbox_display_words();
+    let glyph = words["glyph"].as_str().unwrap();
+    let not_started = words["notStarted"].as_str().unwrap();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "not_started")]
+    }));
+    let line = format!("{glyph} {not_started}");
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+    assert!(
+        !rendered.contains(&format!("{glyph}1 {}", words["queued"].as_str().unwrap())),
+        "it leads the queued count:\n{rendered}"
+    );
+    let reason: String = words["notStartedReason"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        rendered.contains(&reason),
+        "{reason:?} missing:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Error"),
+        "it is attention, not a failure:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+
+    let two = inbox_notice_card(serde_json::json!({
+        "attention": [
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "not_started"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b851", "not_started")
+        ]
+    }));
+    let line = format!("{glyph} 2 {not_started}");
+    assert!(two.contains(&line), "{line:?} missing:\n{two}");
+
+    let mixed = inbox_notice_card(serde_json::json!({
+        "attention": [
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "uncertain"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b851", "not_started"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b852", "held_long")
+        ]
+    }));
+    let line = format!("{glyph} {}", words["uncertain"].as_str().unwrap());
+    assert!(mixed.contains(&line), "{line:?} missing:\n{mixed}");
+    assert!(
+        !mixed.contains(not_started),
+        "the uncertain delivery leads:\n{mixed}"
+    );
+}
+
 /// Scenario: Render a pending-message card at the existing 20-column Compact snapshot budget. The envelope count must fit beside Thinking without removing the tools counter or overrunning either border.
 #[spec("inbox/status/007")]
 #[test]

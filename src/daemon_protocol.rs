@@ -2849,7 +2849,8 @@ pub enum AttachRequest {
         origin: crate::inbox_hub::PostOrigin,
     },
     /// PRD #1666 §6.4: the user's Retry on a deck message `agent_id`'s card in
-    /// `pane_id` lists as uncertain or held_long, at the `revision` it showed.
+    /// `pane_id` lists as uncertain, held_long or not_started (G3), at the
+    /// `revision` it showed.
     /// `request_id` names the press, so a retransmission answers as before
     /// and a second client's press is told it came too late. The reply rides
     /// back on [`AttachResponse::inbox_action`].

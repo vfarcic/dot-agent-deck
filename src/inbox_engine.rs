@@ -24,7 +24,7 @@
 //! registered, so nothing is handed to it, and its doorbell stays silent; mail
 //! waits queued.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,7 @@ use super::{
     AgentKey, BroadcastMsg, HubState, InboxAttentionItem, InboxCardNotices, LATE_ACK_SUBJECT,
     WaiterSignal, kind_sender_label, render_marked,
 };
+use crate::agent_pty::{TurnEdge, TurnSeen};
 use crate::event::{
     InboxAttemptCaps, InboxAttemptRef, InboxBudget, InboxComponent, InboxCorrectable,
     InboxDelivery, InboxDeliveryAttempt, InboxGrant, InboxIssued, InboxNotice, InboxRebound,
@@ -43,7 +44,7 @@ use crate::event::{
 use crate::inbox::{AckHow, AssignmentOwner, Consumer, MessageState, UndeliverableReason};
 use crate::inbox_attempts::{
     AttemptModel, Effect, HandOverRefusal, LapseCheck, Limits, MessageState as Delivery,
-    ResumeAnswer, Rx, Slot, Stage, UncertainReason, UndeliverableReason as Verdict,
+    ResumeAnswer, Rx, Slot, Stage, TurnView, UncertainReason, UndeliverableReason as Verdict,
 };
 use crate::inbox_display::{AttentionKind, IntegrationNotice};
 use crate::inbox_receipt::{EvidenceStore, GenerationSpool, RecordScanner};
@@ -70,6 +71,40 @@ pub fn arm_deadline_from_env() -> Duration {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .map_or(ARM_DEADLINE, Duration::from_millis)
+}
+
+/// Overrides [`crate::inbox_attempts::NOT_STARTED_AFTER`], in milliseconds.
+pub const ENV_NOT_STARTED_MS: &str = "DOT_AGENT_DECK_INBOX_NOT_STARTED_MS";
+
+/// [`crate::inbox_attempts::NOT_STARTED_AFTER`] or its override.
+pub fn not_started_after_from_env() -> Duration {
+    std::env::var(ENV_NOT_STARTED_MS)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(
+            crate::inbox_attempts::NOT_STARTED_AFTER,
+            Duration::from_millis,
+        )
+}
+
+/// PRD #1666 G3: how many exited generations the turn clocks remember, so a
+/// turn edge delayed past its generation's exit cannot bring a clock back.
+/// The registry checks the edge's owner and the daemon hands it here inside
+/// one ingest, so the memory only has to outlast that, not hours.
+pub(super) const EXITED_TURN_KEYS: usize = 1024;
+
+/// PRD #1666 G3: one generation's turns, as its own hook reports reached the
+/// daemon. Kept apart from [`Gen`]: an edge creates no receipt generation,
+/// and a registration reads the clock without resetting it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct TurnClock {
+    pub(super) busy: bool,
+    /// Set only when a turn under way ends.
+    pub(super) idle_since: Option<Instant>,
+    /// The registry's order of the last edge applied; an older one is
+    /// ignored.
+    pub(super) seq: u64,
 }
 
 /// The receiver slot a component's stream registers in (§4).
@@ -170,6 +205,10 @@ pub(super) struct Receipts {
     pub(super) arm_deadline: Duration,
     /// When the clock last read the spools ([`tick`]).
     pub(super) last_check: Option<Instant>,
+    /// PRD #1666 G3: every generation's turn clock ([`note_turn`]).
+    pub(super) turns: HashMap<AgentKey, TurnClock>,
+    /// Generations that exited, newest last, at most [`EXITED_TURN_KEYS`].
+    pub(super) exited_turns: VecDeque<AgentKey>,
 }
 
 impl Receipts {
@@ -182,7 +221,20 @@ impl Receipts {
             removals: Vec::new(),
             arm_deadline,
             last_check: None,
+            turns: HashMap::new(),
+            exited_turns: VecDeque::new(),
         }
+    }
+
+    /// PRD #1666 G3: what `key`'s turn clock reads now; a generation that
+    /// reported no turn reads idle, never seen busy.
+    pub(super) fn turn_view(&self, key: &AgentKey) -> TurnView {
+        self.turns
+            .get(key)
+            .map_or_else(TurnView::default, |clock| TurnView {
+                busy: clock.busy,
+                idle_since: clock.idle_since,
+            })
     }
 
     /// The generation's floor blocks delivery (§11).
@@ -230,7 +282,16 @@ impl Receipts {
             .filter_map(|generation| generation.model.revoke_due_at())
             .min()
             .map(|due| due.max(now));
-        [open.then(|| now + step), arm, check, revoke]
+        // PRD #1666 G3: a not-started attention falls due on its own instant.
+        let not_started = self
+            .gens
+            .iter()
+            .filter_map(|(key, generation)| {
+                generation.model.not_started_due_at(self.turn_view(key))
+            })
+            .min()
+            .map(|due| due.max(now));
+        [open.then(|| now + step), arm, check, revoke, not_started]
             .into_iter()
             .flatten()
             .min()
@@ -815,7 +876,7 @@ pub(super) struct Checked {
     pub(super) degraded: Option<String>,
 }
 
-/// T2/T3, then T4/T8/held_long, for every generation: `checked` holds what
+/// T2/T3, then T4/T8/held_long and G3's not-started attention, for every generation: `checked` holds what
 /// each generation's spool IO found. Every commit found is applied first, so
 /// a receipt published for any issued attempt settles (or corrects) before
 /// a lapse can repeat anything; only the candidates a completed check
@@ -829,6 +890,7 @@ pub(super) fn tick(
     st.receipts.last_check = Some(now);
     let keys: Vec<AgentKey> = st.receipts.gens.keys().cloned().collect();
     for key in &keys {
+        let turn = st.receipts.turn_view(key);
         if let Some(generation) = st.receipts.gens.get_mut(key) {
             let checked = checked.get(key);
             if let Some(error) = checked.and_then(|c| c.degraded.as_deref()) {
@@ -848,9 +910,10 @@ pub(super) fn tick(
             generation
                 .model
                 .tick_verified(checked.map(|c| c.verified.as_slice()).unwrap_or_default());
-            generation.model.tick_cleared(
+            generation.model.tick_turn(
                 now,
                 checked.map(|c| c.cleared.as_slice()).unwrap_or_default(),
+                turn,
             );
         }
         apply(st, key, now, out);
@@ -858,6 +921,35 @@ pub(super) fn tick(
     }
     for key in st.receipts.floors.keys().cloned().collect::<Vec<_>>() {
         broadcast_notices(st, &key, now);
+    }
+}
+
+/// PRD #1666 G3: generation `key` reported a turn edge the registry accepted
+/// from its live owner, or kept for its reserved spawn, numbered `seen.seq`.
+/// A turn starting makes the clock busy; one under way ending makes it idle
+/// from `now`, the only place `idle_since` moves. An edge for an exited
+/// generation, or one older than the last applied, changes nothing. Returns
+/// whether the clock changed.
+pub(super) fn note_turn(st: &mut HubState, key: &AgentKey, seen: TurnSeen, now: Instant) -> bool {
+    if st.receipts.exited_turns.contains(key) {
+        return false;
+    }
+    let clock = st.receipts.turns.entry(key.clone()).or_default();
+    if seen.seq <= clock.seq {
+        return false;
+    }
+    clock.seq = seen.seq;
+    match seen.edge {
+        TurnEdge::Started if !clock.busy => {
+            clock.busy = true;
+            true
+        }
+        TurnEdge::Ended if clock.busy => {
+            clock.busy = false;
+            clock.idle_since = Some(now);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -900,6 +992,15 @@ pub(super) fn exit(
     now: Instant,
 ) -> Option<Arc<GenerationSpool>> {
     st.receipts.floors.remove(key);
+    // PRD #1666 G3: the clock goes, and the key is remembered so a delayed
+    // edge cannot bring it back.
+    st.receipts.turns.remove(key);
+    if !st.receipts.exited_turns.contains(key) {
+        if st.receipts.exited_turns.len() >= EXITED_TURN_KEYS {
+            st.receipts.exited_turns.pop_front();
+        }
+        st.receipts.exited_turns.push_back(key.clone());
+    }
     let told = st.receipts.told.remove(key);
     let generation = st.receipts.gens.remove(key);
     if told.is_some_and(|told| told != InboxCardNotices::default()) {
@@ -1143,6 +1244,7 @@ pub(super) fn notices(st: &HubState, key: &AgentKey, now: Instant) -> InboxCardN
         let kind = match delivery.state {
             Delivery::Uncertain(UncertainReason::Lapsed) => AttentionKind::Uncertain,
             Delivery::Uncertain(UncertainReason::OutOfAttempts) => AttentionKind::OutOfAttempts,
+            _ if delivery.not_started() => AttentionKind::NotStarted,
             _ if delivery.held_long() => AttentionKind::HeldLong,
             _ => continue,
         };

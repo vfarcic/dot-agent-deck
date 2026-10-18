@@ -45,6 +45,10 @@ pub const DEFAULT_EVIDENCE_LIMIT: usize = 1024;
 /// How long possession without a commit lasts before the one held_long
 /// attention notice (§6.3).
 pub const HELD_LONG_AFTER: Duration = Duration::from_secs(60 * 60);
+/// PRD #1666 G3: how long a deck message handed to a Pi agent may go with no
+/// turn starting, the agent idle all that time, before both clients say it
+/// may not have reached the agent. Attention only: nothing is sent again.
+pub const NOT_STARTED_AFTER: Duration = Duration::from_secs(3 * 60);
 /// Keepalives in one `POSSESS_TTL` (§4).
 pub const KEEPALIVES_PER_POSSESS_TTL: u32 = 3;
 /// `POSSESS_TTL`s a message may wait unpossessed for something that would
@@ -67,6 +71,8 @@ pub struct Limits {
     /// A resume answer's window, and a once-waiter's idle grace.
     pub ack_wait: Duration,
     pub held_long_after: Duration,
+    /// PRD #1666 G3: [`NOT_STARTED_AFTER`], or its override.
+    pub not_started_after: Duration,
 }
 
 impl Limits {
@@ -95,8 +101,21 @@ impl Default for Limits {
             possess_ttl: crate::inbox_hub::DEFAULT_KEEPALIVE * KEEPALIVES_PER_POSSESS_TTL,
             ack_wait: crate::inbox::DEFAULT_ACK_WAIT,
             held_long_after: HELD_LONG_AFTER,
+            not_started_after: NOT_STARTED_AFTER,
         }
     }
+}
+
+/// PRD #1666 G3: what the deck last saw of the generation's turns, from its
+/// own hook reports: whether a turn is under way, and since when it has been
+/// idle. `idle_since` moves only when a turn under way ends, so a repeated
+/// Idle, a rebind or a keepalive cannot postpone the not-started window.
+/// The default, idle and never seen busy, is a generation that has reported
+/// no turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnView {
+    pub busy: bool,
+    pub idle_since: Option<Instant>,
 }
 
 /// A daemon-minted receiver incarnation (§4).
@@ -296,6 +315,14 @@ pub struct Delivery {
     /// take its repeat.
     waiting_since: Option<Instant>,
     held_long_sent: Option<u64>,
+    /// PRD #1666 G3: the first possession or hand-over of the current
+    /// assignment. Unlike `possessed_since` a watcher gap does not clear it,
+    /// so a respawn cannot postpone or re-arm the not-started window; a
+    /// commit, the latch, a terminal state, a Retry or a new assignment does.
+    not_started_anchor: Option<Instant>,
+    /// PRD #1666 G3: the revision at which the not-started attention stands,
+    /// recomputed from the turn clock on every tick ([`AttemptModel::note_turn`]).
+    not_started: Option<u64>,
     last_action: Option<(u64, Verb, ActionOutcome)>,
     corrected: bool,
 }
@@ -316,6 +343,8 @@ impl Delivery {
             possessed_since: None,
             waiting_since: None,
             held_long_sent: None,
+            not_started_anchor: None,
+            not_started: None,
             last_action: None,
             corrected: false,
         }
@@ -339,6 +368,16 @@ impl Delivery {
     /// revision and still stands.
     pub fn held_long(&self) -> bool {
         self.state == MessageState::Attempting && self.held_long_sent == Some(self.revision)
+    }
+
+    /// PRD #1666 G3: whether the not-started attention stands at the current
+    /// revision: a deck message handed to a Pi agent that has started no turn
+    /// for [`Limits::not_started_after`]. It yields to [`Self::held_long`], so
+    /// a message is one row.
+    pub fn not_started(&self) -> bool {
+        self.state == MessageState::Attempting
+            && self.not_started == Some(self.revision)
+            && !self.held_long()
     }
 
     fn set_state(&mut self, state: MessageState) {
@@ -1264,6 +1303,68 @@ impl AttemptModel {
         self.revokes_due(now);
     }
 
+    /// [`Self::tick_cleared`], then G3's not-started attention against the
+    /// generation's turn clock ([`Self::note_turn`]).
+    pub fn tick_turn(&mut self, now: Instant, cleared: &[LapseCheck], turn: TurnView) {
+        self.tick_cleared(now, cleared);
+        self.note_turn(now, turn);
+    }
+
+    /// PRD #1666 G3: recompute every message's not-started attention against
+    /// `turn`, the generation's turn clock. It stands for a message handed to
+    /// a Pi receiver, still attempting and uncommitted, once the agent has
+    /// been idle for [`Limits::not_started_after`] since both the message's
+    /// first possession or hand-over and the end of its last turn. A turn
+    /// under way, a commit or ineligibility withdraws it, and only a turn that
+    /// really ended re-arms it. Attention only: it changes no state, schedules
+    /// no repeat and issues nothing.
+    pub fn note_turn(&mut self, now: Instant, turn: TurnView) {
+        if self.exited {
+            return;
+        }
+        let ids: Vec<String> = self.messages.keys().cloned().collect();
+        for id in &ids {
+            let due = self.not_started_due(id, turn);
+            if let Some(msg) = self.messages.get_mut(id) {
+                msg.not_started = due.filter(|due| now >= *due).map(|_| msg.revision);
+            }
+        }
+    }
+
+    /// PRD #1666 G3: when the next not-started attention not yet standing
+    /// falls due under `turn`, so the clock wakes for it.
+    pub fn not_started_due_at(&self, turn: TurnView) -> Option<Instant> {
+        self.messages
+            .iter()
+            .filter(|(_, msg)| msg.not_started.is_none())
+            .filter_map(|(id, _)| self.not_started_due(id, turn))
+            .min()
+    }
+
+    fn not_started_due(&self, id: &str, turn: TurnView) -> Option<Instant> {
+        if self.exited || turn.busy {
+            return None;
+        }
+        let msg = self.messages.get(id)?;
+        // Attempting excludes a commit (rule 1 settles the message) and the
+        // cancel latch (rule 2 holds or ends it).
+        if msg.state != MessageState::Attempting || msg.latch {
+            return None;
+        }
+        let anchor = msg.not_started_anchor?;
+        let on_pi = msg.attempts.iter().filter(|at| at.a == msg.a).any(|at| {
+            !at.stage.is_final()
+                && self
+                    .receivers
+                    .get(&at.rx)
+                    .is_some_and(|r| r.slot == Slot::Pi)
+        });
+        if !on_pi {
+            return None;
+        }
+        Some(anchor.max(turn.idle_since.unwrap_or(anchor)) + self.limits.not_started_after)
+    }
+
     /// r8k R8G-04: send again every revoke still owed an answer one ack-wait
     /// after it was last sent. A revoke line can be lost on its way — the
     /// attempt's incarnation had no link, or its queue was full — and nothing
@@ -1350,7 +1451,8 @@ impl AttemptModel {
         }
     }
 
-    /// T5: user Retry on `Uncertain` or held_long: a manual repeat token.
+    /// T5: user Retry on `Uncertain`, held_long or not-started attention: a
+    /// manual repeat token.
     pub fn retry(
         &mut self,
         now: Instant,
@@ -1405,7 +1507,11 @@ impl AttemptModel {
             _ if state.is_terminal() => ActionOutcome::NotApplicable { state },
             Verb::Retry => {
                 let held_long = state == MessageState::Attempting && msg.held_long_sent.is_some();
-                if !(matches!(state, MessageState::Uncertain(_)) || held_long) {
+                // PRD #1666 G3: the not-started attention the user saw, still
+                // standing at the revision they saw it at.
+                let not_started =
+                    state == MessageState::Attempting && msg.not_started == Some(msg.revision);
+                if !(matches!(state, MessageState::Uncertain(_)) || held_long || not_started) {
                     ActionOutcome::NotApplicable { state }
                 } else if msg.issued >= max_attempts {
                     ActionOutcome::RetryLimit
@@ -1423,6 +1529,8 @@ impl AttemptModel {
                     msg.possessed_since = None;
                     msg.waiting_since = None;
                     msg.held_long_sent = None;
+                    msg.not_started = None;
+                    msg.not_started_anchor = None;
                     ActionOutcome::Applied { revision: 0 }
                 }
             }
@@ -1511,6 +1619,7 @@ impl AttemptModel {
         let all_not_handed =
             !current.is_empty() && current.iter().all(|at| at.stage == Stage::NotHanded);
         let none_issued = current.is_empty();
+        let handed = current.iter().any(|at| at.stage == Stage::Handed);
         let cleared = current.iter().all(|at| !needs_clearance(at) || at.cleared);
         let limits = self.limits;
         let Some(msg) = self.messages.get_mut(id) else {
@@ -1654,6 +1763,17 @@ impl AttemptModel {
             } else {
                 msg.set_state(MessageState::Uncertain(UncertainReason::Lapsed));
             }
+        }
+        // PRD #1666 G3: the not-started window runs from the assignment's
+        // first possession or hand-over; anything that ends the attempting
+        // ends it.
+        if msg.state == MessageState::Attempting && !msg.latch {
+            if held || handed {
+                msg.not_started_anchor.get_or_insert(now);
+            }
+        } else {
+            msg.not_started_anchor = None;
+            msg.not_started = None;
         }
         self.reclaim(id);
     }
@@ -3350,5 +3470,274 @@ mod tests {
                 answer
             );
         }
+    }
+
+    const STEP: Duration = Duration::from_secs(30);
+
+    fn idle() -> TurnView {
+        TurnView::default()
+    }
+
+    /// Register `slot`, post `id`, hand it out possessed and staged Handed.
+    fn handed(m: &mut AttemptModel, t: Instant, slot: Slot, id: &str) -> (Rx, Issued) {
+        let rx = m.register(t, slot, false).rx;
+        m.post(id, false);
+        let issued = issue_held(m, t, id, rx, 1);
+        m.stage(t, id, issued.a, issued.e, Stage::Handed, Some(rx));
+        (rx, issued)
+    }
+
+    /// Keep `held` possessed by `rx` at `now` and tick against `turn`.
+    fn step(
+        m: &mut AttemptModel,
+        now: Instant,
+        rx: Rx,
+        seq: &mut u64,
+        held: &[(&str, u32, u32)],
+        turn: TurnView,
+    ) {
+        *seq += 1;
+        m.snapshot(now, rx, *seq, 0, held);
+        m.tick_turn(now, &[], turn);
+    }
+
+    /// Scenario: A deck message is handed to a Pi receiver whose agent stays
+    /// idle, and the clock ticks every 30 seconds with the receiver keeping
+    /// it possessed. The not-started attention appears once the window has
+    /// passed since the hand-over (or since a later turn end), the clock is
+    /// told when it falls due, and nothing is issued, scheduled or repeated at
+    /// any point; the same message on an OpenCode receiver never raises it.
+    #[spec("inbox/attempts/020")]
+    #[test]
+    fn attempts_020_a_pi_message_with_no_turn_started_raises_attention_and_nothing_else() {
+        let window = Limits::default().not_started_after;
+        let (mut m, t) = model();
+        let (rx, i) = handed(&mut m, t, Slot::Pi, "m");
+        let held = [("m", i.a, i.e)];
+        assert_eq!(m.not_started_due_at(idle()), Some(t + window));
+        let later = TurnView {
+            busy: false,
+            idle_since: Some(t + Duration::from_secs(60)),
+        };
+        assert_eq!(
+            m.not_started_due_at(later),
+            Some(t + Duration::from_secs(60) + window),
+            "a turn that ended after the hand-over starts the window again"
+        );
+        let mut now = t;
+        let mut seq = 1;
+        while now < t + 2 * window {
+            now += STEP;
+            step(&mut m, now, rx, &mut seq, &held, idle());
+            let d = m.delivery("m").unwrap();
+            assert_eq!(d.not_started(), now >= t + window, "at {:?}", now - t);
+            assert!(!d.repeat_scheduled(), "the window schedules no repeat");
+            assert_eq!(d.issued, 1);
+            assert_eq!(d.state, MessageState::Attempting);
+            assert_eq!(m.drain_effects(), vec![], "the window has no effect");
+            assert_eq!(m.issue(now, "m", rx), Err(IssueRefusal::NothingToIssue));
+        }
+        assert_eq!(
+            m.not_started_due_at(idle()),
+            None,
+            "raised, nothing more due"
+        );
+
+        let (mut m, t) = model();
+        let (rx, i) = handed(&mut m, t, Slot::OpencodeTui, "m");
+        assert_eq!(m.not_started_due_at(idle()), None);
+        let mut now = t;
+        let mut seq = 1;
+        while now < t + 2 * window {
+            now += STEP;
+            step(&mut m, now, rx, &mut seq, &[("m", i.a, i.e)], idle());
+            assert!(!m.delivery("m").unwrap().not_started(), "OpenCode never");
+        }
+    }
+
+    /// Raise the not-started attention on a Pi message; returns the model,
+    /// its receiver, the attempt, the instant and the revision shown.
+    fn raised(limits: Limits) -> (AttemptModel, Rx, Issued, Instant, u64) {
+        let (mut m, t) = model_with(limits);
+        let (rx, i) = handed(&mut m, t, Slot::Pi, "m");
+        let now = t + limits.not_started_after;
+        m.snapshot(now, rx, 2, 0, &[("m", i.a, i.e)]);
+        m.tick_turn(now, &[], idle());
+        let d = m.delivery("m").unwrap();
+        assert!(d.not_started());
+        let revision = d.revision;
+        (m, rx, i, now, revision)
+    }
+
+    /// Scenario: The user presses Retry or Cancel on a deck message the
+    /// card says may not have reached a Pi agent. Retry at the shown revision
+    /// schedules one marked repeat and starts a new window, an older revision
+    /// is stale and an exhausted budget is refused; Cancel answers by what
+    /// the receiver says it did, and a Retry pressed after a turn started
+    /// withdrew the row is refused with nothing issued.
+    #[spec("inbox/attempts/021")]
+    #[test]
+    fn attempts_021_retry_and_cancel_on_a_message_that_may_not_have_reached_the_agent() {
+        let limits = Limits::default();
+        let window = limits.not_started_after;
+        // Retry at the shown revision: a marked repeat, a new window.
+        let (mut m, rx, i, now, r) = raised(limits);
+        assert!(matches!(
+            m.retry(now, "m", GEN, r),
+            ActionOutcome::Applied { .. }
+        ));
+        let d = m.delivery("m").unwrap();
+        assert!(!d.not_started(), "Retry clears the row");
+        assert!(d.repeat_scheduled());
+        let repeat = m.issue(now, "m", rx).expect("the manual repeat");
+        assert_eq!(repeat.kind, IssueKind::ManualRetry);
+        assert!(repeat.kind.marked());
+        let held = [("m", i.a, i.e), ("m", repeat.a, repeat.e)];
+        let mut seq = 2;
+        let mut at = now;
+        while at < now + window - STEP {
+            at += STEP;
+            step(&mut m, at, rx, &mut seq, &held, idle());
+            assert!(
+                !m.delivery("m").unwrap().not_started(),
+                "the repeat gets its own window, at {:?}",
+                at - now
+            );
+        }
+        step(&mut m, now + window, rx, &mut seq, &held, idle());
+        assert!(m.delivery("m").unwrap().not_started());
+
+        // An older revision is stale.
+        let (mut m, _, _, now, r) = raised(limits);
+        assert!(matches!(
+            m.retry(now, "m", GEN, r - 1),
+            ActionOutcome::Stale { .. }
+        ));
+        // Past the budget, Retry is refused.
+        let (mut m, _, _, now, r) = raised(Limits {
+            max_attempts: 1,
+            ..limits
+        });
+        assert_eq!(m.retry(now, "m", GEN, r), ActionOutcome::RetryLimit);
+
+        // Cancel of a handed attempt: the receiver says it already has it.
+        let (mut m, rx, i, now, r) = raised(limits);
+        assert!(matches!(
+            m.cancel(now, "m", GEN, r),
+            ActionOutcome::Applied { .. }
+        ));
+        assert_eq!(revokes(&m.drain_effects(), "m"), vec![(i.a, i.e)]);
+        m.stage(now, "m", i.a, i.e, Stage::HandedInert, Some(rx));
+        let d = m.delivery("m").unwrap();
+        assert_eq!(
+            d.state,
+            MessageState::Undeliverable(UndeliverableReason::Cancelled)
+        );
+        assert!(d.attempt(i.a, i.e).unwrap().verifier);
+        // Cancel of an attempt only possessed: the receiver revokes it.
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::Pi, false).rx;
+        m.post("m", false);
+        let i = issue_held(&mut m, t, "m", rx, 1);
+        let now = t + window;
+        m.snapshot(now, rx, 2, 0, &[("m", i.a, i.e)]);
+        m.tick_turn(now, &[], idle());
+        let r = m.delivery("m").unwrap().revision;
+        assert!(m.delivery("m").unwrap().not_started());
+        m.cancel(now, "m", GEN, r);
+        m.stage(now, "m", i.a, i.e, Stage::NotHanded, Some(rx));
+        assert_eq!(
+            m.state("m"),
+            Some(MessageState::Undeliverable(UndeliverableReason::Cancelled))
+        );
+
+        // A turn started after the picker showed the row: Retry at the shown
+        // revision is refused and nothing is issued.
+        let (mut m, rx, _, now, r) = raised(limits);
+        m.note_turn(
+            now,
+            TurnView {
+                busy: true,
+                idle_since: None,
+            },
+        );
+        let d = m.delivery("m").unwrap();
+        assert!(!d.not_started());
+        assert_eq!(d.revision, r, "the withdrawal moves no revision");
+        assert!(matches!(
+            m.retry(now, "m", GEN, r),
+            ActionOutcome::NotApplicable { .. }
+        ));
+        assert!(!m.delivery("m").unwrap().repeat_scheduled());
+        assert_eq!(m.issue(now, "m", rx), Err(IssueRefusal::NothingToIssue));
+        assert_eq!(m.delivery("m").unwrap().issued, 1);
+    }
+
+    /// Scenario: The not-started attention is raised on a Pi message, then a
+    /// turn starts, the agent stays busy past twice the window, and the turn
+    /// ends. The row goes when the turn starts and comes back only one window
+    /// after the turn ended; a commit, a Cancel before the window or a
+    /// message with no Pi attempt never shows it.
+    #[spec("inbox/attempts/023")]
+    #[test]
+    fn attempts_023_only_an_attempting_uncommitted_pi_message_with_no_turn_shows_the_row() {
+        let limits = Limits::default();
+        let window = limits.not_started_after;
+        let busy = TurnView {
+            busy: true,
+            idle_since: None,
+        };
+        // A turn starting withdraws it; only a turn that ended re-arms it.
+        let (mut m, rx, i, now, _) = raised(limits);
+        let held = [("m", i.a, i.e)];
+        let mut seq = 2;
+        let mut at = now;
+        while at < now + 2 * window {
+            at += STEP;
+            step(&mut m, at, rx, &mut seq, &held, busy);
+            assert!(!m.delivery("m").unwrap().not_started(), "busy");
+        }
+        let ended = TurnView {
+            busy: false,
+            idle_since: Some(at),
+        };
+        let end = at;
+        while at < end + window - STEP {
+            at += STEP;
+            step(&mut m, at, rx, &mut seq, &held, ended);
+            assert!(
+                !m.delivery("m").unwrap().not_started(),
+                "the window restarts at the turn's end, at {:?}",
+                at - end
+            );
+        }
+        step(&mut m, end + window, rx, &mut seq, &held, ended);
+        assert!(m.delivery("m").unwrap().not_started());
+
+        // A commit clears it for good.
+        let (mut m, _, i, now, _) = raised(limits);
+        m.stage(now, "m", i.a, i.e, Stage::Committed, None);
+        m.tick_turn(now + window, &[], idle());
+        assert!(!m.delivery("m").unwrap().not_started());
+        assert_eq!(m.not_started_due_at(idle()), None);
+
+        // Cancelled before the window: held for its revoke answer, then
+        // HandedInert. Neither raises it.
+        let (mut m, t) = model();
+        let (rx, i) = handed(&mut m, t, Slot::Pi, "m");
+        let r = m.delivery("m").unwrap().revision;
+        m.cancel(t, "m", GEN, r);
+        let mut seq = 1;
+        let mut at = t;
+        while at < t + 2 * window {
+            at += STEP;
+            step(&mut m, at, rx, &mut seq, &[("m", i.a, i.e)], idle());
+            assert!(!m.delivery("m").unwrap().not_started(), "cancel-held");
+        }
+        assert_eq!(m.state("m"), Some(MessageState::CancelHeld));
+        m.stage(at, "m", i.a, i.e, Stage::HandedInert, Some(rx));
+        m.tick_turn(at + window, &[], idle());
+        assert!(!m.delivery("m").unwrap().not_started(), "handed inert");
+        assert_eq!(m.not_started_due_at(idle()), None);
     }
 }

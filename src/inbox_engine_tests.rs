@@ -2456,3 +2456,270 @@ async fn opencode_053_registration_hands_back_commit_authority_only_for_its_own_
         peer.close().await;
     }
 }
+
+/// PRD #1666 G3: a turn edge the registry accepted, numbered `seq`.
+fn turn(seq: u64, edge: crate::agent_pty::TurnEdge) -> crate::agent_pty::TurnSeen {
+    crate::agent_pty::TurnSeen { seq, edge }
+}
+
+/// Run the receipt clock at `now`, with no spool check to apply.
+fn tick_at(hub: &InboxHub, now: Instant) {
+    let mut st = hub.lock();
+    let mut out = Vec::new();
+    engine::tick(&mut st, now, &HashMap::new(), &mut out);
+}
+
+/// Give `key`'s generation a Pi receiver (the slot no component registers
+/// yet) holding `id`, handed over at `t`.
+fn pi_handed(
+    hub: &InboxHub,
+    key: &AgentKey,
+    id: &str,
+    t: Instant,
+) -> (crate::inbox_attempts::Rx, crate::inbox_attempts::Issued) {
+    use crate::inbox_attempts::{Slot, Stage};
+    let mut st = hub.lock();
+    let generation = engine::generation_mut(&mut st, key, None);
+    let rx = generation.model.register(t, Slot::Pi, false).rx;
+    generation.model.post(id, false);
+    let issued = generation.model.issue(t, id, rx).expect("issue");
+    generation
+        .model
+        .snapshot(t, rx, 1, issued.d, &[(id, issued.a, issued.e)]);
+    generation
+        .model
+        .stage(t, id, issued.a, issued.e, Stage::Handed, Some(rx));
+    (rx, issued)
+}
+
+fn not_started(hub: &InboxHub, key: &AgentKey, id: &str) -> bool {
+    hub.lock().receipts.gens[key]
+        .model
+        .delivery(id)
+        .is_some_and(|d| d.not_started())
+}
+
+/// Scenario: A Pi generation reports a turn starting before any receipt
+/// receiver exists, a receiver registers, and a message is handed while the
+/// turn runs; then the turn ends, a second Idle and an older Started arrive,
+/// and on another generation the watcher respawns halfway through the window.
+/// Only the real turn end moves the clock and starts the window, the clock
+/// wakes for it, and an exited generation's clock never comes back.
+#[spec("inbox/attempts/022")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attempts_022_only_a_turn_that_ended_moves_the_turn_clock() {
+    use crate::agent_pty::TurnEdge::{Ended, Started};
+    use crate::inbox_attempts::{ResumeAnswer, Slot, TurnView};
+    let hub = hub_with(Duration::from_secs(3600), Duration::from_secs(7200));
+    let w = hub.lock().receipts.limits.not_started_after;
+    let key: AgentKey = ("p".into(), "a".into());
+    let view = |hub: &InboxHub| hub.lock().receipts.turn_view(&key);
+    let t = Instant::now();
+    hub.note_turn("p", "a", turn(1, Started), t);
+    assert!(
+        view(&hub).busy,
+        "a turn reported before registration counts"
+    );
+    assert!(
+        !hub.lock().receipts.gens.contains_key(&key),
+        "an edge creates no receipt generation"
+    );
+    let (tx, _lines) = tokio::sync::mpsc::channel(8);
+    engine::register(
+        &mut hub.lock(),
+        &key,
+        InboxComponent::OpenCodeMini,
+        false,
+        false,
+        1,
+        tx,
+        None,
+        t,
+    )
+    .expect("registered");
+    assert_eq!(
+        view(&hub),
+        TurnView {
+            busy: true,
+            idle_since: None
+        },
+        "a registration reads the clock without resetting it"
+    );
+    pi_handed(&hub, &key, "m", t);
+    tick_at(&hub, t + 2 * w);
+    assert!(!not_started(&hub, &key, "m"), "busy: no attention");
+    let end = t + 2 * w;
+    hub.note_turn("p", "a", turn(2, Ended), end);
+    hub.note_turn("p", "a", turn(3, Ended), end + Duration::from_secs(60));
+    assert_eq!(
+        view(&hub),
+        TurnView {
+            busy: false,
+            idle_since: Some(end)
+        },
+        "a second Idle with no turn under way moves nothing"
+    );
+    hub.note_turn("p", "a", turn(2, Started), end + Duration::from_secs(61));
+    assert!(!view(&hub).busy, "an edge older than the last applied");
+    tick_at(&hub, end + w - Duration::from_secs(1));
+    assert!(!not_started(&hub, &key, "m"));
+    tick_at(&hub, end + w);
+    assert!(
+        not_started(&hub, &key, "m"),
+        "one window after the turn ended"
+    );
+    hub.agent_exited("p", "a");
+    hub.note_turn("p", "a", turn(9, Started), end + w);
+    assert!(
+        !hub.lock().receipts.turns.contains_key(&key),
+        "an exited generation's clock does not come back"
+    );
+
+    // Another generation, idle from the start: the window runs from the
+    // hand-over, and a respawn halfway through moves nothing.
+    let hub = hub_with(Duration::from_secs(3600), Duration::from_secs(7200));
+    let key: AgentKey = ("q".into(), "b".into());
+    let (_, i) = pi_handed(&hub, &key, "n", t);
+    assert_eq!(
+        hub.lock().receipts.next_deadline(t),
+        Some(t + w),
+        "the clock wakes for the window"
+    );
+    let half = t + w / 2;
+    {
+        let mut st = hub.lock();
+        let model = &mut st.receipts.gens.get_mut(&key).unwrap().model;
+        let rx = model.register(half, Slot::Pi, true).rx;
+        model.resume_answer(half, rx, "n", i.a, i.e, ResumeAnswer::Retained);
+        model.snapshot(half, rx, 1, 0, &[("n", i.a, i.e)]);
+    }
+    tick_at(&hub, t + w);
+    assert!(
+        not_started(&hub, &key, "n"),
+        "neither the respawn nor a keepalive postpones the window"
+    );
+}
+
+/// The card a client hydrates from `summary` for `a` in `p`.
+fn card_of(summary: &InboxSummary) -> crate::inbox_display::CardInbox {
+    let mut state = crate::state::AppState::default();
+    state.register_pane("p".to_string());
+    state.apply_event(crate::event::AgentEvent {
+        session_id: "gen-p".into(),
+        agent_type: crate::event::AgentType::Pi,
+        event_type: crate::event::EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("p".into()),
+        agent_id: Some("a".into()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        background: None,
+        background_revision: None,
+    });
+    state.apply_inbox_summary("p", "a", summary);
+    state.sessions["gen-p"].card_inbox().unwrap_or_default()
+}
+
+/// Scenario: A deck message handed to a Pi agent that starts no turn for the
+/// window is listed on the card as one that may not have reached the agent,
+/// not as an uncertain delivery; a turn starting takes it off the next push,
+/// held_long replaces it once the hour is up, and a commit clears it. A card
+/// listing one uncertain, one not-started and one held-long message counts
+/// each once and leads with the uncertain one.
+#[spec("inbox/boundary/045")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_045_a_message_the_agent_may_not_have_received_is_its_own_row() {
+    use crate::agent_pty::TurnEdge::{Ended, Started};
+    use crate::inbox_display::{
+        CardInbox, NOT_STARTED, NOT_STARTED_REASON, UNCERTAIN, UNCERTAIN_REASON,
+    };
+    let hub = hub_with(Duration::from_secs(3600), Duration::from_secs(7200));
+    let w = hub.lock().receipts.limits.not_started_after;
+    hub.lock().receipts.limits.held_long_after = 2 * w;
+    let key: AgentKey = ("p".into(), "a".into());
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("first"))
+        .unwrap();
+    let t = Instant::now();
+    let (_, i) = pi_handed(&hub, &key, id.as_str(), t);
+    let kinds = |notices: &InboxCardNotices| -> Vec<AttentionKind> {
+        notices.attention.iter().map(|item| item.kind).collect()
+    };
+    let told = |hub: &InboxHub| kinds(&hub.lock().receipts.told[&key]);
+    tick_at(&hub, t + w);
+    let summary = hub.summary("p", "a");
+    assert_eq!(kinds(&summary.notices), vec![AttentionKind::NotStarted]);
+    assert_eq!(told(&hub), vec![AttentionKind::NotStarted], "pushed");
+    assert!(!AttentionKind::NotStarted.uncertain());
+    assert!(AttentionKind::NotStarted.retry_offered());
+    let card = card_of(&summary);
+    assert_eq!(
+        (card.uncertain, card.not_started, card.held_long),
+        (0, 1, 0)
+    );
+    assert_eq!(card.full_text(), Some(format!("✉ {NOT_STARTED}")));
+    assert_eq!(card.notice_text().as_deref(), Some(NOT_STARTED_REASON));
+
+    hub.note_turn("p", "a", turn(1, Started), t + w);
+    assert_eq!(told(&hub), vec![], "a turn starting withdraws it at once");
+    hub.note_turn("p", "a", turn(2, Ended), t + w);
+    tick_at(&hub, t + 2 * w);
+    assert_eq!(
+        kinds(&hub.summary("p", "a").notices),
+        vec![AttentionKind::HeldLong],
+        "held_long takes the row once the hour is up, one row"
+    );
+    {
+        let mut st = hub.lock();
+        let model = &mut st.receipts.gens.get_mut(&key).unwrap().model;
+        model.stage(
+            t + 2 * w,
+            id.as_str(),
+            i.a,
+            i.e,
+            crate::inbox_attempts::Stage::Committed,
+            None,
+        );
+        let mut out = Vec::new();
+        engine::apply(&mut st, &key, t + 2 * w, &mut out);
+    }
+    assert_eq!(told(&hub), vec![], "a commit clears it");
+
+    let item = |n: u64, kind| InboxAttentionItem {
+        message_id: format!("m-k3xzq2ab-0f3c9a71d2e4b85{n}"),
+        revision: n,
+        kind,
+        from_label: "the orchestrator".into(),
+        subject: "review".into(),
+        task_id: None,
+    };
+    let mut mixed = hub.summary("p", "a");
+    mixed.notices.attention = vec![
+        item(1, AttentionKind::Uncertain),
+        item(2, AttentionKind::NotStarted),
+        item(3, AttentionKind::HeldLong),
+    ];
+    let card = card_of(&mixed);
+    assert_eq!(
+        CardInbox {
+            uncertain: card.uncertain,
+            not_started: card.not_started,
+            held_long: card.held_long,
+            ..CardInbox::default()
+        },
+        CardInbox {
+            uncertain: 1,
+            not_started: 1,
+            held_long: 1,
+            ..CardInbox::default()
+        }
+    );
+    assert_eq!(card.full_text(), Some(format!("✉ {UNCERTAIN}")));
+    assert_eq!(card.notice_text().as_deref(), Some(UNCERTAIN_REASON));
+}

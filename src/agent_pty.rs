@@ -3448,6 +3448,15 @@ pub enum TurnEdge {
     Ended,
 }
 
+/// PRD #1666 G3: a turn edge [`AgentPtyRegistry::note_turn`] accepted, with
+/// its place in the registry's order of accepted edges, for the inbox's turn
+/// clock ([`crate::inbox_hub::InboxHub::note_turn`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnSeen {
+    pub seq: u64,
+    pub edge: TurnEdge,
+}
+
 /// Issue #424 F1/H1: what each pane's input box is holding, as far as this
 /// daemon can tell — the human-input sequence and each pane's input stream,
 /// under ONE mutex.
@@ -6629,6 +6638,9 @@ struct RegistryInner {
     /// first turn reported that early would have no busy edge for its Idle to
     /// end. Removed with the reservation on both its release paths.
     pending_busy: HashSet<String>,
+    /// PRD #1666 G3: the number of the last turn edge
+    /// [`AgentPtyRegistry::note_turn`] accepted ([`TurnSeen::seq`]).
+    turn_seq: u64,
     /// Issue #1612: directories a removal is holding — found unused under this
     /// lock and not yet deleted. [`AgentPtyRegistry::reserve_spawn`] refuses a
     /// spawn whose working directory lies inside one, so a spawn can never
@@ -7139,6 +7151,7 @@ impl AgentPtyRegistry {
                 pending_hook_tokens: HashMap::new(),
                 pending_spawn_dirs: HashMap::new(),
                 pending_busy: HashSet::new(),
+                turn_seq: 0,
                 removal_holds: Vec::new(),
                 closing_instances: HashSet::new(),
                 closing_generations: HashSet::new(),
@@ -9073,7 +9086,12 @@ impl AgentPtyRegistry {
     /// own yet — publication clears the pane's — so its edges are kept on the
     /// reservation instead ([`RegistryInner::pending_busy`]) and the busy one
     /// is applied as the stream is cleared for it (r8k R8G-02).
-    pub fn note_turn(&self, pane_id_env: &str, agent_id: &str, edge: TurnEdge) {
+    ///
+    /// Returns the edge, numbered under the same hold, when it was applied
+    /// for the live owner or kept for the reservation, so the caller can hand
+    /// it on to the inbox's turn clock in order (PRD #1666 G3); `None` when
+    /// it touched nothing.
+    pub fn note_turn(&self, pane_id_env: &str, agent_id: &str, edge: TurnEdge) -> Option<TurnSeen> {
         let mut inner = self.inner.lock().unwrap();
         let owner = inner
             .agents
@@ -9086,20 +9104,26 @@ impl AgentPtyRegistry {
             Some(owner) if owner == agent_id => {
                 self.pane_input.lock().unwrap().note_turn(pane_id_env, edge);
             }
-            Some(_) => {}
+            Some(_) => return None,
             None => {
                 let reserved_here = inner
                     .pending_spawns
                     .get(agent_id)
                     .is_some_and(|pane| pane.as_deref() == Some(pane_id_env));
-                if reserved_here {
-                    match edge {
-                        TurnEdge::Started => inner.pending_busy.insert(agent_id.to_string()),
-                        TurnEdge::Ended => inner.pending_busy.remove(agent_id),
-                    };
+                if !reserved_here {
+                    return None;
                 }
+                match edge {
+                    TurnEdge::Started => inner.pending_busy.insert(agent_id.to_string()),
+                    TurnEdge::Ended => inner.pending_busy.remove(agent_id),
+                };
             }
         }
+        inner.turn_seq += 1;
+        Some(TurnSeen {
+            seq: inner.turn_seq,
+            edge,
+        })
     }
 
     /// Issue #525: how long a guarded delivery waits on one PTY write.

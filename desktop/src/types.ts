@@ -87,7 +87,7 @@ export type AgentInbox = {
 export type InboxAttentionItem = {
   messageId: string;
   revision: number;
-  kind: "uncertain" | "out_of_attempts" | "held_long";
+  kind: "uncertain" | "out_of_attempts" | "held_long" | "not_started";
   fromLabel: string;
   subject: string;
   taskId?: string;

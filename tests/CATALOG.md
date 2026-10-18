@@ -7953,6 +7953,34 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Does not assert:** the engine's cap lookup or the watcher's publication (inbox/opencode/053, inbox/opencode/054), or a Pi context.
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/attempts/020 — A Pi message with no turn started raises attention and nothing else.
+- **Layer:** L1 unit (src/inbox_attempts.rs, injected time and turn view).
+- **Agent:** none.
+- **Asserts:** a message handed to a Pi receiver and kept possessed while the agent stays idle shows the not-started attention from one window after the hand-over, or after a later turn end; the clock is told the due instant; at no step is anything issued, scheduled, repeated or emitted as an effect; the same message on an OpenCode receiver never shows it.
+- **Does not assert:** the hub's turn clock (inbox/attempts/022) or a real Pi (C3's inbox/pi pins).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/021 — Retry and Cancel on a message that may not have reached the agent.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** Retry at the shown revision schedules one marked manual repeat and starts a new window; an older revision is stale; past the attempt budget Retry is refused; Cancel of a handed attempt ends `HandedInert`-cancelled with its verifier kept, Cancel of an attempt only possessed ends on the receiver's revoke; a turn started after the row was shown withdraws it without moving the revision, and Retry at that revision is refused with nothing issued.
+- **Does not assert:** the clients' words for the answer (inbox/status/024, desktop `InboxAttention.test.tsx`).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/022 — Only a turn that ended moves the turn clock.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's turn clock and receipt clock driven with injected instants.
+- **Agent:** none.
+- **Asserts:** a turn reported before any receipt generation exists is kept and creates none; a receipt registration reads the clock without resetting it; a Pi message handed during a turn shows nothing for twice the window; only the real turn end sets `idle_since`, a second Idle does not, and an older edge is ignored; the window then runs from the turn end; an exited generation's clock is not recreated by a late edge; on a generation that never reported a turn, the clock's next deadline is the window's end, and a watcher respawn with a retained resume and a keepalive halfway through do not postpone it.
+- **Does not assert:** the daemon's hook ingest feeding the clock (inbox/boundary/044, with the Pi switch).
+- **Platform coverage:** all.
+
+##### inbox/attempts/023 — Only an attempting, uncommitted Pi message with no turn shows the row.
+- **Layer:** L1 unit (src/inbox_attempts.rs, injected time and turn view).
+- **Agent:** none.
+- **Asserts:** a turn under way withdraws the raised attention for as long as it runs, past twice the window; it returns only one window after that turn ended; a commit clears it for good; a message cancelled before the window, held for its revoke answer and then `HandedInert`, never shows it.
+- **Does not assert:** the clients' rendering (inbox/status/023, inbox/status/024).
+- **Platform coverage:** mac+linux+windows.
+
 #### inbox/receipt
 
 The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the daemon's locked instance namespace under `<state_dir>/inbox-spool`, trusted one-component-at-a-time traversal from the state-directory anchor, immutable `Handed`/`Committed` bearer records, bounded resumable scans streamed to the cap-based evidence store, the exact lookup before absence, and the resumable sibling reaper, plus `platform::lock::try_lock_file`. It is library-only: nothing in the daemon calls it yet, records are published and read, nothing is pruned and no suppression decision is drawn from them.
@@ -8727,6 +8755,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** all.
 - **Cost:** none.
 
+##### inbox/boundary/045 — A message the agent may not have received is its own row.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's projection, its summary and a client's `AppState` hydrated from it.
+- **Agent:** none.
+- **Asserts:** the not-started attention is listed and pushed as `not_started`, which is not an uncertain delivery and offers Retry; a card hydrated from the summary counts it as not started only and says `✉ may not have reached the agent` with its reason; a turn starting withdraws it from the next push; held_long replaces it as one row once the hour is up; a commit clears it; a card listing one uncertain, one not-started and one held-long item counts 1/1/1 and leads with the uncertain delivery.
+- **Does not assert:** the rendered card (inbox/status/023).
+- **Platform coverage:** all.
+
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
 - **Agent:** none.
@@ -8880,6 +8915,20 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** with nine items, moving to the last one keeps its row and cursor on screen, the title says which of the nine are shown, and `c` sends that row's Cancel; with an answer shown, the answer and the cursor's row are both visible, with the buttons too at 9 and 7 rows, and at 5 rows (the fewest that leave the picker a row) the answer is.
 - **Does not assert:** the desktop list (`desktop/src/components/InboxAttention.test.tsx`).
+- **Platform coverage:** all.
+
+##### inbox/status/023 — The card says a message may not have reached the agent.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam.
+- **Agent:** none.
+- **Asserts:** one `not_started` item renders `✉ may not have reached the agent` ahead of the queued count, with its reason and no Error; two render `✉ 2 may not have reached the agent`; beside an uncertain and a held-long item, the uncertain headline leads.
+- **Does not assert:** what raises it (inbox/attempts/020).
+- **Platform coverage:** all.
+
+##### inbox/status/024 — The picker offers Retry and Cancel on a message that may not have reached the agent.
+- **Layer:** L1 (`tests/render_inbox_attention.rs`), TestBackend overlay render and the production key funnel.
+- **Agent:** none.
+- **Asserts:** the cursor's row explains in full that Retry may make the agent get the message twice, with Retry and Cancel offered; `r` and `c` send Retry and Cancel at the row's revision; the deck's answer to a Retry whose row a started turn withdrew renders as the shared "no longer needs a decision" words.
+- **Does not assert:** the daemon refusing that Retry (inbox/attempts/021).
 - **Platform coverage:** all.
 
 #### inbox/claude

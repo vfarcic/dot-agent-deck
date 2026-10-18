@@ -18340,6 +18340,9 @@ fn host_metrics_lines(view: &HostMetricsView, width: u16) -> Vec<Line<'static>> 
 /// shown as the window of items that keeps the cursor's row in view, and the
 /// answer is never pushed out by it: it takes its row first, and where two
 /// rows per item no longer fit, an item is its sender and subject alone.
+/// The cursor's row explains itself in full, wrapped onto the rows the list
+/// leaves spare (PRD #1666 G3: what Retry would do is read before the press,
+/// as the desktop tile shows it), and cut with `…` where they run out.
 /// Returns the lines and, when windowed, the first and last item shown
 /// (zero-based).
 fn inbox_attention_lines(
@@ -18370,6 +18373,7 @@ fn inbox_attention_lines(
         (dialog.selected + 1).saturating_sub(fits).min(total - fits)
     };
     let shown = (total > fits && fits > 0).then(|| (start, start + fits - 1));
+    let mut spare = room.saturating_sub(2 * total.saturating_sub(start).min(fits));
     for (index, item) in dialog.items.iter().enumerate().skip(start).take(fits) {
         let cursor = if index == dialog.selected {
             "▸ "
@@ -18388,9 +18392,24 @@ fn inbox_attention_lines(
             ),
             style,
         ));
-        if !compact {
+        if compact {
+            continue;
+        }
+        let reason = if index == dialog.selected {
+            inbox_attention_reason_rows(item, width)
+        } else {
+            vec![item.kind.reason().to_string()]
+        };
+        let take = reason.len().min(1 + spare);
+        spare -= take - 1;
+        for (row, text) in reason.iter().take(take).enumerate() {
+            let text = if row + 1 == take {
+                reason[row..].join(" ")
+            } else {
+                text.clone()
+            };
             lines.push(Line::styled(
-                truncate_with_ellipsis(&format!("    {}", item.kind.reason()), width),
+                truncate_with_ellipsis(&format!("    {text}"), width),
                 text_dim(),
             ));
         }
@@ -18407,6 +18426,15 @@ fn inbox_attention_lines(
     (lines, shown)
 }
 
+/// The cursor row's explanation wrapped to the picker's `width`, after its
+/// four-column indent.
+fn inbox_attention_reason_rows(
+    item: &crate::inbox_hub::InboxAttentionItem,
+    width: usize,
+) -> Vec<String> {
+    crate::upgrade_dialog::wrap(item.kind.reason(), width.saturating_sub(4))
+}
+
 fn render_inbox_attention_overlay(
     frame: &mut Frame,
     dialog: &InboxAttentionDialog,
@@ -18414,10 +18442,14 @@ fn render_inbox_attention_overlay(
     let area = frame.area();
     let popup_width = 96u16.min(area.width.saturating_sub(2));
     // Every row it would take unwindowed: two per item (or the one "gone"
-    // line) and the answer's two; then a spare row, the footer's two and the
-    // border.
+    // line), the rest of the cursor row's explanation and the answer's two;
+    // then a spare row, the footer's two and the border.
+    let explained = dialog.items.get(dialog.selected).map_or(0, |item| {
+        inbox_attention_reason_rows(item, usize::from(popup_width.saturating_sub(2))).len() - 1
+    });
     let wanted = (dialog.items.len() * 2)
         .max(1)
+        .saturating_add(explained)
         .saturating_add(if dialog.answer.is_some() { 2 } else { 0 });
     let popup_height = wanted
         .saturating_add(3 + 2)

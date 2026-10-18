@@ -1,0 +1,16 @@
+---
+source: tests/render_inbox_attention.rs
+expression: rendered
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+  ┌ Deck messages ───────────────────────────────────────────────────────────────────────────────┐  
+  │▸ the orchestrator · review 850                                                               │  
+  │    the agent has not started any work since it was given this deck message a few minutes ago,│  
+  │    so the message may not have reached it. Retry sends it again, so the agent may get it     │  
+  │    twice. Cancel stops further delivery but cannot take back a copy the agent already has.   │  
+  │                                                                                              │  
+  │  [Retry r] [Cancel c] [Close]                                                                │  
+  │  r Retry · c Cancel · Esc to close                                                           │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

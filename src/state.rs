@@ -6441,19 +6441,24 @@ impl PaneInbox {
             .values()
             .filter(|seen| **seen == SeenMessage::PendingNew)
             .count();
-        let count = |uncertain: bool| {
+        use crate::inbox_display::AttentionKind;
+        // Each kind is counted where its own words go: an uncertain delivery
+        // (out of attempts included), a message that may not have reached the
+        // agent (PRD #1666 G3), and held_long attention.
+        let count = |counts: fn(AttentionKind) -> bool| {
             self.notices
                 .attention
                 .iter()
-                .filter(|item| item.kind.uncertain() == uncertain)
+                .filter(|item| counts(item.kind))
                 .count()
         };
         crate::inbox_display::CardInbox {
             pending: self.baseline + new,
             delivered: self.delivered,
             stalled: self.stalled,
-            uncertain: count(true),
-            held_long: count(false),
+            uncertain: count(AttentionKind::uncertain),
+            not_started: count(|kind| kind == AttentionKind::NotStarted),
+            held_long: count(|kind| kind == AttentionKind::HeldLong),
             integration: self.notices.integration,
             evidence_paused: self.notices.evidence_paused,
             receipts_degraded: self.notices.receipts_degraded.clone(),

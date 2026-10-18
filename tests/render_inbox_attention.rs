@@ -310,3 +310,70 @@ fn status_022_a_long_picker_keeps_the_cursor_row_and_the_answer_in_view() {
         }
     }
 }
+
+/// Scenario: Open the picker over a deck message a Pi agent may not have received. Its row warns that Retry may make the agent get it twice, `r` sends Retry and `c` sends Cancel at the revision the row showed, and when a turn started before the press reached the deck, the picker shows the deck's answer that the message no longer needs a decision.
+#[spec("inbox/status/024")]
+#[test]
+fn status_024_the_picker_offers_retry_and_cancel_on_a_message_that_may_not_have_reached_the_agent()
+{
+    let words = words();
+    let items = [item(FIRST, AttentionKind::NotStarted, 4)];
+    let rendered = text(&render_inbox_attention_overlay_to_buffer(
+        &items, 0, None, 100, 16,
+    ));
+    let reason: String = words["notStartedReason"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(60)
+        .collect();
+    assert!(rendered.contains(&reason), "{rendered}");
+    for said in [
+        "Retry sends it again, so the agent may get it",
+        "twice. Cancel stops",
+    ] {
+        assert!(
+            rendered.contains(said),
+            "the duplicate is said before the press, in full:\n{rendered}"
+        );
+    }
+    for button in ["retry", "cancel"] {
+        assert!(
+            rendered.contains(words[button].as_str().unwrap()),
+            "{rendered}"
+        );
+    }
+    insta::assert_snapshot!(rendered);
+
+    let state = state_with(&items);
+    let (open, presses) = inbox_attention_key_presses(
+        &KeybindingConfig::default(),
+        &state,
+        "gen-q",
+        key(KeyCode::Char('i')),
+        &[key(KeyCode::Char('r')), key(KeyCode::Char('c'))],
+    );
+    assert!(open);
+    let press = |retry| InboxAttentionPress {
+        pane_id: "pane-q".into(),
+        agent_id: "agent-q".into(),
+        message_id: FIRST.into(),
+        revision: 4,
+        retry,
+    };
+    assert_eq!(presses, vec![press(true), press(false)]);
+
+    // The deck refuses a Retry whose row a started turn withdrew
+    // (inbox/attempts/021); the picker says so in the shared words.
+    let answer = dot_agent_deck::inbox_display::action_text(true, "not_applicable");
+    assert_eq!(answer, words["actionGone"].as_str().unwrap());
+    let rendered = text(&render_inbox_attention_overlay_to_buffer(
+        &items,
+        0,
+        Some(answer),
+        100,
+        16,
+    ));
+    let head: String = answer.chars().take(40).collect();
+    assert!(rendered.contains(&head), "{rendered}");
+}

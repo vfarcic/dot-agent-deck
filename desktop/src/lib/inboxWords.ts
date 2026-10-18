@@ -26,6 +26,8 @@ export const INBOX_WORDS = {
   uncertainReason: "a deck message may or may not have reached this agent. Retry sends it again marked as a possible repeat; Cancel stops delivering it.",
   outOfAttempts: "out of attempts: the deck sent this message as many times as it allows. Cancel it, or post it again.",
   heldLong: "the agent has had a deck message for an hour without confirming it. It may still be working on it.",
+  notStarted: "may not have reached the agent",
+  notStartedReason: "the agent has not started any work since it was given this deck message a few minutes ago, so the message may not have reached it. Retry sends it again, so the agent may get it twice. Cancel stops further delivery but cannot take back a copy the agent already has.",
   retry: "Retry",
   cancel: "Cancel",
   retryLimit: "retry limit reached; Cancel it, or post it again",
@@ -44,11 +46,18 @@ export const INBOX_WORDS = {
   evidencePaused: "deck messages paused: {n} delivered messages still wait for proof that older copies cannot run; restart the agent to clear them",
 } as const;
 
-const uncertainCount = (inbox: AgentInbox) =>
-  (inbox.attention ?? []).filter((item) => item.kind !== "held_long").length;
+const countOf = (inbox: AgentInbox, kinds: ReadonlyArray<InboxAttentionItem["kind"]>) =>
+  (inbox.attention ?? []).filter((item) => kinds.includes(item.kind)).length;
+/** Uncertain deliveries, out of attempts included. */
+const uncertainCount = (inbox: AgentInbox) => countOf(inbox, ["uncertain", "out_of_attempts"]);
+/** PRD #1666 G3: messages handed to an agent that has started no work since. */
+const notStartedCount = (inbox: AgentInbox) => countOf(inbox, ["not_started"]);
+const heldLongCount = (inbox: AgentInbox) => countOf(inbox, ["held_long"]);
 
 /**
- * The card's inbox line (PRD #1666 §2.8): `✉2 queued` while messages are queued
+ * The card's inbox line (PRD #1666 §2.8): `✉ delivery uncertain` while
+ * deliveries are uncertain, then `✉ may not have reached the agent` (G3), then
+ * `✉2 queued` while messages are queued
  * or taken but not acknowledged, `✉2 waiting to wake: send it a prompt` while
  * the deck reports nothing has woken the agent for them, `✉ delivered` once the
  * agent has acknowledged one and nothing is pending, and nothing for an inbox
@@ -59,6 +68,9 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
   const uncertain = uncertainCount(inbox);
   if (uncertain === 1) return `${INBOX_WORDS.glyph} ${INBOX_WORDS.uncertain}`;
   if (uncertain > 1) return `${INBOX_WORDS.glyph} ${uncertain} ${INBOX_WORDS.uncertainMany}`;
+  const notStarted = notStartedCount(inbox);
+  if (notStarted === 1) return `${INBOX_WORDS.glyph} ${INBOX_WORDS.notStarted}`;
+  if (notStarted > 1) return `${INBOX_WORDS.glyph} ${notStarted} ${INBOX_WORDS.notStarted}`;
   const pending = inbox.queued + inbox.fetched;
   if (pending > 0 && inbox.wakeStalled) {
     return `${INBOX_WORDS.glyph}${pending} ${INBOX_WORDS.wakeStalled}: ${INBOX_WORDS.wakeStalledHint}`;
@@ -70,8 +82,9 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
 /**
  * PRD #1666 §6.5: the card's inbox notice row, when the deck has something to
  * say beyond the badge — the first that holds of: why the integration takes
- * nothing yet, paused hand-outs, what an uncertain delivery means, held_long
- * attention, failed receipt storage. The TUI's card prints the same row.
+ * nothing yet, paused hand-outs, what an uncertain delivery means, what a
+ * message the agent may not have received means, held_long attention, failed
+ * receipt storage. The TUI's card prints the same row.
  */
 export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (!inbox) return undefined;
@@ -81,16 +94,20 @@ export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (inbox.integration === "refresh_failed") return INBOX_WORDS.refreshFailed;
   if (inbox.evidencePaused !== undefined) return INBOX_WORDS.evidencePaused.replace("{n}", String(inbox.evidencePaused));
   if (uncertainCount(inbox) > 0) return INBOX_WORDS.uncertainReason;
-  if ((inbox.attention ?? []).length > 0) return INBOX_WORDS.heldLong;
+  if (notStartedCount(inbox) > 0) return INBOX_WORDS.notStartedReason;
+  if (heldLongCount(inbox) > 0) return INBOX_WORDS.heldLong;
   if (inbox.receiptsDegraded !== undefined) return `${INBOX_WORDS.receiptsDegraded} (${inbox.receiptsDegraded})`;
   return undefined;
 }
 
 /** PRD #1666 §6.4: what a listed item's row explains. */
 export function attentionReason(kind: InboxAttentionItem["kind"]): string {
-  if (kind === "out_of_attempts") return INBOX_WORDS.outOfAttempts;
-  if (kind === "held_long") return INBOX_WORDS.heldLong;
-  return INBOX_WORDS.uncertainReason;
+  switch (kind) {
+    case "uncertain": return INBOX_WORDS.uncertainReason;
+    case "out_of_attempts": return INBOX_WORDS.outOfAttempts;
+    case "held_long": return INBOX_WORDS.heldLong;
+    case "not_started": return INBOX_WORDS.notStartedReason;
+  }
 }
 
 /** PRD #1666 §2: the row's words for the daemon's answer to Retry or Cancel. */

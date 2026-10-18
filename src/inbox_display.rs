@@ -52,6 +52,13 @@ pub const UNCERTAIN_REASON: &str = "a deck message may or may not have reached t
 pub const OUT_OF_ATTEMPTS: &str = "out of attempts: the deck sent this message as many times as it allows. Cancel it, or post it again.";
 /// PRD #1666 §6.3: one-shot attention, never a failure.
 pub const HELD_LONG: &str = "the agent has had a deck message for an hour without confirming it. It may still be working on it.";
+/// PRD #1666 G3: the card line for a deck message handed to the agent that
+/// has started no work since, after the glyph and any count
+/// (`✉ may not have reached the agent`, `✉ 2 may not have reached the agent`).
+pub const NOT_STARTED: &str = "may not have reached the agent";
+/// PRD #1666 G3: what that line means and what the two actions do. It says
+/// what the deck saw, no turn starting, and that Retry may duplicate it.
+pub const NOT_STARTED_REASON: &str = "the agent has not started any work since it was given this deck message a few minutes ago, so the message may not have reached it. Retry sends it again, so the agent may get it twice. Cancel stops further delivery but cannot take back a copy the agent already has.";
 /// PRD #1666 §6.4: the two user actions, as both clients label them.
 pub const RETRY: &str = "Retry";
 pub const CANCEL: &str = "Cancel";
@@ -176,6 +183,8 @@ pub enum AttentionKind {
     OutOfAttempts,
     /// Possessed for an hour without a commit (§6.3).
     HeldLong,
+    /// PRD #1666 G3: handed to the agent, which has started no turn since.
+    NotStarted,
 }
 
 impl AttentionKind {
@@ -185,12 +194,16 @@ impl AttentionKind {
             AttentionKind::Uncertain => UNCERTAIN_REASON,
             AttentionKind::OutOfAttempts => OUT_OF_ATTEMPTS,
             AttentionKind::HeldLong => HELD_LONG,
+            AttentionKind::NotStarted => NOT_STARTED_REASON,
         }
     }
 
     /// Whether the item is an uncertain delivery rather than attention.
     pub fn uncertain(self) -> bool {
-        !matches!(self, AttentionKind::HeldLong)
+        matches!(
+            self,
+            AttentionKind::Uncertain | AttentionKind::OutOfAttempts
+        )
     }
 
     /// Whether Retry is offered: everything but an exhausted budget.
@@ -222,6 +235,8 @@ pub struct CardInbox {
     pub uncertain: usize,
     /// PRD #1666 §6.3: messages held an hour without a commit.
     pub held_long: usize,
+    /// PRD #1666 G3: messages handed to an agent that started no work since.
+    pub not_started: usize,
     /// PRD #1666 §11: why the agent's integration cannot take messages yet.
     pub integration: Option<IntegrationNotice>,
     /// PRD #1666 §7: delivered messages whose evidence pauses hand-outs.
@@ -233,8 +248,9 @@ pub struct CardInbox {
 impl CardInbox {
     /// The card's inbox line, the same words in both clients:
     /// `✉ delivery uncertain` (`✉ 3 deliveries uncertain`) while deliveries
-    /// are uncertain, then `✉2 queued`, `✉2 waiting to wake: send it a
-    /// prompt`, `✉ delivered`, or nothing. What the card says beside it is
+    /// are uncertain, then `✉ may not have reached the agent` (`✉ 2 may not
+    /// have reached the agent`), then `✉2 queued`, `✉2 waiting to wake: send
+    /// it a prompt`, `✉ delivered`, or nothing. What the card says beside it is
     /// [`Self::notice_text`].
     pub fn full_text(&self) -> Option<String> {
         if self.uncertain == 1 {
@@ -242,6 +258,12 @@ impl CardInbox {
         }
         if self.uncertain > 1 {
             return Some(format!("{GLYPH} {} {UNCERTAIN_MANY}", self.uncertain));
+        }
+        if self.not_started == 1 {
+            return Some(format!("{GLYPH} {NOT_STARTED}"));
+        }
+        if self.not_started > 1 {
+            return Some(format!("{GLYPH} {} {NOT_STARTED}", self.not_started));
         }
         if self.pending > 0 && self.stalled {
             Some(format!(
@@ -259,9 +281,9 @@ impl CardInbox {
 
     /// The card's inbox notice row, the same words in both clients, when the
     /// deck has something to say beyond the line: why the integration takes
-    /// nothing yet, paused hand-outs, what an uncertain delivery means,
-    /// held_long attention, then failed receipt storage — the first that
-    /// holds.
+    /// nothing yet, paused hand-outs, what an uncertain delivery means, what
+    /// a message the agent may not have received means, held_long attention,
+    /// then failed receipt storage — the first that holds.
     pub fn notice_text(&self) -> Option<String> {
         if let Some(notice) = self.integration {
             return Some(notice.text().to_string());
@@ -271,6 +293,9 @@ impl CardInbox {
         }
         if self.uncertain > 0 {
             return Some(UNCERTAIN_REASON.to_string());
+        }
+        if self.not_started > 0 {
+            return Some(NOT_STARTED_REASON.to_string());
         }
         if self.held_long > 0 {
             return Some(HELD_LONG.to_string());
@@ -290,7 +315,7 @@ impl CardInbox {
     /// [`CARD_INBOX_DEGRADED_METADATA_KEY`]).
     pub fn encode(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{}",
             self.pending,
             u8::from(self.delivered),
             u8::from(self.stalled),
@@ -299,11 +324,13 @@ impl CardInbox {
             self.integration.map_or(0, IntegrationNotice::code),
             self.evidence_paused
                 .map_or_else(|| "-".to_string(), |n| n.to_string()),
+            self.not_started,
         )
     }
 
-    /// Reads [`Self::encode`]'s value, and the two- and three-field values
-    /// written before the later fields existed; `None` for anything else.
+    /// Reads [`Self::encode`]'s value, and the two-, three- and seven-field
+    /// values written before the later fields existed; `None` for anything
+    /// else.
     pub fn decode(value: &str) -> Option<Self> {
         let flag = |text: &str| match text {
             "0" => Some(false),
@@ -311,7 +338,7 @@ impl CardInbox {
             _ => None,
         };
         let parts: Vec<&str> = value.split(',').collect();
-        if !matches!(parts.len(), 2 | 3 | 7) {
+        if !matches!(parts.len(), 2 | 3 | 7 | 8) {
             return None;
         }
         let mut inbox = Self {
@@ -322,7 +349,7 @@ impl CardInbox {
         if let Some(text) = parts.get(2) {
             inbox.stalled = flag(text)?;
         }
-        if parts.len() == 7 {
+        if parts.len() >= 7 {
             inbox.uncertain = parts[3].parse().ok()?;
             inbox.held_long = parts[4].parse().ok()?;
             inbox.integration = IntegrationNotice::from_code(parts[5].parse().ok()?)?;
@@ -330,6 +357,9 @@ impl CardInbox {
                 "-" => None,
                 n => Some(n.parse().ok()?),
             };
+        }
+        if let Some(text) = parts.get(7) {
+            inbox.not_started = text.parse().ok()?;
         }
         Some(inbox)
     }
@@ -356,6 +386,8 @@ mod tests {
         assert_eq!(words["uncertainReason"], UNCERTAIN_REASON);
         assert_eq!(words["outOfAttempts"], OUT_OF_ATTEMPTS);
         assert_eq!(words["heldLong"], HELD_LONG);
+        assert_eq!(words["notStarted"], NOT_STARTED);
+        assert_eq!(words["notStartedReason"], NOT_STARTED_REASON);
         assert_eq!(words["retry"], RETRY);
         assert_eq!(words["cancel"], CANCEL);
         assert_eq!(words["retryLimit"], RETRY_LIMIT);

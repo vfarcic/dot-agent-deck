@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import words from "../../../tests/fixtures/inbox-display.json";
 import { AgentTile } from "./AgentTile";
 import { mapDesktopSnapshot, type DesktopSnapshotDto } from "../lib/bridge";
+import { INBOX_WORDS } from "../lib/inboxWords";
 import type { AgentSession } from "../types";
 
 vi.mock("./TerminalViewport", () => ({ TerminalViewport: () => <pre>terminal</pre> }));
@@ -76,6 +77,67 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     const row = card.getByTestId(`inbox-attention-${first}`);
     expect(within(row).getByRole("button", { name: words.retry })).toBeVisible();
     expect(card.queryByText(/^error$/i)).toBeNull();
+  });
+
+  /// Scenario: The daemon's snapshot lists a deck message a Pi agent may not have received; the tile says so instead of calling it uncertain, explains that Retry may make the agent get it twice, and offers Retry and Cancel, without marking the agent failed.
+  it("shows a message that may not have reached the agent with its duplicate warning and both actions", () => {
+    const agent = mapDesktopSnapshot(snapshot({ attention: [item(first, "not_started")] })).agents[0];
+    const card = tile(agent);
+    expect(card.getByTestId("inbox-badge-7")).toHaveTextContent(`${words.glyph} ${words.notStarted}`);
+    expect(card.getByTestId("inbox-notice-7")).toHaveTextContent(words.notStartedReason);
+    const row = card.getByTestId(`inbox-attention-${first}`);
+    expect(row).toHaveTextContent(words.notStartedReason);
+    expect(within(row).getByRole("button", { name: words.retry })).toBeVisible();
+    expect(within(row).getByRole("button", { name: words.cancel })).toBeVisible();
+    expect(card.queryByText(/^error$/i)).toBeNull();
+  });
+
+  /// Scenario: Two messages on one card may not have reached the agent; the tile counts them, as the TUI's card does.
+  it("counts several messages that may not have reached the agent", () => {
+    const agent = mapDesktopSnapshot(snapshot({
+      attention: [item(first, "not_started"), item(second, "not_started")],
+    })).agents[0];
+    expect(tile(agent).getByTestId("inbox-badge-7")).toHaveTextContent(`${words.glyph} 2 ${words.notStarted}`);
+  });
+
+  /// Scenario: One card lists an uncertain delivery, a message that may not have reached the agent and one held for an hour; the uncertain delivery leads the badge and the notice, and each row keeps its own reason.
+  it("leads with the uncertain delivery on a card that lists all three kinds", () => {
+    const third = "m-k3xzq2ab-0f3c9a71d2e4b852";
+    const agent = mapDesktopSnapshot(snapshot({
+      attention: [item(first, "uncertain"), item(second, "not_started"), item(third, "held_long")],
+    })).agents[0];
+    const card = tile(agent);
+    expect(card.getByTestId("inbox-badge-7")).toHaveTextContent(new RegExp(`^${words.glyph} ${words.uncertain}$`));
+    expect(card.getByTestId("inbox-notice-7")).toHaveTextContent(words.uncertainReason);
+    expect(card.getByTestId(`inbox-attention-${second}`)).toHaveTextContent(words.notStartedReason);
+    expect(card.getByTestId(`inbox-attention-${third}`)).toHaveTextContent(words.heldLong);
+  });
+
+  /// Scenario: A message that may not have reached the agent and one held for an hour are on one card; the notice explains the first, not the held-for-an-hour words.
+  it("explains the not-started message ahead of held_long", () => {
+    const agent = mapDesktopSnapshot(snapshot({
+      attention: [item(first, "held_long"), item(second, "not_started")],
+    })).agents[0];
+    expect(tile(agent).getByTestId("inbox-notice-7")).toHaveTextContent(words.notStartedReason);
+  });
+
+  /// Scenario: Retry on a message that may not have reached the agent is pressed after a turn started and the deck no longer lists it; the row says so in the shared words.
+  it("says when Retry on a not-started message came too late", async () => {
+    const onInboxAction = vi.fn(async () => ({ outcome: "not_applicable" }));
+    const agent = mapDesktopSnapshot(snapshot({ attention: [item(first, "not_started", 6)] })).agents[0];
+    const card = tile(agent, onInboxAction);
+    fireEvent.click(within(card.getByTestId(`inbox-attention-${first}`)).getByRole("button", { name: words.retry }));
+    await waitFor(() => expect(onInboxAction).toHaveBeenCalledWith(
+      { deckId: agent.daemonId, agentId: "7" },
+      { paneId: "worker", messageId: first, revision: 6 },
+      "retry",
+    ));
+    expect(await card.findByText(words.actionGone)).toBeVisible();
+  });
+
+  /// Scenario: The desktop's copy of the words is the shared fixture, the copy the TUI's words are checked against too.
+  it("uses exactly the shared words", () => {
+    expect(INBOX_WORDS).toEqual(words);
   });
 
   /// Scenario: Pressing Retry asks the daemon for that message at the revision the tile shows; when another client acted first, the row says so in the shared words.

@@ -2342,8 +2342,17 @@ where
         && !event.is_from_subagent()
         && let Some(pane_id) = event.pane_id.as_deref()
         && let Some(generation) = event.agent_id.as_deref().or(attested_agent)
+        && let Some(seen) = registry.note_turn(pane_id, generation, edge)
     {
-        registry.note_turn(pane_id, generation, edge);
+        // PRD #1666 G3: the inbox's turn clock, after the registry's locks
+        // are released (the inbox asks the registry under its own lock) and
+        // inside this `AppState` write lock, which serializes ingest, so
+        // edges reach it in the order the registry numbered them. A reserved
+        // spawn's edge counts too: its id is the generation's, so a turn it
+        // reported before publication is on its clock from the start.
+        registry
+            .inbox()
+            .note_turn(pane_id, generation, seen, std::time::Instant::now());
     }
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?

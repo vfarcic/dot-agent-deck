@@ -2335,7 +2335,7 @@ function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox 
   };
 }
 
-const ATTENTION_KINDS = new Set(["uncertain", "out_of_attempts", "held_long"]);
+const ATTENTION_KINDS = new Set(["uncertain", "out_of_attempts", "held_long", "not_started"]);
 const INTEGRATION_NOTICES = new Set(["cli_too_old", "adapter_too_old", "not_armed", "refresh_failed"]);
 
 /** PRD #1666 §6.5: the listed items the crate sent, an unknown kind dropped. */

@@ -121,8 +121,9 @@ mod engine;
 #[path = "inbox_engine_tests.rs"]
 mod engine_tests;
 pub use engine::{
-    ARM_DEADLINE, ENV_ARM_DEADLINE_MS, ENV_PROBE_DEADLINE_MS, PROBE_DEADLINE, ProbeVerdict,
-    arm_deadline_from_env, probe_cli, probe_deadline_from_env,
+    ARM_DEADLINE, ENV_ARM_DEADLINE_MS, ENV_NOT_STARTED_MS, ENV_PROBE_DEADLINE_MS, PROBE_DEADLINE,
+    ProbeVerdict, arm_deadline_from_env, not_started_after_from_env, probe_cli,
+    probe_deadline_from_env,
 };
 
 /// PRD #1666 §6.6: the subject of the notice an orchestrator gets when a
@@ -668,6 +669,7 @@ impl InboxHub {
                         max_deliver: limits_max_deliver,
                         possess_ttl: keepalive * crate::inbox_attempts::KEEPALIVES_PER_POSSESS_TTL,
                         ack_wait: limits_ack_wait,
+                        not_started_after: not_started_after_from_env(),
                         ..crate::inbox_attempts::Limits::default()
                     },
                     arm_deadline_from_env(),
@@ -2498,6 +2500,35 @@ impl InboxHub {
             .entry((pane_id.to_string(), agent_id.to_string()))
             .or_default();
         floor.arm_by = Some(Instant::now() + deadline);
+        drop(st);
+        self.changed.notify_one();
+    }
+
+    /// PRD #1666 G3: generation `agent_id` in `pane_id` reported a turn edge
+    /// the registry accepted (`seen`, see
+    /// [`crate::agent_pty::AgentPtyRegistry::note_turn`]). The daemon calls
+    /// this after the registry's locks are released, inside the ingest that
+    /// serializes hook events, so edges arrive in the order they were
+    /// accepted. Its not-started attention is recomputed at once, so a turn
+    /// starting withdraws it from the next notices push.
+    pub fn note_turn(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        seen: crate::agent_pty::TurnSeen,
+        now: Instant,
+    ) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        if !engine::note_turn(&mut st, &key, seen, now) {
+            return;
+        }
+        let turn = st.receipts.turn_view(&key);
+        let Some(generation) = st.receipts.gens.get_mut(&key) else {
+            return;
+        };
+        generation.model.note_turn(now, turn);
+        engine::broadcast_notices(&mut st, &key, now);
         drop(st);
         self.changed.notify_one();
     }
