@@ -2303,18 +2303,19 @@ where
     // sees it.
     //
     // A turn starts with a report that the agent is working: thinking, a
-    // tool starting, compacting or a permission request (r8k R8G-02). Every
-    // supported agent reports its turn's start as Thinking. A tool FINISHING
-    // starts nothing: a ToolEnd that arrives after its turn's Idle would
-    // otherwise open a turn the next Idle "ends", releasing Escapes that
-    // opened a menu meanwhile (Qodo r8, PR #1735). An Idle with no turn under
+    // tool starting, compacting or a permission request (r8k R8G-02). A tool
+    // FINISHING starts nothing, since its ToolStart already started its
+    // turn: a ToolEnd that arrives after its turn's Idle would otherwise open
+    // a turn the next Idle "ends", releasing Escapes that opened a menu
+    // meanwhile (Qodo r8, PR #1735). An Idle with no turn under
     // way releases nothing: a repeated Idle (OpenCode sends two) must not
     // release the Escapes that opened a menu on an agent already Idle. A
     // line `dot-agent-deck wrap` classified from the child's output proves
     // only that it printed something, or stopped printing, so it neither
     // starts nor ends a turn: a wrapped Codex's quiet-output Idle does not
     // end a turn its hooks reported (Qodo r8). A wrapper-only agent
-    // therefore never releases, and its Escapes hold until the user's Enter.
+    // therefore has no turn end to release on, and its Escapes hold until a
+    // submit or the user's clear.
     //
     // Only the generation that sent it counts, as for the quota latch: the
     // one it names, or the one its token was minted for, and the registry
@@ -15882,10 +15883,9 @@ mod hook_provenance_audit_tests {
     /// Scenario: Agent A is sent keys, and its PTY takes them, but the deck
     /// has not recorded them yet when A exits on its own and agent B replaces
     /// it on the pane. B finishes a turn and the user presses Escape twice
-    /// on Idle B, which holds the doorbell; A's Escapes are then recorded.
-    /// B's Escapes must keep holding. And when A's late keys are text
-    /// instead, B, with nothing typed, must hold nothing: A's keys are not
-    /// B's input.
+    /// on Idle B, which holds the doorbell, and A's Escapes, recorded late,
+    /// must not release B's. When A's late keys are text instead, B, with
+    /// nothing typed, must hold nothing, since A's keys are not B's input.
     #[spec("inbox/doorbell/028")]
     #[tokio::test]
     async fn doorbell_028_a_replaced_agents_late_keys_do_not_reach_its_successors_input() {

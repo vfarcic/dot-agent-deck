@@ -3117,17 +3117,16 @@ mod tests {
         assert_eq!(m.evidence_reserved(), reserved);
     }
 
-    /// Scenario: An OpenCode watcher is handed a message and dies, and its
-    /// replacement dies before answering for it, so the attempt is fenced;
-    /// the user then cancels the message. A spool check for its commit is
-    /// taken, another replacement registers and is handed the attempt's
-    /// commit authority, and the check then finds nothing, as does one
-    /// taken after the registration. That replacement dies before
-    /// publishing, the next one is handed the attempt again, and the
-    /// commit it publishes tells the sender the message was delivered after
-    /// all and returns the evidence once. Once a replacement holding the
-    /// hand-back is retired with no successor, a check that finds nothing
-    /// returns the evidence.
+    /// Scenario: An OpenCode watcher is handed a message and dies, its
+    /// replacement dies before answering, so the attempt is fenced, and the
+    /// user cancels the message; a spool check for its commit is taken,
+    /// another replacement registers and is handed the attempt's commit
+    /// authority, and that check, like one taken after the registration,
+    /// finds nothing. That replacement dies before publishing, the next one
+    /// is handed the attempt again, and the commit it publishes tells the
+    /// sender the message was delivered after all and returns the evidence
+    /// once. Once a replacement holding the hand-back is retired with no
+    /// successor, a check that finds nothing returns the evidence.
     #[spec("inbox/attempts/019")]
     #[test]
     fn attempts_019_a_handed_back_fenced_commit_keeps_its_verifier_while_its_replay_is_outstanding()

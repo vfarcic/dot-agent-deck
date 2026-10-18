@@ -13,16 +13,17 @@
 //! edits nothing (a menu answer with no Enter, a draft backspaced to empty)
 //! sets it until the user's next Enter. The one exception is a run of Escape
 //! keys and nothing else, the way the user interrupts a turn (OpenCode's
-//! interrupt is Escape twice): it holds the bit only until the turn it
-//! interrupted ends ([`DraftTracker::turn_ended`]). A turn ends when the
-//! pane's own agent reports Idle after reporting itself working, and
-//! `crate::agent_pty` applies that end only to the bytes that reached the PTY
-//! before it (PRD #1666 r8k R8G-02). An Escape run on an agent that is already
-//! Idle opens a menu in some agents, and holds the bit until that agent next
-//! finishes a turn or the user presses Enter: a repeated Idle releases
-//! nothing. Where the deck cannot tell whether an Idle came before the
-//! Escapes reached the agent or after, it holds. An agent whose busy reports
-//! never reach the deck releases nothing, and its Escapes hold until Enter.
+//! interrupt is Escape twice): besides a submit or clear, the end of the
+//! turn it interrupted can release it ([`DraftTracker::turn_ended`]). A turn
+//! ends when the pane's own agent reports Idle after reporting itself
+//! working, and `crate::agent_pty` applies that end only to the bytes that
+//! reached the PTY before it (PRD #1666 r8k R8G-02). An Escape run on an
+//! agent that is already Idle opens a menu in some agents, and holds the bit
+//! until a later turn of that agent ends or a submit or clear: a repeated
+//! Idle releases nothing. Where the deck cannot tell whether an Idle came
+//! before the Escapes reached the agent or after, it holds. An agent whose busy reports
+//! never reach the deck has no turn end to release on, and its Escapes hold
+//! until a submit or clear.
 
 use std::time::Duration;
 
@@ -138,7 +139,8 @@ const MAX_STRING_LEN: u16 = 4096;
 pub(crate) struct DraftTracker {
     pending: bool,
     /// Set instead of `pending` by the user's lone Escape keys (`ESC ESC`):
-    /// held only until [`Self::turn_ended`], which `crate::agent_pty` calls
+    /// cleared like `pending` by a submit or clear, and also by
+    /// [`Self::turn_ended`], which `crate::agent_pty` calls
     /// for the end of a turn of the pane's own agent that came after these
     /// keys reached it.
     escapes: bool,
