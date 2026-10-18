@@ -88,10 +88,11 @@ pub fn not_started_after_from_env() -> Duration {
         )
 }
 
-/// PRD #1666 G3: how many exited generations the turn clocks remember, so a
-/// turn edge delayed past its generation's exit cannot bring a clock back.
-/// The registry checks the edge's owner and the daemon hands it here inside
-/// one ingest, so the memory only has to outlast that, not hours.
+/// PRD #1666 G3: how many exited generations the turn clocks remember. A
+/// turn edge delayed past its generation's exit is refused while that key is
+/// still among them; the oldest is forgotten when the ring is full. The
+/// registry checks the edge's owner and the daemon hands it here inside one
+/// ingest, so the memory only has to outlast that, not hours.
 pub(super) const EXITED_TURN_KEYS: usize = 1024;
 
 /// PRD #1666 G3: one generation's turns, as its own hook reports reached the
@@ -930,7 +931,8 @@ pub(super) fn tick(
 /// from its live owner, or kept for its reserved spawn, numbered `seen.seq`.
 /// A turn starting makes the clock busy; one under way ending makes it idle
 /// from `now`, the only place `idle_since` moves. An edge for an exited
-/// generation, or one older than the last applied, changes nothing. Returns
+/// generation still remembered in [`EXITED_TURN_KEYS`], or one older than
+/// the last applied, changes nothing. Returns
 /// whether the clock changed.
 pub(super) fn note_turn(st: &mut HubState, key: &AgentKey, seen: TurnSeen, now: Instant) -> bool {
     if st.receipts.exited_turns.contains(key) {
@@ -986,8 +988,9 @@ pub(super) fn lapse_checks(st: &HubState, now: Instant) -> Vec<Check> {
         .collect()
 }
 
-/// PRD #1666 G3: `key`'s turn clock goes, and the key is remembered so a
-/// delayed edge cannot bring it back.
+/// PRD #1666 G3: `key`'s turn clock goes, and the key joins the exited
+/// generations, so a delayed edge for it is refused while it stays among the
+/// [`EXITED_TURN_KEYS`] most recent.
 pub(super) fn forget_turns(st: &mut HubState, key: &AgentKey) {
     st.receipts.turns.remove(key);
     if !st.receipts.exited_turns.contains(key) {

@@ -1029,8 +1029,36 @@ mod tests {
     #[cfg(not(unix))]
     fn set_mode(_path: &Path, _mode: u32) {}
 
+    /// What a `node --test` run of one pin proves: `Ok(true)` when its tests
+    /// ran and passed, `Ok(false)` when the pin skipped itself on a platform
+    /// it does not run on, otherwise `Err`. Off Unix, a run that passed
+    /// nothing but skipped the pin is that pin's own platform skip (pi/031's
+    /// shell fixtures are Unix-only); on Unix every pin must run, so a skip
+    /// fails there like a filter that matched nothing.
+    fn node_pin_verdict(success: bool, passed: u32, skipped: u32, unix: bool) -> Result<bool, ()> {
+        match (success, passed, skipped) {
+            (true, 1.., _) => Ok(true),
+            (true, 0, 1..) if !unix => Ok(false),
+            _ => Err(()),
+        }
+    }
+
+    /// Scenario: A pin's Node run is judged from its exit status and its passed and skipped counts. On Unix only a run that passed tests counts, and a skipped or empty run fails; off Unix a run that skipped the pin itself is reported as a skip, while an empty or failed run still fails.
+    #[test]
+    fn node_pin_verdict_accepts_a_platform_skip_only_off_unix() {
+        assert_eq!(node_pin_verdict(true, 3, 0, true), Ok(true));
+        assert_eq!(node_pin_verdict(true, 0, 1, true), Err(()));
+        assert_eq!(node_pin_verdict(true, 0, 0, true), Err(()));
+        assert_eq!(node_pin_verdict(false, 3, 0, true), Err(()));
+        assert_eq!(node_pin_verdict(true, 0, 1, false), Ok(false));
+        assert_eq!(node_pin_verdict(true, 0, 0, false), Err(()));
+        assert_eq!(node_pin_verdict(false, 0, 1, false), Err(()));
+        assert_eq!(node_pin_verdict(true, 2, 0, false), Ok(true));
+    }
+
     /// Runs the tests of the extension's Node file `file` whose name starts
-    /// with `pin`, and fails unless at least one ran and none failed. Prints
+    /// with `pin`, and fails unless at least one ran and none failed (see
+    /// [`node_pin_verdict`] for a pin that skips itself off Unix). Prints
     /// `SKIP:` and passes without a Node that strips TypeScript types (23.6+).
     fn node_pin(file: &str, pin: &str) {
         let Ok(node) = std::process::Command::new("node").arg("--version").output() else {
@@ -1054,16 +1082,22 @@ mod tests {
             .output()
             .expect("run node --test");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let passed = stdout
-            .lines()
-            .find_map(|line| line.strip_prefix("# pass "))
-            .and_then(|n| n.trim().parse::<u32>().ok())
-            .unwrap_or(0);
-        assert!(
-            out.status.success() && passed > 0,
-            "{file} {pin}: {passed} passed\n{stdout}{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let count = |what: &str| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(what))
+                .and_then(|n| n.trim().parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        let (passed, skipped) = (count("# pass "), count("# skipped "));
+        match node_pin_verdict(out.status.success(), passed, skipped, cfg!(unix)) {
+            Ok(true) => {}
+            Ok(false) => eprintln!("SKIP: {file} {pin} skips itself on this platform"),
+            Err(()) => panic!(
+                "{file} {pin}: {passed} passed, {skipped} skipped\n{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        }
     }
 
     /// Scenario: The generated receiver is given a resolver for the deck binary that returns a bare name a stand-in on the agent's PATH answers to, a relative path, nothing, a missing file or a non-executable file, and none of them runs: no watcher starts, nothing is delivered and the receiver tries again on its backoff. An absolute path to an executable, with spaces in it, does run.

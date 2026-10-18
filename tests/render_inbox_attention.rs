@@ -384,7 +384,7 @@ fn flat(rendered: &str) -> String {
         .join(" ")
 }
 
-/// Scenario: Open the picker over five deck messages in a 100×16 terminal, over ten in a 100×24 one and over three in a 50-column one, the cursor on one that may not have reached the agent. Its whole explanation, the possible duplicate included, is on screen before Retry in each, with the other messages windowed around it. In a terminal too short for that explanation, `r` sends nothing and the picker asks for a taller window; once it is taller, `r` sends Retry.
+/// Scenario: Open the picker over five deck messages in a 100×16 terminal, over ten in a 100×24 one and over three in a 50-column one, the cursor on one that may not have reached the agent. Its whole explanation, the possible duplicate included, is on screen before Retry in each, with the other messages windowed around it. In a terminal too short for that explanation, or too narrow to hold its words however tall, `r` sends nothing and the picker asks for a taller or a wider window; once it is large enough, `r` sends Retry.
 #[spec("inbox/status/025")]
 #[test]
 fn status_025_the_picker_shows_what_retry_does_before_retry_in_any_layout() {
@@ -470,5 +470,44 @@ fn status_025_the_picker_shows_what_retry_does_before_retry_in_any_layout() {
             revision: 4,
             retry: true,
         }]
+    );
+
+    // Too narrow for the explanation's words after its indent, however tall:
+    // `r` sends nothing and asks for a wider window. Sixteen columns leave
+    // the indented text eight, its longest word's width, and Retry is sent.
+    let longest = reason.split(' ').map(str::len).max().unwrap();
+    assert_eq!(longest, 8, "the boundary below is drawn for this reason");
+    for (width, height) in [(8, 1024), (15, 1024)] {
+        let narrow = inbox_attention_run(
+            &KeybindingConfig::default(),
+            &state,
+            "gen-q",
+            key(KeyCode::Char('i')),
+            &[key(KeyCode::Char('r'))],
+            (width, height),
+        );
+        assert_eq!(
+            narrow.presses,
+            vec![],
+            "{width}×{height}: no Retry when the explanation is cut across"
+        );
+        assert_eq!(
+            narrow.answer.as_deref(),
+            Some("make the window wider to see what Retry does"),
+            "{width}×{height}"
+        );
+    }
+    let wide_enough = inbox_attention_run(
+        &KeybindingConfig::default(),
+        &state,
+        "gen-q",
+        key(KeyCode::Char('i')),
+        &[key(KeyCode::Char('r'))],
+        (16, 1024),
+    );
+    assert_eq!(wide_enough.presses.len(), 1, "16 columns hold every word");
+    assert!(
+        flat(&text(wide_enough.screen.as_ref().unwrap())).contains(reason),
+        "the explanation is whole at 16 columns"
     );
 }

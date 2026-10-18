@@ -2543,8 +2543,9 @@ impl InboxHub {
 
     /// PRD #1666 G3 (R2-05): a spawn reserved as `agent_id` in `pane_id`
     /// reported a turn and was then given up without publishing. Its turn
-    /// clock goes, and its key is remembered so a delayed edge cannot bring
-    /// it back, as at an exit.
+    /// clock goes, and as at an exit its key joins the bounded set of exited
+    /// generations, which refuses a delayed edge for it while the key is
+    /// still there.
     pub fn turns_abandoned(&self, pane_id: &str, agent_id: &str) {
         let mut st = self.lock();
         engine::forget_turns(&mut st, &(pane_id.to_string(), agent_id.to_string()));

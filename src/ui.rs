@@ -10674,7 +10674,7 @@ fn dispatch_action(
                     .is_some_and(|item| item.kind.retry_offered())
                 && !inbox_attention_retry_readable(dialog, frame_area)
             {
-                dialog.answer = Some(RETRY_NEEDS_ROOM.to_string());
+                dialog.answer = Some(inbox_attention_retry_needs(dialog, frame_area).to_string());
                 return Flow::Continue;
             }
             let press = ui
@@ -18352,7 +18352,8 @@ fn host_metrics_lines(view: &HostMetricsView, width: u16) -> Vec<Line<'static>> 
 /// wrapped (PRD #1666 G3: what Retry would do is read before the press, as
 /// the desktop tile shows it), and the other items share what is left, two
 /// rows each, as the window of items that keeps the cursor's row in view.
-/// Where the cursor's explanation does not fit whole, the cursor's row is
+/// Where the cursor's explanation does not fit whole — too few rows, or too
+/// narrow to hold its longest word after the indent — the cursor's row is
 /// shown alone with it cut by `…`, and where two rows no longer fit, an item
 /// is its sender and subject alone. Returns the lines, when windowed the
 /// first and last item shown (zero-based), and whether the cursor's
@@ -18384,7 +18385,11 @@ fn inbox_attention_lines(
         .get(dialog.selected)
         .map(|item| inbox_attention_reason_rows(item, width))
         .unwrap_or_default();
-    let explained = total == 0 || (!compact && room > explanation.len());
+    let wide = dialog
+        .items
+        .get(dialog.selected)
+        .is_none_or(|item| inbox_attention_reason_fits_width(item, width));
+    let explained = total == 0 || (wide && !compact && room > explanation.len());
     let fits = if compact {
         room
     } else if explained {
@@ -18449,13 +18454,37 @@ fn inbox_attention_lines(
     (lines, shown, explained)
 }
 
+/// The columns the picker indents an explanation by.
+const INBOX_REASON_INDENT: usize = 4;
+
 /// The cursor row's explanation wrapped to the picker's `width`, after its
-/// four-column indent.
+/// indent.
 fn inbox_attention_reason_rows(
     item: &crate::inbox_hub::InboxAttentionItem,
     width: usize,
 ) -> Vec<String> {
-    crate::upgrade_dialog::wrap(item.kind.reason(), width.saturating_sub(4))
+    crate::upgrade_dialog::wrap(
+        item.kind.reason(),
+        width.saturating_sub(INBOX_REASON_INDENT),
+    )
+}
+
+/// PRD #1666 G3 (F-A01): whether a picker `width` columns wide holds `item`'s
+/// explanation after its indent with no word broken. Narrower, the wrapped
+/// rows are cut at the edge (at four columns or fewer, all of the text), so
+/// counting them says nothing about what is readable.
+fn inbox_attention_reason_fits_width(
+    item: &crate::inbox_hub::InboxAttentionItem,
+    width: usize,
+) -> bool {
+    let longest = item
+        .kind
+        .reason()
+        .split(' ')
+        .map(unicode_width::UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0);
+    width >= INBOX_REASON_INDENT + longest.max(1)
 }
 
 /// The picker's popup in `area`, and the height of its footer (the button
@@ -18513,7 +18542,8 @@ fn inbox_attention_body(
 /// PRD #1666 G3: whether Retry may be pressed on the cursor's row of the
 /// picker drawn in `area`: it offers Retry and its whole explanation, which
 /// says what Retry does (a possible duplicate), is on screen. In a window
-/// too short for it Retry waits until the window is taller.
+/// too short or too narrow for it Retry waits until the window is larger
+/// ([`inbox_attention_retry_needs`]).
 fn inbox_attention_retry_readable(dialog: &InboxAttentionDialog, area: Rect) -> bool {
     dialog
         .items
@@ -18524,7 +18554,27 @@ fn inbox_attention_retry_readable(dialog: &InboxAttentionDialog, area: Rect) -> 
 
 /// PRD #1666 G3: the TUI's answer to `r` in a picker too short to show what
 /// Retry does. The desktop tile has no such state: its list scrolls.
-const RETRY_NEEDS_ROOM: &str = "make the window taller to see what Retry does";
+const RETRY_NEEDS_HEIGHT: &str = "make the window taller to see what Retry does";
+
+/// PRD #1666 G3 (F-A01): the answer to `r` in a picker too narrow for it.
+const RETRY_NEEDS_WIDTH: &str = "make the window wider to see what Retry does";
+
+/// Which way the picker drawn in `area` is too small to show what Retry does
+/// on the cursor's row: width when the explanation's words do not fit across
+/// it, else height.
+fn inbox_attention_retry_needs(dialog: &InboxAttentionDialog, area: Rect) -> &'static str {
+    let (popup_area, _) = inbox_attention_geometry(dialog, area);
+    let width = usize::from(popup_area.width.saturating_sub(2));
+    let wide = dialog
+        .items
+        .get(dialog.selected)
+        .is_none_or(|item| inbox_attention_reason_fits_width(item, width));
+    if wide {
+        RETRY_NEEDS_HEIGHT
+    } else {
+        RETRY_NEEDS_WIDTH
+    }
+}
 
 fn render_inbox_attention_overlay(
     frame: &mut Frame,
@@ -23176,6 +23226,8 @@ pub struct InboxAttentionRun {
     pub presses: Vec<InboxAttentionPress>,
     /// The picker as drawn after the last key, when it is open.
     pub screen: Option<ratatui::buffer::Buffer>,
+    /// The picker's answer to the last press, whole, when it is open.
+    pub answer: Option<String>,
 }
 
 /// The pane controller of the picker seam: the picker never touches a pane.
@@ -23270,6 +23322,11 @@ pub fn inbox_attention_run(
             .expect("TestBackend draw should succeed");
         terminal.backend().buffer().clone()
     });
+    let answer = ui
+        .inbox_attention
+        .as_ref()
+        .filter(|_| open)
+        .and_then(|dialog| dialog.answer.clone());
     let presses = sent
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -23288,6 +23345,7 @@ pub fn inbox_attention_run(
         open,
         presses,
         screen,
+        answer,
     }
 }
 
