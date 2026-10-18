@@ -4218,7 +4218,7 @@ fn surface_one_orchestration(
                 if let Some(dead) = replaced_dead_slot.as_deref() {
                     st.remove_sessions_for_pane(dead);
                 }
-                st.register_pane(role.pane_id.clone());
+                st.register_agent_pane(role.pane_id.clone(), agent_id.as_deref());
                 st.insert_placeholder_session(
                     role.pane_id.clone(),
                     Some(surface.cwd.clone()),
@@ -10052,7 +10052,7 @@ fn dispatch_action(
                                 for (id, agent_id) in
                                     role_pane_ids.iter().zip(role_agent_ids.iter())
                                 {
-                                    st.register_pane(id.clone());
+                                    st.register_agent_pane(id.clone(), agent_id.as_deref());
                                     st.insert_placeholder_session(
                                         id.clone(),
                                         Some(dir_str.clone()),
@@ -10300,7 +10300,7 @@ fn dispatch_action(
                             let new_agent_id = pane.pane_agent_id(&new_id);
                             {
                                 let mut st = state.blocking_write();
-                                st.register_pane(new_id.clone());
+                                st.register_agent_pane(new_id.clone(), new_agent_id.as_deref());
                                 st.insert_placeholder_session(
                                     new_id.clone(),
                                     Some(dir_str.clone()),
@@ -11859,7 +11859,7 @@ pub fn run_tui(
         daemon_pane_ids.extend(hydrated.iter().map(|h| h.pane_id.clone()));
         for h in &hydrated {
             let mut st = state.blocking_write();
-            st.register_pane(h.pane_id.clone());
+            st.register_agent_pane(h.pane_id.clone(), Some(&h.agent_id));
             // Carry the daemon-recorded cwd through to the seeded session
             // so the session card shows the right directory.
             //
@@ -12360,7 +12360,7 @@ pub fn run_tui(
                                     for (id, agent_id) in
                                         role_pane_ids.iter().zip(role_agent_ids.iter())
                                     {
-                                        st.register_pane(id.clone());
+                                        st.register_agent_pane(id.clone(), agent_id.as_deref());
                                         st.insert_placeholder_session(
                                             id.clone(),
                                             Some(saved_pane.dir.clone()),
@@ -12491,7 +12491,7 @@ pub fn run_tui(
                     let new_agent_id = pane.pane_agent_id(&new_id);
                     {
                         let mut st = state.blocking_write();
-                        st.register_pane(new_id.clone());
+                        st.register_agent_pane(new_id.clone(), new_agent_id.as_deref());
                         st.insert_placeholder_session(
                             new_id.clone(),
                             Some(saved_pane.dir.clone()),

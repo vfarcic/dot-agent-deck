@@ -527,7 +527,11 @@ function watchQueue(proc: InboxProcess, key: string, ctx: ExtensionContext | und
 		return;
 	}
 	const run = proc.runs;
-	/** `true` once marked, `false` once there is nothing left to watch. */
+	/**
+	 * `true` while the attempt is still eligible and not yet seen queued, so
+	 * the caller keeps watching; `false` once it is marked queued or there is
+	 * nothing left to watch.
+	 */
 	const look = (): boolean => {
 		const passed = proc.passed.get(key);
 		if (passed === undefined || passed.stage !== "input" || passed.queued || proc.runs !== run || askIdle(ctx) !== false) {

@@ -62,6 +62,10 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
     // which nothing was listening — a stream that ended, or attempts that
     // failed — so it must resynchronize before applying anything new.
     let mut first_attempt = true;
+    // PRD #1666 §2.8: the state can ask for a resync while the stream is
+    // healthy — an adopted pane whose held inbox may have been evicted
+    // (`AppState::take_event_resync_wanted`).
+    let resync_wanted = state.read().await.event_resync_signal();
     loop {
         let resync = !std::mem::replace(&mut first_attempt, false);
         let subscribed = if resync {
@@ -81,7 +85,26 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
             delay = config.initial_delay;
             seed_hook_binary_notices(&client, &state).await;
             loop {
-                match sub.next_event().await {
+                // Biased, the wake-up first: one left over from a request the
+                // last resync already satisfied is taken before this
+                // iteration starts reading a frame, so dropping that read
+                // cannot lose part of one. A wake-up that does want a resync
+                // discards the stream, a partly read frame with it.
+                let next = tokio::select! {
+                    biased;
+                    () = resync_wanted.notified() => {
+                        if state.write().await.take_event_resync_wanted() {
+                            tracing::info!(
+                                "subscribe_events: the inbox history of an adopted pane \
+                                     may be lost, resynchronizing"
+                            );
+                            break;
+                        }
+                        continue;
+                    }
+                    next = sub.next_event() => next,
+                };
+                match next {
                     Ok(Some(BroadcastMsg::Event(event))) => {
                         if config.drop_event.is_some_and(|drop| drop(&event)) {
                             continue;
@@ -369,6 +392,11 @@ mod tests {
         agents: Vec<(&'static str, &'static str)>,
         failing_lists: usize,
         ordered: bool,
+        /// The first subscription stays open after `first_stream` instead of
+        /// being torn down `lagged`.
+        first_stream_open: bool,
+        /// The inbox summary each listed pane's record carries.
+        inboxes: Vec<(&'static str, crate::inbox_hub::InboxSummary)>,
     }
 
     impl ScriptedDaemon {
@@ -389,6 +417,8 @@ mod tests {
                 agents,
                 failing_lists,
                 ordered,
+                first_stream_open: false,
+                inboxes: Vec::new(),
             }
         }
 
@@ -406,6 +436,13 @@ mod tests {
                 })
                 .collect();
             self.daemon.attach_live_sessions(&mut records);
+            for record in &mut records {
+                record.inbox = self
+                    .inboxes
+                    .iter()
+                    .find(|(pane, _)| record.pane_id_env.as_deref() == Some(*pane))
+                    .map(|(_, summary)| summary.clone());
+            }
             Some(records)
         }
     }
@@ -456,6 +493,10 @@ mod tests {
                         write_frame(&mut wr, KIND_RESP, &ok).await.unwrap();
                         if n.subscriptions.fetch_add(1, Ordering::SeqCst) == 0 {
                             write_events(&mut wr, &script.first_stream).await;
+                            if script.first_stream_open {
+                                let _ = read_frame(&mut rd).await;
+                                return;
+                            }
                             write_frame(&mut wr, KIND_STREAM_END, b"lagged")
                                 .await
                                 .unwrap();
@@ -614,6 +655,119 @@ mod tests {
                  the stream it lost (generation, status, closures)"
             );
         }
+    }
+
+    /// PRD #1666 §2.8 (reviewer R3fix4-02): the TUI adopts a pane whose held
+    /// inbox was evicted while the stream is healthy. The subscriber does not
+    /// wait for the stream to fail: it ends it and resubscribes through the
+    /// ordered snapshot, whose summary gives the pane back what it lost.
+    #[tokio::test]
+    async fn adopting_a_pane_whose_held_inbox_was_lost_resynchronizes() {
+        use crate::inbox_hub::{InboxAttentionItem, InboxCardNotices, InboxSummary, WakePath};
+        let notices = InboxCardNotices {
+            attention: vec![InboxAttentionItem {
+                message_id: "m-1".into(),
+                revision: 1,
+                kind: crate::inbox_display::AttentionKind::NotStarted,
+                from_label: "the orchestrator".into(),
+                subject: "subject".into(),
+                task_id: None,
+            }],
+            ..Default::default()
+        };
+        let notice = |pane: String, notices: InboxCardNotices| crate::event::InboxNotice {
+            pane_id: pane,
+            agent_id: Some(AGENT.into()),
+            message_id: "m-1".into(),
+            subject: "subject".into(),
+            from_label: "the orchestrator".into(),
+            state: crate::inbox::StateName::Queued,
+            reason: None,
+            returned: false,
+            wake_stalled: false,
+            wake_update: false,
+            attention_update: true,
+            notices,
+        };
+        let mut tui = AppState::default();
+        tui.apply_inbox_notice(&notice(PANE.into(), notices.clone()));
+        // Enough other panes, never adopted here, to evict `PANE`'s.
+        for other in 0..1024 {
+            tui.apply_inbox_notice(&notice(format!("pane-other-{other}"), notices.clone()));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("attach.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
+        let counters = Arc::new(Counters {
+            subscriptions: AtomicUsize::new(0),
+            lists: AtomicUsize::new(0),
+            ordered_subscriptions: AtomicUsize::new(0),
+        });
+        let mut script = ScriptedDaemon::new(
+            Vec::new(),
+            AppState::default(),
+            vec![(AGENT, PANE)],
+            0,
+            true,
+        );
+        script.first_stream_open = true;
+        script.inboxes = vec![(
+            PANE,
+            InboxSummary {
+                queued: 1,
+                fetched: 0,
+                claimed: 0,
+                undeliverable: 0,
+                last_acked_at: None,
+                wake: WakePath::Doorbell,
+                component: None,
+                wake_stalled: false,
+                notices,
+            },
+        )];
+        let server = tokio::spawn(serve(listener, Arc::new(script), Arc::clone(&counters)));
+        let state: SharedState = Arc::new(RwLock::new(tui));
+        let config = SubscriberConfig {
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+            drop_event: None,
+            break_on_event: None,
+        };
+        let subscriber = tokio::spawn(run(DaemonClient::new(socket), Arc::clone(&state), config));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while counters.subscriptions.load(Ordering::SeqCst) == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            counters.subscriptions.load(Ordering::SeqCst),
+            1,
+            "subscribed"
+        );
+        state.write().await.register_pane(PANE.to_string());
+        assert!(
+            state.read().await.inbox_attention(PANE).is_none(),
+            "the held inbox was evicted, so this tests its recovery"
+        );
+        let mut restored = false;
+        while !restored && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            restored = state.read().await.inbox_attention(PANE).is_some();
+        }
+        subscriber.abort();
+        server.abort();
+        assert!(
+            restored,
+            "the adoption ended the healthy stream and the resync restored the pane's inbox"
+        );
+        assert_eq!(
+            counters.ordered_subscriptions.load(Ordering::SeqCst),
+            1,
+            "through the ordered snapshot, once"
+        );
     }
 
     /// Issue #1520 (Qodo on #1553): a `ListAgents` that fails right after the
