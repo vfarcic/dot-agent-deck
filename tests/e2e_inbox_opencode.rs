@@ -1955,19 +1955,26 @@ fn opencode_052_a_cancelled_tasks_commit_survives_its_watcher_killed_mid_publish
         record["inbox"]["receipts_degraded"].is_null(),
         "the replacement had the cap, so nothing is degraded: {record}"
     );
-    let read: Vec<String> = op
-        .events()
-        .into_iter()
-        .filter(|e| e["kind"] == "stdout")
-        .filter_map(|e| e["text"].as_str().map(str::to_owned))
-        .collect();
+    // The fixture logs each `data` chunk as it comes, and a chunk can end
+    // mid-line: rebuild each watcher's stdout before reading its lines, so a
+    // marker split across two chunks is still seen.
+    let mut streams: std::collections::BTreeMap<String, String> = Default::default();
+    for event in op.events().into_iter().filter(|e| e["kind"] == "stdout") {
+        if let Some(text) = event["text"].as_str() {
+            streams
+                .entry(event["pid"].to_string())
+                .or_default()
+                .push_str(text);
+        }
+    }
+    let read: Vec<&str> = streams.values().flat_map(|stream| stream.lines()).collect();
     assert!(
-        read.iter().any(|text| text.contains("\"correctable\"")),
+        read.iter().any(|line| line.contains("\"correctable\"")),
         "the replacement's registration names the attempt: {read:?}"
     );
     assert!(
         read.iter()
-            .all(|text| !text.contains("\"caps\"") && !text.contains("\"commit\":\"")),
+            .all(|line| !line.contains("\"caps\"") && !line.contains("\"commit\":\"")),
         "a cap reached the plugin: {read:?}"
     );
 }

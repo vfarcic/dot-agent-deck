@@ -276,7 +276,10 @@ impl DraftTracker {
                 // byte's origin) AND is the one who went on typing: a deck
                 // ESC is never theirs, and a lone Escape keypress followed by
                 // a deck write edits nothing of theirs. It counts as an
-                // Escape key, which the agent's next Idle releases.
+                // Escape key, released only by the end of a turn the agent
+                // reported starting — a known busy-to-Idle edge, ordered
+                // after these keys reached it ([`Self::turn_ended`]) — or by
+                // a submit or clear.
                 ESC => {
                     self.escapes |= self.esc_user && self.by_user;
                     self.ground(byte, in_paste)

@@ -7946,6 +7946,13 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Does not assert:** the adapter's local revoke (inbox/opencode/037).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/attempts/019 — A handed-back fenced commit keeps its verifier while its replay is outstanding.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** for an OpenCode TUI attempt fenced by an unanswered resume and then cancelled, a registration lists it as correctable; a spool check taken before that registration and one taken after it reclaim nothing; with that replacement's stream closed, the next registration lists it again, the attempt stays non-callable, and its commit yields `DeliveredAfterAll` despite the Cancel and one `Reclaimed`, with no evidence left reserved and a repeated commit a no-op; once a replacement holding the hand-back is retired by the clock with no successor, a check reclaims it once and a later registration lists nothing.
+- **Does not assert:** the engine's cap lookup or the watcher's publication (inbox/opencode/053, inbox/opencode/054), or a Pi context.
+- **Platform coverage:** mac+linux+windows.
+
 #### inbox/receipt
 
 The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the daemon's locked instance namespace under `<state_dir>/inbox-spool`, trusted one-component-at-a-time traversal from the state-directory anchor, immutable `Handed`/`Committed` bearer records, bounded resumable scans streamed to the cap-based evidence store, the exact lookup before absence, and the resumable sibling reaper, plus `platform::lock::try_lock_file`. It is library-only: nothing in the daemon calls it yet, records are published and read, nothing is pruned and no suppression decision is drawn from them.
@@ -8389,7 +8396,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread, parked by `pause_next_pty_write_for_test` after the write returned and its turn count was read.
 - **Agent:** none (`cat`), events typed as OpenCode.
 - **Asserts:** with the agent Thinking, two Escapes the PTY took before the Idle was ingested, but recorded after it, do not hold the doorbell.
-- **Does not assert:** an Idle ingested between the write and its turn-count reading, which holds (`inbox/doorbell/023`'s side of the policy).
+- **Does not assert:** an Idle ingested between the write and its turn-count reading, which holds (`inbox/doorbell/027`).
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
@@ -8422,6 +8429,22 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none (`cat`), events typed as OpenCode.
 - **Asserts:** an interrupt sent as two separate Escape writes while Thinking, then Idle, holds nothing; two separate Escape writes on the Idle agent hold; an Escape the PTY took before the Idle but recorded after it does not pair with the Escape written after the Idle, so nothing holds.
 - **Does not assert:** a real agent's interrupt timing.
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/027 — An Idle between the write and its turn-count reading holds the doorbell.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread, parked by `pause_next_pty_write_for_test` after the write returned and before its turn count is read.
+- **Agent:** none (`cat`), events typed as OpenCode.
+- **Asserts:** with the agent Thinking, two Escapes the PTY took, with the Idle ingested before their turn count was read, hold the doorbell — the deliberate side of the ambiguous window; two Enters release it.
+- **Does not assert:** that the agent read the Escapes before or after its Idle (the daemon cannot observe it), or a time bound on the hold (there is none).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/028 — A replaced agent's late keys do not reach its successor's input.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread, parked by `pause_next_pty_write_for_test` after the write returned and its turn count was read.
+- **Agent:** none (a shell script that exits when the test asks, replaced by `cat` on one pane), events typed as OpenCode.
+- **Asserts:** with agent A's two Escapes taken by its PTY and not yet recorded, A exits on its own and B is published on the pane; after B's Thinking, Idle and an Escape pair on Idle B, A's Escapes recorded late leave B's doorbell held; text A's PTY took and that is recorded only after B is published leaves B with nothing pending.
+- **Does not assert:** a predecessor removed by close or respawn (its writer was already retired, issue #542), or what the agent processes read.
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
@@ -10104,7 +10127,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over in-memory duplexes.
 - **Agent:** none.
 - **Asserts:** with one agent's TUI attempts ending HandedInert (Cancel, `already_handed`), NotHanded (Cancel, `revoked_ack`), Committed, open, and NotHanded outside a Cancel (its message handed out again, so the attempt is not reclaimed), and its server context's doorbell-fetch attempt ending HandedInert, the replaced server watcher's registration lists only the server attempt as correctable, and the replaced TUI watcher's lists only its HandedInert attempt, with that attempt's commit cap and not its hand-out cap, while the open attempts are asked back; a commit then reported for it makes it Committed and returns its evidence. Another agent's registration on the same pane lists nothing, and a registration from another plugin instance is refused with nothing listed.
-- **Does not assert:** a Fenced attempt still verifying (listed by the same rule), or a real watcher (`inbox/opencode/054`).
+- **Does not assert:** a Fenced attempt still verifying (listed by the same rule; its verifier's hold while handed back is `inbox/attempts/019`), or a real watcher (`inbox/opencode/054`).
 - **Platform coverage:** all.
 - **Cost:** none.
 
