@@ -3434,8 +3434,8 @@ impl DraftTestStream {
 /// [`AgentPtyRegistry::note_turn`] applies to the pane's input stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnEdge {
-    /// The agent reported working — thinking, a tool, compacting or a
-    /// permission request: a turn is under way (r8k R8G-02). Creates the
+    /// The agent reported working — thinking, a tool starting, compacting or
+    /// a permission request: a turn is under way (r8k R8G-02). Creates the
     /// pane's stream when it has none yet, so a first turn reported before
     /// any input is still a turn.
     Started,

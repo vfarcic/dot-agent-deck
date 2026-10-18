@@ -2303,12 +2303,17 @@ where
     // sees it.
     //
     // A turn starts with a report that the agent is working: thinking, a
-    // tool, compacting or a permission request (r8k R8G-02). Every supported
-    // agent reports its turn's start as Thinking. An Idle with no turn under
+    // tool starting, compacting or a permission request (r8k R8G-02). Every
+    // supported agent reports its turn's start as Thinking. A tool FINISHING
+    // starts nothing: a ToolEnd that arrives after its turn's Idle would
+    // otherwise open a turn the next Idle "ends", releasing Escapes that
+    // opened a menu meanwhile (Qodo r8, PR #1735). An Idle with no turn under
     // way releases nothing: a repeated Idle (OpenCode sends two) must not
-    // release the Escapes that opened a menu on an agent already Idle. A line
-    // `dot-agent-deck wrap` classified from the child's output proves only
-    // that it printed something, so it starts no turn; a wrapper-only agent
+    // release the Escapes that opened a menu on an agent already Idle. A
+    // line `dot-agent-deck wrap` classified from the child's output proves
+    // only that it printed something, or stopped printing, so it neither
+    // starts nor ends a turn: a wrapped Codex's quiet-output Idle does not
+    // end a turn its hooks reported (Qodo r8). A wrapper-only agent
     // therefore never releases, and its Escapes hold until the user's Enter.
     //
     // Only the generation that sent it counts, as for the quota latch: the
@@ -2319,16 +2324,12 @@ where
     // agent's, and a subagent's turn is not the main thread's the user
     // interrupted.
     let turn_edge = match event.event_type {
+        _ if event.is_wrapper_output_classified() => None,
         crate::event::EventType::Idle => Some(crate::agent_pty::TurnEdge::Ended),
         crate::event::EventType::Thinking
         | crate::event::EventType::ToolStart
-        | crate::event::EventType::ToolEnd
         | crate::event::EventType::Compacting
-        | crate::event::EventType::PermissionRequest
-            if !event.is_wrapper_output_classified() =>
-        {
-            Some(crate::agent_pty::TurnEdge::Started)
-        }
+        | crate::event::EventType::PermissionRequest => Some(crate::agent_pty::TurnEdge::Started),
         _ => None,
     };
     if !unproven
@@ -15440,6 +15441,21 @@ mod hook_provenance_audit_tests {
 
         /// The agent reports `kind` (`thinking`, `idle`, …) about itself.
         async fn report(&self, kind: &str) {
+            self.report_with(kind, serde_json::json!({})).await;
+        }
+
+        /// `kind` as `dot-agent-deck wrap` classifies it from the agent's
+        /// output, in its name.
+        async fn report_classified(&self, kind: &str) {
+            let mut metadata = serde_json::Map::new();
+            metadata.insert(
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.into(),
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.into(),
+            );
+            self.report_with(kind, metadata.into()).await;
+        }
+
+        async fn report_with(&self, kind: &str, metadata: serde_json::Value) {
             let mut payload = line(
                 &format!("{}-session", self.pane),
                 Some(&self.pane),
@@ -15448,6 +15464,7 @@ mod hook_provenance_audit_tests {
                 None,
             );
             payload["agent_type"] = self.agent_type.into();
+            payload["metadata"] = metadata;
             ingest_event_unless(
                 &self.state,
                 &self.event_tx,
@@ -15939,6 +15956,70 @@ mod hook_provenance_audit_tests {
             "the replaced agent's keys, recorded late, were taken as its \
              successor's draft"
         );
+    }
+
+    /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, the agent
+    /// reports Thinking and the user presses Escape twice. An Idle that
+    /// `dot-agent-deck wrap` classified from the agent's output then arrives,
+    /// as a wrapped Codex's quiet output sends it. Output going quiet is not
+    /// the agent reporting its turn over, so the Escapes must keep holding
+    /// the doorbell; the agent's own Idle then releases them.
+    #[spec("inbox/doorbell/029")]
+    #[tokio::test]
+    async fn doorbell_029_a_wrapper_classified_idle_ends_no_reported_turn() {
+        for agent_type in ["claude_code", "codex", "opencode", "pi"] {
+            let pane = TurnPane::new(&format!("classified-idle-{agent_type}"), agent_type);
+            pane.report("thinking").await;
+            pane.keys(&[0x1b, 0x1b]).await;
+            pane.report_classified("idle").await;
+            let after_classified = pane.holds();
+            pane.report("idle").await;
+            let after_own = pane.holds();
+            pane.registry.shutdown_all();
+
+            assert!(
+                after_classified,
+                "{agent_type}: a wrapper-classified Idle ended the turn the \
+                 agent reported, releasing its Escapes"
+            );
+            assert!(
+                !after_own,
+                "{agent_type}: the agent's own Idle must release them"
+            );
+        }
+    }
+
+    /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, the agent
+    /// finishes a turn (Thinking, then Idle) and the user presses Escape
+    /// twice on the Idle agent — a menu. A ToolEnd of that finished turn
+    /// then arrives late, followed by another Idle. A tool finishing starts
+    /// no turn, so the Escapes must keep holding the doorbell; the agent's
+    /// next Thinking then Idle releases them.
+    #[spec("inbox/doorbell/030")]
+    #[tokio::test]
+    async fn doorbell_030_a_late_tool_end_starts_no_turn() {
+        for agent_type in ["claude_code", "codex", "opencode", "pi"] {
+            let pane = TurnPane::new(&format!("late-tool-end-{agent_type}"), agent_type);
+            pane.report("thinking").await;
+            pane.report("idle").await;
+            pane.keys(&[0x1b, 0x1b]).await;
+            pane.report("tool_end").await;
+            pane.report("idle").await;
+            let after_late_tool_end = pane.holds();
+            pane.report("thinking").await;
+            pane.report("idle").await;
+            let after_turn = pane.holds();
+            pane.registry.shutdown_all();
+
+            assert!(
+                after_late_tool_end,
+                "{agent_type}: a late ToolEnd then Idle released a menu's Escapes"
+            );
+            assert!(
+                !after_turn,
+                "{agent_type}: the agent's next turn ending must release them"
+            );
+        }
     }
 
     /// Scenario: Agent A exits and agent B replaces it on a pane, and an

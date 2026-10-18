@@ -8448,6 +8448,22 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
+##### inbox/doorbell/029 — A wrapper-classified Idle ends no turn the agent reported.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path against a real registry and a stand-in PTY.
+- **Agent:** none (`cat`), events typed as Claude Code, Codex, OpenCode and Pi.
+- **Asserts:** with the agent Thinking and two Escapes recorded, an Idle carrying the `dot-agent-deck wrap` output-classified mark (what a wrapped Codex's quiet output sends) leaves the doorbell held; the agent's own Idle then releases it.
+- **Does not assert:** the wrapper producing that Idle (`src/wrap.rs`'s quiet-output tests), or an unclassified Idle the wrapper sends at process exit.
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/030 — A late ToolEnd starts no turn.
+- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path against a real registry and a stand-in PTY.
+- **Agent:** none (`cat`), events typed as Claude Code, Codex, OpenCode and Pi.
+- **Asserts:** after a turn (Thinking, Idle), two Escapes pressed on the Idle agent, then a ToolEnd and another Idle, leave the doorbell held; the agent's next Thinking then Idle releases them.
+- **Does not assert:** a real agent delivering a ToolEnd after its Idle (the daemon cannot tell a late one from a timely one, so none starts a turn).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
 #### inbox/boundary
 
 ##### inbox/boundary/001 — The legacy ack-wait touches only legacy-owned assignments.
