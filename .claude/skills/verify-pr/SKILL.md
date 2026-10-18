@@ -84,7 +84,7 @@ Re-running on a PR that has been pushed to since: `setup.sh <n> --force`.
 
 **`WORKFLOWS_AWAITING_APPROVAL` from Phase 0 is non-zero.** GitHub withholds Actions runs on a fork PR from an outside contributor until a maintainer approves them, so the PR can look checked while every job that matters never ran. Do this now, before Phase 2, so CI runs alongside the local suite and its results are in hand by Phase 6.
 
-**Why this is not optional.** CI is not a duplicate of `checks.sh` — it is the only source for things the local run *cannot* produce: `build-macos` and `build-windows` each do a real `cargo build` + `clippy -D warnings` + `cargo nextest run` on the real OS, and `security` runs `cargo audit`. Locally, `windows-cross` is a type-check proxy that fails outright on machines without an MSVC cross-toolchain, and there is no macOS proxy at all. Measured on #334: `CI` and `Docs` sat at `action_required` on every head commit for two days, so a Linux-only local run was the sole verification of a PR that was otherwise reported as green.
+**Why this is not optional.** CI is not a duplicate of `checks.sh` — it is the only source for things the local run *cannot* produce: `build-macos` does a real `cargo build` + `clippy -D warnings` + `cargo nextest run` on the real OS (`build-windows` does the same on Windows when enabled — it is `if: false` until Windows ships, so it reports `skipped`), and `security` runs `cargo audit`. Locally, `windows-cross` is a type-check proxy that fails outright on machines without an MSVC cross-toolchain, and there is no macOS proxy at all. Measured on #334: `CI` and `Docs` sat at `action_required` on every head commit for two days, so a Linux-only local run was the sole verification of a PR that was otherwise reported as green.
 
 **The safety bar here is higher than Phase 0's.** Phase 0 asks "is it safe to check this out on my machine?" Approving asks "is it safe to execute this in CI, where repository secrets live?" Two things follow:
 
@@ -246,7 +246,7 @@ Template:
 ## CI
 <per-job conclusions from `gh pr checks`, or "held for approval — released in Phase 1b" /
 "not approved, see blocking findings". Name the jobs the local run cannot replace:
-build-macos, build-windows, security (cargo audit), and e2e-deterministic — lane 1
+build-macos, security (cargo audit), and e2e-deterministic — lane 1
 is CI's job now, so quote its conclusion here rather than a local `e2e` row.
 State lane 2 explicitly: run by you with your own credentials (name the tests), or
 UNVERIFIED. Nothing in CI covers it.>
@@ -265,10 +265,11 @@ UNVERIFIED. Nothing in CI covers it.>
 
 ## NOT verified
 <skipped real-agent tests; the rule 12 cross-version test if it was not run;
-anything --no-e2e or --only skipped. macOS and Windows belong here ONLY while
-their CI jobs have not gone green — once Phase 1b released the runs and
-build-macos / build-windows / security passed, report them as verified by CI
-instead, and say so.>
+anything --no-e2e or --only skipped. Windows belongs here always while
+`build-windows` is `if: false` — a `skipped` conclusion verifies nothing, so never
+report it as verified by CI. macOS belongs here ONLY while its CI job has not gone
+green — once Phase 1b released the runs and build-macos / security passed, report
+them as verified by CI instead, and say so.>
 ```
 
 ## Phase 7 — Close out
