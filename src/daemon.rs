@@ -15829,6 +15829,118 @@ mod hook_provenance_audit_tests {
         );
     }
 
+    /// Scenario: The agent reports Thinking and the user presses Escape
+    /// twice. The PTY takes both keys, and the agent's Idle — the turn the
+    /// Escapes interrupted ending — is ingested after the write returned but
+    /// before the deck reads the turn count for those keys. The deck cannot
+    /// tell that Idle from one that came before the keys, so the Escapes
+    /// must hold the doorbell until the user's Enter — pressed twice, since
+    /// an Enter right after an Escape reads as Alt+Enter.
+    #[spec("inbox/doorbell/027")]
+    #[tokio::test]
+    async fn doorbell_027_an_idle_between_the_write_and_its_count_holds_the_doorbell() {
+        let pane = TurnPane::new("escape-idle-before-count", "opencode");
+        pane.report("thinking").await;
+        let (after_write, release) = pane
+            .registry
+            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::AfterWrite);
+        let write = pane.keys_in_background(&[0x1b, 0x1b]);
+        reached(after_write, "the write never returned").await;
+        pane.report("idle").await;
+        release.send(()).unwrap();
+        write.await.unwrap();
+        let held = pane.holds();
+        pane.keys(b"\r").await;
+        pane.keys(b"\r").await;
+        let after_enter = pane.holds();
+        pane.registry.shutdown_all();
+        assert!(
+            held,
+            "an Idle ingested between the write and its turn-count reading \
+             released the Escapes"
+        );
+        assert!(!after_enter, "the user's Enter must release them");
+    }
+
+    /// Scenario: Agent A is sent keys, and its PTY takes them, but the deck
+    /// has not recorded them yet when A exits on its own and agent B replaces
+    /// it on the pane. B finishes a turn and the user presses Escape twice
+    /// on Idle B, which holds the doorbell; A's Escapes are then recorded.
+    /// B's Escapes must keep holding. And when A's late keys are text
+    /// instead, B, with nothing typed, must hold nothing: A's keys are not
+    /// B's input.
+    #[spec("inbox/doorbell/028")]
+    #[tokio::test]
+    async fn doorbell_028_a_replaced_agents_late_keys_do_not_reach_its_successors_input() {
+        async fn late_keys_after_handover(
+            pane_id: &str,
+            late: &'static [u8],
+            successor: impl AsyncFnOnce(&TurnPane),
+        ) -> bool {
+            let temp = crate::test_temp::tempdir().unwrap();
+            let exit_file = temp.path().join("exit");
+            let script = temp.path().join("exits-on-request.sh");
+            crate::test_isolation::write_script(
+                &script,
+                "#!/bin/sh\nwhile [ ! -e \"$EXIT_FILE\" ]; do sleep 0.01; done\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let old = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(script.to_str().unwrap()),
+                    env: vec![
+                        (DOT_AGENT_DECK_PANE_ID.into(), pane_id.into()),
+                        ("EXIT_FILE".into(), exit_file.to_string_lossy().into_owned()),
+                    ],
+                    ..Default::default()
+                })
+                .expect("spawn the agent that exits");
+            let old_pane = TurnPane::with(registry.clone(), pane_id, old, "opencode");
+            let (at_record, release) =
+                registry.pause_next_pty_write_for_test(pane_id, PtyWritePause::BeforeRecord);
+            let write = old_pane.keys_in_background(late);
+            reached(at_record, "the old agent's write never reached its record").await;
+            std::fs::write(&exit_file, b"").unwrap();
+            wait_until_nothing_lives(&registry).await;
+            let new = spawn(&registry, Some(pane_id), "cat");
+            let pane = TurnPane::with(registry.clone(), pane_id, new, "opencode");
+            successor(&pane).await;
+            release.send(()).unwrap();
+            write.await.unwrap();
+            let holds = pane.holds();
+            registry.shutdown_all();
+            holds
+        }
+
+        let menu_holds = late_keys_after_handover(
+            "late-escapes-after-handover",
+            &[0x1b, 0x1b],
+            async |pane: &TurnPane| {
+                pane.report("thinking").await;
+                pane.report("idle").await;
+                pane.keys(&[0x1b, 0x1b]).await;
+                assert!(pane.holds(), "precondition: the successor's menu holds");
+            },
+        )
+        .await;
+        let text_holds =
+            late_keys_after_handover("late-text-after-handover", b"a", async |_: &TurnPane| {})
+                .await;
+
+        assert!(
+            menu_holds,
+            "the replaced agent's Escapes, recorded late, released its \
+             successor's menu"
+        );
+        assert!(
+            !text_holds,
+            "the replaced agent's keys, recorded late, were taken as its \
+             successor's draft"
+        );
+    }
+
     /// Scenario: Agent A exits and agent B replaces it on a pane, and an
     /// attached client already shows B's card. A's reports with no agent id —
     /// a running report under B's card key, one under a key of A's own, and a

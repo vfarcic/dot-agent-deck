@@ -2474,7 +2474,10 @@ pub struct RunningAgent {
     /// [`AgentPtyRegistry::close_agent`] and
     /// [`AgentPtyRegistry::respawn_agent_for_pane`] when this record leaves the
     /// registry, so a write already holding that writer cannot record into
-    /// [`PaneInputState`] after the removal. An atomic beside the writer rather
+    /// [`PaneInputState`] after the removal. Also set when a successor is
+    /// published on this record's pane (PRD #1666, r8k B01), which a record
+    /// that exited on its own survives in the registry: its writer must not
+    /// record into the successor's stream either. An atomic beside the writer rather
     /// than a field behind its async lock, because the removal paths are
     /// synchronous and must not wait on a writer another task holds.
     pub pane_retired: Arc<AtomicBool>,
@@ -3619,9 +3622,14 @@ impl PaneInputState {
     /// have come after the bytes — it may have come before them, and Escapes
     /// written to an agent that had just gone Idle open a menu there — so it
     /// is not applied, and the Escapes hold until the next turn ends or the
-    /// user's Enter. That ambiguous window is decided towards holding. A reset
-    /// stream (a new owner since the reading) has a lower count and is also
-    /// left alone.
+    /// user's Enter. That ambiguous window is decided towards holding.
+    ///
+    /// The count is this stream's, not an identity: a stream reset for a new
+    /// owner since the reading can have counted past it. Bytes of a previous
+    /// owner never reach this, because the handover retires every writer
+    /// still on the pane before it resets the stream (see
+    /// [`PaneWriter::retired`]), and [`InputRecorder::record`] skips a retired
+    /// writer.
     fn settle_written_bytes(&mut self, pane_id_env: &str, turns_after_write: u64) {
         if let Some(stream) = self.input.get_mut(pane_id_env)
             && stream.turns > turns_after_write
@@ -3675,12 +3683,14 @@ pub struct PaneWriter {
     /// [`InputRecorder`].
     pty: PtyWriterThread,
     state: Arc<Mutex<PaneInputState>>,
-    /// Issue #542: set once this writer's agent has left the registry — the
+    /// Issue #542: set once this writer's agent has left the registry, or
+    /// (PRD #1666, r8k B01) once a successor is published on its pane — the
     /// same flag as [`RunningAgent::pane_retired`]. From then on nothing written
     /// through this writer records anything in [`PaneInputState`].
     ///
-    /// Read only while holding `state`'s lock, and set by the removal path
-    /// BEFORE it takes that lock to prune the pane. So a record made through
+    /// Read only while holding `state`'s lock, and set by the removal path,
+    /// and by the publication that resets the pane's stream, BEFORE it takes
+    /// that lock to prune or reset the pane. So a record made through
     /// this writer is either made before the prune (and removed by it) or finds
     /// the flag already set (and is skipped). A write or a guarded send that
     /// passed its ownership check before the close and finishes after it can no
@@ -3900,6 +3910,8 @@ impl InputRecorder {
 pub(crate) enum PtyWritePause {
     /// Before a PTY write.
     BeforeWrite,
+    /// After the write returned, before its turn count is read.
+    AfterWrite,
     /// After the write returned and its turn count was read, before its
     /// bytes are recorded.
     BeforeRecord,
@@ -4360,6 +4372,8 @@ fn write_once_recorded(
     #[cfg(test)]
     recorder.pause_at(PtyWritePause::BeforeWrite);
     let n = w.write(buf)?;
+    #[cfg(test)]
+    recorder.pause_at(PtyWritePause::AfterWrite);
     let turns = recorder.turns_after_write();
     #[cfg(test)]
     recorder.pause_at(PtyWritePause::BeforeRecord);
@@ -9909,6 +9923,18 @@ impl AgentPtyRegistry {
         // prompt-loss finding. Done here, under the same lock as the duplicate
         // check, so the record cannot outlive the handover.
         if let Some(ref claimed) = pane_id_env {
+            // PRD #1666 (r8k B01): every record still on the pane — exited, or
+            // the check above would have refused this one — stops recording
+            // into it, BEFORE the reset below takes the pane-state lock (see
+            // [`PaneWriter::retired`]). A write such a predecessor's PTY took
+            // before it exited and records only now would otherwise land in
+            // this agent's fresh stream and settle it against the
+            // predecessor's turn count, releasing this agent's Escapes.
+            for agent in inner.agents.values() {
+                if agent.pane_id_env.as_deref() == Some(claimed.as_str()) {
+                    agent.pane_retired.store(true, Ordering::SeqCst);
+                }
+            }
             self.forget_pane_input(claimed);
             if busy_before_publication {
                 self.pane_input
