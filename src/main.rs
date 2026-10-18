@@ -4699,3 +4699,5 @@ mod tests {
 // rwx-eval scenario S3a-src
 
 // rwx-eval scenario S3b-src
+
+// rwx-eval scenario S3c-src
