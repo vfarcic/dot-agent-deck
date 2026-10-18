@@ -1,0 +1,144 @@
+# The 4-CPU variant of .rwx/ci.yml: the same task graph with every task on a
+# 4 CPU / 16 GB runner, the size of a GitHub `ubuntu-latest`, so the RWX
+# platform can be compared with GitHub Actions on equal hardware. It differs
+# from ci.yml only in runner sizes and tool-cache names (separate caches, so
+# the two configs never warm each other). Generated from ci.yml; regenerate it
+# rather than editing the two apart.
+
+on:
+  github:
+    push:
+      if: ${{ event.git.branch == 'rwx-eval' }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+  # `rwx run` from the worktree: runs the local uncommitted changes on top of
+  # the pushed HEAD, without a push and without starting GitHub Actions.
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.2.0
+
+# Incremental `target/` and `~/.cargo` between runs — the counterpart of
+# Swatinem/rust-cache in ci.yml. Without it every content-cache miss compiles
+# from scratch. The vault holds no secrets; it must be unlocked for `rwx-eval`
+# and have "Allow public repositories" on.
+tool-cache:
+  vault: dot_agent_deck_rwx_eval
+
+tasks:
+  - key: system-packages
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+        libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
+        build-essential pkg-config
+      sudo apt-get clean
+
+  - key: code
+    call: git/clone 2.2.0
+    with:
+      repository: https://github.com/vfarcic/dot-agent-deck.git
+      ref: ${{ init.commit-sha }}
+      # Some fast-tier tests run `git rev-parse --show-toplevel`.
+      preserve-git-dir: true
+
+  - key: rust
+    call: rust-lang/install 1.1.1
+    with:
+      rust-version: 1.98.1
+
+  - key: nextest
+    use: rust
+    run: |
+      mkdir -p "$HOME/.cargo/bin"
+      curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "$HOME/.cargo/bin"
+      cargo nextest --version
+
+  - key: go-task
+    run: |
+      curl -LsSf https://github.com/go-task/task/releases/download/v3.53.1/task_linux_amd64.tar.gz \
+        | sudo tar zxf - -C /usr/local/bin task
+      task --version
+
+  - key: fmt
+    use: [code, rust]
+    run: cargo fmt --check
+
+  - key: clippy
+    use: [system-packages, code, rust]
+    tool-cache: ci4cpu-clippy
+    runner:
+      cpus: 4
+      memory: 16gb
+    run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
+
+  - key: build-release
+    use: [system-packages, code, rust]
+    tool-cache: ci4cpu-build-release
+    runner:
+      cpus: 4
+      memory: 16gb
+    run: cargo build --release
+
+  - key: linkage-check
+    use: build-release
+    run: cargo xtask linkage-check
+
+  - key: test
+    use: [system-packages, code, rust, nextest, go-task]
+    tool-cache: ci4cpu-test
+    runner:
+      cpus: 4
+      memory: 16gb
+    env:
+      DAD_REQUIRE_GO_TASK: "1"
+      # Line tables keep file:line in panics and backtraces but drop the rest
+      # of the debug info, which is most of `target/`'s size and link time.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    run: cargo test-fast
+    outputs:
+      test-results:
+        - path: target/nextest/default/junit.xml
+          options:
+            language: Rust
+            framework: cargo-nextest
+
+  # Compile the e2e tier once into a nextest archive. The partitions run the
+  # archive, so they never invoke cargo: a cargo run there rebuilds the
+  # workspace crates, whose sources get fresh mtimes in every task.
+  - key: e2e-build
+    use: [system-packages, code, rust, nextest]
+    tool-cache: ci4cpu-e2e-build
+    # The e2e `target/` plus its archive needs well over the default 50 GB.
+    runner:
+      cpus: 4
+      memory: 16gb
+      disk: 150gb
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    run: cargo nextest archive --workspace --features e2e --archive-file e2e.tar.zst
+
+  # Four runners the size of a GitHub `ubuntu-latest` (4 vCPU / 16 GB), so the
+  # timing-sensitive e2e tests see the per-runner load they see in ci.yml, and
+  # the speed-up comes from partitioning rather than from bigger machines.
+  - key: e2e
+    use: e2e-build
+    parallel: 4
+    runner:
+      cpus: 4
+      memory: 16gb
+      disk: 150gb
+    run: |
+      cargo nextest run --archive-file e2e.tar.zst --workspace-remap . --retries 1 \
+        --partition "count:$((RWX_PARALLEL_INDEX + 1))/$RWX_PARALLEL_TOTAL"
+    outputs:
+      # Nothing uses a partition's filesystem; uploading it cost 5 minutes.
+      filesystem: false
+      test-results:
+        - path: target/nextest/default/junit.xml
+          options:
+            language: Rust
+            framework: cargo-nextest

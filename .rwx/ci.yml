@@ -12,6 +12,11 @@ on:
       if: ${{ event.git.branch == 'rwx-eval' }}
       init:
         commit-sha: ${{ event.git.sha }}
+  # `rwx run` from the worktree: runs the local uncommitted changes on top of
+  # the pushed HEAD, without a push and without starting GitHub Actions.
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
 
 base:
   image: ubuntu:24.04
@@ -38,6 +43,8 @@ tasks:
     with:
       repository: https://github.com/vfarcic/dot-agent-deck.git
       ref: ${{ init.commit-sha }}
+      # Some fast-tier tests run `git rev-parse --show-toplevel`.
+      preserve-git-dir: true
 
   - key: rust
     call: rust-lang/install 1.1.1
@@ -89,6 +96,9 @@ tasks:
       memory: 64gb
     env:
       DAD_REQUIRE_GO_TASK: "1"
+      # Line tables keep file:line in panics and backtraces but drop the rest
+      # of the debug info, which is most of `target/`'s size and link time.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     run: cargo test-fast
     outputs:
       test-results:
@@ -97,15 +107,20 @@ tasks:
             language: Rust
             framework: cargo-nextest
 
-  # Compile the e2e tier once; the partitions below inherit this task's
-  # `target/` through `use` instead of each compiling it again.
+  # Compile the e2e tier once into a nextest archive. The partitions run the
+  # archive, so they never invoke cargo: a cargo run there rebuilds the
+  # workspace crates, whose sources get fresh mtimes in every task.
   - key: e2e-build
     use: [system-packages, code, rust, nextest]
     tool-cache: ci-e2e-build
+    # The e2e `target/` plus its archive needs well over the default 50 GB.
     runner:
       cpus: 16
       memory: 64gb
-    run: cargo nextest list --workspace --features e2e > /dev/null
+      disk: 150gb
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    run: cargo nextest archive --workspace --features e2e --archive-file e2e.tar.zst
 
   # Four runners the size of a GitHub `ubuntu-latest` (4 vCPU / 16 GB), so the
   # timing-sensitive e2e tests see the per-runner load they see in ci.yml, and
@@ -116,8 +131,13 @@ tasks:
     runner:
       cpus: 4
       memory: 16gb
-    run: cargo test-e2e --retries 1 --partition "count:$((RWX_PARALLEL_INDEX + 1))/$RWX_PARALLEL_TOTAL"
+      disk: 150gb
+    run: |
+      cargo nextest run --archive-file e2e.tar.zst --workspace-remap . --retries 1 \
+        --partition "count:$((RWX_PARALLEL_INDEX + 1))/$RWX_PARALLEL_TOTAL"
     outputs:
+      # Nothing uses a partition's filesystem; uploading it cost 5 minutes.
+      filesystem: false
       test-results:
         - path: target/nextest/default/junit.xml
           options:

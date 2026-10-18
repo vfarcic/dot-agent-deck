@@ -290,7 +290,7 @@ jobs:
   # needs only Node + pnpm, so it starts (and fails) fast.
   desktop-web:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: ${{ !startsWith(github.ref, 'refs/heads/rwx-eval') && (needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -361,7 +361,7 @@ jobs:
   # touch the bundle this job builds.
   desktop-browser:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: ${{ !startsWith(github.ref, 'refs/heads/rwx-eval') && (needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true') }}
     runs-on: ubuntu-latest
     # NOT a measured runner wall clock — this job's own first run is the first
     # measurement, so this is derived rather than observed. Measured on a warm
@@ -476,7 +476,7 @@ jobs:
   # point: the handshake it checks has two ends.
   desktop-driver:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: ${{ !startsWith(github.ref, 'refs/heads/rwx-eval') && (needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true') }}
     runs-on: ubuntu-latest
     # Measured once, on run 36231844544 (a workflow_dispatch of this job's own
     # branch, cold rust-cache): 6m55s end to end — the app's `tauri build`
@@ -562,7 +562,12 @@ jobs:
           # tidiness rather than a leak.
           retention-days: 7
 
-  build:
+  # rwx-eval: the optimized layout being compared with RWX. The serial `build`
+  # job and the single `e2e-deterministic` job on `main` are split into parallel
+  # jobs; `build` and `e2e-deterministic` survive as aggregators so the required
+  # contexts and `notify-main-red` keep their names. The rationale comments for
+  # every command below are on `main`'s copy of this file and are unchanged.
+  fmt:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
@@ -573,133 +578,77 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: 1.98.1
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          tool: cargo-nextest@0.9.146
-      # The desktop crate's Linux build deps, needed because clippy/nextest below
-      # run with --workspace, which includes desktop/src-tauri
-      # (dot-agent-deck-desktop). Without them that crate fails to build on this
-      # runner at all.
-      #
-      # The first five are Tauri's. `libasound2-dev` is PRD #802 M7's: the crate
-      # declares `cpal` for microphone capture, and on Linux its `alsa-sys`
-      # build script resolves `alsa` through pkg-config. macOS needs nothing for
-      # CoreAudio and Windows nothing for WASAPI, so this line is Linux-shaped.
-      # The same set is declared in `tauri-deps/flake.nix` for a devbox shell,
-      # in the `e2e-deterministic` and `desktop-driver` jobs, and in
-      # release.yml's bundle job — keep the five in step.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
-      - run: cargo fmt --check
-      # Issue #407 — `--all-targets --features e2e`, not the bare `cargo clippy`
-      # this used to be. Both flags are load-bearing: without `--all-targets`
-      # cargo builds only lib and bin targets, and every `tests/e2e_*.rs` opens
-      # with `#![cfg(feature = "e2e")]`, so without the feature they compile to
-      # empty crates. The old invocation therefore type-checked NO test file at
-      # all — verified by injecting an E0308 into tests/e2e_handshake.rs, which
-      # both `cargo clippy` and `cargo clippy --all-targets` reported clean.
-      #
-      # Until this step existed, e2e code was linted by nothing anywhere and
-      # type-checked only by `cargo test-e2e`, which at the time ran in no
-      # workflow at all. Since issue #502 lane 1 DOES run in CI — see
-      # `e2e-deterministic` below — but this step is still only a type-check and
-      # lint: it runs no test and needs no agent or API key, so naming the e2e
-      # features here neither duplicates that job nor gives this one a
-      # credential. It just makes the local rule 2 gate something a contributor
-      # cannot forget to run.
-      #
-      # Linux only. build-windows/build-macos below stay on bare `cargo clippy`
-      # for the reason documented there, reinforced here: the L2 tier is
-      # Unix-only in practice, so `--features e2e` against the Windows target
-      # yields dozens of E0425s (scripts/windows-cross-check.sh, issue #164).
-      #
-      # `--workspace` (issue #436): cargo's default target selection is the
-      # root package ALONE, so `xtask/docs`, `xtask/linkage-check` and
-      # `xtask/spec` were linted by no gate anywhere. `xtask/spec` and
-      # `xtask-docs` are path dev-deps so they were at least built, but
-      # building is not linting and `xtask/linkage-check` was not even built.
-      # A live `unnecessary_sort_by` had been sitting in its `clean_tmp.rs`
-      # unnoticed; it is fixed in the same commit that added this flag, so the
-      # widened gate landed green rather than red on its first run.
-      #
-      # `e2e-live` (issue #502): the credentialed subset of the L2 suite now
-      # opens with `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so
-      # under `--features e2e` alone those files compile to empty crates —
-      # exactly the #407 hole above, reopened for a third of the tier. Measured
-      # the same way #407 was: with an E0308 injected into
-      # tests/e2e_dispatcher_mode.rs, `--features e2e` exited 0 and
-      # `--features e2e,e2e-live` failed with that E0308. This step is still a
-      # type-check and lint only — it runs no test and needs no credential, so
-      # naming `e2e-live` here does not put lane 2 into this job.
-      #
-      # THAT FLAG NOW CARRIES THE WHOLE WEIGHT. Lane 2 does not run in CI at
-      # all — no e2e test reaches a real agent there, so no TEST credential is
-      # registered on this repository (the separately credentialed Codex
-      # issue-labeler is out of scope; see the e2e-deterministic job's comment
-      # and docs/develop/issue-labeling.md) — which makes this step the ONLY
-      # thing in CI that compiles the lane-2 files. Drop `e2e-live` from this
-      # line and they go back to being checked by nothing until a developer
-      # runs them.
       - run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
+
+  build-release:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
       - run: cargo build --release
-      # Issue #324: `release_channel_vars_005` runs the Homebrew/Scoop tasks
-      # through go-task itself, since go-task's built-in shell — not bash — is
-      # what executes them in release.yml's `finalize`. It skips where `task` is
-      # absent, so this installs it with the same pinned action and the same
-      # `3.x` spec as `finalize`, and DAD_REQUIRE_GO_TASK on the nextest step
-      # turns a skip into a failure — without it a missing install would read
-      # as green.
-      #
-      # `repo-token` because the action resolves `3.x` through GitHub's API and
-      # has no default token: unauthenticated, it shares the runner IP's
-      # 60-requests-an-hour limit and fails the job on `API rate limit
-      # exceeded` (PR #1465's `build`, run 36814458923). The token is this
-      # workflow's read-only one (`permissions:` above).
+      - run: cargo xtask linkage-check
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
       - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52 # v3.0.0
         with:
           version: 3.x
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      # `cargo nextest run`, NOT `cargo test` — the same runner as the
-      # `cargo test-fast` local gate, and as build-macos/build-windows which
-      # already use it. `cargo test` runs the whole tier in ONE process with
-      # parallel threads; nextest gives each test its own process.
-      #
-      # That difference produced real flakes. On 2026-07-30, two different
-      # timing-sensitive tests failed here and nowhere else:
-      # `delegate_injects_single_line_pointer_and_keeps_footer_in_task_file`
-      # (waiting on a PTY write; task file came back empty) and
-      # `login_shell::tests::captures_path_despite_large_stdout_banner`
-      # (subprocess plus a large stdout drain). Both passed on re-run with no
-      # code change, both passed on macOS and Windows in the SAME runs, and
-      # `cargo nextest run` passed 1343/1343 locally throughout — the three jobs
-      # were a natural experiment and only the `cargo test` one flaked.
-      #
-      # Aligning the runners also makes a CI failure reproducible locally, which
-      # neither of those was, and makes "green locally" mean the same thing as
-      # "green in CI".
-      #
-      # `--workspace` (issue #489, duplicate #470) — the test-side sibling of
-      # the same flag on the clippy step above, and it must stay in lockstep
-      # with the `test-fast` alias in .cargo/config.toml for the "green locally
-      # == green in CI" claim in the previous paragraph to hold. Cargo's
-      # default selection is the root package alone, so the tests in
-      # `xtask/linkage-check` and `xtask/docs` ran in NO gate anywhere: 1657
-      # tests without the flag, 1705 with it. Clippy's `--workspace` still
-      # BUILT those tests, which is why only their runtime assertions were
-      # inert and the gap survived #436. Costs nothing measurable: all 48 are
-      # under 40ms and the tier's wall clock is set by its slowest test.
       - run: cargo nextest run --workspace
         env:
-          # Issue #324: see the go-task step above.
           DAD_REQUIRE_GO_TASK: "1"
-      # Issue #564: keep this attempt's results after a job-level re-run
-      # overwrites the conclusion. Full rationale on the identical step in
-      # `build-macos` below — the masking is a property of re-running any job,
-      # not of macOS, so all three test jobs carry it.
+          # Line tables keep file:line in panics and backtraces but drop the
+          # rest of the debug info, which is most of `target/`'s size and link
+          # time — and most of what this job's cache entry has to hold.
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
       - name: Preserve this attempt's test results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -707,114 +656,26 @@ jobs:
           name: nextest-linux-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
           if-no-files-found: warn
-      # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
-      # rule 7 fails the build if the Scenario comment is missing or the
-      # generator fails"), and the build-macos/build-windows comment says these
-      # steps "stay on the Linux job" — but no such step existed, so nothing
-      # enforced either claim. Added 2026-07-30 after a revert removed two
-      # `#[spec]`-annotated tests and left their tests/CATALOG.md entries
-      # orphaned: linkage-check was failing on main and no gate noticed, because
-      # it only ever ran when somebody invoked it by hand.
-      - run: cargo xtask linkage-check
 
-  # Issue #502 lane 1 — the DETERMINISTIC two thirds of the L2 e2e tier, run on
-  # every PR. This is the first job in this repository that has ever executed
-  # the e2e tier: until now `tests/e2e_*.rs` was type-checked by the `build`
-  # job's clippy step and run by nothing anywhere, which is what let #460 sit
-  # broken on main across 12 commits.
-  #
-  # `cargo test-e2e` is the alias in `.cargo/config.toml`. It enables the `e2e`
-  # cargo feature ALONE, which selects the `tests/e2e_*.rs` files needing no
-  # agent credential; the rest open with
-  # `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and compile to empty
-  # crates here, so they are never even built into this job. The credentialed
-  # superset is lane 2, and lane 2 runs ONLY on a developer's machine — no e2e
-  # test reaches a real agent in CI. `docs/develop/e2e-lanes.md` records why,
-  # and CLAUDE.md rule 5 is the policy.
-  #
-  # NO AGENT OR TEST CREDENTIAL REACHES THIS JOB, and that is the property the
-  # lane rests on rather than a detail: no ANTHROPIC_API_KEY, no OPENAI_API_KEY,
-  # no agent CLI credential. It declares no `environment:` and no job-level
-  # `env:` reading `secrets.*`, and no workflow anywhere registers a TEST
-  # credential — which is the point, because a test credential in a public
-  # repository's CI is a vulnerability that running it less often does not
-  # remove.
-  #
-  # This sentence used to continue "no other job in `ci.yml` does either", and
-  # since issue #1088 that is false: `notify-main-red` reads
-  # `secrets.TELEGRAM_BOT_TOKEN` and `secrets.TELEGRAM_CHAT_ID` to tell a human
-  # that a post-merge run went red. The narrower fact this lane actually needs is
-  # untouched — neither is an agent or a test credential, neither is registered on
-  # this repository today, and that job runs only on a `push` to main, so it
-  # cannot be reached from a `pull_request` run at all, let alone from this one.
-  #
-  # If a test here ever fails for want of a credential then the test is in the
-  # wrong lane: re-gate its file into `e2e-live`. DO NOT add a key here to make
-  # it pass.
-  #
-  # That is still NOT the same as "no secrets in this job", which this comment
-  # once claimed and which was false. The automatic GITHUB_TOKEN has not gone
-  # anywhere: `actions/checkout` below takes it as its default `token:` input
-  # and authenticates the fetch with it. What issue #811 changed is where it
-  # comes to REST. With `persist-credentials: false` on that checkout the action
-  # no longer writes it into `.git/config` as an auth header, so it is not
-  # sitting in the tree for the life of the job while this lane drives the PTY
-  # e2e tier — dozens of contributor-authored test binaries spawning the real
-  # deck. The note above `jobs:` has the survey behind that flag and why it went
-  # on all thirteen checkouts rather than only this one.
-  #
-  # SCOPE is still the outer bound and still does the heavier lifting: this
-  # workflow's top-level `permissions:` block grants `contents: read` and
-  # `pull-requests: read` and nothing else, and a fork `pull_request` run gets a
-  # read-only token whatever the block says (see
-  # `.claude/skills/verify-pr/SKILL.md`). The flag is a layer under that, not a
-  # replacement for it.
-  #
-  # That is deliberately NOT the wider claim "no agent credential reaches this
-  # repository's CI", which is false: the Codex issue-labeler
-  # (`issue-labeler.md`, `issue-labeler.lock.yml`, `issue-labeler-batch.yml`)
-  # passes the repository secret OPENAI_API_KEY into a `codex exec` step and
-  # genuinely reaches a real agent. That is a separate feature with its own
-  # threat model — `docs/develop/issue-labeling.md` — and out of scope for the
-  # e2e lanes. Do not cite it as precedent for putting a test key here.
-  #
-  # NO AGENT CLI is installed either, and that is deliberate rather than merely
-  # unnecessary. `scheduler/cli/002` in tests/e2e_scheduler_cli.rs writes a
-  # schedule whose `--command` is the literal string `claude` on a
-  # `*/5 * * * * *` cron. It asserts nothing about an agent and cannot fail for
-  # want of a credential, but with a real `claude` on PATH a mid-test firing
-  # would spawn one inside the test's isolated HOME. With none installed the
-  # spawn just fails into a pane nothing looks at, which is the behaviour this
-  # lane was classified against.
-  #
-  # NOT one of the four required checks. The required set is a repository
-  # ruleset (CLAUDE.md rule 8) and widening it is a separate, deliberate act —
-  # worth revisiting only once this job has enough honest runs to show whether
-  # the tier is stable on a runner at all.
-  e2e-deterministic:
+  # The required context: green only when every part above is.
+  build:
+    needs: [changes, fmt, clippy, build-release, test]
+    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failed="$(printf '%s' "$NEEDS_JSON" | jq -r '[to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"] | join(", ")')"
+          if [ -n "$failed" ]; then echo "not green: $failed"; exit 1; fi
+
+  # The e2e tier, compiled once into a nextest archive that the four
+  # partitions below run. Partitions running `cargo` themselves would each
+  # rebuild the workspace crates, whose sources get fresh mtimes on checkout.
+  e2e-build:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
-    # HOW THIS NUMBER WAS PICKED, and what it is not. It is NOT a measured
-    # runner wall clock: nobody has ever run this tier on a GitHub runner, so
-    # this job's own first run is the first measurement. It is derived from the
-    # bounds the tier already declares:
-    #
-    #   * `lifecycle/version/001` is in THIS lane and carries the largest kill
-    #     window in .config/nextest.toml — 120s x 10 = 20 minutes — because it
-    #     runs a nested `cargo build` into its own CARGO_TARGET_DIR and pays a
-    #     cold ~10-minute dependency build on a machine that has never run it.
-    #     Every fresh runner is exactly that machine.
-    #   * the tier compiles one test binary per lane-1 `tests/e2e_*.rs` file on
-    #     top of what `build` compiles.
-    #   * the remaining PTY scenarios sit at the default 3 x 60s kill window,
-    #     and they contend with each other on 4 vCPUs.
-    #
-    # 60 minutes leaves generous margin over the ~25-40 minutes those add up to
-    # while still capping a wedged PTY test at a sixth of the 6-hour runner
-    # default. Re-tune it downward once a few honest runs exist; do not raise it
-    # to paper over a hang.
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -826,53 +687,75 @@ jobs:
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-nextest@0.9.146
-      # The same Linux deps the `build` job installs, for the same reason: the
-      # alias carries `--workspace`, which includes desktop/src-tauri
-      # (dot-agent-deck-desktop), and without them that crate does not build on
-      # this runner at all. Locally the devbox shell lacks them too, which is
-      # issue #771 and why a local run needs `--exclude dot-agent-deck-desktop`;
-      # installing them here is the fix rather than narrowing the CI gate.
-      # `libasound2-dev` is PRD #802 M7's `cpal` — see the `build` job.
       - run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
-      # Issues #351/#818: a single ~16-21s stall lands on ONE arbitrary test per
-      # run on a `ubuntu-latest` runner, and reddens the tier wherever it hits.
-      # Measured across four reports of the same tree: `pane_input_007` 1.54s /
-      # 20.93s FAIL / 1.59s / 1.59s, `inline_001` 0.25s / 0.23s / 18.26s FAIL /
-      # 0.27s, `manager_016` 0.92s / 1.17s / 1.07s / 16.52s FAIL. Every victim
-      # is fast in every run but the one it failed in, so the stall is a
-      # property of the runner, not of any test: the tier's shape is unchanged
-      # across all four (17-18 tests over 10s, cpu-time 1244-1266s).
-      #
-      # It is NOT slower hardware — the median CI/local per-test ratio is 0.96x
-      # across the 2653 tests two reports share — so widening budgets does not
-      # reach it either: `manager_016` failed an ASSERTION (a mid-repaint
-      # snapshot compare), not a wait.
-      #
-      # `--retries 1` is scoped to CI deliberately. It is not rerun-until-green:
-      # a genuine regression fails BOTH attempts, and nextest reports a
-      # recovered run as FLAKY, so the underlying stall stays visible in this
-      # job's summary rather than being silently absorbed. The same reasoning
-      # and the same value already sit on `dispatch_015` in
-      # `.config/nextest.toml`. Local runs keep `retries = 0` so a developer
-      # still sees the raw signal.
-      - run: cargo test-e2e --retries 1
-      # Issue #564: keep THIS attempt's results after a job-level re-run
-      # overwrites the conclusion. Full rationale on the identical step in
-      # `build-macos`. It matters more here than anywhere else in this file:
-      # the e2e tier is the flakiest signal in the repository, a re-run is the
-      # only remedy on offer (`retries = 0`), and the JUnit XML carries the
-      # per-test wall clock that is the only way to tell a timing blip from a
-      # real regression.
+      - run: cargo nextest archive --workspace --features e2e --archive-file e2e.tar.zst
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: e2e-archive-attempt-${{ github.run_attempt }}
+          path: e2e.tar.zst
+          # Already zstd-compressed.
+          compression-level: 0
+          retention-days: 1
+
+  e2e:
+    needs: [changes, e2e-build]
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # Some e2e tests run a nested `cargo build`, so the toolchain is still
+      # needed even though the tier itself is not compiled here.
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: 1.98.1
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      # The desktop crate's test binaries link these libraries at run time.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: e2e-archive-attempt-${{ github.run_attempt }}
+      # Extracted into the checkout, so `target/` lands where the tests'
+      # compile-time paths (`env!("CARGO_BIN_EXE_dot-agent-deck")`) point.
+      - run: |
+          cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
+            --extract-to . --extract-overwrite --retries 1 \
+            --partition count:${{ matrix.partition }}/4
       - name: Preserve this attempt's test results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: nextest-e2e-attempt-${{ github.run_attempt }}
+          name: nextest-e2e-p${{ matrix.partition }}-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
           if-no-files-found: warn
+
+  # The required context: green only when every partition is.
+  e2e-deterministic:
+    needs: [changes, e2e-build, e2e]
+    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failed="$(printf '%s' "$NEEDS_JSON" | jq -r '[to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"] | join(", ")')"
+          if [ -n "$failed" ]; then echo "not green: $failed"; exit 1; fi
 
   # CLAUDE.md rule 12's cross-version check, `cargo xver`
   # (docs/develop/cross-version-harness.md), run on a runner instead of a
@@ -895,7 +778,7 @@ jobs:
   # with `scripts/apply-branch-protection.sh`, not something a PR can do.
   cross-version:
     needs: changes
-    if: needs.changes.outputs.binary == 'true'
+    if: ${{ !startsWith(github.ref, 'refs/heads/rwx-eval') && (needs.changes.outputs.binary == 'true') }}
     runs-on: ubuntu-latest
     # A cold build of one binary plus both directions' scenarios, each bounded
     # by the harness's own `--run-timeout-secs` (1200 by default).
@@ -1062,7 +945,7 @@ jobs:
   # runner with CC and AR unset is enough (verified).
   windows-cross-check:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: ${{ !startsWith(github.ref, 'refs/heads/rwx-eval') && (needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1114,7 +997,7 @@ jobs:
   # tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9), not M8.
   build-windows:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: ${{ !startsWith(github.ref, 'refs/heads/rwx-eval') && (needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1213,7 +1096,7 @@ jobs:
   # `cargo nextest run` runs the same test-fast tier as the Linux `build` job.
   build-macos:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: ${{ !startsWith(github.ref, 'refs/heads/rwx-eval') && (needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1282,7 +1165,7 @@ jobs:
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: ${{ !startsWith(github.ref, 'refs/heads/rwx-eval') && (needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1328,7 +1211,7 @@ jobs:
   # from-source release build of the whole crate.
   nix:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true'
+    if: ${{ !startsWith(github.ref, 'refs/heads/rwx-eval') && (needs.changes.outputs.devbox_only != 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1452,6 +1335,7 @@ jobs:
   # SCOPE: x86_64-linux only. The aarch64-darwin entries in devbox.lock stay
   # unvalidated; add a macos-latest leg if that gap starts to bite.
   devbox:
+    if: ${{ !startsWith(github.ref, 'refs/heads/rwx-eval') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
