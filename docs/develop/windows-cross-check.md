@@ -1,6 +1,6 @@
 # Checking a Windows compile locally, before CI
 
-**`build-windows` is switched off until Windows ships.** No release so far has carried a Windows build (all 108 up to v0.46.0, checked on 2026-10-18), so the job is skipped with `if: false` in `ci.yml` (its comment has why that rather than deleting it, and the condition to restore). Until it is re-enabled, the `windows-cross-check` job below is the only Windows gate in CI, and it is a type-check: no Windows test runs anywhere. The rest of this page describes `build-windows` as it behaves when enabled.
+**`build-windows` is switched off until Windows ships.** No release so far has carried a Windows build (all 108 up to v0.46.0, checked on 2026-10-18), so the job is skipped with `if: false` in `ci.yml` (its comment has why that rather than deleting it, and the condition to restore). Until it is re-enabled, the `windows-cross-check` job below is the only Windows check in CI, and it is a type-check and advisory, not required: no Windows test runs anywhere, and a Windows-only compile break it reports does not block a merge. The rest of this page describes `build-windows` as it behaves when enabled.
 
 ## The gap this closes
 

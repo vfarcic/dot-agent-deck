@@ -1285,8 +1285,14 @@ jobs:
   # out: `build-windows` is a REQUIRED context, and a required job skipped by its
   # own condition counts as passing (docs/develop/governance.md), so no ruleset,
   # `scripts/apply-branch-protection.sh` or reviewer change is needed; and
-  # Renovate keeps the pins below current while it is off. `windows-cross-check`
-  # still type-checks the Windows target on every PR.
+  # Renovate keeps the pins below current while it is off.
+  #
+  # What remains for Windows is `windows-cross-check`, a type-check of the
+  # workspace, tests included, for the Windows target, on every PR the `changes`
+  # gate does not skip. It is ADVISORY, not required, so while this job is off a
+  # Windows-only compile break can merge with every required check green. Making
+  # it required is a ruleset change (`scripts/apply-branch-protection.sh`), not a
+  # workflow one.
   #
   # To re-enable it when Windows ships, restore this condition:
   #   if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
