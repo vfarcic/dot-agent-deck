@@ -1,5 +1,7 @@
 # Checking a Windows compile locally, before CI
 
+**`build-windows` is switched off until Windows ships.** No release so far has carried a Windows build (all 108 up to v0.46.0, checked on 2026-10-18), so the job is skipped with `if: false` in `ci.yml` (its comment has why that rather than deleting it, and the condition to restore). Until it is re-enabled, the `windows-cross-check` job below is the only Windows gate in CI, and it is a type-check: no Windows test runs anywhere. The rest of this page describes `build-windows` as it behaves when enabled.
+
 ## The gap this closes
 
 `cargo test-fast`, `cargo test-e2e` and `cargo test-e2e-live` only ever compile for the host, which on every current dev machine is Linux. CI's `build-windows` job (`.github/workflows/ci.yml`) is therefore the *first* thing that ever compiles the tree for `x86_64-pc-windows-msvc` — so a Windows-only compile break is invisible locally and shows up as a red PR minutes later.

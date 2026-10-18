@@ -1277,9 +1277,22 @@ jobs:
   # red locally and is not a gate (issue #368). Porting the harness to Windows
   # named pipes + ConPTY and running full integration/e2e on a Windows VM is
   # tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9), not M8.
+  # SKIPPED UNTIL WINDOWS SHIPS. No release so far has carried a Windows build (all
+  # 108 up to v0.46.0 checked on 2026-10-18) — release.yml
+  # builds no `*-pc-windows-*` target for the CLI and no Windows desktop bundle —
+  # so this job gated every PR, for 13-19 minutes, on a platform no user can
+  # install. It is switched off with `if: false` rather than deleted or commented
+  # out: `build-windows` is a REQUIRED context, and a required job skipped by its
+  # own condition counts as passing (docs/develop/governance.md), so no ruleset,
+  # `scripts/apply-branch-protection.sh` or reviewer change is needed; and
+  # Renovate keeps the pins below current while it is off. `windows-cross-check`
+  # still type-checks the Windows target on every PR.
+  #
+  # To re-enable it when Windows ships, restore this condition:
+  #   if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
   build-windows:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: false
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
