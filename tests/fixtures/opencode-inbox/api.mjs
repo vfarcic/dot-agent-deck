@@ -32,6 +32,7 @@ cp.spawn = (...args) => {
     log('stdin', {text: bytes.toString()});
     return write(bytes, ...rest);
   };
+  child.stdout?.on?.('data', (bytes) => log('stdout', {pid: child.pid, text: bytes.toString()}));
   child.on('exit', (code, signal) => log('exit', {pid: child.pid, code, signal}));
   return child;
 };

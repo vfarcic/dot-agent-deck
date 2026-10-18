@@ -3363,6 +3363,32 @@ pub struct InboxRebound {
     pub caps: Option<InboxAttemptCaps>,
 }
 
+/// PRD #1666 (r8k R8G-03): a final attempt of a retired incarnation of the
+/// registering slot whose late commit can still correct the sender — a
+/// `HandedInert` attempt after a Cancel, or a fenced one still verifying —
+/// handed to the new watcher with its COMMIT cap only, so a commit its
+/// predecessor took and died with can still be published. The watcher strips
+/// the cap before the component sees the line; the component sees the ref.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxCorrectable {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
+impl std::fmt::Debug for InboxCorrectable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboxCorrectable")
+            .field("id", &self.id)
+            .field("a", &self.a)
+            .field("e", &self.e)
+            .field("commit", &self.commit.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
 /// PRD #1666 §5: an attempt's two capabilities, as the daemon hands them to
 /// the watcher that publishes its receipts. Never written to the component's
 /// JavaScript, to a hook's output or to `inbox fetch --json`.
@@ -3685,6 +3711,12 @@ pub struct InboxWaitReply {
     /// PRD #1666 §5: caps of attempts a doorbell fetch issued here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issued: Vec<InboxIssued>,
+    /// PRD #1666 (r8k R8G-03): on a registration, final attempts of this
+    /// slot's retired incarnations whose late commit can still correct the
+    /// sender, with their commit authority. Additive inside the unreleased
+    /// inbox stream protocol; not part of the TUI↔daemon attach contract.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub correctable: Vec<InboxCorrectable>,
 }
 
 impl InboxWaitReply {

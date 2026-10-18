@@ -36,9 +36,9 @@ use super::{
     WaiterSignal, kind_sender_label, render_marked,
 };
 use crate::event::{
-    InboxAttemptCaps, InboxAttemptRef, InboxBudget, InboxComponent, InboxDelivery,
-    InboxDeliveryAttempt, InboxGrant, InboxIssued, InboxNotice, InboxRebound, InboxRegistered,
-    InboxStreamControl, InboxWaitReply,
+    InboxAttemptCaps, InboxAttemptRef, InboxBudget, InboxComponent, InboxCorrectable,
+    InboxDelivery, InboxDeliveryAttempt, InboxGrant, InboxIssued, InboxNotice, InboxRebound,
+    InboxRegistered, InboxStreamControl, InboxWaitReply,
 };
 use crate::inbox::{AckHow, AssignmentOwner, Consumer, MessageState, UndeliverableReason};
 use crate::inbox_attempts::{
@@ -308,6 +308,29 @@ pub(super) fn register(
     floor.refresh_failed = false;
     let generation = generation_mut(st, key, spool);
     let registration = generation.model.register(now, slot, resumed);
+    // r8k R8G-03: commit authority only, for the new watcher to publish a
+    // late commit its predecessor died with; it strips the cap before the
+    // component sees the line. An attempt whose caps the store no longer
+    // holds is left out: there is no authority to hand back.
+    let correctable: Vec<InboxCorrectable> = {
+        let evidence = generation
+            .evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registration
+            .correctable
+            .iter()
+            .filter_map(|(id, a, e)| {
+                let caps = evidence.store.caps(id, *a, *e)?;
+                Some(InboxCorrectable {
+                    id: id.clone(),
+                    a: *a,
+                    e: *e,
+                    commit: Some(caps.commit.hex()),
+                })
+            })
+            .collect()
+    };
     generation.links.insert(
         registration.rx,
         Link {
@@ -322,6 +345,7 @@ pub(super) fn register(
         rx = registration.rx.0,
         slot = slot_name(slot),
         resume = registration.resume.len(),
+        correctable = correctable.len(),
         "inbox: receipt receiver registered"
     );
     Some(InboxWaitReply {
@@ -337,6 +361,7 @@ pub(super) fn register(
             .into_iter()
             .map(|(id, a, e)| InboxAttemptRef { id, a, e })
             .collect(),
+        correctable,
         ..InboxWaitReply::default()
     })
 }

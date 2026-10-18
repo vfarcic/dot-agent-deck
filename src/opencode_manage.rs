@@ -1629,9 +1629,13 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
   // runs, or before a new one has registered, waits here and its attempt
   // answers a resume `retained`; the registered watcher is sent it after the
   // resume answers, and publishes its receipt with the caps the deck rebinds
-  // to it. One a watcher that has since exited took is sent again only for an
-  // attempt the deck asks back, i.e. one it never settled. Bounded, oldest
-  // dropped first.
+  // to it. One a watcher that has since exited took is sent again only when
+  // the new registration hands back authority to publish it: its attempt is
+  // asked back (`resume`), or it is a `committed` report for an attempt the
+  // deck lists as `correctable` (a final attempt whose late commit still
+  // corrects the sender, sent with its commit cap to the watcher only). Any
+  // other is dropped: no correction authority survives for it. Bounded,
+  // oldest dropped first.
   const reports = new Map();
   const reported = (key) => reports.has("handed|" + key) || reports.has("committed|" + key);
   const flush = () => {
@@ -1704,8 +1708,11 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
       watermark = { seen: 0, above: new Set() };
       const resume = Array.isArray(reply.resume) ? reply.resume : [];
       const asked = new Set(resume.map(inboxKey));
+      const correctable = new Set((Array.isArray(reply.correctable) ? reply.correctable : []).map(inboxKey));
       for (const [key, entry] of reports) {
-        if (entry.to !== undefined && !asked.has(inboxKey(entry.ref))) reports.delete(key);
+        if (entry.to === undefined) continue;
+        const ref = inboxKey(entry.ref);
+        if (!asked.has(ref) && !(entry.stage === "committed" && correctable.has(ref))) reports.delete(key);
       }
       const answers = resume.map((ref) => ({
         id: ref.id,
@@ -4943,6 +4950,43 @@ receiver.start();
 feed({ registered: { rx: 7, slot: "opencode_tui", keepalive_ms: 30000 }, resume: [ref(2)] });
 check(sent()[0], { resume_answers: [{ ...ref(2), answer: "retained" }] }, "asked back");
 check(sent()[1], { committed: [ref(2)] }, "and sent again");
+"#,
+        );
+    }
+
+    /// Scenario: A receiver is handed two attempts and reports both handed and committed to its watcher, which dies before publishing. The replacement's registration lists the first attempt as correctable and asks for neither back: only the first attempt's commit is sent again, its handed report and everything about the second are dropped, and nothing is answered. A later registration that lists nothing gets nothing, and one listing the first attempt again finds the report already gone.
+    #[spec("inbox/opencode/052")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_052_a_dead_watchers_commit_is_sent_again_only_for_a_correctable_attempt() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const ref = (e) => ({ id: "m-k3xzq2ab-0f3c9a71d2e4b850", a: 1, e });
+feed({ messages: [{ ...ref(1), subject: "s", from: "x", text: "t", d: 1 }, { ...ref(2), subject: "s", from: "x", text: "t", d: 2 }] });
+receiver.handed([ref(1), ref(2)]);
+receiver.committed([ref(1), ref(2)]);
+check(sent().filter((c) => c.committed).length, 1, "the first watcher took both commits");
+current().emit("exit");
+receiver.start();
+feed({ registered: { rx: 5, slot: "opencode_tui", keepalive_ms: 30000 }, correctable: [ref(1)] });
+check(sent().filter((c) => c.committed || c.handed), [{ committed: [ref(1)] }], "only the correctable commit is sent again");
+check(sent().filter((c) => c.resume_answers).length, 0, "a correctable attempt is not resumed");
+
+current().emit("exit");
+receiver.start();
+feed({ registered: { rx: 6, slot: "opencode_tui", keepalive_ms: 30000 } });
+check(sent().filter((c) => c.committed || c.handed).length, 0, "no authority listed: dropped");
+current().emit("exit");
+receiver.start();
+feed({ registered: { rx: 7, slot: "opencode_tui", keepalive_ms: 30000 }, correctable: [ref(1)] });
+check(sent().filter((c) => c.committed || c.handed).length, 0, "and gone for good");
 "#,
         );
     }

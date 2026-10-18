@@ -60,6 +60,18 @@ impl Peer {
         Self::open_buffered(hub, pane, agent, component, arm, 1 << 16).await
     }
 
+    /// [`Self::open`] for the plugin instance `instance`.
+    async fn open_instance(
+        hub: &Arc<InboxHub>,
+        pane: &str,
+        agent: &str,
+        component: InboxComponent,
+        arm: ReceiptArm,
+        instance: u32,
+    ) -> Peer {
+        Self::open_with(hub, pane, agent, component, arm, 1 << 16, Some(instance)).await
+    }
+
     /// [`Self::open`] over a connection that buffers only `buffer` bytes, so
     /// the daemon's writer stops while the test is not reading.
     async fn open_buffered(
@@ -70,6 +82,18 @@ impl Peer {
         arm: ReceiptArm,
         buffer: usize,
     ) -> Peer {
+        Self::open_with(hub, pane, agent, component, arm, buffer, None).await
+    }
+
+    async fn open_with(
+        hub: &Arc<InboxHub>,
+        pane: &str,
+        agent: &str,
+        component: InboxComponent,
+        arm: ReceiptArm,
+        buffer: usize,
+        instance: Option<u32>,
+    ) -> Peer {
         let (client, server) = tokio::io::duplex(buffer);
         let (read, write) = tokio::io::split(server);
         let serve = tokio::spawn(serve_waiter(
@@ -78,7 +102,7 @@ impl Peer {
             agent.to_string(),
             InboxWaitMode::Stream,
             component,
-            None,
+            instance,
             arm,
             BufReader::new(read),
             write,
@@ -2200,4 +2224,235 @@ async fn boundary_040_an_owed_revoke_keeps_the_clock_running_for_a_settled_messa
     );
     ticker.abort();
     peer.close().await;
+}
+
+/// The `(id, a, e)` of each attempt a registration lists.
+fn refs_of<'a>(refs: impl IntoIterator<Item = (&'a str, u32, u32)>) -> Vec<(String, u32, u32)> {
+    let mut refs: Vec<_> = refs
+        .into_iter()
+        .map(|(id, a, e)| (id.to_string(), a, e))
+        .collect();
+    refs.sort();
+    refs
+}
+
+fn key_of(delivery: &InboxDelivery) -> (String, u32, u32) {
+    (
+        delivery.id.clone(),
+        attempt(delivery).a,
+        attempt(delivery).e,
+    )
+}
+
+/// Scenario: One OpenCode agent's TUI watcher is handed four messages: one is cancelled and answered already handed, one is cancelled and answered not handed, one commits, one stays open, and one is reported not handed outside a Cancel and handed out again; its server context's doorbell fetch binds a fifth, which is cancelled and answered already handed. When each context's watcher is replaced, the server's registration lists only its own already-handed attempt as correctable, and the TUI's lists only its own, with that attempt's commit cap and no hand-out cap, while the open attempts are asked back instead and the not-handed one, which keeps no verifier, gets nothing; the commit then reported for it returns its evidence. Another agent's registration on the same pane, and a registration from a plugin instance other than the one this agent pinned, get nothing.
+#[spec("inbox/opencode/053")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_053_registration_hands_back_commit_authority_only_for_its_own_slot() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let doorbell_only = ReceiptArm {
+        doorbell_only: true,
+        ..INTEGRATION
+    };
+    let resumed = ReceiptArm {
+        resumed: true,
+        ..INTEGRATION
+    };
+    let cancel = |id: &str| {
+        let revision = hub.lock().receipts.gens[&("p".to_string(), "a".to_string())]
+            .model
+            .delivery(id)
+            .unwrap()
+            .revision;
+        hub.inbox_action("p", "a", id, revision, false, "desktop")
+    };
+
+    let mut server = Peer::open_instance(
+        &hub,
+        "p",
+        "a",
+        InboxComponent::OpenCodeMini,
+        doorbell_only,
+        1,
+    )
+    .await;
+    let server_rx = server.next().await.registered.unwrap().rx;
+    let on_server = hub
+        .post_direct(Recipient::bound("p", "a"), content("server"))
+        .unwrap();
+    let fetched = hub
+        .receipt_fetch("p", "a", server_rx, Some(on_server.as_str()), None)
+        .unwrap();
+    let server_attempt = (
+        on_server.to_string(),
+        attempt(&fetched[0]).a,
+        attempt(&fetched[0]).e,
+    );
+    assert!(!server.next().await.issued.is_empty());
+    cancel(on_server.as_str());
+    let revoked = revokes_within(&mut server, Duration::from_secs(2)).await;
+    server
+        .send(serde_json::json!({"already_handed": revoked}))
+        .await;
+
+    let mut tui = Peer::open_instance(
+        &hub,
+        "p",
+        "a",
+        InboxComponent::OpenCodePlugin,
+        INTEGRATION,
+        1,
+    )
+    .await;
+    tui.next().await;
+    let ids: Vec<MessageId> = ["inert", "not-handed", "committed", "open", "requeued"]
+        .into_iter()
+        .map(|body| {
+            hub.post_direct(Recipient::bound("p", "a"), content(body))
+                .unwrap()
+        })
+        .collect();
+    let mut handed = Vec::new();
+    while handed.len() < ids.len() {
+        handed.extend(tui.handout().await);
+    }
+    let of = |id: &MessageId| handed.iter().find(|d| d.id == id.as_str()).unwrap().clone();
+    let (inert, not_handed, committed, open, requeued) = (
+        of(&ids[0]),
+        of(&ids[1]),
+        of(&ids[2]),
+        of(&ids[3]),
+        of(&ids[4]),
+    );
+    let seen = handed.iter().map(|d| attempt(d).d).max().unwrap();
+    tui.send(serde_json::json!({"possess": {"seq": 1, "seen": seen, "held": handed.iter().map(at).collect::<Vec<_>>()}}))
+        .await;
+    tui.send(serde_json::json!({"committed": [at(&committed)]}))
+        .await;
+    cancel(&inert.id);
+    cancel(&not_handed.id);
+    let mut answered = 0;
+    while answered < 2 {
+        for revoked in tui.next().await.revoke {
+            answered += 1;
+            let answer = if revoked.id == inert.id {
+                "already_handed"
+            } else {
+                "revoked_ack"
+            };
+            tui.send(serde_json::json!({ answer: [revoked] })).await;
+        }
+    }
+    // Positively not handed, outside a Cancel: final with no verifier, and
+    // not reclaimed, since its message goes on — handed out again.
+    tui.send(serde_json::json!({"not_handed": [at(&requeued)]}))
+        .await;
+    let again = tui.handout().await.remove(0);
+    assert_eq!(again.id, requeued.id);
+    until("every answer to be applied", || {
+        state_of(&hub, "p", &inert.id) == StateName::Undeliverable
+            && state_of(&hub, "p", &not_handed.id) == StateName::Undeliverable
+            && state_of(&hub, "p", &committed.id) == StateName::Acknowledged
+            && state_of(&hub, "p", on_server.as_str()) == StateName::Undeliverable
+    })
+    .await;
+
+    let mut server = Peer::open_instance(
+        &hub,
+        "p",
+        "a",
+        InboxComponent::OpenCodeMini,
+        doorbell_only,
+        1,
+    )
+    .await;
+    let registered = server.next().await;
+    assert_eq!(
+        refs_of(
+            registered
+                .correctable
+                .iter()
+                .map(|c| (c.id.as_str(), c.a, c.e))
+        ),
+        vec![server_attempt.clone()],
+        "the server slot gets its own already-handed attempt back"
+    );
+
+    let mut tui =
+        Peer::open_instance(&hub, "p", "a", InboxComponent::OpenCodePlugin, resumed, 1).await;
+    let registered = tui.next().await;
+    assert_eq!(
+        refs_of(registered.resume.iter().map(|r| (r.id.as_str(), r.a, r.e))),
+        refs_of([&open, &again].map(|d| (d.id.as_str(), attempt(d).a, attempt(d).e))),
+        "the open attempts are asked back, not handed authority"
+    );
+    assert!(
+        !attempt_state(
+            &hub,
+            "p",
+            "a",
+            &requeued.id,
+            attempt(&requeued).a,
+            attempt(&requeued).e
+        )
+        .1,
+        "precondition: the not-handed attempt of a message still going on is not reclaimed"
+    );
+    assert_eq!(
+        refs_of(
+            registered
+                .correctable
+                .iter()
+                .map(|c| (c.id.as_str(), c.a, c.e))
+        ),
+        vec![key_of(&inert)],
+        "only this slot's final attempt that still verifies"
+    );
+    let caps = attempt(&inert).caps.clone().unwrap();
+    assert_eq!(
+        registered.correctable[0].commit.as_deref(),
+        Some(caps.commit.as_str())
+    );
+    let line = serde_json::to_string(&registered).unwrap();
+    assert!(
+        !line.contains(&caps.handed),
+        "the hand-out cap is not handed back: {line}"
+    );
+
+    // The commit the replacement publishes with that authority corrects the
+    // sender and returns the attempt's evidence.
+    tui.send(serde_json::json!({"committed": [at(&inert)]}))
+        .await;
+    until(
+        "the late commit to end the attempt and return its evidence",
+        || {
+            attempt_state(
+                &hub,
+                "p",
+                "a",
+                &inert.id,
+                attempt(&inert).a,
+                attempt(&inert).e,
+            ) == (crate::inbox_attempts::Stage::Committed, true)
+        },
+    )
+    .await;
+
+    let mut other = Peer::open(&hub, "p", "b", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    let registered = other.next().await;
+    assert!(registered.registered.is_some());
+    assert!(
+        registered.correctable.is_empty(),
+        "another agent's generation gets nothing"
+    );
+
+    let mut stale =
+        Peer::open_instance(&hub, "p", "a", InboxComponent::OpenCodePlugin, resumed, 2).await;
+    let refused = stale.next().await;
+    assert!(
+        refused.refused.is_some() && refused.correctable.is_empty(),
+        "another plugin instance is refused and gets nothing: {refused:?}"
+    );
+    for peer in [server, tui, other, stale] {
+        peer.close().await;
+    }
 }

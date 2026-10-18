@@ -14,7 +14,11 @@
 //! the new watcher with its caps, so its receipts are still published: a
 //! stage report that comes before this watcher has read its registration, or
 //! before the daemon's `rebound` answer for its attempt, waits for them, the
-//! attempt held meanwhile. A stage report for an attempt whose cap this
+//! attempt held meanwhile. A final attempt of an earlier watcher of the same
+//! slot whose late commit still corrects the sender comes in the registration
+//! as `correctable`, with its commit cap alone (r8k R8G-03): the cap stays
+//! here, so a commit the component reports again for it is published, and the
+//! component is forwarded the bare ref. A stage report for an attempt whose cap this
 //! watcher lacks once registered (and rebound) publishes nothing and says so,
 //! as a degraded report, rather than passing for a receipt, and so does one
 //! whose watcher's registration does not come within the wait. Told to stop
@@ -152,6 +156,33 @@ mod unix {
                 shared.caps.insert(key.clone(), caps_of(caps));
             }
             shared.rebinding.remove(&key);
+            drop(shared);
+            self.rebound.notify_all();
+        }
+
+        /// This watcher's registration `reply` arrived, with `spool` opened
+        /// for it: publications may go ahead, the attempts it asks back wait
+        /// for their `rebound` caps, and each correctable attempt's commit
+        /// cap (r8k R8G-03) is taken out of the line, under the same lock, so
+        /// a commit report for it publishes with that cap and the component
+        /// is forwarded the bare refs.
+        fn registered(&self, reply: &mut InboxWaitReply, spool: SpoolOrError) {
+            let mut shared = self.lock();
+            if let Some(registered) = &reply.registered {
+                shared.keepalive = Some(Duration::from_millis(registered.keepalive_ms.max(1)));
+            }
+            shared.last_snapshot = Some(Instant::now());
+            shared.spool = Some(spool);
+            shared.rebinding = reply.resume.iter().map(key).collect();
+            for correctable in reply.correctable.iter_mut() {
+                if let Some(commit) = correctable.commit.take() {
+                    shared
+                        .caps
+                        .entry((correctable.id.clone(), correctable.a, correctable.e))
+                        .or_insert((None, None))
+                        .1 = Cap::from_hex(&commit);
+                }
+            }
             drop(shared);
             self.rebound.notify_all();
         }
@@ -476,18 +507,11 @@ mod unix {
                     return ExitCode::SUCCESS;
                 }
             }
-            if let Some(registered) = &reply.registered {
+            if reply.registered.is_some() {
                 if let Some(ms) = test_ms(super::ENV_TEST_REGISTER_DELAY_MS) {
                     std::thread::sleep(Duration::from_millis(ms));
                 }
-                let spool = open_spool();
-                let mut shared = watch.lock();
-                shared.keepalive = Some(Duration::from_millis(registered.keepalive_ms.max(1)));
-                shared.last_snapshot = Some(Instant::now());
-                shared.spool = Some(spool);
-                shared.rebinding = reply.resume.iter().map(key).collect();
-                drop(shared);
-                watch.rebound.notify_all();
+                watch.registered(&mut reply, open_spool());
             }
             if !reply.issued.is_empty() {
                 let mut shared = watch.lock();
@@ -605,6 +629,87 @@ mod unix {
             assert!(
                 failed.is_some(),
                 "a report whose wait ended unanswered is a failure, not a receipt"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod correctable_tests {
+        use super::*;
+        use crate::event::{InboxCorrectable, InboxRegistered};
+        use spec::spec;
+
+        /// Scenario: A replacement watcher reads a registration that lists one attempt as correctable, with its commit cap. The cap is taken out of the line before it goes on to the plugin, which sees only the attempt; a commit report for that attempt then publishes a commit receipt with it, while a handed report for it, and a commit for an attempt the registration did not list, publish nothing and come back as failures.
+        #[spec("inbox/opencode/054")]
+        #[test]
+        fn opencode_054_a_correctable_attempts_commit_cap_reaches_the_publisher_and_nothing_else() {
+            let state = tempfile::tempdir().unwrap();
+            let spool =
+                crate::inbox_receipt::Spool::start(&state.path().canonicalize().unwrap()).unwrap();
+            let generation = Arc::new(spool.generation("pane", "agent").unwrap());
+            let commit = Cap::random().unwrap();
+            let listed = InboxAttemptRef {
+                id: "m-correctable".into(),
+                a: 1,
+                e: 1,
+            };
+            let unlisted = InboxAttemptRef {
+                id: "m-correctable".into(),
+                a: 1,
+                e: 2,
+            };
+            let mut reply = InboxWaitReply {
+                registered: Some(InboxRegistered {
+                    rx: 5,
+                    slot: "opencode_tui".into(),
+                    keepalive_ms: 30_000,
+                }),
+                correctable: vec![InboxCorrectable {
+                    id: listed.id.clone(),
+                    a: 1,
+                    e: 1,
+                    commit: Some(commit.hex()),
+                }],
+                ..InboxWaitReply::default()
+            };
+            let watch = Watch::default();
+            watch.registered(&mut reply, Ok(Arc::clone(&generation)));
+
+            let forwarded = serde_json::to_string(&reply).unwrap();
+            assert!(
+                !forwarded.contains(&commit.hex()) && !forwarded.contains("\"commit\""),
+                "the plugin's line carries a cap: {forwarded}"
+            );
+            assert_eq!(
+                reply.correctable,
+                vec![InboxCorrectable {
+                    id: listed.id.clone(),
+                    a: 1,
+                    e: 1,
+                    commit: None,
+                }]
+            );
+            assert_eq!(
+                publish(
+                    &watch,
+                    RecordStage::Committed,
+                    std::slice::from_ref(&listed)
+                ),
+                None,
+                "the listed attempt's commit publishes"
+            );
+            assert!(
+                publish(&watch, RecordStage::Handed, std::slice::from_ref(&listed)).is_some(),
+                "commit authority only: no handed receipt"
+            );
+            assert!(
+                publish(
+                    &watch,
+                    RecordStage::Committed,
+                    std::slice::from_ref(&unlisted)
+                )
+                .is_some(),
+                "an attempt the registration did not list has no cap"
             );
         }
     }

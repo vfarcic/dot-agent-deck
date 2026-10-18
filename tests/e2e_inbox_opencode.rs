@@ -166,9 +166,16 @@ impl OpenCode {
                 .push(json!(["DOT_AGENT_DECK_INBOX_TEST_REGISTER_DELAY_MS", ms]));
         }
         if let Some(pool) = pool {
+            // With `{"keepWorker": true}` a delegation to the worker role
+            // reaches the OpenCode pane instead of restarting it.
+            let clear = if config["keepWorker"] == true {
+                "clear = false\n"
+            } else {
+                ""
+            };
             std::fs::write(
                 daemon.cwd().join(".dot-agent-deck.toml"),
-                format!("[[orchestrations]]\nname = 'offers'\n[[orchestrations.roles]]\nname = 'orchestrator'\ncommand = 'cat'\nstart = true\n[[orchestrations.roles]]\nname = 'worker'\ncommand = 'cat'\ntake_offers = ['{pool}']\n"),
+                format!("[[orchestrations]]\nname = 'offers'\n[[orchestrations.roles]]\nname = 'orchestrator'\ncommand = 'cat'\nstart = true\n[[orchestrations.roles]]\nname = 'worker'\ncommand = 'cat'\ntake_offers = ['{pool}']\n{clear}"),
             )
             .unwrap();
             start["tab_membership"] = membership("worker", 1, false);
@@ -1858,4 +1865,109 @@ fn opencode_051_a_commit_reported_at_shutdown_reaches_the_deck() {
     op.wait_kind("disposed");
     state(&op.daemon, &op.pane, &id, "acknowledged");
     assert_eq!(op.prompts().len(), 1, "{:?}", op.prompts());
+}
+
+/// Scenario: A task is delegated to the OpenCode worker and prompted, and every receipt publish takes three seconds. The user cancels it; the plugin answers that it was already handed, and the task ends cancelled. OpenCode then answers it, so the plugin reports the commit, and the watcher is killed with SIGKILL while that publish is in flight. The replacement watcher's registration hands back the attempt's commit authority: the plugin sends the commit again, the replacement publishes it, the orchestrator is told the task was delivered after all despite Cancel, the receipts are not reported degraded, and no line the plugin reads carries a cap.
+#[spec("inbox/opencode/052")]
+#[test]
+fn opencode_052_a_cancelled_tasks_commit_survives_its_watcher_killed_mid_publish() {
+    let op = OpenCode::new(
+        "session",
+        json!({"offerPool":"review","keepWorker":true,"publishDelayMs":"3000"}),
+    );
+    armed(&op.daemon, &op.pane, 1);
+    let orch = op.orchestrator.as_ref().unwrap();
+    let mut req = request(orch, "delegate");
+    req["task"] = json!(BODY);
+    req["to"] = json!(["worker"]);
+    req["timestamp"] = json!(chrono::Utc::now());
+    let reply = hook(&op.daemon, req);
+    let id = reply["message_ids"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("the delegation is accepted: {reply}"))
+        .to_string();
+    op.wait_kind("user-message");
+
+    let pressed = cancel(&op, &id);
+    assert_eq!(pressed["inbox_action"]["outcome"], "applied", "{pressed}");
+    assert!(
+        common::wait_until(WAIT, || op
+            .controls()
+            .iter()
+            .filter_map(|c| c["already_handed"].as_array().cloned())
+            .flatten()
+            .any(|at| at["id"] == id.as_str())),
+        "the revoke is answered already handed: {:?}",
+        op.controls()
+    );
+    assert!(
+        common::wait_until(WAIT, || op.message_state(&id) == "undeliverable"),
+        "the task ends cancelled"
+    );
+    op.assistant(&last_user(&op));
+    assert!(
+        common::wait_until(WAIT, || op.commits(&id) >= 1),
+        "the plugin reports the commit: {:?}",
+        op.controls()
+    );
+    let first = first_watcher_pid(&op);
+    op.control(json!({"killWatcher":true}));
+    assert!(
+        common::wait_until(WAIT, || op
+            .events()
+            .iter()
+            .any(|e| e["kind"] == "exit" && e["pid"] == first)),
+        "the watcher is killed mid-publish"
+    );
+    assert!(
+        common::wait_until(WAIT, || op.commits(&id) >= 2),
+        "the plugin sends the commit again to the replacement: {:?}",
+        op.controls()
+    );
+
+    let corrected = || {
+        inbox::listing(&op.daemon, orch)["messages"]
+            .as_array()
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|m| m["subject"] == "task delivered after all")
+            })
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(20), corrected),
+        "the orchestrator is told the task was delivered after all: {:?}",
+        inbox::listing(&op.daemon, orch)
+    );
+    let fetched = inbox::fetch(&op.daemon, orch, true).to_string();
+    assert!(
+        fetched.contains("delivered after all, despite Cancel"),
+        "the correction says despite Cancel: {fetched}"
+    );
+    let records = attach(&op.daemon, json!({"op":"list-agents"}));
+    let record = records["agent_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == op.pane.agent.as_str())
+        .unwrap_or_else(|| panic!("the worker's record: {records}"));
+    assert!(
+        record["inbox"]["receipts_degraded"].is_null(),
+        "the replacement had the cap, so nothing is degraded: {record}"
+    );
+    let read: Vec<String> = op
+        .events()
+        .into_iter()
+        .filter(|e| e["kind"] == "stdout")
+        .filter_map(|e| e["text"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        read.iter().any(|text| text.contains("\"correctable\"")),
+        "the replacement's registration names the attempt: {read:?}"
+    );
+    assert!(
+        read.iter()
+            .all(|text| !text.contains("\"caps\"") && !text.contains("\"commit\":\"")),
+        "a cap reached the plugin: {read:?}"
+    );
 }

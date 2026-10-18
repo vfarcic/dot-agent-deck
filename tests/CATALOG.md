@@ -10093,6 +10093,29 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** that every report made at shutdown arrives (a publish longer than the drain is lost or degraded), or reports queued while no watcher is registered, which the plugin's stop does not flush.
 - **Cost:** none.
 
+##### inbox/opencode/052 — A cancelled task's commit survives its watcher killed mid-publish.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watcher with a 3 s `DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS`, an offers orchestration whose worker role keeps its agent, and the fixture logging what each watcher writes to the plugin; plus a fast JS test in `src/opencode_manage.rs`.
+- **Agent:** generated TUI plugin; the unit half drives the receiver with stand-in watchers.
+- **Asserts:** a delegated task, prompted, then cancelled and answered `already_handed`, ends cancelled; OpenCode then answers it and the plugin reports the commit; the watcher is SIGKILLed while that publish is in flight; the plugin sends the commit again to the replacement, the orchestrator receives "delivered after all, despite Cancel", the worker's card carries no `receipts_degraded`, the replacement's registration reaches the plugin naming `correctable`, and no line the plugin reads carries a cap. Unit: after a watcher dies holding two commits, a registration listing the first as correctable gets only that commit again (not its handed report, nothing about the second, no resume answer); a registration listing nothing gets nothing, and the report is then gone for good.
+- **Does not assert:** a real OpenCode, the evidence's return (`inbox/opencode/053`), or Pi.
+- **Cost:** none.
+
+##### inbox/opencode/053 — Registration hands back commit authority only for its own slot.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over in-memory duplexes.
+- **Agent:** none.
+- **Asserts:** with one agent's TUI attempts ending HandedInert (Cancel, `already_handed`), NotHanded (Cancel, `revoked_ack`), Committed, open, and NotHanded outside a Cancel (its message handed out again, so the attempt is not reclaimed), and its server context's doorbell-fetch attempt ending HandedInert, the replaced server watcher's registration lists only the server attempt as correctable, and the replaced TUI watcher's lists only its HandedInert attempt, with that attempt's commit cap and not its hand-out cap, while the open attempts are asked back; a commit then reported for it makes it Committed and returns its evidence. Another agent's registration on the same pane lists nothing, and a registration from another plugin instance is refused with nothing listed.
+- **Does not assert:** a Fenced attempt still verifying (listed by the same rule), or a real watcher (`inbox/opencode/054`).
+- **Platform coverage:** all.
+- **Cost:** none.
+
+##### inbox/opencode/054 — A correctable attempt's commit cap reaches the publisher and nothing else.
+- **Layer:** Fast (`src/inbox_watcher.rs`, unix), the watcher's registration step and publisher against a real generation spool.
+- **Agent:** none.
+- **Asserts:** a registration listing one correctable attempt with its commit cap leaves the line forwarded to the plugin with the bare ref and no cap; a commit report for that attempt then publishes, while a handed report for it and a commit for an attempt the registration did not list come back as failures.
+- **Does not assert:** the watcher's process loop or socket (`inbox/opencode/052`).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
 ##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`)
 - **Agent:** generated server plugin under mini, full-TUI, run, serve and attach argv.

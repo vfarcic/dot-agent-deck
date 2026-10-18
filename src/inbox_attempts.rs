@@ -413,12 +413,21 @@ pub enum ResumeAnswer {
     Unknown,
 }
 
-/// A registration's answer: the new incarnation and the attempts it is asked
-/// to resume (§4).
+/// A registration's answer: the new incarnation, the attempts it is asked
+/// to resume (§4), and the final attempts whose late commit it may still
+/// publish (r8k R8G-03).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
     pub rx: Rx,
     pub resume: Vec<(String, u32, u32)>,
+    /// Final attempts bound to a retired incarnation of the same slot that
+    /// keep their late-commit verifier (§7) and are not reclaimed: a
+    /// `HandedInert` one, and a `Fenced` one still verifying. Their late
+    /// commit still corrects the sender, and the context that holds such a
+    /// commit, its watcher having died with it, now answers on this
+    /// incarnation. The caller hands each one's commit authority, and only
+    /// that, to the new watcher: no stage, approval or callback comes with it.
+    pub correctable: Vec<(String, u32, u32)>,
 }
 
 /// A `may_hand_over` approval, valid only under the epoch it was granted in
@@ -596,6 +605,7 @@ impl AttemptModel {
             },
         );
         let mut resume = Vec::new();
+        let mut correctable = Vec::new();
         if let Some(old) = self.slots.insert(slot, rx) {
             if let Some(r) = self.receivers.get_mut(&old) {
                 r.retired = true;
@@ -618,8 +628,25 @@ impl AttemptModel {
                 }
             }
         }
+        // Every retired incarnation of the slot counts, the one just replaced
+        // and any the clock retired with no successor (which frees the slot).
+        for (id, msg) in &self.messages {
+            for at in &msg.attempts {
+                let in_slot = self
+                    .receivers
+                    .get(&at.rx)
+                    .is_some_and(|r| r.slot == slot && r.retired);
+                if in_slot && at.stage.is_final() && at.verifier && !at.reclaimed {
+                    correctable.push((id.clone(), at.a, at.e));
+                }
+            }
+        }
         self.finalize_all(now);
-        Registration { rx, resume }
+        Registration {
+            rx,
+            resume,
+            correctable,
+        }
     }
 
     /// T1: hand `id` out to `rx`, if it is `Queued` or carries a repeat token
