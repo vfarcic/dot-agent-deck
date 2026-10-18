@@ -1394,11 +1394,13 @@ fn prepared_spawn_cwd(
 
 /// PRD #1666 G6: the directory a Pi child's relative agent dir is resolved
 /// in, which is where the child enters. For a prepared start, on every Unix,
-/// that is the verified directory object itself, held open: the refresh
-/// creates and writes everything relative to its descriptor
+/// the refresh is anchored to the verified directory object itself, held
+/// open: it creates and writes everything relative to its descriptor
 /// ([`crate::orchestrator_ext::materialize_beneath`]), so a rename-and-replace
 /// of the pathname, before or after this check, cannot redirect a write into
-/// another directory. A start that cannot enter its directory
+/// another directory. Only on Linux does the child enter that object too; on
+/// other Unix it enters the pathname after an identity check, with the
+/// stat-to-chdir window [`spawn_in`] documents. A start that cannot enter its directory
 /// ([`prepared_spawn_cwd`]) is refused here, as the spawn will refuse it, and
 /// nothing is written. Otherwise `cwd`, or the daemon's own directory for a
 /// child that inherits it.

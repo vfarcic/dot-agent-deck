@@ -249,7 +249,10 @@ pub enum ChildDir<'a> {
     /// The pathname the child enters.
     Path(&'a Path),
     /// A prepared start's verified directory object, held open, which the
-    /// child enters whatever its pathname `path` names by then.
+    /// refresh writes beneath whatever its pathname `path` names by then. On
+    /// Linux the child enters that object too; on other Unix it enters `path`
+    /// after an identity check, with the window [`crate::agent_pty::spawn_in`]
+    /// documents.
     #[cfg(unix)]
     Held {
         dir: std::os::fd::BorrowedFd<'a>,

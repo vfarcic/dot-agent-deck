@@ -358,9 +358,9 @@ test("pi_011 after the gate: already handed, lost on positive settle evidence, h
 	}
 });
 
-/// Scenario: A deck message is handed to Pi while a tool runs, passes the gate and waits in Pi's queue behind that run. One Escape takes it out of the queue into the editor and aborts the tool, and the run settles with nothing queued and no start for the message: it is released lost, never not handed. A follow-up still queued at the settle stays held, and so does one whose run ended before Pi could queue it, which goes on to a preflight of its own.
+/// Scenario: A deck message is handed to Pi while a tool runs, passes the gate and waits in Pi's queue behind that run. One Escape takes it out of the queue into the editor and aborts the tool — after the next macrotask, or before it, while Pi's own queueing has run only in microtasks — and the run settles with nothing queued and no start for the message: it is released lost, never not handed. A follow-up still queued at the settle stays held, and so does one whose run ended before Pi could queue it, which goes on to a preflight of its own.
 test("pi_011 a busy follow-up Escape takes out of the queue is released lost at the settle", async () => {
-	for (const escaped of ["escape", "still-queued", "run-ended-first"]) {
+	for (const escaped of ["escape", "escape-before-macrotask", "still-queued", "run-ended-first"]) {
 		const { pi, child } = await started();
 		let queue = 0;
 		pi.ctx.hasPendingMessages = () => queue > 0;
@@ -380,6 +380,12 @@ test("pi_011 a busy follow-up Escape takes out of the queue is released lost at 
 		} else {
 			queue = 1;
 		}
+		if (escaped === "escape-before-macrotask") {
+			// Pi queued in microtasks; the Escape's terminal input runs
+			// before any timer the gate scheduled.
+			for (let i = 0; i < 10; i++) await null;
+			queue = 0;
+		}
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		if (escaped === "escape") {
 			// Escape: the queue goes to the editor, then the tool is aborted.
@@ -389,8 +395,8 @@ test("pi_011 a busy follow-up Escape takes out of the queue is released lost at 
 		pi.ctx.isIdle = () => true;
 		pi.ctx.signal = undefined;
 		await pi.emit("agent_settled", {});
-		if (escaped === "escape") {
-			assert.deepEqual(child.sent("possess").at(-1).held, [], "released lost");
+		if (escaped.startsWith("escape")) {
+			assert.deepEqual(child.sent("possess").at(-1).held, [], `${escaped}: released lost`);
 			assert.deepEqual(child.refs("not_handed"), [], "never not handed");
 			child.say({ revoke: [ref()] });
 			assert.deepEqual(child.refs("already_handed"), [ref()], "possibly handed");

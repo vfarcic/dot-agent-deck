@@ -494,31 +494,65 @@ function gate(proc: InboxProcess, instance: Instance, event: unknown, ctx: Exten
 }
 
 /**
+ * How many microtasks after a hand-over point `watchQueue` keeps looking for
+ * Pi's choice before it leaves the rest to one macrotask check. Pi 0.84.4
+ * queues in the microtasks after the gate returns: a few for its own awaits,
+ * and up to about three for each `input` handler that runs after ours and
+ * returns without waiting on anything else, so this covers some three hundred
+ * of those.
+ */
+const QUEUE_WATCH_MICROTASKS = 1000;
+
+/**
  * An attempt that passed a hand-over point while a run was active goes into
  * Pi's queue behind that run — unless the run ended in the moment before Pi
  * looked, when it goes on to start a run of its own, through a preflight that
  * reads idle with nothing queued. Pi chooses in the microtasks after the
- * gate returns, unless another extension's `input` hook makes it wait, so an
- * attempt still at `input` at the next macrotask, with that run still active
- * and something queued, is marked `queued`: a settle of that run leaving it
- * uncommitted with nothing queued means Pi dropped it from the queue (Escape,
- * or a dequeue to the editor), and `settled` releases it. Unmarked, it stays
- * held until a run starts. The mark can be wrong when such a hook delays
- * Pi's choice past that macrotask while something else is queued and the run
- * then ends before Pi chooses: the attempt is released `lost` and still runs,
- * which is possibly handed, so the deck's checked, marked repeat covers it.
+ * gate returns, unless another extension's `input` hook makes it wait, so the
+ * attempt is watched in those microtasks — before any terminal input, so
+ * before an Escape or a dequeue can empty the queue — and once more at the
+ * next macrotask, for a hook that made Pi wait. Still at `input`, with that
+ * run still active and something queued, it is marked `queued`: a settle of
+ * that run leaving it uncommitted with nothing queued means Pi dropped it from
+ * the queue (Escape, or a dequeue to the editor), and `settled` releases it.
+ * Unmarked, it stays held until a run starts, as one does when such a hook
+ * delays Pi's choice and an Escape empties the queue before the macrotask
+ * check. The mark can be wrong when such a hook delays Pi's choice while something else
+ * is queued and the run then ends before Pi chooses: the attempt is released
+ * `lost` and still runs, which is possibly handed, so the deck's checked,
+ * marked repeat covers it.
  */
 function watchQueue(proc: InboxProcess, key: string, ctx: ExtensionContext | undefined): void {
 	if (askIdle(ctx) !== false) {
 		return;
 	}
 	const run = proc.runs;
+	/** `true` once marked, `false` once there is nothing left to watch. */
+	const look = (): boolean => {
+		const passed = proc.passed.get(key);
+		if (passed === undefined || passed.stage !== "input" || passed.queued || proc.runs !== run || askIdle(ctx) !== false) {
+			return false;
+		}
+		if (askQueued(ctx) === true) {
+			passed.queued = true;
+			return false;
+		}
+		return true;
+	};
+	let left = QUEUE_WATCH_MICROTASKS;
+	const step = (): void => {
+		try {
+			if (look() && --left > 0) {
+				queueMicrotask(step);
+			}
+		} catch {
+			// Never let a callback throw into Pi.
+		}
+	};
+	queueMicrotask(step);
 	const timer = setTimeout(() => {
 		try {
-			const passed = proc.passed.get(key);
-			if (passed !== undefined && passed.stage === "input" && proc.runs === run && askIdle(ctx) === false && askQueued(ctx) === true) {
-				passed.queued = true;
-			}
+			look();
 		} catch {
 			// Never let a timer callback throw into Pi.
 		}
@@ -725,8 +759,10 @@ interface Instance {
 	shutdown: boolean;
 	/**
 	 * The process's receiver it uses, bound at its `session_start`: a delayed
-	 * callback of this instance keeps acting on that one, never on a receiver
-	 * a later version put in its place.
+	 * callback of this instance keeps acting on that one, not on a receiver a
+	 * later version put in its place — except `session_shutdown`, which acts
+	 * on the successor a compatible replacement carried its records to
+	 * (`holding`).
 	 */
 	proc: InboxProcess | undefined;
 	/** Its `session_start` is waiting for the process's receiver (a version replacement). */

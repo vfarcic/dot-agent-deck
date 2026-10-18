@@ -1562,6 +1562,14 @@ pub struct AppState {
     /// state since — from which its card's `✉N` / `delivered` line is drawn
     /// ([`Self::apply_inbox_notice`], [`Self::apply_inbox_summary`]).
     pane_inboxes: HashMap<String, PaneInbox>,
+    /// PRD #1666 §2.8: inbox notices for panes this client does not manage
+    /// yet, oldest first, applied when it adopts the pane
+    /// ([`Self::register_pane`]). The daemon publishes a new agent's first
+    /// notices — a failed integration refresh among them — while it spawns
+    /// it, before the client has the pane's card. Bounded by
+    /// [`MAX_EARLY_INBOX_NOTICES`]; a notice that replaces a pane's earlier
+    /// one whole replaces it here too.
+    early_inbox_notices: VecDeque<crate::event::InboxNotice>,
     /// Issue #1635: what the TUI's last release check found — the plans for
     /// this machine's copies — set by [`crate::upgrade_dialog::run_checker`]
     /// at start and every re-check interval. `None` until a check succeeds.
@@ -6404,6 +6412,10 @@ enum SeenMessage {
 /// are kept only so a repeated terminal frame is not counted twice.
 const MAX_SEEN_INBOX_MESSAGES: usize = 256;
 
+/// Bound on [`AppState::early_inbox_notices`], across every pane; the oldest
+/// goes first.
+const MAX_EARLY_INBOX_NOTICES: usize = 256;
+
 /// PRD #1666 §2.8: what a client knows of one pane's inbox — the daemon's last
 /// summary, and the messages seen change state since. Keyed by message id, so
 /// a frame repeated or a hand-back (`fetched` → `queued`) counts nothing twice.
@@ -7070,7 +7082,23 @@ impl AppState {
         {
             self.clear_pane_maps(&pane_id);
         }
-        self.managed_pane_ids.insert(pane_id);
+        self.managed_pane_ids.insert(pane_id.clone());
+        // PRD #1666 §2.8: what the daemon said about this pane's inbox before
+        // the client adopted it, in the order it said it.
+        if self
+            .early_inbox_notices
+            .iter()
+            .any(|n| n.pane_id == pane_id)
+        {
+            let (early, rest): (VecDeque<_>, VecDeque<_>) =
+                std::mem::take(&mut self.early_inbox_notices)
+                    .into_iter()
+                    .partition(|n| n.pane_id == pane_id);
+            self.early_inbox_notices = rest;
+            for notice in &early {
+                self.apply_inbox_notice(notice);
+            }
+        }
     }
 
     /// Whether `session_id` names a card this state holds as PROVEN — one
@@ -7897,6 +7925,7 @@ impl AppState {
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
         self.forget_unproven_journal_count(&session_id);
+        let carried = pane_id.clone();
         self.sessions.insert(
             session_id.clone(),
             SessionState {
@@ -7933,6 +7962,10 @@ impl AppState {
             carrier.background_revision = Some(revision);
             push_journal_carrier(session, carrier);
         }
+        // PRD #1666 §2.8: a card minted for a pane whose inbox the client
+        // already knows — notices the daemon raised while it spawned the
+        // agent, before the card existed — shows it from the start.
+        self.carry_card_inbox(&carried);
         session_id
     }
 
@@ -8360,9 +8393,22 @@ impl AppState {
     /// changed state ([`crate::event::BroadcastMsg::Inbox`]). Keyed by message
     /// id, so a repeated frame or a message going back and forth between
     /// queued and fetched is counted once. A notice for a pane this client
-    /// does not manage changes nothing.
+    /// does not manage changes no card: it is held in
+    /// [`Self::early_inbox_notices`] until the client adopts the pane.
     pub fn apply_inbox_notice(&mut self, notice: &crate::event::InboxNotice) {
         if !self.managed_pane_ids.contains(&notice.pane_id) {
+            let early = &mut self.early_inbox_notices;
+            if notice.attention_update || notice.wake_update {
+                early.retain(|held| {
+                    held.pane_id != notice.pane_id
+                        || (held.attention_update, held.wake_update)
+                            != (notice.attention_update, notice.wake_update)
+                });
+            }
+            early.push_back(notice.clone());
+            while early.len() > MAX_EARLY_INBOX_NOTICES {
+                early.pop_front();
+            }
             return;
         }
         let inbox = self.pane_inboxes.entry(notice.pane_id.clone()).or_default();
@@ -9258,6 +9304,7 @@ impl AppState {
         self.managed_pane_ids.remove(pane_id);
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
+        self.early_inbox_notices.retain(|n| n.pane_id != pane_id);
         self.pane_event_epochs.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
@@ -19286,6 +19333,83 @@ mod tests {
             state.sessions["gen-q"].recent_events.len(),
             MAX_RECENT_EVENTS
         );
+    }
+
+    /// PRD #1666 §2.8 (the TUI half of inbox/pi/021): the daemon raises a
+    /// new agent's first inbox notices while it spawns it, before this client
+    /// adopts the pane or has a card for it. Each is held until the pane is
+    /// registered, and the pane's card then shows what they said — the
+    /// integration notice of every kind, an item waiting on the user, a queued
+    /// message and a wake stall — whether the card is minted before the pane
+    /// is registered or after; a later whole-notices update replaces the
+    /// earlier one, and another pane's notices stay off this card.
+    #[test]
+    fn notices_raised_before_a_pane_is_adopted_show_on_its_card() {
+        use crate::inbox::StateName::Queued;
+        use crate::inbox_display::{AttentionKind, IntegrationNotice};
+        let attention = |integration: IntegrationNotice| crate::event::InboxNotice {
+            attention_update: true,
+            notices: crate::inbox_hub::InboxCardNotices {
+                integration: Some(integration),
+                attention: vec![crate::inbox_hub::InboxAttentionItem {
+                    message_id: "m-a".to_string(),
+                    revision: 1,
+                    kind: AttentionKind::NotStarted,
+                    from_label: "the orchestrator".to_string(),
+                    subject: "subject".to_string(),
+                    task_id: None,
+                }],
+                ..Default::default()
+            },
+            ..inbox_notice("pane-q", "m-a", Queued)
+        };
+        for integration in [
+            IntegrationNotice::RefreshFailedPi,
+            IntegrationNotice::RefreshFailed,
+            IntegrationNotice::AdapterTooOld,
+            IntegrationNotice::NotArmed,
+            IntegrationNotice::CliTooOld,
+        ] {
+            for card_first in [false, true] {
+                let case = format!("{integration:?}, card minted first: {card_first}");
+                let mut state = AppState::default();
+                state.apply_inbox_notice(&crate::event::InboxNotice {
+                    notices: Default::default(),
+                    ..attention(IntegrationNotice::CliTooOld)
+                });
+                state.apply_inbox_notice(&inbox_notice("pane-q", "m-a", Queued));
+                state.apply_inbox_notice(&crate::event::InboxNotice {
+                    wake_update: true,
+                    wake_stalled: true,
+                    ..inbox_notice("pane-q", "m-a", Queued)
+                });
+                state.apply_inbox_notice(&attention(integration));
+                state.apply_inbox_notice(&inbox_notice("pane-other", "m-x", Queued));
+                let mint = |state: &mut AppState| {
+                    state.insert_placeholder_session(
+                        "pane-q".to_string(),
+                        None,
+                        None,
+                        Some("agent-q".to_string()),
+                    )
+                };
+                let early_card = card_first.then(|| mint(&mut state));
+                state.register_pane("pane-q".to_string());
+                let card = early_card.unwrap_or_else(|| mint(&mut state));
+                let shown = state.sessions[&card]
+                    .card_inbox()
+                    .unwrap_or_else(|| panic!("{case}: the card shows the pane's inbox"));
+                assert_eq!(shown.integration, Some(integration), "{case}");
+                assert_eq!(shown.not_started, 1, "{case}");
+                assert_eq!(shown.pending, 1, "{case}");
+                assert!(shown.stalled, "{case}");
+                assert!(
+                    state.sessions[&card].inbox_notice().is_some(),
+                    "{case}: the card has a notice row"
+                );
+                assert!(state.inbox_attention("pane-other").is_none(), "{case}");
+            }
+        }
     }
 
     /// PRD #1666 S11: a claimed job counts on its holder's card like a taken

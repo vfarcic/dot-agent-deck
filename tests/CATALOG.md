@@ -10489,7 +10489,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/011 — After the Pi gate: already handed, lost on evidence, held in preflight.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** A revoke after the gate is `already_handed`; the refusal pattern and an Escape settle release `lost`, never `not_handed`; a settle in preflight keeps it held. A follow-up handed while a tool runs and seen in Pi's queue behind that run is released `lost` at the run's settle once Escape has emptied the queue, with no `before_agent_start` for it; one still queued at that settle, and one whose run ended before Pi could queue it, stay held.
+- **Asserts:** A revoke after the gate is `already_handed`; the refusal pattern and an Escape settle release `lost`, never `not_handed`; a settle in preflight keeps it held. A follow-up handed while a tool runs and seen in Pi's queue behind that run is released `lost` at the run's settle once Escape has emptied the queue, with no `before_agent_start` for it, including an Escape that empties it before the next macrotask, when Pi's queueing has run only in microtasks; one still queued at that settle, and one whose run ended before Pi could queue it, stay held.
 - **Does not assert:** Which Pi events a real refusal emits (lane 2).
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.

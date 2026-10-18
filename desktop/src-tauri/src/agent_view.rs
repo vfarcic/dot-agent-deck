@@ -570,6 +570,61 @@ mod tests {
         assert_eq!(view.fetch_count(), 1, "only the install fetched");
     }
 
+    /// Scenario: install one agent, then receive the daemon's inbox notice
+    /// that a second agent's Pi extension could not be refreshed, raised while
+    /// it spawned and before this view holds any record of it (inbox/pi/021's
+    /// desktop half). The notice makes the next refresh fetch, and the new
+    /// agent's record from that fetch carries the warning to its tile.
+    #[test]
+    fn an_inbox_notice_before_the_agents_record_reaches_its_tile() {
+        use dot_agent_deck::inbox_display::IntegrationNotice;
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        assert_eq!(view.needs_fetch(now), None);
+
+        let notices = dot_agent_deck::inbox_hub::InboxCardNotices {
+            integration: Some(IntegrationNotice::RefreshFailedPi),
+            ..Default::default()
+        };
+        view.apply(&BroadcastMsg::Inbox(dot_agent_deck::event::InboxNotice {
+            pane_id: "pane-8".into(),
+            agent_id: Some("8".into()),
+            message_id: String::new(),
+            subject: String::new(),
+            from_label: String::new(),
+            state: dot_agent_deck::inbox::StateName::Queued,
+            reason: None,
+            returned: false,
+            wake_stalled: false,
+            wake_update: false,
+            attention_update: true,
+            notices: notices.clone(),
+        }));
+        assert_eq!(view.needs_fetch(now), Some(FetchReason::Inbox));
+
+        let mut spawned = record("8", "pane-8");
+        spawned.inbox = Some(dot_agent_deck::inbox_hub::InboxSummary {
+            queued: 0,
+            fetched: 0,
+            claimed: 0,
+            undeliverable: 0,
+            last_acked_at: None,
+            wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
+            component: None,
+            wake_stalled: false,
+            notices,
+        });
+        view.install(listing(vec![record("7", "pane-7"), spawned]), now);
+        let shown = view
+            .records()
+            .into_iter()
+            .find(|record| record.id == "8")
+            .and_then(|record| record.inbox)
+            .and_then(|inbox| inbox.notices.integration);
+        assert_eq!(shown, Some(IntegrationNotice::RefreshFailedPi));
+    }
+
     /// Scenario: install one working agent, then fold the daemon's PRD #1401
     /// pull request report for it, and later the report that it has none. The
     /// rendered record carries the pull request and then drops it, with no
