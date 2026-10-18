@@ -293,6 +293,16 @@ pub fn armed(daemon: &impl Endpoint, pane: &Pane, count: u64) {
     );
 }
 
+/// PRD #1666: a receipt watcher is registered for `pane` (its wake reads
+/// `native`).
+pub fn receipt_registered(daemon: &impl Endpoint, pane: &Pane) {
+    assert!(
+        common::wait_until(WAIT, || listing(daemon, pane)["wake"] == "native"),
+        "a receipt watcher must register: {}",
+        listing(daemon, pane)
+    );
+}
+
 pub fn announce(daemon: &impl Endpoint, pane: &Pane, wake: &str) {
     let mut req = request(pane, "inbox_announce");
     req["component"] = json!("claude_waiter");
@@ -306,8 +316,17 @@ pub fn announce(daemon: &impl Endpoint, pane: &Pane, wake: &str) {
 /// armed from the test process at the adapter floor; returns once the deck
 /// registered it.
 pub fn receipt_stream(daemon: &impl Endpoint, pane: &Pane) -> BufReader<UnixStream> {
+    receipt_stream_as(daemon, pane, "opencode_plugin")
+}
+
+/// [`receipt_stream`] for `component`'s watcher (`pi_extension`, …).
+pub fn receipt_stream_as(
+    daemon: &impl Endpoint,
+    pane: &Pane,
+    component: &str,
+) -> BufReader<UnixStream> {
     let mut req = request(pane, "inbox_wait");
-    req["component"] = json!("opencode_plugin");
+    req["component"] = json!(component);
     req["component_version"] = json!("synthetic-receipt");
     req["mode"] = json!("stream");
     req["pid"] = json!(pane.pid);
@@ -376,9 +395,12 @@ pub fn possess_for(stream: &mut BufReader<UnixStream>, held: &Value, span: Durat
     written
 }
 
+/// A legacy stream waiter, armed from the test process. No component the deck
+/// ships arms one since Pi moved to the receipt stream (PRD #1666), so it names
+/// none (`other`).
 pub fn waiter(daemon: &impl Endpoint, pane: &Pane) -> BufReader<UnixStream> {
     let mut req = request(pane, "inbox_wait");
-    req["component"] = json!("pi_extension");
+    req["component"] = json!("other");
     req["component_version"] = json!("synthetic-doorbell");
     req["mode"] = json!("stream");
     req["pid"] = json!(pane.pid);

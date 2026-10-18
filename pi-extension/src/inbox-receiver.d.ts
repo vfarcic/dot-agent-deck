@@ -16,14 +16,26 @@ export interface InboxApproval {
   at: number;
   valid: number;
 }
+export interface InboxReceiverState {
+  held?: (InboxRef & { d?: number; stage?: string })[];
+  called?: string[];
+  forgot?: boolean;
+  revoked?: string[];
+  reports?: { stage: string; ref: InboxRef; taken?: boolean }[];
+}
 export interface InboxReceiverOptions {
   agent: string;
   doorbellOnly?: boolean;
   active: () => boolean;
   deliver?: (message: InboxMessage) => void;
+  exited?: (code: number | null) => void;
+  state?: InboxReceiverState;
 }
 export interface InboxReceiver {
   start(): void;
+  ensure(): void;
+  drain(): Promise<"exited" | "forced">;
+  exportState(): InboxReceiverState;
   stop(): void;
   rx(): number | undefined;
   epoch(): number;

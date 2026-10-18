@@ -276,7 +276,7 @@ fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
     );
 }
 
-/// Scenario: Start each supported agent type with a daemon seed while it has sent no SessionStart, showing Codex's recognised empty composer in its stand-in. The seed must already be queued once and bound to that generation; Pi's legacy GetSeed alias consumes the oldest inbox item once, while the other panes fetch after their fixed doorbell without receiving typed content.
+/// Scenario: Start each supported agent type with a daemon seed while it has sent no SessionStart, showing Codex's recognised empty composer in its stand-in. The seed must already be queued once and bound to that generation; Pi's GetSeed alias, which predates the receipt stream, is refused and leaves the seed queued, while the other panes fetch after their fixed doorbell without receiving typed content.
 #[spec("inbox/route/004")]
 #[test]
 fn route_004_start_agent_seed_is_first_message_for_every_agent_type() {
@@ -301,26 +301,13 @@ fn route_004_start_agent_seed_is_first_message_for_every_agent_type() {
         );
         route::only_doorbells(&pane, &messages);
         if agent_type == "pi" {
+            // PRD #1666 G10: a Pi generation is on the receipt stream, so the
+            // get-seed alias an extension from before it used is refused: no
+            // seed, the message stays queued for the receiver.
             let first = hook(&daemon, request(&pane, "get_seed"));
-            let text = first["seed"]
-                .as_str()
-                .expect("Pi GetSeed must serve the inbox seed");
+            assert!(first["seed"].is_null(), "Pi GetSeed is refused: {first}");
             let id = messages[0]["id"].as_str().unwrap();
-            assert!(
-                text.contains(route::TASK) && text.contains(id),
-                "framed seed: {first}"
-            );
-            state(&daemon, &pane, id, "acknowledged");
-            assert!(hook(&daemon, request(&pane, "get_seed"))["seed"].is_null());
-            let next = enqueue(&daemon, &pane, "PI-GET-SEED-NEXT-79a2");
-            let second = hook(&daemon, request(&pane, "get_seed"));
-            assert!(
-                second["seed"].as_str().is_some_and(
-                    |text| text.contains(&next) && text.contains("PI-GET-SEED-NEXT-79a2")
-                ),
-                "alias must consume inbox messages after the startup seed too: {second}"
-            );
-            state(&daemon, &pane, &next, "acknowledged");
+            state(&daemon, &pane, id, "queued");
             assert!(!String::from_utf8_lossy(&bytes(&pane)).contains(route::TASK));
             continue;
         }
@@ -529,14 +516,15 @@ fn long_turn_daemon() -> common::DaemonProc {
     ])
 }
 
-/// A stand-in for the worker's streaming component (Pi's extension), armed
-/// from the test process.
+/// A stand-in for a worker's legacy stream, armed from the test process. No
+/// component the deck ships arms one since Pi moved to the receipt stream
+/// (PRD #1666), so it names none (`other`).
 fn worker_stream(
     daemon: &common::DaemonProc,
     worker: &Pane,
 ) -> std::io::BufReader<std::os::unix::net::UnixStream> {
     let mut req = request(worker, "inbox_wait");
-    req["component"] = json!("pi_extension");
+    req["component"] = json!("other");
     req["component_version"] = json!("synthetic-long-turn");
     req["mode"] = json!("stream");
     req["pid"] = json!(worker.pid);

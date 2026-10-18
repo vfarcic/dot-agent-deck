@@ -92,7 +92,7 @@ fn pi_002_live_streaming_messages_run_in_order_one_per_turn() {
     pi.idle();
 }
 
-/// Scenario: Finish a native delegate in real Pi, invoke /new, and inspect only children of its captured process id. Exactly one replacement watcher must remain, and the next delegate must execute and be acknowledged in the new session.
+/// Scenario: Finish a native delegate in real Pi, invoke /new, and inspect only children of its captured process id. The one watcher Pi's process runs is the same process after /new, with no second registration, and the next delegate executes and is acknowledged in the new session.
 #[spec("inbox/pi/003")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -107,19 +107,18 @@ fn pi_003_live_new_session_keeps_one_watcher_and_receives_next_message() {
     assert_eq!(old_watchers.len(), 1);
     pi.prompt("/new");
     assert!(
-        common::wait_until(BUDGET, || pi.session() != old_session
-            && pi.watcher_pids().len() == 1
-            && pi.watcher_pids() != old_watchers),
-        "/new must leave one replacement watcher; {}",
+        common::wait_until(BUDGET, || pi.session() != old_session),
+        "/new must start a new session; {}",
         pi.evidence()
     );
-    assert!(
-        common::wait_until(BUDGET, || old_watchers
-            .iter()
-            .all(|pid| !common::process_running(*pid))),
-        "old watcher must exit after /new"
+    // PRD #1666 §0: one receiver per Pi process, so /new keeps its watcher.
+    assert_eq!(
+        pi.watcher_pids(),
+        old_watchers,
+        "/new keeps the one watcher; {}",
+        pi.evidence()
     );
-    inbox::armed(&pi.deck, &pi.pane, 1);
+    inbox::receipt_registered(&pi.deck, &pi.pane);
     let new_session = pi.session();
     let id = pi.delegate("pi-after-new-18c2ba.txt");
     pi.done(&id, "pi-after-new-18c2ba.txt");

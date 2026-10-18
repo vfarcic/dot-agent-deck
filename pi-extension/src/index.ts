@@ -3,8 +3,11 @@
  *
  * This is the thin Pi-API glue. It:
  *   1. registers `delegate` and `work_done` as native, schema-validated tools
- *      whose bodies shell the `dot-agent-deck` CLI, and
- *   2. subscribes to Pi's event bus and reports the pane's status
+ *      whose bodies shell the `dot-agent-deck` CLI,
+ *   2. runs the deck's inbox receiver (`./inbox-receiver.js`, PRD #1666), one
+ *      per Pi process, and hands each deck message to Pi behind the deck's
+ *      final check, and
+ *   3. subscribes to Pi's event bus and reports the pane's status
  *      (running / waiting / finished) and card detail (directory, submitted
  *      prompt, tool calls — issue #622) via `dot-agent-deck agent-event` — so
  *      a Pi pane's card is driven with NO Claude-Code hook installed and NO
@@ -25,13 +28,22 @@ import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+	INBOX_ADAPTER_INTEGRATION,
+	inboxBinary,
+	inboxKey,
+	inboxReceiver,
+	inboxRef,
+	type InboxApproval,
+	type InboxMessage as InboxReceiverMessage,
+	type InboxReceiver,
+	type InboxReceiverState,
+	type InboxRef,
+} from "./inbox-receiver.js";
+import {
 	buildDelegateArgv,
-	buildInboxAckArgv,
 	buildInboxAnnounceArgv,
 	buildInboxDoorbellFetchArgv,
-	buildInboxWaitArgv,
 	buildWorkDoneArgv,
-	createLineSplitter,
 	createReporter,
 	createSerialQueue,
 	createTurnReplyTracker,
@@ -41,25 +53,17 @@ import {
 	execWithStdin,
 	inboxIdsIn,
 	inboxIdsToAck,
-	INBOX_ACK_CONFIRM_ATTEMPTS,
-	INBOX_ACK_CONFIRM_DELAY_MS,
-	INBOX_ACK_CONFIRM_MAX_DELAY_MS,
-	INBOX_ADMISSION_RECHECK_MS,
 	type InboxMessage,
 	inboxUserText,
-	nextWatcherBackoff,
-	parseInboxAckReply,
-	parseInboxFetch,
-	parseInboxLine,
 	installQuestionWrappers,
+	isAbsoluteOverride,
+	parseInboxFetch,
 	piEventReport,
 	resolveDeckBin,
 	spawnFailureMessage,
 	tagHandOver,
 	untagHandOver,
-	WATCHER_BACKOFF_MIN_MS,
 	WATCHER_NOT_IN_DECK_EXIT,
-	watcherBackoffOverride,
 } from "./orchestrator.ts";
 
 /**
@@ -101,790 +105,738 @@ async function runDeck(
 	return outcome;
 }
 
-// --- PRD #1666: the deck's inbox ------------------------------------------
+// --- PRD #1666: the deck's inbox -------------------------------------------
 
-/** The part of a spawned watcher the inbox uses (Node's `ChildProcess`). */
-interface WatcherChild {
-	stdin: {
-		write(line: string): unknown;
-		end(): unknown;
-		on?(event: string, listener: (...args: any[]) => void): unknown;
-		writableEnded?: boolean;
-		destroyed?: boolean;
-	} | null;
-	stdout: { setEncoding?(encoding: string): unknown; on(event: string, listener: (...args: any[]) => void): unknown } | null;
-	on(event: string, listener: (...args: any[]) => void): unknown;
-	kill(signal?: NodeJS.Signals): boolean;
+/**
+ * The deck binary the receiver runs its watcher with: the resolved CLI when it
+ * is an absolute path, else none, so the receiver never runs a bare name from
+ * Pi's `$PATH` (`resolveDeckBin`'s fallback for an older deck). The generated
+ * module refuses anything but an absolute path to an executable file too.
+ */
+inboxBinary(() => (isAbsoluteOverride(deckBin, process.platform) ? deckBin : undefined));
+
+/**
+ * Bumped whenever this file's inbox code changes: a reload that evaluates a
+ * different version replaces the process's receiver (`replaceVersion`).
+ */
+const INBOX_VERSION = 1;
+/**
+ * The shape of what a replacement carries over (`Transfer`). Bumped only when
+ * that shape changes; a replacement across a different one carries nothing.
+ */
+const INBOX_STATE_VERSION = 1;
+/** How long a doorbell waits for the receiver's watcher to register before it consumes the line and leaves the mail queued. */
+export const DOORBELL_REGISTER_WAIT_MS = 5000;
+/**
+ * How long a hand-over may go unseen by this extension's `input` gate while Pi
+ * sits idle with nothing queued before it counts as dropped: positively not
+ * handed, since nothing past the gate saw it.
+ */
+export const INBOX_UNSEEN_RECHECK_MS = 30000;
+/** How many committed attempts and hand-over tags the process remembers. */
+const INBOX_REMEMBERED = 4096;
+
+/** An attempt handed to `sendUserMessage` whose hand-over the `input` gate has not seen. */
+interface Sent {
+	message: InboxMessage;
+	ref: InboxRef;
+	tag: string;
+	/** The session instance whose `pi` made the call. */
+	token: number;
+	granted: InboxApproval | undefined;
+	/** `runs` when it was sent. */
+	run: number;
+}
+
+/** An attempt past a native hand-over point (the gate's `transform`, or a doorbell's): possibly handed. */
+interface Passed {
+	ref: InboxRef;
+	token: number;
+	/** `input` once past the gate; `start` once a `before_agent_start` prompt carried it. */
+	stage: "input" | "start";
+	/** `runs` when it passed. */
+	run: number;
+	/** At `start`: a settle came while another run was active, the way Pi settles a prompt it refused. */
+	suspect: boolean;
+	/** Released `lost`: it waits for a commit only. */
+	lost: boolean;
+}
+
+/** The session instance currently receiving deck messages. */
+interface Current {
+	token: number;
+	pi: ExtensionAPI;
+	ctx: ExtensionContext | undefined;
 }
 
 /**
- * State shared by every instance of this extension in the process. Pi builds a
- * new instance on each session replacement (`/new`, fork, resume, reload) and
- * the old one's `pi` then throws on every call; the generation lets the old
- * instance's late callbacks do nothing at all, and `watcher` lets a new
- * instance stop a watcher an old one left behind. Kept on `globalThis` so a
- * reload that evaluates this module again still sees it.
+ * One receiver per Pi process (PRD #1666 §0): every session instance, `/new`,
+ * resume, fork and reload included, shares it, its watcher and the hand-over
+ * gate's records, so a commit seen in a successor is published by the
+ * receiver that holds its authority. Kept on `globalThis` under
+ * `INBOX_PROCESS` so a reload that evaluates this module again finds it.
  */
-interface InboxShared {
-	generation: number;
-	watcher?: WatcherChild;
-	/**
-	 * The message ids Pi committed in this process, at most
-	 * `MAX_COMMITTED_IDS`. A session replacement keeps them, so the deck
-	 * handing one over again in the next session is acknowledged, not run.
-	 */
+interface InboxProcess {
+	version: number;
+	stateVersion: number;
+	receiver: InboxReceiver;
+	sent: Map<string, Sent>;
+	/** Hand-over tag → attempt key, bounded. */
+	tags: Map<string, string>;
+	passed: Map<string, Passed>;
+	/** Message id → its attempt keys. */
+	byId: Map<string, Set<string>>;
+	/** Attempt keys committed, bounded. */
 	committed: Set<string>;
-	/**
-	 * Committed ids whose acknowledgement the deck has not confirmed, with the
-	 * confirmations asked so far. A session replacement keeps them, and the
-	 * next instance goes on confirming them.
-	 */
-	unconfirmed: Map<string, number>;
-}
-const INBOX_SHARED = Symbol.for("dot-agent-deck.pi-inbox");
-function inboxShared(): InboxShared {
-	const holder = globalThis as unknown as Record<symbol, Partial<InboxShared> | undefined>;
-	// A reload of an older copy of this module may have left an object without the newer fields.
-	const shared = (holder[INBOX_SHARED] ??= {});
-	shared.generation ??= 0;
-	shared.committed ??= new Set();
-	shared.unconfirmed ??= new Map();
-	return shared as InboxShared;
+	/** Attempts held while no session is current, in order. */
+	pending: InboxMessage[];
+	current: Current | undefined;
+	nextToken: number;
+	nextTag: number;
+	tagPrefix: string;
+	/** Runs Pi started (`agent_start`), to date hand-overs. */
+	runs: number;
+	/** One hand-over at a time, in the order the deck handed them out. */
+	chain: Promise<void>;
+	/** Every status report, across instances, in the order Pi emitted them. */
+	reportQueue: <T>(task: () => Promise<T>) => Promise<T>;
+	rechecks: Map<string, ReturnType<typeof setTimeout>>;
+	/** The instance a `reload` shut down, whose passed attempts its successor takes over. */
+	reloadedFrom: number | undefined;
+	/** A version replacement under way: later instances wait for it. */
+	replacing: Promise<void> | undefined;
+	disposed: boolean;
+	/** The watcher said this process runs outside a deck pane: no respawn. */
+	notInDeck: boolean;
 }
 
-/** The first of `set`, in insertion order. */
-const first = <T>(set: Set<T>): T | undefined => set.values().next().value;
+/** What a replacement carries from a receiver of the same state version. */
+interface Transfer {
+	receiver: unknown;
+	sent: Map<string, Sent>;
+	tags: Map<string, string>;
+	passed: Map<string, Passed>;
+	byId: Map<string, Set<string>>;
+	committed: Set<string>;
+	pending: InboxMessage[];
+	nextToken: number;
+	nextTag: number;
+	tagPrefix: string;
+	runs: number;
+}
 
-/** Close a watcher's stdin (it exits on EOF), then SIGTERM it. */
-function stopWatcher(child: WatcherChild | undefined): void {
-	if (!child) {
+const INBOX_PROCESS = Symbol.for("dot-agent-deck.pi-receiver");
+/** The process state an extension from before the receipt stream kept. */
+const LEGACY_INBOX = Symbol.for("dot-agent-deck.pi-inbox");
+const HANDLED = { action: "handled" } as const;
+type InputAnswer = typeof HANDLED | { action: "transform"; text: string } | undefined;
+
+const holder = globalThis as unknown as Record<symbol, unknown>;
+
+/** Remember `key` in a bounded insertion-ordered set. */
+function rememberKey(set: Set<string>, key: string): void {
+	set.delete(key);
+	set.add(key);
+	while (set.size > INBOX_REMEMBERED) {
+		set.delete(set.values().next().value as string);
+	}
+}
+
+function rememberTag(proc: InboxProcess, tag: string, key: string): void {
+	proc.tags.set(tag, key);
+	while (proc.tags.size > INBOX_REMEMBERED) {
+		proc.tags.delete(proc.tags.keys().next().value as string);
+	}
+}
+
+function noteId(proc: InboxProcess, ref: InboxRef): void {
+	const keys = proc.byId.get(ref.id) ?? new Set<string>();
+	keys.add(inboxKey(ref));
+	proc.byId.set(ref.id, keys);
+}
+
+/** Whether the receiver still holds `ref` (a revoke answered or a commit took it otherwise). */
+function holds(proc: InboxProcess, ref: InboxRef): boolean {
+	return proc.receiver.of(ref.id).some((held) => held.a === ref.a && held.e === ref.e);
+}
+
+/** Positively not handed: nothing past a native hand-over point saw it. Silent for an attempt no longer held. */
+function refuse(proc: InboxProcess, ref: InboxRef): void {
+	clearRecheck(proc, inboxKey(ref));
+	if (holds(proc, ref)) {
+		proc.receiver.notHanded(ref);
+	}
+}
+
+function clearRecheck(proc: InboxProcess, key: string): void {
+	const timer = proc.rechecks.get(key);
+	if (timer !== undefined) {
+		clearTimeout(timer);
+		proc.rechecks.delete(key);
+	}
+}
+
+/** Pi's answers, or `undefined` when it cannot be asked: never taken as a reason to release anything. */
+function askIdle(ctx: ExtensionContext | undefined): boolean | undefined {
+	try {
+		return ctx?.isIdle();
+	} catch {
+		return undefined;
+	}
+}
+function askQueued(ctx: ExtensionContext | undefined): boolean | undefined {
+	try {
+		return ctx?.hasPendingMessages?.();
+	} catch {
+		return undefined;
+	}
+}
+/** An agent run is active: Pi's `signal` is set only while one is. */
+function askRunning(ctx: ExtensionContext | undefined): boolean | undefined {
+	try {
+		return ctx === undefined ? undefined : ctx.signal !== undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * A sent attempt the gate has not seen, re-checked every
+ * `INBOX_UNSEEN_RECHECK_MS`: once Pi is idle with nothing queued it never
+ * reached the gate, so it is positively not handed, and its late arrival at
+ * the gate is consumed.
+ */
+function armRecheck(proc: InboxProcess, key: string): void {
+	clearRecheck(proc, key);
+	const timer = setTimeout(() => {
+		proc.rechecks.delete(key);
+		try {
+			const sent = proc.sent.get(key);
+			if (sent === undefined || proc.disposed) {
+				return;
+			}
+			const ctx = proc.current?.ctx;
+			if (askIdle(ctx) === true && askQueued(ctx) === false) {
+				proc.sent.delete(key);
+				refuse(proc, sent.ref);
+			} else {
+				armRecheck(proc, key);
+			}
+		} catch {
+			// Never let a timer callback throw into Pi.
+		}
+	}, INBOX_UNSEEN_RECHECK_MS);
+	(timer as { unref?: () => void }).unref?.();
+	proc.rechecks.set(key, timer);
+}
+
+/** The receiver handed out `message`: hand it to the current session, or keep it until one starts. */
+function deliver(proc: InboxProcess, message: InboxMessage): void {
+	if (proc.disposed) {
 		return;
 	}
-	try {
-		child.stdin?.end();
-	} catch {
-		// Already closed.
+	const key = inboxKey(message as InboxRef);
+	if (proc.sent.has(key) || proc.passed.has(key) || proc.committed.has(key)) {
+		// One native call per attempt; a marked repeat is a new attempt.
+		return;
 	}
-	try {
-		child.kill("SIGTERM");
-	} catch {
-		// Already gone.
+	if (proc.pending.some((held) => inboxKey(held as InboxRef) === key)) {
+		return;
 	}
+	if (proc.current === undefined) {
+		proc.pending.push(message);
+		return;
+	}
+	enqueue(proc, message);
 }
 
-/** How many doorbell-fetched ids an instance remembers until Pi commits them. */
-const MAX_DOORBELL_IDS = 256;
-/** How many committed message ids an instance remembers, to consume a late hand-over of one. */
-const MAX_COMMITTED_IDS = 256;
+function enqueue(proc: InboxProcess, message: InboxMessage): void {
+	proc.chain = proc.chain.then(() => handOver(proc, message)).catch(() => undefined);
+}
 
-/** One hand-over of deck messages to Pi, from `sendUserMessage` until Pi commits it or another replaces it. */
-interface HandOver {
-	/** Names this hand-over on the first line of the text Pi's `input` hooks see. */
-	attempt: string;
-	messages: InboxMessage[];
-	/** The text Pi goes on with once this extension's `input` hook removed that line. */
-	text: string;
-	/** Runs Pi had started when it was handed over. */
-	run: number;
-	/**
-	 * How far Pi has taken it, as far as this extension can see: `handed` until
-	 * its `input` hook sees it, `input` after that, and `start` once its
-	 * `before_agent_start` hook has seen it.
-	 */
-	stage: "handed" | "input" | "start";
-	/** At `start`: a run settled while another one was active, the way Pi settles a prompt it refused. */
-	suspect: boolean;
+/** Hand everything held while no session was current to the current one, in order. */
+function drainPending(proc: InboxProcess): void {
+	for (const message of proc.pending.splice(0)) {
+		enqueue(proc, message);
+	}
 }
 
 /**
- * One extension instance's inbox: the watcher it runs for its session, the
- * hand-over of each message to Pi, and the acknowledgement once Pi commits it.
- *
- * - Every message goes in with `deliverAs: "followUp"`: when Pi is idle the
- *   option is ignored and a turn starts; when it is streaming the message
- *   waits for the turn to end. Without it, a send while streaming is dropped.
- * - A message is acknowledged when Pi starts the user message carrying it
- *   (`message_start`), never on `input`, which fires before Pi commits it: a
- *   queued follow-up can still be lost to Escape after `input`.
- * - When the deck rings the doorbell instead (no watcher was armed), the line
- *   is caught on `input` before the model sees it and the waiting content is
- *   handed over the same way.
- * - Pi admits a prompt only after its input hooks and preflight resolve, and
- *   refuses a second one that is still in preflight when the first starts —
- *   reporting the refusal itself, never to the caller. So while Pi is idle at
- *   most one hand-over is in flight, and later messages wait until it commits;
- *   while Pi is busy each one waits as a follow-up, which Pi queues safely.
- * - Each hand-over names its attempt on a first line that this extension's
- *   `input` hook removes. The hook consumes a hand-over another one replaced,
- *   and one whose messages Pi already committed, so neither reaches the model.
- * - A hand-over the `input` hook has not seen can be handed over again safely:
- *   once Pi starts a run after it and settles with nothing queued, or once Pi
- *   stays idle with nothing queued for `INBOX_ADMISSION_RECHECK_MS`.
- * - A hand-over the hook has seen is past that guard, so it is handed over
- *   again only on a sign that Pi refused it: Pi settles a refused prompt while
- *   the run that beat it is still active, which a run's own end never does. So
- *   after `before_agent_start` saw it, a settle during an active run and then
- *   a settle with no run, with no commit of it between, is that sign. Without
- *   one it waits for the deck, which hands an unacknowledged message over
- *   again: that redelivery replaces it once Pi has nothing queued.
+ * Hand one attempt to the current session behind the final hand-over check:
+ * the deck's approval, then — with no await before `sendUserMessage` — the
+ * session that asked is still current, the process is not disposed, and the
+ * receiver's own check. A session replaced meanwhile gets the attempt back at
+ * the front of `pending`, uncalled, for its successor's fresh check.
  */
-function createPiInbox(pi: ExtensionAPI) {
-	let active = false;
-	let generation = 0;
-	let watcher: WatcherChild | undefined;
-	let respawn: ReturnType<typeof setTimeout> | undefined;
-	const fromDoorbell = new Set<string>();
-	const committedIds = inboxShared().committed;
-	/** The latest context Pi handed this instance, to ask whether it is idle. */
-	let context: ExtensionContext | undefined;
-	/** Runs Pi started in this session (`agent_start`), to date each hand-over. */
-	let runs = 0;
-	/** Names this instance's hand-overs apart from any other instance's. */
-	const instance = Math.random().toString(36).slice(2, 10) || "0";
-	let attempts = 0;
-	/** Handed to Pi and not yet committed or replaced, in the order they were handed over. */
-	let outstanding: HandOver[] = [];
-	/** The hand-over made while Pi was idle, until it commits or is replaced. */
-	let admitting: HandOver | undefined;
-	/** Waiting for `admitting` to settle, in inbox order. */
-	let held: InboxMessage[][] = [];
-	let recheck: ReturnType<typeof setTimeout> | undefined;
-	/**
-	 * Committed ids whose acknowledgement the deck has not confirmed, with the
-	 * confirmations asked so far. The watcher's stdin answers nothing, and the
-	 * deck may never hand a message over again (it ran out of hand-overs, or
-	 * allows one), so each is confirmed with the CLI until the deck records it.
-	 * Shared with the instance that replaces this one ([`InboxShared`]).
-	 */
-	const unconfirmed = inboxShared().unconfirmed;
-	/**
-	 * Each unconfirmed id's own confirmation timer, so its asks follow its own
-	 * schedule: a new acknowledgement never moves another id's due time.
-	 */
-	const confirmTimers = new Map<string, ReturnType<typeof setTimeout>>();
-	/** The ids whose confirmation is due, asked one at a time by [`confirm`]. */
-	const confirmDue = new Set<string>();
-	let confirming = false;
+async function handOver(proc: InboxProcess, message: InboxMessage): Promise<void> {
+	const ref = inboxRef(message as InboxRef);
+	const key = inboxKey(ref);
+	const token = proc.current?.token;
+	if (token === undefined) {
+		proc.pending.unshift(message);
+		return;
+	}
+	let granted = await proc.receiver.may(ref);
+	if (granted !== undefined && granted.epoch !== proc.receiver.epoch()) {
+		granted = await proc.receiver.may(ref);
+	}
+	// No await from here to the call.
+	if (proc.disposed) {
+		return;
+	}
+	const current = proc.current;
+	if (current?.token !== token) {
+		proc.pending.unshift(message);
+		if (current !== undefined) {
+			drainPending(proc);
+		}
+		return;
+	}
+	let ready = false;
+	try {
+		ready = proc.receiver.ready(ref, granted) && !proc.sent.has(key) && !proc.passed.has(key);
+	} catch {
+		ready = false;
+	}
+	if (!ready) {
+		refuse(proc, ref);
+		return;
+	}
+	proc.nextTag += 1;
+	const tag = `${proc.tagPrefix}.${proc.nextTag}`;
+	// Pi can run the `input` gate before `sendUserMessage` returns, so the
+	// attempt is on record first.
+	proc.sent.set(key, { message, ref, tag, token, granted, run: proc.runs });
+	rememberTag(proc, tag, key);
+	noteId(proc, ref);
+	try {
+		current.pi.sendUserMessage(tagHandOver(tag, inboxUserText([message])), { deliverAs: "followUp" });
+	} catch {
+		// A synchronous throw (a stale `pi`): nothing reached Pi.
+		proc.sent.delete(key);
+		refuse(proc, ref);
+		return;
+	}
+	if (proc.sent.has(key)) {
+		armRecheck(proc, key);
+	}
+}
 
-	const current = () => active && generation === inboxShared().generation;
+/**
+ * The native gate (PRD #1666 §2.2): our hand-over reaching Pi's `input`
+ * hooks, run by the instance `token`. It passes — `transform`, the hand-over
+ * point — only for an attempt this instance sent, while this instance is
+ * current and nothing is disposed, and only while the receiver still
+ * authorizes it with the approval the call was made under. Anything else is
+ * consumed (`handled`), never passed through: an unknown or older tag
+ * silently; one that failed a check after a positive not-handed when the
+ * receiver still holds it.
+ */
+function gate(proc: InboxProcess, instance: Instance, event: unknown): InputAnswer {
+	const input = event as { text?: unknown; source?: unknown } | undefined;
+	if (input?.source !== "extension") {
+		return undefined;
+	}
+	const tagged = untagHandOver(input.text);
+	if (!tagged) {
+		return undefined;
+	}
+	const key = proc.tags.get(tagged.attempt);
+	const sent = key === undefined ? undefined : proc.sent.get(key);
+	if (key === undefined || sent === undefined || sent.tag !== tagged.attempt) {
+		return HANDLED;
+	}
+	proc.sent.delete(key);
+	clearRecheck(proc, key);
+	const live =
+		!proc.disposed &&
+		!instance.shutdown &&
+		instance.token !== undefined &&
+		proc.current?.token === instance.token &&
+		sent.token === instance.token;
+	let ready = false;
+	try {
+		ready = live && proc.receiver.ready(sent.ref, sent.granted);
+	} catch {
+		ready = false;
+	}
+	if (!ready) {
+		refuse(proc, sent.ref);
+		return HANDLED;
+	}
+	proc.receiver.calling(sent.ref);
+	proc.passed.set(key, { ref: sent.ref, token: instance.token!, stage: "input", run: proc.runs, suspect: false, lost: false });
+	proc.receiver.handed([sent.ref]);
+	return { action: "transform", text: tagged.text };
+}
 
-	/** Pi is idle, as far as it can be asked; an unanswerable Pi counts as idle, which only holds messages back. */
-	const piIdle = (): boolean => askIdle() ?? true;
-	/** Pi's answers, or `undefined` when it cannot be asked: never taken as a reason to hand anything over again. */
-	const askIdle = (): boolean | undefined => {
+/**
+ * A submitted input that is nothing but the deck's doorbell (PRD #1666 §2.5).
+ * Waits up to `DOORBELL_REGISTER_WAIT_MS` for the watcher to register, then
+ * fetches what it announced, issued to this receiver. The fetched attempts are
+ * held whatever happens next; the input is transformed in place into their
+ * content only if — with no await before the return — the session that
+ * fetched is still current, nothing is disposed, the watcher was not
+ * restarted, and the receiver authorizes every one under the approval taken
+ * before the fetch. Otherwise the line is consumed and each is positively not
+ * handed. With no registration, or a deck that cannot be asked, the line is
+ * consumed and the mail stays queued for the watcher.
+ */
+async function doorbell(proc: InboxProcess, instance: Instance, ids: string[], signal: AbortSignal | undefined): Promise<InputAnswer> {
+	const until = Date.now() + DOORBELL_REGISTER_WAIT_MS;
+	while (proc.receiver.rx() === undefined && Date.now() < until && !proc.disposed) {
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
+	const rx = proc.receiver.rx();
+	const current = proc.current;
+	if (rx === undefined || current === undefined || current.token !== instance.token) {
+		return HANDLED;
+	}
+	const token = current.token;
+	const epoch = proc.receiver.epoch();
+	const approval = proc.receiver.approval();
+	const fetched: InboxMessage[] = [];
+	for (const id of ids) {
+		let outcome: { code: number; stdout: string };
 		try {
-			return context?.isIdle();
+			outcome = await current.pi.exec(deckBin, buildInboxDoorbellFetchArgv(id, rx, INBOX_ADAPTER_INTEGRATION), { signal, timeout: 5000 });
 		} catch {
-			return undefined;
+			break;
 		}
-	};
-	const askQueued = (): boolean | undefined => {
-		try {
-			return context?.hasPendingMessages?.();
-		} catch {
-			return undefined;
+		const messages = outcome.code === 0 ? parseInboxFetch(outcome.stdout) : undefined;
+		if (!messages) {
+			break;
 		}
-	};
-	/** An agent run is active: Pi's `signal` is set only while one is. */
-	const askRunning = (ctx: ExtensionContext): boolean | undefined => {
-		try {
-			return ctx.signal !== undefined;
-		} catch {
-			return undefined;
+		fetched.push(...messages.filter((m) => typeof m.a === "number" && typeof m.e === "number"));
+	}
+	if (fetched.length === 0) {
+		return HANDLED;
+	}
+	proc.receiver.take(fetched as InboxReceiverMessage[]);
+	// No await from here to the return.
+	const refs = fetched.map((m) => inboxRef(m as InboxRef));
+	const live =
+		!proc.disposed &&
+		!instance.shutdown &&
+		proc.current?.token === token &&
+		proc.receiver.epoch() === epoch;
+	let ready = false;
+	try {
+		ready = live && refs.every((ref) => proc.receiver.ready(ref, approval));
+	} catch {
+		ready = false;
+	}
+	if (!ready) {
+		for (const ref of refs) {
+			refuse(proc, ref);
 		}
-	};
+		return HANDLED;
+	}
+	for (const ref of refs) {
+		proc.receiver.calling(ref);
+		proc.passed.set(inboxKey(ref), { ref, token, stage: "input", run: proc.runs, suspect: false, lost: false });
+		noteId(proc, ref);
+	}
+	proc.receiver.handed(refs);
+	return { action: "transform", text: inboxUserText(fetched) };
+}
 
-	const isHeld = (id: string): boolean => held.some((batch) => batch.some((m) => m.id === id));
-	const carrying = (id: string): HandOver | undefined => outstanding.find((o) => o.messages.some((m) => m.id === id));
-	const unseen = (): HandOver[] => outstanding.filter((o) => o.stage === "handed");
-
-	const clearRecheck = (): void => {
-		if (recheck !== undefined) {
-			clearTimeout(recheck);
-			recheck = undefined;
-		}
-	};
-
-	/** (Re)start the idle recheck: armed from the latest hand-over while one the `input` hook has not seen remains. */
-	const armRecheck = (): void => {
-		clearRecheck();
-		if (!current() || unseen().length === 0) {
-			return;
-		}
-		recheck = setTimeout(() => {
-			recheck = undefined;
-			try {
-				if (!current() || unseen().length === 0) {
-					return;
-				}
-				if (askIdle() === true && askQueued() === false) {
-					replace(unseen());
-				} else {
-					armRecheck();
-				}
-			} catch {
-				// Never let a timer callback throw into Pi.
-			}
-		}, INBOX_ADMISSION_RECHECK_MS);
-		try {
-			(recheck as { unref?: () => void }).unref?.();
-		} catch {
-			// A timer without unref.
-		}
-	};
-
-	/** Hand `messages` to Pi as one user message. False when Pi threw at once: nothing was handed over. */
-	const send = (messages: InboxMessage[]): boolean => {
-		const idle = piIdle();
-		attempts += 1;
-		const handed: HandOver = {
-			attempt: `${instance}.${attempts}`,
-			messages,
-			text: inboxUserText(messages),
-			run: runs,
-			stage: "handed",
-			suspect: false,
-		};
-		// Pi can run this extension's `input` hook before `sendUserMessage`
-		// returns, so the hand-over is on record first.
-		outstanding.push(handed);
-		try {
-			pi.sendUserMessage(tagHandOver(handed.attempt, handed.text), { deliverAs: "followUp" });
-		} catch {
-			outstanding = outstanding.filter((o) => o !== handed);
-			return false;
-		}
-		if (idle && outstanding.includes(handed)) {
-			admitting = handed;
-		}
-		armRecheck();
-		return true;
-	};
-
-	/** Hand over what is held, until a hand-over to an idle Pi has to settle first. */
-	const flush = (): void => {
-		while (current() && admitting === undefined && held.length > 0) {
-			// Not handed over, so not acknowledged: the deck hands it over again.
-			send(held.shift()!);
-		}
-	};
-
-	/**
-	 * These hand-overs will not commit: hand their messages over again, ahead
-	 * of anything held. Each one is forgotten, so its own late arrival at the
-	 * `input` hook is consumed there.
-	 */
-	const replace = (stale: HandOver[]): void => {
-		if (stale.length === 0) {
-			return;
-		}
-		outstanding = outstanding.filter((o) => !stale.includes(o));
-		if (admitting !== undefined && stale.includes(admitting)) {
-			admitting = undefined;
-		}
-		held = [...stale.map((o) => o.messages), ...held];
-		armRecheck();
-		flush();
-	};
-
-	/**
-	 * Give `messages` to Pi, once each. A message already held, or carried by
-	 * a hand-over that may still commit, is not handed over again, and the
-	 * deck is told it is held (`hold`), so a turn longer than the deck's
-	 * hand-over limit does not use that limit up. One the deck hands over again
-	 * while its hand-over is past the `input` hook and Pi has nothing queued
-	 * replaces that hand-over, and is not a hold: the hand-over it replaces did
-	 * not reach the agent. One Pi already committed is acknowledged again and
-	 * not handed over: the deck sends it again only because it never recorded
-	 * the acknowledgement. False only when Pi threw at once.
-	 */
-	const deliver = (messages: InboxMessage[]): boolean => {
-		const fresh: InboxMessage[] = [];
-		const stale = new Set<HandOver>();
-		const holding: string[] = [];
-		const committedAgain: string[] = [];
-		for (const m of messages) {
-			if (committedIds.has(m.id)) {
-				committedAgain.push(m.id);
+/**
+ * Pi committed `message` (`message_start`): every attempt of each deck id a
+ * user message carries that passed a hand-over point, or that was sent and
+ * reached Pi around the gate, is committed. Only a current instance that has
+ * not shut down is a witness; a commit never comes from a change of session.
+ */
+function commit(proc: InboxProcess, instance: Instance, message: unknown): void {
+	if (proc.disposed || instance.shutdown || instance.token === undefined || proc.current?.token !== instance.token) {
+		return;
+	}
+	const refs: InboxRef[] = [];
+	for (const id of inboxIdsToAck(message)) {
+		for (const key of proc.byId.get(id) ?? []) {
+			if (proc.committed.has(key)) {
 				continue;
 			}
-			if (isHeld(m.id)) {
-				holding.push(m.id);
-				continue;
-			}
-			const handed = carrying(m.id);
-			if (handed === undefined) {
-				fresh.push(m);
-			} else if (handed.stage !== "handed" && askQueued() === false) {
-				stale.add(handed);
+			const passed = proc.passed.get(key);
+			const sent = proc.sent.get(key);
+			if (passed !== undefined) {
+				refs.push(passed.ref);
+			} else if (sent !== undefined) {
+				proc.sent.delete(key);
+				clearRecheck(proc, key);
+				proc.receiver.calling(sent.ref);
+				refs.push(sent.ref);
 			} else {
-				holding.push(m.id);
+				continue;
+			}
+			proc.passed.delete(key);
+			rememberKey(proc.committed, key);
+		}
+		proc.byId.delete(id);
+	}
+	if (refs.length > 0) {
+		proc.receiver.committed(refs);
+	}
+}
+
+/** A `before_agent_start` prompt carries these attempts: they are about to run, or be refused. */
+function starting(proc: InboxProcess, instance: Instance, prompt: unknown): void {
+	if (proc.current?.token !== instance.token) {
+		return;
+	}
+	const ids = new Set(inboxIdsIn(prompt));
+	for (const passed of proc.passed.values()) {
+		if (passed.token === instance.token && passed.stage === "input" && ids.has(passed.ref.id)) {
+			passed.stage = "start";
+			passed.suspect = false;
+		}
+	}
+}
+
+/**
+ * Pi settled a run, or a prompt it refused (PRD #1666 §2.3). Only positive
+ * evidence releases an attempt past the gate as `lost` — possibly handed, so
+ * the deck decides on its checked, marked repeat:
+ * - one a `before_agent_start` prompt carried, at a settle with no run
+ *   active, after a settle while another run was active (Pi's refusal) or
+ *   with nothing queued;
+ * - one past the gate, at a settle with no run active and nothing queued,
+ *   after a run started since it passed (Escape pulled it back, or the run
+ *   dropped it).
+ * One still in preflight, or a Pi that cannot be asked, keeps it held. A sent
+ * attempt the gate never saw, at a settle with nothing queued after a run
+ * started since it was sent, never reached the gate: positively not handed.
+ */
+function settled(proc: InboxProcess, instance: Instance, ctx: ExtensionContext): void {
+	if (proc.disposed || proc.current?.token !== instance.token) {
+		return;
+	}
+	const running = askRunning(ctx);
+	const queued = askQueued(ctx);
+	for (const [key, passed] of proc.passed) {
+		if (passed.token !== instance.token || passed.lost || proc.committed.has(key)) {
+			continue;
+		}
+		let release = false;
+		if (passed.stage === "start") {
+			if (running === true) {
+				passed.suspect = true;
+			} else if (running === false && (passed.suspect || queued === false)) {
+				release = true;
+			}
+		} else if (running === false && queued === false && passed.run < proc.runs) {
+			release = true;
+		}
+		if (release) {
+			passed.lost = true;
+			proc.receiver.lost(passed.ref);
+		}
+	}
+	if (running === false && queued === false) {
+		for (const [key, sent] of proc.sent) {
+			if (sent.token === instance.token && sent.run < proc.runs) {
+				proc.sent.delete(key);
+				refuse(proc, sent.ref);
 			}
 		}
-		if (holding.length > 0 && writable(watcher)) {
+	}
+}
+
+/** One extension instance: Pi builds one per session (`/new`, resume, fork, reload). */
+interface Instance {
+	token: number | undefined;
+	/** Its `session_shutdown` ran: no longer current, and no longer a witness. */
+	shutdown: boolean;
+}
+
+/** A session started in `instance`: it becomes the current one and is handed what waited. */
+function sessionStart(proc: InboxProcess, instance: Instance, pi: ExtensionAPI, ctx: ExtensionContext, reason: unknown): void {
+	proc.nextToken += 1;
+	instance.token = proc.nextToken;
+	if (reason === "reload" && proc.reloadedFrom !== undefined) {
+		// A reload keeps the same agent and its queue: what the outgoing
+		// instance passed is this one's now.
+		for (const passed of proc.passed.values()) {
+			if (passed.token === proc.reloadedFrom) {
+				passed.token = instance.token;
+			}
+		}
+	}
+	proc.reloadedFrom = undefined;
+	proc.current = { token: instance.token, pi, ctx };
+	proc.receiver.ensure();
+	drainPending(proc);
+}
+
+/**
+ * `instance`'s session ended. A `/new`, resume or fork drops Pi's follow-up
+ * queue with the session (PRD #1666 §0.7), so what this instance passed and
+ * Pi has not committed is released `lost` — possibly handed, never not handed
+ * — and what it sent that the gate has not seen goes back, uncalled, to the
+ * front of `pending` for the successor. A reload keeps the agent and its
+ * queue, so it releases nothing. The watcher is left running either way.
+ */
+function sessionShutdown(proc: InboxProcess, instance: Instance, reason: unknown): void {
+	instance.shutdown = true;
+	if (instance.token === undefined || proc.current?.token !== instance.token) {
+		return;
+	}
+	if (reason === "reload") {
+		proc.reloadedFrom = instance.token;
+	} else {
+		for (const [key, passed] of proc.passed) {
+			if (passed.token === instance.token && !passed.lost && !proc.committed.has(key)) {
+				passed.lost = true;
+				proc.receiver.lost(passed.ref);
+			}
+		}
+		const unseen: InboxMessage[] = [];
+		for (const [key, sent] of proc.sent) {
+			if (sent.token === instance.token) {
+				proc.sent.delete(key);
+				clearRecheck(proc, key);
+				unseen.push(sent.message);
+			}
+		}
+		proc.pending.unshift(...unseen);
+	}
+	proc.current = undefined;
+}
+
+/**
+ * A fresh process state, carrying `transfer` from a replaced one when there is
+ * one. A replacement registers `--resumed`, so the deck asks about the
+ * attempts the old receiver held; with nothing transferred, the new one
+ * cannot say what the old one handed, so it answers every revoke
+ * `already_handed` and resumes `unknown` — possibly handed, never not handed.
+ */
+function createProcess(transfer?: Transfer, replaced = false): InboxProcess {
+	const proc: InboxProcess = {
+		version: INBOX_VERSION,
+		stateVersion: INBOX_STATE_VERSION,
+		receiver: undefined as unknown as InboxReceiver,
+		sent: transfer?.sent ?? new Map(),
+		tags: transfer?.tags ?? new Map(),
+		passed: transfer?.passed ?? new Map(),
+		byId: transfer?.byId ?? new Map(),
+		committed: transfer?.committed ?? new Set(),
+		pending: transfer?.pending ?? [],
+		current: undefined,
+		nextToken: transfer?.nextToken ?? 0,
+		nextTag: transfer?.nextTag ?? 0,
+		tagPrefix: transfer?.tagPrefix ?? (Math.random().toString(36).slice(2, 10) || "0"),
+		runs: transfer?.runs ?? 0,
+		chain: Promise.resolve(),
+		reportQueue: createSerialQueue(),
+		rechecks: new Map(),
+		reloadedFrom: undefined,
+		replacing: undefined,
+		disposed: false,
+		notInDeck: false,
+	};
+	proc.receiver = inboxReceiver({
+		agent: "pi",
+		active: () => !proc.disposed && !proc.notInDeck,
+		deliver: (message) => deliver(proc, message as InboxMessage),
+		exited: (code) => {
+			if (code === WATCHER_NOT_IN_DECK_EXIT) {
+				proc.notInDeck = true;
+			}
+		},
+		state: (transfer?.receiver as InboxReceiverState | undefined) ?? (replaced ? { forgot: true } : undefined),
+	});
+	// What a sent attempt the old receiver never saw at the gate waits for now.
+	for (const key of proc.sent.keys()) {
+		armRecheck(proc, key);
+	}
+	return proc;
+}
+
+/**
+ * The process's receiver, created on first use. An extension from before the
+ * receipt stream left its own watcher and state: its instances are retired
+ * and its watcher stopped, since this receiver registers in its place.
+ */
+function inboxProcess(): InboxProcess {
+	const existing = holder[INBOX_PROCESS] as InboxProcess | undefined;
+	if (existing !== undefined) {
+		return existing;
+	}
+	const legacy = holder[LEGACY_INBOX] as { generation?: number; watcher?: { stdin?: { end(): unknown } | null; kill(signal?: string): unknown } } | undefined;
+	if (legacy !== undefined) {
+		legacy.generation = (legacy.generation ?? 0) + 1;
+		try {
+			legacy.watcher?.stdin?.end();
+			legacy.watcher?.kill("SIGTERM");
+		} catch {
+			// Already gone.
+		}
+		legacy.watcher = undefined;
+	}
+	const proc = createProcess();
+	holder[INBOX_PROCESS] = proc;
+	return proc;
+}
+
+/**
+ * PRD #1666 §0.5: the process's receiver came from a different version of this
+ * file (a reload after the extension was refreshed). It is disposed at once —
+ * it delivers nothing more and requests no grant, but answers revokes and
+ * resumes from what it holds — and its watcher drained, awaited, so the two
+ * never publish side by side. Then a new receiver starts: holding the old
+ * one's attempts, reports and gate records when their shape is this
+ * version's, so it answers the deck's resumes `retained`; holding nothing
+ * otherwise, so the deck hears `unknown` — possibly handed, never not handed.
+ * One replacement serves every instance that asks while it runs.
+ */
+async function replaceVersion(): Promise<InboxProcess> {
+	for (;;) {
+		const old = holder[INBOX_PROCESS] as Partial<InboxProcess> | undefined;
+		if (old === undefined) {
+			return inboxProcess();
+		}
+		if (old.version === INBOX_VERSION) {
+			return old as InboxProcess;
+		}
+		if (old.replacing !== undefined) {
+			await old.replacing;
+			continue;
+		}
+		old.replacing = (async () => {
+			old.disposed = true;
+			const receiver = old.receiver as Partial<InboxReceiver> | undefined;
 			try {
-				watcher.stdin!.write(`${JSON.stringify({ hold: holding })}\n`);
-			} catch {
-				// The deck counts the redelivery, as it does without a hold.
-			}
-		}
-		// Pi already committed these: the deck hands them over again because
-		// their acknowledgement never reached it (the watcher exited with it
-		// unforwarded, or the CLI failed). They are acknowledged again, never
-		// handed to Pi a second time.
-		for (const id of committedAgain) {
-			fromDoorbell.delete(id);
-		}
-		acknowledge(committedAgain);
-		replace([...stale]);
-		if (fresh.length === 0) {
-			return true;
-		}
-		if (admitting !== undefined) {
-			held.push(fresh);
-			return true;
-		}
-		return send(fresh);
-	};
-
-	/** Pi committed these ids: their hand-overs are done, and a settled admission lets the held ones go. */
-	const settleCommitted = (ids: string[]): void => {
-		for (const id of ids) {
-			committedIds.add(id);
-			while (committedIds.size > MAX_COMMITTED_IDS) {
-				committedIds.delete(committedIds.values().next().value as string);
-			}
-		}
-		for (const o of outstanding) {
-			o.messages = o.messages.filter((m) => !ids.includes(m.id));
-		}
-		outstanding = outstanding.filter((o) => o.messages.length > 0);
-		if (admitting !== undefined && admitting.messages.length === 0) {
-			admitting = undefined;
-		}
-		if (unseen().length === 0) {
-			clearRecheck();
-		}
-		flush();
-	};
-
-	const clearConfirm = (): void => {
-		for (const timer of confirmTimers.values()) {
-			clearTimeout(timer);
-		}
-		confirmTimers.clear();
-		confirmDue.clear();
-	};
-
-	/**
-	 * Confirm `id` after `delay`. One already scheduled or due for it is kept:
-	 * an id's next ask is set only by its own previous one.
-	 */
-	const scheduleConfirm = (id: string, delay: number): void => {
-		if (!current() || !unconfirmed.has(id) || confirmTimers.has(id) || confirmDue.has(id)) {
-			return;
-		}
-		const timer = setTimeout(() => {
-			confirmTimers.delete(id);
-			confirmDue.add(id);
-			void confirm();
-		}, delay);
-		try {
-			(timer as { unref?: () => void }).unref?.();
-		} catch {
-			// A timer without unref.
-		}
-		confirmTimers.set(id, timer);
-	};
-
-	/** Confirm `ids` now, ahead of any confirmation scheduled for them. */
-	const confirmNow = (ids: Iterable<string>): void => {
-		for (const id of ids) {
-			const timer = confirmTimers.get(id);
-			if (timer !== undefined) {
-				clearTimeout(timer);
-				confirmTimers.delete(id);
-			}
-			if (unconfirmed.has(id)) {
-				confirmDue.add(id);
-			}
-		}
-		void confirm();
-	};
-
-	/** Tell the user in Pi that the deck could not record message `id` as delivered. */
-	const reportUnconfirmed = (id: string, why: string): void => {
-		try {
-			context?.ui?.notify?.(
-				`dot-agent-deck could not record message ${id} as delivered (${why}). Pi received it; the deck may show it as not delivered.`,
-				"warning",
-			);
-		} catch {
-			// A stale context: nothing more to tell.
-		}
-	};
-
-	/**
-	 * Ask the deck about each due id with `dot-agent-deck ack --json`, one at
-	 * a time. An id is done once the deck records it, or refuses it for good,
-	 * or after `INBOX_ACK_CONFIRM_ATTEMPTS` unanswered asks; the last two are
-	 * reported to the user. Any other is asked again after its own backoff.
-	 */
-	const confirm = async (): Promise<void> => {
-		if (confirming) {
-			// The running pass takes the ids that fell due meanwhile.
-			return;
-		}
-		confirming = true;
-		try {
-			for (let id = first(confirmDue); id !== undefined && current(); id = first(confirmDue)) {
-				confirmDue.delete(id);
-				const asked = unconfirmed.get(id);
-				if (asked === undefined) {
-					continue;
-				}
-				let stdout: unknown;
-				try {
-					stdout = (await pi.exec(deckBin, buildInboxAckArgv(id), { timeout: 5000 })).stdout;
-				} catch {
-					// A stale `pi`, or the CLI did not run: not confirmed.
-				}
-				if (!current()) {
-					// Replaced meanwhile: the next instance asks again, and counts that ask.
-					return;
-				}
-				if (!unconfirmed.has(id)) {
-					continue;
-				}
-				const outcome = parseInboxAckReply(stdout);
-				if (outcome === "recorded") {
-					unconfirmed.delete(id);
-				} else if (outcome !== "unconfirmed") {
-					unconfirmed.delete(id);
-					reportUnconfirmed(id, outcome.refused);
-				} else if (asked + 1 >= INBOX_ACK_CONFIRM_ATTEMPTS) {
-					unconfirmed.delete(id);
-					reportUnconfirmed(id, "the deck did not confirm it");
+				if (typeof receiver?.drain === "function") {
+					await receiver.drain();
 				} else {
-					unconfirmed.set(id, asked + 1);
-					scheduleConfirm(id, Math.min(INBOX_ACK_CONFIRM_DELAY_MS * 2 ** (asked + 1), INBOX_ACK_CONFIRM_MAX_DELAY_MS));
-				}
-			}
-		} finally {
-			confirming = false;
-		}
-	};
-
-	/**
-	 * Acknowledge `ids` over the watcher's stdin, or with the CLI for `viaCli`
-	 * and when no watcher takes the line, and keep each until the deck confirms
-	 * it ([`confirm`]): at once when the CLI carries it, else after
-	 * `INBOX_ACK_CONFIRM_DELAY_MS`, unless that id's confirmation is already
-	 * scheduled.
-	 */
-	const acknowledge = (ids: string[], viaCli: string[] = []): void => {
-		let written = false;
-		if (ids.length > 0 && writable(watcher)) {
-			try {
-				watcher.stdin!.write(`${JSON.stringify({ ack: ids })}\n`);
-				written = true;
-			} catch {
-				// Confirmed with the CLI below.
-			}
-		}
-		for (const id of [...ids, ...viaCli]) {
-			if (!unconfirmed.has(id)) {
-				unconfirmed.set(id, 0);
-			}
-		}
-		if (written) {
-			for (const id of ids) {
-				scheduleConfirm(id, INBOX_ACK_CONFIRM_DELAY_MS);
-			}
-		}
-		const now = written ? viaCli : [...ids, ...viaCli];
-		if (now.length > 0) {
-			confirmNow(now);
-		}
-	};
-
-	const writable = (child: WatcherChild | undefined): child is WatcherChild =>
-		!!child?.stdin && !child.stdin.writableEnded && !child.stdin.destroyed;
-
-	/** The fixed respawn delay the environment sets, read at each session start. */
-	let fixedBackoff: number | undefined;
-	const nextBackoff = (current: number, ranForMs: number): number =>
-		fixedBackoff ?? nextWatcherBackoff(current, ranForMs);
-
-	const scheduleRespawn = (delay: number, next: number): void => {
-		if (!current()) {
-			return;
-		}
-		respawn = setTimeout(() => {
-			respawn = undefined;
-			try {
-				spawnWatcher(next);
-			} catch {
-				// Never let a timer callback throw into Pi.
-			}
-		}, delay);
-		try {
-			(respawn as { unref?: () => void }).unref?.();
-		} catch {
-			// A timer without unref.
-		}
-	};
-
-	const spawnWatcher = (backoff: number): void => {
-		if (!current()) {
-			return;
-		}
-		const started = Date.now();
-		let child: WatcherChild;
-		try {
-			child = spawn(deckBin, buildInboxWaitArgv(), { stdio: ["pipe", "pipe", "inherit"] }) as unknown as WatcherChild;
-		} catch {
-			scheduleRespawn(backoff, nextBackoff(backoff, 0));
-			return;
-		}
-		watcher = child;
-		inboxShared().watcher = child;
-		const lines = createLineSplitter();
-		child.stdout?.setEncoding?.("utf8");
-		child.stdout?.on("data", (chunk: unknown) => {
-			try {
-				if (!current() || watcher !== child) {
-					return;
-				}
-				for (const line of lines(String(chunk))) {
-					const message = parseInboxLine(line);
-					if (!message || !current()) {
-						continue;
-					}
-					// When Pi throws, nothing is handed over or acknowledged: the deck hands it over again.
-					deliver([message]);
+					receiver?.stop?.();
 				}
 			} catch {
-				// An uncaught throw in a child-process callback would end Pi.
+				// Gone already.
 			}
-		});
-		let gone = false;
-		const exited = (code?: unknown) => {
-			try {
-				if (gone) {
-					return;
-				}
-				gone = true;
-				if (watcher === child) {
-					watcher = undefined;
-				}
-				if (inboxShared().watcher === child) {
-					inboxShared().watcher = undefined;
-				}
-				if (code === WATCHER_NOT_IN_DECK_EXIT) {
-					return;
-				}
-				scheduleRespawn(backoff, nextBackoff(backoff, Date.now() - started));
-			} catch {
-				// An uncaught throw in a child-process callback would end Pi.
-			}
-		};
-		child.on("exit", (code: unknown) => exited(code));
-		child.on("error", () => exited());
-		try {
-			child.stdin?.on?.("error", () => undefined);
-		} catch {
-			// No stdin to watch.
-		}
-	};
-
-	return {
-		/** A session began in this instance: retire every older instance and arm a watcher. */
-		start(ctx: ExtensionContext): void {
-			context = ctx;
-			const shared = inboxShared();
-			shared.generation += 1;
-			generation = shared.generation;
-			active = true;
-			stopWatcher(shared.watcher);
-			shared.watcher = undefined;
-			fixedBackoff = watcherBackoffOverride(process.env);
-			spawnWatcher(fixedBackoff ?? WATCHER_BACKOFF_MIN_MS);
-			// What the session this one replaced left unconfirmed.
-			if (unconfirmed.size > 0) {
-				confirmNow(unconfirmed.keys());
-			}
-		},
-
-		/** This instance's session ended: stop its watcher and never respawn it. */
-		stop(): void {
-			active = false;
-			clearRecheck();
-			// The unconfirmed acknowledgements stay, for the instance that replaces this one.
-			clearConfirm();
-			outstanding = [];
-			admitting = undefined;
-			held = [];
-			if (respawn !== undefined) {
-				clearTimeout(respawn);
-				respawn = undefined;
-			}
-			const child = watcher;
-			watcher = undefined;
-			if (child && inboxShared().watcher === child) {
-				inboxShared().watcher = undefined;
-			}
-			stopWatcher(child);
-		},
-
-		/**
-		 * Pi committed `message`: acknowledge every deck message a user message
-		 * carries — over the watcher's stdin, or with `dot-agent-deck ack` for
-		 * content a doorbell fetched or when no watcher is running.
-		 */
-		committed(message: unknown): void {
-			if (!current()) {
-				return;
-			}
-			const ids = inboxIdsToAck(message);
-			if (ids.length === 0) {
-				return;
-			}
-			const viaCli = ids.filter((id) => fromDoorbell.delete(id));
-			acknowledge(
-				ids.filter((id) => !viaCli.includes(id)),
-				viaCli,
-			);
-			settleCommitted(ids);
-		},
-
-		/** Pi started a run: a hand-over from before it that never commits was refused. */
-		runStarted(ctx: ExtensionContext): void {
-			context = ctx;
-			runs += 1;
-		},
-
-		/**
-		 * One of this instance's hand-overs reached Pi's `input` hooks. A
-		 * hand-over that was replaced, or whose messages Pi already committed,
-		 * is consumed; any other one goes on without the line naming it.
-		 * `undefined` for an input that is not a hand-over.
-		 */
-		handOverInput(event: unknown): { action: "handled" } | { action: "transform"; text: string } | undefined {
-			const input = event as { text?: unknown; source?: unknown } | undefined;
-			if (input?.source !== "extension") {
-				return undefined;
-			}
-			const tagged = untagHandOver(input.text);
-			if (!tagged) {
-				return undefined;
-			}
-			const handed = current() ? outstanding.find((o) => o.attempt === tagged.attempt) : undefined;
-			if (handed === undefined) {
-				const ids = inboxIdsIn(tagged.text);
-				if (tagged.attempt.startsWith(`${instance}.`) || (ids.length > 0 && ids.every((id) => committedIds.has(id)))) {
-					return { action: "handled" };
-				}
-				return { action: "transform", text: tagged.text };
-			}
-			if (handed.stage === "handed") {
-				handed.stage = "input";
-				armRecheck();
-			}
-			return { action: "transform", text: tagged.text };
-		},
-
-		/** Pi's `before_agent_start` hooks reached `prompt`: a hand-over carrying it is about to run or be refused. */
-		starting(prompt: unknown): void {
-			if (!current()) {
-				return;
-			}
-			const handed = outstanding.find((o) => o.stage === "input" && o.text === prompt);
-			if (handed !== undefined) {
-				handed.stage = "start";
-				handed.suspect = false;
-			}
-		},
-
-		/**
-		 * Pi settled a run, or a prompt it refused. A refused prompt settles
-		 * while the run that beat it is still active; a run's own end settles
-		 * with none. A hand-over past `before_agent_start` that sees the first
-		 * and then the second without committing was refused. With nothing
-		 * queued, a hand-over the `input` hook never saw and that was made
-		 * before the latest run started is handed over again too.
-		 */
-		settled(ctx: ExtensionContext): void {
-			context = ctx;
-			if (!current()) {
-				return;
-			}
-			const running = askRunning(ctx);
-			const refused: HandOver[] = [];
-			for (const o of outstanding) {
-				if (o.stage !== "start") {
-					continue;
-				}
-				if (running === true) {
-					o.suspect = true;
-				} else if (running === false && o.suspect) {
-					refused.push(o);
+			let transfer: Transfer | undefined;
+			if (old.stateVersion === INBOX_STATE_VERSION && typeof receiver?.exportState === "function") {
+				transfer = {
+					receiver: receiver.exportState(),
+					sent: old.sent ?? new Map(),
+					tags: old.tags ?? new Map(),
+					passed: old.passed ?? new Map(),
+					byId: old.byId ?? new Map(),
+					committed: old.committed ?? new Set(),
+					pending: old.pending ?? [],
+					nextToken: old.nextToken ?? 0,
+					nextTag: old.nextTag ?? 0,
+					tagPrefix: old.tagPrefix ?? "0",
+					runs: old.runs ?? 0,
+				};
+				for (const timer of old.rechecks?.values() ?? []) {
+					clearTimeout(timer);
 				}
 			}
-			if (askQueued() === false) {
-				refused.push(...unseen().filter((o) => o.run < runs));
-			}
-			replace(refused);
-		},
-
-		/**
-		 * A submitted input that is nothing but the deck's doorbell: fetch what
-		 * it announced without acknowledging it and hand it to Pi, so the model
-		 * is never asked to fetch. Answers whether the input was consumed. A
-		 * doorbell whose message was already handed over (a line recalled from
-		 * history) is consumed with nothing to deliver. When the deck cannot be
-		 * asked, the line goes to the model as typed, and it fetches.
-		 */
-		async interceptDoorbell(event: unknown, signal: AbortSignal | undefined): Promise<boolean> {
-			if (!current()) {
-				return false;
-			}
-			const input = event as { text?: unknown; source?: unknown } | undefined;
-			if (input?.source === "extension") {
-				return false;
-			}
-			const ids = doorbellIdsIn(input?.text);
-			for (const id of ids) {
-				let outcome: { code: number; stdout: string };
-				try {
-					outcome = await pi.exec(deckBin, buildInboxDoorbellFetchArgv(id), { signal, timeout: 5000 });
-				} catch {
-					return false;
-				}
-				const messages = outcome.code === 0 ? parseInboxFetch(outcome.stdout) : undefined;
-				if (!messages || !current()) {
-					return false;
-				}
-				if (messages.length === 0) {
-					continue;
-				}
-				for (const message of messages) {
-					fromDoorbell.add(message.id);
-					while (fromDoorbell.size > MAX_DOORBELL_IDS) {
-						fromDoorbell.delete(fromDoorbell.values().next().value as string);
-					}
-				}
-				if (!deliver(messages)) {
-					for (const message of messages) {
-						fromDoorbell.delete(message.id);
-					}
-					return false;
-				}
-				return true;
-			}
-			return ids.length > 0;
-		},
-	};
+			holder[INBOX_PROCESS] = createProcess(transfer, true);
+		})();
+		await old.replacing;
+	}
 }
 
 /**
@@ -958,6 +910,19 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	// --- PRD #1666: this instance of the extension -------------------------
+	// The process's receiver it uses, bound at its session_start: a delayed
+	// callback of this instance keeps acting on that one, never on a receiver
+	// a later version put in its place.
+	const instance: Instance & { proc: InboxProcess | undefined } = { token: undefined, shutdown: false, proc: undefined };
+	/** Keep the current session's context fresh for the receiver's questions to Pi. */
+	const seen = (ctx: ExtensionContext): void => {
+		const current = instance.proc?.current;
+		if (current !== undefined && current.token === instance.token) {
+			current.ctx = ctx;
+		}
+	};
+
 	// --- M2.2 / issue #622: event bus → card reports ---------------------
 	// Reporting is best-effort: a failed report (e.g. no pane env vars, daemon
 	// down) must never break the agent loop, so failures are swallowed here —
@@ -974,16 +939,23 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	const reporter = createReporter((argv, signal, stdin) =>
 		runDeck(pi, argv, signal, stdin === undefined ? undefined : { text: stdin, cwd: reportCwd }),
 	);
-	// Every report, with its retries, runs to completion before the next one
-	// starts, so the deck receives them in the order Pi emitted them.
-	const inOrder = createSerialQueue();
 	// PRD #1497: the run's last assistant reply, attached to `agent_settled`.
 	// Observed synchronously in each handler, so it follows Pi's event order.
 	const replies = createTurnReplyTracker();
+	// PRD #1666 §0.3: every instance in the process reports through one queue,
+	// each report with its retries run to completion before the next, so the
+	// deck receives them in the order Pi emitted them, across a session
+	// replacement too. An instance that is no longer current reports nothing
+	// but its own session_shutdown, which is queued before its successor's
+	// first report: a stale Thinking can never claim a turn for the successor.
 	const report = (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> => {
 		replies.observe(eventName, event);
 		const reply = eventName === "agent_settled" ? replies.take() : undefined;
-		return inOrder(async () => {
+		const proc = instance.proc;
+		if (proc === undefined || (eventName !== "session_shutdown" && proc.current?.token !== instance.token)) {
+			return Promise.resolve();
+		}
+		return proc.reportQueue(async () => {
 			const decided = piEventReport(eventName, event, ctx.cwd, reply);
 			if (!decided) {
 				return;
@@ -992,13 +964,6 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			await reporter.send(decided, ctx.signal);
 		});
 	};
-
-	// --- PRD #1666: the deck's inbox -----------------------------------------
-	// Every message for this agent — its first task included — arrives through
-	// the watcher this instance runs for its session. The deck no longer types
-	// a prompt into the pane, and `get-seed` is no longer asked: it would
-	// acknowledge the seed before Pi committed it.
-	const inbox = createPiInbox(pi);
 
 	// --- PRD #1631: answer other extensions' dialogs from the deck --------
 	// Pi's `ctx.ui` is one object shared by every extension and is rebuilt when
@@ -1023,12 +988,15 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	pi.on(
 		"session_start",
 		guarded(async (event, ctx) => {
-			// The watcher first, then the announcement that holds the doorbell
-			// off until it arms, then the status (Idle — a Pi pane awaiting its
-			// first prompt is idle, matching every other backend's
-			// session-start), so the deck never sees an idle, unarmed Pi.
+			// The receiver first — its watcher already runs unless this is the
+			// process's first session — then the announcement that holds the
+			// doorbell off until it registers, then the status (Idle — a Pi
+			// pane awaiting its first prompt is idle, matching every other
+			// backend's session-start).
 			wrapDialogs(ctx);
-			inbox.start(ctx);
+			const proc = await replaceVersion();
+			instance.proc = proc;
+			sessionStart(proc, instance, pi, ctx, (event as { reason?: unknown } | undefined)?.reason);
 			try {
 				await pi.exec(deckBin, buildInboxAnnounceArgv(), { signal: ctx.signal, timeout: 5000 });
 			} catch {
@@ -1044,47 +1012,71 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	pi.on(
 		"before_agent_start",
 		guarded(async (event, ctx) => {
+			seen(ctx);
 			try {
 				await report("before_agent_start", event, ctx);
 			} finally {
 				// Once its own hook has run, a hand-over goes on to run or be refused.
-				inbox.starting(event.prompt);
+				if (instance.proc !== undefined) {
+					starting(instance.proc, instance, event.prompt);
+				}
 			}
 		}),
 	);
-	// PRD #1666: the extension's own hand-over is consumed here when another
-	// replaced it, and otherwise goes on without the line naming it; a
-	// submitted doorbell line is consumed and its content handed over instead.
+	// PRD #1666 §2.2: the gate. The extension's own hand-over passes here —
+	// `transform`, the point it is handed to Pi — or is consumed; a gate that
+	// throws consumes it too, never passing tagged text on. A submitted
+	// doorbell line is consumed, or transformed into the content it announced.
 	// Issue #1567: otherwise, a prompt submitted while Pi is busy is queued and
 	// never reaches `before_agent_start`; `piEventReport` reports exactly that
 	// `input` and ignores every other. Returns nothing then, so Pi carries on
 	// with the input unchanged.
-	pi.on(
-		"input",
-		guarded(async (event, ctx) => {
-			const handOver = inbox.handOverInput(event);
-			if (handOver?.action === "handled") {
-				return handOver;
+	pi.on("input", async (event, ctx) => {
+		const tagged =
+			(event as { source?: unknown } | undefined)?.source === "extension" &&
+			untagHandOver((event as { text?: unknown }).text) !== undefined;
+		let answer: InputAnswer;
+		try {
+			const proc = instance.proc;
+			answer = proc === undefined ? (tagged ? HANDLED : undefined) : gate(proc, instance, event);
+		} catch {
+			answer = tagged ? HANDLED : undefined;
+		}
+		if (answer?.action === "handled") {
+			return answer;
+		}
+		return guarded(async () => {
+			seen(ctx);
+			const proc = instance.proc;
+			const input = event as { text?: unknown; source?: unknown };
+			if (answer === undefined && proc !== undefined && input.source !== "extension") {
+				const ids = doorbellIdsIn(input.text);
+				if (ids.length > 0) {
+					return doorbell(proc, instance, ids, ctx.signal);
+				}
 			}
-			if (await inbox.interceptDoorbell(event, ctx.signal)) {
-				return { action: "handled" as const };
-			}
-			await report("input", handOver ? { ...event, text: handOver.text } : event, ctx);
-			return handOver;
-		}),
-	);
-	// PRD #1666: the user message carrying a deck message has been committed
-	// — the acknowledgement.
+			await report("input", answer ? { ...event, text: answer.text } : event, ctx);
+			return answer;
+		})(event, ctx);
+	});
+	// PRD #1666 §2.4: the user message carrying deck messages started — their
+	// commit.
 	pi.on(
 		"message_start",
 		guarded((event) => {
-			inbox.committed(event.message);
+			if (instance.proc !== undefined) {
+				commit(instance.proc, instance, event.message);
+			}
 		}),
 	);
 	pi.on(
 		"agent_start",
 		guarded(async (event, ctx) => {
-			inbox.runStarted(ctx);
+			seen(ctx);
+			const proc = instance.proc;
+			if (proc !== undefined && proc.current?.token === instance.token) {
+				proc.runs += 1;
+			}
 			await report("agent_start", event, ctx);
 		}),
 	);
@@ -1111,14 +1103,20 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	pi.on(
 		"agent_settled",
 		guarded(async (event, ctx) => {
-			inbox.settled(ctx);
+			seen(ctx);
+			if (instance.proc !== undefined) {
+				settled(instance.proc, instance, ctx);
+			}
 			await report("agent_settled", event, ctx);
 		}),
 	);
 	pi.on(
 		"session_shutdown",
 		guarded(async (event, ctx) => {
-			inbox.stop();
+			const proc = instance.proc;
+			if (proc !== undefined) {
+				sessionShutdown(proc, instance, (event as { reason?: unknown } | undefined)?.reason);
+			}
 			await report("session_shutdown", event, ctx);
 		}),
 	);

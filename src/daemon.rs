@@ -5432,12 +5432,18 @@ fn admit_component_process(
 /// `live` one: an unattested request (admitted under the `warn` provenance
 /// policy) gets nothing, and so does one naming any other agent (`requested`),
 /// so no generation can take another's work.
+///
+/// PRD #1666 G10: a Pi generation (`pi`) is on the receipt stream, so only
+/// an extension from before it asks; it is refused like an old adapter — no
+/// seed, its mail stays queued for the receiver and its card says to restart
+/// the agent.
 fn get_seed_inbox_alias(
     hub: &crate::inbox_hub::InboxHub,
     pane_id: &str,
     requested: Option<&str>,
     attested: Option<&str>,
     live: Option<&str>,
+    pi: bool,
 ) -> Option<String> {
     let agent = attested?;
     if requested.is_some_and(|requested| !requested.is_empty() && requested != agent) {
@@ -5451,8 +5457,20 @@ fn get_seed_inbox_alias(
     if live != Some(agent) {
         return None;
     }
+    if pi {
+        hub.refuse_old_adapter(pane_id, agent);
+        return None;
+    }
     hub.fetch_first_acked(pane_id, agent, crate::inbox::AckHow::ExtensionConfirmed)
         .map(|delivery| delivery.text)
+}
+
+/// PRD #1666 G10: whether `agent_id` in `pane_id` is a Pi generation: started
+/// as Pi, or whose extension announced itself.
+fn pi_generation(registry: &AgentPtyRegistry, pane_id: &str, agent_id: &str) -> bool {
+    registry.spawn_agent_type(agent_id) == Some(crate::event::AgentType::Pi)
+        || registry.inbox().announced_component(pane_id, agent_id)
+            == Some(crate::event::InboxComponent::PiExtension)
 }
 
 fn handle_inbox_fetch(
@@ -5511,8 +5529,11 @@ fn handle_inbox_fetch(
             ),
         };
     }
+    // PRD #1666 G10: Pi's too — a plain doorbell fetch is an extension from
+    // before the receipt stream.
     if req.consumer == InboxFetchConsumer::DoorbellHook
-        && registry.spawn_agent_type(agent_id) == Some(crate::event::AgentType::OpenCode)
+        && (registry.spawn_agent_type(agent_id) == Some(crate::event::AgentType::OpenCode)
+            || pi_generation(registry, &req.pane_id, agent_id))
     {
         registry.inbox().refuse_old_adapter(&req.pane_id, agent_id);
         return crate::event::InboxWaitReply::refused(
@@ -6707,6 +6728,9 @@ async fn run_hook_loop_with_limits(
                                             &req.pane_id,
                                         )
                                     });
+                                    let pi = attested.is_some_and(|agent| {
+                                        pi_generation(&pty_registry, &req.pane_id, agent)
+                                    });
                                     let seed = get_seed_inbox_alias(
                                         pty_registry.inbox(),
                                         &req.pane_id,
@@ -6715,6 +6739,7 @@ async fn run_hook_loop_with_limits(
                                         pty_registry
                                             .pane_current_agent_id(&req.pane_id)
                                             .as_deref(),
+                                        pi,
                                     );
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
@@ -12079,15 +12104,120 @@ mod hook_ingestion_tests {
             (None, Some("new"), Some("newer")),
         ] {
             assert_eq!(
-                get_seed_inbox_alias(&hub, "p", requested, attested, live),
+                get_seed_inbox_alias(&hub, "p", requested, attested, live, false),
                 None,
                 "{requested:?} {attested:?} {live:?}"
             );
             assert!(queued(), "{requested:?} {attested:?} {live:?}");
         }
-        let seed = get_seed_inbox_alias(&hub, "p", Some("new"), Some("new"), Some("new"))
+        let seed = get_seed_inbox_alias(&hub, "p", Some("new"), Some("new"), Some("new"), false)
             .expect("its own agent gets it");
         assert!(seed.contains("the successor's task"));
+    }
+
+    /// Scenario: A Pi generation whose extension predates the receipt stream holds a queued deck message. Its stream without the deck's integration, its plain doorbell fetch and its get-seed are each refused as an out-of-date adapter: the message stays queued and the card says to restart the agent. An OpenCode generation's stream is refused the same way, and a Claude hook's plain doorbell fetch is still served.
+    #[spec("inbox/boundary/030")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boundary_030_a_pi_extension_from_before_the_receipt_stream_is_refused() {
+        use crate::event::{InboxComponent, InboxWaitMode};
+        use crate::inbox_display::IntegrationNotice;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let registry = AgentPtyRegistry::new();
+        let hub = Arc::clone(registry.inbox());
+        let queued = |pane: &str, id: &crate::inbox::MessageId| {
+            hub.list(pane)
+                .iter()
+                .any(|m| m.id == *id && m.state == crate::inbox::StateName::Queued)
+        };
+        let post = |pane: &str, agent: &str| {
+            hub.post_direct(
+                crate::inbox::Recipient::bound(pane, agent),
+                crate::inbox::Content::from_deck("seed", "task", "the task"),
+            )
+            .unwrap()
+        };
+        // An old stream, for Pi and for OpenCode.
+        for (pane, component) in [
+            ("pi", InboxComponent::PiExtension),
+            ("oc", InboxComponent::OpenCodePlugin),
+        ] {
+            let id = post(pane, "a");
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let (read, write) = tokio::io::split(server);
+            let serve = tokio::spawn(crate::inbox_hub::serve_waiter(
+                Arc::clone(&hub),
+                pane.to_string(),
+                "a".to_string(),
+                InboxWaitMode::Stream,
+                component,
+                None,
+                crate::inbox_hub::ReceiptArm::default(),
+                BufReader::new(read),
+                write,
+                |_: &str| {},
+            ));
+            let mut lines = BufReader::new(client).lines();
+            let reply: crate::event::InboxWaitReply =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(reply.refused.as_deref(), Some("adapter_too_old"), "{pane}");
+            serve.await.unwrap();
+            assert!(queued(pane, &id), "{pane}: the message stays queued");
+            assert_eq!(
+                hub.integration_notice(pane, "a"),
+                Some(IntegrationNotice::AdapterTooOld),
+                "{pane}"
+            );
+        }
+        // A plain doorbell fetch and get-seed from a Pi generation.
+        hub.announce(
+            "p",
+            "a",
+            crate::event::InboxWake::Native,
+            InboxComponent::PiExtension,
+            None,
+        )
+        .unwrap();
+        let id = post("p", "a");
+        let fetch = |pane: &str| -> crate::event::InboxFetchRequest {
+            serde_json::from_value(serde_json::json!({
+                "pane_id": pane, "consumer": "doorbell_hook",
+                "doorbell": id.as_str(), "max_chars": 65536
+            }))
+            .unwrap()
+        };
+        let reply = handle_inbox_fetch(&registry, &fetch("p"), "a");
+        assert_eq!(reply.refused.as_deref(), Some("adapter_too_old"));
+        assert_eq!(
+            get_seed_inbox_alias(
+                &hub,
+                "p",
+                None,
+                Some("a"),
+                Some("a"),
+                pi_generation(&registry, "p", "a")
+            ),
+            None
+        );
+        assert!(queued("p", &id), "no seed, no fetch: it stays queued");
+        assert_eq!(
+            hub.integration_notice("p", "a"),
+            Some(IntegrationNotice::AdapterTooOld)
+        );
+        // A Claude hook's doorbell fetch is still served.
+        hub.announce(
+            "c",
+            "a",
+            crate::event::InboxWake::Native,
+            InboxComponent::ClaudeHooks,
+            None,
+        )
+        .unwrap();
+        let claude = post("c", "a");
+        let mut req = fetch("c");
+        req.doorbell = Some(claude.as_str().to_string());
+        let reply = handle_inbox_fetch(&registry, &req, "a");
+        assert_eq!(reply.refused, None);
+        assert_eq!(reply.messages.map(|m| m.len()), Some(1));
     }
 
     // ---------------------------------------------------------------------
@@ -12410,6 +12540,158 @@ mod hook_ingestion_tests {
             .rendered(pane_id)
             .into_iter()
             .any(|delivery| delivery.text.contains(needle))
+    }
+
+    /// Scenario: A Pi worker reports a turn starting before its receipt watcher registers, is then handed a deck message it holds, and the hub's own clock runs with a short not-started window. Nothing shows while the turn runs; once the worker's own attested Idle ends it, and while more Idles keep arriving, the card lists the message as one that may not have reached the agent. A predecessor's Thinking, a ToolEnd and an unattested Thinking leave the row; the worker's attested Thinking withdraws it, and after a Cancel it never returns.
+    #[spec("inbox/boundary/044")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boundary_044_a_pi_workers_attested_turns_drive_the_not_started_row() {
+        use crate::event::{InboxComponent, InboxWaitMode};
+        use crate::inbox_display::AttentionKind;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let _lock = HOOK_PROVENANCE_ENV_LOCK.lock().await;
+        // SAFETY: nextest runs each test in its own process; the hub reads it
+        // once, when it is created below.
+        unsafe { std::env::set_var(crate::inbox_hub::ENV_NOT_STARTED_MS, "300") };
+        let fx = ProvenanceFixture::start().await;
+        let (pane, agent) = (PROV_WORKER_PANE, fx.worker_agent.clone());
+        let hub = Arc::clone(fx.registry.inbox());
+        let send = |agent_id: String, kind: &'static str, token: Option<String>| {
+            let sock = fx.sock.clone();
+            async move {
+                let mut payload = serde_json::json!({
+                    "session_id": "pi-session", "pane_id": pane, "agent_id": agent_id,
+                    "agent_type": "pi", "event_type": kind, "timestamp": chrono::Utc::now(),
+                });
+                if let Some(token) = token {
+                    payload["token"] = serde_json::Value::String(token);
+                }
+                let mut stream = UnixStream::connect(&sock).await.unwrap();
+                stream
+                    .write_all(format!("{payload}\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                let mut reply = String::new();
+                let _ = stream.read_to_string(&mut reply).await;
+            }
+        };
+        let own = || Some(fx.worker_token.clone());
+        let row = || {
+            hub.summary(pane, &agent)
+                .notices
+                .attention
+                .iter()
+                .find(|item| item.kind == AttentionKind::NotStarted)
+                .cloned()
+        };
+        let quiet_for = |span: Duration| {
+            let row = &row;
+            async move {
+                let until = std::time::Instant::now() + span;
+                while std::time::Instant::now() < until {
+                    assert!(row().is_none(), "the row stayed off");
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        };
+        let raised = || {
+            let row = &row;
+            async move {
+                let until = std::time::Instant::now() + Duration::from_secs(5);
+                while row().is_none() {
+                    assert!(std::time::Instant::now() < until, "the row appears");
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        };
+        // A turn starts before the watcher registers.
+        send(agent.clone(), "thinking", own()).await;
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(server);
+        let serve = tokio::spawn(crate::inbox_hub::serve_waiter(
+            Arc::clone(&hub),
+            pane.to_string(),
+            agent.clone(),
+            InboxWaitMode::Stream,
+            InboxComponent::PiExtension,
+            None,
+            crate::inbox_hub::ReceiptArm {
+                adapter_integration: Some(crate::inbox_hub::ADAPTER_INTEGRATION),
+                ..Default::default()
+            },
+            BufReader::new(read),
+            write,
+            |_: &str| {},
+        ));
+        let (from, mut to) = tokio::io::split(client);
+        let mut lines = BufReader::new(from).lines();
+        let id = hub
+            .post_direct(
+                crate::inbox::Recipient::bound(pane, &agent),
+                crate::inbox::Content::from_deck("seed", "task", "the task"),
+            )
+            .unwrap();
+        let handed = loop {
+            let line = lines.next_line().await.unwrap().unwrap();
+            let reply: crate::event::InboxWaitReply = serde_json::from_str(&line).unwrap();
+            if let Some(messages) = reply.messages {
+                break messages;
+            }
+        };
+        let at = handed[0].attempt.clone().expect("a receipt attempt");
+        let r = serde_json::json!({"id": id.as_str(), "a": at.a, "e": at.e});
+        let control =
+            serde_json::json!({"possess": {"seq": 1, "seen": at.d, "held": [r]}, "handed": [r]});
+        to.write_all(format!("{control}\n").as_bytes())
+            .await
+            .unwrap();
+        quiet_for(Duration::from_millis(900)).await;
+        // The worker's own Idle ends the turn; the window then runs out while
+        // more Idles keep arriving, since a repeated Idle does not restart it.
+        let until = std::time::Instant::now() + Duration::from_secs(3);
+        while row().is_none() {
+            assert!(
+                std::time::Instant::now() < until,
+                "the row appears while repeated Idles arrive"
+            );
+            send(agent.clone(), "idle", own()).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for (who, kind, token) in [
+            ("a-predecessor".to_string(), "thinking", None),
+            (agent.clone(), "tool_end", own()),
+            (agent.clone(), "thinking", None),
+        ] {
+            send(who.clone(), kind, token).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(row().is_some(), "{who} {kind}: the row stays");
+        }
+        // An attested predecessor generation's edge is the registry's to
+        // refuse: it names an agent that no longer owns the pane.
+        assert_eq!(
+            fx.registry
+                .note_turn(pane, "a-predecessor", crate::agent_pty::TurnEdge::Started),
+            None,
+            "a non-owner's turn edge is not numbered for the clock"
+        );
+        send(agent.clone(), "thinking", own()).await;
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while row().is_some() {
+            assert!(
+                std::time::Instant::now() < until,
+                "a started turn withdraws it"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        send(agent.clone(), "idle", own()).await;
+        raised().await;
+        let item = row().unwrap();
+        hub.inbox_action(pane, &agent, id.as_str(), item.revision, false, "tui-1");
+        quiet_for(Duration::from_millis(900)).await;
+        drop(to);
+        drop(lines);
+        let _ = serve.await;
     }
 
     async fn assert_agent_event_refused(kind: &str, token_kind: &str, policy: &str) {

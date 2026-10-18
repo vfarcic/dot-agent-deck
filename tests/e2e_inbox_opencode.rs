@@ -826,12 +826,7 @@ fn opencode_008_mini_targets_root_and_requests_ack_and_idle_repaint() {
 #[spec("inbox/opencode/009")]
 #[test]
 fn opencode_009_only_mini_stream_nudges_without_losing_scrollback_or_geometry() {
-    for component in [
-        "opencode_plugin",
-        "pi_extension",
-        "claude_waiter",
-        "opencode_mini",
-    ] {
+    for component in ["opencode_plugin", "other", "claude_waiter", "opencode_mini"] {
         let daemon = daemon_unbound(&[("DOT_AGENT_DECK_REPAINT_NUDGE_GAP_MS", "300")]);
         let script = daemon.home.join("size-probe.py");
         let base = daemon.home.join("probe");

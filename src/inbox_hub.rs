@@ -1806,6 +1806,14 @@ impl InboxHub {
             .contains_key(&(pane_id.to_string(), agent_id.to_string()))
     }
 
+    /// The component `agent_id` in `pane_id` last announced, if any.
+    pub fn announced_component(&self, pane_id: &str, agent_id: &str) -> Option<InboxComponent> {
+        self.lock()
+            .announced
+            .get(&(pane_id.to_string(), agent_id.to_string()))
+            .map(|announced| announced.component)
+    }
+
     /// What `agent_id` in `pane_id` last announced, if anything.
     pub fn announced_wake(&self, pane_id: &str, agent_id: &str) -> Option<InboxWake> {
         self.lock()
@@ -2567,10 +2575,17 @@ impl InboxHub {
     }
 
     /// PRD #1666 §11: the deck could not rewrite `agent_id`'s integration
-    /// files as it started (`failed` names each), so until a registration
-    /// proves the integration current, its card says restarting will not
-    /// update it.
-    pub fn set_refresh_failed(&self, pane_id: &str, agent_id: &str, failed: &[String]) {
+    /// files as it started (`failed` names each — for Pi, the child's
+    /// resolved extension directory), so until a registration proves the
+    /// integration current, its card says restarting will not update it, as
+    /// `notice` words it for that integration.
+    pub fn set_refresh_failed(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        failed: &[String],
+        notice: crate::inbox_display::IntegrationNotice,
+    ) {
         let mut st = self.lock();
         let key = (pane_id.to_string(), agent_id.to_string());
         let floor = st.receipts.floors.entry(key.clone()).or_default();
@@ -2578,7 +2593,7 @@ impl InboxHub {
             return;
         }
         warn!(pane_id, agent_id, failed = ?failed, "inbox: could not refresh the agent's integration files");
-        floor.refresh_failed = true;
+        floor.refresh_failed = Some(notice);
         engine::broadcast_notices(&mut st, &key, Instant::now());
     }
 
@@ -5350,7 +5365,7 @@ mod tests {
             "p".to_string(),
             "a".to_string(),
             InboxWaitMode::Stream,
-            InboxComponent::PiExtension,
+            InboxComponent::Other,
             None,
             ReceiptArm::default(),
             tokio::io::BufReader::new(read),
@@ -6175,7 +6190,7 @@ mod tests {
             "p".to_string(),
             "a".to_string(),
             InboxWaitMode::Stream,
-            InboxComponent::PiExtension,
+            InboxComponent::Other,
             Some(4242),
             ReceiptArm::default(),
             tokio::io::BufReader::new(daemon_reads),

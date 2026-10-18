@@ -322,6 +322,15 @@ async fn wait_for_attach_socket(attach_socket: &Path, timeout: Duration) {
 /// injects `DOT_AGENT_DECK_AGENT_ID`; the returned id is then replayed into the
 /// real `agent-event` subprocess exactly as it is inside the managed pane.
 #[cfg(unix)]
+/// PRD #1666 G6: the agent dir a Pi stand-in started in `cwd` resolves, so the
+/// deck's refresh of its extension lands in the test's scratch directory.
+fn pi_agent_dir(cwd: &std::path::Path) -> (String, String) {
+    (
+        "PI_CODING_AGENT_DIR".to_string(),
+        cwd.join("pi-agent").display().to_string(),
+    )
+}
+
 async fn start_tui_managed_agent(
     daemon: &common::InProcDaemon,
     pane_id: &str,
@@ -332,7 +341,10 @@ async fn start_tui_managed_agent(
         .start_agent(StartAgentOptions {
             command: Some(common::capability_export_command("cat")),
             cwd: Some(cwd.to_string()),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
+                pi_agent_dir(std::path::Path::new(cwd)),
+            ],
             agent_type: Some(AgentType::Pi),
             ..StartAgentOptions::default()
         })
@@ -551,7 +563,11 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             command: Some(common::capability_export_command("cat")),
             cwd: Some(cwd_str.clone()),
             display_name: Some(JSON_LABEL.to_string()),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), JSON_PANE.to_string())],
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), JSON_PANE.to_string()),
+                // A Pi start refreshes the extension into its own agent dir.
+                pi_agent_dir(cwd.path()),
+            ],
             tab_membership: Some(TabMembership::Mode {
                 name: JSON_MODE.to_string(),
             }),

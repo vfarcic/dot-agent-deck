@@ -97,7 +97,7 @@ fn inbox_protocol_019_two_transient_hook_shells_reach_one_receiver_on_this_platf
         "while [ ! -f announce-go ]; do sleep 0.05; done; \
          \"$INBOX_TEST_BIN\" inbox announce --agent pi 2> announce.stderr",
         "while [ ! -f wait-go ]; do sleep 0.05; done; \
-         sleep 60 | \"$INBOX_TEST_BIN\" inbox wait --agent pi --stream > wait.stdout 2> wait.stderr",
+         sleep 60 | \"$INBOX_TEST_BIN\" inbox wait --agent pi --stream --adapter-integration 2 > wait.stdout 2> wait.stderr",
         "exec sleep 600",
     ];
     std::fs::write(daemon.home.join("hooks.nul"), hooks.join("\0") + "\0").unwrap();

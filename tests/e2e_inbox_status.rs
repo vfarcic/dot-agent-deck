@@ -12,6 +12,7 @@ use dot_agent_deck::event::BroadcastMsg;
 use inbox::*;
 use serde_json::{Value, json};
 use spec::spec;
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
@@ -40,7 +41,7 @@ fn pending(daemon: &impl Endpoint, pane: &Pane, queued: u64, fetched: u64, wake:
     assert_eq!(value["wake"], wake, "current wake path: {value}");
 }
 
-/// Scenario: Queue and fetch work for one synthetic agent while another remains empty, then announce Pi's extension without a watcher. ListAgents must show doorbell fallback until the Pi stream arms, native while it is armed, and doorbell again after EOF; acknowledgements and other panes' counts remain separate.
+/// Scenario: Queue and fetch work for one synthetic agent while another remains empty, then announce Pi's extension without a watcher. ListAgents must show doorbell fallback until Pi's receipt stream registers, native while it is registered, and doorbell again after EOF; acknowledgements and other panes' counts remain separate.
 #[spec("inbox/status/003")]
 #[test]
 fn status_003_list_agents_reports_counts_and_armed_wake() {
@@ -72,13 +73,20 @@ fn status_003_list_agents_reports_counts_and_armed_wake() {
     assert_eq!(hook(&daemon, pi_announce)["accepted"], true);
     pending(&daemon, &worker, 2, 0, "doorbell");
     assert_eq!(summary(&daemon, &worker)["component"], "pi_extension");
-    let wait = waiter(&daemon, &worker);
-    armed(&daemon, &worker, 1);
+    // Pi's extension arms its receipt stream (PRD #1666).
+    let wait = receipt_stream_as(&daemon, &worker, "pi_extension");
     pending(&daemon, &worker, 2, 0, "native");
     assert_eq!(summary(&daemon, &worker)["component"], "pi_extension");
     drop(wait);
-    armed(&daemon, &worker, 0);
-    pending(&daemon, &worker, 2, 0, "doorbell");
+    let listing_after = RefCell::new(Value::Null);
+    assert!(
+        common::wait_until(WAIT, || {
+            *listing_after.borrow_mut() = summary(&daemon, &worker);
+            listing_after.borrow()["wake"] == "doorbell"
+        }),
+        "the closed stream leaves the doorbell: {}",
+        listing_after.borrow()
+    );
     announce(&daemon, &worker, "turn_end");
     pending(&daemon, &worker, 2, 0, "turn_end");
 }

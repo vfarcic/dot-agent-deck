@@ -5240,6 +5240,56 @@ fn opencode_spawn(agent_type: Option<&crate::event::AgentType>, command: Option<
     agent_type.cloned().or(basename) == Some(crate::event::AgentType::OpenCode)
 }
 
+/// PRD #1666 G6: whether a spawn starts Pi — by its declared agent type, or by
+/// the basename of its command when it declares none — and so owes the inbox
+/// a refresh of its extension. A wrapper (`devbox run pi-big`) is not
+/// detected and gets none.
+fn pi_spawn(agent_type: Option<&crate::event::AgentType>, command: Option<&str>) -> bool {
+    let basename = command
+        .and_then(|c| c.split_whitespace().next())
+        .and_then(|program| std::path::Path::new(program).file_name())
+        .and_then(|name| name.to_str())
+        .and_then(crate::agent_registry::detect_from_basename);
+    agent_type.cloned().or(basename) == Some(crate::event::AgentType::Pi)
+}
+
+/// PRD #1666 §11: which integration a spawn's inbox refresh was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboxIntegration {
+    OpenCode,
+    Pi,
+}
+
+/// PRD #1666 §11, G7: the CLI a generation's capability probe runs, the one
+/// its adapter will run. `DOT_AGENT_DECK_BIN` in the child's env when
+/// absolute; else for Pi this daemon's own binary (the extension's
+/// `DOT_AGENT_DECK_EXE`), and for OpenCode its first refreshed pin, else its
+/// first configured one. Blocking (the configured pins are read from disk):
+/// call it off the executor.
+fn inbox_probe_binary(
+    integration: InboxIntegration,
+    env: &[(String, String)],
+    pins: &[crate::hook_binary::HookPin],
+) -> Option<std::path::PathBuf> {
+    let override_bin = env
+        .iter()
+        .find(|(k, _)| k == "DOT_AGENT_DECK_BIN")
+        .map(|(_, v)| std::path::PathBuf::from(v))
+        .filter(|path| path.is_absolute());
+    override_bin.or_else(|| {
+        if integration == InboxIntegration::Pi {
+            return std::env::current_exe().ok();
+        }
+        pins.first()
+            .map(|pin| std::path::PathBuf::from(&pin.binary))
+            .or_else(|| {
+                crate::opencode_manage::configured_pins()
+                    .and_then(|pins| pins.into_iter().next())
+                    .map(|pin| std::path::PathBuf::from(pin.binary))
+            })
+    })
+}
+
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
 /// the in-process API; M1.2 wires it to the streaming attach protocol via
 /// [`AgentBus`] and [`AttachHandle`].
@@ -9883,8 +9933,28 @@ impl AgentPtyRegistry {
         // rewritten from this daemon's binary before its child starts, so the
         // agent loads the integration the deck checks it against rather than
         // a copy it read before a refresh on another thread caught up.
-        let inbox_refresh = opencode_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref())
-            .then(|| crate::inbox_hub::off_the_executor(crate::opencode_manage::refresh_for_spawn));
+        // PRD #1666 G6: a Pi generation's extension is rewritten into the
+        // directory the child resolves (its own `PI_CODING_AGENT_DIR`, else
+        // its `HOME`), likewise before it starts.
+        let inbox_refresh = if opencode_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {
+            Some((
+                InboxIntegration::OpenCode,
+                crate::inbox_hub::off_the_executor(crate::opencode_manage::refresh_for_spawn),
+            ))
+        } else if pi_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {
+            let env = opts.env.clone();
+            Some((
+                InboxIntegration::Pi,
+                (
+                    Vec::new(),
+                    crate::inbox_hub::off_the_executor(move || {
+                        crate::orchestrator_ext::refresh_for_spawn(&env)
+                    }),
+                ),
+            ))
+        } else {
+            None
+        };
         let guard = PtyGuard::new(spawn_with_dir(opts, dir)?);
         #[cfg(test)]
         {
@@ -10173,50 +10243,47 @@ impl AgentPtyRegistry {
         // harmless — the monitor will re-check counters anyway.
         self.change_notify.notify_one();
         drop(inner);
-        if let (Some(pane), Some(refresh)) = (inbox_spawn.0, inbox_refresh) {
-            self.note_inbox_spawn(&pane, &id, refresh, &inbox_spawn.2);
+        if let (Some(pane), Some((integration, refresh))) = (inbox_spawn.0, inbox_refresh) {
+            self.note_inbox_spawn(&pane, &id, integration, refresh, &inbox_spawn.2);
         }
         Ok(id)
     }
 
-    /// PRD #1666 §11: what an OpenCode generation's start owes its inbox,
-    /// after the registry lock is released. Its adapter declares the floor,
-    /// so its card says the integration has not connected yet if nothing
-    /// registers by the readiness deadline; a refresh of its integration
-    /// files that failed before the child started ([`opencode_spawn`]'s
-    /// caller) is said on the card instead of promising that a restart
+    /// PRD #1666 §11: what an OpenCode or Pi generation's start owes its
+    /// inbox, after the registry lock is released. Its adapter declares the
+    /// floor, so its card says the integration has not connected yet if
+    /// nothing registers by the readiness deadline; a refresh of its
+    /// integration files that failed before the child started
+    /// ([`opencode_spawn`]'s and [`pi_spawn`]'s caller) is said on the card,
+    /// in that integration's words, instead of promising that a restart
     /// updates them. Off the executor, the capability probe runs the CLI the
-    /// adapter will run: only clap refusing the flag marks the generation's
-    /// CLI too old.
+    /// adapter will run — OpenCode's pinned binary, or for Pi the binary the
+    /// extension resolves (`DOT_AGENT_DECK_BIN` when absolute, else this
+    /// daemon's own, which it exports as `DOT_AGENT_DECK_EXE`): only clap
+    /// refusing the flag marks the generation's CLI too old.
     fn note_inbox_spawn(
         &self,
         pane: &str,
         agent: &str,
+        integration: InboxIntegration,
         (pins, failed): (Vec<crate::hook_binary::HookPin>, Vec<String>),
         env: &[(String, String)],
     ) {
         let hub = Arc::clone(self.inbox());
         hub.expect_integration(pane, agent);
         if !failed.is_empty() {
-            hub.set_refresh_failed(pane, agent, &failed);
+            let notice = match integration {
+                InboxIntegration::OpenCode => {
+                    crate::inbox_display::IntegrationNotice::RefreshFailed
+                }
+                InboxIntegration::Pi => crate::inbox_display::IntegrationNotice::RefreshFailedPi,
+            };
+            hub.set_refresh_failed(pane, agent, &failed, notice);
         }
-        let override_bin = env
-            .iter()
-            .find(|(k, _)| k == "DOT_AGENT_DECK_BIN")
-            .map(|(_, v)| std::path::PathBuf::from(v))
-            .filter(|path| path.is_absolute());
+        let env = env.to_vec();
         let (pane, agent) = (pane.to_string(), agent.to_string());
         std::thread::spawn(move || {
-            let binary = override_bin.or_else(|| {
-                pins.first()
-                    .map(|pin| std::path::PathBuf::from(&pin.binary))
-                    .or_else(|| {
-                        crate::opencode_manage::configured_pins()
-                            .and_then(|pins| pins.into_iter().next())
-                            .map(|pin| std::path::PathBuf::from(pin.binary))
-                    })
-            });
-            let Some(binary) = binary else {
+            let Some(binary) = inbox_probe_binary(integration, &env, &pins) else {
                 return;
             };
             let verdict =
@@ -23454,6 +23521,120 @@ mod spawn_tests {
             .unwrap()
             .block_on(registry.freeze_admission())
             .expect("no respawn is in flight")
+    }
+
+    /// Scenario: A Pi agent is started with its own HOME and PI_CODING_AGENT_DIR, a stale extension in the directory the latter names. The deck rewrites the extension there before the agent starts, and leaves the directory its HOME alone would name untouched; a non-Pi agent's start writes nothing, and a Pi agent's capability probe runs the deck's own binary rather than an OpenCode pin. A Pi agent whose extension directory cannot be written gets the Pi-worded refresh notice, and one that never registers is reported not yet connected once the readiness deadline passes.
+    #[spec("inbox/boundary/032")]
+    #[cfg(unix)]
+    #[test]
+    fn boundary_032_a_pi_spawn_refreshes_the_extension_the_child_will_load() {
+        use crate::inbox_display::IntegrationNotice;
+        // SAFETY: nextest runs each test in its own process; the hub reads
+        // this once, when the registry first asks for it below.
+        unsafe { std::env::set_var(crate::inbox_hub::ENV_ARM_DEADLINE_MS, "200") };
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let agent_dir = root.path().join("agent");
+        let extension = agent_dir.join("extensions").join("dot-agent-deck");
+        std::fs::create_dir_all(&extension).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(extension.join("index.ts"), "stale").unwrap();
+        let spawn = |pane: &str, agent_type: Option<AgentType>, env: Vec<(String, String)>| {
+            let mut env = env;
+            env.push((DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string()));
+            // The capability probe runs this, not the test binary.
+            env.push(("DOT_AGENT_DECK_BIN".to_string(), "/bin/true".to_string()));
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    agent_type,
+                    env,
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn")
+        };
+        let child_env = vec![
+            ("HOME".to_string(), home.display().to_string()),
+            (
+                crate::orchestrator_ext::ENV_PI_AGENT_DIR.to_string(),
+                agent_dir.display().to_string(),
+            ),
+        ];
+        let pi = spawn("pane-pi", Some(AgentType::Pi), child_env.clone());
+        let index = std::fs::read_to_string(extension.join("index.ts")).unwrap();
+        assert!(
+            index.contains("export default function"),
+            "refreshed: {index}"
+        );
+        assert!(extension.join("inbox-receiver.js").exists());
+        assert!(
+            !home.join(".pi").exists(),
+            "the child's own dir, not its HOME's"
+        );
+        assert_eq!(registry.inbox().integration_notice("pane-pi", &pi), None);
+
+        let other_home = root.path().join("other-home");
+        std::fs::create_dir_all(&other_home).unwrap();
+        spawn(
+            "pane-cat",
+            None,
+            vec![("HOME".to_string(), other_home.display().to_string())],
+        );
+        assert!(
+            !other_home.join(".pi").exists(),
+            "a non-Pi start writes nothing"
+        );
+
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, "a file where the agent dir should be").unwrap();
+        let failed = spawn(
+            "pane-blocked",
+            Some(AgentType::Pi),
+            vec![
+                ("HOME".to_string(), home.display().to_string()),
+                (
+                    crate::orchestrator_ext::ENV_PI_AGENT_DIR.to_string(),
+                    blocked.display().to_string(),
+                ),
+            ],
+        );
+        assert_eq!(
+            registry.inbox().integration_notice("pane-blocked", &failed),
+            Some(IntegrationNotice::RefreshFailedPi)
+        );
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            registry.inbox().integration_notice("pane-pi", &pi),
+            Some(IntegrationNotice::NotArmed),
+            "nothing registered by the readiness deadline"
+        );
+        registry.shutdown_all();
+
+        // The probe runs the CLI the adapter will: an absolute override, else
+        // for Pi this daemon's own binary, never an OpenCode pin.
+        let pins = [crate::hook_binary::HookPin {
+            agent: AgentType::OpenCode,
+            config: root.path().join("opencode.json"),
+            binary: "/opt/opencode-pin/dot-agent-deck".to_string(),
+        }];
+        let own = std::env::current_exe().ok();
+        let bin = |value: &str| vec![("DOT_AGENT_DECK_BIN".to_string(), value.to_string())];
+        assert_eq!(inbox_probe_binary(InboxIntegration::Pi, &[], &pins), own);
+        assert_eq!(
+            inbox_probe_binary(InboxIntegration::Pi, &bin("relative/deck"), &pins),
+            own,
+            "a relative override is not the adapter's"
+        );
+        assert_eq!(
+            inbox_probe_binary(InboxIntegration::Pi, &bin("/opt/deck"), &pins),
+            Some(std::path::PathBuf::from("/opt/deck"))
+        );
+        assert_eq!(
+            inbox_probe_binary(InboxIntegration::OpenCode, &[], &pins),
+            Some(std::path::PathBuf::from("/opt/opencode-pin/dot-agent-deck"))
+        );
     }
 
     /// Scenario: A spawn reserved on a pane is parked after its child is forked, and its agent reports a turn starting, which reaches the inbox's turn clock. The start is then refused, once by a restart's reservation and once by the daemon shutting down, and the clock entry goes with it, a later edge included; a start that publishes keeps it.

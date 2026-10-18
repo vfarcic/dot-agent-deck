@@ -899,12 +899,13 @@ export function execWithStdin(
 
 // --- PRD #1666: the deck's inbox --------------------------------------------
 //
-// The deck holds every message for this agent in an inbox and hands them to a
-// watcher the extension runs (`dot-agent-deck inbox wait --agent pi --stream`),
-// one JSON line per message. The extension starts each one with
-// `pi.sendUserMessage` and acknowledges it once Pi commits it as a user
-// message, so a message Pi drops before then (Escape, a crash) is handed over
-// again.
+// The deck holds every message for this agent in an inbox and hands each
+// attempt to the receiver the extension runs (`./inbox-receiver.js`, on the
+// deck's receipt stream). The extension starts each one with
+// `pi.sendUserMessage` behind the deck's final check, and the receiver
+// reports it committed once Pi starts it as a user message; one Pi drops
+// before then (Escape, a session replacement) is released to the deck, which
+// decides on a checked, marked repeat.
 
 /**
  * The sentence every hand-over starts with. It must stay byte-identical to the
@@ -931,57 +932,13 @@ export function buildInboxAnnounceArgv(): string[] {
 	return ["inbox", "announce", "--agent", "pi"];
 }
 
-/** argv fetching what a doorbell for `id` announced, without acknowledging it. */
-export function buildInboxDoorbellFetchArgv(id: string): string[] {
-	return ["inbox", "fetch", "--json", "--doorbell", id];
-}
-
 /**
- * argv acknowledging message `id` with the deck CLI, which answers whether the
- * deck recorded it ([`parseInboxAckReply`]). The watcher's stdin carries an
- * acknowledgement faster but answers nothing, so this is also how one is
- * confirmed.
+ * argv fetching what a doorbell for `id` announced, issued to the receiver
+ * registered as `rx` at adapter `integration` rather than acknowledged.
  */
-export function buildInboxAckArgv(id: string): string[] {
-	return ["ack", "--json", id];
+export function buildInboxDoorbellFetchArgv(id: string, rx: number, integration: number): string[] {
+	return ["inbox", "fetch", "--json", "--doorbell", id, "--adapter-integration", String(integration), "--rx", String(rx)];
 }
-
-/** What the deck said to `dot-agent-deck ack --json`. */
-export type InboxAckOutcome =
-	/** The deck recorded the acknowledgement, now or before. */
-	| "recorded"
-	/** The deck refused it for this id (no longer deliverable, another agent's): asking again changes nothing. */
-	| { refused: string }
-	/** No answer the deck stands behind: ask again. */
-	| "unconfirmed";
-
-/** Read the CLI's answer to [`buildInboxAckArgv`]; anything it cannot read is "unconfirmed". */
-export function parseInboxAckReply(stdout: unknown): InboxAckOutcome {
-	if (typeof stdout !== "string") {
-		return "unconfirmed";
-	}
-	for (const line of stdout.split("\n")) {
-		try {
-			const reply = JSON.parse(line) as { acknowledged?: unknown; final?: unknown; reason?: unknown };
-			if (reply.acknowledged === true) {
-				return "recorded";
-			}
-			if (reply.acknowledged === false) {
-				return reply.final === true ? { refused: typeof reply.reason === "string" ? reply.reason : "refused" } : "unconfirmed";
-			}
-		} catch {
-			// Not the JSON line.
-		}
-	}
-	return "unconfirmed";
-}
-
-/** How long after Pi commits a message its acknowledgement is first confirmed with the CLI. */
-export const INBOX_ACK_CONFIRM_DELAY_MS = 1000;
-/** The longest wait between two confirmations of one acknowledgement. */
-export const INBOX_ACK_CONFIRM_MAX_DELAY_MS = 30000;
-/** How many times one acknowledgement is asked for before the extension reports it failed. */
-export const INBOX_ACK_CONFIRM_ATTEMPTS = 8;
 
 /** The ids of the deck message blocks whose opener `text` carries, in order, once each. */
 export function inboxIdsIn(text: unknown): string[] {
@@ -1009,10 +966,17 @@ export function doorbellIdsIn(text: unknown): string[] {
 	return [...new Set(ids)];
 }
 
-/** One message as the deck hands it over: `{id, text, …}`, `text` being its rendered block. */
+/**
+ * One message as the deck hands it over: `{id, text, …}`, `text` being its
+ * rendered block; on the receipt stream also its attempt (`a`, `e`) and its
+ * delivery number (`d`).
+ */
 export interface InboxMessage {
 	id: string;
 	text: string;
+	a?: number;
+	e?: number;
+	d?: number;
 }
 
 function asInboxMessage(value: unknown): InboxMessage | undefined {
@@ -1020,7 +984,14 @@ function asInboxMessage(value: unknown): InboxMessage | undefined {
 	if (!record || typeof record.id !== "string" || typeof record.text !== "string") {
 		return undefined;
 	}
-	return { id: record.id, text: record.text };
+	const message: InboxMessage = { id: record.id, text: record.text };
+	for (const field of ["a", "e", "d"] as const) {
+		const value = record[field];
+		if (typeof value === "number") {
+			message[field] = value;
+		}
+	}
+	return message;
 }
 
 /** A watcher stdout line as a message, or `undefined` when it is not one. */
@@ -1090,23 +1061,15 @@ export function inboxIdsToAck(message: unknown): string[] {
  */
 export const WATCHER_NOT_IN_DECK_EXIT = 3;
 
-/**
- * How long a hand-over of deck messages may go unseen by this extension's
- * `input` hook, while Pi sits idle with nothing queued, before the extension
- * takes it as refused and hands the messages over again. Pi reports a refused
- * `sendUserMessage` itself, never to the caller. A hand-over the hook has seen
- * is never retried on a timer: see {@link tagHandOver}.
- */
-export const INBOX_ADMISSION_RECHECK_MS = 30000;
-
 /** The opening of the line naming a hand-over (see {@link tagHandOver}). */
 export const HAND_OVER_TAG_PREFIX = "[dot-agent-deck hand-over ";
 
 /**
  * PRD #1666: `text` with a first line naming hand-over `attempt`, so the
- * extension's `input` hook can tell its hand-overs apart: it consumes one a
- * retry replaced before Pi takes it any further, and removes the line from the
- * one it lets through, so the model never sees it.
+ * extension's `input` gate can tell its hand-overs apart: it consumes one it
+ * did not send, or one that failed its final check, before Pi takes it any
+ * further, and removes the line from the one it lets through, so the model
+ * never sees it.
  */
 export function tagHandOver(attempt: string, text: string): string {
 	return `${HAND_OVER_TAG_PREFIX}${attempt}]\n${text}`;
@@ -1124,10 +1087,6 @@ export function untagHandOver(text: unknown): { attempt: string; text: string } 
 	}
 	return { attempt, text: text.slice(end + 2) };
 }
-
-/** The first respawn delay after a watcher exits unexpectedly, and the longest. */
-export const WATCHER_BACKOFF_MIN_MS = 1000;
-export const WATCHER_BACKOFF_MAX_MS = 30000;
 
 /**
  * PRD #1666: sets every watcher respawn delay to this many milliseconds instead
@@ -1147,17 +1106,6 @@ export function watcherBackoffOverride(env: Record<string, string | undefined>):
 	}
 	const ms = Number(raw);
 	return ms >= 1 && ms <= WATCHER_BACKOFF_OVERRIDE_MAX_MS ? ms : undefined;
-}
-
-/**
- * The delay before the respawn after the next one: back to the minimum when
- * the watcher had been running longer than the maximum, else doubled.
- */
-export function nextWatcherBackoff(current: number, ranForMs: number): number {
-	if (ranForMs > WATCHER_BACKOFF_MAX_MS) {
-		return WATCHER_BACKOFF_MIN_MS;
-	}
-	return Math.min(current * 2, WATCHER_BACKOFF_MAX_MS);
 }
 
 /** Splits a stream into lines across chunk boundaries; `push` returns the complete ones. */

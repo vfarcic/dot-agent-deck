@@ -42,6 +42,7 @@ export const INBOX_WORDS = {
   cliTooOld: "the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent",
   notArmed: "this agent's deck integration has not connected yet; its messages wait until it does",
   refreshFailed: "the deck could not update this agent's deck integration: run dot-agent-deck hooks install --agent opencode to see why, then restart the agent",
+  refreshFailedPi: "the deck could not update this agent's Pi extension: run dot-agent-deck orchestrator setup with the same HOME and PI_CODING_AGENT_DIR as the agent to see why, then restart the agent",
   receiptsDegraded: "messages may repeat: the deck cannot record message receipts for this agent",
   evidencePaused: "deck messages paused: {n} delivered messages still wait for proof that older copies cannot run; restart the agent to clear them",
 } as const;
@@ -92,6 +93,7 @@ export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (inbox.integration === "adapter_too_old") return INBOX_WORDS.adapterTooOld;
   if (inbox.integration === "not_armed") return INBOX_WORDS.notArmed;
   if (inbox.integration === "refresh_failed") return INBOX_WORDS.refreshFailed;
+  if (inbox.integration === "refresh_failed_pi") return INBOX_WORDS.refreshFailedPi;
   if (inbox.evidencePaused !== undefined) return INBOX_WORDS.evidencePaused.replace("{n}", String(inbox.evidencePaused));
   if (uncertainCount(inbox) > 0) return INBOX_WORDS.uncertainReason;
   if (notStartedCount(inbox) > 0) return INBOX_WORDS.notStartedReason;

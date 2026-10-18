@@ -551,7 +551,8 @@ fn inbox_protocol_010_stream_nack_redelivers_and_ack_confirms() {
     let daemon = daemon();
     let pane = pane(&daemon, "stream", "exec /bin/cat");
     let mut req = request(&pane, "inbox_wait");
-    req["component"] = json!("pi_extension");
+    // A legacy stream: no component the deck ships arms one since PRD #1666.
+    req["component"] = json!("other");
     req["component_version"] = json!("synthetic-s2");
     req["mode"] = json!("stream");
     req["pid"] = json!(pane.pid);
@@ -884,13 +885,13 @@ fn connect_from_an_exited_process(path: &Path) -> (BufReader<UnixStream>, u32) {
     }
 }
 
-/// Scenario: With the daemon binding inbox components to the pane's agent, a connection whose creator exited before it is used presents the pane's own token and tries to fetch, acknowledge, arm a waiter for and get-seed the agent's queued task, and to announce a native wake naming that exited creator. The daemon can no longer read who made the connection, so each is refused and the task stays Queued; the real stream waiter then run inside the pane still arms.
+/// Scenario: With the daemon binding inbox components to the pane's agent, a connection whose creator exited before it is used presents the pane's own token and tries to fetch, acknowledge, arm a waiter for and get-seed the agent's queued task, and to announce a native wake naming that exited creator. The daemon can no longer read who made the connection, so each is refused and the task stays Queued; the real receipt watcher then run inside the pane still registers and is handed the task.
 #[spec("inbox/protocol/017")]
 #[test]
 fn inbox_protocol_017_a_connection_of_unknown_ancestry_cannot_take_mail() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let script = daemon.home.join("wait.sh");
-    std::fs::write(&script, "#!/bin/sh\nwhile [ ! -f wait-go ]; do sleep 0.05; done\n\"$INBOX_TEST_BIN\" inbox wait --agent pi --stream > wait.stdout 2> wait.stderr\nexec /bin/cat\n").unwrap();
+    std::fs::write(&script, "#!/bin/sh\nwhile [ ! -f wait-go ]; do sleep 0.05; done\n\"$INBOX_TEST_BIN\" inbox wait --agent pi --stream --adapter-integration 2 > wait.stdout 2> wait.stderr\nexec /bin/cat\n").unwrap();
     // Quote only fixture-owned paths; the binary path contains no shell code.
     // `exec` makes the script's shell the pane's agent process, as an agent's
     // own binary is: a shell under the launch shell would read as a nested
@@ -961,14 +962,12 @@ fn inbox_protocol_017_a_connection_of_unknown_ancestry_cannot_take_mail() {
     state(&daemon, &pane, &id, "queued");
     std::fs::write(daemon.home.join("wait-go"), b"go").unwrap();
     let stderr = || std::fs::read_to_string(daemon.home.join("wait.stderr")).unwrap_or_default();
-    let latest = RefCell::new(Value::Null);
+    let stdout = || std::fs::read_to_string(daemon.home.join("wait.stdout")).unwrap_or_default();
     assert!(
-        common::wait_until(WAIT, || {
-            *latest.borrow_mut() = listing(&daemon, &pane);
-            latest.borrow()["armed"].as_u64() == Some(1)
-        }),
-        "the in-pane stream waiter must arm; last listing: {}, its stderr: {}",
-        latest.borrow(),
+        common::wait_until(WAIT, || stdout().contains(&id)),
+        "the in-pane receipt watcher must register and be handed the task; its stdout: {}, its \
+         stderr: {}",
+        stdout(),
         stderr()
     );
 }

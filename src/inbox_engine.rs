@@ -112,6 +112,7 @@ pub(super) fn slot_for(component: InboxComponent) -> Option<Slot> {
     match component {
         InboxComponent::OpenCodePlugin => Some(Slot::OpencodeTui),
         InboxComponent::OpenCodeMini => Some(Slot::OpencodeServer),
+        InboxComponent::PiExtension => Some(Slot::Pi),
         _ => None,
     }
 }
@@ -138,16 +139,17 @@ pub(super) struct Floor {
     /// A registration declared a missing or lower integration.
     pub(super) adapter_too_old: bool,
     /// The deck could not rewrite the generation's integration files as it
-    /// started (`refresh_for_spawn`), so restarting does not update them.
-    pub(super) refresh_failed: bool,
+    /// started (`refresh_for_spawn`), so restarting does not update them:
+    /// the notice in that integration's words.
+    pub(super) refresh_failed: Option<IntegrationNotice>,
 }
 
 impl Floor {
     fn notice(&self, now: Instant) -> Option<IntegrationNotice> {
         if self.cli_too_old {
             Some(IntegrationNotice::CliTooOld)
-        } else if self.refresh_failed && !self.registered {
-            Some(IntegrationNotice::RefreshFailed)
+        } else if let Some(notice) = self.refresh_failed.filter(|_| !self.registered) {
+            Some(notice)
         } else if self.adapter_too_old {
             Some(IntegrationNotice::AdapterTooOld)
         } else if !self.registered && self.arm_by.is_some_and(|by| now >= by) {
@@ -366,7 +368,7 @@ pub(super) fn register(
     floor.registered = true;
     floor.adapter_too_old = false;
     floor.cli_too_old = false;
-    floor.refresh_failed = false;
+    floor.refresh_failed = None;
     let generation = generation_mut(st, key, spool);
     let registration = generation.model.register(now, slot, resumed);
     // r8k R8G-03: commit authority only, for the new watcher to publish a
@@ -1089,6 +1091,14 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
     broadcast_notices(st, key, now);
 }
 
+/// Whether `key`'s receipts came through a receiver on `slot`.
+fn generation_on(st: &HubState, key: &AgentKey, slot: Slot) -> bool {
+    st.receipts
+        .gens
+        .get(key)
+        .is_some_and(|generation| generation.model.has_slot(slot))
+}
+
 /// Mirror each of `key`'s model states into its inbox copy.
 fn sync(st: &mut HubState, key: &AgentKey, now: Instant, returned: &HashSet<String>) {
     let Some(generation) = st.receipts.gens.get(key) else {
@@ -1121,8 +1131,13 @@ fn sync(st: &mut HubState, key: &AgentKey, now: Instant, returned: &HashSet<Stri
         }
         match state {
             Delivery::Settled => {
-                st.inbox
-                    .ack(now, &id, &key.0, &key.1, AckHow::PluginConfirmed);
+                // G9: a Pi extension's commit is confirmed as an extension's.
+                let how = if generation_on(st, key, Slot::Pi) {
+                    AckHow::ExtensionConfirmed
+                } else {
+                    AckHow::PluginConfirmed
+                };
+                st.inbox.ack(now, &id, &key.0, &key.1, how);
             }
             Delivery::Queued if fetched => {
                 st.inbox.requeue_receipt(now, &id, &key.0);

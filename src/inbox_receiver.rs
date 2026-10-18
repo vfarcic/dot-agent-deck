@@ -9,9 +9,8 @@
 //! module copy for the Pi extension, checked in at
 //! `pi-extension/src/inbox-receiver.js` (with [`PI_MODULE_DTS`] beside it),
 //! because Pi loads the extension's files as they are on disk and the deck
-//! embeds them with `include_str!` (`orchestrator_ext::EXTENSION_FILES`). It
-//! is staged for Pi's switch to the receipt stream: the extension's
-//! `index.ts` does not import it yet.
+//! embeds them with `include_str!` (`orchestrator_ext::EXTENSION_FILES`); the
+//! extension's `index.ts` imports it.
 //! `inbox/pi/006` fails when the checked-in copy differs from the generator;
 //! `DOT_AGENT_DECK_WRITE_PI_RECEIVER=1 cargo test-fast pi_006` rewrites it.
 
@@ -125,14 +124,26 @@ export interface InboxApproval {
   at: number;
   valid: number;
 }
+export interface InboxReceiverState {
+  held?: (InboxRef & { d?: number; stage?: string })[];
+  called?: string[];
+  forgot?: boolean;
+  revoked?: string[];
+  reports?: { stage: string; ref: InboxRef; taken?: boolean }[];
+}
 export interface InboxReceiverOptions {
   agent: string;
   doorbellOnly?: boolean;
   active: () => boolean;
   deliver?: (message: InboxMessage) => void;
+  exited?: (code: number | null) => void;
+  state?: InboxReceiverState;
 }
 export interface InboxReceiver {
   start(): void;
+  ensure(): void;
+  drain(): Promise<"exited" | "forced">;
+  exportState(): InboxReceiverState;
   stop(): void;
   rx(): number | undefined;
   epoch(): number;

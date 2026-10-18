@@ -43,9 +43,8 @@ pub const ENV_PI_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 ///     and
 ///   - `inbox-receiver.js`  — the deck's inbox receiver, generated from
 ///     `src/inbox_receiver.js` ([`crate::inbox_receiver::pi_module`]; PRD
-///     #1666), staged for the switch to the receipt stream: `index.ts` does
-///     not import it yet. Its `.d.ts` is for the extension's type check only
-///     and is not materialized.
+///     #1666), which `index.ts` imports. Its `.d.ts` is for the extension's
+///     type check only and is not materialized.
 ///
 /// A `package.json` is intentionally **not** embedded: the subdirectory
 /// `index.ts` discovery layout does not require one: the extension's one
@@ -204,14 +203,17 @@ pub fn materialize(target_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 // `opencode_manage::auto_install`), which install ONCE at startup. The bundled
 // extension is materialized once when the daemon starts serving (the
 // `dot-agent-deck daemon serve` entry, which both the lazy-spawned daemon and a
-// headless serve go through), NOT on every agent spawn.
+// headless serve go through), and again only for a spawn detected as Pi
+// ([`refresh_for_spawn`], PRD #1666 G6).
 //
-// Why not per-spawn: the deck must not care HOW pi is launched, so we cannot key
-// off the spawn command's basename (a wrapper like `devbox run pi-big` would be
-// missed). Materializing per-spawn regardless of command instead meant every
-// unrelated agent start (claude, a shell, a fast test) rewrote `~/.pi` whenever
-// pi happened to be on PATH. Doing it once at daemon startup is command-agnostic
-// AND touches Pi's dir only once per daemon.
+// Why startup is not keyed off the command: the deck must not care HOW pi is
+// launched, so a basename cannot be the only trigger (a wrapper like `devbox
+// run pi-big` would be missed). Materializing per-spawn regardless of command
+// instead meant every unrelated agent start (claude, a shell, a fast test)
+// rewrote `~/.pi` whenever pi happened to be on PATH. So startup covers every
+// launch command, and the per-spawn refresh covers what startup cannot: a Pi
+// whose own `HOME` or `PI_CODING_AGENT_DIR` points elsewhere, and an extension
+// another deck overwrote since. A wrapper gets the startup copy only.
 //
 // Location mirrors pi's own `getAgentDir()`: `$PI_CODING_AGENT_DIR` if set, else
 // `<HOME>/.pi/agent`, + `/extensions/dot-agent-deck` (see [`ENV_PI_AGENT_DIR`]).
@@ -238,6 +240,22 @@ fn resolve_agent_dir_from_env(env: &[(String, String)]) -> Option<PathBuf> {
         lookup_env(env, ENV_PI_AGENT_DIR).as_deref(),
         lookup_env(env, "HOME").as_deref(),
     )
+}
+
+/// PRD #1666 G6: rewrite the extension into the directory a Pi child spawned
+/// with the env overlay `env` resolves (its `PI_CODING_AGENT_DIR`, else its
+/// `HOME`, each from the overlay first), before the child starts, so it loads
+/// the receiver this deck checks it against. Returns what failed: the target
+/// directory and the error, so the daemon's warning names where; empty when
+/// the files are current or no directory resolves (nothing to refresh).
+pub fn refresh_for_spawn(env: &[(String, String)]) -> Vec<String> {
+    let Some(target) = resolve_agent_dir_from_env(env).map(|dir| extension_dir_in(&dir)) else {
+        return Vec::new();
+    };
+    match materialize(&target) {
+        Ok(_) => Vec::new(),
+        Err(error) => vec![format!("{}: {error}", target.display())],
+    }
 }
 
 /// Whether `pi` is discoverable on the PATH the spawned child will actually
@@ -1053,6 +1071,139 @@ mod tests {
     #[test]
     fn pi_031_the_receiver_runs_only_an_absolute_executable() {
         node_pin("test/inbox-receiver.test.ts", "pi_031");
+    }
+
+    /// Scenario: Pi's first session starts the receiver's watcher on the receipt stream at the deck's adapter integration, and a respawned watcher registers as resumed. A doorbell fetch names that integration and the receiver it is for.
+    #[spec("inbox/pi/005")]
+    #[test]
+    fn pi_005_the_watcher_and_the_doorbell_fetch_declare_the_receipt_integration() {
+        node_pin("test/inbox.test.ts", "pi_005");
+    }
+
+    /// Scenario: The deck hands one attempt to Pi's receiver, then the same attempt again, then a marked repeat of it. Pi gets one follow-up for the attempt and one for the repeat, each behind the deck's approval.
+    #[spec("inbox/pi/007")]
+    #[test]
+    fn pi_007_one_sendusermessage_per_attempt_and_a_marked_repeat_is_sent_once() {
+        node_pin("test/inbox.test.ts", "pi_007");
+    }
+
+    /// Scenario: Hand-overs reach the gate after the deck revoked the attempt, after the watcher restarted, after the approval went stale, and twice. Each is consumed rather than passed to the model; the restarted and stale ones are reported not handed, and a revoked one is not reported a second time.
+    #[spec("inbox/pi/008")]
+    #[test]
+    fn pi_008_the_gate_consumes_refused_hand_overs_and_reports_not_handed_after_revoking() {
+        node_pin("test/inbox.test.ts", "pi_008");
+    }
+
+    /// Scenario: A gate whose check throws consumes the hand-over instead of passing the tagged text to the model, and a user message carrying our block that reached Pi around the gate commits the attempt.
+    #[spec("inbox/pi/009")]
+    #[test]
+    fn pi_009_the_gate_fails_closed_and_our_opener_without_our_tag_commits() {
+        node_pin("test/inbox.test.ts", "pi_009");
+    }
+
+    /// Scenario: A hand-over is sent but Pi's gate never sees it. A revoke is answered revoked_ack and the late gate arrival is consumed; with no revoke, once Pi is idle with nothing queued the recheck reports it not handed, and a repeated revoke gets the same answer with no second not handed.
+    #[spec("inbox/pi/010")]
+    #[test]
+    fn pi_010_a_sent_attempt_the_gate_never_saw() {
+        node_pin("test/inbox.test.ts", "pi_010");
+    }
+
+    /// Scenario: Attempts pass the gate and then a revoke, Pi's refusal pattern, an Escape and a settle in preflight arrive. A revoke is answered already_handed; the refusal and the Escape release the attempt lost, never not handed; a settle while it is still in preflight leaves it held.
+    #[spec("inbox/pi/011")]
+    #[test]
+    fn pi_011_after_the_gate_already_handed_lost_on_positive_settle_evidence_held_in_preflight() {
+        node_pin("test/inbox.test.ts", "pi_011");
+    }
+
+    /// Scenario: Two attempts of one message pass the gate, and the first is released lost before the user message carrying the message starts. The start commits both, the released one included; a revoke that races the commit's publication is answered already handed.
+    #[spec("inbox/pi/012")]
+    #[test]
+    fn pi_012_message_start_commits_every_called_attempt_of_the_id() {
+        node_pin("test/inbox.test.ts", "pi_012");
+    }
+
+    /// Scenario: The receiver's possession snapshots number themselves, carry the contiguous watermark, and list a handed attempt until its commit, the gate's pass included; a keepalive brings a fresh snapshot.
+    #[spec("inbox/pi/013")]
+    #[test]
+    fn pi_013_snapshots_hold_an_attempt_until_its_commit() {
+        node_pin("test/inbox.test.ts", "pi_013");
+    }
+
+    /// Scenario: A session shuts down and a new one starts in the same Pi process. The watcher's stdin stays open, it is not killed, and the new session does not register a second watcher; it is handed the next message.
+    #[spec("inbox/pi/014")]
+    #[test]
+    fn pi_014_a_session_replacement_keeps_the_one_watcher() {
+        node_pin("test/inbox.test.ts", "pi_014");
+    }
+
+    /// Scenario: The watcher dies with one attempt held and another reported committed while no watcher ran. The respawn answers both resumes retained and the replacement publishes the commit; a commit of a Cancelled attempt is sent again only while the deck lists it correctable, across two respawns.
+    #[spec("inbox/pi/015")]
+    #[test]
+    fn pi_015_respawn_resumes_retained_reports_republished_correctable_re_sent() {
+        node_pin("test/inbox.test.ts", "pi_015");
+    }
+
+    /// Scenario: A doorbell line is submitted while the watcher is registered, is recalled, arrives just before the watcher registers, and arrives with no registration at all. Registered, or registering within the wait, it is fetched to this receiver and transformed in place; recalled, it is consumed; unregistered past the wait, it is consumed and the mail stays queued.
+    #[spec("inbox/pi/016")]
+    #[test]
+    fn pi_016_doorbell_fetched_to_the_receiver_and_transformed_in_place() {
+        node_pin("test/inbox.test.ts", "pi_016");
+    }
+
+    /// Scenario: Pi's session shuts down for /new with one attempt past the gate and uncommitted and another sent but unseen. The first is released lost and stays possibly handed; the second goes uncalled to the successor; a commit the outgoing session made while the watcher restarted is still published after the swap.
+    #[spec("inbox/pi/024")]
+    #[test]
+    fn pi_024_a_new_swap_releases_called_uncommitted_attempts_lost() {
+        node_pin("test/inbox.test.ts", "pi_024");
+    }
+
+    /// Scenario: Each of /new, resume, fork and reload is driven through a stand-in Pi with one attempt called and uncommitted and one held uncalled. The first three release the called one lost and hand the held one to the successor; reload releases nothing and a later start in the successor commits it; no restored opener commits; one watcher throughout.
+    #[spec("inbox/pi/030")]
+    #[test]
+    fn pi_030_each_session_replacement_in_pi_0_84_4_s_order() {
+        node_pin("test/inbox.test.ts", "pi_030");
+    }
+
+    /// Scenario: Pi's watcher is registered and no session is current. A message is taken into the receiver and held, not handed to Pi; the next session is handed it through a fresh approval; with no successor it stays held, and a Cancel is answered revoked_ack.
+    #[spec("inbox/pi/025")]
+    #[test]
+    fn pi_025_no_current_session_held_in_pending_until_a_successor() {
+        node_pin("test/inbox.test.ts", "pi_025");
+    }
+
+    /// Scenario: A hand-over approved for one session resumes after a successor took over, a session's delayed shutdown arrives after its successor started, and the outgoing session reports Thinking after it was replaced. The approval does not reach the successor's Pi and the attempt goes to it uncalled; the delayed shutdown leaves the successor current; the stale Thinking is not reported while the outgoing Idle is, in order.
+    #[spec("inbox/pi/026")]
+    #[test]
+    fn pi_026_session_tokens_a_delayed_approval_shutdown_and_report() {
+        node_pin("test/inbox.test.ts", "pi_026");
+    }
+
+    /// Scenario: Inputs carrying a hand-over tag this process never issued, a tag from an older version's format and a well-formed tag for an unknown attempt reach the gate. Each is consumed, and nothing is reported to the deck.
+    #[spec("inbox/pi/027")]
+    #[test]
+    fn pi_027_unknown_or_older_tags_are_consumed_silently() {
+        node_pin("test/inbox.test.ts", "pi_027");
+    }
+
+    /// Scenario: A reload evaluates a different version of the extension while the old receiver holds attempts. The old receiver is disposed before its watcher is drained, the drain is awaited (its exit, or forced at the deadline), two initializers share one replacement, compatible state is carried and answered retained, an incompatible one answers unknown and never not handed, and the old receiver's callbacks deliver nothing after disposal.
+    #[spec("inbox/pi/028")]
+    #[test]
+    fn pi_028_a_version_replacement_dispose_drain_transfer() {
+        node_pin("test/inbox.test.ts", "pi_028");
+    }
+
+    /// Scenario: The watcher dies while no session is current and is respawned; a later session_start finds it healthy and starts no second one; a watcher that says it runs outside a deck pane is not respawned for the rest of the process.
+    #[spec("inbox/pi/029")]
+    #[test]
+    fn pi_029_the_watcher_s_lifetime_is_the_process_s_not_a_session_s() {
+        node_pin("test/inbox.test.ts", "pi_029");
+    }
+
+    /// Scenario: Hand-overs reach the gate late — after a /new swap, after a revoke and after the watcher restarted — and doorbell fetches return late across the same three. Each is consumed, never transformed; the swap's and the rebind's attempts are reported not handed when still held, and the revoke's answer stands alone.
+    #[spec("inbox/pi/032")]
+    #[test]
+    fn pi_032_the_session_and_authorization_fence_at_both_hand_over_points() {
+        node_pin("test/inbox.test.ts", "pi_032");
     }
 
     /// The extension's own Node suites — its inbox delivery and

@@ -709,6 +709,11 @@ impl AttemptModel {
         }
     }
 
+    /// Whether a receiver on `slot` ever registered with this generation.
+    pub fn has_slot(&self, slot: Slot) -> bool {
+        self.receivers.values().any(|r| r.slot == slot)
+    }
+
     /// T1: hand `id` out to `rx`, if it is `Queued` or carries a repeat token
     /// that still holds under the lock right now.
     pub fn issue(&mut self, now: Instant, id: &str, rx: Rx) -> Result<Issued, IssueRefusal> {
@@ -3130,7 +3135,7 @@ mod tests {
         );
     }
 
-    /// Scenario: A stream holds an attempt in a fresh snapshot and closes at
+    /// Scenario: On an OpenCode and on a Pi receiver alike, a stream holds an attempt in a fresh snapshot and closes at
     /// once. No clock pass runs until two TTLs later; that pass finds no
     /// receipt, clears the attempt and schedules an automatic repeat. At three
     /// TTLs the next pass retires the closed stream and fences the attempt,
@@ -3142,44 +3147,46 @@ mod tests {
     #[spec("inbox/boundary/037")]
     #[test]
     fn boundary_037_a_late_pass_fence_leaves_only_the_issue_time_clearance_check() {
-        let (mut m, t) = model();
-        let ttl = ttl();
-        m.post("m", false);
-        let rx = m.register(t, Slot::OpencodeTui, false).rx;
-        issue_held(&mut m, t, "m", rx, 1);
-        m.stream_closed(t, rx);
+        for slot in [Slot::OpencodeTui, Slot::Pi] {
+            let (mut m, t) = model();
+            let ttl = ttl();
+            m.post("m", false);
+            let rx = m.register(t, slot, false).rx;
+            issue_held(&mut m, t, "m", rx, 1);
+            m.stream_closed(t, rx);
 
-        m.tick(t + ttl * 2);
-        let msg = m.delivery("m").unwrap();
-        assert!(
-            msg.attempt(1, 1).unwrap().cleared,
-            "the late pass clears it"
-        );
-        assert!(msg.repeat_scheduled(), "and schedules the repeat");
+            m.tick(t + ttl * 2);
+            let msg = m.delivery("m").unwrap();
+            assert!(
+                msg.attempt(1, 1).unwrap().cleared,
+                "the late pass clears it"
+            );
+            assert!(msg.repeat_scheduled(), "and schedules the repeat");
 
-        let retired = t + Limits::default().closed_retire_after();
-        m.tick_cleared(retired, &[]);
-        let msg = m.delivery("m").unwrap();
-        let at = msg.attempt(1, 1).unwrap();
-        assert_eq!(at.stage, Stage::Fenced, "the closed stream was retired");
-        assert!(!at.cleared, "the fence withdrew the clearance");
-        assert!(
-            msg.repeat_scheduled(),
-            "the token is kept, not yet uncertain"
-        );
+            let retired = t + Limits::default().closed_retire_after();
+            m.tick_cleared(retired, &[]);
+            let msg = m.delivery("m").unwrap();
+            let at = msg.attempt(1, 1).unwrap();
+            assert_eq!(at.stage, Stage::Fenced, "the closed stream was retired");
+            assert!(!at.cleared, "the fence withdrew the clearance");
+            assert!(
+                msg.repeat_scheduled(),
+                "the token is kept, not yet uncertain"
+            );
 
-        let successor = m.register(retired, Slot::OpencodeTui, false);
-        assert!(successor.resume.is_empty(), "retired: nothing to resume");
-        assert!(m.delivery("m").unwrap().repeat_scheduled());
-        assert_eq!(
-            m.issue(retired, "m", successor.rx),
-            Err(IssueRefusal::StaleRepeat),
-            "a repeat on a check the fence withdrew"
-        );
+            let successor = m.register(retired, slot, false);
+            assert!(successor.resume.is_empty(), "retired: nothing to resume");
+            assert!(m.delivery("m").unwrap().repeat_scheduled());
+            assert_eq!(
+                m.issue(retired, "m", successor.rx),
+                Err(IssueRefusal::StaleRepeat),
+                "a repeat on a check the fence withdrew"
+            );
 
-        m.tick(retired);
-        let repeat = m.issue(retired, "m", successor.rx).expect("checked again");
-        assert_eq!(repeat.kind, IssueKind::AutoRepeat);
+            m.tick(retired);
+            let repeat = m.issue(retired, "m", successor.rx).expect("checked again");
+            assert_eq!(repeat.kind, IssueKind::AutoRepeat);
+        }
     }
 
     /// Scenario: A Pi attempt is approved and that approval is kept live;
@@ -3267,7 +3274,7 @@ mod tests {
         assert_eq!(m.evidence_reserved(), reserved);
     }
 
-    /// Scenario: An OpenCode watcher is handed a message and dies, its
+    /// Scenario: On an OpenCode and on a Pi receiver alike, a watcher is handed a message and dies, its
     /// replacement dies before answering, so the attempt is fenced, and the
     /// user cancels the message; a spool check for its commit is taken,
     /// another replacement registers and is handed the attempt's commit
@@ -3281,103 +3288,103 @@ mod tests {
     #[test]
     fn attempts_019_a_handed_back_fenced_commit_keeps_its_verifier_while_its_replay_is_outstanding()
     {
-        let fenced_and_cancelled = || {
-            let (mut m, t) = model();
-            let first = m.register(t, Slot::OpencodeTui, false).rx;
-            m.post("m", false);
-            let at = issue_held(&mut m, t, "m", first, 1);
-            m.register(t, Slot::OpencodeTui, false);
-            let t = t + Limits::default().ack_wait;
-            m.tick(t);
+        for slot in [Slot::OpencodeTui, Slot::Pi] {
+            let fenced_and_cancelled = || {
+                let (mut m, t) = model();
+                let first = m.register(t, slot, false).rx;
+                m.post("m", false);
+                let at = issue_held(&mut m, t, "m", first, 1);
+                m.register(t, slot, false);
+                let t = t + Limits::default().ack_wait;
+                m.tick(t);
+                assert_eq!(
+                    m.delivery("m").unwrap().attempt(1, at.e).unwrap().stage,
+                    Stage::Fenced,
+                    "precondition: the unanswered resume fenced the attempt"
+                );
+                let r = m.delivery("m").unwrap().revision;
+                assert!(matches!(
+                    m.cancel(t, "m", GEN, r),
+                    ActionOutcome::Applied { .. }
+                ));
+                assert!(m.state("m").unwrap().is_terminal());
+                assert_eq!(m.verify_candidates().len(), 1, "precondition: verifying");
+                m.drain_effects();
+                (m, t, at)
+            };
+            let reclaimed = |effects: &[Effect]| {
+                effects
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::Reclaimed { .. }))
+                    .count()
+            };
+            let handed_back = |e: u32| vec![("m".to_string(), 1, e)];
+
+            let (mut m, t, at) = fenced_and_cancelled();
+            let before = m.verify_candidates();
+            let replacement = m.register(t, slot, false);
+            assert_eq!(replacement.correctable, handed_back(at.e));
+            m.tick_verified(&before);
+            let after = m.verify_candidates();
+            m.tick_verified(&after);
             assert_eq!(
-                m.delivery("m").unwrap().attempt(1, at.e).unwrap().stage,
-                Stage::Fenced,
-                "precondition: the unanswered resume fenced the attempt"
+                reclaimed(&m.drain_effects()),
+                0,
+                "an absence check reclaimed a commit handed back for publication"
             );
-            let r = m.delivery("m").unwrap().revision;
-            assert!(matches!(
-                m.cancel(t, "m", GEN, r),
-                ActionOutcome::Applied { .. }
-            ));
-            assert!(m.state("m").unwrap().is_terminal());
-            assert_eq!(m.verify_candidates().len(), 1, "precondition: verifying");
-            m.drain_effects();
-            (m, t, at)
-        };
-        let reclaimed = |effects: &[Effect]| {
-            effects
-                .iter()
-                .filter(|effect| matches!(effect, Effect::Reclaimed { .. }))
-                .count()
-        };
-        let handed_back = |e: u32| vec![("m".to_string(), 1, e)];
+            assert_eq!(m.evidence_reserved(), EVIDENCE_PER_ATTEMPT);
+            m.stream_closed(t, replacement.rx);
+            let next = m.register(t, slot, false);
+            assert_eq!(
+                next.correctable,
+                handed_back(at.e),
+                "the replay was lost with the replacement that died before publishing it"
+            );
+            assert!(
+                m.may_hand_over("m", 1, at.e, next.rx).is_err(),
+                "a final attempt is not callable"
+            );
+            assert_eq!(
+                m.stage(t, "m", 1, at.e, Stage::Committed, None),
+                StageOutcome::Applied
+            );
+            assert_eq!(
+                m.drain_effects(),
+                vec![
+                    Effect::DeliveredAfterAll {
+                        id: "m".into(),
+                        despite_cancel: true
+                    },
+                    Effect::Reclaimed {
+                        id: "m".into(),
+                        a: 1,
+                        e: at.e
+                    }
+                ]
+            );
+            assert_eq!(m.evidence_reserved(), 0);
+            assert_eq!(
+                m.stage(t, "m", 1, at.e, Stage::Committed, None),
+                StageOutcome::NoOp
+            );
+            assert!(m.drain_effects().is_empty());
 
-        let (mut m, t, at) = fenced_and_cancelled();
-        let before = m.verify_candidates();
-        let replacement = m.register(t, Slot::OpencodeTui, false);
-        assert_eq!(replacement.correctable, handed_back(at.e));
-        m.tick_verified(&before);
-        let after = m.verify_candidates();
-        m.tick_verified(&after);
-        assert_eq!(
-            reclaimed(&m.drain_effects()),
-            0,
-            "an absence check reclaimed a commit handed back for publication"
-        );
-        assert_eq!(m.evidence_reserved(), EVIDENCE_PER_ATTEMPT);
-        m.stream_closed(t, replacement.rx);
-        let next = m.register(t, Slot::OpencodeTui, false);
-        assert_eq!(
-            next.correctable,
-            handed_back(at.e),
-            "the replay was lost with the replacement that died before publishing it"
-        );
-        assert!(
-            m.may_hand_over("m", 1, at.e, next.rx).is_err(),
-            "a final attempt is not callable"
-        );
-        assert_eq!(
-            m.stage(t, "m", 1, at.e, Stage::Committed, None),
-            StageOutcome::Applied
-        );
-        assert_eq!(
-            m.drain_effects(),
-            vec![
-                Effect::DeliveredAfterAll {
-                    id: "m".into(),
-                    despite_cancel: true
-                },
-                Effect::Reclaimed {
-                    id: "m".into(),
-                    a: 1,
-                    e: at.e
-                }
-            ]
-        );
-        assert_eq!(m.evidence_reserved(), 0);
-        assert_eq!(
-            m.stage(t, "m", 1, at.e, Stage::Committed, None),
-            StageOutcome::NoOp
-        );
-        assert!(m.drain_effects().is_empty());
-
-        let (mut m, t, at) = fenced_and_cancelled();
-        let replacement = m.register(t, Slot::OpencodeTui, false);
-        assert_eq!(replacement.correctable, handed_back(at.e));
-        m.stream_closed(t, replacement.rx);
-        let gone = t + Limits::default().closed_retire_after();
-        m.tick(gone);
-        let checks = m.verify_candidates();
-        assert_eq!(checks.len(), 1, "verification resumes once no one holds it");
-        m.tick_verified(&checks);
-        assert_eq!(reclaimed(&m.drain_effects()), 1);
-        assert_eq!(m.evidence_reserved(), 0);
-        assert!(
-            m.register(gone, Slot::OpencodeTui, false)
-                .correctable
-                .is_empty(),
-            "a reclaimed attempt is not handed back"
-        );
+            let (mut m, t, at) = fenced_and_cancelled();
+            let replacement = m.register(t, slot, false);
+            assert_eq!(replacement.correctable, handed_back(at.e));
+            m.stream_closed(t, replacement.rx);
+            let gone = t + Limits::default().closed_retire_after();
+            m.tick(gone);
+            let checks = m.verify_candidates();
+            assert_eq!(checks.len(), 1, "verification resumes once no one holds it");
+            m.tick_verified(&checks);
+            assert_eq!(reclaimed(&m.drain_effects()), 1);
+            assert_eq!(m.evidence_reserved(), 0);
+            assert!(
+                m.register(gone, slot, false).correctable.is_empty(),
+                "a reclaimed attempt is not handed back"
+            );
+        }
     }
 
     /// The revokes in `effects`, as `(a, e)` pairs of message `id`.
@@ -3394,14 +3401,14 @@ mod tests {
     /// A message handed to a live receiver and cancelled, its revoke sent
     /// and never answered. Possession lasts far longer than the ack-wait, so
     /// nothing else moves while the clock runs.
-    fn cancelled_unanswered() -> (AttemptModel, Instant, Rx, Issued) {
+    fn cancelled_unanswered(slot: Slot) -> (AttemptModel, Instant, Rx, Issued) {
         let limits = Limits {
             possess_ttl: Duration::from_secs(24 * 60 * 60),
             ..Limits::default()
         };
         let (mut m, t) = model_with(limits);
         m.post("m1", false);
-        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        let rx = m.register(t, slot, false).rx;
         let issued = issue_held(&mut m, t, "m1", rx, 1);
         let r = m.delivery("m1").unwrap().revision;
         assert!(matches!(
@@ -3412,7 +3419,7 @@ mod tests {
         (m, t, rx, issued)
     }
 
-    /// Scenario: A cancelled message's revoke is never answered by its live
+    /// Scenario: On an OpenCode and on a Pi receiver alike, a cancelled message's revoke is never answered by its live
     /// receiver. The clock runs through several ack-waits, ticking twice in
     /// each: the revoke is sent again exactly once per ack-wait, the attempt
     /// stays open and keeps its evidence reserved, nothing is reclaimed, and
@@ -3420,52 +3427,56 @@ mod tests {
     #[spec("inbox/boundary/041")]
     #[test]
     fn boundary_041_an_unanswered_revoke_is_resent_once_per_ack_wait_with_nothing_made_final() {
-        let (mut m, t, _rx, issued) = cancelled_unanswered();
-        let ack_wait = Limits::default().ack_wait;
-        let reserved = m.evidence_reserved();
-        for round in 1..=4u32 {
-            let due = t + ack_wait * round;
-            m.tick(due);
-            m.tick(due + ack_wait / 2);
-            let effects = m.drain_effects();
-            assert_eq!(
-                revokes(&effects, "m1"),
-                vec![(1, issued.e)],
-                "round {round}: one re-send per ack-wait"
-            );
-            assert!(
-                !effects
-                    .iter()
-                    .any(|effect| matches!(effect, Effect::Reclaimed { .. })),
-                "round {round}: a re-send reclaims nothing"
-            );
-            let at = m.delivery("m1").unwrap().attempt(1, issued.e).unwrap();
-            assert!(!at.stage.is_final(), "round {round}: a send is no answer");
-            assert!(!at.reclaimed, "round {round}");
-            assert_eq!(m.evidence_reserved(), reserved, "round {round}");
-            assert_eq!(m.state("m1"), Some(MessageState::CancelHeld));
+        for slot in [Slot::OpencodeTui, Slot::Pi] {
+            let (mut m, t, _rx, issued) = cancelled_unanswered(slot);
+            let ack_wait = Limits::default().ack_wait;
+            let reserved = m.evidence_reserved();
+            for round in 1..=4u32 {
+                let due = t + ack_wait * round;
+                m.tick(due);
+                m.tick(due + ack_wait / 2);
+                let effects = m.drain_effects();
+                assert_eq!(
+                    revokes(&effects, "m1"),
+                    vec![(1, issued.e)],
+                    "round {round}: one re-send per ack-wait"
+                );
+                assert!(
+                    !effects
+                        .iter()
+                        .any(|effect| matches!(effect, Effect::Reclaimed { .. })),
+                    "round {round}: a re-send reclaims nothing"
+                );
+                let at = m.delivery("m1").unwrap().attempt(1, issued.e).unwrap();
+                assert!(!at.stage.is_final(), "round {round}: a send is no answer");
+                assert!(!at.reclaimed, "round {round}");
+                assert_eq!(m.evidence_reserved(), reserved, "round {round}");
+                assert_eq!(m.state("m1"), Some(MessageState::CancelHeld));
+            }
         }
     }
 
-    /// Scenario: A cancelled message's revoke is sent and the clock ticks
+    /// Scenario: On an OpenCode and on a Pi receiver alike, a cancelled message's revoke is sent and the clock ticks
     /// just short of one ack-wait later: nothing is sent again. At the
     /// ack-wait, it is.
     #[spec("inbox/boundary/042")]
     #[test]
     fn boundary_042_no_revoke_is_resent_before_its_ack_wait() {
-        let (mut m, t, _rx, issued) = cancelled_unanswered();
-        let ack_wait = Limits::default().ack_wait;
-        m.tick(t);
-        m.tick(t + ack_wait - Duration::from_millis(1));
-        assert!(
-            revokes(&m.drain_effects(), "m1").is_empty(),
-            "re-sent before its ack-wait"
-        );
-        m.tick(t + ack_wait);
-        assert_eq!(revokes(&m.drain_effects(), "m1"), vec![(1, issued.e)]);
+        for slot in [Slot::OpencodeTui, Slot::Pi] {
+            let (mut m, t, _rx, issued) = cancelled_unanswered(slot);
+            let ack_wait = Limits::default().ack_wait;
+            m.tick(t);
+            m.tick(t + ack_wait - Duration::from_millis(1));
+            assert!(
+                revokes(&m.drain_effects(), "m1").is_empty(),
+                "re-sent before its ack-wait"
+            );
+            m.tick(t + ack_wait);
+            assert_eq!(revokes(&m.drain_effects(), "m1"), vec![(1, issued.e)]);
+        }
     }
 
-    /// Scenario: A cancelled message's revoke is sent again once, and the
+    /// Scenario: On an OpenCode and on a Pi receiver alike, a cancelled message's revoke is sent again once, and the
     /// receiver then answers it — `already_handed` for one message,
     /// `revoked_ack` for another — or the attempt's own commit arrives for a
     /// third. Each attempt is final, the clock runs on through several
@@ -3473,32 +3484,34 @@ mod tests {
     #[spec("inbox/boundary/043")]
     #[test]
     fn boundary_043_revokes_stop_once_the_attempt_is_final() {
-        let ack_wait = Limits::default().ack_wait;
-        for answer in [Stage::HandedInert, Stage::NotHanded, Stage::Committed] {
-            let (mut m, t, rx, issued) = cancelled_unanswered();
-            m.tick(t + ack_wait);
-            assert_eq!(revokes(&m.drain_effects(), "m1"), vec![(1, issued.e)]);
-            let from = (answer != Stage::Committed).then_some(rx);
-            assert_eq!(
-                m.stage(t + ack_wait, "m1", 1, issued.e, answer, from),
-                StageOutcome::Applied,
-                "{answer:?}"
-            );
-            for round in 2..=5u32 {
-                m.tick(t + ack_wait * round);
+        for slot in [Slot::OpencodeTui, Slot::Pi] {
+            let ack_wait = Limits::default().ack_wait;
+            for answer in [Stage::HandedInert, Stage::NotHanded, Stage::Committed] {
+                let (mut m, t, rx, issued) = cancelled_unanswered(slot);
+                m.tick(t + ack_wait);
+                assert_eq!(revokes(&m.drain_effects(), "m1"), vec![(1, issued.e)]);
+                let from = (answer != Stage::Committed).then_some(rx);
+                assert_eq!(
+                    m.stage(t + ack_wait, "m1", 1, issued.e, answer, from),
+                    StageOutcome::Applied,
+                    "{answer:?}"
+                );
+                for round in 2..=5u32 {
+                    m.tick(t + ack_wait * round);
+                }
+                assert!(
+                    revokes(&m.drain_effects(), "m1").is_empty(),
+                    "{answer:?}: a final attempt was revoked again"
+                );
+                assert_eq!(
+                    m.delivery("m1")
+                        .unwrap()
+                        .attempt(1, issued.e)
+                        .unwrap()
+                        .stage,
+                    answer
+                );
             }
-            assert!(
-                revokes(&m.drain_effects(), "m1").is_empty(),
-                "{answer:?}: a final attempt was revoked again"
-            );
-            assert_eq!(
-                m.delivery("m1")
-                    .unwrap()
-                    .attempt(1, issued.e)
-                    .unwrap()
-                    .stage,
-                answer
-            );
         }
     }
 

@@ -16,7 +16,7 @@ A self-contained TypeScript subdirectory with its own JS toolchain: installing i
 
 - `src/orchestrator.ts` — **pure logic** (zero imports): argv construction for each command, the Pi-event → report mapping and the tool-detail extraction. This is what the unit tests target, so no running Pi is needed to test it.
 - `src/index.ts` — the **Pi-API glue**: the default-export factory `(pi) => void` that registers tools and subscribes to events, wiring the pure functions to Pi.
-- `src/inbox-receiver.js` (with `inbox-receiver.d.ts`) — **generated, do not edit**: the deck's inbox receiver, the same source OpenCode's plugins inline (`src/inbox_receiver.js` in the repository root), wrapped as an ES module by `inbox_receiver::pi_module()` (PRD #1666). The fast test `inbox/pi/006` fails when the checked-in copy drifts; `DOT_AGENT_DECK_WRITE_PI_RECEIVER=1 cargo test-fast pi_006` rewrites it. It is staged for the switch to the receipt stream: at this commit `index.ts` does not import it.
+- `src/inbox-receiver.js` (with `inbox-receiver.d.ts`) — **generated, do not edit**: the deck's inbox receiver, the same source OpenCode's plugins inline (`src/inbox_receiver.js` in the repository root), wrapped as an ES module by `inbox_receiver::pi_module()` (PRD #1666). The fast test `inbox/pi/006` fails when the checked-in copy drifts; `DOT_AGENT_DECK_WRITE_PI_RECEIVER=1 cargo test-fast pi_006` rewrites it. `index.ts` imports it: one receiver per Pi process runs the watcher on the deck's receipt stream.
 - `test/orchestrator.test.ts` — unit tests run with `node --import tsx --test` (Node 22; `bun` is not used). Run with `cd pi-extension && npm install && npm test`.
 
 ### Native tools

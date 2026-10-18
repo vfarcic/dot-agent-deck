@@ -73,7 +73,7 @@ export type AgentInbox = {
   /** PRD #1666 §6.5: the deck messages waiting on the user's Retry or Cancel. */
   attention?: InboxAttentionItem[];
   /** PRD #1666 §11: why the agent's integration takes no deck messages yet. */
-  integration?: "cli_too_old" | "adapter_too_old" | "not_armed" | "refresh_failed";
+  integration?: "cli_too_old" | "adapter_too_old" | "not_armed" | "refresh_failed" | "refresh_failed_pi";
   /** PRD #1666 §3: the deck's error recording receipts for this agent. */
   receiptsDegraded?: string;
   /** PRD #1666 §7: delivered messages whose evidence pauses hand-outs. */

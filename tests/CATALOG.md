@@ -8697,18 +8697,18 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real OpenCode.
 - **Platform coverage:** mac+linux.
 
-##### inbox/boundary/026 — An offer moved from OpenCode to Pi is not settled by a late receipt.
+##### inbox/boundary/026 — An offer moved from OpenCode to a legacy-fetch worker is not settled by a late receipt.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
 - **Agent:** none.
-- **Asserts:** after the OpenCode worker's positive not-handed witness the job returns to its pool and goes to the Pi worker's legacy fetch; a commit receipt the OpenCode watcher publishes later tells the offerer the job also reached its earlier holder, and leaves Pi's copy fetched until Pi acknowledges it.
-- **Does not assert:** a real Pi.
+- **Asserts:** after the OpenCode worker's positive not-handed witness the job returns to its pool and goes to a Claude worker's hook fetch; a commit receipt the OpenCode watcher publishes later tells the offerer the job also reached its earlier holder, and leaves the Claude copy fetched until its hook acknowledges it.
+- **Does not assert:** Pi, which is on receipts (inbox/boundary/034).
 - **Platform coverage:** all.
 
-##### inbox/boundary/027 — An offer moved from Pi to OpenCode is not settled by a late ack.
+##### inbox/boundary/027 — An offer moved from a legacy-fetch worker to OpenCode is not settled by a late ack.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
 - **Agent:** none.
-- **Asserts:** a job Pi fetched and handed back goes to the OpenCode worker's receipt stream; Pi's late acknowledgement claims nothing, the OpenCode copy keeps its one open attempt, and the OpenCode commit claims it.
-- **Does not assert:** a real Pi.
+- **Asserts:** a job a Claude worker's hook fetched and handed back goes to the OpenCode worker's receipt stream; the hook's late acknowledgement claims nothing, the OpenCode copy keeps its one open attempt, and the OpenCode commit claims it.
+- **Does not assert:** Pi, which is on receipts (inbox/boundary/035).
 - **Platform coverage:** all.
 
 #### inbox/status
@@ -8725,6 +8725,48 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** after a cleared first hand-out and its marked repeat, a commit receipt published for the first hand-out and then the repeat refused hands out no third copy, and the next read settles the message; with the first hand-out's lookup made Unknown instead, no third copy is handed out and the message is listed as uncertain; each message has exactly two attempts.
 - **Does not assert:** a real watcher.
+- **Platform coverage:** all.
+
+##### inbox/boundary/030 — A Pi extension from before the receipt stream is refused.
+- **Layer:** Fast (`src/daemon.rs`), the hub's stream server over an in-memory duplex and the daemon's own fetch and get-seed handlers.
+- **Agent:** none.
+- **Asserts:** a Pi or OpenCode stream without the deck's integration is refused `adapter_too_old`; a Pi generation's plain doorbell fetch and its get-seed are refused the same way; each leaves the message queued and puts the out-of-date notice on the card; a Claude hook's plain doorbell fetch is still served.
+- **Does not assert:** the clients' rendering of the notice (inbox/status, desktop words test).
+- **Platform coverage:** all.
+
+##### inbox/boundary/031 — A Pi receipt commit settles as confirmed by the extension.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over an in-memory duplex and a real spool.
+- **Agent:** none.
+- **Asserts:** a task delegated to a Pi stream settles `ExtensionConfirmed` and one to an OpenCode stream `PluginConfirmed`, each with one delivery, and each ends its delegate watch.
+- **Does not assert:** a real Pi (lane 2).
+- **Platform coverage:** all.
+
+##### inbox/boundary/032 — A Pi spawn refreshes the extension the child will load.
+- **Layer:** Fast (`src/agent_pty.rs`), real `cat` spawns typed Pi with a scratch HOME and PI_CODING_AGENT_DIR.
+- **Agent:** none.
+- **Asserts:** a stale extension in the child's `PI_CODING_AGENT_DIR` is rewritten before it starts and its HOME's `.pi` is untouched; a non-Pi start writes nothing; an unwritable directory gives the `refresh_failed_pi` notice; a Pi start nothing registers for is `not_armed` after the readiness deadline.
+- **Does not assert:** the capability probe's verdict, or a Pi started through a wrapper (not detected, by design).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/033 — A cancelled Pi attempt's commit corrects across respawns.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over in-memory duplexes.
+- **Agent:** none.
+- **Asserts:** a Pi attempt cancelled and answered `already_handed` is listed `correctable` on each of two later registrations; the commit reported on the third gives the orchestrator one cancelled notice and one delivered-after-all notice, and the attempt's evidence is returned.
+- **Does not assert:** the watcher replaying the commit (inbox/pi/015).
+- **Platform coverage:** all.
+
+##### inbox/boundary/034 — An offer moved from OpenCode to Pi on receipts is settled only by Pi.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over in-memory duplexes and a real spool.
+- **Agent:** none.
+- **Asserts:** after OpenCode's positive not-handed the offer goes to Pi's stream; the OpenCode watcher's late commit tells the offerer the job also reached its earlier holder and leaves Pi's copy fetched until Pi's own commit settles it.
+- **Does not assert:** a real Pi (lane 2).
+- **Platform coverage:** all.
+
+##### inbox/boundary/035 — A lapsed Pi offer is never returned from a lapse.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over in-memory duplexes and a real spool.
+- **Agent:** none.
+- **Asserts:** an offer whose Pi hand-out lapses unpossessed is never back in its pool while it lapses; Pi's positive not-handed returns it and it goes to OpenCode; Pi's late report then settles nothing of OpenCode's copy.
+- **Does not assert:** the uncertain notice a lapse can end in (inbox/boundary/021).
 - **Platform coverage:** all.
 
 ##### inbox/boundary/037 — A late clock pass's fence leaves the hand-out's own clearance check as the only guard.
@@ -8782,6 +8824,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a resume answer, the stream's retirement or exit, which also end it.
 - **Platform coverage:** all.
 - **Cost:** none.
+
+##### inbox/boundary/044 — A Pi worker's attested turns drive the not-started row.
+- **Layer:** Fast (`src/daemon.rs`), the real hook loop over a socket with real `cat` panes, a Pi receipt stream over an in-memory duplex and the hub's own clock (no manual tick).
+- **Agent:** none.
+- **Asserts:** a Thinking reported before the watcher registers keeps the row off while it runs; the worker's own attested Idle starts the window and the row appears; a predecessor's Thinking, a ToolEnd and an unattested Thinking leave it; an attested Thinking withdraws it; after a Cancel it never returns.
+- **Does not assert:** duplicate Idles or rebinds (inbox/attempts/022), or a real Pi (inbox/pi/022, lane 2).
+- **Platform coverage:** mac+linux.
 
 ##### inbox/boundary/045 — A message the agent may not have received is its own row.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's projection, its summary and a client's `AppState` hydrated from it.
@@ -10368,10 +10417,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Escape cancellation or watcher-down fallback.
 - **Platform coverage:** mac+linux.
 
-##### inbox/pi/003 — Pi /new replaces its native watcher and receives the next message in the new session.
+##### inbox/pi/003 — Pi /new keeps its one watcher and receives the next message in the new session.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), real binary, PTY-attached TuiDeck and child enumeration scoped to Pi's captured pid.
 - **Agent:** Real interactive Pi (GPT, `common::pi_test_model()`) with isolated configuration.
-- **Asserts:** /new changes the observed session, the old watcher exits, exactly one replacement remains, and a second sentinel delegate is committed in the new session and acknowledged once.
+- **Asserts:** /new changes the observed session while the same single watcher process keeps running registered, and a second sentinel delegate is committed in the new session and acknowledged once.
 - **Does not assert:** Session fork, reload or watcher-backoff timing.
 - **Platform coverage:** linux (uses /proc).
 
@@ -10382,13 +10431,165 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Doorbell fallback or message delivery after a crash.
 - **Platform coverage:** linux (uses /proc).
 
+##### inbox/pi/005 — The Pi watcher and doorbell fetch declare the receipt integration.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** The watcher runs `inbox wait --agent pi --stream --adapter-integration 2`, a respawn adds `--resumed`, and a doorbell fetch names `--adapter-integration 2 --rx <rx>`.
+- **Does not assert:** The daemon's floor refusal (inbox/boundary/030).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
 ##### inbox/pi/006 — The Pi extension's inbox receiver is the deck's generated copy.
 - **Layer:** Fast (`src/orchestrator_ext.rs`), reading the checked-in copy from the checkout.
 - **Agent:** none.
 - **Asserts:** `pi-extension/src/inbox-receiver.js` and `inbox-receiver.d.ts` equal `inbox_receiver::pi_module()` and `PI_MODULE_DTS` byte for byte, with every placeholder filled; the copy embedded for materialization is the same output; with Node available, the module imports and exports `inboxReceiver`, `inboxBinary`, `inboxKey`, `inboxRef` and the deck's adapter integration.
-- **Does not assert:** that Pi's extension uses the receiver (nothing imports it yet), or any receiver behaviour (the OpenCode receiver tests in `src/opencode_manage.rs` drive the same source).
+- **Does not assert:** any receiver behaviour (the OpenCode receiver tests in `src/opencode_manage.rs` and the `inbox/pi` pins in `pi-extension/test/inbox.test.ts` drive it).
 - **Platform coverage:** all (the import step prints `SKIP:` without Node).
 - **Cost:** none.
+
+##### inbox/pi/007 — Pi gets one sendUserMessage per attempt.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** A repeated hand-out of one attempt is sent once, after one `may`; a marked repeat (new `e`) is sent once.
+- **Does not assert:** The daemon's repeat policy.
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/008 — The Pi gate consumes refused hand-overs.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** After a revoke the gate consumes with no second `not_handed`; after a watcher restart or with a stale approval it consumes and reports `not_handed` once; a duplicate input is consumed.
+- **Does not assert:** Pi's own queue behaviour.
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/009 — The Pi gate fails closed, and an opener without our tag commits.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** A gate whose check throws returns `handled`; a user message carrying a sent attempt's block commits it.
+- **Does not assert:** The model never reading tagged text in a real Pi (lane 2).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/010 — A sent Pi attempt the gate never saw.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** A revoke is answered `revoked_ack` and the late gate arrival consumed; with no revoke, the idle recheck reports `not_handed` only once Pi is idle with nothing queued; repeated revokes add no `not_handed`.
+- **Does not assert:** The recheck interval's exact value.
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/011 — After the Pi gate: already handed, lost on evidence, held in preflight.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** A revoke after the gate is `already_handed`; the refusal pattern and an Escape settle release `lost`, never `not_handed`; a settle in preflight keeps it held.
+- **Does not assert:** Which Pi events a real refusal emits (lane 2).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/012 — Pi's message_start commits every called attempt of the id.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** Both attempts of one id, one already released `lost`, commit on the start; a revoke afterwards is `already_handed`.
+- **Does not assert:** The daemon's settlement (inbox/boundary/031).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/013 — Pi's possession snapshots hold an attempt until its commit.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** Snapshots carry `seq` and the watermark, keep a gated attempt held until its commit, and a keepalive brings a new one.
+- **Does not assert:** The daemon's possession TTL.
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/014 — A Pi session replacement keeps the one watcher.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** `session_shutdown` neither ends the watcher's stdin nor signals it, and the next `session_start` starts no second watcher and receives the next message.
+- **Does not assert:** A real Pi's `/new` (inbox/pi/003, lane 2).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/015 — Pi's receiver across watcher respawns.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** A respawn answers resumes `retained` from held attempts and unpublished reports, publishes a commit made while no watcher ran, and re-sends a commit only while the deck lists it `correctable`, across two respawns.
+- **Does not assert:** The daemon's correction notices (inbox/boundary/033).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/016 — The Pi doorbell is fetched to the receiver and transformed in place.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** Registered: fetched with `--rx`, transformed, reported `handed` and committed on its start; recalled: consumed; unregistered past the wait: consumed with nothing fetched.
+- **Does not assert:** The deck refusing a plain fetch (inbox/boundary/030).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/023 — A message a Pi agent never starts on shows on the attached card; Retry repeats it, Cancel ends it.
+- **Layer:** L2 PTY lane 1 (`tests/e2e_inbox_pi.rs`), the real binary with an attached TuiDeck and a stand-in Pi (`tests/fixtures/pi-inbox/fake-pi.mjs`) running the real extension and receiver under Node, with a 2-second not-started window.
+- **Agent:** none: the stand-in plays Pi 0.84.4's event contract with no model.
+- **Asserts:** a message handed over and never started shows the not-started reason on the card; the picker explains Retry's possible duplicate and `r` hands it over once more as a marked repeat, while `c` removes the line for good. Healthy negatives, each its own function: a committed message in a silent turn longer than twice the window shows nothing; a follow-up handed behind a long turn shows nothing during the turn and the line after it ends uncommitted; a start slower than the window shows the line until the turn starts, with no repeat.
+- **Does not assert:** a real Pi (inbox/pi/022, lane 2), or the desktop app.
+- **Platform coverage:** mac+linux (prints `SKIP:` without Node 23.6+).
+- **Cost:** about 30 seconds.
+
+##### inbox/pi/024 — A Pi /new swap releases called-uncommitted attempts lost.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** The called attempt is released `lost` and answers `already_handed`, never `not_handed`, and is not handed to the successor; a commit made while the watcher restarted is published after the swap.
+- **Does not assert:** A real Pi's queue drop (lane 2).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/025 — Pi with no current session holds deck messages in pending.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** A message arriving between sessions is held and not asked for; the next session gets it after its own `may`; with no successor a Cancel is answered `revoked_ack`.
+- **Does not assert:** How long such a hold lasts (inbox/attempts/020).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/026 — Pi session tokens fence a delayed approval, shutdown and report.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** An approval that resumes after a swap does not call the old `pi` and the attempt goes to the successor after a new `may`; a delayed shutdown leaves the successor current; a stale Thinking is not reported while the outgoing Idle is.
+- **Does not assert:** Report retries (orchestrator.test.ts).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/027 — Unknown or older Pi hand-over tags are consumed silently.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** A tag this process never issued, in either format, is consumed and nothing but snapshots reaches the watcher.
+- **Does not assert:** Garbage that is not a tag (passed through as user text).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/028 — A Pi extension version replacement disposes, drains and transfers.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** The old receiver is disposed before its drain, the drain is awaited (exit, or SIGTERM then SIGKILL at the deadline), two initializers share one replacement, a compatible state answers `retained` and an incompatible one `unknown`, revokes answer `already_handed` and nothing is reported `not_handed`, and the disposed receiver delivers nothing.
+- **Does not assert:** A real Pi reload (lane 2).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/029 — The Pi watcher's lifetime is the process's.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** A watcher that dies with no session current is respawned; `session_start` does not start a second healthy one; a not-in-deck exit stops respawns for the process.
+- **Does not assert:** The backoff schedule (pi_inbox_008).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
+##### inbox/pi/030 — Each Pi session replacement in Pi 0.84.4's order.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** `new`, `resume` and `fork` release the called attempt `lost` and hand the uncalled one to the successor; `reload` releases nothing and the successor's start commits it; no shut-down instance commits; one watcher throughout.
+- **Does not assert:** Pi's runtime itself (the order is read from 0.84.4's source).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
 
 ##### inbox/pi/031 — The Pi extension's receiver runs only an absolute path to an executable deck binary.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox-receiver.test.ts` under Node).
@@ -10397,6 +10598,14 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** which binary the extension's resolver returns, or the deck's not-armed notice after no watcher registers.
 - **Platform coverage:** unix (skipped on Windows; prints `SKIP:` without Node 23.6+).
 - **Cost:** about two seconds.
+
+##### inbox/pi/032 — The Pi session and authorization fence at both hand-over points.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
+- **Agent:** none.
+- **Asserts:** A tagged input delayed past a `/new` swap, a revoke or a watcher restart is consumed, never transformed, with `not_handed` for the swap and the restart and none after the revoke; a doorbell fetch returning after the same three is consumed, its attempts reported `not_handed` when still held.
+- **Does not assert:** The timing of a real Pi's awaited input pipeline (lane 2).
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
 
 #### inbox/publish
 

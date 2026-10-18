@@ -103,6 +103,10 @@ pub const ADAPTER_TOO_OLD: &str =
 /// PRD #1666 §11: the deck could not rewrite the agent's integration files
 /// as the agent started, so a restart does not update them.
 pub const REFRESH_FAILED: &str = "the deck could not update this agent's deck integration: run dot-agent-deck hooks install --agent opencode to see why, then restart the agent";
+/// PRD #1666 G6: [`REFRESH_FAILED`] for a Pi agent, whose extension is
+/// written by `orchestrator setup` into the directory its own `HOME` and
+/// `PI_CODING_AGENT_DIR` resolve.
+pub const REFRESH_FAILED_PI: &str = "the deck could not update this agent's Pi extension: run dot-agent-deck orchestrator setup with the same HOME and PI_CODING_AGENT_DIR as the agent to see why, then restart the agent";
 /// PRD #1666 §11: the capability probe proved the agent's CLI lacks the flag.
 pub const CLI_TOO_OLD: &str = "the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent";
 /// PRD #1666 §11: a reversible readiness notice, cleared by a registration.
@@ -142,6 +146,7 @@ pub enum IntegrationNotice {
     AdapterTooOld,
     NotArmed,
     RefreshFailed,
+    RefreshFailedPi,
 }
 
 impl IntegrationNotice {
@@ -151,6 +156,7 @@ impl IntegrationNotice {
             IntegrationNotice::AdapterTooOld => ADAPTER_TOO_OLD,
             IntegrationNotice::NotArmed => NOT_ARMED,
             IntegrationNotice::RefreshFailed => REFRESH_FAILED,
+            IntegrationNotice::RefreshFailedPi => REFRESH_FAILED_PI,
         }
     }
 
@@ -160,6 +166,7 @@ impl IntegrationNotice {
             IntegrationNotice::AdapterTooOld => 2,
             IntegrationNotice::NotArmed => 3,
             IntegrationNotice::RefreshFailed => 4,
+            IntegrationNotice::RefreshFailedPi => 5,
         }
     }
 
@@ -170,6 +177,7 @@ impl IntegrationNotice {
             2 => Some(Some(IntegrationNotice::AdapterTooOld)),
             3 => Some(Some(IntegrationNotice::NotArmed)),
             4 => Some(Some(IntegrationNotice::RefreshFailed)),
+            5 => Some(Some(IntegrationNotice::RefreshFailedPi)),
             _ => None,
         }
     }
@@ -405,6 +413,7 @@ mod tests {
         assert_eq!(words["cliTooOld"], CLI_TOO_OLD);
         assert_eq!(words["notArmed"], NOT_ARMED);
         assert_eq!(words["refreshFailed"], REFRESH_FAILED);
+        assert_eq!(words["refreshFailedPi"], REFRESH_FAILED_PI);
         assert_eq!(words["receiptsDegraded"], RECEIPTS_DEGRADED);
         assert_eq!(
             words["evidencePaused"]
@@ -504,7 +513,7 @@ mod tests {
             "-1,0",
             "1,0,2",
             "1,0,1,0",
-            "1,0,0,0,0,5,-",
+            "1,0,0,0,0,6,-",
             "1,0,0,0,0,0,x",
         ] {
             assert_eq!(CardInbox::decode(bad), None, "{bad}");
@@ -557,6 +566,7 @@ mod tests {
             IntegrationNotice::AdapterTooOld,
             IntegrationNotice::NotArmed,
             IntegrationNotice::RefreshFailed,
+            IntegrationNotice::RefreshFailedPi,
         ] {
             let blocked = CardInbox {
                 integration: Some(notice),

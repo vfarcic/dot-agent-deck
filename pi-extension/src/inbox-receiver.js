@@ -105,9 +105,15 @@ const inboxRef = (entry) => ({ id: entry.id, a: entry.a, e: entry.e });
 // watcher restart (a rebinding), the context's disposal or a stall the deck
 // may have retired the stream across therefore voids every outstanding
 // approval: a callback that resumes after any of them never reaches OpenCode.
-const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
-  const held = new Map();
-  const revoked = new Set();
+//
+// `exited` is told each watcher's exit code before the receiver decides
+// whether to respawn it. `state` is what another receiver's `exportState`
+// gave up (the Pi extension's replacement across a reload of a different
+// version): this one starts holding it, and registers `--resumed` from its
+// first watcher, so the deck asks about those attempts.
+const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, state }) => {
+  const held = new Map((state?.held ?? []).map((entry) => [inboxKey(entry), { ...entry }]));
+  const revoked = new Set(state?.revoked ?? []);
   // Attempts a callback took into OpenCode's API, or that the agent started
   // on, and that did not end in a positive refusal: possibly handed, whatever
   // happens to their held entry afterwards (a commit, an abort, a revert, an
@@ -115,8 +121,8 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
   // never reported not handed. Bounded, oldest dropped first; once one was
   // dropped, an attempt this receiver does not hold may be one of them, so
   // it is answered the same way.
-  const called = new Set();
-  let forgot = false;
+  const called = new Set(state?.called ?? []);
+  let forgot = state?.forgot === true;
   const call = (key) => {
     called.delete(key);
     called.add(key);
@@ -152,7 +158,14 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
   // corrects the sender, sent with its commit cap to the watcher only). Any
   // other is dropped: no correction authority survives for it. Bounded,
   // oldest dropped first.
-  const reports = new Map();
+  // A report another receiver's watcher took counts as taken by a watcher
+  // that has exited (`to` is none of this receiver's children).
+  const reports = new Map(
+    (state?.reports ?? []).map((entry) => [
+      entry.stage + "|" + inboxKey(entry.ref),
+      { stage: entry.stage, ref: inboxRef(entry.ref), to: entry.taken ? state : undefined },
+    ])
+  );
   const reported = (key) => reports.has("handed|" + key) || reports.has("committed|" + key);
   const flush = () => {
     if (!child || rx === undefined) return;
@@ -179,7 +192,16 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
   let rx;
   let seq = 0;
   let q = 0;
-  let runs = 0;
+  let runs = state ? 1 : 0;
+  // A respawn is scheduled and has not started yet.
+  let restarting = false;
+  const restart = (next, delay) => {
+    restarting = true;
+    setTimeout(() => {
+      restarting = false;
+      start(next);
+    }, delay).unref?.();
+  };
   const observe = (d) => {
     if (typeof d !== "number" || d <= watermark.seen) return;
     watermark.above.add(d);
@@ -192,9 +214,11 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
       possess: { seq, seen: watermark.seen, held: [...held.values()].map(inboxRef) },
     });
   };
+  // An attempt a revoke already answered is not held again: a doorbell fetch
+  // that issued it can return after the deck revoked it.
   const take = (entry) => {
     observe(entry.d);
-    if (!held.has(inboxKey(entry))) {
+    if (!held.has(inboxKey(entry)) && !revoked.has(inboxKey(entry))) {
       held.set(inboxKey(entry), { id: entry.id, a: entry.a, e: entry.e, d: entry.d, stage: "queued" });
     }
     return held.get(inboxKey(entry));
@@ -279,7 +303,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     try {
       spawned = spawn(hookBinary(), args, { stdio: ["pipe", "pipe", "inherit"] });
     } catch (_) {
-      setTimeout(() => start(inboxNextBackoff(backoff, 0)), backoff).unref?.();
+      restart(inboxNextBackoff(backoff, 0), backoff);
       return;
     }
     child = spawned;
@@ -298,20 +322,68 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver }) => {
     });
     spawned.stdin.on("error", () => {});
     spawned.on("error", () => {});
-    spawned.on("exit", () => {
+    spawned.on("exit", (code) => {
       try {
         if (child === spawned) {
           child = undefined;
           rx = undefined;
         }
+        exited?.(code);
         if (!active() || spawned.stdin.writableEnded) return;
-        const next = inboxNextBackoff(backoff, Date.now() - started);
-        setTimeout(() => start(next), backoff).unref?.();
+        restart(inboxNextBackoff(backoff, Date.now() - started), backoff);
       } catch (_) {}
     });
   };
   return {
     start: () => start(inboxFirstBackoff()),
+    // Start a watcher unless one runs or a respawn is already scheduled.
+    ensure: () => {
+      if (!child && !restarting) start(inboxFirstBackoff());
+    },
+    // Like `stop`, but resolves once the watcher exited ("exited"), or at
+    // the deadline after SIGTERM and then SIGKILL ("forced"): a successor
+    // may start only once this watcher can publish nothing more.
+    drain: () =>
+      new Promise((resolve) => {
+        const gone = child;
+        child = undefined;
+        rx = undefined;
+        for (const [, resolve] of grants) resolve(false);
+        grants.clear();
+        if (!gone || typeof gone.exitCode === "number" || gone.signalCode) {
+          resolve("exited");
+          return;
+        }
+        const signal = (name) => {
+          try {
+            gone.kill(name);
+          } catch (_) {}
+        };
+        const term = setTimeout(() => signal("SIGTERM"), INBOX_STOP_GRACE_MS);
+        const kill = setTimeout(() => {
+          signal("SIGKILL");
+          resolve("forced");
+        }, INBOX_STOP_GRACE_MS + 2000);
+        term.unref?.();
+        kill.unref?.();
+        gone.once("exit", () => {
+          clearTimeout(term);
+          clearTimeout(kill);
+          resolve("exited");
+        });
+        try {
+          gone.stdin.end();
+        } catch (_) {}
+      }),
+    // What a successor needs to answer for this receiver's attempts: what it
+    // holds, what it called or revoked, and its unpublished stage reports.
+    exportState: () => ({
+      held: [...held.values()].map((entry) => ({ ...entry })),
+      called: [...called],
+      forgot,
+      revoked: [...revoked],
+      reports: [...reports.values()].map((entry) => ({ stage: entry.stage, ref: entry.ref, taken: entry.to !== undefined })),
+    }),
     stop: () => {
       const gone = child;
       child = undefined;
