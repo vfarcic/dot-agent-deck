@@ -217,8 +217,16 @@ pub struct Attempt {
     revoke_sent: Option<Instant>,
     /// Kept for an attempt whose late commit can still correct the sender
     /// (§7): a `HandedInert` one, and a `Fenced` one until a spool check
-    /// after its message ended found no commit for it.
+    /// after its message ended found no commit for it — one begun while no
+    /// live incarnation held its hand-back ([`Self::correcting`]).
     pub verifier: bool,
+    /// The incarnation this final attempt's commit authority was last handed
+    /// back to ([`Registration::correctable`], r8k B02). While it is live its
+    /// replay of a saved commit can still be outstanding, so no spool check
+    /// may take the verifier away: [`AttemptModel::verify_candidates`] leaves
+    /// the attempt out, and the hand-back makes a check already under way
+    /// stale (the mark).
+    correcting: Option<Rx>,
     pub reclaimed: bool,
     issued_at: Instant,
     resume_deadline: Option<Instant>,
@@ -427,6 +435,8 @@ pub struct Registration {
     /// commit, its watcher having died with it, now answers on this
     /// incarnation. The caller hands each one's commit authority, and only
     /// that, to the new watcher: no stage, approval or callback comes with it.
+    /// Each keeps its verifier while this incarnation lives (r8k B02), so a
+    /// replay it has not published yet is not overtaken by an absence.
     pub correctable: Vec<(String, u32, u32)>,
 }
 
@@ -630,13 +640,17 @@ impl AttemptModel {
         }
         // Every retired incarnation of the slot counts, the one just replaced
         // and any the clock retired with no successor (which frees the slot).
-        for (id, msg) in &self.messages {
-            for at in &msg.attempts {
+        // r8k B02: the hand-back holds the verifier for as long as this
+        // incarnation lives, and a spool check begun before it covers nothing.
+        for (id, msg) in self.messages.iter_mut() {
+            for at in msg.attempts.iter_mut() {
                 let in_slot = self
                     .receivers
                     .get(&at.rx)
                     .is_some_and(|r| r.slot == slot && r.retired);
                 if in_slot && at.stage.is_final() && at.verifier && !at.reclaimed {
+                    at.correcting = Some(rx);
+                    at.recheck();
                     correctable.push((id.clone(), at.a, at.e));
                 }
             }
@@ -739,6 +753,7 @@ impl AttemptModel {
             revoked: false,
             revoke_sent: None,
             verifier: false,
+            correcting: None,
             reclaimed: false,
             issued_at: now,
             resume_deadline: None,
@@ -956,6 +971,13 @@ impl AttemptModel {
     /// finds no commit lets [`Self::tick_verified`] return its evidence, so a
     /// receipt its incarnation published before a Cancel ended the message
     /// still corrects the sender.
+    ///
+    /// An attempt whose commit authority was handed back to an incarnation
+    /// that is still live is left out (r8k B02): that incarnation may yet
+    /// publish the commit its predecessor died with, and an absence now says
+    /// nothing about it. Verification resumes once that incarnation is
+    /// retired — by a successor's registration, which hands the attempt back
+    /// to the successor in turn, or by the clock with no successor.
     pub fn verify_candidates(&self) -> Vec<LapseCheck> {
         let mut out = Vec::new();
         if self.exited {
@@ -966,7 +988,8 @@ impl AttemptModel {
                 continue;
             }
             for at in &msg.attempts {
-                if at.stage == Stage::Fenced && at.verifier && !at.reclaimed {
+                let replaying = at.correcting.is_some_and(|rx| self.live(rx));
+                if at.stage == Stage::Fenced && at.verifier && !at.reclaimed && !replaying {
                     out.push(LapseCheck {
                         id: id.clone(),
                         a: at.a,
@@ -1245,7 +1268,8 @@ impl AttemptModel {
     /// after it was last sent. A revoke line can be lost on its way — the
     /// attempt's incarnation had no link, or its queue was full — and nothing
     /// else would send it again: a terminal message is no lapse candidate, and
-    /// a healthy stream is never retired.
+    /// a stream is retired only by a replacement registration (which answers
+    /// through [`Self::resume_answer`]) or by the clock after it closed.
     ///
     /// Owed while the attempt is revoked and not final, not waiting for a
     /// resume answer (the answer re-sends it, [`Self::resume_answer`]) and not
@@ -1254,9 +1278,12 @@ impl AttemptModel {
     /// its silence, the stream's retirement, or exit. A send proves nothing
     /// and neither does an absence, so neither makes it final.
     ///
-    /// That bounds the RATE — one line per owed attempt per ack-wait — and,
-    /// through the evidence budget, how many attempts can be owed at once. It
-    /// does not bound the number of re-sends: a live receiver that never
+    /// That bounds the RATE of this periodic path — one line per owed attempt
+    /// per ack-wait — and, through the evidence budget, how many attempts can
+    /// be owed at once. A retained rebind sends at once and restamps the
+    /// attempt (see [`Self::resume_answer`]), so repeated registrations can
+    /// send more than one line within an ack-wait. It does not bound the
+    /// number of re-sends: a live receiver that never
     /// answers is sent one per ack-wait for as long as it lives, and its
     /// attempt keeps its evidence reserved all that time.
     pub fn revokes_due(&mut self, now: Instant) {
@@ -3088,6 +3115,120 @@ mod tests {
             "a refusal for a committed assignment is not a witness either"
         );
         assert_eq!(m.evidence_reserved(), reserved);
+    }
+
+    /// Scenario: An OpenCode watcher is handed a message and dies, and its
+    /// replacement dies before answering for it, so the attempt is fenced;
+    /// the user then cancels the message. A spool check for its commit is
+    /// taken, another replacement registers and is handed the attempt's
+    /// commit authority, and the check then finds nothing, as does one
+    /// taken after the registration. That replacement dies before
+    /// publishing, the next one is handed the attempt again, and the
+    /// commit it publishes tells the sender the message was delivered after
+    /// all and returns the evidence once. Once a replacement holding the
+    /// hand-back is retired with no successor, a check that finds nothing
+    /// returns the evidence.
+    #[spec("inbox/attempts/019")]
+    #[test]
+    fn attempts_019_a_handed_back_fenced_commit_keeps_its_verifier_while_its_replay_is_outstanding()
+    {
+        let fenced_and_cancelled = || {
+            let (mut m, t) = model();
+            let first = m.register(t, Slot::OpencodeTui, false).rx;
+            m.post("m", false);
+            let at = issue_held(&mut m, t, "m", first, 1);
+            m.register(t, Slot::OpencodeTui, false);
+            let t = t + Limits::default().ack_wait;
+            m.tick(t);
+            assert_eq!(
+                m.delivery("m").unwrap().attempt(1, at.e).unwrap().stage,
+                Stage::Fenced,
+                "precondition: the unanswered resume fenced the attempt"
+            );
+            let r = m.delivery("m").unwrap().revision;
+            assert!(matches!(
+                m.cancel(t, "m", GEN, r),
+                ActionOutcome::Applied { .. }
+            ));
+            assert!(m.state("m").unwrap().is_terminal());
+            assert_eq!(m.verify_candidates().len(), 1, "precondition: verifying");
+            m.drain_effects();
+            (m, t, at)
+        };
+        let reclaimed = |effects: &[Effect]| {
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Reclaimed { .. }))
+                .count()
+        };
+        let handed_back = |e: u32| vec![("m".to_string(), 1, e)];
+
+        let (mut m, t, at) = fenced_and_cancelled();
+        let before = m.verify_candidates();
+        let replacement = m.register(t, Slot::OpencodeTui, false);
+        assert_eq!(replacement.correctable, handed_back(at.e));
+        m.tick_verified(&before);
+        let after = m.verify_candidates();
+        m.tick_verified(&after);
+        assert_eq!(
+            reclaimed(&m.drain_effects()),
+            0,
+            "an absence check reclaimed a commit handed back for publication"
+        );
+        assert_eq!(m.evidence_reserved(), EVIDENCE_PER_ATTEMPT);
+        m.stream_closed(t, replacement.rx);
+        let next = m.register(t, Slot::OpencodeTui, false);
+        assert_eq!(
+            next.correctable,
+            handed_back(at.e),
+            "the replay was lost with the replacement that died before publishing it"
+        );
+        assert!(
+            m.may_hand_over("m", 1, at.e, next.rx).is_err(),
+            "a final attempt is not callable"
+        );
+        assert_eq!(
+            m.stage(t, "m", 1, at.e, Stage::Committed, None),
+            StageOutcome::Applied
+        );
+        assert_eq!(
+            m.drain_effects(),
+            vec![
+                Effect::DeliveredAfterAll {
+                    id: "m".into(),
+                    despite_cancel: true
+                },
+                Effect::Reclaimed {
+                    id: "m".into(),
+                    a: 1,
+                    e: at.e
+                }
+            ]
+        );
+        assert_eq!(m.evidence_reserved(), 0);
+        assert_eq!(
+            m.stage(t, "m", 1, at.e, Stage::Committed, None),
+            StageOutcome::NoOp
+        );
+        assert!(m.drain_effects().is_empty());
+
+        let (mut m, t, at) = fenced_and_cancelled();
+        let replacement = m.register(t, Slot::OpencodeTui, false);
+        assert_eq!(replacement.correctable, handed_back(at.e));
+        m.stream_closed(t, replacement.rx);
+        let gone = t + Limits::default().closed_retire_after();
+        m.tick(gone);
+        let checks = m.verify_candidates();
+        assert_eq!(checks.len(), 1, "verification resumes once no one holds it");
+        m.tick_verified(&checks);
+        assert_eq!(reclaimed(&m.drain_effects()), 1);
+        assert_eq!(m.evidence_reserved(), 0);
+        assert!(
+            m.register(gone, Slot::OpencodeTui, false)
+                .correctable
+                .is_empty(),
+            "a reclaimed attempt is not handed back"
+        );
     }
 
     /// The revokes in `effects`, as `(a, e)` pairs of message `id`.
