@@ -244,6 +244,10 @@ mod unix {
         spool: Option<Result<Arc<GenerationSpool>, String>>,
         /// The stream ended, so a registration will not come any more.
         ended: bool,
+        /// Test seam: told, under this lock, each time a publish is about to
+        /// wait for a rebound attempt's caps.
+        #[cfg(test)]
+        cap_wait: Option<std::sync::mpsc::Sender<()>>,
     }
 
     fn key(at: &InboxAttemptRef) -> Key {
@@ -308,6 +312,10 @@ mod unix {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if !waiting || left.is_zero() {
                     break;
+                }
+                #[cfg(test)]
+                if !unregistered && let Some(cap_wait) = &shared.cap_wait {
+                    let _ = cap_wait.send(());
                 }
                 shared = watch
                     .rebound
@@ -585,7 +593,7 @@ mod unix {
         use super::*;
         use spec::spec;
 
-        /// Scenario: A registered watcher whose spool could not open is still waiting for a rebound attempt's caps when its stream ends. The commit report it is publishing stops waiting at once and comes back as a failure, instead of holding the watcher's exit for the whole five-second rebinding wait.
+        /// Scenario: A registered watcher whose spool could not open is already blocked waiting for a rebound attempt's caps when its stream ends. The commit report it is publishing stops waiting at once and comes back as a failure, instead of holding the watcher's exit for the whole five-second rebinding wait.
         #[spec("inbox/opencode/051")]
         #[test]
         fn opencode_051_a_rebinding_wait_stops_when_the_stream_ends() {
@@ -595,33 +603,28 @@ mod unix {
                 a: 1,
                 e: 1,
             };
+            let (cap_wait_tx, cap_wait_rx) = std::sync::mpsc::channel();
             {
                 let mut shared = watch.lock();
                 shared.spool = Some(Err("no spool in this test".into()));
                 shared.rebinding.insert(key(&attempt));
+                shared.cap_wait = Some(cap_wait_tx);
             }
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
             let publisher = {
                 let watch = Arc::clone(&watch);
-                std::thread::spawn(move || {
-                    let started = Instant::now();
-                    started_tx.send(()).unwrap();
-                    let failed = publish(&watch, RecordStage::Committed, &[attempt]);
-                    (failed, started.elapsed())
-                })
+                std::thread::spawn(move || publish(&watch, RecordStage::Committed, &[attempt]))
             };
-            started_rx.recv().unwrap();
-            // The stream ends while the report waits for the caps: the
-            // publisher is held for this long first, so a return before it
-            // would mean it never waited at all.
-            let held = Duration::from_millis(300);
-            std::thread::sleep(held);
+            // The publisher signals while holding the lock, just before it
+            // waits; taking the lock afterwards therefore succeeds only once
+            // the wait has released it, so the stream ends during the wait.
+            cap_wait_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("precondition: the report waits for the rebound caps");
+            drop(watch.lock());
+            let ended = Instant::now();
             watch.end();
-            let (failed, elapsed) = publisher.join().unwrap();
-            assert!(
-                elapsed >= held,
-                "precondition: the report waited for the caps ({elapsed:?})"
-            );
+            let failed = publisher.join().unwrap();
+            let elapsed = ended.elapsed();
             assert!(
                 elapsed < Duration::from_secs(2),
                 "the rebinding wait outlived the stream's end by {elapsed:?}"

@@ -1539,8 +1539,10 @@ const inboxWrite = (child, control) => {
 // if it is still running INBOX_STOP_GRACE_MS later, on a timer that keeps
 // nothing alive. Stage reports queued while no watcher is registered (a
 // restart's backoff, or before the new one registers) are not flushed here:
-// there is no authority to publish them with, so their attempts lapse and are
-// repeated, marked, once the deck has checked its spool.
+// there is no authority to publish them with. Their attempts may take the
+// deck's checked, marked repeat if their message is still eligible for one;
+// the generation's exit, the repeat limits and a message already ended stop
+// that instead.
 const INBOX_STOP_GRACE_MS = 3000;
 const inboxStop = (child) => {
   if (!child) return;

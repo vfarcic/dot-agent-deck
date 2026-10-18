@@ -10089,7 +10089,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/opencode/051 — Disposal allows bounded time for a commit's publication.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watcher with a 1.5 s `DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS`; plus a fast unit test in `src/inbox_watcher.rs`.
 - **Agent:** generated TUI plugin; the unit half has no agent.
-- **Asserts:** a commit reported as the context is disposed, its publish still in flight, is published and reported before the watcher exits, and the deck acknowledges the message with one prompt. Unit: a publish waiting for a rebound attempt's caps stops waiting when the stream ends, returning a failure well inside the five-second rebinding wait.
+- **Asserts:** a commit reported as the context is disposed, its publish still in flight, is published and reported before the watcher exits, and the deck acknowledges the message with one prompt. Unit: a publish already blocked waiting for a rebound attempt's caps (a test-only signal sent under the watcher's lock just before the wait, which the test then takes before ending the stream) stops waiting when the stream ends, returning a failure well inside the five-second rebinding wait.
 - **Does not assert:** that every report made at shutdown arrives (a publish longer than the drain is lost or degraded), or reports queued while no watcher is registered, which the plugin's stop does not flush.
 - **Cost:** none.
 

@@ -235,7 +235,7 @@ While a notice stands, the agent's messages wait. When the integration connects 
 
 ### An agent finishes an interrupted request before a delegated task
 
-If you interrupt an agent and a delegated task arrives soon after, the agent may finish the request you interrupted first. That is the agent's choice; the deck delivered the task. If the agent ends its turn without doing the task, ask it to, or delegate the task again.
+If you interrupt an agent and a delegated task arrives soon after, the agent may finish the request you interrupted first. When the agent's card or tile shows `✉ delivered`, or you can see the task in the agent's pane, the deck has delivered it and the order is the agent's choice; if the agent ends its turn without doing the task, ask it to, or delegate the task again. If the badge still shows `✉N queued` or `✉N waiting to wake: send it a prompt`, the task has not reached the agent yet: see [Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app) and [An agent shows the doorbell instead of waking](#an-agent-shows-the-doorbell-instead-of-waking).
 
 ### An agent shows the doorbell instead of waking
 
