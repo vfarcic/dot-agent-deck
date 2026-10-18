@@ -315,13 +315,12 @@ enum Commands {
         turn_reply_failed: bool,
     },
     /// Print the seed/prompt the daemon prepared for this pane, then clear it
-    /// (PRD #201 native prompt delivery). READ-ONLY: it asks the daemon over
-    /// the hook socket for the pane's pending seed and prints it to stdout
-    /// (empty output = no seed). The bundled Pi extension shells this on
-    /// `session_start` and, if the output is non-empty, delivers it natively
-    /// via `pi.sendUserMessage` — so a Pi pane's first prompt no longer needs
-    /// PTY keystroke injection. Uses `DOT_AGENT_DECK_PANE_ID` to scope the
-    /// request, exactly like `agent-event`.
+    /// (PRD #201). A compatibility alias: the daemon posts a pane's seed as its
+    /// first inbox message (PRD #1666 S5), and this verb takes it from the
+    /// inbox and prints it to stdout (empty output = no seed). A Pi generation
+    /// is refused (PRD #1666 G10); the bundled Pi extension no longer calls it.
+    /// Uses `DOT_AGENT_DECK_PANE_ID` to scope the request, exactly like
+    /// `agent-event`.
     GetSeed,
     /// Report a question an agent is asking and wait for the deck's answer
     /// (PRD #1631). Run by the deck's OpenCode plugin and Pi extension, not by

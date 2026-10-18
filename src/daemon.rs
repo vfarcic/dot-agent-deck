@@ -6707,9 +6707,10 @@ async fn run_hook_loop_with_limits(
                                     // seed is the pane's first inbox message, so
                                     // `get-seed` hands over the agent's oldest
                                     // queued message, rendered, and acknowledges
-                                    // it — what a Pi extension that predates the
-                                    // inbox needs to keep receiving its seed.
-                                    // `None` → `{"seed":null}`.
+                                    // it — the verb a Pi extension that predates
+                                    // the inbox used. A Pi generation is refused
+                                    // since G10 (`pi` below). `None` →
+                                    // `{"seed":null}`.
                                     //
                                     // Hardening H2: it acts only for the agent
                                     // the token attests, never for an id the

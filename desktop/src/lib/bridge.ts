@@ -2758,6 +2758,14 @@ const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "discon
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
   /**
+   * PRD #1666 §6.4: the preview answers Retry and Cancel as a daemon that
+   * applied them would, so a fixture tile listing deck messages shows the
+   * buttons the docs describe. Nothing changes in the fixture's state.
+   */
+  async inboxAction(): Promise<InboxActionResult> {
+    return { outcome: "applied" };
+  }
+  /**
    * The whole fixture fleet, selected deck first (PRD #742 M4). One entry for
    * every scenario but `fleet`, which is the three-deck one.
    */

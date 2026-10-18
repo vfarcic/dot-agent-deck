@@ -559,6 +559,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-tile.is-selected { border-color: var(--teal-focus); box-shadow: 0 0 0 1px var(--teal-focus); }
 .agent-header { min-height: 58px; padding: 9px 11px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .agent-identity { min-width: 0; display: flex; align-items: flex-start; gap: 8px; }
+/* The text column may shrink below its longest line, so a one-line notice ends in
+   an ellipsis and the deck-message rows below it wrap inside the tile. */
+.agent-identity > div { min-width: 0; }
 .agent-state-mark { width: 8px; height: 8px; margin-top: 5px; flex: 0 0 8px; border: 2px solid var(--paper-strong); border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 1px currentColor; }
 .agent-state-mark.status-running { color: var(--teal); background: var(--teal); }
 .agent-state-mark.status-passed { color: var(--green); background: var(--green); }
@@ -580,7 +583,16 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-inbox-badge { color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; white-space: nowrap; flex-shrink: 0; }
 /* PRD #1666 §6.4: a long list of deliveries waiting on Retry or Cancel scrolls in
    place, so every row and its buttons stay reachable in a tile that hides overflow. */
-.agent-inbox-attention { max-height: 160px; overflow-y: auto; }
+.agent-inbox-attention { min-width: 0; max-width: 100%; max-height: 160px; margin: 4px 0 0; padding: 0; overflow-y: auto; list-style: none; }
+/* Each row wraps inside the tile, so the whole reason — what Retry would do — is
+   readable without widening the tile, as the TUI picker shows it whole. */
+.agent-inbox-attention-row { padding: 4px 0; border-top: 1px solid var(--line); color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; line-height: 1.45; white-space: normal; overflow-wrap: anywhere; }
+.agent-inbox-attention-who, .agent-inbox-attention-subject { color: var(--ink); font-weight: 700; }
+.agent-inbox-attention-reason { display: block; margin-top: 2px; }
+.agent-inbox-attention-actions { display: flex; gap: 4px; margin-top: 4px; }
+.agent-inbox-attention-actions button { padding: 2px 8px; border: 1px solid var(--line-strong); border-radius: var(--radius); color: var(--ink); background: var(--paper-strong); font: inherit; font-weight: 700; cursor: pointer; }
+.agent-inbox-attention-actions button:disabled { color: var(--faint); cursor: default; }
+.agent-inbox-attention-answer { display: block; margin-top: 3px; color: var(--ink); }
 .agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Issue #1678: background work still running after the turn ended. Ink rather
    than --muted, as the TUI draws it in its primary text colour: it is a reading

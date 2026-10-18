@@ -869,9 +869,10 @@ pub static PI: AgentSpec = AgentSpec {
     hook_install: None,
     hook_uninstall: None,
     materialize: Some(pi_materialize),
-    // Pi's extension is materialized once at DAEMON startup
+    // Pi's extension is materialized at DAEMON startup
     // (`orchestrator_ext::auto_materialize`, called by `daemon serve`), not by
-    // a startup install step and not per spawn (#210).
+    // a startup install step, and refreshed per spawn only for a spawn detected
+    // as Pi (`agent_pty::pi_spawn`, PRD #1666 G6; #210).
     startup_auto_install: None,
     configured_pins: None,
     // PRD #1541, measured on Pi 0.87.1: one ESC interrupts; one Ctrl+U per

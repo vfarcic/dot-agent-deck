@@ -124,6 +124,16 @@ desktopScenario("agent-messaging", async (page) => {
   await expect(page.getByTestId("terminal-2").locator(".xterm-screen canvas").first()).toBeVisible();
 });
 
+desktopScenario("inbox-attention", async (page) => {
+  await page.goto("/?fixture=1&state=docs&messaging=attention&experimental=1");
+  await page.getByTestId("open-deck").click();
+  await page.getByRole("button", { name: "Close events drawer" }).click();
+  const row = page.getByTestId("inbox-attention-m-k3xzq2ab-0000000000000001");
+  await expect(row).toBeVisible();
+  await expect(row.getByRole("button", { name: "Retry" })).toBeVisible();
+  await expect(row.getByRole("button", { name: "Cancel" })).toBeVisible();
+});
+
 desktopScenario("settings-daemons", async (page) => {
   await page.addInitScript(() => {
     window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({

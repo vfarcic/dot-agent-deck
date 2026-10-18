@@ -802,13 +802,13 @@ pub struct StartAgentOptions {
     /// `None` here omits the field from the wire payload so older
     /// daemons keep accepting the request.
     pub agent_type: Option<AgentType>,
-    /// PRD #201 native prompt delivery: a seed/prompt to stash daemon-side for
-    /// this pane at spawn time (via `AgentPtyRegistry::set_pending_seed`), to be
-    /// pulled NATIVELY by the pane's extension via `dot-agent-deck get-seed`
-    /// (→ `pi.sendUserMessage`) instead of typed into the PTY. Set only for a
-    /// Pi start-role (orchestrator) pane. `None` omits the field from the wire
-    /// payload so older daemons keep accepting the request (and, receiving no
-    /// seed, drive the unchanged PTY-injection path).
+    /// The prompt this agent is started with. Forwarded as
+    /// `AttachRequest::StartAgent.seed`; the daemon posts it as the pane's
+    /// first inbox message, bound to the agent it just spawned, for every
+    /// agent type (PRD #1666 S5), and refuses the start when it cannot. The
+    /// TUI sets it for a built-in option's seed (schedule, issue dispatch,
+    /// dispatcher) and for an orchestration's Pi start role (`tab.rs`). `None`
+    /// omits the field from the wire payload.
     pub seed: Option<String>,
 }
 

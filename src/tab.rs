@@ -967,7 +967,9 @@ impl TabManager {
                 // here, so such a role badges and wraps at spawn instead of
                 // reading "No agent" until its first delegated task.
                 agent_type: role.resolved_agent_type(),
-                // PRD #201: seed only the Pi start-role pane for native pull.
+                // PRD #201: only the Pi start-role pane is started with its
+                // prompt as the seed, which the daemon posts as the pane's
+                // first inbox message (PRD #1666 S5).
                 seed: if role_index == orch_idx && start_role_is_pi {
                     orchestrator_prompt.clone()
                 } else {

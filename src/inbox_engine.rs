@@ -12,7 +12,7 @@
 //! **One policy per assignment.** A message is handed to a receipt receiver
 //! only while its inbox copy is queued and not `Legacy`-owned; taking it makes
 //! the assignment `Receipt`-owned ([`crate::inbox::AssignmentOwner`]), which
-//! the legacy ack-wait, requeue and nack then leave alone. The attempt model
+//! the legacy ack-wait and requeue then leave alone. The attempt model
 //! decides everything after that, and [`sync`] mirrors each of its decisions
 //! into the inbox: a settle acknowledges (or claims an offer), rule 3 queues
 //! the message again, an undeliverable verdict retires it.

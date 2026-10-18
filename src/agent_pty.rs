@@ -9962,19 +9962,18 @@ impl AgentPtyRegistry {
         let captured_cols = opts.cols.clamp(1, PTY_RESIZE_DIM_MAX);
 
         // PRD #201 (#210 fix): the bundled Pi orchestrator extension is
-        // materialized ONCE at daemon startup (`orchestrator_ext::auto_materialize`,
-        // called from the `daemon serve` entry), NOT here per spawn. Doing it per
-        // spawn meant an unrelated agent start (claude, a shell, a test) rewrote
-        // `~/.pi` whenever pi was on PATH; the daemon-startup seam is
-        // command-agnostic and touches Pi's dir only once. So there is
-        // deliberately no materialize call in the spawn path.
+        // materialized at daemon startup (`orchestrator_ext::auto_materialize`,
+        // called from the `daemon serve` entry) for every launch command. The
+        // spawn path writes it again only for a spawn detected as Pi
+        // ([`pi_spawn`], PRD #1666 G6, below), never for an unrelated agent
+        // start: materializing on every spawn rewrote `~/.pi` whenever pi was
+        // on PATH, which was #210's bug.
         //
         // PRD #20 note (finding #15 reconciliation): PRD #20 had generalized this
-        // into a per-spawn `spec(agent).materialize` dispatch. That per-spawn seam
-        // is intentionally dropped here to preserve #210's fix — the registry
-        // `AgentSpec.materialize` field remains as capability metadata, but no
-        // agent needs a spawn-time materialize (Codex uses the `wrap` seam;
-        // `materialize` is None). Adding one back would reintroduce #210's bug.
+        // into a per-spawn `spec(agent).materialize` dispatch. That per-spawn
+        // seam stays dropped: the registry `AgentSpec.materialize` field remains
+        // as capability metadata, and G6's Pi refresh goes through the inbox
+        // refresh below, keyed on `pi_spawn`, not through that field.
 
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn

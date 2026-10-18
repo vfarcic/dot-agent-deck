@@ -767,6 +767,26 @@ const docsAgents: AgentSession[] = [
   crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "needs_input", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
 ];
 
+/**
+ * PRD #1666: a Pi agent whose first prompt may not have reached it, matching
+ * the TUI's inbox-attention capture.
+ */
+const docsAttentionAgents: AgentSession[] = [
+  {
+    ...crowdedAgent({ id: "1", displayName: "builder", role: "builder", cli: "pi", status: "idle", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 4, quietForMinutes: 3, tab: { kind: "dashboard" } }),
+    paneId: "pi-builder",
+    inbox: {
+      queued: 0,
+      fetched: 1,
+      undeliverable: 0,
+      wake: "native",
+      component: "pi_extension",
+      attention: [{ messageId: "m-k3xzq2ab-0000000000000001", revision: 1, kind: "not_started", fromLabel: "dot-agent-deck (the prompt this session was started with)", subject: "first prompt" }],
+    },
+    transcript: "",
+  },
+];
+
 /** Synthetic pair matching the TUI's agent-messaging capture. */
 const docsMessagingAgents: AgentSession[] = [
   { ...crowdedAgent({ id: "1", displayName: "planner", role: "Planner", cli: "claude", status: "running", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 30, quietForMinutes: 0, activeTool: "Read", activeToolDetail: "src/checkout/flow.ts", lastUserPrompt: "Plan the checkout retry flow.", tab: orchestrationTab("docs-messaging", "demo-loop", "demo-loop", "planner", 0, true, "/home/dev/demo-project") }), inbox: { queued: 1, fetched: 0, undeliverable: 0, wake: "doorbell" }, transcript: "Planning the checkout retry flow\r\n" },
@@ -1246,8 +1266,9 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
       ? { status: "error" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, daemonDetected: true, message: "This daemon is older than this app, and the two cannot work together. Update the daemon to this app's version.", detail: "The app speaks protocol 6; the daemon reports protocol 5." }
       : { status: "disconnected" as const, message: "No daemon is listening on the configured socket." };
 
-  const messaging = state === "docs" && typeof window !== "undefined" && new URLSearchParams(window.location.search).get("messaging") === "1";
-  const fleet = messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : state === "docs-question" ? docsQuestionAgents : agents;
+  const messagingParam = state === "docs" && typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("messaging") : null;
+  const messaging = messagingParam === "1" || messagingParam === "attention";
+  const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : state === "docs-question" ? docsQuestionAgents : agents;
   // The docs scenario carries only what its screenshots show, so nothing from
   // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
   const docs = state === "docs" || state === "docs-question";

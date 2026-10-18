@@ -2030,15 +2030,14 @@ pub enum AttachRequest {
         /// forward compat with daemons that don't know about it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_type: Option<AgentType>,
-        /// PRD #201 native prompt delivery: a seed/prompt the daemon stashes
-        /// for this pane at spawn time (`AgentPtyRegistry::set_pending_seed`),
-        /// pulled NATIVELY by the pane's extension via `dot-agent-deck get-seed`
-        /// (→ `pi.sendUserMessage`) instead of the daemon typing it into the
-        /// PTY. Set only for a Pi start-role (orchestrator) pane. Same
-        /// `skip_serializing_if` pattern as the M2.x fields above, so adding it
-        /// is forward + backward compatible and needs no `PROTOCOL_VERSION`
-        /// bump — an older daemon simply ignores the field and drives the
-        /// unchanged PTY-injection path (the fallback still delivers).
+        /// The prompt the spawned agent starts with. The daemon posts it as
+        /// the pane's first inbox message, bound to the agent just spawned,
+        /// for every agent type (PRD #1666 S5): nothing is typed into the PTY
+        /// and nothing waits for the agent's session. A post the inbox refuses
+        /// fails the start. The agent's integration takes it like any other
+        /// deck message. `get-seed` remains an inbox alias, which refuses a
+        /// Pi generation (PRD #1666 G10).
+        /// Same `skip_serializing_if` pattern as the M2.x fields above.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<String>,
         /// PRD #1223 M7: start an AUTHORING agent — the daemon composes that

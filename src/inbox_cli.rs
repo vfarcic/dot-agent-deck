@@ -292,10 +292,10 @@ fn wait_stream(json: &str) -> ExitCode {
     {
         return ExitCode::SUCCESS;
     }
-    // Acks, nacks and holds from the component, forwarded as they come. The
-    // component closing our stdin is how it says it is done (PRD #1666 S8:
-    // OpenCode's plugin on dispose), so the watcher then exits, and the deck
-    // takes back whatever it handed over and was not acknowledged.
+    // Control lines from the component, forwarded as they come; a daemon from
+    // this build refuses a stream without `--adapter-integration` before it
+    // reads any. The component closing our stdin is how it says it is done
+    // (PRD #1666 S8: OpenCode's plugin on dispose), so the watcher then exits.
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {

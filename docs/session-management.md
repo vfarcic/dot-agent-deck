@@ -91,9 +91,11 @@ The `Prmt:` line on a TUI card shows `✉ <subject>` for a deck message. Its `Se
 
 Long turns affect delivery in both clients:
 
-- OpenCode and Pi can keep a message queued behind a busy turn without a not-delivered error during that wait; OpenCode does not receive another copy. Claude Code cannot confirm this wait, so a message waiting behind a turn longer than about five minutes can be reported not delivered before it arrives; the orchestrator is then told it arrived.
+- OpenCode and Pi can keep a message queued behind a busy turn without a not-delivered error during that wait, and do not receive another copy. Claude Code cannot confirm this wait, so a message waiting behind a turn longer than about five minutes can be reported not delivered before it arrives; the orchestrator is then told it arrived.
 - If a task reported as not delivered arrives after all, the orchestrator is told, and the TUI card or desktop tile leaves its delivery error state once no other delivery error remains.
-- After a message has been held for an hour, the usual delivery limit and not-delivered notices apply again.
+- A message OpenCode or Pi has kept for an hour without starting on it shows a one-time reminder with **Retry** and **Cancel**; it is not an error, and the agent may still be working on it.
+
+When the deck cannot tell whether an OpenCode or Pi agent got a message, the card or tile says `✉ delivery uncertain`; when a Pi agent has stayed idle for a few minutes without starting on a message the deck handed it, it says `✉ may not have reached the agent`. Both offer **Retry** and **Cancel**: press `i` on the TUI card, or use the tile's buttons. [Orchestration → Delivery](orchestration.md#delivery-in-the-tui-and-desktop-app) explains what each choice does.
 
 ## What a TUI card shows
 
