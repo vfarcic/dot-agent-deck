@@ -2304,11 +2304,14 @@ where
     //
     // A turn starts with a report that the agent is working: thinking, a
     // tool starting, compacting or a permission request (r8k R8G-02). A tool
-    // FINISHING starts nothing, since its ToolStart already started its
-    // turn: a ToolEnd that arrives after its turn's Idle would otherwise open
-    // a turn the next Idle "ends", releasing Escapes that opened a menu
-    // meanwhile (Qodo r8, PR #1735). An Idle with no turn under
-    // way releases nothing: a repeated Idle (OpenCode sends two) must not
+    // FINISHING starts nothing: a ToolEnd that arrives after its turn's Idle
+    // would otherwise open a turn the next Idle "ends", releasing Escapes
+    // that opened a menu meanwhile (Qodo r8, PR #1735), and the daemon cannot
+    // tell it from the first report of a turn whose start it never saw. So a
+    // turn whose start report is missing (lost, or its hook switched off)
+    // releases nothing when it ends, and its Escapes hold until a submit or
+    // the user's clear, the Enter the user docs give. An Idle with no turn
+    // under way releases nothing: a repeated Idle (OpenCode sends two) must not
     // release the Escapes that opened a menu on an agent already Idle. A
     // line `dot-agent-deck wrap` classified from the child's output proves
     // only that it printed something, or stopped printing, so it neither
