@@ -418,7 +418,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
     }
     pub fn interrupted_cancellable_wait(&self) -> Value {
         let before = self.log().len();
-        let prompt = "Run sleep 30 once in the shell as a disposable, cancellable wait while I prepare your next task. This request lasts only until I interrupt you. An interrupt cancels the wait and completes this request: do not restart it, send a follow-up answer, or carry it into the next task. After interruption, handle the next instruction normally.";
+        let prompt = "Run sleep 30 once in the shell as a disposable, cancellable wait while I prepare your next task. If the wait finishes without interruption, reply only with the concatenation of PRIME-INTERRUPT- and 022, with no spaces. This request lasts only until I interrupt you. An interrupt cancels the wait and completes this request: do not restart it, send a follow-up answer, or carry it into the next task. After interruption, handle the next instruction normally.";
         let mut priming_input = self.input(prompt);
         assert!(
             common::wait_until(BUDGET, || composer::composer_has_prompt(

@@ -211,7 +211,7 @@ fn opencode_021_live_watcher_respawns_and_next_delegate_is_native() {
     assert!(!op.log().contains("doorbell rang"), "{}", op.evidence());
 }
 
-/// Scenario: Remove the deck entry from scratch tui.json so no TUI watcher arms, start an explicitly cancellable shell wait, and interrupt it once after its running sleep is visible in both views to obtain a genuine Idle and empty composer. The server plugin must intercept the doorbell before the model, visibly execute the delegated task in both views without restarting the wait or replying to the obsolete request, write the sentinel, acknowledge once, and show a delivered card. This covers delivery after explicit cancellation; the deck does not cancel arbitrary earlier requests.
+/// Scenario: Remove the deck entry from scratch tui.json so no TUI watcher arms, start an explicitly cancellable shell wait with a completion reply marker, and interrupt it once after its running sleep is visible in both views to obtain a genuine Idle and empty composer. The server plugin must intercept the doorbell before the model, visibly execute the delegated task in both views without restarting the wait or emitting its completion reply marker, write the sentinel, acknowledge once, and show a delivered card. This covers delivery after explicit cancellation; the deck does not cancel arbitrary earlier requests.
 #[spec("inbox/opencode/022")]
 #[test]
 fn opencode_022_live_unarmed_doorbell_is_intercepted_before_model() {
@@ -239,7 +239,7 @@ fn opencode_022_live_unarmed_doorbell_is_intercepted_before_model() {
             && p["data"]["text"]
                 .as_str()
                 .is_some_and(|text| text.contains("PRIME-INTERRUPT-022"))),
-        "obsolete priming reply must not appear after delivery; {}",
+        "cancelled wait's completion reply marker must not appear through delegated execution; {}",
         op.evidence()
     );
     assert!(op.log().contains("doorbell rang"), "{}", op.evidence());
