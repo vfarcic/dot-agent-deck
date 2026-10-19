@@ -5682,7 +5682,15 @@ mod tunnel_tests {
             innocent.try_wait().expect("query").is_none(),
             "a process whose command line does not name the socket must survive"
         );
-        let _ = innocent.kill();
+        // Its whole group, not only the shell: dash forks `sleep` rather than
+        // exec it, and a `sleep` that outlived the shell kept this test's
+        // captured stdout and stderr open for five seconds, which nextest
+        // reported as a leak. The shell leads its own group (`setsid` above).
+        // SAFETY: `killpg(2)` on the group this test created; no memory is
+        // passed.
+        unsafe {
+            libc::killpg(innocent.id() as libc::pid_t, libc::SIGKILL);
+        }
         let _ = innocent.wait();
     }
 

@@ -96,7 +96,6 @@ if [ "$check" = --check ]; then
       ;;
     instructions)
       grep -vE '^CLAUDE\.md$|^docs/develop/|^\.claude/skills/[^/]+/[^/]+\.md$' "$tmp/changed" >"$tmp/out"
-      grep -E '^\.claude/skills/dot-ai-' "$tmp/changed" >>"$tmp/out"
       ;;
   esac
   sort -u "$tmp/out" | sed 's/^/OUTSIDE=/' | tee "$tmp/report"
@@ -122,8 +121,7 @@ case "$mode" in
     # same rule --check applies: nested Markdown under a skill is a test
     # fixture, not an instruction (demo-reel-adapter/tests/fixtures/...).
     git ls-files -- CLAUDE.md .claude/skills docs/develop \
-      | grep -E '^CLAUDE\.md$|^docs/develop/.*\.md$|^\.claude/skills/[^/]+/[^/]+\.md$' \
-      | grep -vE '^\.claude/skills/dot-ai-' >"$tmp/owned"
+      | grep -E '^CLAUDE\.md$|^docs/develop/.*\.md$|^\.claude/skills/[^/]+/[^/]+\.md$' >"$tmp/owned"
     ;;
 esac
 [ -s "$tmp/owned" ] || die "the $mode owned set is empty; has the layout moved?"

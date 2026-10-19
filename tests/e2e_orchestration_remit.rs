@@ -7,9 +7,8 @@
 //! compact. This file pins the fix: a `Compacting` event, or a
 //! `/clear`-originated `SessionStart`, on the orchestrator start-role pane
 //! re-delivers the `.dot-agent-deck/orchestrator-context-*.md` pointer, scoped
-//! to the start role only, through the SAME readiness-gating and delivery-
-//! confirmation discipline the spawn-time seed already uses
-//! (`deliver_orchestrator_prompt`, `src/ui.rs`).
+//! to the start role only, by posting it to the start role's inbox the way the
+//! spawn-time seed is (`post_orchestrator_prompt`, `src/ui.rs`).
 //!
 //! Uses the `remit-reassert-orchestration` fixture (`orchestrator` start
 //! role running a synthetic script written by each test into the deck's
@@ -22,16 +21,17 @@
 //! driver (needed only by `orchestration/remit/003`; `001`/`002`/`004`-`007`
 //! simply never trigger that phase).
 //!
-//! `orchestration/remit/003` deliberately asserts only on the RENDERED GRID
-//! feedback string and the delivery-log line count — both pre-existing,
-//! stable observables `deliver_orchestrator_prompt` already produces for a
-//! `HistoryOnly` `SendResult` today — never on an internal Rust symbol or
-//! enum variant, so this file stays correct regardless of internal
-//! refactoring of the delivery-confirmation machinery.
-//!
 //! Gated behind the `e2e` feature so `cargo test-fast` never compiles it.
 
 mod common;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_route.rs"]
+mod route;
+#[path = "support/inbox_view.rs"]
+mod view;
 
 use std::time::Duration;
 
@@ -40,7 +40,7 @@ use dot_agent_deck::agent_pty::TabMembership;
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::{
     AgentEvent, AgentType, CLEAR_SESSION_START_METADATA_KEY, CLEAR_SESSION_START_METADATA_VALUE,
-    EventType, Writable,
+    EventType,
 };
 use spec::spec;
 
@@ -79,11 +79,6 @@ const SPAWN_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// while making it slower. Leave them alone.
 const REASSERTION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long the fixture's delivery confirmation has to reach the daemon's
-/// APPLIED state. Paid on the fixture's `python3` fork, so it is a process
-/// start under whatever load the tier is carrying, not an IPC round trip.
-const CONFIRMATION_APPLIED_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// How long an event THIS FILE has already written to the hook socket has to
 /// show up in the daemon's applied state: one `ListAgents` round trip plus
 /// the daemon's own apply. Deliberately left at the harness-wide 10s default
@@ -104,17 +99,9 @@ const CONFIRMATION_APPLIED_TIMEOUT: Duration = Duration::from_secs(30);
 /// real work rather than a single apply.
 const INJECTED_EVENT_APPLIED_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long the delivery log's pointer count must hold steady before this
-/// file trusts it as the baseline every later assertion counts from. Sized
-/// when the deck's first retry window, `unconfirmed_retry_delay(1)`, was a
-/// flat 500ms, so that it exceeded the window in which an unconfirmed
-/// delivery earns its one automatic replacement payload write. Issue #637
-/// floored that window at the producer's confirmation latency, and this
-/// fixture reports as Codex, so it is now 10s
-/// (`SLOW_CONFIRMATION_LATENCY`, `src/prompt_delivery.rs`) and this window no
-/// longer exceeds it. What it still absorbs is a replacement already SENT when
-/// the settle begins — the pointer line a `python3` fork has yet to append. A
-/// replacement now needs `confirm_submission` to miss 10s rather than 500ms.
+/// How long the synthetic inbox consumer's log must hold steady before later
+/// assertions take their baseline. This waits out fixture subprocess writes;
+/// it is not a production typed-payload retry window.
 const DELIVERY_SETTLE_QUIET_WINDOW: Duration = Duration::from_millis(1500);
 
 /// Ceiling on how long [`settled_pointer_count`] will wait for the count to
@@ -122,23 +109,9 @@ const DELIVERY_SETTLE_QUIET_WINDOW: Duration = Duration::from_millis(1500);
 /// fork on a loaded machine, not an IPC round trip.
 const DELIVERY_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The most [`DELIVERED_POINTER`] lines ONE logical delivery can legitimately
-/// leave in the log, and therefore the ceiling [`settled_pointer_count`]
-/// refuses to settle above.
-///
-/// Three, from `src/prompt_delivery.rs`: `MAX_PAYLOAD_SUBMISSIONS` is 2 — the
-/// write itself plus the one bounded REPLACEMENT payload — and issue #666's
-/// `AgentStartRearm` allows ONE further payload write on positive evidence the
-/// payload was destroyed, which that module documents as a hard cap of three.
-/// Every attempt past that falls back to a submit-only probe, which writes a
-/// bare CR the fixture logs as an empty line rather than as a pointer, so it
-/// cannot inflate this count.
-///
-/// Greptile P2 on PR #837, first half. A settled count with no ceiling accepts
-/// whatever it happens to observe, so a caller that meant "one more delivery"
-/// silently accepts five. Bounding it does NOT on its own pin exactly-once —
-/// a count cannot separate one delivery that retried from two that did not,
-/// which is what [`ContextRewriteWatcher`] exists for.
+/// A loose safety ceiling on lines accepted while settling one inbox delivery.
+/// This bounds a runaway fixture, rather than describing a production retry
+/// budget. The context rewrite watcher independently pins exactly one re-arm.
 const MAX_POINTER_LINES_PER_DELIVERY: usize = 3;
 
 /// The minimum gap [`ContextRewriteWatcher`] requires between two observed
@@ -148,8 +121,7 @@ const MAX_POINTER_LINES_PER_DELIVERY: usize = 3;
 /// `std::fs::write`, which truncates and then writes, so ONE logical rewrite
 /// can bump the mtime twice microseconds apart. Two genuine re-arms cannot be
 /// anywhere near that close: the second cannot start until the first
-/// delivery has actually written its payload (`PromptDelivery::attempts > 0`,
-/// `src/ui.rs`), which puts a whole readiness gate and PTY write between them.
+/// delivery has actually written its payload (the inbox post in `src/ui.rs`), which puts a whole readiness gate and PTY write between them.
 /// Measured against the deliberate double-fire mutation used to verify this
 /// detector: **~680ms** apart, across three runs (679ms, 688ms, 688ms).
 const CONTEXT_REWRITE_DEBOUNCE: Duration = Duration::from_millis(8);
@@ -188,31 +160,36 @@ fn wait_for_applied(
     })
 }
 
+/// PRD #1666 S5: where a remit is counted. The deck no longer types the remit
+/// pointer into the start role's pane; it posts it to that pane's inbox, so
+/// "the pointer was delivered N times" reads as "N remit messages carrying it
+/// were posted".
+#[cfg(unix)]
+struct RemitLog {
+    socket: std::path::PathBuf,
+    pane_id: String,
+}
+
+/// How many remit messages carrying [`DELIVERED_POINTER`] the start role's
+/// inbox holds.
+#[cfg(unix)]
+fn remit_count(log: &RemitLog) -> usize {
+    view::count_containing(&log.socket, &log.pane_id, DELIVERED_POINTER)
+}
+
+/// Wait up to `timeout` for at least `n` remits; answers whether they came.
+#[cfg(unix)]
+fn wait_for_remits(log: &RemitLog, n: usize, timeout: Duration) -> bool {
+    common::wait_until(timeout, || remit_count(log) >= n)
+}
+
 /// The number of [`DELIVERED_POINTER`] lines in the delivery log once that
 /// count has stopped moving for [`DELIVERY_SETTLE_QUIET_WINDOW`] — the
 /// BASELINE every later count assertion in this file measures from, in place
 /// of the literal `2`/`3` they used to hardcode.
 ///
-/// Hardcoding those literals assumed the spawn-time delivery had produced
-/// exactly ONE pointer line, which holds only while the fixture's
-/// `confirm_submission` beats the deck's first retry window
-/// (`unconfirmed_retry_delay(1)`, 500ms when this was written and 10s for this
-/// fixture's Codex producer since issue #637). Under load it did not: the deck then writes its one automatic
-/// REPLACEMENT payload (`MAX_PAYLOAD_SUBMISSIONS` is 2,
-/// `src/prompt_delivery.rs`) and the fixture logs that as a second pointer
-/// line with no re-assertion behind it. So every negative check here ("must
-/// NOT reach a second line") reddens on a payload retry that is designed
-/// behaviour rather than on the leak it exists to catch, and every positive
-/// check greens without a re-assertion having happened. Measured on this
-/// branch under a 64-way CPU load: 8 such failures across 6 module runs,
-/// spread over `_002`, `_003`, `_004`, `_005` and `_006` — a different
-/// failure class from the status clobber issues #818/#832 were, and reachable
-/// at a higher load than the CI runner has so far shown.
-///
-/// Counting from a settled baseline makes each assertion measure what it says
-/// it measures — one more pointer line than the spawn-time delivery left
-/// behind, whatever that delivery cost — instead of asserting a literal that
-/// silently encodes "and the retry did not fire".
+/// Count from the synthetic consumer's settled log, so subprocess scheduling
+/// cannot turn an incomplete baseline into a false re-assertion.
 ///
 /// `ceiling` is the largest count this call will accept as settled, and it is
 /// the answer to Greptile P2's first half on PR #837: without it a caller
@@ -225,11 +202,11 @@ fn wait_for_applied(
 /// here reports it against the delivery that caused it rather than as a
 /// confusing off-by-N in the assertion behind it.
 #[cfg(unix)]
-fn settled_pointer_count(deck: &TuiDeck, log: &std::path::Path, ceiling: usize) -> usize {
+fn settled_pointer_count(deck: &TuiDeck, log: &RemitLog, ceiling: usize) -> usize {
     let last = std::cell::Cell::new(usize::MAX);
     let stable_since = std::cell::Cell::new(std::time::Instant::now());
     let settled = common::wait_until(DELIVERY_SETTLE_TIMEOUT, || {
-        let count = common::count_file_substr(log, DELIVERED_POINTER);
+        let count = remit_count(log);
         if count != last.get() {
             last.set(count);
             stable_since.set(std::time::Instant::now());
@@ -251,9 +228,7 @@ fn settled_pointer_count(deck: &TuiDeck, log: &std::path::Path, ceiling: usize) 
         settled_count <= ceiling,
         "the delivery log settled at {settled_count} `{DELIVERED_POINTER}` line(s), above \
          the {ceiling} one logical delivery can account for \
-         ({MAX_POINTER_LINES_PER_DELIVERY} payload writes at most — \
-         `MAX_PAYLOAD_SUBMISSIONS` plus issue #666's one evidence-based rearm, \
-         `src/prompt_delivery.rs`). More than one delivery therefore ran, so this count \
+         ({MAX_POINTER_LINES_PER_DELIVERY} fixture log lines at most). More than one delivery therefore ran, so this count \
          cannot serve as a baseline for anything.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
@@ -265,22 +240,10 @@ fn settled_pointer_count(deck: &TuiDeck, log: &std::path::Path, ceiling: usize) 
 /// exactly-once detector `orchestration_remit_004` needs and that no pointer
 /// count can provide.
 ///
-/// Greptile P2 on PR #837. Counting pointer lines cannot tell ONE re-assertion
-/// whose delivery earned its replacement payload write (`baseline + 2` lines,
-/// designed behaviour, `MAX_PAYLOAD_SUBMISSIONS` in `src/prompt_delivery.rs`)
-/// from a genuine DOUBLE FIRE whose two deliveries were each confirmed first
-/// time (`baseline + 2` lines, the regression). Both land inside
-/// [`DELIVERY_SETTLE_QUIET_WINDOW`], so a settled baseline absorbs the second
-/// one and the "stays put" check behind it then measures from a baseline that
-/// already contains the defect.
-///
-/// The context FILE separates them, because the two writes have different
-/// authors. A re-arm calls `reassert_orchestrator_prompt` (`src/ui.rs`), which
-/// goes through `prepare_orchestrator_prompt` (`src/orchestrator_context.rs`)
-/// and `std::fs::write`s the whole file. A payload retry re-sends the
-/// ALREADY-PREPARED prompt string and never touches the file at all. So the
-/// number of rewrites IS the number of logical re-assertions, whatever the
-/// pointer count did.
+/// Inbox messages can be delivered again if receipt is not acknowledged, so
+/// a pointer count alone cannot distinguish redelivery from a second re-arm.
+/// `reassert_orchestrator_prompt` publishes a new context file, while inbox
+/// redelivery reuses the prepared body. Count context publications separately.
 ///
 /// **Why a background sampler rather than reading the file at each step.** The
 /// first version of this check stamped a sentinel comment into the file,
@@ -382,11 +345,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 /// meanwhile the FOREGROUND script body reads and logs every line delivered
 /// to its real stdin, however many arrive, to `orchestrator-prompt.log`, and
 /// reports each one back over the hook socket as a `user_prompt`-carrying
-/// `thinking` event — the evidence `deliver_orchestrator_prompt`'s
-/// submission-confirmation logic accepts as CONFIRMATION that a written
-/// prompt was actually submitted rather than merely landed on the PTY.
-/// Without that confirmation every delivery against this fixture — the
-/// spawn-time seed included — is stuck permanently unconfirmed.
+/// `thinking` event.
 ///
 /// The background/foreground split is load-bearing, not stylistic: a
 /// non-interactive POSIX shell reassigns an ASYNCHRONOUS (`&`) job's stdin to
@@ -416,23 +375,9 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 /// comment before adding a test here, and reach for [`wait_for_applied`] rather
 /// than a marker file for any new phase this script grows.
 ///
-/// **Timing hazard 2, the second one**: `confirm_submission` completing inside
-/// `unconfirmed_retry_delay(1)` (`src/prompt_delivery.rs`) of the initial write
-/// is not enforced by anything. That window was 500ms when this was measured,
-/// and under load the fixture missed it; since issue #637 it is floored at the
-/// producer's confirmation latency — 10s for this fixture's Codex producer —
-/// so missing it now takes a far heavier load than the one measured below.
-/// `MAX_PAYLOAD_SUBMISSIONS` there is 2, so a delivery still unconfirmed past
-/// that window earns one automatic *replacement* payload write, appending a
-/// second `DELIVERED_POINTER` line to the log with no re-assertion behind it.
-/// The hardcoded counts this file used to assert read that as a false GREEN
-/// wherever they wanted 2, and as a false RED on every "must NOT reach a second
-/// line" check and on `orchestration_remit_004`'s "must not reach a third".
-/// Measured under a 64-way CPU load: 8 such failures across 6 module runs. The
-/// retry itself is designed behaviour and still happens; what changed is that
-/// [`settled_pointer_count`] gives every assertion a settled baseline to count
-/// from, so a replacement write no longer reads as a re-assertion. It is a
-/// different failure class from hazard 1 and it is NOT what #818/#832 were.
+/// The fixture consumes inbox messages and acknowledges them independently
+/// of its asynchronous status reports. A settled log baseline accounts for
+/// that scheduling, while context publications pin the logical re-arm count.
 const ORCHESTRATOR_REMIT_SCRIPT: &str = r#"#!/bin/sh
 emit_target() {
     WRITABLE="$1" python3 - <<'PY'
@@ -777,21 +722,13 @@ fn inject_clear_session_start(
 }
 
 /// Open the orchestration, write and launch the orchestrator's synthetic
-/// script, and confirm the spawn-time remit pointer lands once. Returns the
-/// daemon socket path, the start role's `(pane_id, agent_id)`, the log
-/// path every test in this file asserts delivery counts against, and the
-/// SETTLED baseline count of pointer lines that delivery left in it — both
-/// the script and the log live directly under `deck.workdir()`, the directory
-/// the orchestrator role pane actually runs in.
+/// script, and confirm the spawn-time remit lands once. Returns the daemon
+/// socket path, the start role's `(pane_id, agent_id)`, the [`RemitLog`] every
+/// test in this file asserts delivery counts against (the start role's inbox),
+/// and the SETTLED baseline count of remits the spawn-time delivery left in it.
 fn open_and_confirm_initial_delivery(
     deck: &TuiDeck,
-) -> (
-    std::path::PathBuf,
-    String,
-    String,
-    std::path::PathBuf,
-    usize,
-) {
+) -> (std::path::PathBuf, String, String, RemitLog, usize) {
     deck.wait_for_string("No active agents");
     write_executable(
         &deck.workdir().join("orchestrator-remit.sh"),
@@ -809,75 +746,35 @@ fn open_and_confirm_initial_delivery(
         .expect("orchestrator role pane must have a DOT_AGENT_DECK_PANE_ID recorded");
     let agent_id = record.id.clone();
 
-    let log = deck.workdir().join("orchestrator-prompt.log");
-    let initial_delivered =
-        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 1, SPAWN_DELIVERY_TIMEOUT);
+    let log = RemitLog {
+        socket: socket.clone(),
+        pane_id: pane_id.clone(),
+    };
+    let initial_delivered = wait_for_remits(&log, 1, SPAWN_DELIVERY_TIMEOUT);
     assert!(
         initial_delivered,
         "precondition failed: the spawn-time orchestrator prompt never reached the \
-         start role's pane within {SPAWN_DELIVERY_TIMEOUT:?}\nFinal grid:\n{}",
+         start role's inbox within {SPAWN_DELIVERY_TIMEOUT:?}\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 
-    // THE BARRIER (issues #818, #832). The wait above returns the moment the
-    // log line lands, and the fixture script's read loop appends that line
-    // BEFORE forking the `python3` that reports the delivery back as a
-    // `thinking` event — so on its own it leaves that confirmation in flight.
-    // Every caller's next move is to inject a `Compacting` or a
-    // `/clear`-originated `SessionStart` for this same pane, and
-    // `AppState::apply_event`'s `EventType::Thinking` arm (`src/state.rs`)
-    // sets `session.status` unconditionally: the in-flight confirmation lands
-    // second and destroys the status the caller is about to poll for.
+    // PRD #1666 S5: the barrier that used to sit here (issues #818, #832)
+    // waited for the fixture's confirmation of a TYPED pointer to be applied,
+    // so it could not clobber the status a caller injects next. A posted remit
+    // produces no such confirmation, so there is nothing in flight to wait for.
     //
-    // That is not a slow-runner problem and it is not recoverable by waiting
-    // longer, which is why the fix is here rather than in the bounds. Measured
-    // on an idle 16-core box, `orchestration_remit_001` failed 2 of 5 solo
-    // runs before this barrier existed; under a 32-way CPU load, 2 of 4 — and
-    // an instrumented poll of the failing runs showed the pane sitting on
-    // `Thinking` with the delivered pointer as its `last_user_prompt` for the
-    // entire 10s, the injected `Compacting` never once sampled. Which side
-    // wins is decided by `python3` start-up latency against this process's own
-    // `ListAgents` round trip, so a saturated runner simply loses it more
-    // often than a dev box does (issue #818's bisect: five green lane-1 runs,
-    // then red on every branch from the merge of #789 onward).
-    //
-    // `last_user_prompt` is the confirmation's own applied footprint: the
-    // fixture's `confirm_submission` sends the delivered line as the event's
-    // `user_prompt`, and `apply_event` records it on the session. Once it is
-    // visible here the confirmation has been APPLIED, not merely sent, so the
-    // caller's injection is the last word on this pane's status.
-    let confirmation_applied =
-        wait_for_applied(&socket, &pane_id, CONFIRMATION_APPLIED_TIMEOUT, |s| {
-            s.last_user_prompt
-                .as_deref()
-                .is_some_and(|p| p.contains(DELIVERED_POINTER))
-        });
-    assert!(
-        confirmation_applied,
-        "precondition failed: the fixture script confirmed the spawn-time pointer over \
-         the hook socket, but the daemon never reported it as the start role's \
-         `last_user_prompt` within {CONFIRMATION_APPLIED_TIMEOUT:?} — without that the \
-         confirmation is still in flight and will overwrite whatever status the caller \
-         injects next.\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    // The settled baseline (see [`settled_pointer_count`]). Taken here, after
-    // the confirmation barrier above, so it accounts for the one replacement
-    // payload write an unconfirmed spawn-time delivery earns under load —
-    // which every caller would otherwise mistake for a re-assertion. The
-    // ceiling counts from ZERO because exactly one delivery — the spawn-time
-    // seed — has run by this point.
+    // The settled baseline (see [`settled_pointer_count`]): exactly one
+    // delivery — the spawn-time remit — has run by this point.
     let baseline = settled_pointer_count(deck, &log, MAX_POINTER_LINES_PER_DELIVERY);
 
     (socket, pane_id, agent_id, log, baseline)
 }
 
 /// Scenario: Open a real orchestration tab and let the start role's
-/// spawn-time remit pointer deliver once, then inject a `Compacting` event
-/// for that SAME start-role pane. The pointer must reach the pane's stdin a
-/// second time — the orchestrator's remit re-asserting itself on compaction,
-/// rather than only ever being delivered at spawn.
+/// spawn-time remit reach its inbox once, then inject a `Compacting` event
+/// for that SAME start-role pane. A second remit must be posted to that inbox
+/// — the orchestrator's remit re-asserting itself on compaction, rather than
+/// only ever being delivered at spawn.
 #[spec("orchestration/remit/001")]
 #[test]
 #[cfg(unix)]
@@ -895,12 +792,7 @@ fn orchestration_remit_001_start_role_compaction_reasserts_remit() {
         &format!("{agent_id}-remit001-session"),
     );
 
-    let reasserted = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        REASSERTION_DELIVERY_TIMEOUT,
-    );
+    let reasserted = wait_for_remits(&log, baseline + 1, REASSERTION_DELIVERY_TIMEOUT);
     assert!(
         reasserted,
         "a Compacting event on the orchestrator start-role pane must re-deliver the \
@@ -945,12 +837,7 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
         &format!("{worker_agent_id}-remit002-worker-session"),
     );
 
-    let leaked_to_worker = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        Duration::from_millis(900),
-    );
+    let leaked_to_worker = wait_for_remits(&log, baseline + 1, Duration::from_millis(900));
     assert!(
         !leaked_to_worker,
         "a Compacting event on the non-start `worker` role's pane must not re-assert \
@@ -966,12 +853,8 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
         &orch_agent_id,
         &format!("{orch_agent_id}-remit002-orch-session"),
     );
-    let reasserted_on_start_role = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        REASSERTION_DELIVERY_TIMEOUT,
-    );
+    let reasserted_on_start_role =
+        wait_for_remits(&log, baseline + 1, REASSERTION_DELIVERY_TIMEOUT);
     assert!(
         reasserted_on_start_role,
         "control failed: a Compacting event on the orchestrator START role must still \
@@ -981,119 +864,20 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
     );
 }
 
-/// Scenario: `Compacting` fires on the start role while its pane currently
-/// declares itself history-only (not writable). The re-assertion must NOT
-/// write blindly — the pointer must stay undelivered, with the same
-/// `History-only session cannot accept live input` feedback the spawn-time
-/// seed already surfaces for a non-applied `SendResult`, until the SAME pane
-/// later declares itself live again, at which point the deferred
-/// re-assertion must complete. Proves re-assertion goes through the seed's
-/// own readiness-gating and delivery-confirmation discipline rather than a
-/// direct, unconfirmed write.
+/// Scenario: Open a real TUI orchestration and fetch its initial remit. Compact it while history-only; one new bound remit stays Queued until the same pane becomes live, then its CLI fetch acknowledges and visibly renders it.
 #[spec("orchestration/remit/003")]
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
-    let deck = TuiDeck::builder()
-        .impersonating_pane_signals()
-        .launch_with_fixture("remit-reassert-orchestration");
-    let (socket, pane_id, agent_id, log, baseline) = open_and_confirm_initial_delivery(&deck);
-
-    std::fs::write(deck.workdir().join("go-history-only"), "")
-        .expect("trigger the fixture script's history-only phase");
-    assert!(
-        common::wait_until(Duration::from_secs(5), || {
-            deck.workdir().join("history-only-emitted").exists()
-        }),
-        "the fixture script never emitted its history-only session_start within 5s"
-    );
-    // The marker file above proves only that the fixture WROTE that
-    // `session_start` to the socket, and its `EventType::SessionStart` arm
-    // asserts `session.status = Idle` just as unconditionally as the
-    // confirmation's `thinking` does — so injecting while it is still in
-    // flight loses the same race [`open_and_confirm_initial_delivery`]'s
-    // barrier closes. Wait for the phase change the emit actually declares
-    // (`live_target.writable`), which is what this test needs to be true
-    // anyway: the whole point is a re-assertion arriving while the pane is
-    // history-only.
-    assert!(
-        wait_for_applied(&socket, &pane_id, CONFIRMATION_APPLIED_TIMEOUT, |s| {
-            s.live_target.map(|t| t.writable) == Some(Writable::HistoryOnly)
-        }),
-        "the daemon never applied the fixture's history-only live_target for pane \
-         {pane_id} within {CONFIRMATION_APPLIED_TIMEOUT:?}; the pane is still writable, \
-         so the injection below would exercise the live path this test is not about.\n\
-         Final grid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    // Reuse the fixture's own boot session id here, unlike `_001`/`_002`'s
-    // synthetic per-call ids: a real `Compacting` hook carries the agent's
-    // own session id (its `PreCompact` originates from that agent's own
-    // process), so a differing synthetic id models an event shape that does
-    // not occur in production. `_003` is the only test in this file whose
-    // flow (history-only -> live-again) makes the resulting id-overwrite
-    // observable, which is why only this call needs the boot id.
-    inject_compacting(
-        &deck,
-        &socket,
-        &pane_id,
-        &agent_id,
-        "remit-reassert-boot-session",
-    );
-
-    let wrote_blindly = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        Duration::from_millis(900),
-    );
-    assert!(
-        !wrote_blindly,
-        "a Compacting-triggered re-assertion must not write to a history-only pane \
-         before delivery is confirmed; the log rose past its settled {baseline} \
-         `{DELIVERED_POINTER}` line(s) while the pane was still history-only.\n\
-         Final grid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    let feedback = deck.wait_for_grid_string_within(
-        "History-only session cannot accept live input",
-        Duration::from_secs(5),
-    );
-
-    std::fs::write(deck.workdir().join("go-live-again"), "")
-        .expect("trigger the fixture script's return-to-live phase");
-    let delivered_once_live = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        REASSERTION_DELIVERY_TIMEOUT,
-    );
-
-    assert!(
-        feedback,
-        "a deferred re-assertion attempt against a history-only pane must surface the \
-         same visible feedback the spawn-time seed uses for a non-applied SendResult\n\
-         Final grid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        delivered_once_live,
-        "once the start-role pane reports itself live again, the deferred \
-         re-assertion must complete and deliver the pointer once more (past the \
-         settled {baseline} line(s))\n\
-         Final grid:\n{}",
-        deck.snapshot_grid()
-    );
+    route::client_orchestration(true);
 }
 
 /// Scenario: Open a real orchestration tab and let the start role's
 /// spawn-time remit pointer deliver once, then inject a synthetic
 /// `SessionStart` for that SAME start-role pane carrying the
 /// `/clear`-originated marker (`CLEAR_SESSION_START_METADATA_KEY` /
-/// `CLEAR_SESSION_START_METADATA_VALUE`). The pointer must reach the pane's
-/// stdin a second time — the orchestrator's remit re-asserting itself on
+/// `CLEAR_SESSION_START_METADATA_VALUE`). A second remit must be posted to
+/// the start role's inbox — the orchestrator's remit re-asserting itself on
 /// `/clear`, exactly as it already re-asserts on compaction, via the same
 /// reused delivery machinery. It must then re-assert EXACTLY once: a sentinel
 /// comment is stamped into the fixed `.dot-agent-deck/orchestrator-context.md`
@@ -1130,12 +914,7 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
         AgentType::ClaudeCode,
     );
 
-    let reasserted = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        REASSERTION_DELIVERY_TIMEOUT,
-    );
+    let reasserted = wait_for_remits(&log, baseline + 1, REASSERTION_DELIVERY_TIMEOUT);
     assert!(
         reasserted,
         "a `/clear`-originated SessionStart event on the orchestrator start-role pane \
@@ -1152,18 +931,11 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     // (`!wait_for_file_substr_count(..., short bound)`), applied here to the
     // count staying PUT rather than never rising.
     //
-    // Settled first, for the same reason the baseline is: the re-assertion's
-    // OWN delivery earns a replacement payload write if the fixture's
-    // confirmation misses the deck's first retry window (500ms when this
-    // reddened, 10s for this Codex fixture since #637), and counting from an
-    // unsettled figure would read that designed retry as a second
-    // re-assertion. Under a 64-way CPU load this reddened here specifically,
-    // on the literal "must not reach a third line".
+    // Settle the asynchronous consumer log before checking for repetition.
     let settled_after_reassertion =
         settled_pointer_count(&deck, &log, baseline + MAX_POINTER_LINES_PER_DELIVERY);
-    let repeated_beyond_one_reassertion = common::wait_for_file_substr_count(
+    let repeated_beyond_one_reassertion = wait_for_remits(
         &log,
-        DELIVERED_POINTER,
         settled_after_reassertion + 1,
         Duration::from_millis(900),
     );
@@ -1176,15 +948,8 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
         deck.snapshot_grid()
     );
 
-    // The half the pointer count cannot do (Greptile P2 on PR #837). Settling
-    // absorbs everything written inside its quiet window, and a count cannot
-    // separate ONE delivery that earned its replacement payload write from TWO
-    // deliveries that were each confirmed first time — both read as
-    // `baseline + 2`, so the check above would take a genuine double fire as
-    // its baseline and then confirm the count stayed put at it. Rewrites of
-    // the context file are not a count of deliveries, they are a count of
-    // RE-ARMS: only `reassert_orchestrator_prompt` writes that file and a
-    // payload retry never does.
+    // A receipt retry reuses the body; only a logical re-arm publishes a
+    // new context file. Count publications independently of consumer log lines.
     //
     // Stopped here rather than earlier so the window covers everything above —
     // the delivery, its settle, and the hold.
@@ -1243,12 +1008,7 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
         AgentType::ClaudeCode,
     );
 
-    let leaked_to_worker = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        Duration::from_millis(900),
-    );
+    let leaked_to_worker = wait_for_remits(&log, baseline + 1, Duration::from_millis(900));
     assert!(
         !leaked_to_worker,
         "a `/clear`-originated SessionStart event on the non-start `worker` role's pane \
@@ -1266,12 +1026,8 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
         &format!("{orch_agent_id}-remit005-orch-session"),
         AgentType::ClaudeCode,
     );
-    let reasserted_on_start_role = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        REASSERTION_DELIVERY_TIMEOUT,
-    );
+    let reasserted_on_start_role =
+        wait_for_remits(&log, baseline + 1, REASSERTION_DELIVERY_TIMEOUT);
     assert!(
         reasserted_on_start_role,
         "control failed: a `/clear`-originated SessionStart event on the orchestrator \
@@ -1321,12 +1077,8 @@ fn orchestration_remit_006_non_claude_agent_type_clear_reasserts_nothing() {
         AgentType::Codex,
     );
 
-    let leaked_for_non_claude_agent_type = common::wait_for_file_substr_count(
-        &log,
-        DELIVERED_POINTER,
-        baseline + 1,
-        Duration::from_millis(900),
-    );
+    let leaked_for_non_claude_agent_type =
+        wait_for_remits(&log, baseline + 1, Duration::from_millis(900));
     assert!(
         !leaked_for_non_claude_agent_type,
         "a `/clear`-originated SessionStart event stamped with a non-Claude-Code \
@@ -1362,8 +1114,8 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
         .impersonating_pane_signals()
         .launch_with_fixture("remit-reassert-orchestration");
     // `_baseline` unused here alone: this test counts [`CARRY_OUT_TASK_POINTER`],
-    // a needle the spawn-time delivery never writes — so a replacement payload
-    // retry of that delivery cannot inflate it and there is nothing to count
+    // a needle absent from the startup message, so redelivery of that
+    // message cannot inflate it and there is nothing to count
     // from. Every other test in this file counts [`DELIVERED_POINTER`], which
     // the spawn-time delivery does write, and therefore needs the baseline.
     let (socket, pane_id, agent_id, log, _baseline) = open_and_confirm_initial_delivery(&deck);
@@ -1403,10 +1155,10 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
         &format!("{agent_id}-remit007-session"),
     );
 
-    let reasserted_with_task = common::wait_for_file_substr_count(
-        &log,
+    let reasserted_with_task = view::wait_for(
+        &log.socket,
+        &log.pane_id,
         CARRY_OUT_TASK_POINTER,
-        1,
         REASSERTION_DELIVERY_TIMEOUT,
     );
     assert!(
@@ -1535,7 +1287,9 @@ fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
     );
     let second_path = second_rearm().expect("second re-arm path");
     let content = read_announced_context(
-        &context_dir.with_file_name("orchestrator-prompt.log"),
+        &daemon.attach_socket,
+        &pane_id,
+        &agent_id,
         &second_path,
         &deck,
     );
@@ -1672,8 +1426,8 @@ struct RearmedRun {
     agent_ids: Vec<String>,
 }
 
-/// Read a re-armed context file only once the start role's pane has been
-/// pointed at it, and return its contents.
+/// Read a re-armed context file only once the start role has been pointed at
+/// it, and return its contents.
 ///
 /// A new `orchestrator-context-<hex>.md` is written in place rather than renamed
 /// into place: `publish_orchestrator_context` (`src/orchestrator_context.rs`)
@@ -1681,22 +1435,46 @@ struct RearmedRun {
 /// written. So a reader that finds the file by listing the directory, as these
 /// tests do, can see it before it is complete, and `orchestration_remit_009`
 /// read one that held neither brief on a starved box (`io full` 55%) in PRD
-/// #1631's broad e2e run. The announcement is the `Read .dot-agent-deck/<name>`
-/// pointer the fixture script appends to `log`, so that is what is waited for.
+/// #1631's broad e2e run. The announcement is the remit posted to the start
+/// role's inbox carrying `Read .dot-agent-deck/<name>` (PRD #1666 S5), so that
+/// is what is waited for, on the daemon's attach `socket` — in the inbox of the
+/// start role's `pane_id` and bound to its `agent_id` (or to no generation), so
+/// a pointer posted to any other role does not satisfy it.
 #[cfg(unix)]
-fn read_announced_context(log: &std::path::Path, path: &std::path::Path, deck: &TuiDeck) -> String {
+fn read_announced_context(
+    socket: &std::path::Path,
+    pane_id: &str,
+    agent_id: &str,
+    path: &std::path::Path,
+    deck: &TuiDeck,
+) -> String {
     let name = path
         .file_name()
         .expect("context path has a file name")
         .to_string_lossy();
     let pointer = format!("Read .dot-agent-deck/{name}");
+    let announced = || {
+        view::messages(socket, pane_id).iter().any(|message| {
+            message
+                .bind_agent
+                .as_deref()
+                .is_none_or(|bound| bound == agent_id)
+                && message
+                    .text
+                    .as_deref()
+                    .is_some_and(|t| t.contains(&pointer))
+        })
+    };
     assert!(
-        common::wait_for_file_substr_count(log, &pointer, 1, REASSERTION_DELIVERY_TIMEOUT),
-        "the start role was never pointed at {} (no `{pointer}` in {}) within \
-         {REASSERTION_DELIVERY_TIMEOUT:?}; log:\n{}\nFinal grid:\n{}",
+        common::wait_until(REASSERTION_DELIVERY_TIMEOUT, announced),
+        "the start role ({pane_id}, agent {agent_id}) was never pointed at {} (no message \
+         carrying `{pointer}` in its inbox) within {REASSERTION_DELIVERY_TIMEOUT:?}; every \
+         inbox, as (to, bound agent, text):\n{:?}\nFinal grid:\n{}",
         path.display(),
-        log.display(),
-        std::fs::read_to_string(log).unwrap_or_default(),
+        view::all_messages(socket)
+            .into_iter()
+            .map(|message| (message.to, message.bind_agent, message.text))
+            .collect::<Vec<_>>(),
         deck.snapshot_grid()
     );
     std::fs::read_to_string(path).expect("read the announced context file")
@@ -1902,8 +1680,13 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
         deck.snapshot_grid()
     );
     let rearmed_path = rearmed().expect("new context path");
-    let content =
-        read_announced_context(&cwd.join("orchestrator-prompt.log"), &rearmed_path, &deck);
+    let content = read_announced_context(
+        &daemon.attach_socket,
+        &pane_id,
+        &record.id,
+        &rearmed_path,
+        &deck,
+    );
     assert!(
         content.contains(first_brief) && !content.contains(second_brief),
         "the first tab must rearm from its own file, not the later mirror; {}: first={}, second={}",

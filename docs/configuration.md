@@ -173,6 +173,40 @@ name = "team"
 
 Scheduled tasks are not in this file; they live in the global `schedules.toml` ([Schedules](scheduled-tasks.md)).
 
+### Subscribe to announcements and job pools
+
+Configure subscriptions in the project's `.dot-agent-deck.toml`. They apply to agents started from either the TUI or the desktop app:
+
+```toml
+[dispatch]
+subscribe = ["progress"]
+
+[[orchestrations]]
+name = "team"
+subscribe = ["announcements"]
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true
+subscribe = ["progress"]
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "claude"
+subscribe = ["review-ready"]
+take_offers = ["reviews"]
+```
+
+| Key | Who receives it |
+| --- | --- |
+| `[[orchestrations]] subscribe` | Roles in that orchestration receive announcements on the listed topics. |
+| `[[orchestrations.roles]] subscribe` | That role receives announcements on those additional topics. |
+| `[[orchestrations.roles]] take_offers` | That role can take jobs offered to the listed pools. |
+| `[dispatch] subscribe` | A pane that dispatched a unit receives announcements on these topics from its dispatch tree. |
+
+Each topic or pool name must be 1–64 lowercase letters, digits or hyphens, starting with a letter or digit. A list accepts up to 64 names. With `extends`, omitted subscription keys inherit; an explicit list replaces the inherited list, and `[]` clears it. Run `dot-agent-deck validate` to check the names. See [Announcements and pooled jobs](orchestration.md#announcements-and-pooled-jobs) for the commands agents use.
+
 ## Turn on experimental features
 
 Some new surfaces ship behind one switch, `experimental`, which is off by default. In the TUI it enables, among others, the `Ctrl+e` command-entry lock in orchestration tabs and the `schedule: issues` mode; in the desktop app, the deck screen and the Projects, Prompts, Orchestrations and Agent Profiles screens.
@@ -241,13 +275,12 @@ Set these in the daemon's environment (see the start of this section). Milliseco
 | --- | --- | --- |
 | `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` | `30` | The daemon exits this many seconds after it has no attached client, no agents and no pending schedules. `0` keeps it running. A value that is not a whole number uses the default. |
 | `DOT_AGENT_DECK_HOOK_PROVENANCE` | enforce | `warn` (any case) makes the daemon accept, with a warning, a `work-done`/`delegate`/`dispatch` or a status update from an agent pane that carries no hook capability token, which happens when the `dot-agent-deck` on the agent's `PATH` is older than the daemon. Any other value keeps refusing. See [Troubleshooting](troubleshooting.md). |
-| `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` | `1000`, or `5000`/`8000` for some agents | Extra wait between a worker looking ready and its task being typed in. `0` removes the wait; maximum `30000`. See [Orchestration](orchestration.md). |
-| `DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS` | `20000,40000,80000` | When a delegated task shows no sign of being received, the waits before re-sending it, comma-separated. Each entry is kept within `100`–`300000`; at most 8 entries are read. `0` or an empty value turns re-sending off; any unparseable entry makes the whole value fall back to the default. |
-| `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS` | `30000`, or `worker_response_timeout_minutes` if shorter; none when that is `0` | How long a worker that received a task may report nothing at all before its orchestrator is told. `0` turns the report off, and a non-zero value turns it on even when `worker_response_timeout_minutes = 0`; maximum `30000`. See [Idle Workers & Notifications](idle-workers-and-notifications.md). |
 | `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS` | `30000` | How long a delegated worker must stay waiting for input before its orchestrator is told. `0` turns the notice off; maximum `600000`. |
-| `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` | `60000` | How long an automatic prompt waits for you to finish text you are typing in that pane before it is written anyway. `0` writes immediately; maximum `600000`. Read once when the daemon starts. |
-| `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` | `5000` | For a schedule that reuses its tab, how long the pane must be free of your typing before the prompt is delivered. See [Schedules](scheduled-tasks.md). |
 | `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` | `14` | Each time the deck writes an orchestration's context into the project's `.dot-agent-deck/` directory, Markdown files there last modified more than this many days ago are deleted, except `orchestrator-context.md`. Subdirectories and symlinks are left alone. `0` turns this off; a value that is not a whole number uses the default. Set it where both the TUI and the daemon are started, since either can start an orchestration. |
+
+The retired delivery settings `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`, `DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS`, `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS`, `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS`, `DOT_AGENT_DECK_SEED_FALLBACK_SECS` and `DOT_AGENT_DECK_SESSION_START_WAIT_MS` have no effect. A daemon started with one set logs a warning; remove it from your launch environment.
+
+Agent messages use an inbox in both clients; no readiness delay or forced submission over a draft is needed. [Orchestration → Delivery](orchestration.md#delivery-in-the-tui-and-desktop-app) describes the badge, agent support and diagnostic commands. `worker_response_timeout_minutes` above controls how long you wait for a worker's completed report; it is separate from message receipt.
 
 ### Remote and desktop
 

@@ -1,6 +1,5 @@
 //! Fast wire-contract tests for PRD #20 live-target and send-result semantics.
 
-use dot_agent_deck::daemon_protocol::AttachResponse;
 use std::collections::HashMap;
 
 use chrono::{Duration, Utc};
@@ -50,35 +49,6 @@ fn live_target_001_descriptor_round_trip_and_legacy_omission() {
         encoded.get("live_target").is_none(),
         "a legacy AgentEvent without live_target must deserialize as None and omit the field when reserialized: {encoded}"
     );
-}
-
-/// Scenario: Round-trip each honest input-delivery result through the daemon's
-/// public response payload. Every result must retain its distinct wire value so
-/// callers can distinguish accepted input from stale, wrong, or unwritable targets.
-#[spec("protocol/send-result/001")]
-#[test]
-fn send_result_001_all_variants_round_trip() {
-    for result in [
-        "applied",
-        "queued",
-        "stale",
-        "wrong-session",
-        "history-only",
-        "no-live-target",
-    ] {
-        let payload = json!({
-            "ok": true,
-            "send_result": result,
-        });
-        let decoded: AttachResponse = serde_json::from_value(payload.clone())
-            .unwrap_or_else(|e| panic!("deserialize send result {result}: {e}"));
-        let encoded = serde_json::to_value(decoded).expect("serialize AttachResponse");
-        assert_eq!(
-            encoded.get("send_result"),
-            payload.get("send_result"),
-            "AttachResponse must preserve SendResult::{result}"
-        );
-    }
 }
 
 /// Scenario: Declare a Codex session history-only, then apply more than the

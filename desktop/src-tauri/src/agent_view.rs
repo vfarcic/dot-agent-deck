@@ -162,6 +162,12 @@ pub(crate) enum FetchReason {
     /// it at all is the signal that the peer is ahead, which is exactly the
     /// pairing issue #801 is about.
     UnknownBroadcast,
+    /// PRD #1666 §2.8: a message in an agent's inbox changed state. The
+    /// counts a tile draws its `✉N` / `delivered` line from ride the record
+    /// (`AgentRecord::inbox`), which no event updates, so the next refresh
+    /// re-reads them — one `ListAgents` per coalescing window at most, as for
+    /// any other mark.
+    Inbox,
     /// The periodic reconciliation, which is the only thing that catches a
     /// silent removal.
     Reconcile,
@@ -283,6 +289,11 @@ impl AgentView {
             }
             BroadcastMsg::OrchestrationSurface(_) => self.mark(FetchReason::OrchestrationSurface),
             BroadcastMsg::WorktreeKept(_) => self.mark(FetchReason::WorktreeKept),
+            // PRD #1666 §2.8: an inbox message changed state, and the counts
+            // the tile shows ride the record; see `FetchReason::Inbox`.
+            BroadcastMsg::Inbox(_) | BroadcastMsg::InboxHandover(_) => {
+                self.mark(FetchReason::Inbox)
+            }
             // Issue #1637: the notices ride the `Hello` reply, which the held
             // link captured once; re-read it, and the list with it.
             BroadcastMsg::HookBinaryNotice(_) => {
@@ -498,6 +509,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         }
     }
 
@@ -558,6 +570,62 @@ mod tests {
             "the fold must have moved the rendered status"
         );
         assert_eq!(view.fetch_count(), 1, "only the install fetched");
+    }
+
+    /// Scenario: install one agent, then receive the daemon's inbox notice
+    /// that a second agent's Pi extension could not be refreshed, raised while
+    /// it spawned and before this view holds any record of it (inbox/pi/021's
+    /// desktop half). The notice makes the next refresh fetch, and the new
+    /// agent's record from that fetch carries the warning to its tile.
+    #[test]
+    fn an_inbox_notice_before_the_agents_record_reaches_its_tile() {
+        use dot_agent_deck::inbox_display::IntegrationNotice;
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        assert_eq!(view.needs_fetch(now), None);
+
+        let notices = dot_agent_deck::inbox_hub::InboxCardNotices {
+            integration: Some(IntegrationNotice::RefreshFailedPi),
+            ..Default::default()
+        };
+        view.apply(&BroadcastMsg::Inbox(dot_agent_deck::event::InboxNotice {
+            pane_id: "pane-8".into(),
+            agent_id: Some("8".into()),
+            message_id: String::new(),
+            subject: String::new(),
+            from_label: String::new(),
+            state: dot_agent_deck::inbox::StateName::Queued,
+            reason: None,
+            returned: false,
+            wake_stalled: false,
+            wake_update: false,
+            attention_update: true,
+            requeued: false,
+            notices: notices.clone(),
+        }));
+        assert_eq!(view.needs_fetch(now), Some(FetchReason::Inbox));
+
+        let mut spawned = record("8", "pane-8");
+        spawned.inbox = Some(dot_agent_deck::inbox_hub::InboxSummary {
+            queued: 0,
+            fetched: 0,
+            claimed: 0,
+            undeliverable: 0,
+            last_acked_at: None,
+            wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
+            component: None,
+            wake_stalled: false,
+            notices,
+        });
+        view.install(listing(vec![record("7", "pane-7"), spawned]), now);
+        let shown = view
+            .records()
+            .into_iter()
+            .find(|record| record.id == "8")
+            .and_then(|record| record.inbox)
+            .and_then(|inbox| inbox.notices.integration);
+        assert_eq!(shown, Some(IntegrationNotice::RefreshFailedPi));
     }
 
     /// Scenario: install one working agent, then fold the daemon's PRD #1401
@@ -766,6 +834,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            delivery_notice: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,
@@ -814,6 +883,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            delivery_notice: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,
@@ -859,6 +929,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            delivery_notice: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,
@@ -1051,6 +1122,7 @@ mod tests {
             last_activity_ms: Some(1_700_000_000_000),
             blocked: None,
             hook_generation: None,
+            delivery_notice: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,

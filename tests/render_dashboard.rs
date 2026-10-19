@@ -33,6 +33,9 @@ use ratatui::widgets::Widget;
 use spec::spec;
 use unicode_width::UnicodeWidthStr;
 
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 /// Issue #413: the instant every card fixture in this file is built against
 /// and rendered at. The card seams take `now` instead of reading the clock, so
 /// a card's `Last:` field is a pure function of the fixture's own timestamps —
@@ -350,6 +353,64 @@ fn background_016_minimal_card_keeps_background_beside_its_reason() {
     );
 }
 
+/// Scenario: Hydrate an Error card whose message the deck could not deliver and which also has background work, and render it at Minimal density, whose one content row both want. The not-delivered notice keeps the row, as the desktop tile shows it ahead of the background line, and the background line follows it on that row after ` · `; at Normal density each keeps a row of its own.
+#[spec("status/background/017")]
+#[test]
+fn background_017_minimal_card_keeps_the_delivery_notice_ahead_of_background() {
+    let now = render_now();
+    let notice = "Not delivered: review fixture (agent exited)";
+    let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+        "status": "Error", "agent_type": "claude_code", "tool_count": 0,
+        "last_activity_ms": now.timestamp_millis(),
+        "delivery_notice": notice,
+        "background": {"commands": 1, "subagents": 1, "since_ms": now.timestamp_millis() - 240_000},
+        "background_revision": 1,
+    }))
+    .unwrap();
+    let mut state = AppState::default();
+    state.register_pane("background-card".into());
+    state.seed_hydrated_session("background-card".into(), None, None, None, Some(&snapshot));
+    let card = state.sessions.values().next().unwrap().clone();
+    assert_eq!(card.delivery_notice(), Some(notice), "the premise");
+    let render = |density: CardDensityKind, width: u16| {
+        buffer_to_text(&render_card_to_buffer(
+            &card,
+            Some("background"),
+            Some(1),
+            density,
+            0,
+            now,
+            false,
+            width,
+            density.rendered_height(),
+        ))
+    };
+
+    let minimal = render(CardDensityKind::Minimal, 120);
+    let row = minimal.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+    assert_eq!(
+        row,
+        "Not delivered: review fixture (agent exited) · Background: 1 command, 1 subagent · 4m",
+        "{minimal}"
+    );
+
+    // Narrow: the notice is kept whole and the background part is cut.
+    let narrow = render(CardDensityKind::Minimal, 60);
+    let row = narrow.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+    assert!(row.starts_with(notice), "{narrow}");
+
+    let normal = render(CardDensityKind::Normal, 120);
+    let rows: Vec<&str> = normal
+        .lines()
+        .map(|line| line.trim_matches(['│', ' ']))
+        .collect();
+    assert!(rows.contains(&notice), "{normal}");
+    assert!(
+        rows.contains(&"Background: 1 command, 1 subagent · 4m"),
+        "{normal}"
+    );
+}
+
 /// Scenario: Render a single dashboard card for a Working agent with a Read
 /// tool and recent prompt into an 80-column, Normal-density L1 buffer, then
 /// snapshot it. The title must carry the card number, display name, and status
@@ -390,10 +451,9 @@ fn pane_004_card_title_row() {
         agent_id: Some("1".to_string()),
         display_name: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
         pull_request: None,
@@ -444,15 +504,540 @@ fn card_stats_session(cwd: &str) -> SessionState {
         agent_id: Some("agent-card-stats".to_string()),
         display_name: Some("api-svc".to_string()),
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
     }
+}
+
+/// Feed the daemon's existing record/resync seam before rendering the card.
+/// No invented card-only inbox field: ListAgents already carries this data.
+fn inbox_card_session(queued: usize, fetched: usize, acknowledged: bool) -> SessionState {
+    inbox_card_session_with(queued, fetched, acknowledged, false)
+}
+
+fn inbox_card_session_with(
+    queued: usize,
+    fetched: usize,
+    acknowledged: bool,
+    wake_stalled: bool,
+) -> SessionState {
+    let session = card_stats_session("/home/dev/api-svc");
+    let record: dot_agent_deck::agent_pty::AgentRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
+            "live": session.live_snapshot(),
+            "inbox": {
+                "queued": queued, "fetched": fetched, "undeliverable": 0,
+                "last_acked_at": acknowledged.then_some(render_now()),
+                "wake": "doorbell", "component": null,
+                "wake_stalled": wake_stalled
+            }
+        }))
+        .expect("the daemon's existing AgentRecord wire shape");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    state.resync_after_event_gap(&[record]);
+    state.sessions.remove("sess-card-stats").unwrap()
+}
+
+fn inbox_display_words() -> serde_json::Value {
+    serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap()
+}
+
+/// Scenario: Refresh a card from daemon inbox summaries containing queued, fetched or both kinds of pending messages. All three renders must show the same envelope count and queued wording as the desktop.
+#[spec("inbox/status/006")]
+#[test]
+fn status_006_card_counts_queued_and_fetched_messages() {
+    let words = inbox_display_words();
+    for (queued, fetched) in [(2, 0), (0, 2), (1, 1)] {
+        let session = inbox_card_session(queued, fetched, false);
+        let buffer = render_card_to_buffer(
+            &session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            false,
+            80,
+            CardDensityKind::Normal.rendered_height(),
+        );
+        let rendered = buffer_to_text(&buffer);
+        let badge = format!("{}2", words["glyph"].as_str().unwrap());
+        assert!(
+            rendered.contains(&badge),
+            "pending inbox badge {badge} missing for {queued} queued + {fetched} fetched:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(words["queued"].as_str().unwrap()),
+            "pending inbox must use the shared queued wording:\n{rendered}"
+        );
+    }
+}
+
+/// Scenario: The daemon reports that nothing has woken an agent for its one waiting message. Its card must say the message is waiting to wake and what to do, in the words the desktop uses, instead of only counting it as queued.
+#[spec("inbox/status/012")]
+#[test]
+fn status_012_card_says_a_stalled_wake_and_what_to_do() {
+    let words = inbox_display_words();
+    // The deck says so only of an agent that is not working.
+    let mut session = inbox_card_session_with(1, 0, false, true);
+    session.status = SessionStatus::Idle;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let line = format!(
+        "{}1 {}: {}",
+        words["glyph"].as_str().unwrap(),
+        words["wakeStalled"].as_str().unwrap(),
+        words["wakeStalledHint"].as_str().unwrap()
+    );
+    assert!(
+        rendered.contains(&line),
+        "a stalled wake must say {line:?}:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
+/// PRD #1666 §6.5: a card whose daemon summary carries `notices` (the attention
+/// items, the integration notice, failed receipts, paused hand-outs) beside
+/// one fetched message, rendered at the Normal density's 80 columns.
+fn inbox_notice_card(notices: serde_json::Value) -> String {
+    let session = card_stats_session("/home/dev/api-svc");
+    let mut inbox = serde_json::json!({
+        "queued": 0, "fetched": 1, "undeliverable": 0,
+        "last_acked_at": null, "wake": "native", "component": "opencode_plugin"
+    });
+    for (key, value) in notices.as_object().unwrap() {
+        inbox[key] = value.clone();
+    }
+    let record: dot_agent_deck::agent_pty::AgentRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
+            "live": session.live_snapshot(), "inbox": inbox
+        }))
+        .expect("the daemon's AgentRecord wire shape with PRD #1666 card notices");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    state.resync_after_event_gap(&[record]);
+    let session = state.sessions.remove("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    buffer_to_text(&buffer)
+}
+
+fn attention_item(id: &str, kind: &str) -> serde_json::Value {
+    serde_json::json!({"message_id": id, "revision": 4, "kind": kind,
+        "from_label": "the orchestrator", "subject": "review the fixture"})
+}
+
+/// Scenario: The daemon's snapshot lists one deck message whose delivery is uncertain. The card says `delivery uncertain` in the words the desktop uses, instead of only counting it.
+#[spec("inbox/status/013")]
+#[test]
+fn status_013_card_says_one_delivery_is_uncertain() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "uncertain")]
+    }));
+    let line = format!(
+        "{} {}",
+        words["glyph"].as_str().unwrap(),
+        words["uncertain"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+    let reason: String = words["uncertainReason"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        rendered.contains(&reason),
+        "{reason:?} missing:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Three deck messages on one card are uncertain, one of them out of attempts. The card counts them together as `3 deliveries uncertain`.
+#[spec("inbox/status/014")]
+#[test]
+fn status_014_card_counts_several_uncertain_deliveries() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "uncertain"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b851", "uncertain"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b852", "out_of_attempts")
+        ]
+    }));
+    let line = format!(
+        "{} 3 {}",
+        words["glyph"].as_str().unwrap(),
+        words["uncertainMany"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+}
+
+/// Scenario: The daemon's snapshot lists one deck message whose delivery is uncertain and out of attempts, so its row offers Cancel alone. The card still says `delivery uncertain`, and its notice row says what running out of attempts means instead of offering Retry, in the words the desktop uses.
+#[spec("inbox/status/026")]
+#[test]
+fn status_026_card_explains_a_delivery_out_of_attempts() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "out_of_attempts")]
+    }));
+    let line = format!(
+        "{} {}",
+        words["glyph"].as_str().unwrap(),
+        words["uncertain"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+    let reason: String = words["outOfAttempts"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        rendered.contains(&reason),
+        "{reason:?} missing:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Retry"),
+        "no Retry is offered:\n{rendered}"
+    );
+}
+
+/// Scenario: A deck message has been held by the agent for an hour without a commit. The card shows the one-shot held-for-an-hour attention, not a failure.
+#[spec("inbox/status/015")]
+#[test]
+fn status_015_card_shows_held_long_attention() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "held_long")]
+    }));
+    let head: String = words["heldLong"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+    assert!(
+        !rendered.contains("Error"),
+        "held_long is not a failure:\n{rendered}"
+    );
+}
+
+/// Scenario: The agent's integration is out of date, or its CLI too old, or it has not connected yet. The card shows that notice in the words the desktop uses, under its directory.
+#[spec("inbox/status/016")]
+#[test]
+fn status_016_card_shows_the_integration_notice() {
+    let words = inbox_display_words();
+    for (code, key) in [
+        ("adapter_too_old", "adapterTooOld"),
+        ("cli_too_old", "cliTooOld"),
+        ("not_armed", "notArmed"),
+    ] {
+        let rendered = inbox_notice_card(serde_json::json!({ "integration": code }));
+        let head: String = words[key].as_str().unwrap().chars().take(40).collect();
+        assert!(
+            rendered.contains(&head),
+            "{code}: {head:?} missing:\n{rendered}"
+        );
+    }
+}
+
+/// Scenario: Hand-outs to the agent are paused because its evidence store is full. The card says deck messages are paused and how many delivered messages still wait.
+#[spec("inbox/status/017")]
+#[test]
+fn status_017_card_shows_paused_hand_outs() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({ "evidence_paused": 7 }));
+    let text = words["evidencePaused"]
+        .as_str()
+        .unwrap()
+        .replace("{n}", "7");
+    let head: String = text.chars().take(40).collect();
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+}
+
+/// Scenario: The deck cannot record message receipts for the agent. The card warns that messages may repeat, under its directory.
+#[spec("inbox/status/018")]
+#[test]
+fn status_018_card_warns_that_messages_may_repeat() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({ "receipts_degraded": "disk full" }));
+    let head: String = words["receiptsDegraded"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+}
+
+/// Scenario: The daemon's snapshot lists deck messages a Pi agent may not have received: one alone, two together, and one beside an uncertain delivery and a held-long one. The card says `may not have reached the agent` ahead of the queued count, with its count for two and the reason under it, never as an error, and an uncertain delivery still leads.
+#[spec("inbox/status/023")]
+#[test]
+fn status_023_card_says_a_message_may_not_have_reached_the_agent() {
+    let words = inbox_display_words();
+    let glyph = words["glyph"].as_str().unwrap();
+    let not_started = words["notStarted"].as_str().unwrap();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "not_started")]
+    }));
+    let line = format!("{glyph} {not_started}");
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+    assert!(
+        !rendered.contains(&format!("{glyph}1 {}", words["queued"].as_str().unwrap())),
+        "it leads the queued count:\n{rendered}"
+    );
+    let reason: String = words["notStartedReason"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        rendered.contains(&reason),
+        "{reason:?} missing:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Error"),
+        "it is attention, not a failure:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+
+    let two = inbox_notice_card(serde_json::json!({
+        "attention": [
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "not_started"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b851", "not_started")
+        ]
+    }));
+    let line = format!("{glyph} 2 {not_started}");
+    assert!(two.contains(&line), "{line:?} missing:\n{two}");
+
+    let mixed = inbox_notice_card(serde_json::json!({
+        "attention": [
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "uncertain"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b851", "not_started"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b852", "held_long")
+        ]
+    }));
+    let line = format!("{glyph} {}", words["uncertain"].as_str().unwrap());
+    assert!(mixed.contains(&line), "{line:?} missing:\n{mixed}");
+    assert!(
+        !mixed.contains(not_started),
+        "the uncertain delivery leads:\n{mixed}"
+    );
+}
+
+/// Scenario: Render a pending-message card at the existing 20-column Compact snapshot budget. The envelope count must fit beside Thinking without removing the tools counter or overrunning either border.
+#[spec("inbox/status/007")]
+#[test]
+fn status_007_narrow_card_keeps_inbox_status_and_stats() {
+    let session = inbox_card_session(1, 1, false);
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Compact,
+        0,
+        render_now(),
+        false,
+        20,
+        CardDensityKind::Compact.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("✉2"),
+        "narrow card lost its inbox badge:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Thinking"),
+        "inbox badge displaced the status:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("14 tools"),
+        "inbox badge displaced the tools counter:\n{rendered}"
+    );
+    for row in rendered.lines() {
+        assert_eq!(
+            UnicodeWidthStr::width(row),
+            20,
+            "narrow card overran its width:\n{rendered}"
+        );
+    }
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: An undeliverable message emits the existing delivery_notice error channel for this pane. Its card must show Error and the complete not-delivered notice instead of keeping the old user prompt as its only explanation.
+#[spec("inbox/status/008")]
+#[test]
+fn status_008_card_shows_not_delivered_error_notice() {
+    let session = card_stats_session("/home/dev/api-svc");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    let words = inbox_display_words();
+    let notice = format!(
+        "{}: review fixture (agent exited)",
+        words["notDelivered"].as_str().unwrap()
+    );
+    state.apply_daemon_report_event(AgentEvent {
+        session_id: "sess-card-stats".into(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::Error,
+        tool_name: None,
+        tool_detail: Some(notice.clone()),
+        cwd: None,
+        timestamp: render_now(),
+        user_prompt: None,
+        metadata: HashMap::from([(
+            dot_agent_deck::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+            notice.clone(),
+        )]),
+        pane_id: Some("pane-card-stats".into()),
+        agent_id: Some("agent-card-stats".into()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        background: None,
+        background_revision: None,
+    });
+    let session = state.sessions.get("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Error"),
+        "undeliverable message did not make the card Error:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&notice),
+        "Error card lost its not-delivered explanation:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: After a human prompt, the daemon broadcasts a deck-message prompt labelled with its subject. The card must render that envelope subject, while its user-prompt history still contains only the human's text.
+#[spec("inbox/status/009")]
+#[test]
+fn status_009_card_labels_deck_subject_without_replacing_user_prompt() {
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    let mut session = card_stats_session("/home/dev/api-svc");
+    session.last_user_prompt = Some("inspect the human fixture".into());
+    session.first_prompts = vec!["inspect the human fixture".into()];
+    state.sessions.insert(session.session_id.clone(), session);
+    state.apply_event(AgentEvent {
+        session_id: "sess-card-stats".into(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::Thinking,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: render_now(),
+        user_prompt: Some("✉ review fixture".into()),
+        metadata: HashMap::from([(
+            dot_agent_deck::inbox_prompt::DECK_MESSAGE_METADATA_KEY.to_string(),
+            "1".into(),
+        )]),
+        pane_id: Some("pane-card-stats".into()),
+        agent_id: Some("agent-card-stats".into()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        background: None,
+        background_revision: None,
+    });
+    let session = state.sessions.get("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let prompt = rendered.lines().find(|row| row.contains("Prmt:")).unwrap();
+    assert!(
+        prompt.contains("✉ review fixture"),
+        "card prompt line must show the deck subject:\n{rendered}"
+    );
+    assert_eq!(
+        session.last_user_prompt.as_deref(),
+        Some("inspect the human fixture")
+    );
+    assert_eq!(session.first_prompts, ["inspect the human fixture"]);
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Refresh a card whose pending messages have been acknowledged. Its rendered inbox state must say delivered, using the same fixture as the desktop, and its pending envelope count must disappear.
+#[spec("inbox/status/010")]
+#[test]
+fn status_010_card_uses_shared_delivered_word_after_ack() {
+    let session = inbox_card_session(0, 0, true);
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let words = inbox_display_words();
+    assert!(
+        rendered.contains(words["delivered"].as_str().unwrap()),
+        "acknowledged inbox must say delivered, matching the desktop:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("✉0"),
+        "an empty inbox must not show a pending count:\n{rendered}"
+    );
 }
 
 /// Scenario: Render an over-long directory in a narrow L1 card, then render a
@@ -597,6 +1182,7 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             last_activity_ms,
             blocked: None,
             hook_generation: None,
+            delivery_notice: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,
@@ -935,10 +1521,9 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         agent_id: None,
         display_name: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
         pull_request: None,
@@ -1133,10 +1718,9 @@ fn pane_007_pi_card_shows_pi_identity() {
         // which is where the Pi identity surfaces.
         display_name: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
         pull_request: None,
@@ -1203,10 +1787,9 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         agent_id: Some("1".to_string()),
         display_name: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
         pull_request: None,
@@ -1468,10 +2051,9 @@ fn palette_session(status: SessionStatus) -> SessionState {
         agent_id: Some("1".to_string()),
         display_name: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
         pull_request: None,
@@ -2360,10 +2942,9 @@ fn pane_005_highlight_follows_selected_session_id() {
         agent_id: Some(name.to_string()),
         display_name: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
         pull_request: None,
@@ -2574,10 +3155,9 @@ fn filled_session() -> SessionState {
         agent_id: Some("1".to_string()),
         display_name: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
         pull_request: None,
@@ -3345,10 +3925,9 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         agent_id: Some("agent-declared-agent".to_string()),
         display_name: Some("reviewer".to_string()),
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
         pull_request: None,
@@ -3698,10 +4277,9 @@ fn role_session(index: usize, role: &str) -> SessionState {
         agent_id: Some(format!("agent-role-{index:02}")),
         display_name: Some(role.to_string()),
         shell_synthetic_working: false,
+        native_hooks_reported: false,
         orchestration_orphaned: false,
         subagent_wait: None,
-        prompt_reports_unavailable: false,
-        prompt_reports_declared: false,
         output_set_status: false,
         pending_question: None,
         pull_request: None,
@@ -4099,4 +4677,114 @@ fn density_008_a_deck_too_large_for_minimal_scrolls_at_compact() {
         "the title counts the cards below the window:\n{title}"
     );
     insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Feed Inbox broadcasts through the real TUI subscriber, followed by ordinary tool events as ordered ingestion barriers. The rendered card must count a queued message once, keep that count when fetched, and replace it with delivered on acknowledgement without a ListAgents refresh.
+#[spec("inbox/status/011")]
+#[cfg(unix)]
+#[test]
+fn status_011_live_subscriber_updates_the_rendered_inbox_card() {
+    use dot_agent_deck::daemon_client::DaemonClient;
+    use dot_agent_deck::daemon_protocol::{
+        AttachRequest, AttachResponse, KIND_EVENT, KIND_REQ, KIND_RESP, read_frame, write_frame,
+    };
+    use dot_agent_deck::event::BroadcastMsg;
+    use dot_agent_deck::event_subscriber::{SubscriberConfig, run};
+    use std::time::Duration;
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let root = test_temp::tempdir().unwrap();
+        let socket = root.path().join("inbox.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (send, mut batches) = tokio::sync::mpsc::unbounded_channel::<Vec<BroadcastMsg>>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (kind, payload) = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_eq!(kind, KIND_REQ);
+            let request = serde_json::from_slice::<AttachRequest>(&payload).unwrap();
+            // The ordered first-subscription path probes capabilities before
+            // subscribing. An old daemon advertises none and receives the plain
+            // subscription on the next connection. Also accept the pre-probe
+            // subscriber so this test keeps its rendered-card claim on either
+            // side of that production change.
+            let request = if matches!(request, AttachRequest::Hello { .. }) {
+                write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&AttachResponse::ok()).unwrap())
+                    .await.unwrap();
+                drop(stream);
+                stream = listener.accept().await.unwrap().0;
+                let (kind, payload) = read_frame(&mut stream).await.unwrap().unwrap();
+                assert_eq!(kind, KIND_REQ);
+                serde_json::from_slice::<AttachRequest>(&payload).unwrap()
+            } else {
+                request
+            };
+            assert!(matches!(
+                request,
+                AttachRequest::SubscribeEvents
+            ));
+            write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&AttachResponse::ok()).unwrap())
+                .await.unwrap();
+            while let Some(batch) = batches.recv().await {
+                for event in batch {
+                    write_frame(&mut stream, KIND_EVENT, &serde_json::to_vec(&event).unwrap())
+                        .await.unwrap();
+                }
+            }
+        });
+        let mut app = AppState::default();
+        app.register_pane("pane-card-stats".into());
+        let session = card_stats_session("/home/dev/api-svc");
+        app.sessions.insert(session.session_id.clone(), session);
+        let state = Arc::new(tokio::sync::RwLock::new(app));
+        let subscriber = tokio::spawn(run(DaemonClient::new(socket), state.clone(), SubscriberConfig::default()));
+        for (index, (pane, message_state, expected)) in [
+            ("foreign-pane", "queued", ""),
+            ("pane-card-stats", "queued", "✉1"),
+            ("pane-card-stats", "queued", "✉1"),
+            ("pane-card-stats", "fetched", "✉1"),
+            ("pane-card-stats", "acknowledged", "delivered"),
+        ].into_iter().enumerate() {
+            let barrier = format!("InboxBarrier{index}");
+            let notice: BroadcastMsg = serde_json::from_value(serde_json::json!({
+                "kind":"inbox", "pane_id":pane, "agent_id":"agent-card-stats",
+                "message_id":"m-k3xzq2ab-0f3c9a71d2e4b850", "subject":"review fixture",
+                "from_label":"the orchestrator", "state":message_state
+            })).unwrap();
+            let event = AgentEvent {
+                session_id: "sess-card-stats".into(), agent_type: AgentType::ClaudeCode,
+                event_type: EventType::ToolStart, tool_name: Some(barrier.clone()), tool_detail: None,
+                cwd: None, timestamp: render_now() + chrono::Duration::seconds(index as i64),
+                user_prompt: None, metadata: HashMap::new(), pane_id: Some("pane-card-stats".into()),
+                agent_id: Some("agent-card-stats".into()), agent_version: None,
+                schema_version: None, live_target: None,
+                background: None,
+                background_revision: None,
+            };
+            send.send(vec![notice, BroadcastMsg::Event(event)]).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if state.read().await.sessions["sess-card-stats"].active_tool.as_ref()
+                        .is_some_and(|tool| tool.name == barrier) { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("ordinary event after Inbox must be applied as an ingestion barrier");
+            let app = state.read().await;
+            let rendered = buffer_to_text(&render_card_to_buffer(
+                &app.sessions["sess-card-stats"], Some("api-svc"), Some(1),
+                CardDensityKind::Normal, 0, render_now(), false, 80,
+                CardDensityKind::Normal.rendered_height(),
+            ));
+            if expected.is_empty() {
+                assert!(!rendered.contains("✉1"), "foreign inbox notice changed this card:\n{rendered}");
+            } else {
+                assert!(rendered.contains(expected), "live Inbox {message_state} must render {expected} after its ingestion barrier:\n{rendered}");
+                assert!(!rendered.contains("✉2"), "duplicate/transition counted twice:\n{rendered}");
+            }
+            if message_state == "acknowledged" {
+                assert!(!rendered.contains("✉1"), "acknowledged message still pending:\n{rendered}");
+            }
+        }
+        subscriber.abort();
+        server.abort();
+    });
 }

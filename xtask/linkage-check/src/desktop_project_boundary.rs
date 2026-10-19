@@ -219,7 +219,6 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // `std::env::current_dir` — all zero for it.
     "login_shell",
     "platform",
-    "prompt_delivery",
     // PRD #1401, argued rather than added quietly. The desktop names
     // `PullRequestInfo` here — the type `SessionSnapshot.pull_request` carries,
     // which `dto::DesktopAgent` copies through to the webview as is — so the
@@ -315,6 +314,14 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // literal, and contains no `std::env::current_dir` — all zero for it.
     "self_upgrade",
     "state",
+    // PRD #1666, argued rather than added quietly. The desktop names ONE item
+    // here, `truncate_on_char_boundary`, the byte bound it puts on a host
+    // metrics disk role (PRD #1258); it lived in `prompt_delivery`, which PRD
+    // #1666 deleted with the typed delivery it served, and it moved here.
+    // Checked against this rule's lines: string functions only — no I/O, no
+    // project, no FORBIDDEN_SYMBOL or project-state literal, and no
+    // `std::env::current_dir` — all zero for it.
+    "submitted_prompt",
     // PRD #1401, argued rather than added quietly. The desktop's Open in
     // browser hands the page to `system_browser::open_with_platform_opener`,
     // the same watched launch the TUI's `o` uses, so a platform opener that
@@ -325,7 +332,6 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // FORBIDDEN_SYMBOL or project-state literal, and contains no
     // `std::env::current_dir` — all zero for it.
     "system_browser",
-    "ui",
     // PRD #741 M7, argued rather than added quietly.
     // `untrusted_text::strip_control_and_bidi` is the policy the connection
     // footer applies to a settings-supplied endpoint label: `dto::safe_message`

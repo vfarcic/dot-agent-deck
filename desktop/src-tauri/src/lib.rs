@@ -66,19 +66,7 @@ use dot_agent_deck::daemon_client::{
     StartAgentOptions,
 };
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
-use dot_agent_deck::event::{
-    AgentType, BroadcastMsg, EventType, PreparedOrchestration, ProjectRole, SendResult,
-};
-use dot_agent_deck::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE;
-
-/// Maximum wait for an agent readiness signal before the coordinator seed
-/// falls back to direct delivery. The crate constant this mirrored
-/// (`ui::SPAWN_TIME_READINESS_TIMEOUT`) was removed by issue #243's
-/// signal-based readiness rework; the nearest crate value
-/// (`state::SESSION_START_WAIT_TIMEOUT`, 30s, pub(crate)) answers a different
-/// question. Kept desktop-local so this client adds no daemon-side surface.
-const SPAWN_TIME_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-use dot_agent_deck::ui::{describe_send_result, is_terminal_send_result, send_retry_delay};
+use dot_agent_deck::event::{AgentType, BroadcastMsg, PreparedOrchestration, ProjectRole};
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
 
@@ -101,46 +89,11 @@ use crate::settings::DesktopSettings;
 use crate::terminal::DesktopState;
 
 const WATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
-/// How long one coordinator-seed `WriteAndSubmit` may take to answer before
-/// this attempt counts as failed and the delivery loop retries.
-///
-/// Issue #1383: the daemon holds a submit's Enter until the payload has
-/// rendered on the agent's screen, for up to
-/// [`dot_agent_deck::daemon_protocol::WRITE_AND_SUBMIT_ECHO_BOUND`] on a pane that never
-/// shows it, and the answer comes after that Enter — behind the capability
-/// probe and any wait for the pane's writer. The old 2 s equalled the bound, so
-/// it could fire while the daemon was still holding the Enter. That does not
-/// lose the prompt (the daemon finishes the write and records its outcome
-/// under the delivery id, so the retry is answered from that record), but it
-/// reports a failure for a write that went ahead and spends a retry on it.
-/// Hence the bound plus 2 s of margin.
-const COORDINATOR_DELIVERY_RPC_TIMEOUT: Duration =
-    dot_agent_deck::daemon_protocol::WRITE_AND_SUBMIT_ECHO_BOUND
-        .saturating_add(Duration::from_secs(2));
-const _: () = assert!(
-    COORDINATOR_DELIVERY_RPC_TIMEOUT.as_millis()
-        > dot_agent_deck::daemon_protocol::WRITE_AND_SUBMIT_ECHO_BOUND.as_millis(),
-    "a coordinator-seed write must be given longer than the daemon may hold its Enter"
-);
-/// How long the post-failure lookup of a role's start may take. It shared
-/// [`COORDINATOR_DELIVERY_RPC_TIMEOUT`]'s 2 s until issue #1383 raised that one
-/// for the submit's echo wait; this is a listing, which submits nothing, so it
-/// keeps the 2 s.
+/// How long posting the coordinator prompt to the start role's inbox may take
+/// to answer before the launch reports it as failed.
+const COORDINATOR_DELIVERY_RPC_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long the post-failure lookup of a role's start may take.
 const ROLE_RECONCILE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Post-`SessionStart` wait before injecting the coordinator seed. See the
-/// call site in `deliver_coordinator_prompt` for why the TUI's 500 ms is not
-/// enough here. Env override in milliseconds, clamped to 0..=30_000.
-fn desktop_seed_buffer() -> Duration {
-    const DEFAULT: Duration = Duration::from_millis(3_000);
-    match std::env::var("DOT_AGENT_DECK_DESKTOP_SEED_BUFFER_MS") {
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(ms) => Duration::from_millis(ms.min(30_000)),
-            Err(_) => DEFAULT,
-        },
-        Err(_) => DEFAULT,
-    }
-}
 
 /// Minimum spacing between full-snapshot refreshes driven by the daemon event
 /// stream.
@@ -400,8 +353,6 @@ fn orchestration_start_options(
 
 #[allow(async_fn_in_trait)]
 trait OrchestrationDaemon {
-    type ReadinessWatch;
-
     /// PRD #819 M6: ask the daemon to resolve the project, compose the
     /// coordinator context and publish it. The only step of a launch that
     /// writes, and it happens on the daemon's filesystem rather than this one's.
@@ -448,33 +399,18 @@ trait OrchestrationDaemon {
         orchestration_id: &str,
         timeout: Duration,
     ) -> Result<Option<String>, String>;
-    async fn begin_coordinator_readiness(&self) -> Result<Self::ReadinessWatch, String>;
-    async fn wait_for_coordinator_readiness(
-        &self,
-        watch: &mut Self::ReadinessWatch,
-        pane_id: &str,
-        agent_id: &str,
-        timeout: Duration,
-    ) -> Result<Option<String>, String>;
-    async fn submit_coordinator_prompt(
+    /// PRD #1666 S5: post the coordinator prompt to the start role's inbox,
+    /// bound to `expected_agent_id`. Answers the message id.
+    async fn post_coordinator_prompt(
         &self,
         pane_id: &str,
         prompt: &str,
         expected_agent_id: &str,
-        expected_session_id: Option<&str>,
-        delivery_id: &str,
         timeout: Duration,
-    ) -> Result<SendResult, String>;
-    async fn wait(&self, duration: Duration);
-    fn now(&self) -> std::time::Instant;
+    ) -> Result<String, String>;
 }
 
 impl OrchestrationDaemon for DaemonClient {
-    /// Issue #1028: the cancel-safe end of a drained
-    /// [`EventSubscription`], not the subscription itself. See
-    /// [`Self::begin_coordinator_readiness`].
-    type ReadinessWatch = tokio::sync::mpsc::Receiver<BroadcastMsg>;
-
     async fn prepare_orchestration(
         &self,
         cwd: &str,
@@ -558,134 +494,33 @@ impl OrchestrationDaemon for DaemonClient {
             .map(|record| record.id))
     }
 
-    async fn begin_coordinator_readiness(&self) -> Result<Self::ReadinessWatch, String> {
-        // Issue #1084: bounded, like the fleet path's own `SubscribeEvents`
-        // and the handshake before it. A deck that is down fails at once with
-        // `ECONNREFUSED`, but one that takes the connection and never answers
-        // left this await with no deadline at all — a launch parked for as long
-        // as the peer held the socket open, with nothing on screen saying why.
-        //
-        // Only the RESP that CONFIRMS the subscription is bounded, and the
-        // ordering is what keeps that true: this completes BEFORE the draining
-        // task below exists, so the single future this timeout can drop is
-        // `subscribe_events()`'s own round trip. It is never `next_event`, whose
-        // cancel-unsafety issue #1028 is about, and never the long-lived event
-        // frames that follow — those are read inside that task, under no
-        // deadline.
-        let mut subscription = crate::daemon_bridge::bounded_reply(
-            "SubscribeEvents for orchestrator readiness",
-            self.subscribe_events(),
-        )
-        .await?;
-        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_DEPTH);
-        // Issue #1028: the subscription is owned by this task and by nothing
-        // else, for the reason [`EVENT_QUEUE_DEPTH`] gives — `next_event` is not
-        // cancel-safe, and the readiness wait below is a `timeout`, which drops
-        // whatever future it is holding when it expires. Draining here means the
-        // only future that timeout can drop is the channel's, and an
-        // `mpsc::Receiver::recv` is cancel-safe: a partly-read five-byte frame
-        // header stays in this task's `read_frame`, so the watch survives a
-        // readiness timeout intact rather than misparsing every frame after it.
-        tauri::async_runtime::spawn(async move {
-            loop {
-                let msg = tokio::select! {
-                    // This arm is the one thing in the loop that can drop a
-                    // partly-read `next_event`, and it is harmless where the
-                    // readiness wait was not: `closed()` resolving means the
-                    // receiver is gone, so the subscription is dropped with it
-                    // and a desynchronised stream has no reader left to
-                    // mislead. The arm also keeps the socket's lifetime
-                    // what it was before this split — dropping the watch used to
-                    // drop the `EventSubscription` and half-close immediately,
-                    // and without this arm the task would sit in `read_frame`
-                    // holding the connection open until the daemon next
-                    // broadcast something, which on an idle daemon is never.
-                    _ = tx.closed() => break,
-                    event = subscription.next_event() => match event {
-                        Ok(Some(msg)) => msg,
-                        // An error and a clean end are both "no more readiness
-                        // signals on this stream", and the waiter reports them
-                        // the same way — see the `None` arm below. Closing the
-                        // channel is how it is told.
-                        Ok(None) | Err(_) => break,
-                    },
-                };
-                if tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(rx)
-    }
-
-    async fn wait_for_coordinator_readiness(
-        &self,
-        watch: &mut Self::ReadinessWatch,
-        pane_id: &str,
-        agent_id: &str,
-        timeout: Duration,
-    ) -> Result<Option<String>, String> {
-        let wait = async {
-            loop {
-                match watch.recv().await {
-                    Some(BroadcastMsg::Event(event))
-                        if event.event_type == EventType::SessionStart
-                            && event.pane_id.as_deref() == Some(pane_id)
-                            && event.agent_id.as_deref() == Some(agent_id) =>
-                    {
-                        return Ok(Some(event.session_id));
-                    }
-                    Some(_) => continue,
-                    // Issue #1028: the reader task ended the channel — the
-                    // daemon ended the stream, or the subscription errored.
-                    // Those two used to carry different text and the second is
-                    // now folded into the first; the CALLER's behaviour is
-                    // unchanged, because `deliver_coordinator_prompt` treats
-                    // every `Err` the same way: wait out the rest of the
-                    // readiness budget and deliver the seed with no session id.
-                    None => return Err("orchestrator readiness stream ended".to_string()),
-                }
-            }
-        };
-        match tokio::time::timeout(timeout, wait).await {
-            Ok(result) => result,
-            Err(_) => Ok(None),
-        }
-    }
-
-    async fn submit_coordinator_prompt(
+    async fn post_coordinator_prompt(
         &self,
         pane_id: &str,
         prompt: &str,
         expected_agent_id: &str,
-        expected_session_id: Option<&str>,
-        delivery_id: &str,
         timeout: Duration,
-    ) -> Result<SendResult, String> {
+    ) -> Result<String, String> {
         match tokio::time::timeout(
             timeout,
-            self.write_and_submit_with_identity(
+            self.post_message(
                 pane_id,
-                prompt,
                 Some(expected_agent_id),
-                expected_session_id,
-                Some(delivery_id),
+                "your role as orchestrator",
+                prompt,
+                None,
+                dot_agent_deck::daemon_protocol::PostOrigin::OrchestratorRemit,
             ),
         )
         .await
         {
-            Ok(Ok(result)) => Ok(result),
+            Ok(Ok(GatedQuery::Answered(id))) => Ok(id),
+            Ok(Ok(GatedQuery::Unsupported)) => {
+                Err("the deck has no agent inbox; upgrade it to deliver the context".into())
+            }
             Ok(Err(error)) => Err(safe_message(error.to_string())),
-            Err(_) => Err("orchestrator prompt delivery RPC timed out".into()),
+            Err(_) => Err("orchestrator context post timed out".into()),
         }
-    }
-
-    async fn wait(&self, duration: Duration) {
-        tokio::time::sleep(duration).await;
-    }
-
-    fn now(&self) -> std::time::Instant {
-        std::time::Instant::now()
     }
 }
 
@@ -969,97 +804,27 @@ impl From<String> for LaunchFailure {
     }
 }
 
+/// PRD #1666 S5: hand the coordinator prompt to the start role's inbox. Nothing
+/// waits for the agent to start a session and nothing is typed: the message
+/// waits in the inbox until the agent's component takes it or the agent answers
+/// the doorbell. One post, not retried — a post the deck refused would only be
+/// refused again, and one that timed out may have landed.
 async fn deliver_coordinator_prompt<D: OrchestrationDaemon + Sync>(
     daemon: &D,
-    readiness: &mut D::ReadinessWatch,
     pane_id: &str,
     agent_id: &str,
     prompt: &str,
-    created_at: std::time::Instant,
 ) -> Result<(), String> {
-    let elapsed = daemon.now().saturating_duration_since(created_at);
-    let readiness_wait = SPAWN_TIME_READINESS_TIMEOUT.saturating_sub(elapsed);
-    let mut last_failure = None;
-    let expected_session_id = if readiness_wait.is_zero() {
-        None
-    } else {
-        match daemon
-            .wait_for_coordinator_readiness(readiness, pane_id, agent_id, readiness_wait)
-            .await
-        {
-            Ok(Some(session_id)) => {
-                // SessionStart precedes reliable submit handling on slower
-                // machines. The TUI's 500 ms buffer proved too short for
-                // Claude Code's boot on this hardware — the seed reached the
-                // PTY (SendResult Applied) but was discarded by the still-
-                // rendering TUI, leaving the coordinator idle at an empty
-                // prompt. Default to a longer wait, overridable via
-                // DOT_AGENT_DECK_DESKTOP_SEED_BUFFER_MS (clamped to 30 s).
-                daemon.wait(desktop_seed_buffer()).await;
-                Some(session_id)
-            }
-            Ok(None) => None,
-            Err(error) => {
-                last_failure = Some(format!("readiness stream failed: {}", safe_message(error)));
-                let remaining = SPAWN_TIME_READINESS_TIMEOUT
-                    .saturating_sub(daemon.now().saturating_duration_since(created_at));
-                if !remaining.is_zero() {
-                    daemon.wait(remaining).await;
-                }
-                None
-            }
-        }
-    };
-
-    let delivery_id = format!("desktop-seed-{pane_id}");
-    let mut attempts = 0u32;
-    loop {
-        let elapsed = daemon.now().saturating_duration_since(created_at);
-        if elapsed >= AUTOMATIC_PROMPT_DEADLINE {
-            return Err(format!(
-                "orchestrator context was not delivered before the {}s deadline{}",
-                AUTOMATIC_PROMPT_DEADLINE.as_secs(),
-                last_failure
-                    .as_deref()
-                    .map(|failure| format!(": {failure}"))
-                    .unwrap_or_default()
-            ));
-        }
-        let remaining = AUTOMATIC_PROMPT_DEADLINE.saturating_sub(elapsed);
-        let rpc_timeout = remaining.min(COORDINATOR_DELIVERY_RPC_TIMEOUT);
-        match daemon
-            .submit_coordinator_prompt(
-                pane_id,
-                prompt,
-                agent_id,
-                expected_session_id.as_deref(),
-                &delivery_id,
-                rpc_timeout,
+    daemon
+        .post_coordinator_prompt(pane_id, prompt, agent_id, COORDINATOR_DELIVERY_RPC_TIMEOUT)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "orchestrator context was not posted: {}",
+                safe_message(error)
             )
-            .await
-        {
-            Ok(SendResult::Applied | SendResult::Queued) => return Ok(()),
-            Ok(result) if is_terminal_send_result(result) => {
-                return Err(format!(
-                    "orchestrator context delivery was terminal: {}",
-                    describe_send_result(result)
-                ));
-            }
-            Ok(result) => {
-                last_failure = Some(describe_send_result(result).to_string());
-            }
-            Err(error) => {
-                last_failure = Some(safe_message(error));
-            }
-        }
-        attempts = attempts.saturating_add(1);
-        let remaining = AUTOMATIC_PROMPT_DEADLINE
-            .saturating_sub(daemon.now().saturating_duration_since(created_at));
-        if remaining.is_zero() {
-            continue;
-        }
-        daemon.wait(send_retry_delay(attempts).min(remaining)).await;
-    }
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1076,10 +841,6 @@ async fn launch_orchestration<D: OrchestrationDaemon + Sync>(
     prep_token: Option<&str>,
 ) -> Result<OrchestrationLaunchResult, LaunchFailure> {
     validate_desktop_orchestrator(roles)?;
-    let created_at = daemon.now();
-    // Subscribe before the first spawn so a fast Claude SessionStart cannot be
-    // lost between process creation and readiness observation.
-    let mut readiness = daemon.begin_coordinator_readiness().await?;
     let mut started = Vec::with_capacity(roles.len());
     let mut start_target = None;
 
@@ -1173,15 +934,8 @@ async fn launch_orchestration<D: OrchestrationDaemon + Sync>(
             None,
         ));
     };
-    if let Err(error) = deliver_coordinator_prompt(
-        daemon,
-        &mut readiness,
-        &start_pane_id,
-        &start_agent_id,
-        orchestrator_seed,
-        created_at,
-    )
-    .await
+    if let Err(error) =
+        deliver_coordinator_prompt(daemon, &start_pane_id, &start_agent_id, orchestrator_seed).await
     {
         let rollback = rollback_orchestration_agents(daemon, &started).await;
         return Err(LaunchFailure::after_rollback(
@@ -1343,10 +1097,6 @@ async fn launch_configured_orchestration<D: OrchestrationDaemon + Sync>(
                 .into(),
         );
     }
-    let created_at = daemon.now();
-    // Subscribed before the first spawn, for `launch_orchestration`'s reason: a fast
-    // SessionStart must not be lost between the spawn and the wait.
-    let mut readiness = daemon.begin_coordinator_readiness().await?;
     let mut started: Vec<StartedRole> = Vec::with_capacity(prepared.roles.len());
     let mut start_target = None;
 
@@ -1460,15 +1210,9 @@ async fn launch_configured_orchestration<D: OrchestrationDaemon + Sync>(
         }
     };
     if !delivered_by_deck
-        && let Err(error) = deliver_coordinator_prompt(
-            daemon,
-            &mut readiness,
-            &start_pane_id,
-            &start_agent_id,
-            &prepared.prompt,
-            created_at,
-        )
-        .await
+        && let Err(error) =
+            deliver_coordinator_prompt(daemon, &start_pane_id, &start_agent_id, &prepared.prompt)
+                .await
     {
         let rollback = rollback_orchestration_agents(daemon, &started).await;
         return Err(LaunchFailure::after_rollback(
@@ -1511,10 +1255,6 @@ fn emit_reading_consent_on(app: &AppHandle) {
 
 fn emit_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
     let _ = app.emit("desktop://snapshot", snapshot);
-}
-
-fn action_result_ok(send_result: Option<&SendResult>) -> bool {
-    send_result.is_none_or(|result| matches!(result, SendResult::Applied | SendResult::Queued))
 }
 
 fn ensure_explicit_start_connected(
@@ -2098,6 +1838,79 @@ async fn desktop_list_directories(
 ) -> Result<DesktopDirectoryListing, String> {
     ensure_main_webview(&webview)?;
     list_directories_on(&state, &deck_id, path, options.unwrap_or_default()).await
+}
+
+/// PRD #1666 §6.4: the desktop's answer to a Retry or Cancel — the daemon's
+/// outcome by its wire spelling (`applied`, `stale`, …), or `unsupported` for
+/// a deck whose daemon predates the verbs.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopInboxActionResult {
+    outcome: String,
+}
+
+/// PRD #1666 §6.4: the user's Retry (`verb: "retry"`) or Cancel on deck
+/// message `message_id` that agent `agent_id`'s tile in `pane_id` lists, at
+/// the `revision` the tile showed. The deck comes from the request, never the
+/// selection, as for every per-deck verb. A deck that does not advertise the
+/// verbs is answered `unsupported` without being sent one (CLAUDE.md rule 18).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn desktop_inbox_action(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    agent_id: String,
+    pane_id: String,
+    message_id: String,
+    revision: u64,
+    verb: String,
+) -> Result<DesktopInboxActionResult, String> {
+    ensure_main_webview(&webview)?;
+    inbox_action_on(
+        &state,
+        &deck_id,
+        &agent_id,
+        &pane_id,
+        &message_id,
+        revision,
+        &verb,
+    )
+    .await
+}
+
+/// [`desktop_inbox_action`] minus the webview.
+async fn inbox_action_on(
+    state: &DesktopState,
+    deck_id: &str,
+    agent_id: &str,
+    pane_id: &str,
+    message_id: &str,
+    revision: u64,
+    verb: &str,
+) -> Result<DesktopInboxActionResult, String> {
+    let retry = match verb {
+        "retry" => true,
+        "cancel" => false,
+        _ => return Err("an inbox action is retry or cancel".to_string()),
+    };
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let request_id = dot_agent_deck::daemon_client::generate_client_id();
+    let answer = daemon
+        .client
+        .inbox_action(pane_id, agent_id, message_id, revision, retry, &request_id)
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    let outcome = match answer {
+        GatedQuery::Answered(reply) => serde_json::to_value(reply.outcome)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string()),
+        GatedQuery::Unsupported => "unsupported".to_string(),
+    };
+    Ok(DesktopInboxActionResult { outcome })
 }
 
 /// Issue #1240: the refusal for listing options sent to a deck that does not
@@ -6173,7 +5986,6 @@ async fn desktop_run_action(
     ensure_main_webview(&webview)?;
     let mut result_agent_id = None;
     let mut result_agent_ids = Vec::new();
-    let mut result_send: Option<SendResult> = None;
     let mut result_terminal = None;
     let mut result_message = None;
 
@@ -6188,7 +6000,6 @@ async fn desktop_run_action(
                 ok: snapshot.connection.status == ConnectionStatus::Connected,
                 agent_id: None,
                 agent_ids: Vec::new(),
-                send_result: None,
                 terminal: None,
                 message: None,
                 snapshot,
@@ -6373,7 +6184,6 @@ async fn desktop_run_action(
                 ok: true,
                 agent_id: None,
                 agent_ids: Vec::new(),
-                send_result: None,
                 terminal: None,
                 message: Some(
                     "Connected anyway for this session; the mismatch stays on screen.".into(),
@@ -6430,47 +6240,13 @@ async fn desktop_run_action(
         DesktopAction::DetachTerminal { session_id } => {
             terminal::detach(&state, &session_id).await?;
         }
-        DesktopAction::SubmitText { agent_id, text } => {
-            validate_agent_id(&agent_id)?;
-            if text.is_empty() || text.len() > COMMAND_MAX_BYTES || text.contains('\0') {
-                return Err(format!(
-                    "text must be 1..={COMMAND_MAX_BYTES} bytes and contain no NUL"
-                )
-                .into());
-            }
-            let daemon = trusted_daemon(&state.daemon).await?;
-            daemon.require_compatible()?;
-            let record = daemon
-                .client
-                .list_agents()
-                .await
-                .map_err(|error| safe_message(error.to_string()))?
-                .into_iter()
-                .find(|record| record.id == agent_id)
-                .ok_or_else(|| format!("agent not found: {agent_id}"))?;
-            let pane_id = record.pane_id_env.ok_or_else(|| {
-                format!("agent {agent_id} has no pane id and cannot accept submitted text")
-            })?;
-            result_send = Some(
-                daemon
-                    .client
-                    .write_and_submit_with_identity(&pane_id, &text, Some(&agent_id), None, None)
-                    .await
-                    .map_err(|error| safe_message(error.to_string()))?,
-            );
-            result_agent_id = Some(agent_id);
-        }
     }
 
     let snapshot = refresh_and_emit(&app, &state.daemon).await;
-    let action_ok = action_result_ok(result_send.as_ref());
     Ok(DesktopActionResult {
-        // Preserve the daemon's honest delivery semantics: a successfully
-        // decoded stale/history-only/etc. outcome is still a non-delivery.
-        ok: action_ok,
+        ok: true,
         agent_id: result_agent_id,
         agent_ids: result_agent_ids,
-        send_result: result_send,
         terminal: result_terminal,
         message: result_message,
         snapshot,
@@ -6782,6 +6558,7 @@ pub fn run() {
             desktop_resolve_project,
             desktop_new_agent_orchestrations,
             desktop_list_directories,
+            desktop_inbox_action,
             desktop_new_agent_options,
             desktop_bootstrap,
             desktop_start_daemon,
@@ -9310,9 +9087,7 @@ mod tests {
         pane_id: String,
         prompt: String,
         expected_agent_id: String,
-        expected_session_id: Option<String>,
-        delivery_id: String,
-        /// How long the delivery loop gave this attempt to be answered.
+        /// How long the delivery was given to be answered.
         timeout: Duration,
     }
 
@@ -9345,7 +9120,6 @@ mod tests {
     }
 
     struct FakeOrchestrationDaemon {
-        now: Mutex<std::time::Instant>,
         prepare_requests: Mutex<Vec<PrepareRequest>>,
         prepare_results: Mutex<VecDeque<Result<PreparedOrchestration, String>>>,
         /// Every spawn this fake was asked for, in order and by role name.
@@ -9358,13 +9132,11 @@ mod tests {
         stopped: Mutex<Vec<String>>,
         reconciliation_results: Mutex<VecDeque<Result<Option<String>, String>>>,
         reconciliation_requests: Mutex<Vec<(String, String)>>,
-        begin_readiness_count: AtomicUsize,
-        readiness: Mutex<Option<Result<Option<String>, String>>>,
-        readiness_waits: Mutex<Vec<Duration>>,
         submissions: Mutex<Vec<PromptSubmission>>,
-        outcomes: Mutex<VecDeque<Result<SendResult, String>>>,
-        fallback_outcome: Result<SendResult, String>,
-        sleeps: Mutex<Vec<Duration>>,
+        /// What each context post answers, in order: `Ok` is a message the deck
+        /// took, `Err` its refusal. Then `fallback_outcome` for every later one.
+        outcomes: Mutex<VecDeque<Result<(), String>>>,
+        fallback_outcome: Result<(), String>,
         /// PRD #1223 M6: the client library withholds the configured start —
         /// the deck does not advertise `prepared-role-command`.
         configured_unsupported: AtomicBool,
@@ -9391,12 +9163,10 @@ mod tests {
 
     impl FakeOrchestrationDaemon {
         fn new(
-            readiness: Result<Option<&str>, &str>,
-            outcomes: impl IntoIterator<Item = Result<SendResult, String>>,
-            fallback_outcome: Result<SendResult, String>,
+            outcomes: impl IntoIterator<Item = Result<(), String>>,
+            fallback_outcome: Result<(), String>,
         ) -> Self {
             Self {
-                now: Mutex::new(std::time::Instant::now()),
                 prepare_requests: Mutex::new(Vec::new()),
                 prepare_results: Mutex::new(VecDeque::new()),
                 spawn_log: Mutex::new(Vec::new()),
@@ -9406,17 +9176,9 @@ mod tests {
                 stopped: Mutex::new(Vec::new()),
                 reconciliation_results: Mutex::new(VecDeque::new()),
                 reconciliation_requests: Mutex::new(Vec::new()),
-                begin_readiness_count: AtomicUsize::new(0),
-                readiness: Mutex::new(Some(
-                    readiness
-                        .map(|session| session.map(str::to_string))
-                        .map_err(str::to_string),
-                )),
-                readiness_waits: Mutex::new(Vec::new()),
                 submissions: Mutex::new(Vec::new()),
                 outcomes: Mutex::new(outcomes.into_iter().collect()),
                 fallback_outcome,
-                sleeps: Mutex::new(Vec::new()),
                 configured_unsupported: AtomicBool::new(false),
                 launched_type: Mutex::new(None),
                 launched_type_queries: Mutex::new(Vec::new()),
@@ -9428,16 +9190,9 @@ mod tests {
                 bounds_preparation: AtomicBool::new(false),
             }
         }
-
-        fn advance(&self, duration: Duration) {
-            let mut now = self.now.lock().unwrap();
-            *now = now.checked_add(duration).expect("test clock overflow");
-        }
     }
 
     impl OrchestrationDaemon for FakeOrchestrationDaemon {
-        type ReadinessWatch = ();
-
         async fn prepare_orchestration(
             &self,
             cwd: &str,
@@ -9553,57 +9308,26 @@ mod tests {
                 .unwrap_or(Ok(None))
         }
 
-        async fn begin_coordinator_readiness(&self) -> Result<Self::ReadinessWatch, String> {
-            self.begin_readiness_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn wait_for_coordinator_readiness(
-            &self,
-            _watch: &mut Self::ReadinessWatch,
-            _pane_id: &str,
-            _agent_id: &str,
-            timeout: Duration,
-        ) -> Result<Option<String>, String> {
-            self.readiness_waits.lock().unwrap().push(timeout);
-            let result = self.readiness.lock().unwrap().take().unwrap_or(Ok(None));
-            if matches!(&result, Ok(None)) {
-                self.advance(timeout);
-            }
-            result
-        }
-
-        async fn submit_coordinator_prompt(
+        async fn post_coordinator_prompt(
             &self,
             pane_id: &str,
             prompt: &str,
             expected_agent_id: &str,
-            expected_session_id: Option<&str>,
-            delivery_id: &str,
             timeout: Duration,
-        ) -> Result<SendResult, String> {
+        ) -> Result<String, String> {
             self.submissions.lock().unwrap().push(PromptSubmission {
                 pane_id: pane_id.to_string(),
                 prompt: prompt.to_string(),
                 expected_agent_id: expected_agent_id.to_string(),
-                expected_session_id: expected_session_id.map(str::to_string),
-                delivery_id: delivery_id.to_string(),
                 timeout,
             });
-            self.outcomes
+            let outcome = self
+                .outcomes
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| self.fallback_outcome.clone())
-        }
-
-        async fn wait(&self, duration: Duration) {
-            self.sleeps.lock().unwrap().push(duration);
-            self.advance(duration);
-        }
-
-        fn now(&self) -> std::time::Instant {
-            *self.now.lock().unwrap()
+                .unwrap_or_else(|| self.fallback_outcome.clone());
+            outcome.map(|()| "m-k3xzq2ab-00000000000000aa".to_string())
         }
     }
 
@@ -9739,11 +9463,7 @@ command = "configured-planner"
             },
         ];
         let cwd = project_dir.to_str().unwrap().to_string();
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
 
         let (roles, prepared) = prepare_orchestration_launch(
             &daemon,
@@ -9794,11 +9514,7 @@ command = "configured-planner"
     /// uses, not the spelling the caller sent.
     #[tokio::test]
     async fn the_prepared_canonical_path_is_the_spawn_cwd() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("session-planner")),
-            [Ok(SendResult::Applied)],
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new([Ok(())], Ok(()));
         let (roles, prepared) = prepare_orchestration_launch(
             &daemon,
             "loop",
@@ -9864,11 +9580,7 @@ command = "configured-planner"
     #[tokio::test]
     async fn a_blank_task_is_prepared_by_the_daemon_rather_than_refused() {
         for blank in ["", "  \n\t "] {
-            let daemon = FakeOrchestrationDaemon::new(
-                Ok(Some("unused-session")),
-                std::iter::empty(),
-                Ok(SendResult::Applied),
-            );
+            let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
             let (roles, prepared) = prepare_orchestration_launch(
                 &daemon,
                 "loop",
@@ -9910,11 +9622,7 @@ command = "configured-planner"
             ),
             (None, None),
         ] {
-            let daemon = FakeOrchestrationDaemon::new(
-                Ok(Some("session-planner")),
-                [Ok(SendResult::Applied)],
-                Ok(SendResult::Applied),
-            );
+            let daemon = FakeOrchestrationDaemon::new([Ok(())], Ok(()));
             launch_orchestration(
                 &daemon,
                 "loop",
@@ -9977,11 +9685,7 @@ command = "configured-planner"
     /// in the root crate, each verified by removing its fix.
     #[tokio::test]
     async fn a_daemon_without_the_prepared_verb_fails_the_launch_closed() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("session-planner")),
-            [Ok(SendResult::Applied)],
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new([Ok(())], Ok(()));
         daemon.start_results.lock().unwrap().push_back(refused(
             "malformed request: unknown variant `start-prepared-agent`, expected one of \
              `list-agents`, `start-agent`, `hello`",
@@ -10041,11 +9745,7 @@ command = "configured-planner"
     /// so it stays on plain `start-agent` and nothing about it changed.
     #[tokio::test]
     async fn a_token_less_launch_presents_no_token() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("session-planner")),
-            [Ok(SendResult::Applied)],
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new([Ok(())], Ok(()));
 
         launch_orchestration(
             &daemon,
@@ -10151,11 +9851,7 @@ command = "configured-planner"
     /// wrapped around this call.
     #[tokio::test(start_paused = true)]
     async fn a_slow_preparation_on_an_older_deck_is_waited_out_rather_than_timed_out() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
         *daemon.prepare_delay.lock().unwrap() = Some(ORCHESTRATION_ROLE_START_TIMEOUT * 4);
 
         let (roles, prepared) = prepare_orchestration_launch(
@@ -10184,11 +9880,7 @@ command = "configured-planner"
     /// bound elapses without the test waiting on it.
     #[tokio::test(start_paused = true)]
     async fn a_slow_preparation_on_a_deadline_deck_is_bounded() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
         daemon.bounds_preparation.store(true, Ordering::SeqCst);
         *daemon.prepare_delay.lock().unwrap() = Some(crate::daemon_bridge::DECK_REPLY_TIMEOUT * 4);
 
@@ -10233,11 +9925,7 @@ command = "configured-planner"
     /// rather than as an error.
     #[tokio::test]
     async fn a_refused_preparation_starts_no_roles() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
         daemon.prepare_results.lock().unwrap().push_back(Err(
             "unresolved: that path is not a project this daemon can offer".into(),
         ));
@@ -10255,7 +9943,6 @@ command = "configured-planner"
 
         assert!(error.contains("unresolved"), "unexpected error: {error}");
         assert!(daemon.started.lock().unwrap().is_empty());
-        assert_eq!(daemon.begin_readiness_count.load(Ordering::SeqCst), 0);
     }
 
     /// A daemon that prepared but reported no canonical path, or no coordinator
@@ -10277,11 +9964,7 @@ command = "configured-planner"
                 "orchestrator prompt",
             ),
         ] {
-            let daemon = FakeOrchestrationDaemon::new(
-                Ok(Some("unused-session")),
-                std::iter::empty(),
-                Ok(SendResult::Applied),
-            );
+            let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
             let mut prepared = prepared_orchestration();
             mutate(&mut prepared);
             daemon
@@ -10326,11 +10009,7 @@ command = "configured-planner"
                         daemon tried to clear those bits and could not, so publishing is refused. \
                         On the machine running the daemon, run: chmod go-w \
                         '/home/dev/project/.dot-agent-deck'";
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
         daemon
             .prepare_results
             .lock()
@@ -10360,11 +10039,7 @@ command = "configured-planner"
     /// on the way.
     #[tokio::test]
     async fn a_pi_coordinator_is_refused_during_preparation() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
 
         let error = prepare_orchestration_launch(
             &daemon,
@@ -10396,13 +10071,12 @@ command = "configured-planner"
         ]
     }
 
+    /// PRD #1666 S5: a non-Pi coordinator's context is posted to its start
+    /// role's inbox once, bound to the start role's agent, with no readiness
+    /// wait, no seed buffer and no retry.
     #[tokio::test]
-    async fn non_pi_launch_waits_for_readiness_and_retries_with_one_identity() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("session-planner")),
-            [Ok(SendResult::NoLiveTarget), Ok(SendResult::Applied)],
-            Ok(SendResult::Applied),
-        );
+    async fn non_pi_launch_posts_its_context_once_to_the_start_role() {
+        let daemon = FakeOrchestrationDaemon::new([Ok(())], Err("no live target".to_string()));
         let seed = "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md and wait.";
 
         let launched = launch_orchestration(
@@ -10425,39 +10099,26 @@ command = "configured-planner"
             launched.agent_ids,
             ["agent-0".to_string(), "agent-1".to_string()]
         );
-        assert_eq!(daemon.begin_readiness_count.load(Ordering::SeqCst), 1);
         let started = daemon.started.lock().unwrap();
         assert_eq!(started.len(), 2);
-        assert_eq!(started[0].seed, None, "Claude must not arm Pi's fallback");
+        assert_eq!(started[0].seed, None, "the context is posted, not seeded");
         assert_eq!(started[1].seed, None);
         drop(started);
 
         let submissions = daemon.submissions.lock().unwrap();
-        assert_eq!(submissions.len(), 2);
-        assert_eq!(submissions[0].pane_id, submissions[1].pane_id);
+        assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].prompt, seed);
         assert_eq!(submissions[0].expected_agent_id, "agent-0");
-        assert_eq!(
-            submissions[0].expected_session_id.as_deref(),
-            Some("session-planner")
-        );
-        assert_eq!(submissions[0].delivery_id, submissions[1].delivery_id);
-        // Issue #1383: the daemon holds each submit's Enter for up to the echo
-        // bound, so an attempt given no more than that could time out on a
-        // write that is still going ahead.
-        for submission in submissions.iter() {
-            assert!(
-                submission.timeout > dot_agent_deck::daemon_protocol::WRITE_AND_SUBMIT_ECHO_BOUND,
-                "a seed attempt must outlast the daemon's echo wait: {:?}",
-                submission.timeout
-            );
-        }
+        let start_pane = daemon.started.lock().unwrap()[0]
+            .env
+            .iter()
+            .find(|(key, _)| key == DOT_AGENT_DECK_PANE_ID)
+            .map(|(_, value)| value.clone())
+            .expect("the start role carries a pane id");
+        assert_eq!(submissions[0].pane_id, start_pane);
+        assert_eq!(submissions[0].timeout, COORDINATOR_DELIVERY_RPC_TIMEOUT);
         drop(submissions);
 
-        assert_eq!(
-            *daemon.sleeps.lock().unwrap(),
-            [desktop_seed_buffer(), send_retry_delay(1)]
-        );
         assert!(daemon.stopped.lock().unwrap().is_empty());
     }
 
@@ -10470,11 +10131,7 @@ command = "configured-planner"
     /// role's pane through the acknowledged Runs delivery.
     #[tokio::test]
     async fn a_configured_launch_starts_every_role_and_delivers_to_a_non_pi_coordinator() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("session-planner")),
-            [Ok(SendResult::Applied)],
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new([Ok(())], Ok(()));
         *daemon.launched_type.lock().unwrap() = Some(AgentType::ClaudeCode);
         let prepared = prepared_orchestration();
 
@@ -10551,10 +10208,6 @@ command = "configured-planner"
         assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].prompt, prepared.prompt);
         assert_eq!(submissions[0].expected_agent_id, "agent-0");
-        assert_eq!(
-            submissions[0].expected_session_id.as_deref(),
-            Some("session-planner")
-        );
         drop(submissions);
         assert!(daemon.stopped.lock().unwrap().is_empty());
     }
@@ -10566,7 +10219,7 @@ command = "configured-planner"
     /// Runs screen's refusal of a Pi coordinator is not inherited.
     #[tokio::test]
     async fn a_configured_launch_leaves_a_pi_coordinators_prompt_to_the_deck() {
-        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new([], Ok(()));
         *daemon.launched_type.lock().unwrap() = Some(AgentType::Pi);
 
         let launched = launch_configured_orchestration(
@@ -10606,7 +10259,7 @@ command = "configured-planner"
     /// which the dialog shows inline.
     #[tokio::test]
     async fn a_configured_launch_stops_the_started_roles_when_a_later_role_is_refused() {
-        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new([], Ok(()));
         daemon
             .start_results
             .lock()
@@ -10649,7 +10302,7 @@ command = "configured-planner"
     /// started, nothing is stopped, and the refusal says why.
     #[tokio::test]
     async fn a_configured_launch_on_a_deck_without_the_capability_starts_nothing() {
-        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new([], Ok(()));
         daemon.configured_unsupported.store(true, Ordering::SeqCst);
 
         let failure = launch_configured_orchestration(
@@ -10694,7 +10347,7 @@ command = "configured-planner"
     /// it along with the one already running.
     #[tokio::test(start_paused = true)]
     async fn a_configured_launch_bounds_a_start_the_deck_never_answers_and_stops_what_landed() {
-        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new([], Ok(()));
         daemon.start_hangs.lock().unwrap().insert(1);
         daemon
             .reconciliation_results
@@ -10747,7 +10400,7 @@ command = "configured-planner"
     /// rather than reporting a clean rollback.
     #[tokio::test(start_paused = true)]
     async fn a_configured_launch_reports_a_timed_out_start_it_cannot_find() {
-        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new([], Ok(()));
         daemon.start_hangs.lock().unwrap().insert(1);
 
         let failure = launch_configured_orchestration(
@@ -10790,7 +10443,7 @@ command = "configured-planner"
     /// and the error names EVERY role whose stop it could not confirm.
     #[tokio::test(start_paused = true)]
     async fn a_rollback_bounds_each_stop_and_names_every_role_it_could_not_confirm() {
-        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new([], Ok(()));
         daemon.start_results.lock().unwrap().extend([
             Ok("agent-0".to_string()),
             Ok("agent-1".to_string()),
@@ -10858,7 +10511,7 @@ command = "configured-planner"
     /// not.
     #[tokio::test(start_paused = true)]
     async fn closing_an_orchestration_stops_every_role_at_once_and_names_the_unconfirmed() {
-        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new([], Ok(()));
         daemon
             .stop_hangs
             .lock()
@@ -10940,11 +10593,7 @@ command = "configured-planner"
     /// answers ends the launch at the start bound and the first is stopped.
     #[tokio::test(start_paused = true)]
     async fn a_runs_launch_bounds_a_start_the_deck_never_answers() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
         daemon.start_hangs.lock().unwrap().insert(1);
 
         let failure = launch_orchestration(
@@ -11108,7 +10757,7 @@ command = "configured-planner"
             (lost("the connection closed before the reply"), true),
             (refused("builder refused"), false),
         ] {
-            let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+            let daemon = FakeOrchestrationDaemon::new([], Ok(()));
             daemon
                 .start_results
                 .lock()
@@ -11158,11 +10807,7 @@ command = "configured-planner"
     /// for the screen to put the cleanup warning first.
     #[tokio::test]
     async fn a_runs_launch_carries_the_roles_its_rollback_could_not_stop_as_data() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
         daemon.start_results.lock().unwrap().extend([
             Ok("agent-0".to_string()),
             refused(&format!(
@@ -11229,11 +10874,7 @@ command = "configured-planner"
 
     #[tokio::test]
     async fn pi_coordinator_is_rejected_before_subscription_or_spawn() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
 
         let failure = launch_orchestration(
             &daemon,
@@ -11252,20 +10893,16 @@ command = "configured-planner"
         let error = &failure.message;
 
         assert!(error.contains("Pi cannot be the desktop orchestration's orchestrator"));
-        assert_eq!(daemon.begin_readiness_count.load(Ordering::SeqCst), 0);
         assert!(daemon.started.lock().unwrap().is_empty());
         assert!(daemon.reconciliation_requests.lock().unwrap().is_empty());
         assert!(daemon.submissions.lock().unwrap().is_empty());
-        assert!(daemon.sleeps.lock().unwrap().is_empty());
     }
 
+    /// PRD #1666 S5: a coordinator that announces nothing gets its context the
+    /// same way — posted at once, with no readiness timeout to sit out.
     #[tokio::test]
-    async fn hookless_coordinator_uses_timeout_fallback_without_session_guard() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(None),
-            [Ok(SendResult::Applied)],
-            Ok(SendResult::Applied),
-        );
+    async fn a_hookless_coordinator_is_posted_without_a_readiness_wait() {
+        let daemon = FakeOrchestrationDaemon::new([Ok(())], Ok(()));
 
         launch_orchestration(
             &daemon,
@@ -11282,23 +10919,16 @@ command = "configured-planner"
         .await
         .unwrap();
 
-        assert_eq!(
-            *daemon.readiness_waits.lock().unwrap(),
-            [SPAWN_TIME_READINESS_TIMEOUT]
-        );
         let submissions = daemon.submissions.lock().unwrap();
         assert_eq!(submissions.len(), 1);
-        assert_eq!(submissions[0].expected_session_id, None);
-        assert!(daemon.sleeps.lock().unwrap().is_empty());
     }
 
+    /// PRD #1666 S5: a context post the deck refuses ends the launch, and every
+    /// role it started is stopped, last first. The post is not retried.
     #[tokio::test]
-    async fn delivery_deadline_rolls_back_every_started_role_in_reverse_order() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("session-planner")),
-            std::iter::empty(),
-            Ok(SendResult::NoLiveTarget),
-        );
+    async fn a_refused_context_post_rolls_back_every_started_role_in_reverse_order() {
+        let daemon =
+            FakeOrchestrationDaemon::new(std::iter::empty(), Err("no live target".to_string()));
 
         let failure = launch_orchestration(
             &daemon,
@@ -11316,22 +10946,21 @@ command = "configured-planner"
         .unwrap_err();
         let error = &failure.message;
 
-        assert!(error.contains("60s deadline"), "unexpected error: {error}");
+        assert!(
+            error.contains("was not posted"),
+            "unexpected error: {error}"
+        );
         assert!(error.contains("stopped 2 already-started role(s)"));
         assert_eq!(
             *daemon.stopped.lock().unwrap(),
             ["agent-1".to_string(), "agent-0".to_string()]
         );
-        assert!(daemon.submissions.lock().unwrap().len() > 1);
+        assert_eq!(daemon.submissions.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn lost_start_response_reconciles_failed_pane_before_rollback() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
         daemon
             .start_results
             .lock()
@@ -11395,11 +11024,7 @@ command = "configured-planner"
 
     #[tokio::test]
     async fn failed_start_reconciliation_reports_cleanup_uncertainty() {
-        let daemon = FakeOrchestrationDaemon::new(
-            Ok(Some("unused-session")),
-            std::iter::empty(),
-            Ok(SendResult::Applied),
-        );
+        let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
         daemon
             .start_results
             .lock()
@@ -11436,24 +11061,6 @@ command = "configured-planner"
     }
 
     #[test]
-    fn action_result_only_marks_delivered_text_as_ok() {
-        assert!(action_result_ok(None));
-        for delivered in [SendResult::Applied, SendResult::Queued] {
-            assert!(action_result_ok(Some(&delivered)));
-        }
-        for not_delivered in [
-            SendResult::Stale,
-            SendResult::WrongSession,
-            SendResult::HistoryOnly,
-            SendResult::NoLiveTarget,
-            SendResult::Ambiguous,
-            SendResult::Unknown,
-        ] {
-            assert!(!action_result_ok(Some(&not_delivered)));
-        }
-    }
-
-    #[test]
     fn explicit_daemon_start_requires_a_connected_snapshot() {
         let disconnected = crate::dto::disconnected_snapshot(
             &crate::local_deck::local_endpoint(),
@@ -11469,240 +11076,5 @@ command = "configured-planner"
         connected.connection.status = ConnectionStatus::Connected;
         connected.connection.error = None;
         assert!(ensure_explicit_start_connected(true, &connected).is_ok());
-    }
-
-    /// One event frame, split so the daemon can stall in the middle of its
-    /// five-byte header (issue #1028).
-    ///
-    /// The `SessionStart` the coordinator readiness wait is looking for, encoded
-    /// as the `KIND_EVENT` frame a real daemon would push.
-    #[cfg(unix)]
-    fn session_start_frame(pane_id: &str, agent_id: &str, session_id: &str) -> Vec<u8> {
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "kind": "event",
-            "session_id": session_id,
-            "agent_type": "claude_code",
-            "event_type": "session_start",
-            "timestamp": "2026-01-01T00:00:00Z",
-            "pane_id": pane_id,
-            "agent_id": agent_id,
-        }))
-        .expect("encode the broadcast");
-        let mut frame = Vec::with_capacity(5 + payload.len());
-        frame.push(dot_agent_deck::daemon_protocol::KIND_EVENT);
-        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&payload);
-        frame
-    }
-
-    /// Scenario: a scripted daemon accepts the coordinator-readiness
-    /// subscription and then stalls **two bytes into** an event frame's
-    /// five-byte header. The desktop's first readiness wait expires on that
-    /// partial header and reports "not ready yet"; the daemon then writes the
-    /// rest of the frame, and a second wait on the SAME watch must still deliver
-    /// the coordinator's `SessionStart`.
-    ///
-    /// This is issue #1028's defect as a runtime ordering, not as a shape:
-    /// `tokio::time::timeout` drops the future it is holding when it expires, and
-    /// `EventSubscription::next_event` is not cancel-safe — the two header bytes
-    /// lived in `read_frame`'s local buffer, so the old code lost them and
-    /// misparsed every frame that followed. Against that code this test fails on
-    /// the second wait.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_readiness_timeout_mid_frame_header_leaves_the_watch_usable() {
-        use dot_agent_deck::daemon_protocol::{
-            AttachResponse, KIND_REQ, KIND_RESP, read_frame, write_frame,
-        };
-        use std::os::unix::fs::PermissionsExt;
-        use tokio::io::AsyncWriteExt;
-
-        let pane_id = "pane-1028";
-        let agent_id = "agent-1028";
-        let session_id = "session-1028";
-        let frame = session_start_frame(pane_id, agent_id, session_id);
-
-        let dir = tempfile::tempdir().expect("a scratch dir for the socket");
-        let socket = dir.path().join("s");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
-        // The client refuses a socket the ambient umask left group- or
-        // world-accessible, the same reason `daemon_bridge`'s fixtures restate
-        // the mode rather than borrowing `IpcListener::bind`'s umask dance.
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .expect("restate 0o600 on the socket inode");
-
-        // Raised by the test once its first readiness wait has timed out, so the
-        // daemon completes the header at exactly the moment that matters rather
-        // than on a sleep that could drift either way.
-        let (timed_out_tx, timed_out_rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(async move {
-            let (stream, _peer) = listener.accept().await.expect("accept the subscriber");
-            let (mut reader, mut writer) = stream.into_split();
-            let (kind, _payload) = read_frame(&mut reader)
-                .await
-                .expect("read the subscribe-events request")
-                .expect("the client sent a frame");
-            assert_eq!(kind, KIND_REQ);
-            let reply = serde_json::to_vec(&AttachResponse {
-                ok: true,
-                ..Default::default()
-            })
-            .expect("encode the subscribe reply");
-            write_frame(&mut writer, KIND_RESP, &reply)
-                .await
-                .expect("accept the subscription");
-
-            // Two of the five header bytes, and then nothing. A reader parked
-            // here is parked mid-header, which is the whole condition.
-            writer
-                .write_all(&frame[..2])
-                .await
-                .expect("write a partial frame header");
-            writer.flush().await.expect("flush the partial header");
-
-            timed_out_rx
-                .await
-                .expect("the test reports its first timeout");
-
-            writer
-                .write_all(&frame[2..])
-                .await
-                .expect("complete the frame");
-            writer.flush().await.expect("flush the completed frame");
-            // Hold the connection open: an EOF racing the frame above would let
-            // a desynchronised reader end the stream for the wrong reason and
-            // pass this test for the wrong reason with it.
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        });
-
-        let client = DaemonClient::new(socket);
-        let mut watch = client
-            .begin_coordinator_readiness()
-            .await
-            .expect("subscribe to the scripted daemon");
-
-        assert_eq!(
-            client
-                .wait_for_coordinator_readiness(
-                    &mut watch,
-                    pane_id,
-                    agent_id,
-                    Duration::from_millis(200)
-                )
-                .await,
-            Ok(None),
-            "a readiness wait that expires must report 'not ready yet'"
-        );
-        let _ = timed_out_tx.send(());
-
-        assert_eq!(
-            client
-                .wait_for_coordinator_readiness(
-                    &mut watch,
-                    pane_id,
-                    agent_id,
-                    Duration::from_secs(5)
-                )
-                .await,
-            Ok(Some(session_id.to_string())),
-            "the watch must still be synchronised after a timeout dropped a wait \
-             mid-header — issue #1028"
-        );
-
-        server.abort();
-    }
-
-    /// Scenario: a scripted daemon accepts the coordinator-readiness
-    /// subscription, reads the `SubscribeEvents` request and then answers
-    /// nothing at all, holding the socket open. `begin_coordinator_readiness`
-    /// must come back with an error naming the deck as wedged rather than
-    /// parking the launch for as long as the peer keeps the connection.
-    ///
-    /// Issue #1084, and the same defect PRD #742 M14 fixed one path over: a deck
-    /// that is DOWN fails at once with `ECONNREFUSED`, so the failure this
-    /// covers is the one where the connect succeeds. **Measured against the
-    /// unbounded code**, where it fails on the outer bound below rather than on
-    /// either assertion; take that bound away too and it does not fail at all,
-    /// it never returns. That is why the outer bound is here, exactly as in
-    /// `daemon_bridge`'s sibling test for the handshake.
-    ///
-    /// # Paused time, and paused at a POINT
-    ///
-    /// The clock is stopped only once `accepted_rx` resolves, which is the peer
-    /// confirming it took the connection and read the request. `start_paused`
-    /// would auto-advance from the first moment the runtime had nothing to poll,
-    /// so a clock that jumped while the connect was still in flight would report
-    /// the same error for a scenario nobody wrote. Pausing here leaves exactly
-    /// one thing outstanding — a read against a peer that will never write — and
-    /// the runtime advances to the only deadline left. Real socket I/O, real
-    /// silence, none of the fifteen seconds spent.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_deck_that_never_answers_the_readiness_subscription_is_reported_rather_than_awaited()
-    {
-        use dot_agent_deck::daemon_protocol::read_frame;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("a scratch dir for the socket");
-        let socket = dir.path().join("s");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .expect("restate 0o600 on the socket inode");
-
-        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let silent = tokio::spawn(async move {
-            let (stream, _peer) = listener.accept().await.expect("accept the subscriber");
-            // The write half is kept bound rather than dropped: dropping it
-            // shuts the socket down and the client would read EOF instead of
-            // the stall this test is about.
-            let (mut reader, _writer) = stream.into_split();
-            let _ = read_frame(&mut reader).await;
-            let _ = accepted.send(());
-            let _ = release_rx.await;
-        });
-
-        let subscribing = {
-            let socket = socket.clone();
-            tokio::spawn(async move {
-                DaemonClient::new(socket)
-                    .begin_coordinator_readiness()
-                    .await
-            })
-        };
-        accepted_rx
-            .await
-            .expect("the deck must have taken the connection and read the request");
-        tokio::time::pause();
-
-        // Under a paused clock tokio advances to the NEAREST deadline, so the
-        // bound under test fires first while it has one, and this outer bound
-        // fires only when it does not. Neither costs wall clock; without it a
-        // regression is a hung job rather than a red test.
-        let outcome = tokio::time::timeout(Duration::from_secs(600), subscribing)
-            .await
-            .expect(
-                "begin_coordinator_readiness() must bound its own wait rather than await a \
-                 reply that is not coming",
-            )
-            .expect("the subscribing task must not panic");
-
-        let _ = release.send(());
-        let _ = silent.await;
-
-        let error = outcome.expect_err("a deck that never answers must not resolve as subscribed");
-        assert!(
-            error.contains("did not answer"),
-            "the elapsed case must say the deck took the connection and stalled, rather than \
-             reading as a transport failure: {error}"
-        );
-        assert!(
-            error.contains(
-                &crate::daemon_bridge::DECK_REPLY_TIMEOUT
-                    .as_secs()
-                    .to_string()
-            ),
-            "and name the bound it exceeded: {error}"
-        );
     }
 }

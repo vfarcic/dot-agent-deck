@@ -1,0 +1,12 @@
+---
+source: tests/render_dashboard.rs
+expression: rendered
+---
+┌ 1 ClaudeCode · api-svc ───────── ● Idle ✉1 waiting to wake: send it a prompt ┐
+│Dir:  api-svc                                                                 │
+│Prmt: move the stats into the border                                          │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└───────────────────────────────────────────────────────── Last: 1h  Tools: 14 ┘

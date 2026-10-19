@@ -71,8 +71,8 @@ impl Remote {
         fs::create_dir_all(&local).unwrap();
         // A hard link retains the build without overwriting Cargo's inode.
         for path in [&installed, &retained] {
-            if fs::hard_link(env!("CARGO_BIN_EXE_dot-agent-deck"), path).is_err() {
-                fs::copy(env!("CARGO_BIN_EXE_dot-agent-deck"), path).unwrap();
+            if fs::hard_link(common::contained_deck_binary(), path).is_err() {
+                fs::copy(common::contained_deck_binary(), path).unwrap();
             }
         }
         let version_output = Command::new(&retained).arg("--version").output().unwrap();
@@ -289,7 +289,7 @@ impl Remote {
     }
 
     pub(crate) fn piped(&self, extra: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        let mut command = Command::new(common::contained_deck_binary());
         command
             .args(["remote", "upgrade", DECK])
             .args(extra)
@@ -454,7 +454,7 @@ impl Terminal {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        let mut command = CommandBuilder::new(common::contained_deck_binary());
         command.args(args);
         command.env_clear();
         command.cwd(cwd);

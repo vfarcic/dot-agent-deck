@@ -55,6 +55,48 @@ export type AgentBlocked = {
   resetsAtMs?: number;
 };
 /**
+ * PRD #1666: an agent's inbox as the daemon summarises it. `queued` and
+ * `fetched` are both still pending — the card counts them together — and
+ * `lastAckedAt` is when the agent last acknowledged a message, which is what
+ * "delivered" means.
+ */
+export type AgentInbox = {
+  queued: number;
+  fetched: number;
+  undeliverable: number;
+  lastAckedAt?: string;
+  /** How a new message would reach the agent: `native`, `turn_end`, `doorbell` or `none`. */
+  wake: string;
+  component?: string;
+  /** PR #1735 fifth review (R5): nothing has woken the agent for its waiting messages. */
+  wakeStalled?: boolean;
+  /** PRD #1666 §6.5: the deck messages waiting on the user's Retry or Cancel. */
+  attention?: InboxAttentionItem[];
+  /** PRD #1666 §11: why the agent's integration takes no deck messages yet. */
+  integration?: "cli_too_old" | "adapter_too_old" | "not_armed" | "refresh_failed" | "refresh_failed_pi";
+  /** PRD #1666 §3: the deck's error recording receipts for this agent. */
+  receiptsDegraded?: string;
+  /** PRD #1666 §7: delivered messages whose evidence pauses hand-outs. */
+  evidencePaused?: number;
+};
+/**
+ * PRD #1666 §6.4: one deck message an agent card lists for the user to decide
+ * on. `revision` is what Retry and Cancel compare on, so a second client
+ * acting on the same message is told it was too late.
+ */
+export type InboxAttentionItem = {
+  messageId: string;
+  revision: number;
+  kind: "uncertain" | "out_of_attempts" | "held_long" | "not_started";
+  fromLabel: string;
+  subject: string;
+  taskId?: string;
+};
+/** PRD #1666 §6.4: the two user actions on a listed deck message. */
+export type InboxActionVerb = "retry" | "cancel";
+/** PRD #1666 §2: the daemon's answer to Retry or Cancel. */
+export type InboxActionResult = { outcome: string };
+/**
  * Issue #1678: the background work an agent left running after its turn ended,
  * as the DAEMON counts it — commands still running in their own session and
  * subagents started and not yet stopped. Present only with at least one count
@@ -891,6 +933,18 @@ export interface AgentSession {
   /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
   blocked?: AgentBlocked;
   /**
+   * HONEST. PRD #1666: the agent's inbox as the daemon summarises it
+   * (`AgentRecord.inbox`). Absent from a daemon predating the inbox and in
+   * fixture mode.
+   */
+  inbox?: AgentInbox;
+  /**
+   * HONEST. PRD #1666: the deck's notice explaining an `error` status — today a
+   * message the deck could not deliver to this agent. A display copy, present
+   * only while the daemon reports the agent in error.
+   */
+  deliveryNotice?: string;
+  /**
    * HONEST. PRD #1631: the question the agent is waiting on, from the daemon's
    * snapshot. Every text field is the agent's own words, scrubbed by the
    * crate; render it through `displayText` like any other free-form string.
@@ -1114,19 +1168,21 @@ export type DeckFleet = DeckSnapshot[];
 
 /** One delegation's lifecycle, driven by the daemon's handoff events. */
 export interface HandoffEdge {
-  /** The daemon's delegation id (`dlg-<millis>-<seq>`). */
+  /** The delegated message's inbox id (`m-…`), PRD #1666. */
   id: string;
   toRole: string;
   orchestration?: string;
   taskPreview?: string;
   /**
-   * delegated → delivered → done is the healthy path; failed is terminal and
-   * carries `reason`. `respawned` marks that the worker was restarted for this
-   * delegation (expected for clear=true roles).
+   * delegated → delivered → done is the healthy path; failed (the message was
+   * not delivered) is terminal and carries `reason`. `respawned` marks that the
+   * worker was restarted for this delegation (expected for clear=true roles).
    */
   status: "delegated" | "delivered" | "failed" | "done";
   respawned: boolean;
   reason?: string;
+  /** The worker report that marked this edge done, so a redelivered report marks nothing else. */
+  reportId?: string;
   /** Wall-clock of the newest event applied to this edge (HH:MM:SS). */
   at: string;
 }
@@ -1204,15 +1260,11 @@ export type DeckAction =
    * named as.
    */
   | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string }[] }
-  | { type: "rename_agent"; agentId: string; displayName: string }
-  | { type: "submit_text"; agentId: string; text: string };
+  | { type: "rename_agent"; agentId: string; displayName: string };
 
 /**
- * The daemon's honest delivery outcome for submitted input, mirroring the Rust
- * `SendResult` (kebab-case on the wire). Only `applied` and `queued` mean the
- * text reached the agent; every other value — including an unrecognised future
- * one decoded as `unknown` — is a non-delivery the UI must not dress up as
- * success.
+ * Whether an agent's pane takes input. The terminal reads `history-only` and
+ * `no-live-target` off the agent's write lease (`lib/terminalInput.ts`).
  */
 export type SendResult =
   | "applied"
@@ -1224,15 +1276,9 @@ export type SendResult =
   | "ambiguous"
   | "unknown";
 
-/**
- * What `desktop_run_action` reports back. The Rust command returns `ok: false`
- * with a non-delivered `sendResult` instead of raising, so a caller that only
- * awaits the promise cannot tell delivery from silent loss — every consumer of
- * `submit_text` must read this.
- */
+/** What `desktop_run_action` reports back. */
 export interface DeckActionResult {
   ok: boolean;
-  sendResult?: SendResult;
   message?: string;
   /**
    * The id of the agent the action acted on — for `start_agent`, the one the
@@ -1241,11 +1287,6 @@ export interface DeckActionResult {
    * consumer keys it as `(deckId, agentId)`, never alone.
    */
   agentId?: string;
-}
-
-/** True only for the two outcomes that actually reached the agent. */
-export function isDelivered(result: DeckActionResult): boolean {
-  return result.ok && (result.sendResult === undefined || result.sendResult === "applied" || result.sendResult === "queued");
 }
 
 /** Operator-facing explanation of a non-delivered outcome. */
@@ -1461,26 +1502,8 @@ export interface DeckRuntimeState {
   upgradeDaemon?: (deckId: string, onEvent: (event: import("./lib/upgrade").UpgradeEvent) => void) => Promise<import("./lib/upgrade").UpgradeOutcome>;
   /** Answer question `questionId` of the upgrade `upgradeId`. */
   decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
-  /**
-   * Issue #1042 — the last NON-DELIVERED `SendResult` the guarded send verb
-   * returned, per agent id. An agent with no entry has nothing unresolved.
-   *
-   * This is the post-hoc half of the terminal's input state. `history-only` and
-   * `no-live-target` are read off `AgentSession.writeLease` and need no send;
-   * `wrong-session` is decided at write time, is carried by no snapshot field,
-   * and after a rollover the pane reads `writeLease === "write"` — it looks
-   * deliverable precisely when a send would fail. So it can only be known by
-   * trying, which makes a returned verdict the only place it can come from.
-   *
-   * Optional, and absence is a real state rather than an oversight: a runtime
-   * through which nothing has ever been submitted has no verdicts to report.
-   *
-   * **Keyed by `agentKey(deckId, agentId)` since PRD #1105's security audit**,
-   * not by the bare id. A verdict recorded for deck A's `planner` would
-   * otherwise disable deck B's pane and render A's rejection notice under B's
-   * heading — the ids collide across decks by construction.
-   */
-  terminalInputResults?: Record<string, SendResult>;
+  /** PRD #1666 §6.4: Retry or Cancel one listed deck message; absent where no daemon can answer. */
+  inboxAction?: (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**

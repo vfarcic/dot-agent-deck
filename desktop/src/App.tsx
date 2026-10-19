@@ -797,7 +797,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   // voice-registry-exempt: a mirror of the open pane's own tab, written only by the screen's report so the voice panel can see it; it switches nothing
   const [paneTab, setPaneTab] = useState<PanelTab>("terminal");
   const paneShownAgent = base === "overview" ? (paneDeck ? paneAgentShown : undefined) : paneAgent;
-  const paneInput = agentView && paneShownAgent ? terminalInputState(paneShownAgent, runtime.terminalInputResults?.[agentKey(agentView.deckId, agentView.agentId)]) : undefined;
+  const paneInput = agentView && paneShownAgent ? terminalInputState(paneShownAgent) : undefined;
   const voicePane = useMemo<VoicePane | undefined>(() => (agentView && paneShownAgent && paneInput
     ? {
       deckId: agentView.deckId,
@@ -1424,7 +1424,6 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
          rejection notice under this agent's heading, and that deck's cached
          grid would be submitted to this agent's PTY — reflowing it, and every
          other viewer attached to it, from a viewport on another machine. */
-      inputResult={runtime.terminalInputResults?.[agentKey(view.deckId, agent.id)]}
       onSelect={() => undefined}
       onTabChange={setTab}
       onTerminalInput={keyboardInput}
@@ -2500,7 +2499,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   tab={tabs[agent.id] ?? "terminal"}
                   terminalFeed={runtime.terminalFeed}
                   evidence={snapshot.evidence}
-                  inputResult={runtime.terminalInputResults?.[agentKey(agent.daemonId, agent.id)]}
                   terminalFocusToken={terminalFocus?.agentId === agent.id ? terminalFocus.token : 0}
                   voiceNumber={tileNumbers && index >= (tilesPaged ? tileSlice.start : 0) && index < (tilesPaged ? tileSlice.end : snapshot.agents.length) ? index - (tilesPaged ? tileSlice.start : 0) + 1 : undefined}
                   offPage={tilesPaged && (index < tileSlice.start || index >= tileSlice.end)}
@@ -2512,6 +2510,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   appliedGeometry={runtime.appliedGeometry?.[agentKey(agent.daemonId, agent.id)]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext, { open: true }); }}
                   onRename={mode === "live" ? renameAgent : undefined}
+                  onInboxAction={runtime.inboxAction}
                   /*
                     Opening SELECTS as well, which is the difference between the
                     overlay's `selected` being harmlessly degenerate and being

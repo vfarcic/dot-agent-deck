@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::event::{
-    AGENT_EVENT_SCHEMA_VERSION, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
+    AGENT_EVENT_SCHEMA_VERSION, AgentType, EventType, LiveTarget, TargetKind, Writable,
 };
 use spec::spec;
 
@@ -50,30 +50,20 @@ fn check_codex_sandbox_can_start() -> Result<(), String> {
     }
 }
 
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = std::path::Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
-
 /// Scenario: Restore a pane running `dot-agent-deck wrap --agent codex` around
 /// a deterministic shell stand-in that paints interactive-Codex-shaped text and
 /// ends its turn through Codex's native `Stop` hook, as real Codex does.
 /// Subscribe to the real daemon event stream and detach to the dashboard;
 /// events must carry the Codex identity and schema version while the visible
-/// card moves Thinking → Idle and reads `Codex`. Send identity-bound input and
-/// require it to reach the wrapped child exactly once.
+/// card moves Thinking → Idle and reads `Codex`. Type input into the pane the
+/// way a client does and require it to reach the wrapped child exactly once.
 #[spec("codex/wrap/001")]
 #[test]
 fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
     let command = "dot-agent-deck wrap --agent codex -- /bin/sh codex-standin.sh";
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_continue_session("", command)
         .launch_with_fixture("codex-synthetic");
 
@@ -107,19 +97,10 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
         .agent_id
         .as_deref()
         .expect("managed wrapper event carries its agent id");
-    let response = common::write_and_submit_with_identity_on(
-        deck.attach_socket_path(),
-        pane_id,
-        "MANAGED-WRAPPER-WRITE",
-        agent_id,
-        Some(&working.session_id),
-    )
-    .expect("write through managed wrapper pane");
-    assert_eq!(
-        response.send_result,
-        Some(SendResult::Applied),
-        "dashboard writes to a managed wrapped Codex pane must be applied to its live PTY"
-    );
+    // Held open until the child has the line: the daemon reads an attach
+    // stream's input only after answering it, so closing at once can drop it.
+    let mut input = common::AttachInput::attach(deck.attach_socket_path(), agent_id);
+    input.write("MANAGED-WRAPPER-WRITE\r");
     assert!(
         common::wait_for_file_substr_count(
             &deck.workdir().join("managed-wrapper-input.log"),
@@ -129,6 +110,7 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
         ),
         "the managed wrapper declared Live but the submitted write never reached its child"
     );
+    drop(input);
     assert!(
         deck.wait_for_stream_string_within("Thinking", Duration::from_secs(10)),
         "the wrapped Codex card never visibly entered Thinking:\n{}",
@@ -179,7 +161,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     skip_unless!(check_codex_sandbox_can_start());
 
     let prompt = format!(
-        "Use the shell to list the current directory and confirm {SENTINEL_NAME} exists. Then write exactly {SENTINEL_NAME} followed by a newline to {INTERACTIVE_PROOF_NAME}. Do not modify any other file."
+        "Use the shell to run pwd, then list exactly the directory it prints and confirm {SENTINEL_NAME} exists. Then write exactly {SENTINEL_NAME} followed by a newline to {INTERACTIVE_PROOF_NAME} in that same directory. Do not modify any other file."
     );
     let command = format!(
         "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",
@@ -191,7 +173,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
         .expect("write bare Codex default command");
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_imported_codex_credentials()
         .launch_with_fixture("codex-live");
@@ -307,7 +289,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
 fn codex_wrap_002_preserves_tty_resize_input_and_interrupt() {
     let command = "dot-agent-deck wrap --agent codex -- ./tty-probe.sh";
     let mut deck = TuiDeck::builder()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_continue_session("tty-probe", command)
         .launch_with_fixture("codex-tty-probe");
     deck.wait_for_string("[Command Mode Ctrl+D]");

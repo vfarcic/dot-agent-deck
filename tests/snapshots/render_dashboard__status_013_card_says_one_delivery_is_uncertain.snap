@@ -1,0 +1,12 @@
+---
+source: tests/render_dashboard.rs
+expression: rendered
+---
+┌ 1 ClaudeCode · api-svc ───────────────────── ● Thinking ✉ delivery uncertain ┐
+│Dir:  api-svc                                                                 │
+│a deck message may or may not have reached this agent. Retry sends it again m…│
+│Prmt: move the stats into the border                                          │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└───────────────────────────────────────────────────────── Last: 1h  Tools: 14 ┘

@@ -20,8 +20,12 @@
     "webfetch": "allow",
     "websearch": "allow",
     "external_directory": {
-      "/home/vfarcic/.cargo/**": "allow",
-      "/home/vfarcic/.rustup/toolchains/**": "allow"
+      "{env:HOME}/.cargo/**": "allow",
+      "{env:HOME}/.rustup/toolchains/**": "allow",
+      "*/lib/node_modules": "allow",
+      "*/lib/node_modules/*": "allow",
+      "{env:HOME}/.local/lib": "allow",
+      "{env:HOME}/.local/lib/*": "allow"
     }
   }
 }

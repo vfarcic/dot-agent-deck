@@ -68,29 +68,89 @@ fn form_001_click_mode_chip_selects() {
     deck.wait_for_string("schedule mode");
 }
 
-/// Scenario: Open the form, fill Name + Command via the keyboard, then click
-/// `[Submit]`. The pane must be created with the entered values — the same as
-/// Enter — so the form closes and the new pane (named `subm5`) appears. RED
-/// until M8 renders the `[Submit]` button.
+/// Read the visible value, excluding the form's border and padding.
+fn form_field_value(grid: &str, label: &str) -> Option<String> {
+    grid.lines().find_map(|line| {
+        line.split_once(label).map(|(_, value)| {
+            value
+                .split('│')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+    })
+}
+
+/// Wait for both edited values and the visible cursor in the blank Command field.
+fn wait_for_edited_form(deck: &TuiDeck, name: &str) {
+    deck.capture_screen_when("edited Name and blank, focused Command", |screen| {
+        let grid = screen.contents();
+        let (row, line) = grid
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("Command:"))?;
+        let col = line.find("Command:")?;
+        let value_col = line[..col].chars().count() + "Command: ".len();
+        (form_field_value(&grid, "Name:").as_deref() == Some(name)
+            && form_field_value(&grid, "Command:").as_deref() == Some("")
+            && !screen.hide_cursor()
+            && screen.cursor_position() == (row as u16, value_col as u16))
+            .then_some(())
+    });
+}
+
+/// Scenario: At 120x40 and 200x55, open the form with a configured command, replace the suggested Name and clear exactly the Command's length. Wait for the edited values and Command cursor, then click Submit once; the dialog must close and a shell pane named subm5 must appear.
 #[spec("mouse/form/001")]
 #[test]
 fn form_001_click_submit_creates_pane() {
-    let deck = TuiDeck::launch_with_fixture("form");
-    open_form(&deck);
+    // Mirrors the seed helper's pre-filled command without launching a real agent.
+    let configured_command =
+        "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write";
+    let config = common::harness_tempdir().unwrap();
+    std::fs::write(
+        config.path().join("config.toml"),
+        format!("default_command = {configured_command:?}\n"),
+    )
+    .unwrap();
 
-    deck.send_bytes(b"\t"); // Mode → Name
-    deck.send_bytes(b"subm5");
-    deck.send_bytes(b"\t"); // Name → Command
-    deck.send_bytes(b"sleep 600"); // plain command → real pane, no credentials
+    for (cols, rows) in [(120, 40), (200, 55)] {
+        let deck = TuiDeck::builder()
+            .with_pty_size(cols, rows)
+            .with_env(
+                "DOT_AGENT_DECK_CONFIG",
+                config.path().join("config.toml").to_string_lossy(),
+            )
+            .launch_with_fixture("form");
+        open_form(&deck);
 
-    click_target(&deck, "[Submit]");
+        let initial_name = deck.capture_screen_when("initial Name value", |screen| {
+            form_field_value(&screen.contents(), "Name:")
+        });
+        deck.send_bytes(b"\t"); // Mode → Name
+        deck.send_bytes(&vec![0x7f; initial_name.chars().count()]);
+        deck.send_bytes(b"subm5");
+        deck.wait_until_grid("Name changed to subm5", |grid| {
+            form_field_value(grid, "Name:").as_deref() == Some("subm5")
+        });
+        deck.send_bytes(b"\t"); // Name → Command
+        deck.send_bytes(&vec![0x7f; configured_command.chars().count()]);
+        wait_for_edited_form(&deck, "subm5");
 
-    // Submitted like Enter: the form closes (its title gone) and the named
-    // pane was created (the "subm5" card remains). The combined wait is the
-    // assertion.
-    deck.wait_until_grid("form closed and subm5 pane created", |g| {
-        !g.contains("┌ New Agent") && g.contains("subm5")
-    });
+        let (col, row) = deck.wait_for_in_grid("[Submit]");
+        eprintln!(
+            "single Submit click at {cols}x{rows}: cell=({col},{row}), cursor={:?}\n{}",
+            deck.terminal_cursor_snapshot(),
+            common::redact_credentials_for_output(&deck.snapshot_grid())
+        );
+        deck.click(col, row);
+        deck.wait_until_grid(
+            &format!(
+                "one Submit click at ({col},{row}) closes form and creates subm5 at {cols}x{rows}"
+            ),
+            |grid| !grid.contains("┌ New Agent") && grid.contains("subm5"),
+        );
+    }
 }
 
 /// Scenario: Open the form, type a Name, then click `[Cancel]`. The form must

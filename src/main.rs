@@ -129,13 +129,13 @@ enum Commands {
     /// that far: no daemon was reachable, the daemon refused it (the reason is
     /// printed), or the command line itself was unusable.
     ///
-    /// What happened arrives afterwards, typed into this pane: first the
+    /// What happened arrives afterwards as messages in this agent's inbox: first the
     /// daemon's reply to the dispatch, beginning `dispatch:`. A reply beginning
     /// `dispatch: spawned isolated` names what was started and where; a reply
     /// with any other opening is a failure and says why. A spawned unit has
     /// still not been confirmed to have received its task. The report it sends
     /// later, when it finishes, beginning `dispatch: a unit you dispatched has
-    /// completed`, is the first thing delivered to this pane that indicates it
+    /// completed`, is the first message that indicates it
     /// did — an indication, not proof, since the deck does not tie that report
     /// to the task's delivery.
     ///
@@ -261,13 +261,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Acknowledge that a delegated task reached you, so the deck stops
-    /// re-sending its pointer. Run it with the delivery id your task file names
-    /// (`d-` plus 8 hex characters). Always exits 0: a failed acknowledgement
-    /// is harmless, and the task goes on either way.
+    /// Acknowledge a message the deck delivered to you (`m-…`). Exits non-zero
+    /// only when the deck says it holds no such message for you; any other
+    /// failure to acknowledge is harmless, and the task goes on.
     Ack {
-        /// The delivery id from the task file, e.g. `d-7f3a9c21`.
+        /// The message id (`m-…`).
         delivery_id: String,
+        /// Print the deck's answer as one JSON line, for the agent-side
+        /// components that confirm their acknowledgements.
+        #[arg(long, hide = true)]
+        json: bool,
+    },
+    /// Read and manage this agent's dot-agent-deck inbox.
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
     },
     /// Report an agent lifecycle state, a submitted prompt or a tool call so
     /// the pane's card updates (PRD #201 M1.2, issue #622). Used by an agent's
@@ -290,11 +298,11 @@ enum Commands {
         /// A short description of the tool call, e.g. its command or path.
         #[arg(long = "tool-detail", allow_hyphen_values = true)]
         tool_detail: Option<String>,
-        /// Declare that the reporter reports every prompt the agent submits,
-        /// so the deck may re-submit a delivered prompt it never reported
-        /// (issue #1567). Sent by the bundled Pi extension on every report.
-        #[arg(long = "reports-prompts")]
-        reports_prompts: bool,
+        /// Accepted and ignored. Pi extensions from before PRD #1666 pass it on
+        /// every report to declare that they report every prompt; nothing reads
+        /// that any more, so the flag does nothing.
+        #[arg(long = "reports-prompts", hide = true)]
+        _reports_prompts: bool,
         /// Read the final reply of the turn that just settled (with `--type
         /// finished`) from stdin, for the deck's reading mode (PRD #1497). Sent
         /// by the bundled Pi extension, which writes the reply to stdin so it
@@ -307,13 +315,12 @@ enum Commands {
         turn_reply_failed: bool,
     },
     /// Print the seed/prompt the daemon prepared for this pane, then clear it
-    /// (PRD #201 native prompt delivery). READ-ONLY: it asks the daemon over
-    /// the hook socket for the pane's pending seed and prints it to stdout
-    /// (empty output = no seed). The bundled Pi extension shells this on
-    /// `session_start` and, if the output is non-empty, delivers it natively
-    /// via `pi.sendUserMessage` — so a Pi pane's first prompt no longer needs
-    /// PTY keystroke injection. Uses `DOT_AGENT_DECK_PANE_ID` to scope the
-    /// request, exactly like `agent-event`.
+    /// (PRD #201). A compatibility alias: the daemon posts a pane's seed as its
+    /// first inbox message (PRD #1666 S5), and this verb takes it from the
+    /// inbox and prints it to stdout (empty output = no seed). A Pi generation
+    /// is refused (PRD #1666 G10); the bundled Pi extension no longer calls it.
+    /// Uses `DOT_AGENT_DECK_PANE_ID` to scope the request, exactly like
+    /// `agent-event`.
     GetSeed,
     /// Report a question an agent is asking and wait for the deck's answer
     /// (PRD #1631). Run by the deck's OpenCode plugin and Pi extension, not by
@@ -767,6 +774,114 @@ enum WorktreeCmd {
 }
 
 #[derive(Subcommand)]
+enum InboxAction {
+    /// Print every message waiting for you, framed as from the deck, and
+    /// acknowledge them.
+    Fetch {
+        /// Print the deck's JSON answer instead.
+        #[arg(long)]
+        json: bool,
+        /// For an agent-side component that caught the doorbell naming this
+        /// message: fetch without acknowledging, and only while that message
+        /// is still waiting. Implies `--json`.
+        #[arg(long, hide = true, value_name = "ID")]
+        doorbell: Option<String>,
+        /// The integration the component running a doorbell fetch declares
+        /// (PRD #1666 §11). Run by that component, not by hand.
+        #[arg(long, hide = true, value_name = "N")]
+        adapter_integration: Option<u32>,
+        /// The receiver incarnation a doorbell fetch's attempts are bound to:
+        /// the component's own stream (PRD #1666 §4).
+        #[arg(long, hide = true, value_name = "RX")]
+        rx: Option<u64>,
+    },
+    /// List your messages and their delivery states.
+    List {
+        /// Print the deck's JSON answer instead.
+        #[arg(long)]
+        json: bool,
+        /// From an orchestrator pane: every inbox in its orchestration.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Wait for messages on behalf of an agent's hook, plugin or extension.
+    /// Run by those components, not by hand.
+    Wait {
+        /// The agent the component belongs to (`claude-code`, `opencode`,
+        /// `pi`, `codex`, `devin`).
+        #[arg(long)]
+        agent: String,
+        /// Stay connected and print each message as a JSON line, reading the
+        /// component's receipt controls from stdin.
+        #[arg(long)]
+        stream: bool,
+        /// The deck integration the component that runs this watcher
+        /// declares; with it the stream carries deck message receipts.
+        #[arg(long, value_name = "N")]
+        adapter_integration: Option<u32>,
+        /// Register a receiver that only carries the component's doorbell
+        /// substitutions.
+        #[arg(long, hide = true)]
+        doorbell_only: bool,
+        /// The component's callbacks survived since its previous watcher.
+        #[arg(long, hide = true)]
+        resumed: bool,
+    },
+    /// Tell the deck an agent's native inbox component is about to arm. Run
+    /// by those components, not by hand.
+    #[command(hide = true)]
+    Announce {
+        /// The agent the component belongs to.
+        #[arg(long)]
+        agent: String,
+    },
+    /// Announce something to every agent in your orchestration (or dispatch
+    /// tree) subscribed to TOPIC. They see it as another agent's text, to
+    /// use as information.
+    Publish {
+        /// The topic: lowercase letters, digits and hyphens.
+        topic: String,
+        #[command(flatten)]
+        body: InboxBody,
+    },
+    /// From an orchestrator pane: offer a job to the first free worker whose
+    /// role takes jobs from POOL. One worker gets it; you are told when it is
+    /// claimed, completed, or its claim expires.
+    Offer {
+        /// The pool: lowercase letters, digits and hyphens.
+        pool: String,
+        #[command(flatten)]
+        body: InboxBody,
+        /// How long the worker that takes the job may hold it before it is
+        /// offered to another, e.g. `30m`, `1h30m`, `90s`.
+        #[arg(long, value_name = "DURATION")]
+        claim_ttl: Option<String>,
+    },
+    /// Report a job you were offered as done.
+    Complete {
+        /// The job's message id.
+        id: String,
+    },
+    /// Hand a job you were offered back, so another worker can take it.
+    Release {
+        /// The job's message id.
+        id: String,
+    },
+}
+
+/// The text of an `inbox publish` or `inbox offer`.
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct InboxBody {
+    /// The text.
+    #[arg(long)]
+    text: Option<String>,
+    /// Read the text from this file (`-` reads stdin).
+    #[arg(long, value_name = "PATH")]
+    file: Option<String>,
+}
+
+#[derive(Subcommand)]
 enum HooksAction {
     /// Install hooks for an agent
     Install {
@@ -911,6 +1026,45 @@ enum AckStream {
 /// still with exit 0: nothing proves the deck matched the ack, so the worker
 /// must not be told it did, and nothing proves it failed either, so the worker
 /// carries on.
+/// PRD #1666: whether the deck positively said it holds no message under the
+/// id for this agent — the one `ack` outcome that exits non-zero, so an agent
+/// that acknowledged the wrong id learns it. Every other failure to confirm
+/// stays a success, for the reason [`ack_report`] gives.
+fn ack_was_refused_by_id(reply: &AckReply) -> bool {
+    use dot_agent_deck::event::AckDelivery;
+    use dot_agent_deck::hook::SocketReply;
+    let AckReply::Socket(SocketReply::Line(line)) = reply else {
+        return false;
+    };
+    parse_signal_ack(line).is_some_and(|ack| {
+        ack.accepted
+            && matches!(
+                ack.delivery,
+                Some(AckDelivery::Unknown | AckDelivery::WrongAgent | AckDelivery::Undeliverable)
+            )
+    })
+}
+
+/// PR #1735 second review: `ack --json`'s one line, for an agent-side
+/// component that must know whether the deck recorded its acknowledgement (the
+/// Pi extension confirms each one it sends over its watcher, which answers
+/// nothing). `final` is true when the deck refused the id itself, so asking
+/// again changes nothing; every other unrecorded answer may be asked again.
+fn ack_json(reply: &AckReply) -> serde_json::Value {
+    use dot_agent_deck::hook::{AckConfirmation, ack_confirmation};
+    if let AckReply::Socket(socket) = reply {
+        match ack_confirmation(socket) {
+            AckConfirmation::Recorded => return serde_json::json!({"acknowledged": true}),
+            AckConfirmation::Refused(reason) => {
+                return serde_json::json!({"acknowledged": false, "final": true, "reason": reason});
+            }
+            AckConfirmation::Unconfirmed => {}
+        }
+    }
+    let (_, message) = ack_report(reply);
+    serde_json::json!({"acknowledged": false, "final": false, "reason": message})
+}
+
 fn ack_report(reply: &AckReply) -> (AckStream, String) {
     use dot_agent_deck::event::AckDelivery;
     use dot_agent_deck::hook::SocketReply;
@@ -922,7 +1076,7 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
         )
     };
     match reply {
-        AckReply::Malformed => not_confirmed("that is not a delivery id"),
+        AckReply::Malformed => not_confirmed("that is not a message id"),
         AckReply::NoPane => not_confirmed("not running inside a dot-agent-deck managed pane"),
         AckReply::Socket(SocketReply::Unreachable) => not_confirmed("the deck is not reachable"),
         AckReply::Socket(SocketReply::NoReply) => {
@@ -937,9 +1091,22 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
                 Some(AckDelivery::Unknown) => (
                     AckStream::Stderr,
                     format!(
-                        "The deck has no delivery under that id for this pane (mistyped, or from \
-                         an earlier task), so it may send the task pointer again; {CARRY_ON}"
+                        "Unknown id: the deck has no delivery under that id for this pane \
+                         (mistyped, or from an earlier task), so it may send the task pointer \
+                         again; {CARRY_ON}"
                     ),
+                ),
+                Some(AckDelivery::WrongAgent) => (
+                    AckStream::Stderr,
+                    "That message is addressed to another agent (wrong_agent); it was not \
+                     acknowledged."
+                        .to_string(),
+                ),
+                Some(AckDelivery::Undeliverable) => (
+                    AckStream::Stderr,
+                    "That message is no longer deliverable (undeliverable); it was not \
+                     acknowledged."
+                        .to_string(),
                 ),
                 Some(_) => not_confirmed("the deck's reply was not one this build understands"),
                 None => not_confirmed("the deck did not say whether the delivery id matched"),
@@ -1184,6 +1351,18 @@ fn blocked_workers_note(resp: &dot_agent_deck::event::DelegateResponse) -> Optio
         ));
     }
     Some(lines.join("\n"))
+}
+
+/// A delegated-task delivery id from before PRD #1666 (`d-` and eight lowercase
+/// hex digits). Still sent, so the deck can answer that it holds no such
+/// message instead of the CLI calling a task file's id malformed.
+fn is_retired_delivery_id(id: &str) -> bool {
+    id.strip_prefix("d-").is_some_and(|hex| {
+        hex.len() == 8
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 fn main() -> ExitCode {
@@ -1586,9 +1765,50 @@ fn main() -> ExitCode {
             };
             send_signal_and_report_ack(&json, "work-done", "work-done report")
         }
-        Some(Commands::Ack { delivery_id }) => {
+        Some(Commands::Inbox { action }) => match action {
+            InboxAction::Fetch {
+                doorbell: Some(id),
+                adapter_integration,
+                rx,
+                ..
+            } => dot_agent_deck::inbox_cli::fetch_for_doorbell(&id, adapter_integration, rx),
+            InboxAction::Fetch {
+                json,
+                doorbell: None,
+                ..
+            } => dot_agent_deck::inbox_cli::fetch(json),
+            InboxAction::List { json, all } => dot_agent_deck::inbox_cli::list(json, all),
+            InboxAction::Wait {
+                agent,
+                stream,
+                adapter_integration,
+                doorbell_only,
+                resumed,
+            } => dot_agent_deck::inbox_cli::wait(
+                &agent,
+                stream,
+                dot_agent_deck::inbox_cli::Receipt {
+                    adapter_integration,
+                    doorbell_only,
+                    resumed,
+                },
+            ),
+            InboxAction::Announce { agent } => dot_agent_deck::inbox_cli::announce(&agent),
+            InboxAction::Publish { topic, body } => {
+                dot_agent_deck::inbox_cli::publish(&topic, body.text, body.file)
+            }
+            InboxAction::Offer {
+                pool,
+                body,
+                claim_ttl,
+            } => dot_agent_deck::inbox_cli::offer(&pool, body.text, body.file, claim_ttl),
+            InboxAction::Complete { id } => dot_agent_deck::inbox_cli::settle(&id, true),
+            InboxAction::Release { id } => dot_agent_deck::inbox_cli::settle(&id, false),
+        },
+        Some(Commands::Ack { delivery_id, json }) => {
             let reply = match (
-                dot_agent_deck::delegate_retry::is_valid_delivery_id(&delivery_id),
+                dot_agent_deck::inbox::is_valid_message_id(&delivery_id)
+                    || is_retired_delivery_id(&delivery_id),
                 std::env::var(DOT_AGENT_DECK_PANE_ID),
             ) {
                 (false, _) => AckReply::Malformed,
@@ -1610,12 +1830,20 @@ fn main() -> ExitCode {
                     }
                 }
             };
-            let (stream, message) = ack_report(&reply);
-            match stream {
-                AckStream::Stdout => println!("{message}"),
-                AckStream::Stderr => eprintln!("{message}"),
+            if json {
+                println!("{}", ack_json(&reply));
+            } else {
+                let (stream, message) = ack_report(&reply);
+                match stream {
+                    AckStream::Stdout => println!("{message}"),
+                    AckStream::Stderr => eprintln!("{message}"),
+                }
             }
-            ExitCode::SUCCESS
+            if ack_was_refused_by_id(&reply) {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Some(Commands::AgentEvent {
             r#type,
@@ -1623,7 +1851,7 @@ fn main() -> ExitCode {
             prompt,
             tool_name,
             tool_detail,
-            reports_prompts,
+            _reports_prompts,
             turn_reply_stdin,
             turn_reply_failed,
         }) => {
@@ -1683,7 +1911,6 @@ fn main() -> ExitCode {
                     prompt,
                     tool_name,
                     tool_detail,
-                    reports_prompts,
                 },
             );
             // Issue #318: present this pane's hook capability token.
@@ -2282,11 +2509,11 @@ fn main() -> ExitCode {
             // Issue #243: the wrapper LOGS. Until this call it did not — the
             // subcommand went straight into `run_wrap`, so the two `tracing`
             // lines the interface watch emits (which of its two facts fired, the
-            // single most useful field diagnostic the readiness mechanism
-            // produces) were dropped on the floor by the no-op global
-            // subscriber, and `crate::state::dispatch_one_owned`'s claim that
-            // the fact is "in the wrapper's log" was false. Diagnosing a Codex
-            // delegate that never got its prompt meant reading the wire.
+            // single most useful field diagnostic for a wrapped agent's boot)
+            // were dropped on the floor by the no-op global subscriber, and the
+            // daemon's claim that the fact is "in the wrapper's log" was false.
+            // Diagnosing a Codex delegate that never got its prompt meant
+            // reading the wire.
             //
             // Safe in a pane. `init_logging_from_env` installs a subscriber ONLY
             // when `DOT_AGENT_DECK_LOG` is set, and that subscriber only ever
@@ -2695,6 +2922,8 @@ fn spawn_event_subscriber(
         drop_event: Some(e2e_subscriber_drops),
         #[cfg(feature = "e2e")]
         break_on_event: Some(e2e_subscriber_breaks),
+        #[cfg(feature = "e2e")]
+        applied: Some(e2e_subscriber_applied),
         ..SubscriberConfig::default()
     };
     tokio::spawn(run(DaemonClient::new(attach_path), state, config));
@@ -2746,6 +2975,31 @@ fn e2e_subscriber_breaks(event: &dot_agent_deck::event::AgentEvent) -> bool {
     event.pane_id.as_deref() == Some(pane)
         && format!("{:?}", event.event_type) == kind
         && !FIRED.swap(true, Ordering::SeqCst)
+}
+
+/// Reviewer R9T-05 e2e seam: when `DOT_AGENT_DECK_E2E_APPLIED_LOG` names a
+/// file, append `<pane id>\t<EventType>` to it for each event this subscriber
+/// has applied to the TUI's state, so a PTY test can hold a step until an
+/// event is in that state rather than merely on the socket
+/// (`newagent/visibility/001`'s attach race). Compiled only into the `e2e`
+/// build, like the seams above.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_applied(event: &dot_agent_deck::event::AgentEvent) {
+    let Some(path) = std::env::var_os("DOT_AGENT_DECK_E2E_APPLIED_LOG") else {
+        return;
+    };
+    let line = format!(
+        "{}\t{:?}\n",
+        event.pane_id.as_deref().unwrap_or(""),
+        event.event_type
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
 }
 
 /// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an
@@ -4606,7 +4860,7 @@ mod tests {
 
     /// Issue #1383: `ack` exits 0 whatever happens, and says on stderr — never
     /// as a failure — when receipt could not be confirmed. Only an accepted ack
-    /// whose id matched the pane's delivery prints "Acknowledged"; an unanswered
+    /// whose id matched a message the deck holds prints "Acknowledged"; an unanswered
     /// one (an older daemon) and a bare admission (PR #1414 review) do not.
     #[test]
     fn ack_report_is_never_a_failure_and_says_what_happened() {
@@ -4619,15 +4873,11 @@ mod tests {
             serde_json::to_string(&SignalAck::refused("missing_token", "no token")).unwrap();
         let cases = [
             (
-                line(SignalAck::acknowledged(AckDelivery::Stopped)),
+                line(SignalAck::acknowledged(AckDelivery::Acknowledged)),
                 AckStream::Stdout,
             ),
             (
                 line(SignalAck::acknowledged(AckDelivery::AlreadyAcknowledged)),
-                AckStream::Stdout,
-            ),
-            (
-                line(SignalAck::acknowledged(AckDelivery::NotPending)),
                 AckStream::Stdout,
             ),
             // Admitted, but the daemon did not say the id matched: an admission
@@ -4693,5 +4943,45 @@ mod tests {
             refused_message.contains("missing_token"),
             "{refused_message}"
         );
+    }
+
+    /// PR #1735 second review: `ack --json` says whether the deck recorded the
+    /// acknowledgement, and whether a refusal is final, for the components
+    /// that confirm theirs.
+    #[test]
+    fn ack_json_says_whether_the_deck_recorded_it() {
+        use dot_agent_deck::event::{AckDelivery, SignalAck};
+        use dot_agent_deck::hook::SocketReply;
+        let line = |ack: SignalAck| {
+            AckReply::Socket(SocketReply::Line(serde_json::to_string(&ack).unwrap()))
+        };
+        for delivery in [AckDelivery::Acknowledged, AckDelivery::AlreadyAcknowledged] {
+            assert_eq!(
+                ack_json(&line(SignalAck::acknowledged(delivery))),
+                serde_json::json!({"acknowledged": true})
+            );
+        }
+        for (delivery, reason) in [
+            (AckDelivery::Unknown, "unknown"),
+            (AckDelivery::WrongAgent, "wrong_agent"),
+            (AckDelivery::Undeliverable, "undeliverable"),
+        ] {
+            let reply = ack_json(&line(SignalAck::acknowledged(delivery)));
+            assert_eq!(reply["acknowledged"], false, "{reply}");
+            assert_eq!(reply["final"], true, "{reply}");
+            assert_eq!(reply["reason"], reason, "{reply}");
+        }
+        for reply in [
+            line(SignalAck::accepted()),
+            line(SignalAck::refused("inbox_not_agent_process", "outside")),
+            AckReply::Socket(SocketReply::NoReply),
+            AckReply::Socket(SocketReply::Unreachable),
+            AckReply::NoPane,
+        ] {
+            let reply = ack_json(&reply);
+            assert_eq!(reply["acknowledged"], false, "{reply}");
+            assert_eq!(reply["final"], false, "{reply}");
+            assert!(reply["reason"].is_string(), "{reply}");
+        }
     }
 }

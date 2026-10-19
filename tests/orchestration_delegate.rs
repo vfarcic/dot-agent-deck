@@ -74,10 +74,10 @@ fn spawn_worker_stub(registry: &Arc<AgentPtyRegistry>, cwd: &str, pane_env: &str
 /// Scenario: A Pi-identity orchestrator (the synthetic harness,
 /// `AgentType::Pi`, the `start = true` role) calls `delegate --to coder` from
 /// its pane; the daemon's real `handle_delegate` routes the task into the
-/// `coder` worker pane's PTY. Assert the worker `cat` stub received the
-/// single-line task pointer — the same contract `orchestration/delegate/001`
-/// proves for claude/opencode, now driven by a Pi orchestrator through the
-/// harness.
+/// `coder` worker's inbox. Assert the worker was posted one task, bound to it,
+/// carrying the delegated text from the orchestrator, with nothing typed into
+/// its pane — the same contract `orchestration/delegate/001` proves for
+/// claude/opencode, now driven by a Pi orchestrator through the harness.
 // The linkage-check scanner links `#[spec(...)]` to the next plain `fn`
 // (not `async fn`), so the spec'd entry point is a sync `#[test]` that
 // `block_on`s the async body (mirrors `session/live/007` in rehydration.rs).
@@ -135,10 +135,37 @@ async fn delegate_005_pi_orchestrator_delegate_routes_to_worker_inner() {
     let signal = pi.delegate("List the files in the current directory.", &[WORKER_ROLE]);
     state.handle_delegate(signal, &registry, &event_tx).await;
 
-    let snap = wait_for_needle(&registry, &worker_agent_id, POINTER, Duration::from_secs(5)).await;
+    // PRD #1666 S5: the task is posted to the worker's inbox, bound to the
+    // worker, carrying the delegated text — and nothing is typed into its pane.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let task = loop {
+        let task = registry
+            .inbox()
+            .list(WORKER_PANE)
+            .into_iter()
+            .zip(registry.inbox().rendered(WORKER_PANE))
+            .find(|(message, _)| message.bind_agent.as_deref() == Some(worker_agent_id.as_str()))
+            .map(|(_, delivery)| delivery.text);
+        if task.is_some() || tokio::time::Instant::now() >= deadline {
+            break task;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let task = task.unwrap_or_else(|| {
+        panic!(
+            "Pi orchestrator's delegate never reached the coder worker's inbox; inbox = {:?}",
+            registry.inbox().list(WORKER_PANE)
+        )
+    });
     assert!(
-        snap.windows(POINTER.len()).any(|w| w == POINTER),
-        "Pi orchestrator's delegate never reached the coder worker pane; snapshot = {:?}",
+        task.contains("List the files in the current directory.")
+            && task.contains("from the orchestrator]"),
+        "the worker's task must carry the delegated text from the orchestrator; task = {task:?}"
+    );
+    let snap = registry.snapshot(&worker_agent_id).unwrap_or_default();
+    assert!(
+        !snap.windows(POINTER.len()).any(|w| w == POINTER),
+        "nothing may be typed into the worker's pane; snapshot = {:?}",
         String::from_utf8_lossy(&snap)
     );
 

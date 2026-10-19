@@ -6,11 +6,17 @@
 //! JSON to pin the optional field's wire spelling independently of the typed
 //! client. The stand-in is the paste-aware variant of the late-announcing
 //! `claude` probe used by `prompt/new-pane/017`: it emits a genuine
-//! `SessionStart` through the real hook socket, distinguishes bytes queued
-//! before readiness from bytes read afterwards, and reports a bracketed paste
-//! as one submitted turn without spending a credential.
+//! `SessionStart` through the real hook socket and distinguishes bytes queued
+//! before readiness from bytes read afterwards, without spending a credential.
+//!
+//! Since PRD #1666 the daemon posts the seed to the pane's inbox rather than
+//! typing it, so a seed is "queued once and rung only after readiness": the
+//! inbox holds it exactly once, and the only bytes the stand-in ever reads are
+//! the fixed doorbell line naming it.
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -23,7 +29,6 @@ use serde_json::{Value, json};
 use spec::spec;
 
 const AUTHORING_KINDS: [&str; 3] = ["schedule", "schedule-issues", "dispatcher"];
-const PASTE_SUBMITTED: &str = "submitted|paste";
 
 fn wire_path(path: &Path) -> String {
     path.to_str()
@@ -131,12 +136,13 @@ fn start_cat(
 
 /// The seed the DAEMON composes for `kind` in `cwd`. Since issue #1385 a seed
 /// names the deck by `binary_name()` — the composing process's own path — and
-/// the daemon here is the built `dot-agent-deck`, not this test binary, so the
-/// expected text is composed as that binary would compose it.
+/// the daemon here is the built `dot-agent-deck`, run as the harness's
+/// contained link (PRD #1666), not this test binary, so the expected text is
+/// composed as that binary would compose it.
 fn daemon_composed_seed(kind: AuthoringKind, cwd: &Path) -> String {
-    dot_agent_deck::platform::paths::set_test_current_exe_override(std::path::PathBuf::from(env!(
-        "CARGO_BIN_EXE_dot-agent-deck"
-    )));
+    dot_agent_deck::platform::paths::set_test_current_exe_override(
+        common::contained_deck_binary().to_path_buf(),
+    );
     kind.compose_seed(cwd)
 }
 
@@ -144,26 +150,41 @@ fn stand_in_log(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|_| "<the stand-in wrote no log>".to_string())
 }
 
-fn submitted_pastes(log: &str) -> Vec<String> {
-    let mut submitted = Vec::new();
-    let mut lines = Vec::new();
-    for line in log.lines() {
-        if let Some(received) = line.strip_prefix(common::LATE_ANNOUNCE_RECEIVED) {
-            lines.push(received);
-        } else if line == PASTE_SUBMITTED {
-            submitted.push(lines.join("\n"));
-            lines.clear();
-        }
-    }
-    submitted
+/// Every line the stand-in read after its readiness announcement.
+fn received_lines(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter_map(|line| line.strip_prefix(common::LATE_ANNOUNCE_RECEIVED))
+        .collect()
 }
 
-fn assert_ready_then_received_once(log_path: &Path, expected: &str, kind: AuthoringKind) {
+fn assert_ready_then_received_once(
+    daemon: &DaemonProc,
+    pane_id: &str,
+    log_path: &Path,
+    expected: &str,
+    kind: AuthoringKind,
+) {
     const DELIVERY_WAIT: Duration = Duration::from_secs(15);
     assert!(
-        common::wait_for_file_substr_count(log_path, PASTE_SUBMITTED, 1, DELIVERY_WAIT),
-        "the {:?} authoring seed never reached the stand-in as one submitted paste after its \
-         readiness announcement within {}s\nstand-in log:\n{}",
+        inbox_view::wait_for(&daemon.attach_socket, pane_id, expected, DELIVERY_WAIT),
+        "the {:?} authoring seed never reached pane {pane_id}'s inbox within {}s; inbox = \
+         {:?}\nstand-in log:\n{}",
+        kind.as_str(),
+        DELIVERY_WAIT.as_secs(),
+        inbox_view::messages(&daemon.attach_socket, pane_id),
+        stand_in_log(log_path)
+    );
+    // The doorbell rings only once the stand-in's genuine SessionStart reported
+    // Idle, so its first ring is the moment readiness was honoured.
+    assert!(
+        common::wait_for_file_substr_count(
+            log_path,
+            common::LATE_ANNOUNCE_RECEIVED,
+            1,
+            DELIVERY_WAIT
+        ),
+        "the doorbell never rang the {:?} seed after the stand-in's readiness announcement \
+         within {}s\nstand-in log:\n{}",
         kind.as_str(),
         DELIVERY_WAIT.as_secs(),
         stand_in_log(log_path)
@@ -171,45 +192,52 @@ fn assert_ready_then_received_once(log_path: &Path, expected: &str, kind: Author
 
     let log = stand_in_log(log_path);
     assert!(
-        log.lines().any(|line| line == common::LATE_ANNOUNCE_CLEAN),
-        "the {:?} seed was already queued before the stand-in's genuine SessionStart (or the \
-         readiness probe failed); delivery must use the existing readiness gate\nstand-in log:\n{log}",
+        log.lines().any(|line| line == common::LATE_ANNOUNCE_CLEAN)
+            && !log.contains(common::LATE_ANNOUNCE_PREMATURE),
+        "bytes for the {:?} seed were already queued before the stand-in's genuine \
+         SessionStart (or the readiness probe failed); nothing may be written before \
+         readiness\nstand-in log:\n{log}",
         kind.as_str()
     );
+    let messages = inbox_view::messages(&daemon.attach_socket, pane_id);
     assert_eq!(
-        submitted_pastes(&log),
-        [expected],
-        "the {:?} authoring start must submit the exact shared seed composition\nstand-in \
-         log:\n{log}",
+        messages.len(),
+        1,
+        "the {:?} authoring start must post exactly one message; inbox = {messages:?}",
         kind.as_str()
     );
+    let id = messages[0].id.as_str().to_string();
+    let doorbell = dot_agent_deck::doorbell::doorbell_line(&id);
     let opening_line = expected
         .lines()
         .next()
         .expect("an authoring seed is non-empty");
+    for line in received_lines(&log) {
+        let line = line.trim();
+        assert!(
+            line.is_empty() || line == doorbell.trim(),
+            "the stand-in read something other than the fixed doorbell for {id}: {line:?}; \
+             the seed's content must never be typed\nstand-in log:\n{log}"
+        );
+        assert!(
+            !line.contains(opening_line.trim()),
+            "the {:?} seed's content was typed into the pane\nstand-in log:\n{log}",
+            kind.as_str()
+        );
+    }
     assert!(
-        !common::wait_for_file_substr_count(
-            log_path,
-            &format!("{}{}", common::LATE_ANNOUNCE_RECEIVED, opening_line),
-            2,
-            Duration::from_millis(800),
-        ),
-        "the {:?} authoring seed was delivered a second time after its first successful \
-         delivery\nstand-in log:\n{}",
+        !common::wait_until(Duration::from_millis(800), || {
+            inbox_view::messages(&daemon.attach_socket, pane_id).len() != 1
+        }),
+        "the {:?} authoring seed was posted a second time; inbox = {:?}",
         kind.as_str(),
-        stand_in_log(log_path)
-    );
-    assert_eq!(
-        common::count_file_substr(log_path, PASTE_SUBMITTED),
-        1,
-        "the {:?} authoring seed must produce exactly one submitted turn\nstand-in log:\n{}",
-        kind.as_str(),
-        stand_in_log(log_path)
+        inbox_view::messages(&daemon.attach_socket, pane_id)
     );
 }
 
 /// Scenario: Start one readiness-announcing stand-in for each advertised
-/// authoring kind and require the matching TUI seed text to arrive once after
+/// authoring kind and require the matching TUI seed text to be posted to the
+/// pane's inbox exactly once, with only the fixed doorbell line typed after
 /// readiness. The options query and handshake must expose all three kinds and
 /// the capability that makes sending `authoring_kind` safe.
 #[spec("newagent/authoring/001")]
@@ -225,7 +253,13 @@ fn newagent_authoring_001_each_kind_delivers_its_tui_seed_and_is_advertised() {
         let log_path = cwd.join(&log_name);
         let pane_id = format!("newagent-authoring-001-{kind_name}");
         start_stand_in(&daemon, &cwd, &pane_id, &log_name, 1, Some(kind_name));
-        assert_ready_then_received_once(&log_path, &daemon_composed_seed(kind, &cwd), kind);
+        assert_ready_then_received_once(
+            &daemon,
+            &pane_id,
+            &log_path,
+            &daemon_composed_seed(kind, &cwd),
+            kind,
+        );
     }
 
     let options_response = send_json_request(&daemon, &json!({"op": "new-agent-options"}));
@@ -274,7 +308,8 @@ fn newagent_authoring_001_each_kind_delivers_its_tui_seed_and_is_advertised() {
 /// Scenario: Start an authoring stand-in that withholds its genuine readiness
 /// announcement for three seconds and a plain control with no authoring kind.
 /// Nothing may reach either pane early; after the late announcement only the
-/// authoring pane receives one seed, while the control remains untouched.
+/// authoring pane's inbox holds one seed and only its doorbell rings, while
+/// the control's inbox stays empty and its pane untouched.
 #[spec("newagent/authoring/002")]
 #[test]
 fn newagent_authoring_002_late_readiness_delivers_once_and_plain_start_delivers_nothing() {
@@ -306,6 +341,8 @@ fn newagent_authoring_002_late_readiness_delivers_once_and_plain_start_delivers_
     );
 
     assert_ready_then_received_once(
+        &daemon,
+        "newagent-authoring-002-late",
         &authoring_log,
         &daemon_composed_seed(KIND, &authoring_cwd),
         KIND,
@@ -330,6 +367,12 @@ fn newagent_authoring_002_late_readiness_delivers_once_and_plain_start_delivers_
         ),
         "a StartAgent with no authoring_kind must receive no daemon-owned seed\nstand-in log:\n{}",
         stand_in_log(&plain_log)
+    );
+    let plain_inbox = inbox_view::messages(&daemon.attach_socket, "newagent-authoring-002-plain");
+    assert!(
+        plain_inbox.is_empty(),
+        "a StartAgent with no authoring_kind must post no daemon-owned seed; inbox = \
+         {plain_inbox:?}"
     );
 }
 

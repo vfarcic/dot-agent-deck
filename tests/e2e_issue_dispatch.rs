@@ -34,6 +34,9 @@
 
 mod common;
 
+#[path = "support/inbox_view.rs"]
+mod view;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -384,7 +387,7 @@ fn w() -> Duration {
 /// Assert the repo is cloned to `<working_dir>/<name>`, a per-issue worktree
 /// appears at `<clone>/.worktrees/issue-7` on branch `agent/issue-7`, and an
 /// orchestrator-role agent is spawned into that worktree with the substituted
-/// per-issue prompt delivered (echoed by `cat`).
+/// per-issue prompt posted to its inbox.
 #[spec("scheduler/dispatch/001")]
 #[test]
 fn dispatch_001_clone_worktree_spawn() {
@@ -443,7 +446,12 @@ fn dispatch_001_clone_worktree_spawn() {
             )
         });
     assert!(
-        daemon.attach_and_wait_for_output(&agent.id, "ISSUEDISPATCH-7", w()),
+        view::wait_for(
+            &daemon.attach_socket,
+            agent.pane_id_env.as_deref().expect("the agent's pane id"),
+            "ISSUEDISPATCH-7",
+            w(),
+        ),
         "the substituted per-issue prompt must be delivered to the dispatched orchestrator"
     );
 }
@@ -691,7 +699,15 @@ fn dispatch_004_orchestration_vs_single_agent() {
         .wait_for_agent_where(|r| orchestrator_in(r, &orch_wt), w())
         .expect("orchestration clone must open an orchestrator tab in the worktree");
     assert!(
-        daemon.attach_and_wait_for_output(&orch_agent.id, "ORCHDISP-11", w()),
+        view::wait_for(
+            &daemon.attach_socket,
+            orch_agent
+                .pane_id_env
+                .as_deref()
+                .expect("the agent's pane id"),
+            "ORCHDISP-11",
+            w(),
+        ),
         "the prompt must reach the orchestrator role of the orchestration dispatch"
     );
 
@@ -704,7 +720,15 @@ fn dispatch_004_orchestration_vs_single_agent() {
         .wait_for_agent_where(|r| single_card_in(r, &plain_wt), w())
         .expect("plain clone must open a single-agent card in the worktree");
     assert!(
-        daemon.attach_and_wait_for_output(&plain_agent.id, "PLAINDISP-22", w()),
+        view::wait_for(
+            &daemon.attach_socket,
+            plain_agent
+                .pane_id_env
+                .as_deref()
+                .expect("the agent's pane id"),
+            "PLAINDISP-22",
+            w(),
+        ),
         "the prompt must reach the single-agent card of the plain dispatch"
     );
     assert!(

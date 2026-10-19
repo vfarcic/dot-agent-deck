@@ -21,12 +21,15 @@ impl StaleHome {
         std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Overriding the harness HOME also replaces its installed-binary link.
         // Supply one here so startup reads the old pin even on a machine with
-        // no deck on PATH. The target remains a cargo artifact, so this link
-        // resolves the installer without making the running build takeover-eligible.
+        // no deck on PATH. It names the file the deck runs as (PRD #1666), as
+        // the harness's own link does. The running build stays takeover-
+        // ineligible because that file and this HOME sit under the harness
+        // temp root, which the resolver treats as ephemeral (issue #1637); a
+        // `DAD_E2E_TMPDIR` outside the system temp directories would change that.
         let bin_dir = home.join(".local/bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         std::os::unix::fs::symlink(
-            env!("CARGO_BIN_EXE_dot-agent-deck"),
+            crate::common::contained_deck_binary(),
             bin_dir.join("dot-agent-deck"),
         )
         .unwrap();

@@ -1,0 +1,7 @@
+  >_ OpenAI Codex (v0.160.0)
+  /scratch/project
+
+› Ask Codex to do anything
+
+  GPT-5.6-Luna low · /scratch/project
+  ? for shortcuts

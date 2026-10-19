@@ -95,8 +95,11 @@ questions (\"red for colour and large for size\"), and a question with `multi_se
 true takes several options at once. Every selection carries `evidence`: the words \
 of the utterance that chose it, copied EXACTLY as the user said them — never \
 paraphrased, never words from the question; make no selection the utterance has no \
-words for. For a `free_text` option, put the user's own words for it in `text`, \
-copied exactly from the utterance, or null when they gave none. Answer `cancel`, with no \
+words for. For a `free_text` option, `text` is only the content the user wants \
+entered, copied exactly from the utterance: the words that select the option or name \
+the question are not part of it, and belong in `evidence`. When the utterance is only \
+that content, cite it as the `evidence` too. Make `text` null when the user gave no \
+content. Answer `cancel`, with no \
 selections, when the user calls the answer off (\"cancel\", \"never mind\"). Answer \
 `not_answer`, with no selections, when the utterance is not about this question — a \
 command to the app, or anything else.";
@@ -1259,16 +1262,26 @@ pub fn question_data_turn(request: &QuestionRequest<'_>) -> String {
 /// spelling of an optional field — required, and typed `["string", "null"]`,
 /// which its strict mode needs ([`super::openai`] has why); the Anthropic
 /// dialect leaves `text` out of `required` instead, as its command schema
-/// leaves its params out.
+/// leaves its params out. Both dialects describe `text` the same way apart from
+/// how it is left empty.
 pub fn answer_schema(nullable_text: bool) -> Value {
+    const TEXT: &str = "For a `free_text` option, only the content the user wants \
+entered, copied exactly from the utterance. The words that select the option or name the \
+question are not part of it; they belong in `evidence`.";
     let (text, required) = if nullable_text {
         (
-            json!({ "type": ["string", "null"] }),
+            json!({
+                "type": ["string", "null"],
+                "description": format!("{TEXT} `null` when the user gave no content."),
+            }),
             json!(["question_index", "option_indices", "text", "evidence"]),
         )
     } else {
         (
-            json!({ "type": "string" }),
+            json!({
+                "type": "string",
+                "description": format!("{TEXT} Left out when the user gave no content."),
+            }),
             json!(["question_index", "option_indices", "evidence"]),
         )
     };

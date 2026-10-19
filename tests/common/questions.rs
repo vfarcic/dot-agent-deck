@@ -28,14 +28,7 @@ pub fn quote(value: &str) -> String {
 }
 
 pub fn path() -> String {
-    format!(
-        "{}:{}",
-        std::path::Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-            .parent()
-            .unwrap()
-            .display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
+    common::path_with_binary_dir()
 }
 
 pub fn agent_id(deck: &TuiDeck) -> String {

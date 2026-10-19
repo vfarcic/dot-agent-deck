@@ -591,6 +591,122 @@ pub fn force_kill_pid(pid: u32) -> std::io::Result<()> {
 // Orphan watchdog (lifted from daemon.rs; test-gated, OFF in production).
 // ---------------------------------------------------------------------------
 
+/// PRD #1666 hardening M2: the parent of process `pid`, or `None` when the
+/// process is gone or this platform cannot say. Linux reads
+/// `/proc/<pid>/stat`; macOS asks `proc_pidinfo(PROC_PIDTBSDINFO)`. Other Unix
+/// platforms answer `None`, and the caller falls back to not checking.
+#[cfg(target_os = "linux")]
+pub fn parent_pid_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid …`; `comm` may itself hold spaces or parentheses.
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// See the Linux variant.
+#[cfg(target_os = "macos")]
+pub fn parent_pid_of(pid: u32) -> Option<u32> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a zeroed, stack-allocated `proc_bsdinfo` that outlives
+    // the call, and `size` is exactly its size, so the kernel writes at most
+    // that many bytes into it.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (written == size).then_some(info.pbi_ppid)
+}
+
+/// See the Linux variant.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn parent_pid_of(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// PR #1735 third review (F2): when process `pid` started, in a unit fixed per
+/// platform, or `None` when the process is gone or this platform cannot say.
+/// Two processes that hold one pid in turn answer different values, so a pid
+/// recorded with its start time names one process, not whatever reuses the
+/// number later. Linux reads field 22 of `/proc/<pid>/stat` (clock ticks since
+/// boot); macOS asks `proc_pidinfo(PROC_PIDTBSDINFO)` (microseconds since the
+/// epoch). Other Unix platforms answer `None`.
+#[cfg(target_os = "linux")]
+pub fn process_start_of(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // After `comm`'s closing parenthesis the fields run from 3 (`state`), so
+    // field 22 (`starttime`) is the 20th.
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// See the Linux variant.
+#[cfg(target_os = "macos")]
+pub fn process_start_of(pid: u32) -> Option<u64> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: as in `parent_pid_of`: a zeroed stack `proc_bsdinfo` of exactly
+    // `size` bytes that outlives the call.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (written == size).then(|| {
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec)
+    })
+}
+
+/// See the Linux variant.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_start_of(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Audit F3: the executable process `pid` runs, or `None` when the process is
+/// gone or this platform cannot say. Linux reads the `/proc/<pid>/exe` link;
+/// macOS asks `proc_pidpath`. Other Unix platforms answer `None`, and the
+/// caller falls back to not checking.
+#[cfg(target_os = "linux")]
+pub fn executable_of(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+/// See the Linux variant.
+#[cfg(target_os = "macos")]
+pub fn executable_of(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is a live, writable buffer of exactly the size passed, and
+    // the kernel writes at most that many bytes into it.
+    let written =
+        unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    let written = usize::try_from(written).ok().filter(|n| *n > 0)?;
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &buf[..written],
+    )))
+}
+
+/// See the Linux variant.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn executable_of(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// The calling process's parent pid. Wraps `getppid(2)` (async-signal-safe,
 /// infallible) so the single `unsafe` lives in one place.
 pub fn current_ppid() -> i32 {

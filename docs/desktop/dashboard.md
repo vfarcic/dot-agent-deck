@@ -70,10 +70,20 @@ The desktop app shows five statuses. Each covers one or more of the words the TU
 | **RUNNING** | Thinking, Working, Compacting | The agent is busy. An agent that has reported no status at all yet, for example a plain shell or an agent whose hooks are not installed, also shows **RUNNING**. |
 | **NEEDS INPUT** | Needs Input | The agent is waiting for you: a permission answer or other input. Answer it in its pane. |
 | **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. Commands or subagents it left running keep it **IDLE**; open its pane to see what is still running. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
-| **FAILED** | Error | Something went wrong. |
+| **error** (counted under **FAILED**) | Error | Something went wrong, including a message the deck could not deliver. Read the notice and open the pane. |
 | **BLOCKED** | Blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. Open the agent's pane to see which limit, and when it resets if the provider says. |
 
 What each status means, and which agents can report Blocked, is on [Session Management → Session Statuses](../session-management.md#session-statuses). An agent that stays **RUNNING** when it is clearly idle usually has no hooks reporting to the daemon; see [Troubleshooting → Hooks](../troubleshooting.md#hooks).
+
+## Message delivery and handoffs
+
+Agent tiles show `✉N queued` while messages await acknowledgement, and `✉ delivered` when received and nothing remains pending. If delivery fails, the tile reads **error** and shows `not delivered: …`. When the deck cannot tell whether a message reached an OpenCode or Pi agent (`✉ delivery uncertain`), or a Pi agent has stayed idle without starting on one (`✉ may not have reached the agent`), the tile lists each such message with its explanation and **Retry** and **Cancel** buttons. The TUI cards show the same states, with **Error** as the status and `✉N` on narrow cards, and list the messages when you press `i`.
+
+The handoff rail tracks worker handoffs with `delegated · queued`, `delivered · working`, `work-done` and `not delivered`. It is a desktop surface; in the TUI, follow the role cards and the orchestrator's pane. A delivered message is a receipt, so read the worker's report before treating its work as complete.
+
+In both the desktop app and the TUI, a job that arrives while OpenCode or Pi is busy waits for that agent for as long as the agent keeps it queued, without going to another worker during that wait. A Claude Code worker can lose an unclaimed job to the next worker while busy. If the orchestrator was told a task has not reached its worker and the worker then picks it up, the orchestrator is told the task arrived after all. If the task was reported not delivered, its later receipt also clears the card or tile's delivery error once no other delivery error remains.
+
+See [Orchestration → Delivery](../orchestration.md#delivery-in-the-tui-and-desktop-app) for native wake support, the fallback doorbell and the inbox commands.
 
 ## The agent pane
 
