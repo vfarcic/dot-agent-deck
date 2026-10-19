@@ -878,10 +878,12 @@ pub(super) fn explicit_commit(st: &mut HubState, key: &AgentKey, id: &str, now: 
     true
 }
 
-/// Write `out`'s lines. A line for a stream whose queue is full is dropped
+/// Write `out`'s lines, each on the room [`send`] reserved for it under the
+/// hub lock, so nothing here is dropped for want of capacity. A line whose
+/// stream had no room was dropped by [`send`] before it reached the outbox,
 /// and the stream stays open (a dropped revoke is sent again by the clock,
-/// [`AttemptModel::revokes_due`]); a stream that is gone is left to its own
-/// connection task to notice.
+/// [`AttemptModel::revokes_due`]). A line for a stream that has gone since is
+/// discarded, and that stream's connection task notices it is gone.
 pub(super) fn flush(out: Outbox) {
     for (permit, reply) in out {
         permit.send(WaiterSignal::Line(Box::new(reply)));

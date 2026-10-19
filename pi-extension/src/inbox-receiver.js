@@ -120,7 +120,8 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
   // what another receiver gave up included. Nothing bounds how many revokes
   // arrive while a fetch or an approval is outstanding, so a drop voids
   // every approval given before it (`fresh`): a forgotten attempt a late
-  // fetch brings back is held, but never ready (reviewer R9T-04).
+  // fetch brings back is held, and not ready under an approval given before
+  // the drop; a fresh `may` can still make it ready (reviewer R9T-04).
   const imported = state?.revoked ?? [];
   const revoked = new Set(imported.slice(-INBOX_MAX_CALLED));
   let fence = imported.length > INBOX_MAX_CALLED ? inboxNow() : -Infinity;
@@ -305,8 +306,9 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     const handed = handedBefore(key);
     revoke(key);
     if (handed) {
-      // Said once, kept while `stands` remembers it, whether or not the
-      // attempt is still held (`rejected`).
+      // Said once, kept: `stands` remembers it whether or not the attempt is
+      // still held, and past its bound a refusal of a called attempt is not
+      // reported `not_handed` either (`rejected`).
       stand(key);
       inboxWrite(child, { already_handed: [ref] });
     } else {
@@ -516,10 +518,12 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     },
     // §3: the daemon's final hand-over check; resolves to the approval (its
     // epoch and when it was asked for), or undefined when it was refused or
-    // went unanswered. A question the watcher's restart voided is asked once
-    // more under the successor, once it registers (PR #1735 review
-    // 4305713311), so a restart alone never reads as a refusal; if none
-    // registers within INBOX_GRANT_TIMEOUT_MS it resolves undefined.
+    // went unanswered. A question the watcher's exit voided waits at most
+    // INBOX_GRANT_TIMEOUT_MS for a successor's registration and is then asked
+    // once more under it (PR #1735 review 4305713311). That one re-ask can
+    // still be refused, time out, fail to write, be stopped or drained, or be
+    // voided by another restart, and each resolves undefined, as does no
+    // registration in time.
     may: async (ref) => {
       const ask = async () => {
         if (!child || rx === undefined || draining) return undefined;
