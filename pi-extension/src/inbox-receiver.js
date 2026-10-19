@@ -150,6 +150,26 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
       forgot = true;
     }
   };
+  // Attempts this receiver answered as handed: a revoke answered
+  // `already_handed`, or a commit. A refusal of the call that arrives later
+  // never contradicts that answer with `not_handed` (`rejected`, PR #1735
+  // review 4306466350). Kept apart from the held entry, which a session's
+  // idle or a commit can delete while the call is still in flight. Bounded,
+  // oldest dropped first; once one was dropped, a refusal of an attempt this
+  // receiver called is treated as possibly handed, so past the bound a
+  // refusal becomes a lapse rather than a `not_handed`.
+  const standsBefore = state?.stands ?? [];
+  const stands = new Set(standsBefore.slice(-INBOX_MAX_CALLED));
+  let standsForgot = state?.standsForgot === true || standsBefore.length > INBOX_MAX_CALLED;
+  const stand = (key) => {
+    stands.delete(key);
+    stands.add(key);
+    if (stands.size > INBOX_MAX_CALLED) {
+      stands.delete(stands.values().next().value);
+      standsForgot = true;
+    }
+  };
+  const standing = (key) => stands.has(key) || (standsForgot && (called.has(key) || forgot));
   const handedBefore = (key) =>
     held.get(key)?.stage === "handed" || called.has(key) || (forgot && !held.has(key));
   // §2 "Revoke proof and callback quiescence": the deck retires a stream
@@ -285,10 +305,9 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     const handed = handedBefore(key);
     revoke(key);
     if (handed) {
-      // Said once, kept: this attempt never reports `not_handed` from here on
-      // (`rejected`, PR #1735 review 4306466350).
-      const entry = held.get(key);
-      if (entry) entry.toldHanded = true;
+      // Said once, kept while `stands` remembers it, whether or not the
+      // attempt is still held (`rejected`).
+      stand(key);
       inboxWrite(child, { already_handed: [ref] });
     } else {
       held.delete(key);
@@ -474,6 +493,8 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
       held: [...held.values()].map((entry) => ({ ...entry })),
       called: [...called],
       forgot,
+      stands: [...stands],
+      standsForgot,
       revoked: [...revoked],
       reports: [...reports.values()].map((entry) => ({ stage: entry.stage, ref: entry.ref, taken: entry.to !== undefined })),
     }),
@@ -558,6 +579,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
       for (const ref of refs) {
         held.delete(inboxKey(ref));
         call(inboxKey(ref));
+        stand(inboxKey(ref));
       }
       report("committed", refs);
       snapshot();
@@ -579,14 +601,15 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     // (`inboxRefusedBeforeAcceptance`). It was the attempt's only call
     // (`ready`), so the attempt was positively not handed: revoked locally
     // first, like `notHanded`, so no approval still outstanding for it can
-    // reach OpenCode once the deck believes it was not handed. A revoke the
-    // receiver already answered `already_handed` while the call was in flight
-    // stands: the attempt stays possibly handed and nothing contradicts it.
+    // reach OpenCode once the deck believes it was not handed. An attempt
+    // `stands` remembers as answered handed (a revoke answered
+    // `already_handed` while the call was in flight, before or after a
+    // session's idle dropped its held entry) stays possibly handed instead:
+    // no longer held, and nothing contradicts the answer.
     rejected: (ref) => {
       const key = inboxKey(ref);
-      if (held.get(key)?.toldHanded) {
-        held.delete(key);
-        snapshot();
+      if (standing(key)) {
+        if (held.delete(key)) snapshot();
         return;
       }
       revoke(key);

@@ -4774,7 +4774,7 @@ check(sent().filter((c) => c.handed).map((c) => c.handed), [[ref]], "reported ha
         );
     }
 
-    /// Scenario: An approved callback is inside its OpenCode call when the deck revokes the attempt, which is answered `already_handed`. OpenCode then refuses the call before accepting it. The attempt is not reported not handed, and a revoke sent again is answered `already_handed` once more.
+    /// Scenario: An approved callback is inside its OpenCode call when the deck revokes the attempt, which is answered `already_handed`; OpenCode then refuses the call before accepting it. The attempt is not reported not handed, and a revoke sent again is answered `already_handed` once more. The same holds when the session goes idle while the call is in flight, whether before or after the revoke.
     #[spec("inbox/opencode/056")]
     #[cfg(unix)]
     #[test]
@@ -4805,6 +4805,36 @@ check(sent().filter((c) => c.not_handed).length, 0, "never reported not handed a
 feed({ revoke: [ref] });
 check(sent().filter((c) => c.already_handed).length, 2, "a revoke sent again is answered the same");
 check(sent().filter((c) => c.revoked_ack).length, 0, "and never revoked_ack");
+
+// The session goes idle while the call is in flight, before or after the
+// revoke: the idle handler's loop drops the held entry (`lost`), and the
+// answer still stands (PRD #1666 r9v, reviewer R9U-02).
+const idle = () => { for (const r of receiver.inSession("s1")) receiver.lost(r); };
+for (const [e, order] of [[2, "revoke, idle"], [3, "idle, revoke"]]) {
+  const attempt = { id, a: 1, e };
+  const answered = () => sent().filter((c) => c.already_handed).flatMap((c) => c.already_handed).filter((r) => r.e === e);
+  const of = (kind) => sent().filter((c) => c[kind]).flatMap((c) => c[kind]).filter((r) => r.e === e);
+  feed({ messages: [{ ...attempt, subject: "s", from: "x", text: "t", d: e }] });
+  let refuse;
+  const inFlight = inboxHandOver(receiver, attempt, "s1", () => new Promise((r) => { refuse = r; }));
+  await tick();
+  feed({ grant: { q: sent().filter((c) => c.may).pop().may.q, ok: true } });
+  await tick();
+  if (order === "revoke, idle") {
+    feed({ revoke: [attempt] });
+    idle();
+  } else {
+    idle();
+    feed({ revoke: [attempt] });
+  }
+  check(answered().length, 1, order + ": answered already_handed");
+  refuse({ error: { status: 400 }, response: { status: 400 } });
+  check(await inFlight, false, order + ": the call was refused");
+  check(of("not_handed").length, 0, order + ": never reported not handed");
+  feed({ revoke: [attempt] });
+  check(answered().length, 2, order + ": a later revoke is answered already_handed");
+  check(of("revoked_ack").length, 0, order + ": and never revoked_ack");
+}
 "#,
         );
     }
