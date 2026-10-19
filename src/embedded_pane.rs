@@ -4982,6 +4982,38 @@ mod tests {
         assert!(parser.screen().contents().contains("old child"));
     }
 
+    /// vt100 0.18: a pane made shorter keeps its newest rows on screen and
+    /// moves the oldest into scrollback; made taller again, it brings them
+    /// back. Under 0.16 the shrink cut rows off the bottom, hiding the latest
+    /// output and the cursor's row. Driven through the production parser and
+    /// resize seam (`new_pane_parser`, `set_parser_size_if_changed`).
+    #[test]
+    fn a_shorter_pane_keeps_its_latest_output_and_a_taller_one_restores_it() {
+        let parser = Mutex::new(new_pane_parser(10, 20));
+        let lines: Vec<String> = (1..=10).map(|n| format!("LINE_{n:02}")).collect();
+        parser
+            .lock()
+            .unwrap()
+            .process(lines.join("\r\n").as_bytes());
+
+        set_parser_size_if_changed(&parser, 5, 20);
+        {
+            let p = parser.lock().unwrap();
+            let visible: Vec<String> = p.screen().rows(0, 20).collect();
+            assert_eq!(visible, lines[5..], "the newest five lines stay visible");
+            assert_eq!(p.screen().cursor_position(), (4, 7));
+        }
+
+        set_parser_size_if_changed(&parser, 10, 20);
+        let p = parser.lock().unwrap();
+        let visible: Vec<String> = p.screen().rows(0, 20).collect();
+        assert_eq!(
+            visible, lines,
+            "growing back pulls the rows out of scrollback"
+        );
+        assert_eq!(p.screen().cursor_position(), (9, 7));
+    }
+
     // PRD #104 M2: hydration sizes the local vt100 parser from the
     // daemon-reported dims. Pin the small helper so its three branches
     // (sane / older-daemon zero / out-of-range) keep their documented
