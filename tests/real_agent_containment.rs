@@ -244,8 +244,12 @@ fn orchestration_dispatch_008_the_contained_link_and_path_keep_the_checkout_out(
     // per-target scratch directory, which is inside the checkout exactly when the
     // target directory is; with a target directory elsewhere there is no way to
     // build one without writing into the checkout, so that half is skipped.
+    // Cargo creates that directory when it builds, but a test run from a
+    // nextest archive (CI's e2e shards) extracts `target/` without it, so it
+    // is created here; the path itself is the compile-time one either way.
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"));
     if scratch.starts_with(checkout) || scratch.starts_with(&canonical_checkout) {
+        std::fs::create_dir_all(scratch).expect("create cargo's per-target scratch dir");
         let dir = tempfile::Builder::new()
             .prefix("contain-path-")
             .tempdir_in(scratch)
