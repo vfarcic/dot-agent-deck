@@ -3262,9 +3262,19 @@ pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
 /// as `none`.
 pub fn attach_inbox_summaries(registry: &AgentPtyRegistry, records: &mut [AgentRecord]) {
     let hub = registry.inbox();
+    attach_inbox_summaries_from(records, &|pane, id| hub.summary(pane, id));
+}
+
+/// [`attach_inbox_summaries`] reading each summary through `summarize`, for a
+/// caller that reads them all under one hold of the hub's lock
+/// ([`crate::inbox_hub::InboxHub::with_summaries`]).
+pub fn attach_inbox_summaries_from(
+    records: &mut [AgentRecord],
+    summarize: &dyn Fn(&str, &str) -> crate::inbox_hub::InboxSummary,
+) {
     for record in records {
         record.inbox = record.pane_id_env.as_deref().map(|pane| {
-            let mut summary = hub.summary(pane, &record.id);
+            let mut summary = summarize(pane, &record.id);
             if summary.wake == crate::inbox_hub::WakePath::Doorbell && record.live.is_none() {
                 summary.wake = crate::inbox_hub::WakePath::None;
             }

@@ -7962,6 +7962,16 @@ async fn handle_subscribe_events(
 /// `AppState::apply_event`'s ownership check already takes under the write
 /// guard on every event, so it adds no new lock order.
 ///
+/// PRD #1666 §2.8: each record's inbox summary is read under the inbox hub's
+/// lock, the one every [`BroadcastMsg::Inbox`] notice is sent under, with the
+/// receiver opened and the records read under that same hold. Inbox changes do
+/// not generally take the `AppState` guard, so that guard alone would not
+/// order them: a notice sent between the receiver and a summary would be in
+/// both. Under the hub's lock each one is in the summary or on the stream,
+/// never both. The nesting is `AppState`, then the hub, then the registry —
+/// the hub-then-registry order [`crate::inbox_hub::InboxHub::set_live_agent_check`]
+/// already takes.
+///
 /// Otherwise the listing is the [`AttachRequest::ListAgents`] reply's records,
 /// built by the same calls.
 async fn handle_subscribe_events_with_snapshot(
@@ -7972,10 +7982,14 @@ async fn handle_subscribe_events_with_snapshot(
 ) -> io::Result<()> {
     let (rx, mut records, notices) = {
         let guard = state.read().await;
-        let rx = event_tx.subscribe();
-        let mut records = registry.agent_records();
-        guard.attach_live_sessions(&mut records);
-        guard.attach_orchestrator_context_paths(&mut records);
+        let (rx, records) = registry.inbox().with_summaries(|summarize| {
+            let rx = event_tx.subscribe();
+            let mut records = registry.agent_records();
+            guard.attach_live_sessions(&mut records);
+            guard.attach_orchestrator_context_paths(&mut records);
+            crate::agent_pty::attach_inbox_summaries_from(&mut records, summarize);
+            (rx, records)
+        });
         (rx, records, guard.hook_binaries.notices())
     };
     crate::agent_pty::attach_cli_names(&mut records);
@@ -9331,6 +9345,167 @@ mod tests {
             ("gen-b", EventType::Thinking),
             "the stream must start after the snapshot: the rollover it includes must not \
              follow it"
+        );
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// PRD #1666 §2.8 (reviews R9Q-A01 / R9Q-01): the real handler's snapshot
+    /// carries each pane's inbox, read under the hub's lock together with the
+    /// receiver, so a reconnecting client recovers a count and a wake stall
+    /// that changed while it was away, and a notice is in the summary or on
+    /// the stream, never both.
+    ///
+    /// The test holds the hub's lock while the request is in flight. A handler
+    /// that opens its receiver under that lock cannot open it until the lock
+    /// is released; one that opens it first and reads the summaries afterwards
+    /// opens it at once, which leaves a window for a notice to land in both.
+    /// The wait for the receiver is the Greptile pattern of the test above.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ordered_subscription_carries_each_panes_inbox_ordered_with_its_notices() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(64);
+        registry.inbox().set_broadcast(event_tx.clone());
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "ordered-inbox-pane";
+        let agent_id = DaemonClient::new(sock.clone())
+            .start_agent(StartAgentOptions {
+                command: Some("cat".to_string()),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("spawn a pane through the attach socket");
+        let post = |subject: &str| {
+            registry
+                .inbox()
+                .post_direct(
+                    crate::inbox::Recipient::bound(pane_id, &agent_id),
+                    crate::inbox::Content {
+                        from: crate::inbox::Sender::Deck {
+                            reason: "test".to_string(),
+                        },
+                        subject: subject.to_string(),
+                        body: "b".to_string(),
+                        body_trust: crate::inbox::BodyTrust::Trusted,
+                        spill_path: None,
+                        id: None,
+                        preface: None,
+                    },
+                )
+                .expect("post")
+                .to_string()
+        };
+        // Changed while the client was away: a message waiting and nothing
+        // having woken the agent for it.
+        post("before");
+        registry.inbox().set_wake_stalled(pane_id, &agent_id, true);
+
+        let hub = Arc::clone(registry.inbox());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            hub.with_summary("", "", |_| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+        });
+        held_rx.recv().expect("the hub's lock is held");
+        let (mut rd, mut wr) = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect for the ordered subscription")
+            .into_split();
+        let receivers = event_tx.receiver_count();
+        let request = serde_json::to_vec(&AttachRequest::SubscribeEventsWithSnapshot).unwrap();
+        write_frame(&mut wr, KIND_REQ, &request)
+            .await
+            .expect("send the request");
+        // A blocking wait: the handler blocks a runtime worker on the held
+        // lock, so the runtime's timers are not this wait's clock.
+        let opened_by = std::time::Instant::now() + Duration::from_secs(1);
+        while event_tx.receiver_count() == receivers && std::time::Instant::now() < opened_by {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let opened_under_the_hubs_lock = event_tx.receiver_count() != receivers;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            !opened_under_the_hubs_lock,
+            "the receiver must open under the hub's lock, with the summaries; opened \
+             before them, a notice sent in between is in both"
+        );
+
+        async fn read(rd: &mut tokio::net::unix::OwnedReadHalf) -> (u8, Vec<u8>) {
+            tokio::time::timeout(Duration::from_secs(5), read_frame(rd))
+                .await
+                .expect("the daemon answers within 5 s")
+                .expect("the frame reads")
+                .expect("the stream is open")
+        }
+        let (kind, payload) = read(&mut rd).await;
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&payload).expect("a response");
+        assert!(resp.ok, "the ordered subscription opens: {:?}", resp.error);
+        let inbox = resp
+            .agent_records
+            .expect("the reply carries the snapshot")
+            .into_iter()
+            .find(|r| r.id == agent_id)
+            .expect("the agent is listed")
+            .inbox
+            .expect("the snapshot carries the pane's inbox");
+        assert_eq!(inbox.queued, 1, "the message posted before the snapshot");
+        assert!(inbox.wake_stalled, "the stall raised before the snapshot");
+
+        let after = post("after");
+        let notice = loop {
+            let (kind, payload) = read(&mut rd).await;
+            assert_eq!(kind, KIND_EVENT);
+            if let BroadcastMsg::Inbox(notice) =
+                serde_json::from_slice::<BroadcastMsg>(&payload).expect("a broadcast")
+            {
+                break notice;
+            }
+        };
+        assert_eq!(
+            (notice.message_id.as_str(), notice.state),
+            (after.as_str(), crate::inbox::StateName::Queued),
+            "the stream's first inbox notice is the post after the snapshot, not one the \
+             snapshot already counts"
         );
 
         registry.shutdown_all();

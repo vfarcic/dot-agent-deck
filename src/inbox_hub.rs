@@ -1659,6 +1659,17 @@ impl InboxHub {
         f(summary_of(&st, pane_id, agent_id))
     }
 
+    /// PRD #1666 §2.8: [`Self::with_summary`] for any number of agents — run
+    /// `f` with a reader of [`Self::summary`] while holding the lock every
+    /// [`BroadcastMsg::Inbox`] notice is sent under. A receiver `f` opens on
+    /// that broadcast is ordered with what the reader answers: each summary
+    /// includes every notice sent before the receiver existed and none the
+    /// receiver gets. `f` must not call back into this hub.
+    pub fn with_summaries<R>(&self, f: impl FnOnce(&dyn Fn(&str, &str) -> InboxSummary) -> R) -> R {
+        let st = self.lock();
+        f(&|pane_id, agent_id| summary_of(&st, pane_id, agent_id))
+    }
+
     /// PRD #1666 S3: `agent_id` in `pane_id` exited. Its bound messages become
     /// undeliverable, and what it had announced is forgotten.
     ///
