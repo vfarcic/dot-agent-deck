@@ -565,7 +565,7 @@ impl std::fmt::Debug for InboxHub {
 pub fn keepalive_from_env() -> Duration {
     match std::env::var(ENV_KEEPALIVE_MS) {
         Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            Ok(ms) if ms > 0 => crate::inbox::override_millis(ms),
             _ => {
                 warn!(
                     variable = ENV_KEEPALIVE_MS,
@@ -584,7 +584,7 @@ pub fn keepalive_from_env() -> Duration {
 pub fn undelivered_after_from_env() -> Duration {
     match std::env::var(ENV_UNDELIVERED_NOTICE_AFTER_MS) {
         Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            Ok(ms) if ms > 0 => crate::inbox::override_millis(ms),
             _ => {
                 warn!(
                     variable = ENV_UNDELIVERED_NOTICE_AFTER_MS,

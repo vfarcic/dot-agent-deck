@@ -52,7 +52,8 @@ use crate::inbox_receipt::{EvidenceStore, GenerationSpool, RecordScanner};
 /// How many lines may wait for one receipt stream's connection task. A line
 /// that finds the queue full is dropped ([`flush`]); the stream itself stays
 /// open, so a dropped revoke is sent again by the clock
-/// ([`AttemptModel::revokes_due`]).
+/// ([`AttemptModel::revokes_due`]), and [`dispatch`] issues no hand-out a
+/// full queue would drop.
 pub(super) const RECEIPT_SIGNAL_CAPACITY: usize = 64;
 
 /// PRD #1666 §11: how long after spawn a generation whose adapter declares
@@ -70,7 +71,7 @@ pub fn arm_deadline_from_env() -> Duration {
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|ms| *ms > 0)
-        .map_or(ARM_DEADLINE, Duration::from_millis)
+        .map_or(ARM_DEADLINE, crate::inbox::override_millis)
 }
 
 /// Overrides [`crate::inbox_attempts::NOT_STARTED_AFTER`], in milliseconds.
@@ -84,7 +85,7 @@ pub fn not_started_after_from_env() -> Duration {
         .filter(|ms| *ms > 0)
         .map_or(
             crate::inbox_attempts::NOT_STARTED_AFTER,
-            Duration::from_millis,
+            crate::inbox::override_millis,
         )
 }
 
@@ -619,6 +620,18 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
         link.component.inline_budget(),
         link.tx.clone(),
     );
+    // PR #1735 review 4307236310: nothing is issued while the stream's queue
+    // has no room for the line, counting the lines this pass already owes
+    // it, since a line that does not fit is dropped after its attempts were
+    // issued. The mail stays queued for the next pass: the receiver's next
+    // control (a keepalive's snapshot among them) or the clock.
+    let owed = out
+        .iter()
+        .filter(|(queued, _)| queued.same_channel(&tx))
+        .count();
+    if tx.capacity() <= owed {
+        return;
+    }
     let ids = candidates(st, key);
     if ids.is_empty() {
         return;
@@ -1522,5 +1535,5 @@ pub fn probe_deadline_from_env() -> Duration {
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|ms| *ms > 0)
-        .map_or(PROBE_DEADLINE, Duration::from_millis)
+        .map_or(PROBE_DEADLINE, crate::inbox::override_millis)
 }

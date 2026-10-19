@@ -74,6 +74,16 @@ pub const MAX_CLAIM_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// The rate-limit window.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 
+/// The longest any inbox duration override is taken as. A longer one is
+/// clamped to it, so a deadline the deck computes from one cannot overflow an
+/// `Instant` on any platform (PR #1735 review 4306466354, 4308059735).
+pub const MAX_OVERRIDE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// A duration override of `ms` milliseconds, clamped to [`MAX_OVERRIDE`].
+pub fn override_millis(ms: u64) -> Duration {
+    Duration::from_millis(ms).min(MAX_OVERRIDE)
+}
+
 /// Environment overrides, one per limit, read by [`InboxLimits::from_env`].
 pub const ENV_ACK_WAIT_MS: &str = "DOT_AGENT_DECK_INBOX_ACK_WAIT_MS";
 pub const ENV_MAX_DELIVER: &str = "DOT_AGENT_DECK_INBOX_MAX_DELIVER";
@@ -774,7 +784,7 @@ impl InboxLimits {
                 }
             }
         };
-        let ms = |name: &str| positive(name).map(Duration::from_millis);
+        let ms = |name: &str| positive(name).map(override_millis);
         let count = |name: &str| positive(name).map(|n| usize::try_from(n).unwrap_or(usize::MAX));
         let small = |name: &str| positive(name).map(|n| u32::try_from(n).unwrap_or(u32::MAX));
         let d = Self::default();
@@ -3435,6 +3445,21 @@ mod tests {
         assert_eq!(limits.max_messages, DEFAULT_MAX_MESSAGES);
         assert_eq!(limits.min_claim_ttl, Duration::from_millis(100));
         assert_eq!(InboxLimits::from_lookup(|_| None), InboxLimits::default());
+    }
+
+    /// PR #1735 review (4306466354, 4308059735): a duration override far past
+    /// any useful value is clamped, so the deadlines computed from it stay
+    /// representable.
+    #[test]
+    fn a_huge_duration_override_is_clamped() {
+        let huge = u64::MAX.to_string();
+        let limits =
+            InboxLimits::from_lookup(|name| (name == ENV_ACK_WAIT_MS).then(|| huge.clone()));
+        assert_eq!(limits.ack_wait, MAX_OVERRIDE);
+        assert_eq!(override_millis(u64::MAX), MAX_OVERRIDE);
+        assert_eq!(override_millis(250), Duration::from_millis(250));
+        let now = Instant::now();
+        assert!(now.checked_add(limits.ack_wait).is_some());
     }
 
     /// Scenario: One agent publishes and offers more than the per-minute rate

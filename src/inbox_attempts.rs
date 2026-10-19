@@ -1652,13 +1652,22 @@ impl AttemptModel {
             // Rule 1: any attempt of the assignment committed.
             if committed {
                 if msg.state.is_terminal() {
-                    if msg.state == MessageState::Undeliverable(UndeliverableReason::Cancelled)
+                    // A message ended as cancelled, or as out of attempts on
+                    // not-handed reports a commit now contradicts (PR #1735
+                    // review 4298669219), reached the agent after all, and
+                    // whoever was told otherwise is told so.
+                    let despite_cancel = match msg.state {
+                        MessageState::Undeliverable(UndeliverableReason::Cancelled) => Some(true),
+                        MessageState::Undeliverable(UndeliverableReason::MaxDeliver) => Some(false),
+                        _ => None,
+                    };
+                    if let Some(despite_cancel) = despite_cancel
                         && !msg.corrected
                     {
                         msg.corrected = true;
                         effects.push(Effect::DeliveredAfterAll {
                             id: id.to_string(),
-                            despite_cancel: true,
+                            despite_cancel,
                         });
                     }
                     break 'rules;
@@ -2921,6 +2930,48 @@ mod tests {
         assert_eq!(
             m.state("refused"),
             Some(MessageState::Undeliverable(UndeliverableReason::MaxDeliver))
+        );
+    }
+
+    /// PR #1735 review (4298669219): a message that ran out of attempts on
+    /// not-handed reports, whose last attempt then commits after all — the
+    /// receiver contradicting its own report — is corrected as delivered
+    /// after all, once, without being cancelled.
+    #[test]
+    fn a_commit_after_running_out_of_attempts_corrects_the_message() {
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::Pi, false).rx;
+        m.post("refused", false);
+        let mut issued = Vec::new();
+        for _ in 0..crate::inbox::DEFAULT_MAX_DELIVER {
+            let x = m.issue(t, "refused", rx).unwrap();
+            m.stage(t, "refused", 1, x.e, Stage::NotHanded, Some(rx));
+            issued.push(x.e);
+        }
+        assert_eq!(
+            m.state("refused"),
+            Some(MessageState::Undeliverable(UndeliverableReason::MaxDeliver))
+        );
+        m.drain_effects();
+        m.stage(
+            t,
+            "refused",
+            1,
+            issued[issued.len() - 1],
+            Stage::Committed,
+            None,
+        );
+        let effects = m.drain_effects();
+        assert!(effects.contains(&Effect::DeliveredAfterAll {
+            id: "refused".into(),
+            despite_cancel: false
+        }));
+        m.stage(t, "refused", 1, issued[0], Stage::Committed, None);
+        assert!(
+            !m.drain_effects()
+                .iter()
+                .any(|effect| matches!(effect, Effect::DeliveredAfterAll { .. })),
+            "corrected once"
         );
     }
 

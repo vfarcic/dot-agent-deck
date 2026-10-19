@@ -2066,6 +2066,47 @@ async fn boundary_038_a_revoke_with_no_link_is_sent_again_on_the_retained_rebind
     }
 }
 
+/// PR #1735 review (4307236310): a message posted while its receiver's queue
+/// of waiting lines is full is not issued — a hand-out line that does not fit
+/// would be dropped with its attempt spent — and is handed out once the
+/// receiver reads its lines again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_stream_queue_is_issued_nothing() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let mut peer = Peer::open_buffered(
+        &hub,
+        "p",
+        "a",
+        InboxComponent::PiExtension,
+        INTEGRATION,
+        256,
+    )
+    .await;
+    let rx = peer.next().await.registered.unwrap().rx;
+    assert!(fill_the_queue(&hub, "p", "a", rx).await > 0);
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("wait for room"))
+        .unwrap();
+    assert_eq!(
+        queue_capacity(&hub, "p", "a", rx),
+        0,
+        "precondition: the queue was full when the message was posted"
+    );
+    assert_eq!(
+        attempts_of(&hub, "p", "a", id.as_str()),
+        0,
+        "an attempt was issued into a full queue"
+    );
+    assert_eq!(state_of(&hub, "p", id.as_str()), StateName::Queued);
+    let handed = peer.handout_ticking(&hub).await;
+    assert_eq!(
+        handed.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        vec![id.as_str()]
+    );
+    assert_eq!(attempts_of(&hub, "p", "a", id.as_str()), 1);
+    peer.close().await;
+}
+
 /// Scenario: On an OpenCode and on a Pi receiver alike, a message is handed to a receiver whose connection stops taking lines, so its queue of waiting lines fills; Cancel's revoke finds the queue full and is dropped, while the stream stays connected. The test reads the queue out: no revoke arrives before one ack-wait has passed, and the clock's next pass after it sends the revoke again on the same stream, which answers it; the message ends cancelled and its evidence is returned.
 #[spec("inbox/boundary/039")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
