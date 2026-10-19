@@ -261,7 +261,7 @@ impl Widget for TerminalWidget {
         // layout/PTY-size mismatch that `resize_panes_to_layout` (M4) now
         // prevents, and the row window was the direct cause of the "scramble /
         // stale content near the bottom rows" symptom.
-        let (screen_rows, screen_cols) = screen.size();
+        let (screen_rows, screen_cols) = crate::vt_grid::size(screen);
 
         // PRD #882 — the invariant-3 equality guard is GONE, and its removal is
         // a design change rather than a relaxation.

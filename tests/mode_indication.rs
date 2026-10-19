@@ -286,7 +286,7 @@ fn render_cursor_widget(input_active: bool) -> Buffer {
     const CURSOR_ROW: u16 = 1;
     const CURSOR_COL: u16 = 3;
 
-    let mut parser = vt100::Parser::new(SCREEN_ROWS, SCREEN_COLS, 0);
+    let mut parser = dot_agent_deck::vt_grid::parser(SCREEN_ROWS, SCREEN_COLS, 0);
     parser.process(b"\x1b[2;4H");
     assert_eq!(parser.screen().cursor_position(), (CURSOR_ROW, CURSOR_COL));
 
@@ -734,13 +734,14 @@ fn mode_banner_004_degraded_and_collapsed_states_never_escape_the_pane() {
         40,
         CONTENT,
     );
-    let oversized_render_size = oversized_render
-        .get_screen("oversized-render")
-        .expect("the render seam must register its focused pane")
-        .lock()
-        .expect("the render seam screen lock must remain healthy")
-        .screen()
-        .size();
+    let oversized_render_size = dot_agent_deck::vt_grid::size(
+        oversized_render
+            .get_screen("oversized-render")
+            .expect("the render seam must register its focused pane")
+            .lock()
+            .expect("the render seam screen lock must remain healthy")
+            .screen(),
+    );
     assert_eq!(
         oversized_render_size,
         (24, 80),
@@ -755,13 +756,14 @@ fn mode_banner_004_degraded_and_collapsed_states_never_escape_the_pane() {
             CONTENT,
             false,
         );
-    let oversized_scroll_size = oversized_scroll
-        .get_screen("oversized-scroll")
-        .expect("the scroll seam must register its focused pane")
-        .lock()
-        .expect("the scroll seam screen lock must remain healthy")
-        .screen()
-        .size();
+    let oversized_scroll_size = dot_agent_deck::vt_grid::size(
+        oversized_scroll
+            .get_screen("oversized-scroll")
+            .expect("the scroll seam must register its focused pane")
+            .lock()
+            .expect("the scroll seam screen lock must remain healthy")
+            .screen(),
+    );
     assert_eq!(
         oversized_scroll_size,
         (24, 80),
@@ -774,13 +776,14 @@ fn mode_banner_004_degraded_and_collapsed_states_never_escape_the_pane() {
         40,
         CONTENT,
     );
-    let oversized_second_size = oversized_scroll
-        .get_screen("oversized-second")
-        .expect("the second-pane seam must register its pane")
-        .lock()
-        .expect("the second-pane seam screen lock must remain healthy")
-        .screen()
-        .size();
+    let oversized_second_size = dot_agent_deck::vt_grid::size(
+        oversized_scroll
+            .get_screen("oversized-second")
+            .expect("the second-pane seam must register its pane")
+            .lock()
+            .expect("the second-pane seam screen lock must remain healthy")
+            .screen(),
+    );
     assert_eq!(
         oversized_second_size,
         (24, 80),

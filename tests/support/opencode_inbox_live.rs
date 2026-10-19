@@ -324,7 +324,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
     }
     pub fn screen(&self) -> String {
         let record = self.record();
-        let mut parser = vt100::Parser::new(
+        let mut parser = dot_agent_deck::vt_grid::parser(
             record["rows"].as_u64().unwrap() as u16,
             record["cols"].as_u64().unwrap() as u16,
             0,

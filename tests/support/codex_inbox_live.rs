@@ -148,7 +148,7 @@ impl Codex {
         let record = self.record();
         let rows = record["rows"].as_u64().unwrap() as u16;
         let cols = record["cols"].as_u64().unwrap() as u16;
-        let mut parser = vt100::Parser::new(rows, cols, 0);
+        let mut parser = dot_agent_deck::vt_grid::parser(rows, cols, 0);
         parser.process(&common::pane_snapshot_on(
             self.deck.attach_socket_path(),
             &self.pane.agent,

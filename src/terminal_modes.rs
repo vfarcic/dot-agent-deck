@@ -369,7 +369,7 @@ mod tests {
 
     /// Feed `preamble` to a fresh `vt100` parser — the thing a replay is for.
     fn parsed(preamble: &[u8]) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut parser = crate::vt_grid::parser(24, 80, 0);
         parser.process(preamble);
         parser
     }
