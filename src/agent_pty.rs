@@ -20870,7 +20870,7 @@ mod spawn_tests {
     /// Issue #1537 — what a fresh reader makes of a snapshot: parsed into a
     /// new `vt100` parser exactly as the TUI hydrates a pane.
     fn parse_snapshot(snapshot: &[u8]) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut parser = crate::vt_grid::parser(24, 80, 0);
         parser.process(snapshot);
         parser
     }

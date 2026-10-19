@@ -5203,7 +5203,7 @@ pub(crate) fn keyevent_to_bytes_for_test(key: &KeyEvent) -> Option<Vec<u8>> {
 /// coordinates. Must match the viewport calculation in `terminal_widget.rs`.
 fn screen_row_offset(screen: &vt100::Screen, pane_rect: Rect) -> u16 {
     let inner_h = pane_rect.height.saturating_sub(2) as usize;
-    let screen_rows = screen.size().0 as usize;
+    let screen_rows = crate::vt_grid::size(screen).0 as usize;
     let cursor_row = screen.cursor_position().0 as usize;
     let anchor = (cursor_row + 1).min(screen_rows);
     let effective_rows = anchor.max(inner_h);
@@ -5239,7 +5239,7 @@ fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offse
         (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
     };
     let mut result = String::new();
-    let (screen_rows, screen_cols) = screen.size();
+    let (screen_rows, screen_cols) = crate::vt_grid::size(screen);
     for widget_row in sr..=er {
         let screen_row = widget_row + row_offset;
         if screen_row >= screen_rows {
@@ -5380,7 +5380,7 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 /// `row` is widget-relative; `row_offset` maps it to screen coordinates.
 /// Returns (start_col, end_col) for the word at the given position.
 fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16, row_offset: u16) -> (u16, u16) {
-    let (_rows, cols) = screen.size();
+    let (_rows, cols) = crate::vt_grid::size(screen);
     let screen_row = row + row_offset;
     let is_word_char = |c: u16| -> bool {
         screen
@@ -14059,13 +14059,13 @@ pub fn run_tui(
                                                 let offset =
                                                     screen_row_offset(parser.screen(), rect);
                                                 let screen = parser.screen();
-                                                let screen_rows = screen.size().0;
+                                                let screen_rows = crate::vt_grid::size(screen).0;
                                                 let is_blank_row = |wr: u16| -> bool {
                                                     let sr = wr + offset;
                                                     if sr >= screen_rows {
                                                         return true;
                                                     }
-                                                    let cols = screen.size().1;
+                                                    let cols = crate::vt_grid::size(screen).1;
                                                     (0..cols).all(|c| {
                                                         screen
                                                             .cell(sr, c)
@@ -26265,13 +26265,13 @@ mod tests {
                  — which would re-send a resize on every frame forever",
                 req.0, req.1
             );
-            let parsed = ctrl
-                .get_screen(pane_id)
-                .expect("the seam controller must register its panes")
-                .lock()
-                .expect("the seam parser lock must stay healthy")
-                .screen()
-                .size();
+            let parsed = crate::vt_grid::size(
+                ctrl.get_screen(pane_id)
+                    .expect("the seam controller must register its panes")
+                    .lock()
+                    .expect("the seam parser lock must stay healthy")
+                    .screen(),
+            );
             assert_eq!(
                 parsed, want,
                 "resize_pane_pty({}x{}) must clamp the OPTIMISTIC parser write too. \

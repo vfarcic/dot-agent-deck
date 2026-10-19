@@ -76,7 +76,7 @@ pub fn visible_tail_lines(snapshot: &[u8], rows: u16, cols: u16, max_lines: usiz
     // caller gets no lines and the notice says the pane rendered nothing, which
     // is the honest answer when the screen could not be reconstructed.
     let parsed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
+        let mut parser = crate::vt_grid::parser(rows, cols, 0);
         parser.process(snapshot);
         parser
             .screen()
@@ -137,7 +137,7 @@ pub fn visible_rows_and_cursor(
     }
     let (rows, cols) = parser_init_dims(rows, cols);
     std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
+        let mut parser = crate::vt_grid::parser(rows, cols, 0);
         parser.process(snapshot);
         let screen = parser.screen();
         let lines = screen

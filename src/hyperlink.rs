@@ -573,7 +573,7 @@ mod tests {
     #[test]
     fn full_pipeline() {
         let mut filter = Osc8Filter::new();
-        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut parser = crate::vt_grid::parser(24, 80, 0);
         let mut hmap = HyperlinkMap::new();
 
         let pty = b"Hello \x1b]8;;https://example.com\x07Click here\x1b]8;;\x07 world\r\n";

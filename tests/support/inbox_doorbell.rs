@@ -447,7 +447,7 @@ pub fn rings(pane: &Pane) -> Vec<Value> {
 
 pub fn screen(daemon: &impl Endpoint, pane: &Pane) -> String {
     let snapshot = common::pane_snapshot_on(daemon.attach_socket(), &pane.agent);
-    let mut parser = vt100::Parser::new(40, 140, 0);
+    let mut parser = dot_agent_deck::vt_grid::parser(40, 140, 0);
     parser.process(&snapshot);
     parser.screen().contents()
 }

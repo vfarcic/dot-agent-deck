@@ -1409,7 +1409,7 @@ impl TuiDeck {
         let child = pair.slave.spawn_command(cmd).expect("spawn dot-agent-deck");
         drop(pair.slave);
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+        let parser = Arc::new(Mutex::new(dot_agent_deck::vt_grid::parser(
             builder.rows,
             builder.cols,
             0,
@@ -1532,11 +1532,7 @@ impl TuiDeck {
                 pixel_height: 0,
             })
             .expect("resize PTY");
-        self.parser
-            .lock()
-            .unwrap()
-            .screen_mut()
-            .set_size(rows, cols);
+        dot_agent_deck::vt_grid::set_size(self.parser.lock().unwrap().screen_mut(), rows, cols);
     }
 
     /// Quiescence wait: blocks until the deck has emitted no bytes for
@@ -12963,7 +12959,7 @@ pub async fn wait_for_rendered_agent_text(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let snap = registry.snapshot(agent_id).unwrap_or_default();
-        let mut parser = vt100::Parser::new(40, 120, 0);
+        let mut parser = dot_agent_deck::vt_grid::parser(40, 120, 0);
         parser.process(&snap);
         let screen = parser.screen().contents();
         if screen.contains(needle) {

@@ -3153,7 +3153,7 @@ const GRID_COLS: u16 = 120;
 /// test was written.
 fn render_like_ratatui(cols: u16, rows: &[String]) -> String {
     let height = u16::try_from(rows.len().max(1)).expect("test grid height");
-    let mut parser = vt100::Parser::new(height, cols, 0);
+    let mut parser = dot_agent_deck::vt_grid::parser(height, cols, 0);
     for (index, row) in rows.iter().enumerate() {
         parser.process(format!("\x1b[{};1H{row}", index + 1).as_bytes());
     }

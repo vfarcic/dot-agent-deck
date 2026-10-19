@@ -178,6 +178,8 @@ pub mod ui;
 pub mod untrusted_text;
 pub mod upgrade_dialog;
 pub mod version;
+// vt100 0.18 sizes grids in `NonZeroU16`; the deck's `u16` geometry crosses here.
+pub mod vt_grid;
 pub mod watch;
 pub mod worktree_owner;
 pub mod worktree_reclaim;

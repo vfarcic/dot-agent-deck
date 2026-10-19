@@ -11,6 +11,7 @@
 //! its CLI.
 
 use std::io::{Read, Write};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -171,7 +172,9 @@ impl PtyDeck {
             }
         };
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        // vt100 sizes its grid in `NonZeroU16`; a zero axis is raised to 1.
+        let axis = |v| NonZeroU16::new(v).unwrap_or(NonZeroU16::MIN);
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(axis(rows), axis(cols), 0)));
         let history = Arc::new(Mutex::new(Vec::<u8>::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
