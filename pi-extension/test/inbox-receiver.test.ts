@@ -90,3 +90,65 @@ test("pi_031 the receiver runs only an absolute path to an executable file", { s
 		assert.equal(existsSync(deck.marker), true, "the absolute executable did not run");
 	});
 });
+
+// A stand-in watcher that prints `lines`, one JSON value per line, then stays
+// up until the receiver stops it.
+function fakeWatcher(name: string, lines: unknown[]): string {
+	const path = join(dir, name);
+	const out = join(dir, name + ".out");
+	writeFileSync(out, lines.map((line) => JSON.stringify(line) + "\n").join(""));
+	writeFileSync(path, `#!/bin/sh\ncat '${out}'\nexec sleep 5\n`);
+	chmodSync(path, 0o755);
+	return path;
+}
+
+const REGISTERED = { registered: { rx: 7, slot: "pi", keepalive_ms: 1000 }, resume: [] };
+
+/// Scenario: The watcher hands out one message missing its text and one whole one. Only the whole one is held and delivered.
+test("pi_031 a hand-out missing its text is neither held nor delivered", { skip: process.platform === "win32" }, async () => {
+	const watcher = fakeWatcher("watcher", [
+		REGISTERED,
+		{ messages: [{ id: "m-bad", a: 1, e: 1, d: 1 }, { id: "m-good", a: 1, e: 1, d: 2, text: "hello" }] },
+	]);
+	inboxBinary(() => watcher);
+	const delivered: string[] = [];
+	let on = true;
+	const receiver = inboxReceiver({ agent: "pi", active: () => on, deliver: (message: { id: string }) => delivered.push(message.id) });
+	receiver.start();
+	for (let waited = 0; delivered.length === 0 && waited < 3000; waited += 20) await settle(20);
+	const held = (receiver.exportState().held ?? []).map((entry: { id: string }) => entry.id);
+	on = false;
+	receiver.stop();
+	assert.deepEqual(delivered, ["m-good"]);
+	assert.deepEqual(held, ["m-good"]);
+});
+
+/// Scenario: The watcher revokes more attempts than the receiver remembers. It keeps the newest ones only, up to its bound.
+test("pi_031 the receiver's memory of revoked attempts is bounded", { skip: process.platform === "win32" }, async () => {
+	const revoke = Array.from({ length: 4100 }, (_, n) => ({ id: "m-" + n, a: 1, e: 1 }));
+	const watcher = fakeWatcher("watcher", [REGISTERED, { revoke }]);
+	inboxBinary(() => watcher);
+	let on = true;
+	const receiver = inboxReceiver({ agent: "pi", active: () => on });
+	receiver.start();
+	let revoked: string[] = [];
+	for (let waited = 0; revoked.length < 4096 && waited < 3000; waited += 20) {
+		await settle(20);
+		revoked = receiver.exportState().revoked ?? [];
+	}
+	on = false;
+	receiver.stop();
+	assert.equal(revoked.length, 4096);
+	assert.ok(revoked.includes("m-4099|1|1"), "the newest is kept");
+	assert.ok(!revoked.includes("m-0|1|1"), "the oldest is dropped");
+});
+
+/// Scenario: The resolved deck binary is a script whose interpreter is missing, so Node fails the spawn after it returned, with an error and no exit. The receiver tries again on its backoff.
+test("pi_031 a spawn Node fails after returning is tried again", { skip: process.platform === "win32" }, async () => {
+	const path = join(dir, "no-interpreter");
+	writeFileSync(path, "#!/nonexistent/dot-agent-deck-interpreter\n");
+	chmodSync(path, 0o755);
+	const outcome = await run(() => path);
+	assert.ok(outcome.resolutions > 1, `no retry after a spawn that failed late (${outcome.resolutions})`);
+	assert.equal(outcome.rx, undefined);
+});

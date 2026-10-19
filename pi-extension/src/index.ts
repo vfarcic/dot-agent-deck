@@ -572,7 +572,7 @@ function watchQueue(proc: InboxProcess, key: string, ctx: ExtensionContext | und
  * content only if — with no await before the return — the session that
  * fetched is still current, nothing is disposed, the watcher was not
  * restarted, and the receiver authorizes every one under the approval taken
- * before the fetch. Otherwise the line is consumed and each is positively not
+ * before the fetches, which run at once. Otherwise the line is consumed and each is positively not
  * handed. With no registration, or a deck that cannot be asked, the line is
  * consumed and the mail stays queued for the watcher.
  */
@@ -589,19 +589,21 @@ async function doorbell(proc: InboxProcess, instance: Instance, ids: string[], c
 	const token = current.token;
 	const epoch = proc.receiver.epoch();
 	const approval = proc.receiver.approval();
+	// The ids are fetched at once, so the approval taken before them ages by
+	// the slowest fetch rather than by all of them in turn (PR #1735 review
+	// 4306950752). A fetch that fails leaves its id queued; the others' are
+	// still taken, since the deck issued them to this receiver.
+	const outcomes = await Promise.all(
+		ids.map((id) =>
+			current.pi
+				.exec(deckBin, buildInboxDoorbellFetchArgv(id, rx, INBOX_ADAPTER_INTEGRATION), { signal: ctx.signal, timeout: 5000 })
+				.catch(() => undefined),
+		),
+	);
 	const fetched: InboxMessage[] = [];
-	for (const id of ids) {
-		let outcome: { code: number; stdout: string };
-		try {
-			outcome = await current.pi.exec(deckBin, buildInboxDoorbellFetchArgv(id, rx, INBOX_ADAPTER_INTEGRATION), { signal: ctx.signal, timeout: 5000 });
-		} catch {
-			break;
-		}
-		const messages = outcome.code === 0 ? parseInboxFetch(outcome.stdout) : undefined;
-		if (!messages) {
-			break;
-		}
-		fetched.push(...messages.filter((m) => typeof m.a === "number" && typeof m.e === "number"));
+	for (const outcome of outcomes) {
+		const messages = outcome?.code === 0 ? parseInboxFetch(outcome.stdout) : undefined;
+		fetched.push(...(messages ?? []).filter((m) => typeof m.a === "number" && typeof m.e === "number"));
 	}
 	if (fetched.length === 0) {
 		return HANDLED;

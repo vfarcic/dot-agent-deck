@@ -10,9 +10,8 @@ import { accessSync, constants, statSync } from "node:fs";
 // else the resolver gives (nothing, a bare name the agent's PATH would look
 // up, a path relative to its working directory, a missing or non-executable
 // file) fails the spawn at once, so no watcher registers and nothing is
-// handed over, and the receiver tries again on its backoff. A spawn Node
-// fails later instead (a missing file) would report no exit, and the
-// receiver would not try again.
+// handed over, and the receiver tries again on its backoff, as it does when
+// Node fails the spawn later (the file gone since it was resolved).
 let inboxBinaryOf = () => undefined;
 const inboxAbsolute = (path) =>
   process.platform === "win32" ? /^([A-Za-z]:[\\/]|[\\/]{2})/.test(path) : path.startsWith("/");
@@ -115,7 +114,16 @@ const inboxRef = (entry) => ({ id: entry.id, a: entry.a, e: entry.e });
 // first watcher, so the deck asks about those attempts.
 const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, registered, state }) => {
   const held = new Map((state?.held ?? []).map((entry) => [inboxKey(entry), { ...entry }]));
+  // Attempts revoked here, so neither a late doorbell fetch nor an approval
+  // still outstanding brings one back (`take`, `ready`). Both are bounded in
+  // time (a fetch and an approval each by seconds), so the oldest are
+  // dropped first beyond INBOX_MAX_CALLED (PR #1735 review 4305525329).
   const revoked = new Set(state?.revoked ?? []);
+  const revoke = (key) => {
+    revoked.delete(key);
+    revoked.add(key);
+    if (revoked.size > INBOX_MAX_CALLED) revoked.delete(revoked.values().next().value);
+  };
   // Attempts a callback took into OpenCode's API, or that the agent started
   // on, and that did not end in a positive refusal: possibly handed, whatever
   // happens to their held entry afterwards (a commit, an abort, a revert, an
@@ -230,7 +238,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
   const answerRevoke = (ref) => {
     const key = inboxKey(ref);
     const handed = handedBefore(key);
-    revoked.add(key);
+    revoke(key);
     if (handed) {
       inboxWrite(child, { already_handed: [ref] });
     } else {
@@ -281,15 +289,19 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     }
     for (const ref of Array.isArray(reply.revoke) ? reply.revoke : []) answerRevoke(ref);
     if (Array.isArray(reply.messages)) {
-      for (const message of reply.messages) {
-        if (!message || typeof message.id !== "string" || typeof message.text !== "string") continue;
-        if (typeof message.a !== "number" || typeof message.e !== "number") continue;
-        take(message);
-      }
+      // A hand-out missing its text or attempt numbers is neither held nor
+      // delivered (PR #1735 review 4306813143).
+      const handOuts = reply.messages.filter(
+        (message) =>
+          message &&
+          typeof message.id === "string" &&
+          typeof message.text === "string" &&
+          typeof message.a === "number" &&
+          typeof message.e === "number"
+      );
+      for (const message of handOuts) take(message);
       snapshot();
-      for (const message of reply.messages) {
-        if (message && typeof message.id === "string" && typeof message.a === "number") deliver?.(message);
-      }
+      for (const message of handOuts) deliver?.(message);
     }
     if (reply.keepalive || (Array.isArray(reply.rebound) && reply.rebound.length)) snapshot();
   };
@@ -326,16 +338,30 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
       } catch (_) {}
     });
     spawned.stdin.on("error", () => {});
-    spawned.on("error", () => {});
+    // A watcher that ends is respawned once, whether Node reports its exit or
+    // only an error: a spawn Node fails after returning (the binary gone or
+    // unlaunchable since it was resolved) reports no exit (PR #1735 review
+    // 4307453606).
+    let ended = false;
+    const end = (code) => {
+      if (ended) return;
+      ended = true;
+      if (child === spawned) {
+        child = undefined;
+        rx = undefined;
+      }
+      exited?.(code);
+      if (!active() || spawned.stdin.writableEnded) return;
+      restart(inboxNextBackoff(backoff, Date.now() - started), backoff);
+    };
+    spawned.on("error", () => {
+      try {
+        if (spawned.pid === undefined) end(null);
+      } catch (_) {}
+    });
     spawned.on("exit", (code) => {
       try {
-        if (child === spawned) {
-          child = undefined;
-          rx = undefined;
-        }
-        exited?.(code);
-        if (!active() || spawned.stdin.writableEnded) return;
-        restart(inboxNextBackoff(backoff, Date.now() - started), backoff);
+        end(code);
       } catch (_) {}
     });
   };
@@ -485,7 +511,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     notHanded: (ref) => {
       const key = inboxKey(ref);
       if (handedBefore(key)) return;
-      revoked.add(key);
+      revoke(key);
       held.delete(key);
       inboxWrite(child, { not_handed: [ref] });
       snapshot();
@@ -497,7 +523,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     // reach OpenCode once the deck believes it was not handed.
     rejected: (ref) => {
       const key = inboxKey(ref);
-      revoked.add(key);
+      revoke(key);
       called.delete(key);
       held.delete(key);
       inboxWrite(child, { not_handed: [ref] });

@@ -553,6 +553,25 @@ test("pi_016 doorbell: fetched to the receiver and transformed in place", async 
 	}
 });
 
+/// Scenario: A doorbell line names two messages, each of whose fetches takes most of the receiver's approval window (900 ms, at a 100 ms keepalive). The fetches run at once, so the approval is still fresh when they return and the line is transformed into both.
+test("pi_016 a doorbell's fetches together stay within its approval", async () => {
+	const { pi, child } = await started();
+	child.say({ registered: { rx: 7, keepalive_ms: 100 } });
+	await settle();
+	pi.pi.exec = async (_bin: string, argv: string[]) => {
+		pi.execs.push(argv);
+		if (argv[1] !== "fetch") return { code: 0, stdout: "", stderr: "", killed: false };
+		await new Promise((resolve) => setTimeout(resolve, 600));
+		const id = argv[argv.indexOf("--doorbell") + 1];
+		return { code: 0, stdout: JSON.stringify({ messages: [{ ...ref(id), d: id === ID ? 1 : 2, text: block(id) }] }), stderr: "", killed: false };
+	};
+	const doorbell = (id: string) => `dot-agent-deck: message ${id} waiting, run: dot-agent-deck inbox fetch`;
+	const answer: any = await pi.emit("input", { text: doorbell(ID) + "\n" + doorbell(ID2), source: "interactive" });
+	assert.equal(answer.action, "transform", "the approval went stale across the fetches");
+	assert.deepEqual(child.refs("handed"), [ref(ID), ref(ID2)]);
+	assert.deepEqual(child.refs("not_handed"), []);
+});
+
 /// Scenario: Pi's session shuts down for /new with one attempt past the gate and uncommitted and another sent but unseen. The first is released lost and stays possibly handed; the second goes uncalled to the successor; a commit the outgoing session made while the watcher restarted is still published after the swap.
 test("pi_024 a /new swap releases called-uncommitted attempts lost", async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });

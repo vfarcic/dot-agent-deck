@@ -10477,7 +10477,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/012 — Pi's message_start commits every called attempt of the id.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** Both attempts of one id, one already released `lost`, commit on the start; a revoke afterwards is `already_handed`.
+- **Asserts:** Both attempts of one id, one already released `lost`, commit on the start; a revoke afterwards is `already_handed`. A start whose block's trusted body quotes another message's whole block commits only its own attempt; the quoted one commits on its own start.
 - **Does not assert:** The daemon's settlement (inbox/boundary/031).
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.
@@ -10509,7 +10509,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/016 — The Pi doorbell is fetched to the receiver and transformed in place.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** Registered: fetched with `--rx`, transformed, reported `handed` and committed on its start; recalled: consumed; unregistered past the wait: consumed with nothing fetched.
+- **Asserts:** Registered: fetched with `--rx`, transformed, reported `handed` and committed on its start; recalled: consumed; unregistered past the wait: consumed with nothing fetched. A line naming two messages whose fetches each take most of the approval window is still transformed into both: the fetches run at once.
 - **Does not assert:** The deck refusing a plain fetch (inbox/boundary/030).
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.
@@ -10623,7 +10623,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/031 — The Pi extension's receiver runs only an absolute path to an executable deck binary.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox-receiver.test.ts` under Node).
 - **Agent:** none; stand-in shell scripts as the deck binary in a temporary directory.
-- **Asserts:** a resolver result that is a bare name found on PATH, a relative path, nothing, a missing file or a non-executable file runs nothing, starts no watcher, delivers nothing and is tried again on the backoff; an absolute path to an executable file containing spaces runs.
+- **Asserts:** a resolver result that is a bare name found on PATH, a relative path, nothing, a missing file or a non-executable file runs nothing, starts no watcher, delivers nothing and is tried again on the backoff; an absolute path to an executable file containing spaces runs; a spawn Node fails after returning (a script whose interpreter is missing) is tried again too. With a stand-in watcher, a hand-out missing its text is neither held nor delivered, and the receiver remembers at most 4096 revoked attempts, the newest.
 - **Does not assert:** which binary the extension's resolver returns, or the deck's not-armed notice after no watcher registers.
 - **Platform coverage:** unix (skipped on Windows; prints `SKIP:` without Node 23.6+).
 - **Cost:** about two seconds.

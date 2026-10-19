@@ -75,9 +75,8 @@ import { accessSync, constants, statSync } from "node:fs";
 // else the resolver gives (nothing, a bare name the agent's PATH would look
 // up, a path relative to its working directory, a missing or non-executable
 // file) fails the spawn at once, so no watcher registers and nothing is
-// handed over, and the receiver tries again on its backoff. A spawn Node
-// fails later instead (a missing file) would report no exit, and the
-// receiver would not try again.
+// handed over, and the receiver tries again on its backoff, as it does when
+// Node fails the spawn later (the file gone since it was resolved).
 let inboxBinaryOf = () => undefined;
 const inboxAbsolute = (path) =>
   process.platform === "win32" ? /^([A-Za-z]:[\\/]|[\\/]{2})/.test(path) : path.startsWith("/");
