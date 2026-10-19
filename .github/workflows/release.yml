@@ -418,12 +418,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.98.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # only main's caches are readable by other runs; see ci.yml's cache note
           key: ${{ matrix.target }}
       - name: Install cross
         if: matrix.use_cross
@@ -764,11 +765,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.98.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # only main's caches are readable by other runs; see ci.yml's cache note
       # The first six are ci.yml's compile set, needed because this job builds
       # `dot-agent-deck-desktop` — five for Tauri and `libasound2-dev` for PRD
       # #802 M7's `cpal`, whose `alsa-sys` build script resolves `alsa` through
@@ -785,7 +788,7 @@ jobs:
             patchelf fakeroot file desktop-file-utils
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 11.25.0
+          version: 12.9.0
       # pnpm and Node match ci.yml's `desktop-web` job, so what is tested is
       # what is shipped. pnpm is also the exact version devbox.json pins, and
       # `scripts/check-pin-lockstep.sh` fails if any of those sites disagree

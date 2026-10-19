@@ -472,9 +472,9 @@ GATES — CLAUDE.md is the authority, this is the summary:
   the URL that prints, not from a listing). But the helper's gates run BEFORE
   a commit exists, so they have already passed by the time there is anything
   to dispatch, and the helper stays the per-task gate. What a dispatch
-  buys is the part no local gate covers at all — build-macos, build-windows,
+  buys is the part no local gate covers at all — build-macos,
   e2e-deterministic, nix, devbox, security, the desktop jobs,
-  windows-cross-check — earlier than opening the PR, and the option of NOT
+  windows-cross-check (not build-windows, `if: false` until Windows ships) — earlier than opening the PR, and the option of NOT
   adding a second broad local sweep on a box already busy with the mandatory
   ones. NOT as the per-edit gate: a round trip has a 9.5-minute median against
   a warm clippy of ~9-15s. It covers neither lane 2 nor anything you have not
@@ -638,8 +638,9 @@ lifecycle, and it covers what /prd-full does not.
   relieves NO gate a worker owes: `cargo xtask affected-checks --run` is the
   gate before a commit exists, so whatever it selected has already passed by
   the time there is anything to dispatch. What it buys is the part no local
-  gate covers — build-macos, build-windows, e2e-deterministic, nix, devbox,
-  security, the desktop jobs, windows-cross-check — earlier than opening the PR, and the option of not
+  gate covers — build-macos, e2e-deterministic, nix, devbox,
+  security, the desktop jobs, windows-cross-check (not build-windows, `if: false`
+  until Windows ships) — earlier than opening the PR, and the option of not
   adding a second broad local sweep on a box already busy. Never a worker's
   per-edit gate, where a 9.5-minute median round trip would stand in for a
   warm clippy of ~9-15s. Your workers run the gates and you do not, so tell

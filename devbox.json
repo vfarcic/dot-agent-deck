@@ -12,7 +12,7 @@
     "rustc":                        "1.98.1",
     "cargo":                        "1.98.1",
     "clippy":                       "1.98.1",
-    "mold":                         "2.42.1",
+    "mold":                         "3.0.0",
     "rustfmt":                      "1.98.1",
     "path:gcloud#google-cloud-sdk": "",
     "asciinema-agg":                "1.9.0",
@@ -24,7 +24,7 @@
     "github:NixOS/nixpkgs/nixos-26.05#nodejs_24": {
       "disable_plugin": true
     },
-    "pnpm":                       "11.25.0",
+    "pnpm":                       "12.9.0",
     "netlify-cli":                "23.15.0",
     "pkg-config":                 "0.29.2",
     "path:tauri-deps#tauri-deps": ""

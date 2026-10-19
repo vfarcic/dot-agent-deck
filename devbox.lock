@@ -668,41 +668,41 @@
         }
       }
     },
-    "mold@2.42.1": {
-      "last_modified": "2026-10-08T19:21:32Z",
-      "resolved": "github:NixOS/nixpkgs/8edc0c72e3a38faf5434e40d1f19431125fe4b30#mold",
+    "mold@3.0.0": {
+      "last_modified": "2026-10-14T08:20:44Z",
+      "resolved": "github:NixOS/nixpkgs/319e4cebef10cbb636c6ea392137b52ad105336a#mold",
       "source": "devbox-search",
-      "version": "2.42.1",
+      "version": "3.0.0",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/zibpay1i6jln31q8xklby0zrpdbkb5k3-mold-unwrapped-wrapper-2.42.1",
+              "path": "/nix/store/m20jpzxlh25znmqhlr3f5ka57wwljw9c-mold-unwrapped-wrapper-3.0.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/zibpay1i6jln31q8xklby0zrpdbkb5k3-mold-unwrapped-wrapper-2.42.1"
+          "store_path": "/nix/store/m20jpzxlh25znmqhlr3f5ka57wwljw9c-mold-unwrapped-wrapper-3.0.0"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/gbq334xbibaz4gn184j7gs58m2spgwi7-mold-unwrapped-wrapper-2.42.1",
+              "path": "/nix/store/kv383fb16sjkyb3gj1kqgzw15j5wmrwd-mold-unwrapped-wrapper-3.0.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/gbq334xbibaz4gn184j7gs58m2spgwi7-mold-unwrapped-wrapper-2.42.1"
+          "store_path": "/nix/store/kv383fb16sjkyb3gj1kqgzw15j5wmrwd-mold-unwrapped-wrapper-3.0.0"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/9dcddrfxlfl9n3wfibi5jkmp22bjkvkh-mold-unwrapped-wrapper-2.42.1",
+              "path": "/nix/store/lwgvlhgbv85i9rm0yy1bf0wbw0z91k9p-mold-unwrapped-wrapper-3.0.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/9dcddrfxlfl9n3wfibi5jkmp22bjkvkh-mold-unwrapped-wrapper-2.42.1"
+          "store_path": "/nix/store/lwgvlhgbv85i9rm0yy1bf0wbw0z91k9p-mold-unwrapped-wrapper-3.0.0"
         }
       }
     },
@@ -888,41 +888,41 @@
         }
       }
     },
-    "pnpm@11.25.0": {
-      "last_modified": "2026-09-14T07:18:56Z",
-      "resolved": "github:NixOS/nixpkgs/c7def046b9a883d46974757852106483d741586f#pnpm",
+    "pnpm@12.9.0": {
+      "last_modified": "2026-10-08T19:21:32Z",
+      "resolved": "github:NixOS/nixpkgs/8edc0c72e3a38faf5434e40d1f19431125fe4b30#pnpm",
       "source": "devbox-search",
-      "version": "11.25.0",
+      "version": "12.9.0",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/ba4z00fd818dpvvnprspj1wyadfi7gff-pnpm-11.25.0",
+              "path": "/nix/store/6vnrsxp5zmq5chqqvrflhsk3dw9w941s-pnpm-12.9.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/ba4z00fd818dpvvnprspj1wyadfi7gff-pnpm-11.25.0"
+          "store_path": "/nix/store/6vnrsxp5zmq5chqqvrflhsk3dw9w941s-pnpm-12.9.0"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/fycffh29x8nngy9bs0irw7fkbw74zc7x-pnpm-11.25.0",
+              "path": "/nix/store/4cgvir2rfw19yvni23j747rgkn98p3dm-pnpm-12.9.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/fycffh29x8nngy9bs0irw7fkbw74zc7x-pnpm-11.25.0"
+          "store_path": "/nix/store/4cgvir2rfw19yvni23j747rgkn98p3dm-pnpm-12.9.0"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/igcspl7ysgfxzhxwz548ajwfkfh51hfw-pnpm-11.25.0",
+              "path": "/nix/store/gslcmgvwsgn1csg90b4dpcgxr57x91yv-pnpm-12.9.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/igcspl7ysgfxzhxwz548ajwfkfh51hfw-pnpm-11.25.0"
+          "store_path": "/nix/store/gslcmgvwsgn1csg90b4dpcgxr57x91yv-pnpm-12.9.0"
         }
       }
     },
