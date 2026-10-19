@@ -1709,6 +1709,47 @@ fn first_watcher_pid(op: &OpenCode) -> Value {
         .clone()
 }
 
+/// Each watcher's stdout by pid. The fixture logs each `data` chunk as it
+/// comes, and a chunk can end mid-line: the stream is rebuilt before its
+/// lines are read, so a marker split across two chunks is still seen.
+fn watcher_streams(op: &OpenCode) -> std::collections::BTreeMap<String, String> {
+    let mut streams: std::collections::BTreeMap<String, String> = Default::default();
+    for event in op.events().into_iter().filter(|e| e["kind"] == "stdout") {
+        if let Some(text) = event["text"].as_str() {
+            streams
+                .entry(event["pid"].to_string())
+                .or_default()
+                .push_str(text);
+        }
+    }
+    streams
+}
+
+/// The watchers' spawns and exits, the plugin's commit reports and the
+/// registrations it read, in ms from the first event, for a failure message.
+fn timeline(op: &OpenCode) -> String {
+    let events = op.events();
+    let start = events.first().and_then(|e| e["t"].as_i64()).unwrap_or(0);
+    events
+        .iter()
+        .filter_map(|e| {
+            let text = e["text"].as_str().unwrap_or("");
+            let what = match e["kind"].as_str()? {
+                "spawn" if e["args"][1][1] == "wait" => format!("watcher {} spawned", e["pid"]),
+                "exit" => format!("{} exited ({})", e["pid"], e["signal"]),
+                "stdin" if text.contains("\"committed\"") => "commit reported".into(),
+                "stdout" if text.contains("\"registered\"") => {
+                    let listed = text.contains("\"correctable\"");
+                    format!("{} registered, correctable listed: {listed}", e["pid"])
+                }
+                _ => return None,
+            };
+            Some(format!("+{}ms {what}", e["t"].as_i64()? - start))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// The resume answers the plugin wrote to its watchers.
 fn resume_answers(op: &OpenCode) -> Vec<Value> {
     op.controls()
@@ -1882,13 +1923,20 @@ fn opencode_051_a_commit_reported_at_shutdown_reaches_the_deck() {
     assert_eq!(op.prompts().len(), 1, "{:?}", op.prompts());
 }
 
-/// Scenario: A task is delegated to the OpenCode worker and prompted, and every receipt publish takes three seconds. The user cancels it; the plugin answers that it was already handed, and the task ends cancelled. OpenCode then answers it, so the plugin reports the commit, and the watcher is killed with SIGKILL while that publish is in flight. The replacement watcher's registration hands back the attempt's commit authority: the plugin sends the commit again, the replacement publishes it, the orchestrator is told the task was delivered after all despite Cancel, the receipts are not reported degraded, and no line the plugin reads carries a cap.
+/// Scenario: A task is delegated to the OpenCode worker and prompted, and the first watcher's receipt publishes are held for two minutes. The user cancels it; the plugin answers that it was already handed, and the task ends cancelled. OpenCode then answers it, so the plugin reports the commit, and the watcher is killed with SIGKILL while that publish is in flight. The replacement watcher's registration hands back the attempt's commit authority: the plugin sends the commit again, the replacement publishes it, the orchestrator is told the task was delivered after all despite Cancel, the receipts are not reported degraded, and no line the plugin reads carries a cap.
 #[spec("inbox/opencode/052")]
 #[test]
 fn opencode_052_a_cancelled_tasks_commit_survives_its_watcher_killed_mid_publish() {
+    // Only the first watcher waits out the publish delay. Two minutes is
+    // twelve times the longest wait between the plugin's commit report and
+    // the kill, so the kill lands while that commit is still being published
+    // unless the box stalls for minutes. A three-second delay raced the kill
+    // under load: a commit published before it leaves the replacement
+    // nothing to hand back, and the later watchers publish at once.
     let op = OpenCode::new(
         "session",
-        json!({"offerPool":"review","keepWorker":true,"publishDelayMs":"3000"}),
+        json!({"offerPool":"review","keepWorker":true,"publishDelayMs":"120000",
+            "firstWatcherDelaysPublish":true}),
     );
     armed(&op.daemon, &op.pane, 1);
     let orch = op.orchestrator.as_ref().unwrap();
@@ -1934,10 +1982,38 @@ fn opencode_052_a_cancelled_tasks_commit_survives_its_watcher_killed_mid_publish
             .any(|e| e["kind"] == "exit" && e["pid"] == first)),
         "the watcher is killed mid-publish"
     );
+    // Each step its own assertion, with the timeline, so a failure names the
+    // step that did not happen.
+    let first = first.to_string();
+    let registration = || {
+        watcher_streams(&op)
+            .into_iter()
+            .filter(|(pid, _)| *pid != first)
+            .flat_map(|(_, stream)| {
+                stream
+                    .lines()
+                    .filter(|line| line.contains("\"registered\""))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .next()
+    };
+    assert!(
+        common::wait_until(WAIT, || registration().is_some()),
+        "the replacement watcher registers: {}",
+        timeline(&op)
+    );
+    let registered = registration().unwrap_or_default();
+    assert!(
+        registered.contains("\"correctable\"") && registered.contains(id.as_str()),
+        "the replacement's registration hands the attempt back: {registered}\n{}",
+        timeline(&op)
+    );
     assert!(
         common::wait_until(WAIT, || op.commits(&id) >= 2),
-        "the plugin sends the commit again to the replacement: {:?}",
-        op.controls()
+        "the plugin sends the commit again to the replacement: {:?}\n{}",
+        op.controls(),
+        timeline(&op)
     );
 
     let corrected = || {
@@ -1972,18 +2048,7 @@ fn opencode_052_a_cancelled_tasks_commit_survives_its_watcher_killed_mid_publish
         record["inbox"]["receipts_degraded"].is_null(),
         "the replacement had the cap, so nothing is degraded: {record}"
     );
-    // The fixture logs each `data` chunk as it comes, and a chunk can end
-    // mid-line: rebuild each watcher's stdout before reading its lines, so a
-    // marker split across two chunks is still seen.
-    let mut streams: std::collections::BTreeMap<String, String> = Default::default();
-    for event in op.events().into_iter().filter(|e| e["kind"] == "stdout") {
-        if let Some(text) = event["text"].as_str() {
-            streams
-                .entry(event["pid"].to_string())
-                .or_default()
-                .push_str(text);
-        }
-    }
+    let streams = watcher_streams(&op);
     let read: Vec<&str> = streams.values().flat_map(|stream| stream.lines()).collect();
     assert!(
         read.iter().any(|line| line.contains("\"correctable\"")),

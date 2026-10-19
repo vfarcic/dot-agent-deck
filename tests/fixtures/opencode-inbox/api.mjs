@@ -13,7 +13,8 @@ if(config.worker && !workerData) {
   worker.on('error',error=>{console.error(error);process.exit(1);});
   await new Promise(resolve=>worker.on('exit',resolve));process.exit(0);
 }
-const log = (kind, data = {}) => fs.appendFileSync(base + '.events', JSON.stringify({kind, ...data}) + '\n');
+// `t` (wall-clock ms) lets a failing test say how far apart two events were.
+const log = (kind, data = {}) => fs.appendFileSync(base + '.events', JSON.stringify({kind, t: Date.now(), ...data}) + '\n');
 const handlers = new Map();
 const emit = (type, properties) => {
   for (const fn of handlers.get(type) ?? []) fn({type, properties});
@@ -22,7 +23,15 @@ const spawned = [];
 if(process.stdin.isTTY) process.stdin.setRawMode(true);
 process.stdin.on('data',chunk=>fs.appendFileSync(base+'.bytes',chunk));
 const realSpawn = cp.spawn;
+// With `firstWatcherDelaysPublish`, only the first watcher inherits the
+// publish delay knob: a later one publishes at once.
+let watchers = 0;
 cp.spawn = (...args) => {
+  if (config.firstWatcherDelaysPublish && args[1]?.[1] === 'wait' && watchers++ > 0) {
+    const env = {...process.env};
+    delete env.DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS;
+    args[2] = {...args[2], env};
+  }
   const child = realSpawn(...args);
   spawned.push(child);
   log('spawn', {pid: child.pid, args: args.slice(0, 2)});
