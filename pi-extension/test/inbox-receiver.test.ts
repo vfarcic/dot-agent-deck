@@ -143,6 +143,51 @@ test("pi_031 the receiver's memory of revoked attempts is bounded", { skip: proc
 	assert.ok(!revoked.includes("m-0|1|1"), "the oldest is dropped");
 });
 
+/// Scenario: Under an approval given before any revoke, the watcher revokes an attempt and then more attempts than the receiver remembers, so the first is forgotten. A late doorbell fetch then brings that attempt back: it is held, but not ready under that approval, while an approval given now still readies a held attempt.
+test("pi_031 a forgotten revoke never becomes ready under an approval given before it", { skip: process.platform === "win32" }, async () => {
+	const revoke = Array.from({ length: 4097 }, (_, n) => ({ id: "m-" + n, a: 1, e: 1 }));
+	const path = join(dir, "watcher");
+	writeFileSync(join(dir, "registered"), JSON.stringify(REGISTERED) + "\n");
+	writeFileSync(join(dir, "revokes"), JSON.stringify({ revoke }) + "\n");
+	writeFileSync(path, `#!/bin/sh\ncat '${join(dir, "registered")}'\nsleep 0.3\ncat '${join(dir, "revokes")}'\nexec sleep 5\n`);
+	chmodSync(path, 0o755);
+	inboxBinary(() => path);
+	let on = true;
+	const receiver = inboxReceiver({ agent: "pi", active: () => on });
+	receiver.start();
+	for (let waited = 0; receiver.rx() === undefined && waited < 3000; waited += 10) await settle(10);
+	const before = receiver.approval();
+	let revoked: string[] = [];
+	for (let waited = 0; !revoked.includes("m-4096|1|1") && waited < 3000; waited += 20) {
+		await settle(20);
+		revoked = receiver.exportState().revoked ?? [];
+	}
+	const forgotten = { id: "m-0", a: 1, e: 1 };
+	const other = { id: "m-other", a: 1, e: 1 };
+	receiver.take([{ ...forgotten, d: 1, text: "late" }, { ...other, d: 2, text: "never revoked" }]);
+	const lateReady = receiver.ready(forgotten, before);
+	const nowReady = receiver.ready(other, receiver.approval());
+	const age = performance.now() - before.at;
+	on = false;
+	receiver.stop();
+	assert.ok(!revoked.includes("m-0|1|1"), "precondition: the first revoke was forgotten");
+	assert.ok(age < before.valid, `precondition: the earlier approval is still within its time (${age} ms)`);
+	assert.equal(nowReady, true, "precondition: the receiver readies a held attempt under a new approval");
+	assert.equal(lateReady, false, "a forgotten revoke became ready under an approval given before it");
+});
+
+/// Scenario: A receiver starts from another receiver's state holding more revoked and called attempts than it remembers. It keeps the newest of each, up to its bound, and counts the dropped called ones as possibly handed.
+test("pi_031 a transferred memory of revoked and called attempts is bounded", () => {
+	const keys = Array.from({ length: 5000 }, (_, n) => "m-" + n + "|1|1");
+	const receiver = inboxReceiver({ agent: "pi", active: () => false, state: { held: [], revoked: keys, called: keys, reports: [] } });
+	const state = receiver.exportState();
+	const revoked = state.revoked ?? [];
+	assert.equal(revoked.length, 4096);
+	assert.ok(revoked.includes("m-4999|1|1") && !revoked.includes("m-0|1|1"), "the newest revoked are kept");
+	assert.equal((state.called ?? []).length, 4096);
+	assert.equal(state.forgot, true, "a dropped called attempt counts as possibly handed");
+});
+
 /// Scenario: The resolved deck binary is a script whose interpreter is missing, so Node fails the spawn after it returned, with an error and no exit. The receiver tries again on its backoff.
 test("pi_031 a spawn Node fails after returning is tried again", { skip: process.platform === "win32" }, async () => {
 	const path = join(dir, "no-interpreter");

@@ -115,14 +115,22 @@ const inboxRef = (entry) => ({ id: entry.id, a: entry.a, e: entry.e });
 const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, registered, state }) => {
   const held = new Map((state?.held ?? []).map((entry) => [inboxKey(entry), { ...entry }]));
   // Attempts revoked here, so neither a late doorbell fetch nor an approval
-  // still outstanding brings one back (`take`, `ready`). Both are bounded in
-  // time (a fetch and an approval each by seconds), so the oldest are
-  // dropped first beyond INBOX_MAX_CALLED (PR #1735 review 4305525329).
-  const revoked = new Set(state?.revoked ?? []);
+  // still outstanding brings one back (`take`, `ready`). Bounded, oldest
+  // dropped first beyond INBOX_MAX_CALLED (PR #1735 review 4305525329),
+  // what another receiver gave up included. Nothing bounds how many revokes
+  // arrive while a fetch or an approval is outstanding, so a drop voids
+  // every approval given before it (`fresh`): a forgotten attempt a late
+  // fetch brings back is held, but never ready (reviewer R9T-04).
+  const imported = state?.revoked ?? [];
+  const revoked = new Set(imported.slice(-INBOX_MAX_CALLED));
+  let fence = imported.length > INBOX_MAX_CALLED ? inboxNow() : -Infinity;
   const revoke = (key) => {
     revoked.delete(key);
     revoked.add(key);
-    if (revoked.size > INBOX_MAX_CALLED) revoked.delete(revoked.values().next().value);
+    if (revoked.size > INBOX_MAX_CALLED) {
+      revoked.delete(revoked.values().next().value);
+      fence = inboxNow();
+    }
   };
   // Attempts a callback took into OpenCode's API, or that the agent started
   // on, and that did not end in a positive refusal: possibly handed, whatever
@@ -131,8 +139,9 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
   // never reported not handed. Bounded, oldest dropped first; once one was
   // dropped, an attempt this receiver does not hold may be one of them, so
   // it is answered the same way.
-  const called = new Set(state?.called ?? []);
-  let forgot = state?.forgot === true;
+  const calledBefore = state?.called ?? [];
+  const called = new Set(calledBefore.slice(-INBOX_MAX_CALLED));
+  let forgot = state?.forgot === true || calledBefore.length > INBOX_MAX_CALLED;
   const call = (key) => {
     called.delete(key);
     called.add(key);
@@ -155,7 +164,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     valid: keepaliveMs ? Math.min(INBOX_GRANT_TIMEOUT_MS, keepaliveMs * INBOX_RETIRE_KEEPALIVES) : INBOX_GRANT_TIMEOUT_MS,
   });
   const fresh = (granted) =>
-    granted !== undefined && granted.epoch === epoch && inboxNow() - granted.at < granted.valid;
+    granted !== undefined && granted.epoch === epoch && granted.at > fence && inboxNow() - granted.at < granted.valid;
   // Stage reports (`handed`, `committed`) no registered watcher has taken
   // yet, or that a watcher took and then exited. One made while no watcher
   // runs, or before a new one has registered, waits here and its attempt
@@ -171,7 +180,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
   // A report another receiver's watcher took counts as taken by a watcher
   // that has exited (`to` is none of this receiver's children).
   const reports = new Map(
-    (state?.reports ?? []).map((entry) => [
+    (state?.reports ?? []).slice(-INBOX_MAX_CALLED).map((entry) => [
       entry.stage + "|" + inboxKey(entry.ref),
       { stage: entry.stage, ref: inboxRef(entry.ref), to: entry.taken ? state : undefined },
     ])
