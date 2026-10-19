@@ -39,16 +39,19 @@ fn pi_001_live_idle_delegate_wakes_and_acknowledges() {
     );
 }
 
-/// Scenario: While real Pi runs a slow bash tool, post three inbox messages through the client attach API in quick succession. They must append A, B and C after the current tool, enter Pi once each in separate turns, and each become acknowledged.
+/// Scenario: While real Pi runs a slow bash tool specified in a fenced command, post three inbox messages through the client attach API in quick succession. They must append A, B and C after the current tool, enter Pi once each in separate turns, and each become acknowledged.
 #[spec("inbox/pi/002")]
 #[test]
 fn pi_002_live_streaming_messages_run_in_order_one_per_turn() {
     skip_unless!(live::available());
     let pi = Pi::new();
-    pi.prompt(&format!("Use bash to run exactly: printf started > '{}/busy-start'; sleep 30; printf '0\\n' > '{}/order.txt'. Then reply BUSY-DONE.",pi.work.display(),pi.work.display()));
+    pi.prompt(&format!(
+        "Use bash to run this exact command:\n```sh\nprintf started > '{}/busy-start'; sleep 30; printf '0\\n' > '{}/order.txt'\n```\nAfter the command finishes, reply BUSY-DONE.",
+        pi.work.display(), pi.work.display()
+    ));
     common::wait_for_file_trimmed_eq(&pi.work.join("busy-start"), "started", BUDGET).unwrap();
     let ids=['A','B','C'].map(|letter|pi.post_body(&format!("queued task {letter}"), &format!(
-        "Use bash to run exactly: printf '{letter}\\n' >> '{}/order.txt'. Reply DONE-{letter} and end your turn.",pi.work.display()
+        "Use bash to run this exact command:\n```sh\nprintf '{letter}\\n' >> '{}/order.txt'\n```\nAfter the command finishes, reply DONE-{letter} and end your turn.",pi.work.display()
     )));
     assert!(
         !pi.work.join("order.txt").exists(),

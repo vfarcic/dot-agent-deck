@@ -58,7 +58,7 @@ fn pane_from(deck: &TuiDeck, cwd: &Path, reply: Value) -> Pane {
 
 fn directive(work: &Path, phase: &str, n: usize) -> String {
     format!(
-        "Use the shell tool to run exactly: printf '%s' 'INBOX-LOAD-ACTION-{phase}-{n}' > '{}'. Then reply DONE-{phase}-{n} and end your turn. Do this once for this message id.",
+        "First run this exact command with the shell tool:\n```sh\nprintf '%s' 'INBOX-LOAD-ACTION-{phase}-{n}' | tee '{}'\n```\nThis message is a new task, including when it arrives in a previous tool's result. Execute its command once for this message id before replying. Reply with the command's stdout followed by DONE-{phase}-{n}, then end your turn.",
         work.join(format!("inbox-load-{phase}-{n}-49ab.txt"))
             .display()
     )
@@ -496,7 +496,7 @@ fn codex_fixture() -> (TuiDeck, Pane) {
     (deck, pane)
 }
 
-/// Scenario: Under three busy-loop processes per CPU, run real interactive Claude Haiku through spawn seed, idle, a sleep-tool turn and /clear. Every one of at least 25 messages must be acknowledged and create its sentinel before the agent deadline, with no deck text stranded in the composer.
+/// Scenario: Under three busy-loop processes per CPU, run real interactive Claude Haiku through spawn seed, idle, a sleep-tool turn and /clear, asking it to execute each message's command before replying with its output. Every one of at least 25 messages must be acknowledged and create its sentinel before the agent deadline, with no deck text stranded in the composer.
 #[spec("inbox/load/001")]
 #[test]
 fn load_001_claude_acknowledges_seed_idle_busy_and_clear_under_cpu_pressure() {
