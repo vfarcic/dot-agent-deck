@@ -9512,6 +9512,134 @@ mod tests {
         server.abort();
     }
 
+    /// PRD #1666 §2.8 (reviews R9Q-A02 / R9Q-02): the TUI's event subscriber,
+    /// started against the real daemon while a pane already has a message
+    /// waiting and a wake stall, takes that pane's inbox from its first
+    /// subscription's snapshot. The startup hydration registers the pane and
+    /// draws its card beside it, in whichever order the two land, and a
+    /// message posted afterwards counts on top: the card shows both messages
+    /// and the stall, not just the later message.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_subscription_takes_a_running_panes_inbox_from_the_real_daemon() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(64);
+        registry.inbox().set_broadcast(event_tx.clone());
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "startup-inbox-pane";
+        let agent_id = DaemonClient::new(sock.clone())
+            .start_agent(StartAgentOptions {
+                command: Some("cat".to_string()),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("spawn a pane through the attach socket");
+        let post = |subject: &str| {
+            registry
+                .inbox()
+                .post_direct(
+                    crate::inbox::Recipient::bound(pane_id, &agent_id),
+                    crate::inbox::Content {
+                        from: crate::inbox::Sender::Deck {
+                            reason: "test".to_string(),
+                        },
+                        subject: subject.to_string(),
+                        body: "b".to_string(),
+                        body_trust: crate::inbox::BodyTrust::Trusted,
+                        spill_path: None,
+                        id: None,
+                        preface: None,
+                    },
+                )
+                .expect("post");
+        };
+        post("before the TUI");
+        registry.inbox().set_wake_stalled(pane_id, &agent_id, true);
+
+        let receivers = event_tx.receiver_count();
+        let tui: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let subscriber = tokio::spawn(crate::event_subscriber::run(
+            DaemonClient::new(sock.clone()),
+            tui.clone(),
+            crate::event_subscriber::SubscriberConfig {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(50),
+                drop_event: None,
+                break_on_event: None,
+            },
+        ));
+        {
+            // The startup hydration.
+            let mut st = tui.write().await;
+            st.register_pane(pane_id.to_string());
+            st.insert_placeholder_session(pane_id.to_string(), None, None, Some(agent_id.clone()));
+        }
+        while event_tx.receiver_count() == receivers {
+            assert!(
+                tokio::time::Instant::now() < deadline + Duration::from_secs(5),
+                "the subscriber never subscribed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        post("after the TUI");
+
+        let shown = |st: &crate::state::AppState| {
+            st.sessions
+                .values()
+                .find(|s| s.pane_id.as_deref() == Some(pane_id))
+                .and_then(|s| s.card_inbox())
+                .map(|inbox| (inbox.pending, inbox.stalled))
+        };
+        let shown_by = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = None;
+        while seen != Some((2, true)) && tokio::time::Instant::now() < shown_by {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            seen = shown(&*tui.read().await);
+        }
+        subscriber.abort();
+        registry.shutdown_all();
+        server.abort();
+        assert_eq!(
+            seen,
+            Some((2, true)),
+            "the message and stall from before the TUI, and the message after it"
+        );
+    }
+
     /// The payload the real `dot-agent-deck agent-event --type running` CLI puts
     /// on the hook socket (`Commands::AgentEvent` in `main.rs`): a bare
     /// `AgentEvent`, `EventType::Thinking`, a pane-derived session id, and the

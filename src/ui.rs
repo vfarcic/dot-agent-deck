@@ -11893,13 +11893,6 @@ pub fn run_tui(
                 Some(h.agent_id.clone()),
                 h.live.as_ref(),
             );
-            // PRD #1666 §2.8: the card's inbox line starts from the daemon's
-            // summary; live notices move it from here. Unless the event stream
-            // has already given the pane its account, which is ordered with
-            // those notices where this reply is not.
-            if let Some(summary) = h.inbox.as_ref() {
-                st.seed_inbox_summary(&h.pane_id, &h.agent_id, summary);
-            }
             drop(st);
             let display_name = h.display_name.clone().unwrap_or_else(|| h.agent_id.clone());
             ui.pane_display_names
@@ -26619,7 +26612,6 @@ mod tests {
             agent_type: None,
             live: None,
             orchestrator_context_path: None,
-            inbox: None,
         }
     }
 

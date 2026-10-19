@@ -1564,7 +1564,8 @@ pub struct AppState {
     ///
     /// The daemon's accounts are ordered with its notices: the inbox a
     /// card-surfacing start carries ([`take_surfaced_inbox`]) and the snapshot
-    /// a resync applies ([`Self::take_inbox_snapshot`]).
+    /// the first subscription and every resync where the daemon offers one
+    /// apply ([`Self::take_inbox_snapshot`]).
     /// So a pane has an entry from the first account of it, whether or not
     /// this client manages the pane yet, and a notice for a pane with neither
     /// an entry nor management is dropped: the account the daemon gives when
@@ -8457,8 +8458,8 @@ impl AppState {
     }
 
     /// PRD #1666 §2.8: the daemon's agents, read in order with the event
-    /// stream — the reply a resync applies before its stream's first event —
-    /// as its account of every
+    /// stream — the reply the first subscription or a resync applies before
+    /// its stream's first event — as its account of every
     /// pane's inbox. A listed pane's summary replaces what this state held
     /// for it ([`Self::apply_inbox_summary`]), whether or not this client
     /// manages the pane yet, so a later registration finds it, and the
@@ -8516,22 +8517,6 @@ impl AppState {
             .or_default()
             .retire(next);
         self.refresh_card_inbox(pane_id);
-    }
-
-    /// PRD #1666 §2.8: [`Self::apply_inbox_summary`] for a pane this state has
-    /// no account of yet, from a reply read out of order with the event
-    /// stream — the TUI's startup hydration. A pane the stream has already
-    /// given an account of keeps it: that one is ordered with the notices
-    /// applied since, and the reply may be older or newer than it.
-    pub fn seed_inbox_summary(
-        &mut self,
-        pane_id: &str,
-        agent_id: &str,
-        summary: &crate::inbox_hub::InboxSummary,
-    ) {
-        if !self.pane_inboxes.contains_key(pane_id) {
-            self.apply_inbox_summary(pane_id, agent_id, summary);
-        }
     }
 
     /// PRD #1666 §2.8: one message in the inbox of a pane changed state
@@ -19647,37 +19632,6 @@ mod tests {
         assert_eq!(
             pane_card_inbox(&state, "pane-q").and_then(|inbox| inbox.integration),
             None
-        );
-    }
-
-    /// PRD #1666 §2.8: the startup hydration's reply, read out of order with
-    /// the event stream, seeds the inbox of a pane the stream has given no
-    /// account of, and leaves alone one it has, with the notices since.
-    #[test]
-    fn hydration_seeds_only_a_pane_the_stream_has_no_account_of() {
-        use crate::inbox::StateName::Queued;
-        use crate::inbox_display::IntegrationNotice::RefreshFailedPi;
-        let mut state = AppState::default();
-        state.apply_event(surfacing_start(
-            "pane-q",
-            "agent-q",
-            &held_summary(1, Some(RefreshFailedPi)),
-        ));
-        state.apply_inbox_notice(&inbox_notice("pane-q", "m-2", Queued));
-        state.seed_inbox_summary("pane-q", "agent-q", &held_summary(0, None));
-        let shown = pane_card_inbox(&state, "pane-q").expect("the card");
-        assert_eq!(
-            (shown.pending, shown.integration),
-            (2, Some(RefreshFailedPi))
-        );
-
-        state.register_pane("pane-h".to_string());
-        state.insert_placeholder_session("pane-h".to_string(), None, None, None);
-        state.seed_inbox_summary("pane-h", "agent-h", &held_summary(1, Some(RefreshFailedPi)));
-        let shown = pane_card_inbox(&state, "pane-h").expect("the hydrated card");
-        assert_eq!(
-            (shown.pending, shown.integration),
-            (1, Some(RefreshFailedPi))
         );
     }
 

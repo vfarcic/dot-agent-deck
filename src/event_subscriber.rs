@@ -67,9 +67,7 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
         let subscribed = if resync {
             resubscribe(&client, &state).await
         } else {
-            client.subscribe_events().await.map_err(|e| {
-                tracing::debug!(error = %e, "subscribe_events: subscribe failed, retrying");
-            })
+            subscribe(&client, &state).await
         };
         // On `Err` the failure was logged where it happened. Qodo on #1553: a
         // resync that could not read the daemon's agents leaves this state
@@ -152,6 +150,44 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
         }
         tokio::time::sleep(delay).await;
         delay = std::cmp::min(delay * 2, config.max_delay);
+    }
+}
+
+/// The first subscription. PRD #1666 §2.8: where the daemon offers it, the
+/// stream and the daemon's agents come from one `SubscribeEventsWithSnapshot`,
+/// and the agents' inboxes become this state's account of every pane's inbox
+/// ([`crate::state::AppState::take_inbox_snapshot`]) before the stream's first
+/// notice is applied — the panes the TUI's startup hydration registers
+/// included, whose own `ListAgents` reply is not ordered with the stream and
+/// so is not read for their inboxes. Only the inboxes: nothing was missed
+/// before the first subscription, so there is no gap to reconcile. From a
+/// daemon that does not offer it, a plain `SubscribeEvents`, as before: the
+/// capability shipped before the inbox did (issue #1555), so such a daemon
+/// sends no inbox notices to order.
+async fn subscribe(
+    client: &DaemonClient,
+    state: &SharedState,
+) -> Result<crate::daemon_client::EventSubscription, ()> {
+    use crate::daemon_client::GatedQuery;
+    match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.subscribe_events_with_snapshot()).await {
+        Ok(Ok(GatedQuery::Answered((sub, records)))) => {
+            state.write().await.take_inbox_snapshot(&records);
+            Ok(sub)
+        }
+        Ok(Ok(GatedQuery::Unsupported)) => client.subscribe_events().await.map_err(|e| {
+            tracing::debug!(error = %e, "subscribe_events: subscribe failed, retrying");
+        }),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "subscribe_events: subscribe failed, retrying");
+            Err(())
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = RESYNC_LIST_TIMEOUT.as_millis() as u64,
+                "subscribe_events: the first subscription timed out, retrying"
+            );
+            Err(())
+        }
     }
 }
 
@@ -344,7 +380,10 @@ mod tests {
     }
 
     /// A daemon reduced to the requests the subscriber makes. The FIRST
-    /// subscription carries `first_stream` and is then torn down with
+    /// subscription — a `SubscribeEventsWithSnapshot` where `ordered`, whose
+    /// snapshot lists `agents` with their `inboxes` and counts as no
+    /// `ListAgents` — carries `first_notices` and `first_stream` and is then
+    /// torn down with
     /// `KIND_STREAM_END "lagged"` — the daemon's own reaction to a receiver that
     /// fell behind its broadcast. Every later one carries `queued` (plain
     /// `SubscribeEvents` only) and then `after_snapshot`, and stays open.
@@ -372,6 +411,8 @@ mod tests {
         /// The first subscription stays open after `first_stream` instead of
         /// being torn down `lagged`.
         first_stream_open: bool,
+        /// Inbox notices the first subscription carries before `first_stream`.
+        first_notices: Vec<crate::event::InboxNotice>,
         /// The inbox summary each listed pane's record carries.
         inboxes: Vec<(&'static str, crate::inbox_hub::InboxSummary)>,
     }
@@ -395,6 +436,7 @@ mod tests {
                 failing_lists,
                 ordered,
                 first_stream_open: false,
+                first_notices: Vec::new(),
                 inboxes: Vec::new(),
             }
         }
@@ -404,6 +446,11 @@ mod tests {
             if n.lists.fetch_add(1, Ordering::SeqCst) < self.failing_lists {
                 return None;
             }
+            Some(self.records())
+        }
+
+        /// The daemon's agents, as a listing reports them.
+        fn records(&self) -> Vec<AgentRecord> {
             let mut records: Vec<AgentRecord> = self
                 .agents
                 .iter()
@@ -420,14 +467,35 @@ mod tests {
                     .find(|(pane, _)| record.pane_id_env.as_deref() == Some(*pane))
                     .map(|(_, summary)| summary.clone());
             }
-            Some(records)
+            records
+        }
+
+        /// The first subscription's frames after its reply: `first_notices`,
+        /// `first_stream`, then the `lagged` tear-down unless
+        /// `first_stream_open`, in which case it is held open.
+        async fn first_frames(
+            &self,
+            rd: &mut tokio::net::unix::OwnedReadHalf,
+            wr: &mut tokio::net::unix::OwnedWriteHalf,
+        ) {
+            for notice in &self.first_notices {
+                let msg = serde_json::to_vec(&BroadcastMsg::Inbox(notice.clone())).unwrap();
+                write_frame(wr, KIND_EVENT, &msg).await.unwrap();
+            }
+            write_events(wr, &self.first_stream).await;
+            if self.first_stream_open {
+                let _ = read_frame(rd).await;
+                return;
+            }
+            write_frame(wr, KIND_STREAM_END, b"lagged").await.unwrap();
         }
     }
 
     struct Counters {
         subscriptions: AtomicUsize,
         lists: AtomicUsize,
-        /// How many `SubscribeEventsWithSnapshot` requests arrived.
+        /// How many `SubscribeEventsWithSnapshot` requests arrived to
+        /// resynchronize, the first subscription's not counted.
         ordered_subscriptions: AtomicUsize,
     }
 
@@ -469,14 +537,7 @@ mod tests {
                         let ok = serde_json::to_vec(&AttachResponse::ok()).unwrap();
                         write_frame(&mut wr, KIND_RESP, &ok).await.unwrap();
                         if n.subscriptions.fetch_add(1, Ordering::SeqCst) == 0 {
-                            write_events(&mut wr, &script.first_stream).await;
-                            if script.first_stream_open {
-                                let _ = read_frame(&mut rd).await;
-                                return;
-                            }
-                            write_frame(&mut wr, KIND_STREAM_END, b"lagged")
-                                .await
-                                .unwrap();
+                            script.first_frames(&mut rd, &mut wr).await;
                         } else {
                             write_events(&mut wr, &script.queued).await;
                             write_events(&mut wr, &script.after_snapshot).await;
@@ -486,7 +547,13 @@ mod tests {
                     }
                     AttachRequest::SubscribeEventsWithSnapshot => {
                         assert!(script.ordered, "sent to a daemon that never advertised it");
-                        n.subscriptions.fetch_add(1, Ordering::SeqCst);
+                        if n.subscriptions.fetch_add(1, Ordering::SeqCst) == 0 {
+                            let resp = AttachResponse::agent_records(script.records());
+                            let resp = serde_json::to_vec(&resp).unwrap();
+                            write_frame(&mut wr, KIND_RESP, &resp).await.unwrap();
+                            script.first_frames(&mut rd, &mut wr).await;
+                            return;
+                        }
                         n.ordered_subscriptions.fetch_add(1, Ordering::SeqCst);
                         let resp = match script.listing(&n) {
                             Some(records) => AttachResponse::agent_records(records),
@@ -632,6 +699,118 @@ mod tests {
                  the stream it lost (generation, status, closures)"
             );
         }
+    }
+
+    /// PRD #1666 §2.8: the first subscription opens with the daemon's agents
+    /// read at the same instant, and their inboxes become the TUI's account of
+    /// each pane before any notice is applied — the pane the TUI's startup
+    /// hydration registers afterwards included. A notice after the snapshot
+    /// counts on top of it, and one for a pane the snapshot does not list is
+    /// dropped. Hydration registers the pane and draws its card, and leaves
+    /// its inbox to the ordered account.
+    #[tokio::test]
+    async fn the_first_subscription_takes_every_panes_inbox_from_its_snapshot() {
+        use crate::inbox_display::IntegrationNotice::RefreshFailedPi;
+        use crate::inbox_hub::{InboxCardNotices, InboxSummary, WakePath};
+        let summary = |queued, integration| InboxSummary {
+            queued,
+            fetched: 0,
+            claimed: 0,
+            undeliverable: 0,
+            last_acked_at: None,
+            wake: WakePath::Doorbell,
+            component: None,
+            wake_stalled: false,
+            notices: InboxCardNotices {
+                integration,
+                ..Default::default()
+            },
+        };
+        let queued = |pane: &str, id: &str| crate::event::InboxNotice {
+            pane_id: pane.into(),
+            agent_id: Some(AGENT.into()),
+            message_id: id.into(),
+            subject: "subject".into(),
+            from_label: "the orchestrator".into(),
+            state: crate::inbox::StateName::Queued,
+            reason: None,
+            returned: false,
+            wake_stalled: false,
+            wake_update: false,
+            attention_update: false,
+            notices: Default::default(),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("attach.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
+        let counters = Arc::new(Counters {
+            subscriptions: AtomicUsize::new(0),
+            lists: AtomicUsize::new(0),
+            ordered_subscriptions: AtomicUsize::new(0),
+        });
+        let mut script = ScriptedDaemon::new(
+            Vec::new(),
+            AppState::default(),
+            vec![(AGENT, PANE)],
+            0,
+            true,
+        );
+        script.first_stream_open = true;
+        script.inboxes = vec![(PANE, summary(1, Some(RefreshFailedPi)))];
+        script.first_notices = vec![queued(PANE, "m-2"), queued("pane-unlisted", "m-3")];
+        let server = tokio::spawn(serve(listener, Arc::new(script), Arc::clone(&counters)));
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let config = SubscriberConfig {
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+            drop_event: None,
+            break_on_event: None,
+        };
+        let subscriber = tokio::spawn(run(DaemonClient::new(socket), Arc::clone(&state), config));
+
+        let pending = |st: &AppState| {
+            st.sessions
+                .values()
+                .find(|s| s.pane_id.as_deref() == Some(PANE))
+                .and_then(|s| s.card_inbox())
+                .map(|inbox| (inbox.pending, inbox.integration))
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = None;
+        while seen != Some((2, Some(RefreshFailedPi))) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut st = state.write().await;
+            if st
+                .sessions
+                .values()
+                .all(|s| s.pane_id.as_deref() != Some(PANE))
+            {
+                // The startup hydration: the pane is registered and its card
+                // drawn; its inbox is the ordered account's.
+                st.register_pane(PANE.to_string());
+                st.insert_placeholder_session(PANE.to_string(), None, None, Some(AGENT.into()));
+            }
+            seen = pending(&st);
+        }
+        subscriber.abort();
+        server.abort();
+        assert_eq!(
+            seen,
+            Some((2, Some(RefreshFailedPi))),
+            "the snapshot's queued message and warning, and the message queued after it"
+        );
+        assert_eq!(
+            counters.subscriptions.load(Ordering::SeqCst),
+            1,
+            "one subscription"
+        );
+        assert_eq!(counters.lists.load(Ordering::SeqCst), 0, "no other listing");
+        let st = state.read().await;
+        assert!(
+            st.inbox_attention("pane-unlisted").is_none(),
+            "a notice for a pane no account lists is dropped"
+        );
     }
 
     /// Issue #1520 (Qodo on #1553): a `ListAgents` that fails right after the
@@ -882,7 +1061,14 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
         let server = tokio::spawn(async move {
             // One subscription, ended as `lagged`; then the daemon goes away.
+            // The first subscription asks first whether the ordered one is
+            // offered; this daemon offers nothing.
             let (stream, _) = listener.accept().await.expect("the subscriber connects");
+            let (mut rd, mut wr) = stream.into_split();
+            let _ = read_frame(&mut rd).await;
+            let hello = serde_json::to_vec(&AttachResponse::hello(PROTOCOL_VERSION)).unwrap();
+            write_frame(&mut wr, KIND_RESP, &hello).await.unwrap();
+            let (stream, _) = listener.accept().await.expect("the subscriber subscribes");
             let (mut rd, mut wr) = stream.into_split();
             let _ = read_frame(&mut rd).await;
             let ok = serde_json::to_vec(&AttachResponse::ok()).unwrap();
