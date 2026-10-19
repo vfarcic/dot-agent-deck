@@ -1021,7 +1021,8 @@ fn first_durable_path_match(path: &std::ffi::OsStr, name: &str) -> Option<PathBu
 /// `current_exe()`, or — only under the `e2e` feature, and only once
 /// [`set_test_current_exe_override`] has been called — the injected test
 /// override. [`spawn_inprocess_daemon`]'s test harness (`tests/common/mod.rs`)
-/// calls the setter with `env!("CARGO_BIN_EXE_dot-agent-deck")` before driving
+/// calls the setter with the built deck binary — a link to
+/// `env!("CARGO_BIN_EXE_dot-agent-deck")` outside the checkout — before driving
 /// `handle_delegate`, because a `handle_delegate` run entirely in-process
 /// makes the CALLING process the libtest binary, not the deck — so without
 /// this override [`binary_name`] would (correctly, for that process) name the
@@ -1051,8 +1052,8 @@ fn effective_current_exe() -> std::io::Result<PathBuf> {
 
 /// Backing store for [`set_test_current_exe_override`]. A plain [`OnceLock`]
 /// is enough: every call site within a given test process passes the same
-/// compile-time constant (`env!("CARGO_BIN_EXE_dot-agent-deck")`), so a
-/// second `set` call — if it ever happens — is safely redundant, not a race.
+/// path (the harness's one per-process link to the built deck), so a second
+/// `set` call — if it ever happens — is safely redundant, not a race.
 /// `cargo nextest` gives each test its own process, so a value set here can
 /// never leak into a different test's process.
 ///

@@ -1,0 +1,7 @@
+  A new startup decision is required
+  The deck does not know this screen.
+
+› 1. Continue with a new behaviour
+  2. Cancel
+
+  enter confirm · esc cancel

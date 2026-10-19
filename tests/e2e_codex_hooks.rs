@@ -55,16 +55,6 @@ const DECK_HOOK_EVENTS: &[(&str, &str)] = &[
     ("Interrupt", "interrupt"),
 ];
 
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = std::path::Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
-
 fn hook_list_response(entries: Vec<Value>) -> String {
     json!({
         "id": 2,
@@ -138,7 +128,7 @@ fn seed_durable_binary(home: &Path) -> std::path::PathBuf {
     let bin_dir = home.join(".local").join("bin");
     std::fs::create_dir_all(&bin_dir).expect("create durable bin dir");
     let durable = bin_dir.join("dot-agent-deck");
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dot-agent-deck"), &durable)
+    std::os::unix::fs::symlink(common::contained_deck_binary(), &durable)
         .expect("seed durable deck symlink");
     durable
 }
@@ -201,7 +191,7 @@ fn codex_hooks_002_script_launch_installs_exact_scoped_trust() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let output = Command::new(common::contained_deck_binary())
         .args(["wrap", "--agent", "codex", "--"])
         .arg(&launcher)
         .env("PATH", path)
@@ -263,7 +253,11 @@ fn codex_hooks_002_script_launch_installs_exact_scoped_trust() {
 #[cfg(unix)]
 fn codex_hooks_003_non_codex_launcher_gets_startup_integration() {
     let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-synthetic");
-    let path = format!("{}:{}", fixture_bin.display(), path_with_binary_dir());
+    let path = format!(
+        "{}:{}",
+        fixture_bin.display(),
+        common::path_with_binary_dir()
+    );
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("PATH", path)
@@ -369,7 +363,7 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
     let path = format!(
         "{}:{}",
         launcher_dir.path().display(),
-        path_with_binary_dir()
+        common::path_with_binary_dir()
     );
     let prompt = format!(
         "Run this exact command with the shell tool: printf {HOOK_SENTINEL_CONTENT} > {HOOK_SENTINEL_NAME}. Do not use apply_patch. After reporting completion, stay open and wait for another prompt."

@@ -149,18 +149,59 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
 
 #[cfg(unix)]
 pub use unix::{
-    AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait,
-    force_kill_child_group, force_kill_pid, foreground_pgid, pin_process, process_table,
-    process_table_async, send_sigterm_to_child_group, terminate_child_with_grace_and_wait,
-    terminate_pid,
+    AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,
+    force_kill_child_group, force_kill_pid, foreground_pgid, parent_pid_of, pin_process,
+    process_start_of, process_table, process_table_async, send_sigterm_to_child_group,
+    terminate_child_with_grace_and_wait, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
-    AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait,
-    force_kill_child_group, force_kill_pid, foreground_pgid, pin_process, process_table,
-    process_table_async, send_sigterm_to_child_group, terminate_child_with_grace_and_wait,
-    terminate_pid,
+    AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,
+    force_kill_child_group, force_kill_pid, foreground_pgid, parent_pid_of, pin_process,
+    process_start_of, process_table, process_table_async, send_sigterm_to_child_group,
+    terminate_child_with_grace_and_wait, terminate_pid,
 };
+
+/// PR #1735 second review: whether [`parent_pid_of`] reads parents on this
+/// platform: Linux (`/proc`), macOS (`proc_pidinfo`) and Windows (a Toolhelp
+/// snapshot). Elsewhere it always answers `None`, so [`descends_from`] can
+/// never give positive evidence and a check that requires it would refuse
+/// every caller.
+pub const ANCESTRY_LOOKUP: bool = cfg!(any(target_os = "linux", target_os = "macos", windows));
+
+/// PRD #1666 hardening M2: whether process `pid` is `root` or descends from
+/// it, walking parents with [`parent_pid_of`]. `None` when the walk cannot be
+/// completed — the platform cannot read a parent, or a process on the way
+/// exited — so the caller can tell "no" from "cannot say".
+pub fn descends_from(pid: u32, root: u32) -> Option<bool> {
+    descends_from_with(pid, root, parent_pid_of)
+}
+
+/// [`descends_from`] over any parent lookup.
+pub fn descends_from_with(
+    pid: u32,
+    root: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+) -> Option<bool> {
+    /// Deeper than any real agent's process tree; bounds a walk through a
+    /// table that changed under it.
+    const MAX_DEPTH: usize = 128;
+    let mut current = pid;
+    for _ in 0..MAX_DEPTH {
+        if current == root {
+            return Some(true);
+        }
+        if current <= 1 {
+            return Some(false);
+        }
+        let parent = parent_of(current)?;
+        if parent == current {
+            return Some(false);
+        }
+        current = parent;
+    }
+    Some(false)
+}
 
 /// A [`portable_pty::Child`] stand-in over a real [`std::process::Child`], so the
 /// teardown state machines in both backends can be driven against **real**

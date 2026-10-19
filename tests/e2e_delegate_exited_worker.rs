@@ -16,6 +16,14 @@
 //! fixture's `worker.py`), no agent and no credential.
 
 mod common;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_route.rs"]
+mod route;
+#[path = "support/inbox_view.rs"]
+mod view;
 
 use std::cell::RefCell;
 use std::process::Output;
@@ -108,18 +116,24 @@ fn describe(output: &Output) -> String {
     )
 }
 
-/// Whether a worker logged as `name` (the fixture's `worker.py`) has READ the
-/// daemon's task pointer for `role` from its PTY.
-///
-/// Issue #1539: read from the worker's own log, never from the pane snapshot.
-/// The snapshot is the daemon's replay ring, which a resize drops, and the TUI
-/// resizes every role pane from its provisional spawn size once it lays out
-/// the freshly opened tab — so a pointer delivered in that window was really
-/// in the worker's input and still missing from the snapshot.
-fn worker_read_pointer(deck: &TuiDeck, name: &str, role: &str) -> bool {
-    std::fs::read(deck.workdir().join(format!("{name}-received.log"))).is_ok_and(|log| {
-        squeeze(&String::from_utf8_lossy(&log)).contains(&format!("worker-task-{role}.md"))
-    })
+/// Whether the agent that holds `role`'s pane now has been posted a task —
+/// PRD #1666 S5: what a delegate does instead of typing a pointer that the
+/// fixture's `worker.py` read from its PTY. `_name` is the fixture worker the
+/// test expects to hold the pane; the binding to the live agent is what checks
+/// it.
+fn worker_read_pointer(deck: &TuiDeck, _name: &str, role: &str) -> bool {
+    let Some(record) = role_record(deck, role) else {
+        return false;
+    };
+    let Some(pane) = record.pane_id_env.as_deref() else {
+        return false;
+    };
+    view::messages(deck.attach_socket_path(), pane)
+        .into_iter()
+        .any(|message| {
+            message.bind_agent.as_deref() == Some(record.id.as_str())
+                && message.subject.starts_with("task from the orchestrator")
+        })
 }
 
 /// [`worker_read_pointer`] for a role's own fixture worker.
@@ -206,7 +220,7 @@ fn start_successor(
         .expect("start a successor on the exited worker's pane id")
 }
 
-/// Scenario: Launch the real TUI and its lazy daemon on the `delegate-exited-worker` fixture and open its orchestration. Delegate to the `clear = false` worker `steady` and see the task pointer land, then let that worker report `work-done` and EXIT ON ITS OWN, and delegate to `steady` again: the real `delegate` CLI must exit non-zero naming `steady` as a role that reached no worker. Then let the `clear = true` worker `fresh` exit the same way and delegate to it: the CLI must exit 0 and a fresh `fresh` worker must come back holding the task pointer.
+/// Scenario: Launch the real TUI and its lazy daemon on the `delegate-exited-worker` fixture and open its orchestration. Delegate to the `clear = false` worker `steady` and see the task reach its inbox, then let that worker report `work-done` and EXIT ON ITS OWN, and delegate to `steady` again: the real `delegate` CLI must exit non-zero naming `steady` as a role that reached no worker. Then let the `clear = true` worker `fresh` exit the same way and delegate to it: the CLI must exit 0 and a fresh `fresh` worker must come back with the task in its inbox.
 #[spec("orchestration/delegate/049")]
 #[test]
 fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_delivered() {
@@ -218,7 +232,6 @@ fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_de
         // Both delegation watches off: neither detector is under test, and a
         // notice firing into the orchestrator would only add noise.
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .with_env("DAD_TEST_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
         .launch_with_fixture("delegate-exited-worker");
     deck.wait_for_string("No active agents");
@@ -235,7 +248,7 @@ fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_de
     );
     assert!(
         common::wait_until(Duration::from_secs(30), || role_has_pointer(&deck, STEADY)),
-        "control — the first task pointer never reached the live `steady` worker"
+        "control — the first task never reached the live `steady` worker"
     );
     // Issue #1539: the TUI may still be laying out the new tab when the pointer
     // lands, and its resize drops the pane's replay ring. Doing that resize
@@ -243,7 +256,7 @@ fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_de
     resize_role_pane(&deck, STEADY);
     assert!(
         role_has_pointer(&deck, STEADY),
-        "issue #1539: a resize after delivery hid the first task pointer"
+        "issue #1539: a resize after delivery hid the first task"
     );
 
     // ---- THE NATURAL EXIT -------------------------------------------------
@@ -277,112 +290,23 @@ fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_de
          still be delivered — refusing it would turn a working delivery into a failure\n{}",
         describe(&third)
     );
-    // The replacement is a stand-in that reports no `SessionStart`, so the
-    // dispatch writes its pointer only once the delegate's readiness wait gives
-    // up — measured at 30.0 s. 90 s clears that with room for a busy box.
+    // PRD #1666 S5: the task is posted to the replacement as soon as the
+    // respawn produced it; nothing waits for a `SessionStart`.
     assert!(
         common::wait_until(Duration::from_secs(90), || role_has_pointer(&deck, FRESH)),
-        "the respawned `fresh` worker never received its task pointer; records = {:?}",
+        "the respawned `fresh` worker never received its task; records = {:?}",
         common::agent_records_on(deck.attach_socket_path())
     );
 }
 
-/// The report the successor sends. Must reach the orchestrator labelled as one
-/// the deck has no delegation on record for.
-const SUCCESSOR_SENTINEL: &str = "successor-report-7d1e";
-
-/// The #448 label, spelled out here rather than imported from `src/` so a
-/// silent rewording of the daemon's template fails this test instead of
-/// following it.
-const UNSOLICITED_NEEDLE: &str = "the deck has no outstanding delegation to that worker on record";
-
-/// Scenario: Launch the real TUI on the `delegate-exited-worker` fixture, delegate to the `clear = false` worker `quitter`, and once the task pointer lands let that worker EXIT ON ITS OWN without reporting. Start a different agent in the same pane through the daemon's real `StartAgent` (what a TUI sends when it opens a pane) and have it run the real `work-done` from inside that pane. The orchestrator's pane must show that report labelled as one the deck has no delegation on record for, never "Worker quitter has completed their task", and no `work-done-quitter.md` may be written.
+/// Scenario: Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report reaches the orchestrator inbox as uncommissioned work and leaves the earlier commissioned report file intact.
 #[spec("orchestration/work-done/015")]
 #[test]
 fn work_done_015_a_successor_in_an_exited_worker_s_pane_is_not_credited_with_its_task() {
-    let deck = TuiDeck::builder()
-        .impersonating_pane_signals()
-        .with_pty_size(160, 40)
-        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
-        .with_env("DAD_TEST_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .launch_with_fixture("delegate-exited-worker");
-    deck.wait_for_string("No active agents");
-    open_orchestration(&deck);
-    let orchestrator_pane = wait_for_roles(&deck);
-    let orchestrator_agent = role_record(&deck, "orchestrator")
-        .expect("the orchestrator is live")
-        .id;
-    let quitter = role_record(&deck, QUITTER).expect("the quitter is live");
-
-    // ---- A REAL DELEGATION, OWED BY THE FIRST WORKER ----------------------
-    let delegated = delegate(&deck, &orchestrator_pane, QUITTER, "Do the quitter's task.");
-    assert!(
-        delegated.status.success(),
-        "control — a delegate to the live `quitter` must succeed\n{}",
-        describe(&delegated)
-    );
-    assert!(
-        common::wait_until(Duration::from_secs(30), || role_has_pointer(&deck, QUITTER)),
-        "control — the task pointer never reached the live `quitter` worker"
-    );
-    // Issue #1539: the TUI may still be laying out the new tab when the pointer
-    // lands, and its resize drops the pane's replay ring. Doing that resize
-    // here, after delivery, keeps the evidence honest about it every run.
-    resize_role_pane(&deck, QUITTER);
-    assert!(
-        role_has_pointer(&deck, QUITTER),
-        "issue #1539: a resize after delivery hid the task pointer"
-    );
-
-    // ---- THE NATURAL EXIT, NO REPORT ---------------------------------------
-    let_worker_exit(&deck, QUITTER);
-
-    // ---- A SUCCESSOR IN THE SAME PANE, through the daemon's `StartAgent` ----
-    let successor_command = format!(
-        "while [ ! -f ./successor-report ]; do sleep 0.1; done; \
-         \"$DAD_TEST_BIN\" work-done --task {SUCCESSOR_SENTINEL}; exec cat"
-    );
-    let successor = start_successor(&deck, &quitter, successor_command);
-    assert_ne!(successor, quitter.id, "the successor is a different agent");
-
-    // ---- THE SUCCESSOR REPORTS, from inside its own pane --------------------
-    std::fs::write(deck.workdir().join("successor-report"), b"go\n")
-        .expect("release the successor's report");
-    let orchestrator_pty = || {
-        squeeze(&String::from_utf8_lossy(&common::pane_snapshot_on(
-            deck.attach_socket_path(),
-            &orchestrator_agent,
-        )))
-    };
-    let arrived = common::wait_until(Duration::from_secs(30), || {
-        orchestrator_pty().contains(SUCCESSOR_SENTINEL)
-            || orchestrator_pty().contains(&squeeze("Worker quitter has completed their task"))
-    });
-    let pty = orchestrator_pty();
-    assert!(
-        arrived,
-        "control — the successor's report never reached the orchestrator; PTY = {pty}"
-    );
-    assert!(
-        !pty.contains(&squeeze("Worker quitter has completed their task")),
-        "issue #507: an agent that was never delegated to inherited the exited worker's \
-         commission, so the orchestrator was told the delegated task came back; PTY = {pty}"
-    );
-    assert!(
-        pty.contains(&squeeze(UNSOLICITED_NEEDLE)),
-        "the successor's report must carry the unsolicited label; PTY = {pty}"
-    );
-    assert!(
-        !deck
-            .workdir()
-            .join(".dot-agent-deck/work-done-quitter.md")
-            .exists(),
-        "issue #507: the successor's uncommissioned report was filed as the role's report"
-    );
+    route::successor_worker_report();
 }
 
-/// Scenario: Launch the real TUI on the `delegate-exited-worker` fixture and delegate to the `clear = false` worker `quitter`; a second delegate to it is refused as busy while it lives and owes that task. Let it EXIT ON ITS OWN without reporting and start a different agent in the same pane through the daemon's real `StartAgent`. The real `delegate` CLI must then exit 0 without `--supersede`, and the successor must read the task pointer.
+/// Scenario: Launch the real TUI on the `delegate-exited-worker` fixture and delegate to the `clear = false` worker `quitter`; a second delegate to it is refused as busy while it lives and owes that task. Let it EXIT ON ITS OWN without reporting and start a different agent in the same pane through the daemon's real `StartAgent`. The real `delegate` CLI must then exit 0 without `--supersede`, and the task must be posted to the successor.
 #[spec("orchestration/delegate/051")]
 #[test]
 fn delegate_051_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_busy() {
@@ -390,7 +314,6 @@ fn delegate_051_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
         .impersonating_pane_signals()
         .with_pty_size(160, 40)
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .with_env("DAD_TEST_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
         .launch_with_fixture("delegate-exited-worker");
     deck.wait_for_string("No active agents");
@@ -407,7 +330,7 @@ fn delegate_051_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
     );
     assert!(
         common::wait_until(Duration::from_secs(30), || role_has_pointer(&deck, QUITTER)),
-        "control — the task pointer never reached the live `quitter` worker"
+        "control — the task never reached the live `quitter` worker"
     );
 
     // ---- CONTROL: the busy refusal is live while that worker owes it -------
@@ -458,7 +381,7 @@ fn delegate_051_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
             "successor",
             QUITTER
         )),
-        "the successor never read the task pointer; records = {:?}",
+        "the successor never received the task; records = {:?}",
         common::agent_records_on(deck.attach_socket_path())
     );
 }

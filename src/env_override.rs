@@ -1,7 +1,7 @@
 //! Issue #1516: an in-process stand-in for a handful of environment knobs, for
 //! the tests that have to change one while the deck's own tasks are running.
 //!
-//! A knob such as `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` is read per
+//! A knob such as `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS` is read per
 //! delegate, on whichever Tokio worker runs that delegate. A test that changes
 //! it between two delegates used to `std::env::set_var` from inside `block_on`,
 //! with those workers alive, which is the unsound case `set_var` warns about: it
@@ -18,12 +18,9 @@
 //! ordinary dependency and cannot see `#[cfg(test)]` items; it is
 //! `#[doc(hidden)]` for the same reason the L1 seams in `ui.rs` are.
 //!
-//! Only the knobs whose readers call [`var`] honour an override. Today those are
-//! `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`,
-//! `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS`,
-//! `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS` and
-//! `DOT_AGENT_DECK_SESSION_START_WAIT_MS`. An override of any other name is
-//! never read.
+//! Only the knobs whose readers call [`var`] honour an override. Today that is
+//! `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS`. An override of any other name
+//! is never read.
 
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

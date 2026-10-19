@@ -2559,9 +2559,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * Press Enter in the agent's prompt.
    *
    * Through `sendTerminalInput`, which is the path the user's own keystrokes
-   * take — dictation gets no send verb of its own, and in particular not
-   * `submit_text`, which types AND submits in one guarded call and would make
-   * the text invisible until it was already gone.
+   * take — dictation gets no send verb of its own.
    */
   const submitDictation = useCallback(async (aim: Pending) => {
     /* PRD #1260 review, round 3 — the action this Enter belongs to. A failure

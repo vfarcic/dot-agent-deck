@@ -17,119 +17,6 @@ pub enum PaneError {
     NotAvailable,
 }
 
-/// Issue #1383: the outcome of a write-and-submit that may still be running.
-///
-/// The TUI polls one of these from its render loop instead of waiting for the
-/// submit, because a submit now holds its CR until the payload renders — up to
-/// [`crate::submit_echo::SUBMIT_ECHO_BOUND`] on a pane that does not echo —
-/// and a render thread waiting that long cannot redraw.
-pub struct PendingSubmit {
-    state: PendingSubmitState,
-}
-
-/// Issue #621: a finished write-and-submit — its outcome, and on a `stale`
-/// refusal of a request that named no session, the hook-session generation the
-/// daemon refused it against
-/// ([`crate::daemon_client::GuardedSendReply::current_session_id`]). A
-/// controller that does not talk to a daemon never has one.
-#[derive(Debug)]
-pub struct SubmitReply {
-    pub result: Result<crate::event::SendResult, PaneError>,
-    pub current_session_id: Option<String>,
-    /// For a failed submit, whether it could nonetheless have written — see
-    /// [`crate::daemon_client::GuardedSendFailure`]. A controller that cannot
-    /// tell says so by leaving it `true` for every error, which is what the
-    /// `From` conversion does; it is never consulted for an `Ok`.
-    pub may_have_written: bool,
-}
-
-impl From<Result<crate::event::SendResult, PaneError>> for SubmitReply {
-    fn from(result: Result<crate::event::SendResult, PaneError>) -> Self {
-        Self {
-            may_have_written: result.is_err(),
-            result,
-            current_session_id: None,
-        }
-    }
-}
-
-/// The sending half of [`PendingSubmit::channel`].
-#[derive(Clone)]
-pub struct PendingSubmitSender(std::sync::mpsc::Sender<SubmitReply>);
-
-impl PendingSubmitSender {
-    /// Finish the submit with `outcome` and no refused generation.
-    pub fn send(
-        &self,
-        outcome: Result<crate::event::SendResult, PaneError>,
-    ) -> Result<(), std::sync::mpsc::SendError<SubmitReply>> {
-        self.send_reply(outcome.into())
-    }
-
-    /// Finish the submit with its whole reply (issue #621).
-    pub fn send_reply(
-        &self,
-        reply: SubmitReply,
-    ) -> Result<(), std::sync::mpsc::SendError<SubmitReply>> {
-        self.0.send(reply)
-    }
-}
-
-enum PendingSubmitState {
-    Ready(Option<SubmitReply>),
-    Waiting(std::sync::mpsc::Receiver<SubmitReply>),
-}
-
-impl PendingSubmit {
-    /// A submit that has already finished.
-    pub fn ready(result: Result<crate::event::SendResult, PaneError>) -> Self {
-        Self::ready_reply(result.into())
-    }
-
-    /// A submit that has already finished, with its whole reply (issue #621).
-    pub fn ready_reply(reply: SubmitReply) -> Self {
-        Self {
-            state: PendingSubmitState::Ready(Some(reply)),
-        }
-    }
-
-    /// A submit that finishes when the returned sender is sent its outcome.
-    pub fn channel() -> (PendingSubmitSender, Self) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        (
-            PendingSubmitSender(tx),
-            Self {
-                state: PendingSubmitState::Waiting(rx),
-            },
-        )
-    }
-
-    /// The outcome, once: `None` while the submit is still running and after
-    /// the outcome has been taken. A sender dropped without an outcome (the
-    /// task running the submit ended early) reads as a failed submit, so a
-    /// caller never waits on one forever.
-    pub fn poll(&mut self) -> Option<Result<crate::event::SendResult, PaneError>> {
-        self.poll_reply().map(|reply| reply.result)
-    }
-
-    /// [`Self::poll`], keeping the whole reply (issue #621).
-    pub fn poll_reply(&mut self) -> Option<SubmitReply> {
-        let reply = match &mut self.state {
-            PendingSubmitState::Ready(reply) => return reply.take(),
-            PendingSubmitState::Waiting(rx) => match rx.try_recv() {
-                Ok(reply) => reply,
-                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(PaneError::CommandFailed(
-                    "write_and_submit: the submit ended without an outcome".to_string(),
-                ))
-                .into(),
-            },
-        };
-        self.state = PendingSubmitState::Ready(None);
-        Some(reply)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneDirection {
     Up,
@@ -560,96 +447,6 @@ pub trait PaneController: Send + Sync {
     fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError>;
     fn toggle_layout(&self) -> Result<(), PaneError>;
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError>;
-    /// PRD #100: write `text` to `pane_id` and submit atomically — the
-    /// daemon side holds its per-agent writer mutex across the full
-    /// `payload → SUBMIT_DELAY → CR` sequence, matching the contract
-    /// `AgentPtyRegistry::write_and_submit_guarded` provides to
-    /// daemon-initiated callers (orchestration delegate / work-done
-    /// feedback). The default impl forwards to [`Self::write_to_pane`],
-    /// which is the historical two-`STREAM_IN`-frames-with-gap pattern
-    /// — fine for test mocks and any caller whose pane has no
-    /// concurrent same-pane writer in production. The
-    /// `EmbeddedPaneController` impl overrides this with the atomic
-    /// `WriteAndSubmit` RPC; the orchestrator spawn-time role-prompt
-    /// injection in `ui.rs` uses the override because it shares its
-    /// pane with daemon-initiated writes.
-    ///
-    /// PRD #20 M3: returns the honest [`crate::event::SendResult`] the atomic
-    /// submit path produced, so a caller can surface feedback when input was
-    /// NOT delivered to a live target (a history-only / view-only session)
-    /// instead of assuming a fire-and-forget success. The default impl forwards
-    /// to [`Self::write_to_pane`] (the raw keystroke path, which has no
-    /// send-result of its own) and reports [`crate::event::SendResult::Applied`]
-    /// on success — correct for the local-PTY mocks that use the default, since
-    /// they always target a live pane.
-    fn write_and_submit_to_pane(
-        &self,
-        pane_id: &str,
-        text: &str,
-    ) -> Result<crate::event::SendResult, PaneError> {
-        self.write_to_pane(pane_id, text)
-            .map(|()| crate::event::SendResult::Applied)
-    }
-    /// PRD #20 R20-003/R20-004: identity-bearing, idempotent counterpart of
-    /// [`Self::write_and_submit_to_pane`]. Carries the agent identity + session
-    /// the automatic prompt was queued for and a stable delivery id so the daemon
-    /// can (a) refuse delivery to a replacement agent on a rebind
-    /// (`stale`/`wrong-session`) and (b) dedup a retry after a lost response.
-    ///
-    /// The default impl DROPS the identity and forwards to
-    /// [`Self::write_and_submit_to_pane`] — correct for local-PTY test mocks
-    /// (which always target a live pane and don't talk to a daemon). The
-    /// daemon-backed `EmbeddedPaneController` overrides it to carry the identity
-    /// over the wire via `DaemonClient::write_and_submit_with_identity`.
-    ///
-    /// Issue #608 audit, finding 5: what the daemon refuses is the identity-less
-    /// WIRE SHAPE — a paned `write-and-submit` carrying no `expected_agent_id`
-    /// answers `no-live-target` with nothing written. It does not follow that the
-    /// identity-less METHOD is dead, and this comment used to say a daemon-backed
-    /// caller "must" come through here. It does not have to.
-    /// `EmbeddedPaneController`'s override of [`Self::write_and_submit_to_pane`]
-    /// deliberately remains a working fallback: it resolves the pane's current
-    /// owner itself and puts that agent id on the wire, so what it sends is a
-    /// shape the daemon accepts. What that override cannot supply is the SESSION
-    /// generation — daemon-side state the controller does not track — so a caller
-    /// that knows one (both production prompt-delivery paths in `ui.rs`) should
-    /// use THIS method, which can name the conversation as well as the agent.
-    fn write_and_submit_to_pane_with_identity(
-        &self,
-        pane_id: &str,
-        text: &str,
-        _expected_agent_id: Option<&str>,
-        _expected_session_id: Option<&str>,
-        _delivery_id: Option<&str>,
-    ) -> Result<crate::event::SendResult, PaneError> {
-        self.write_and_submit_to_pane(pane_id, text)
-    }
-    /// Issue #1383: [`Self::write_and_submit_to_pane_with_identity`] started
-    /// without waiting for it, for a caller on the TUI's render thread. The
-    /// daemon holds a submit's CR until the payload renders, up to
-    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`], and the render thread must
-    /// keep drawing meanwhile.
-    ///
-    /// The default impl runs the synchronous method and returns its outcome
-    /// ready — correct for the local-PTY test mocks, whose submit does not
-    /// wait on a daemon. The daemon-backed `EmbeddedPaneController` overrides
-    /// it to run the RPC on its runtime.
-    fn begin_write_and_submit_to_pane_with_identity(
-        &self,
-        pane_id: &str,
-        text: &str,
-        expected_agent_id: Option<&str>,
-        expected_session_id: Option<&str>,
-        delivery_id: Option<&str>,
-    ) -> PendingSubmit {
-        PendingSubmit::ready(self.write_and_submit_to_pane_with_identity(
-            pane_id,
-            text,
-            expected_agent_id,
-            expected_session_id,
-            delivery_id,
-        ))
-    }
     /// Issue #1445: tell the daemon that the orchestrator in `pane_id` has just
     /// been re-armed from `context_path`, so the context file it records for
     /// that orchestration — the one a TUI attaching later is handed, and the
@@ -661,6 +458,20 @@ pub trait PaneController: Send + Sync {
     /// with no daemon behind them. The daemon-backed `EmbeddedPaneController`
     /// overrides it to send the report on its runtime.
     fn report_orchestrator_context(&self, _pane_id: &str, _context_path: &std::path::Path) {}
+    /// PRD #1666 S5: post a deck-generated message — a seed, an orchestrator's
+    /// role context, the configuration request — to `pane_id`'s inbox, bound to
+    /// the agent the pane holds now. Answers the message id. The default has no
+    /// inbox behind it and refuses; the daemon-backed `EmbeddedPaneController`
+    /// overrides it.
+    fn post_message(
+        &self,
+        _pane_id: &str,
+        _subject: &str,
+        _body: &str,
+        _origin: crate::inbox_hub::PostOrigin,
+    ) -> Result<String, PaneError> {
+        Err(PaneError::NotAvailable)
+    }
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
     fn as_any(&self) -> &dyn Any;

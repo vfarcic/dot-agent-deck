@@ -267,21 +267,24 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 # Scoped by name; still bounded. The filters track the test FUNCTION names,
 # so rename them in lockstep.
 #
-# `/015`: the OpenCode preflight probe (~60s), the composer paint (120s),
-# Thinking and Working (120s), the prompt event (90s) and the sentinel (90s):
-# ~480s, so 9 x 60s.
+# `/015`: scratch install and boot, a clear delegate and visible native work.
+# Keep the finite nine-minute window for slow local model turns and diagnostics.
 [[profile.default.overrides]]
 filter = 'test(delegate_015_real_opencode_worker_acts_on_clear_true_delegate)'
 slow-timeout = { period = "60s", terminate-after = 9 }
 
-# `/046`: the preflight (~60s), the delegate CLI (30s), the replacement's
-# record (20s) and the work-done report (240s): ~350s, so 7 x 60s. The test
-# pins its deck's `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` to 480s, above this
-# window, or its daemon and agents would be reaped at the 300s harness default
-# before the window could be used (Qodo on PR #1523).
+# `/046`: a task queued before a real replacement boots, then visible work.
+# Its fixture's 600s lifetime exceeds this seven-minute diagnostic window.
 [[profile.default.overrides]]
-filter = 'test(delegate_046_real_opencode_recovers_early_pointer_in_place)'
+filter = 'test(delegate_046_real_opencode_consumes_boot_queued_task_in_place)'
 slow-timeout = { period = "60s", terminate-after = 7 }
+
+# Native OpenCode turns include the real delegate's completion report. Allow
+# time for the explicit 120s screen/status bounds to fail with their evidence;
+# the scratch fixture lives 600s and each test is capped at six minutes.
+[[profile.default.overrides]]
+filter = 'binary(e2e_inbox_opencode_live)'
+slow-timeout = { period = "60s", terminate-after = 6 }
 
 # PRD #220: `prompt/new-pane/016` drives a REAL interactive agent through a
 # dispatch turn, then waits for the daemon's `git worktree add` to land on disk.
@@ -698,6 +701,25 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(project_launch_003_a_real_coordinator_reads_the_daemon_published_context)'
 slow-timeout = { period = "60s", terminate-after = 11 }
+
+# The Pi chain-smoke cases must report their own failed phase before nextest
+# kills them. pi/001 has 45s worker settling + 120s sentinel + 60s work-done
+# + 30s status = 255s of sequential waits, plus daemon/setup overhead; pi/002
+# has 120s sentinel + 60s work-done plus delegate/setup. Five 60s periods give
+# both diagnostics time to run. The shortened waits also stay inside the
+# in-process agents' existing 300s lifetime cap; raising nextest alone past that
+# cap would leave a worker reaped before its declared waits finished.
+# These filters track function names; update them together with any rename.
+[[profile.default.overrides]]
+filter = 'test(chain_smoke_pi_001_orchestrator_delegates_to_real_worker) | test(chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Claude already specifies an exact Bash command, but its three 30s TUI
+# readiness waits + 120s turn + 10s proof wait can take 220s, before launch
+# overhead. Keep its failure grid/file evidence ahead of nextest's kill too.
+[[profile.default.overrides]]
+filter = 'test(claude_001_thinking_working_idle)'
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 # PRD #1631: real question tests have bounded agent startup, prompt submission,
 # permission paint, answer delivery and completion waits; /004 and /005 run

@@ -36,16 +36,6 @@ impl Drop for SiblingWorktreeGuard {
     }
 }
 
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bindir = Path::new(bin).parent().expect("binary path has a parent");
-    format!(
-        "{}:{}",
-        bindir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
-
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
@@ -205,7 +195,7 @@ fn dispatch_single_001_unit_runs_the_dispatchers_command_as_its_agent() {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(200, 50)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");

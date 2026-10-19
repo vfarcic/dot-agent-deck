@@ -977,6 +977,46 @@ fn stage_orchestration() -> DashboardScene {
     DashboardScene { deck, capture_at }
 }
 
+/// Scenario: Start demo-loop's synthetic role panes with the planner's queued
+/// startup remit, then post a task to the builder while both are working.
+/// Capture their queued badges beside the work shown in the desktop scenario.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_agent_messaging() {
+    html_dir();
+    for attempt in 1..=DASHBOARD_ATTEMPTS {
+        let scene = stage_orchestration();
+        // Activation already queued the planner's startup remit. The stand-in
+        // deliberately leaves it pending, just as the builder leaves its task.
+        let builder = wait_for_record(&scene.deck, "builder", |_| true);
+        common::post_message_on(
+            scene.deck.attach_socket_path(),
+            builder.pane_id_env.as_deref().expect("builder's pane id"),
+            &builder.id,
+            "Check the checkout retry tests after the current task.",
+        )
+        .expect("post a synthetic queued task");
+        let ready = |grid: &str| {
+            grid.contains("demo-loop [×]")
+                && grid.contains("planner")
+                && grid.contains("builder")
+                && grid.matches("✉1 queued").count() == 2
+                && grid.matches("Working").count() == 2
+                && grid.matches('●').count() == 2
+                && grid.contains("Last: 2s ")
+                && grid.contains("Last: 3s ")
+                && grid.contains("Planning the checkout retry flow")
+                && !grid.contains("Activated orchestration")
+        };
+        let missed =
+            || attempt < DASHBOARD_ATTEMPTS && Utc::now().timestamp() >= scene.capture_at + 2;
+        if capture_unless(&scene.deck, "agent-messaging", ready, missed) {
+            return;
+        }
+    }
+    unreachable!("the final attempt captures or panics");
+}
+
 /// Scenario: Open the Schedules manager over an empty dashboard with one
 /// disabled nightly-triage task. Its longer name leaves a visible gap between
 /// the NAME and STATUS headers while keeping the next-fire field stable.
@@ -1150,4 +1190,105 @@ fn docs_screenshot_self_upgrade() {
         "no part of the scene's temp path reaches the image"
     );
     write_page("self-upgrade", &page);
+}
+
+/// What the `inbox-attention` scene shows as the Pi agent's directory name, in
+/// place of the scene's own `/tmp` folder's name of the same length.
+const INBOX_ATTENTION_DISPLAY_DIR: &str = "demo-project";
+
+/// Scenario: Start a stand-in Pi that runs the deck's real extension with a
+/// first prompt it takes and never starts on, then open Deck messages on its
+/// card. Capture the card's `may not have reached the agent` line beside the
+/// picker showing that message's whole explanation and its Retry and Cancel.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_inbox_attention() {
+    html_dir();
+    let node = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v node"])
+            .output()
+            .expect("run sh")
+            .stdout,
+    )
+    .expect("UTF-8 node path");
+    let node = node.trim();
+    assert!(
+        !node.is_empty(),
+        "the inbox-attention scene runs the Pi extension in node 23.6 or newer"
+    );
+    // The card prints the name of the agent's directory. A `/tmp` folder whose
+    // name is exactly as long as the displayed one is written over by it in
+    // the HTML, so the swap moves no cell.
+    const RANDOM: usize = 4;
+    let prefix_len = INBOX_ATTENTION_DISPLAY_DIR.len() - RANDOM;
+    let cwd = tempfile::Builder::new()
+        .prefix(&"dad-docs-attention"[..prefix_len])
+        .rand_bytes(RANDOM)
+        .tempdir_in("/tmp")
+        .expect("create the scene's working folder");
+    let cwd_text = cwd.path().to_str().expect("UTF-8 path").to_string();
+    let cwd_name = cwd
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a UTF-8 folder name")
+        .to_string();
+    assert_eq!(
+        cwd_name.chars().count(),
+        INBOX_ATTENTION_DISPLAY_DIR.chars().count(),
+        "the working folder's name must be as long as the one displayed"
+    );
+    let deck =
+        launch_with(|builder| builder.with_env("DOT_AGENT_DECK_INBOX_NOT_STARTED_MS", "1500"));
+    deck.wait_for_string("No active agents");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let base = deck.home_dir().join("fake-pi");
+    let command = format!(
+        "exec {} {} {} never {}",
+        shell_word(Path::new(node)),
+        shell_word(&root.join("tests/fixtures/pi-inbox/fake-pi.mjs")),
+        shell_word(&root.join("pi-extension/src/index.ts")),
+        shell_word(&base)
+    );
+    let start: dot_agent_deck::daemon_protocol::AttachRequest =
+        serde_json::from_value(serde_json::json!({"op":"start-agent",
+            "command": common::capability_export_command(&command),
+            "cwd": cwd_text, "rows": 40, "cols": 120,
+            "env": [["DOT_AGENT_DECK_PANE_ID","pi-builder"]],
+            "display_name": "builder",
+            "seed": "Implement the checkout retry flow."}))
+        .expect("a start-agent request");
+    let started = common::attach_request_on(deck.attach_socket_path(), &start)
+        .expect("start the stand-in Pi");
+    assert!(started.ok, "stand-in spawn: {:?}", started.error);
+    deck.wait_for_string("may not have reached the agent");
+    // Started over the attach socket, so no pane took focus: `i` reaches the
+    // selected card.
+    deck.wait_for_string("[Back to Pane d/Ctrl+D]");
+    deck.send_keys(b"i");
+    let page = deck.capture_screen_when("inbox-attention", |screen| {
+        let grid = screen.contents();
+        (grid.contains("builder")
+            && grid.contains("may not have reached the agent")
+            && grid.contains("Retry sends it again")
+            && grid.contains("first prompt"))
+        .then(|| render_page(screen, "inbox-attention (TUI)", &RenderOptions::default()))
+    });
+    assert!(
+        page.contains(&cwd_name),
+        "the card shows the working folder's name"
+    );
+    let page = page.replace(&cwd_name, INBOX_ATTENTION_DISPLAY_DIR);
+    for leak in [
+        cwd_text.as_str(),
+        "/tmp/",
+        "/var/tmp",
+        "dad-tests-",
+        "dad-e2e-",
+        "dad-docs",
+    ] {
+        assert!(!page.contains(leak), "{leak} reaches the image");
+    }
+    write_page("inbox-attention", &page);
 }

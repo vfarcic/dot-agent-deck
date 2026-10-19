@@ -30,16 +30,19 @@ pub mod daemon_status;
 pub mod daemon_stop;
 pub mod daemon_upgrade;
 pub mod deck_list;
-pub mod delegate_retry;
+// PRD #1666: the deck's persistent id, carried in inbox addresses and message ids.
+pub mod deck_identity;
 pub mod devin_hooks_manage;
 // PRD #1223 M1: the daemon's one-level, bounded directory listing that backs
 // the desktop's new-agent directory step.
 pub mod directory_listing;
-// Issue #544: automatic first writes wait while the user has an unsent draft.
 pub mod dispatch;
 pub mod dispatch_return;
+// PRD #1666 S4: the fixed one-line doorbell for an agent with no armed inbox component.
+pub mod doorbell;
 // PRD #1589: the record of dispatched units the `close` verb is authorized from.
 pub mod dispatched_units;
+// Issue #544: the per-pane unsent-draft bit the doorbell reads before it writes.
 pub mod draft_deferral;
 pub mod embedded_pane;
 // PRD #1419 Decision 4: the user docs embedded at build time for `docs [topic]`.
@@ -73,9 +76,22 @@ pub mod hook_binary;
 pub mod hook_provenance;
 pub mod hooks_manage;
 pub mod hyperlink;
+// PRD #1666: the per-agent inbox every deck message is posted to (pure data).
+pub mod inbox;
+pub mod inbox_attempts;
+pub mod inbox_cli;
+pub mod inbox_display;
+pub mod inbox_hub;
+pub mod inbox_prompt;
+pub mod inbox_pubsub;
+pub mod inbox_receipt;
+pub mod inbox_receiver;
+pub mod inbox_spills;
+pub mod inbox_watcher;
 pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
+pub mod jsonc_edit;
 pub mod keybindings;
 // Issue #1540: the deck's last New-agent-form command, owned by the daemon.
 pub mod last_command;
@@ -90,7 +106,6 @@ pub mod orchestrator_ext;
 pub mod osc52;
 pub mod palette;
 pub mod pane;
-pub mod pane_delivery_queue;
 pub mod pane_input;
 pub mod pane_screen_text;
 pub mod platform;
@@ -103,7 +118,6 @@ pub mod project_config;
 // there is for files this process wrote, and this one is for a path a caller
 // selected over the attach socket.
 pub mod project_resolve;
-pub mod prompt_delivery;
 // PRD #1401: the pull request an agent's work produced, on the session wire.
 pub mod pull_request;
 pub mod pull_request_info;
@@ -121,7 +135,7 @@ pub mod scheduler;
 pub mod self_upgrade;
 pub mod spawn;
 pub mod state;
-pub mod submit_echo;
+pub mod submitted_prompt;
 // PRD #1401: the TUI's `o` key, which hands a wire URL to the system browser.
 pub mod system_browser;
 pub mod tab;

@@ -92,7 +92,7 @@ Starting a unit happens in three steps, and each one tells you something differe
 |---|---|---|
 | `dot-agent-deck dispatch` exits 0 | The daemon accepted the request, or gave no answer the command could check (an older daemon, or none within 5 seconds). | That a worktree was created, that a unit started, or that it got its task. The daemon answers before doing any of that. |
 | A turn in the dispatcher pane beginning `dispatch: spawned isolated` | The worktree exists and the unit's agents were started in it. The turn names what was started, its directory and its branch, and usually the commit the worktree was cut from. | That the agent received its task. |
-| A turn beginning `dispatch: a unit you dispatched has completed` | The unit is reporting back: finished, or stuck and unable to continue. This is the first sign its task arrived. | That the work is correct; read the report. |
+| A turn beginning `dispatch: a unit you dispatched has completed` | The unit is reporting back: finished, or stuck and unable to continue. The unit received enough work to send a report; read the report to see what happened. | That the work is correct; read the report. |
 
 Any other turn beginning `dispatch:` is a failure that says why (a name already used, an orchestration the project does not define, a worktree that could not be created), and the unit did not start. If some of an orchestration's agents were already running when it failed, the deck leaves them and their directory in place and the turn says so.
 
@@ -102,13 +102,9 @@ Each unit also appears on your deck like any other work: a card for a single age
 
 ### When a unit stays quiet
 
-If the unit's agent does not report submitting its task within about a minute, the deck puts a notice on **the unit's own card** saying the task may never have arrived. The notice is not sent to the dispatcher. Not every lost task leaves a notice:
+The unit's task waits in its inbox. Both the TUI card and desktop tile show `✉N queued`, then `✉ delivered` when the agent acknowledges it. A delivery failure shows **Error** (desktop **error**) with `not delivered: …`. Open the pane to check for an unsent draft, a permission prompt or an agent that has exited. [Inspect delivery](orchestration.md#inspect-delivery) explains the inbox commands and `daemon status` columns.
 
-- A **Pi** unit is checked only when its Pi loaded the extension that comes with this version of the deck or a later one. A Pi that was already running when you upgraded the deck keeps its older extension until it restarts; that Pi is not checked and never gets a notice.
-- A **Codex** unit whose prompt hook the deck knows will not run gets no notice either. That happens when you switched the hook off in Codex's `/hooks` list, or when `codex` is reachable only inside a launcher (such as `devbox run codex-big`) and not on the deck's own `PATH`; see [Codex events not showing](troubleshooting.md#codex-events-not-showing).
-- If the unit's pane went away, or its agent was replaced, before the task was typed in, the deck records that in its log and not on the card.
-
-A unit that stays quiet for a long time is worth opening, whether or not it has a notice.
+Delivery confirms receipt, not completion: a unit whose task was delivered can still be stuck. Read its pane and eventual report. The desktop handoff rail also shows the progress of worker handoffs inside a team; the TUI shows that progress on its cards.
 
 ## Hearing back from a unit
 
@@ -126,7 +122,7 @@ A single-agent unit reports by running `dot-agent-deck work-done`; an orchestrat
 
 ### When a report does not arrive
 
-The report is delivered to the dispatcher pane only while that pane is running; nothing stores it. If the dispatcher pane was closed, or the daemon stopped, before the unit finished, the report is dropped and recorded only in the deck's log. It is not queued or re-sent.
+The report waits in the dispatcher's inbox while its agent is running. If that agent exits or its pane is closed, the message is not transferred to a replacement. Restarting the daemon clears its inboxes. Check the unit's own report file and worktree when the summary does not arrive.
 
 The unit's work is not affected: it is still committed on the unit's branch, and its directory is still on disk. Only the summary is lost; open the unit's card or tab, or its directory.
 

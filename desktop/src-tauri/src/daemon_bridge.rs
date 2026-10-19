@@ -3495,6 +3495,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         }
     }
 
@@ -7353,9 +7354,14 @@ start = true
                 .find(|record| record.id == started.start_agent_id)?
                 .pane_id_env
                 .clone()?;
+            // PRD #1666 S5: the deck's seed is the pane's first inbox message.
             remote
                 .registry
-                .take_pending_seed_native_for(&pane, Some(&started.start_agent_id))
+                .inbox()
+                .rendered(&pane)
+                .into_iter()
+                .map(|delivery| delivery.text)
+                .next()
         });
         local.shutdown();
         remote.shutdown();

@@ -736,12 +736,61 @@ pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), Da
     run_daemon_with(socket_path, Daemon::new(state)).await
 }
 
+/// PRD #1666: the environment settings of the typed delivery the inbox
+/// replaced. Each one used to tune a wait or a retry of a prompt the deck typed
+/// into a pane; the deck types nothing but the doorbell now, so none of them
+/// does anything.
+pub const REMOVED_DELIVERY_SETTINGS: &[&str] = &[
+    "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS",
+    "DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS",
+    "DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS",
+    "DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS",
+    "DOT_AGENT_DECK_SEED_FALLBACK_SECS",
+    "DOT_AGENT_DECK_SESSION_START_WAIT_MS",
+];
+
+/// Log one `warn!` for each [`REMOVED_DELIVERY_SETTINGS`] entry `is_set`
+/// reports, and return their names.
+fn warn_removed_delivery_settings(is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    let set: Vec<&'static str> = REMOVED_DELIVERY_SETTINGS
+        .iter()
+        .copied()
+        .filter(|name| is_set(name))
+        .collect();
+    for name in &set {
+        warn!(
+            setting = %name,
+            "{name} no longer has any effect: messages go through the agent's inbox"
+        );
+    }
+    set
+}
+
+#[cfg(test)]
+mod removed_delivery_settings_tests {
+    use super::*;
+
+    /// PRD #1666 (D-7): a removed delivery setting that is set is named, and
+    /// one that is not set, or any other variable, is not.
+    #[test]
+    fn removed_delivery_settings_that_are_set_are_named() {
+        let named = warn_removed_delivery_settings(|name| {
+            name == "DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS" || name == "DOT_AGENT_DECK_SOCKET"
+        });
+        assert_eq!(named, ["DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS"]);
+        assert!(warn_removed_delivery_settings(|_| false).is_empty());
+    }
+}
+
 /// Same as `run_daemon` but lets callers (and tests) inject a pre-built
 /// `Daemon` so they can hold a clone of the PTY registry alongside it.
 /// If `daemon.attach_socket_path` is set, the M1.2 streaming attach server
 /// is spawned alongside the hook-ingestion loop and aborted when this
 /// function returns.
 pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), DaemonError> {
+    // PRD #1666 (decision D-7): settings of the typed delivery the inbox
+    // replaced do nothing now; say so once rather than ignore them silently.
+    warn_removed_delivery_settings(|name| std::env::var_os(name).is_some());
     // PRD #819 M3: capture this daemon's own working directory ONCE, here, at
     // startup — the first of the four seeds its project enumeration draws on.
     // A process's cwd is not guaranteed stable, so reading it lazily at request
@@ -859,12 +908,50 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // spawns is handed that path explicitly instead of re-resolving it from
     // inherited environment when it emits. See `DOT_AGENT_DECK_SOCKET`.
     pty_registry.set_hook_socket(socket_path.to_path_buf());
+    // PRD #1666: the inbox, addressed by this deck's persisted id. A state
+    // directory that cannot hold the id costs it persistence, not the inbox.
+    {
+        let state_dir = crate::config::state_dir();
+        let deck = crate::inbox::DeckId::load_or_create(&state_dir).unwrap_or_else(|error| {
+            warn!(%error, "could not load or create the deck id; using one for this run only");
+            crate::inbox::DeckId::generate()
+        });
+        let hub = Arc::new(crate::inbox_hub::InboxHub::from_env(deck));
+        // PR #1735 fifth review (B-05): the saved bodies of long messages are
+        // listed for this run, and those earlier runs left are taken over.
+        hub.open_spill_ledger(&state_dir);
+        // PRD #1666 §3: this run's receipt spool, with the instances earlier
+        // runs left reaped, a step at a time. A spool that cannot start costs
+        // suppression, which every card it affects says, with the reason, not
+        // delivery.
+        match crate::inbox_receipt::Spool::start(&state_dir) {
+            Ok(spool) => {
+                hub.set_spool(spool);
+                hub.spawn_spool_reaper();
+            }
+            Err(error) => {
+                warn!(%error, "could not start the inbox receipt spool; deck messages may repeat");
+                hub.set_spool_error(&error.to_string());
+            }
+        }
+        pty_registry.install_inbox(hub);
+    }
+    let inbox_ticker = pty_registry.inbox().spawn_ticker();
     // PRD #1589 D8: and which attach endpoint, so an agent's `close` (and every
     // other attach-socket call it makes) reaches THIS daemon. The configured
     // primary path as given, or `None` for a hook-only daemon — whose children
     // are then pointed nowhere rather than at the default endpoint.
     pty_registry.set_attach_socket(daemon.attach_socket_path.clone());
     let state = daemon.state;
+    // PRD #1666 S4: the doorbell, for agents no inbox component is armed for.
+    let doorbell = crate::doorbell::spawn(
+        Arc::clone(&pty_registry),
+        state.clone(),
+        crate::doorbell::DoorbellConfig::from_env(),
+    );
+    // PRD #1666 S11: hands an offered job back in its pool to the next taker.
+    let offer_assigner =
+        crate::inbox_pubsub::spawn_offer_assigner(Arc::clone(&pty_registry), state.clone());
     let restart_control = daemon.restart_control;
     // Issue #454: teach this daemon's `AppState` to resolve "do I own the agent
     // this event names?" against the registry rather than against a set it
@@ -903,6 +990,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         state.write().await.set_last_command_store(Arc::new(store));
     }
     let event_tx = daemon.event_tx;
+    // PRD #1666 S3: every inbox state change reaches attached clients.
+    pty_registry.inbox().set_broadcast(event_tx.clone());
     // Issue #424: give the spawn-time delivery path a way to REPORT a failed
     // delivery as state on the pane's card instead of typing a diagnostic line
     // into the agent's input buffer. See `install_delivery_notice_sink`.
@@ -1239,6 +1328,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     codex_rollout_handle.abort();
     pull_request_handle.abort();
     scheduler_handle.abort();
+    inbox_ticker.abort();
+    offer_assigner.abort();
+    doorbell.abort();
     if let Some(h) = orphan_handle {
         h.abort();
     }
@@ -1249,12 +1341,6 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // between now and the end of the successor work must still claim its stop
     // before the plan is decided, and a second one must still force-exit. It is
     // aborted once that work is done, below.
-    // Issue #424 (reviewer finding B9): a spawn-time prompt's confirmation loop
-    // must not outlive the daemon that owns the PTY it re-submits into. The loop
-    // also ends on its own when the broadcast sender drops (`PromptWatch::Closed`),
-    // but that is a race against the next backoff window expiring, and this is
-    // the deterministic half.
-    crate::spawn::cancel_all_prompt_confirmations();
     drop(pty_registry);
 
     // PRD #1487: an accepted `restart-daemon` in `Installed` mode left its
@@ -1457,6 +1543,7 @@ fn make_schedule_callback(
         // done, the value that belongs here is `Unattended`: a scheduled task
         // fires with no one at the pane (issue #703).
         compose_orchestrator_context: None,
+        seed_reason: None,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
     // Issue #835: the task's declared spawn shape, `None` for every task that does
@@ -2207,19 +2294,65 @@ where
         } else if crate::quota_block::is_work_evidence(&event) {
             registry.quota_note_work_event(pane_id, generation);
         }
-        // Issue #1650: remember when a booting agent first announced it is
-        // ready, so a `clear = false` delegate that arrives later can tell a
-        // worker still starting from one that is up. Only for the generation
-        // the event names, like the quota latch above.
-        if let Some(agent_id) = event.agent_id.as_deref()
-            && crate::state::session_start_opens_boot_gate(&event)
-        {
-            registry.note_boot_readiness(
-                pane_id,
-                agent_id,
-                event.is_wrapper_interface_ready_session_start(),
-            );
-        }
+    }
+    // PRD #1666: an Idle from the pane's own agent that ends a turn it
+    // reported starting ends what a run of the user's Escape keys could have
+    // been holding, the interrupt of that turn, so the doorbell stops reading
+    // those keys as a draft (`DraftTracker::turn_ended`). Under this lock,
+    // like the quota latch, so it reaches the tracker in the order the card
+    // sees it.
+    //
+    // A turn starts with a report that the agent is working: thinking, a
+    // tool starting, compacting or a permission request (r8k R8G-02). A tool
+    // FINISHING starts nothing: a ToolEnd that arrives after its turn's Idle
+    // would otherwise open a turn the next Idle "ends", releasing Escapes
+    // that opened a menu meanwhile (Qodo r8, PR #1735), and the daemon cannot
+    // tell it from the first report of a turn whose start it never saw. So a
+    // turn whose start report is missing (lost, or its hook switched off)
+    // releases nothing when it ends, and its Escapes hold until a submit or
+    // the user's clear, the Enter the user docs give. An Idle with no turn
+    // under way releases nothing: a repeated Idle (OpenCode sends two) must not
+    // release the Escapes that opened a menu on an agent already Idle. A
+    // line `dot-agent-deck wrap` classified from the child's output proves
+    // only that it printed something, or stopped printing, so it neither
+    // starts nor ends a turn: a wrapped Codex's quiet-output Idle does not
+    // end a turn its hooks reported (Qodo r8). A wrapper-only agent
+    // therefore has no turn end to release on, and its Escapes hold until a
+    // submit or the user's clear.
+    //
+    // Only the generation that sent it counts, as for the quota latch: the
+    // one it names, or the one its token was minted for, and the registry
+    // applies it only while that generation is the pane's live owner, or
+    // keeps it for a spawn reserved on the pane (r8g R8G-01). A report with
+    // neither touches nothing. An event the daemon authored is no turn of the
+    // agent's, and a subagent's turn is not the main thread's the user
+    // interrupted.
+    let turn_edge = match event.event_type {
+        _ if event.is_wrapper_output_classified() => None,
+        crate::event::EventType::Idle => Some(crate::agent_pty::TurnEdge::Ended),
+        crate::event::EventType::Thinking
+        | crate::event::EventType::ToolStart
+        | crate::event::EventType::Compacting
+        | crate::event::EventType::PermissionRequest => Some(crate::agent_pty::TurnEdge::Started),
+        _ => None,
+    };
+    if !unproven
+        && let Some(edge) = turn_edge
+        && !event.is_daemon_synthetic()
+        && !event.is_from_subagent()
+        && let Some(pane_id) = event.pane_id.as_deref()
+        && let Some(generation) = event.agent_id.as_deref().or(attested_agent)
+        && let Some(seen) = registry.note_turn(pane_id, generation, edge)
+    {
+        // PRD #1666 G3: the inbox's turn clock, after the registry's locks
+        // are released (the inbox asks the registry under its own lock) and
+        // inside this `AppState` write lock, which serializes ingest, so
+        // edges reach it in the order the registry numbered them. A reserved
+        // spawn's edge counts too: its id is the generation's, so a turn it
+        // reported before publication is on its clock from the start.
+        registry
+            .inbox()
+            .note_turn(pane_id, generation, seen, std::time::Instant::now());
     }
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?
@@ -2997,6 +3130,9 @@ fn notify_orchestrator_of_quota_block(
 /// * `pull_request` (PRD #1401), the daemon's report of a card's pull request,
 ///   is stripped from every producer frame, and the hook loop drops a
 ///   producer's `pull_request` event outright;
+/// * `surfaced_inbox` (PRD #1666 §2.8), the inbox a card-surfacing start
+///   carries, which a client takes as the pane's, is stripped from every
+///   producer frame;
 /// * `quota_blocked_source` and `quota_blocked_lifted`, the daemon's own
 ///   markers (its Codex-rollout block, and the lift after a pane restart), are
 ///   stripped from every producer frame;
@@ -3020,6 +3156,16 @@ fn admit_producer_event(event: &mut AgentEvent) {
     };
     event.metadata.remove(QUOTA_BLOCKED_SOURCE_METADATA_KEY);
     event.metadata.remove(QUOTA_BLOCKED_LIFTED_METADATA_KEY);
+    // PRD #1666 long-turn delivery: only the daemon lifts its own notice.
+    event
+        .metadata
+        .remove(crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY);
+    // PRD #1666 S6: nor does a producer say a prompt is the deck's own
+    // message; the raw-event ingress stamps that after this, and no other
+    // ingress does.
+    event
+        .metadata
+        .remove(crate::inbox_prompt::DECK_MESSAGE_METADATA_KEY);
     // PRD #1631: the deck's own answered marker never comes from a producer,
     // and a question is rewritten sanitized — or dropped — so every reader of
     // the fan-out sees the question the snapshot will hold.
@@ -3047,6 +3193,11 @@ fn admit_producer_event(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::PULL_REQUEST_REVISION_METADATA_KEY);
+    // PRD #1666 §2.8: so is the inbox a card-surfacing start carries, which a
+    // client takes as the pane's inbox.
+    event
+        .metadata
+        .remove(crate::event::SURFACED_INBOX_METADATA_KEY);
     // Issue #1678: the background aggregate is the daemon's alone; a producer's
     // copy would otherwise reach every attached client's card.
     event.background = None;
@@ -3516,6 +3667,27 @@ fn install_delivery_notice_sink(
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) {
+    // PRD #1666 §2.8: a message the inbox could not deliver reaches its
+    // recipient's card through this same sink.
+    let card_registry = Arc::downgrade(registry);
+    registry
+        .inbox()
+        .set_card_notice_sink(std::sync::Arc::new(move |notice| {
+            if let Some(registry) = card_registry.upgrade() {
+                registry.publish_delivery_notice(notice);
+            }
+        }));
+    // PR #1735 fifth review (N4): the inbox's own notices to an agent are
+    // posted only while that agent still holds its pane, asked under the
+    // inbox's lock.
+    let live_registry = Arc::downgrade(registry);
+    registry
+        .inbox()
+        .set_live_agent_check(std::sync::Arc::new(move |pane_id, agent_id| {
+            live_registry.upgrade().is_some_and(|registry| {
+                registry.pane_current_agent_id(pane_id).as_deref() == Some(agent_id)
+            })
+        }));
     let weak_registry = Arc::downgrade(registry);
     registry.set_delivery_notice_sink(std::sync::Arc::new(move |notice| {
         let state = state.clone();
@@ -3591,20 +3763,55 @@ fn install_delivery_notice_sink(
                     );
                     notice.pane_id.clone()
                 });
+            // PRD #1666 long-turn delivery: lift only a card that still shows
+            // the deck's not-delivered notice, as far as the daemon's own copy
+            // says. A client that predates the lift reads the event as a plain
+            // Thinking, so it is sent only where Thinking is what the card
+            // should now show. A card only attached clients hold (#424 F5) is
+            // not the daemon's to check, and gets it; current clients apply
+            // the same rule themselves.
+            if notice.cleared
+                && guard
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.delivery_notice().is_none())
+            {
+                tracing::debug!(
+                    pane_id = %notice.pane_id,
+                    delivery_id = %notice.delivery_id,
+                    "delivery cleared: the card no longer shows the deck's notice"
+                );
+                return;
+            }
             let mut metadata = std::collections::HashMap::new();
-            metadata.insert(
-                crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
-                notice.detail.to_string(),
-            );
+            // PRD #1666 long-turn delivery: a notice that a reported message
+            // reached the agent after all lifts the card's not-delivered
+            // Error (`AppState::apply_status_transition` moves only that one).
+            let (event_type, tool_detail) = if notice.cleared {
+                metadata.insert(
+                    crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY.to_string(),
+                    crate::event::DELIVERY_NOTICE_CLEARED_METADATA_VALUE.to_string(),
+                );
+                (crate::event::EventType::Thinking, None)
+            } else {
+                metadata.insert(
+                    crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+                    notice.detail.to_string(),
+                );
+                (
+                    crate::event::EventType::Error,
+                    Some(notice.detail.to_string()),
+                )
+            };
             let event = AgentEvent {
                 session_id,
                 // The daemon is not the agent, and must not claim to be one:
                 // `apply_event` only fills a session's type when it is still
                 // unknown, so `None` cannot overwrite a real agent type.
                 agent_type: crate::event::AgentType::None,
-                event_type: crate::event::EventType::Error,
+                event_type,
                 tool_name: None,
-                tool_detail: Some(notice.detail.to_string()),
+                tool_detail,
                 cwd: None,
                 timestamp: chrono::Utc::now(),
                 user_prompt: None,
@@ -4491,79 +4698,6 @@ pub(crate) fn resolve_dispatch_caller(
     }
 }
 
-/// Issue #617 (finding 3): deliver a dispatch result back to the agent that
-/// asked for it, bound to the registry agent id captured from the caller's
-/// `AgentRecord` *before* the dispatch ran.
-///
-/// The write used to be inline in `run_hook_loop`'s `Dispatch` arm and used the
-/// unguarded `write_to_pane_and_submit(&signal.pane_id, …)`. Between the request
-/// and this delivery sits `handle_dispatch` — a git worktree creation plus an
-/// agent spawn, unbounded and deliberately performed outside any `AppState` lock
-/// — which is one of the widest race windows in the daemon. A pane id is a
-/// recycled handle, so a caller that was closed or respawned during that work had
-/// its dispatch result submitted into whatever process inherited its pane, which
-/// may then act on it with its own tools.
-///
-/// Extracted rather than fixed in place so the delivery has a name and a seam:
-/// the slow half (`handle_dispatch`) was already unit-testable and this half was
-/// not, which is why the only coverage of it was end-to-end.
-///
-/// Every refusal is terminal and none is retried — a retry could only re-target
-/// whichever process now occupies the pane. `Ambiguous` is deliberately NOT
-/// folded in with the refusals: bytes of ours already reached the authorized
-/// caller, so re-sending would duplicate a half-written message rather than
-/// repair it, and the caller is the one place where that distinction is visible.
-pub async fn deliver_dispatch_result(
-    registry: &AgentPtyRegistry,
-    pane_id: &str,
-    expected_agent_id: &str,
-    message: &str,
-) -> crate::agent_pty::GuardedSend {
-    use crate::agent_pty::GuardedSend;
-    match registry
-        .write_and_submit_guarded_first_write(
-            pane_id,
-            message,
-            expected_agent_id,
-            || async { true },
-            std::time::Instant::now(),
-        )
-        .await
-    {
-        Ok(GuardedSend::Applied) => GuardedSend::Applied,
-        Ok(GuardedSend::Ambiguous) => {
-            warn!(
-                pane_id = %pane_id,
-                agent_id = %expected_agent_id,
-                "dispatch: result delivery was ambiguous (partial write); not retried"
-            );
-            GuardedSend::Ambiguous
-        }
-        Ok(refused) => {
-            warn!(
-                pane_id = %pane_id,
-                agent_id = %expected_agent_id,
-                outcome = ?refused,
-                "dispatch: identity gate refused the result (the caller pane no longer belongs \
-                 to the agent that requested the dispatch); nothing written"
-            );
-            refused
-        }
-        Err(e) => {
-            warn!(
-                pane_id = %pane_id,
-                agent_id = %expected_agent_id,
-                error = %e,
-                "dispatch: failed to write result into caller pane"
-            );
-            // A transport error, not a refusal: no identity decision was
-            // reached. Reported as `Stale` so callers have one vocabulary, with
-            // the real cause on the `warn!` above.
-            GuardedSend::Stale
-        }
-    }
-}
-
 /// Issue #319: how many hook-socket connections the daemon serves at once.
 ///
 /// **Where the number comes from.** A hook connection is short-lived by
@@ -4892,70 +5026,624 @@ fn mask_capability_runs(text: &str) -> Option<String> {
     changed.then_some(out)
 }
 
-/// Issue #1383: act on a worker's `ack` for a delegated task's delivery id.
-///
-/// Stops the pane's in-place retry when the id is the pane's pending delivery,
-/// and cancels the silent-worker watch armed for the pane's current delivery,
-/// retry or no retry — an ack is
-/// not an [`crate::event::AgentEvent`], so that watch cannot see it, and a
-/// hookless worker that acknowledged must not later be reported as never having
-/// got its task. The cancel is seq-conditional, not
-/// [`AgentPtyRegistry::retire_silence_watch`], whose oldest-first accounting
-/// belongs to `work-done`.
-///
-/// Returns what the caller is told (PR #1414 review): the hook loop writes it
-/// back as [`crate::event::SignalAck::acknowledged`], so the `ack` CLI says
-/// "Acknowledged" only for an id that named the pane's current delivery. The
-/// id is producer-supplied, so a malformed one is logged only as a length,
-/// looks nothing up, and answers [`crate::event::AckDelivery::Unknown`].
-///
-/// `attested_agent_id` is the agent the hook-token provenance gate resolved
-/// from the token (Qodo, #1414), and it outranks the payload's own
-/// `agent_id`, which the sender chooses: an older generation still holding a
-/// valid token for the same pane is identified as itself and cannot stop a
-/// newer generation's retry by leaving `agent_id` out. The payload's id is
-/// consulted only for an ack the gate admitted without attesting it (a pane
-/// never issued a token, or `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`), and an ack
-/// with neither matches nothing.
-pub(crate) fn handle_delivery_ack(
+/// PRD #1666: the refusal code for an inbox request no token attests.
+const INBOX_UNATTESTED: &str = "unattested";
+const INBOX_UNATTESTED_MESSAGE: &str = "inbox requests need the hook capability token dot-agent-deck gave this pane's agent, \
+     and this one carried none the deck could check; run it from inside the agent's own pane";
+/// PRD #1666: the refusal code for an inbox request naming another agent.
+const INBOX_WRONG_AGENT: &str = "wrong_agent";
+const INBOX_WRONG_AGENT_MESSAGE: &str =
+    "this request names an agent other than the one its hook capability token was issued to";
+
+/// PRD #1666: `ack <m-id>` — acknowledge an inbox message for the agent the
+/// token attests.
+fn handle_inbox_ack(
     registry: &AgentPtyRegistry,
     signal: &crate::event::AckSignal,
-    attested_agent_id: Option<&str>,
+    agent_id: &str,
 ) -> crate::event::AckDelivery {
-    if !crate::delegate_retry::is_valid_delivery_id(&signal.delivery_id) {
+    if !crate::inbox::is_valid_message_id(&signal.delivery_id) {
         warn!(
             pane_id = %escape_id_for_log(&signal.pane_id),
-            delivery_id_len = signal.delivery_id.len(),
-            "Received an ack whose delivery id is not shaped like one this daemon mints; ignored"
+            id_len = signal.delivery_id.len(),
+            "Received an ack whose id is not shaped like an inbox message id; ignored"
         );
         return crate::event::AckDelivery::Unknown;
     }
-    let outcome = registry.pending_deliveries().acknowledge(
-        &signal.pane_id,
+    let outcome = registry.inbox().ack(
         &signal.delivery_id,
-        attested_agent_id.or(signal.agent_id.as_deref()),
+        &signal.pane_id,
+        agent_id,
+        crate::inbox::AckHow::Explicit,
     );
-    // A matching ack with no retry pending cancels too (Qodo, PR #1414): with
-    // the retry off no record is ever armed, and the watch would otherwise
-    // report a worker that acknowledged as never having got its task.
-    let silence_cancelled = match outcome {
-        crate::delegate_retry::AckOutcome::Stopped {
-            silence_seq: Some(seq),
-        }
-        | crate::delegate_retry::AckOutcome::NotPending {
-            silence_seq: Some(seq),
-        } => registry.cancel_silence_watch_if(&signal.pane_id, seq),
-        _ => false,
-    };
     info!(
         pane_id = %escape_id_for_log(&signal.pane_id),
-        delivery_id = %signal.delivery_id,
+        message_id = %signal.delivery_id,
         outcome = ?outcome,
-        silence_cancelled,
-        "Received ack"
+        "Received inbox ack"
     );
     outcome.into()
 }
+
+/// PRD #1666: `inbox_fetch` — hand the attested agent its queued messages.
+/// PRD #1666 hardening M2: the refusal code for an inbox component whose
+/// process is not the pane's agent or one of its descendants.
+const INBOX_NOT_AGENT_PROCESS: &str = "inbox_not_agent_process";
+
+/// [`INBOX_NOT_AGENT_PROCESS`]'s message.
+const INBOX_NOT_AGENT_PROCESS_MESSAGE: &str = "this process is not the pane's agent or one of its processes, so it may not receive \
+     the agent's inbox";
+
+/// TEST knob, honoured only in a build with the `e2e` feature: inbox
+/// components may connect from outside the pane's agent process tree, as the
+/// synthetic lane-1 tests that drive the inbox wire from the test process do.
+const ENV_TEST_UNBOUND_COMPONENTS: &str = "DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS";
+
+/// Which inbox verb a component is admitted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentUse {
+    /// A post, or settling a job: the agent's own process tree may use its
+    /// token, tools included.
+    Cli,
+    /// Arming a waiter or announcing a wake: registering the agent's native
+    /// receiver ([`admit_receiver_process`]).
+    Receiver,
+}
+
+/// How much a component's ancestry must prove for an inbox verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// Refused only on a positive "not the agent's"; a walk that cannot say
+    /// admits. For the verbs that post or settle a job.
+    BestEffort,
+    /// PR #1735 second review: admitted only on a positive "the agent's". For
+    /// the verbs that take or settle the agent's own mail — fetch, ack,
+    /// get-seed and arming a waiter — and, since the third review, announcing
+    /// a wake, which pins the agent's receiver: a caller can make its ancestry
+    /// unreadable on purpose, since a connection whose creator exited still
+    /// reports that creator as its peer.
+    Required,
+}
+
+/// [`admit_component_process`] — or [`admit_receiver_process`] for a
+/// receiver — on this platform's process table, unless the `e2e`-only
+/// [`ENV_TEST_UNBOUND_COMPONENTS`] knob is set. [`Evidence::Required`] falls
+/// back to [`Evidence::BestEffort`] on a platform without
+/// [`crate::platform::proc::ANCESTRY_LOOKUP`], where no caller could prove
+/// anything.
+fn admit_inbox_component(
+    peer: Option<AcceptedPeer>,
+    claimed: Option<u32>,
+    root: Option<u32>,
+    used_as: ComponentUse,
+    evidence: Evidence,
+) -> Result<Option<u32>, &'static str> {
+    #[cfg(feature = "e2e")]
+    if std::env::var(ENV_TEST_UNBOUND_COMPONENTS)
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+    {
+        return Ok(claimed);
+    }
+    #[cfg(not(feature = "e2e"))]
+    let _ = ENV_TEST_UNBOUND_COMPONENTS;
+    let evidence = if crate::platform::proc::ANCESTRY_LOOKUP {
+        evidence
+    } else {
+        Evidence::BestEffort
+    };
+    admit_inbox_component_with(peer, claimed, root, used_as, evidence, &PLATFORM_LOOKUPS)
+}
+
+/// PR #1735 third review (F2): the connecting process as the daemon accepted
+/// its hook connection — the pid the kernel reported, and when that process
+/// started ([`crate::platform::proc::process_start_of`]), `None` where that
+/// cannot be read. A connection keeps reporting the process that made it after
+/// that process exits, and its pid can then be reused; the start time tells
+/// the process that connected from a later one holding the same number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptedPeer {
+    pid: u32,
+    started: Option<u64>,
+}
+
+impl AcceptedPeer {
+    /// The peer `pid` names, read now, as the connection is accepted.
+    fn accept(pid: Option<u32>) -> Option<Self> {
+        pid.map(|pid| Self {
+            pid,
+            started: crate::platform::proc::process_start_of(pid),
+        })
+    }
+}
+
+/// The process-table reads the inbox admission makes, injectable so a test
+/// can stand in a process table — a reused pid included.
+struct ProcessLookups {
+    descends: fn(u32, u32) -> Option<bool>,
+    parent_of: fn(u32) -> Option<u32>,
+    executable_of: fn(u32) -> Option<std::path::PathBuf>,
+    started: fn(u32) -> Option<u64>,
+}
+
+/// This platform's process table.
+const PLATFORM_LOOKUPS: ProcessLookups = ProcessLookups {
+    descends: crate::platform::proc::descends_from,
+    parent_of: crate::platform::proc::parent_pid_of,
+    executable_of: crate::platform::proc::executable_of,
+    started: crate::platform::proc::process_start_of,
+};
+
+/// [`admit_inbox_component`] over `lookups`, with `evidence` already settled
+/// for the platform.
+///
+/// PR #1735 third review (F2): the peer's ancestry is walked by its pid, so
+/// once the walk has answered, the peer must still be the process accepted
+/// ([`still_the_accepted_peer`]). Read after the walk, the same start time
+/// means that process was alive from the accept through the walk, so the walk
+/// read its ancestry and not a later process's that reuses its pid.
+fn admit_inbox_component_with(
+    peer: Option<AcceptedPeer>,
+    claimed: Option<u32>,
+    root: Option<u32>,
+    used_as: ComponentUse,
+    evidence: Evidence,
+    lookups: &ProcessLookups,
+) -> Result<Option<u32>, &'static str> {
+    let pid = peer.map(|peer| peer.pid);
+    let admitted = match used_as {
+        ComponentUse::Cli => {
+            admit_component_process(pid, claimed, root, lookups.descends, evidence)
+        }
+        ComponentUse::Receiver => admit_receiver_process(
+            pid,
+            claimed,
+            root,
+            lookups.descends,
+            lookups.parent_of,
+            lookups.executable_of,
+            evidence,
+        ),
+    }?;
+    if let Some(peer) = peer {
+        still_the_accepted_peer(peer, lookups.started, evidence)?;
+    }
+    Ok(admitted)
+}
+
+/// PR #1735 third review (F2): whether `peer.pid` still names the process
+/// accepted as `peer`. A different start time is a positive "no" and refuses
+/// under either [`Evidence`]; a start time that cannot be read now, or could
+/// not be when the connection was accepted, refuses only
+/// [`Evidence::Required`].
+fn still_the_accepted_peer(
+    peer: AcceptedPeer,
+    started_of: fn(u32) -> Option<u64>,
+    evidence: Evidence,
+) -> Result<(), &'static str> {
+    match (peer.started, started_of(peer.pid)) {
+        (Some(then), Some(now)) if then == now => Ok(()),
+        (Some(_), Some(_)) => {
+            Err("the connecting process has exited, and its process id now names another")
+        }
+        _ if evidence == Evidence::Required => Err("the connecting process cannot be identified"),
+        _ => Ok(()),
+    }
+}
+
+/// PR #1735 review: whether the connecting process `peer` may take or settle
+/// `agent_id`'s own mail — `inbox_fetch`, `ack` and the `get_seed` alias — on
+/// the same terms as the verbs that post ([`ComponentUse::Cli`]): only the
+/// agent's own process tree may use its token for them, and only on positive
+/// evidence that the caller is in it ([`Evidence::Required`]). Logs a refusal.
+fn mail_taker_admitted(
+    registry: &AgentPtyRegistry,
+    peer: Option<AcceptedPeer>,
+    agent_id: &str,
+    verb: &str,
+    pane_id: &str,
+) -> bool {
+    match admit_inbox_component(
+        peer,
+        None,
+        registry.child_pid(agent_id),
+        ComponentUse::Cli,
+        Evidence::Required,
+    ) {
+        Ok(_) => true,
+        Err(why) => {
+            warn!(
+                verb,
+                pane_id = %escape_id_for_log(pane_id),
+                why,
+                "hook socket: refused an inbox verb from outside the pane's agent"
+            );
+            false
+        }
+    }
+}
+
+/// Audit F3: [`admit_component_process`] for a component registering the
+/// agent's native receiver. Answers the instance the receiver is pinned by
+/// ([`receiver_instance`]), and refuses one with an agent of its own kind
+/// between it and the caller ([`nested_between`]).
+///
+/// Audit D1: this bounds registration to the agent's process tree; it does not
+/// tell the visible integration from another process the agent runs. A waiter
+/// started from the agent's own tool shell resolves to the agent, and a nested
+/// agent of another kind naming the outer agent's pid passes the same-kind
+/// check; either is then the same receiver as far as the pin can tell.
+fn admit_receiver_process(
+    peer: Option<u32>,
+    claimed: Option<u32>,
+    root: Option<u32>,
+    descends: impl Fn(u32, u32) -> Option<bool>,
+    parent_of: impl Fn(u32) -> Option<u32> + Copy,
+    executable_of: impl Fn(u32) -> Option<std::path::PathBuf> + Copy,
+    evidence: Evidence,
+) -> Result<Option<u32>, &'static str> {
+    let instance = admit_component_process(peer, claimed, root, descends, evidence)?
+        .map(|claimed| receiver_instance(claimed, root, parent_of, executable_of));
+    if let (Some(peer), Some(instance)) = (peer, instance)
+        && nested_between(peer, instance, parent_of, executable_of) == Some(true)
+    {
+        return Err("an agent of the same kind sits between the caller and the component it names");
+    }
+    Ok(instance)
+}
+
+/// Audit F3: the process an agent's receiver is pinned by — `claimed`, or,
+/// when `claimed` is a shell the agent runs a hook through, the nearest
+/// ancestor that is not a shell, never above the agent's own process `root`.
+///
+/// Claude Code runs every hook through a new `sh` that does not `exec` it
+/// (measured on 2.1.299: `claude ── sh ── hook`), so its announcement and each
+/// of its waiters name a different shell; the agent above them is the one
+/// receiver. Without `root` there is nothing to bound the walk, so `claimed`
+/// stands, as it does where a process cannot be read or the shells run deeper
+/// than the walk reads (`MAX_SHELLS`) without reaching one that is not a shell.
+fn receiver_instance(
+    claimed: u32,
+    root: Option<u32>,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    executable_of: impl Fn(u32) -> Option<std::path::PathBuf>,
+) -> u32 {
+    /// More shells than any hook runner stacks.
+    const MAX_SHELLS: usize = 8;
+    let Some(root) = root else {
+        return claimed;
+    };
+    let mut current = claimed;
+    for _ in 0..MAX_SHELLS {
+        if current == root || !executable_of(current).is_some_and(|exe| is_shell(&exe)) {
+            return current;
+        }
+        match parent_of(current) {
+            Some(parent) if parent > 1 => current = parent,
+            _ => return claimed,
+        }
+    }
+    claimed
+}
+
+/// Whether `exe` is a POSIX-style shell, by its file name.
+fn is_shell(exe: &std::path::Path) -> bool {
+    let name = exe.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+    matches!(
+        name,
+        "sh" | "dash" | "bash" | "zsh" | "ksh" | "mksh" | "ash" | "fish" | "busybox"
+    )
+}
+
+/// Audit F3: whether a process strictly between `peer` and `claimed` — one of
+/// `peer`'s ancestors below `claimed` — runs the same executable as
+/// `claimed`: an agent of the same kind nested inside the one it names, as a
+/// tool can start. `None` when the walk cannot say: a process exited, or this
+/// platform cannot read a parent or an executable.
+fn nested_between(
+    peer: u32,
+    claimed: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    executable_of: impl Fn(u32) -> Option<std::path::PathBuf>,
+) -> Option<bool> {
+    /// Deeper than any real agent's process tree, as `descends_from`'s.
+    const MAX_DEPTH: usize = 128;
+    if peer == claimed {
+        return Some(false);
+    }
+    let kind = executable_of(claimed)?;
+    let mut current = parent_of(peer)?;
+    for _ in 0..MAX_DEPTH {
+        if current == claimed || current <= 1 {
+            return Some(false);
+        }
+        if executable_of(current)? == kind {
+            return Some(true);
+        }
+        current = parent_of(current)?;
+    }
+    Some(false)
+}
+
+/// PRD #1666 hardening M2: bind an inbox component to the pane's managed
+/// agent. `peer` is the connecting process as the kernel reports it, `claimed`
+/// the component instance it names (the process that runs its watcher, which
+/// the stream is keyed by), and `root` the agent process the deck spawned.
+/// Each must be `root` or descend from it, and the claimed instance must be an
+/// ancestor of the caller (or the caller itself). Under
+/// [`Evidence::BestEffort`], where `descends` cannot say — a Unix other than
+/// Linux or macOS, or a process that exited during the walk — the check is
+/// skipped, as it is without a `peer` or a `root`. Under
+/// [`Evidence::Required`] each of those refuses. Windows reads parents from a
+/// process snapshot since PR #1735's review. Answers the instance to arm the
+/// stream under.
+fn admit_component_process(
+    peer: Option<u32>,
+    claimed: Option<u32>,
+    root: Option<u32>,
+    descends: impl Fn(u32, u32) -> Option<bool>,
+    evidence: Evidence,
+) -> Result<Option<u32>, &'static str> {
+    let required = evidence == Evidence::Required;
+    let Some(root) = root else {
+        return if required {
+            Err("the pane has no agent process to bind the caller to")
+        } else {
+            Ok(claimed)
+        };
+    };
+    // `Err(true)` for a positive "no", `Err(false)` for "cannot say" where
+    // the evidence must be positive.
+    let check = |pid: u32, ancestor: u32| match descends(pid, ancestor) {
+        Some(true) => Ok(()),
+        Some(false) => Err(true),
+        None if required => Err(false),
+        None => Ok(()),
+    };
+    const UNREADABLE: &str = "the caller's process ancestry cannot be read";
+    match peer {
+        Some(peer) => check(peer, root).map_err(|not| {
+            if not {
+                "the connecting process is not the agent's"
+            } else {
+                UNREADABLE
+            }
+        })?,
+        None if required => return Err("the connecting process cannot be identified"),
+        None => {}
+    }
+    if let Some(claimed) = claimed {
+        check(claimed, root).map_err(|not| {
+            if not {
+                "the named component process is not the agent's"
+            } else {
+                UNREADABLE
+            }
+        })?;
+        if let Some(peer) = peer {
+            check(peer, claimed).map_err(|not| {
+                if not {
+                    "the named component process is not the caller's"
+                } else {
+                    UNREADABLE
+                }
+            })?;
+        }
+    }
+    Ok(claimed)
+}
+
+/// PRD #1666 hardening H2: the inbox half of `get-seed` — the oldest message
+/// queued for the agent, rendered and acknowledged, which an extension that
+/// predates the inbox reads as its seed. It acts only for `attested`, the
+/// agent the request's token attests, and only while that agent is the pane's
+/// `live` one: an unattested request (admitted under the `warn` provenance
+/// policy) gets nothing, and so does one naming any other agent (`requested`),
+/// so no generation can take another's work.
+///
+/// PRD #1666 G10: a Pi generation (`pi`) is on the receipt stream, so only
+/// an extension from before it asks; it is refused like an old adapter — no
+/// seed, its mail stays queued for the receiver and its card says to restart
+/// the agent.
+fn get_seed_inbox_alias(
+    hub: &crate::inbox_hub::InboxHub,
+    pane_id: &str,
+    requested: Option<&str>,
+    attested: Option<&str>,
+    live: Option<&str>,
+    pi: bool,
+) -> Option<String> {
+    let agent = attested?;
+    if requested.is_some_and(|requested| !requested.is_empty() && requested != agent) {
+        warn!(
+            pane_id = %escape_id_for_log(pane_id),
+            "get-seed named an agent other than the one its token attests; no inbox message \
+             was handed over"
+        );
+        return None;
+    }
+    if live != Some(agent) {
+        return None;
+    }
+    if pi {
+        hub.refuse_old_adapter(pane_id, agent);
+        return None;
+    }
+    hub.fetch_first_acked(pane_id, agent, crate::inbox::AckHow::ExtensionConfirmed)
+        .map(|delivery| delivery.text)
+}
+
+/// PRD #1666 G10: whether `agent_id` in `pane_id` is a Pi generation: started
+/// as Pi, or whose extension announced itself.
+fn pi_generation(registry: &AgentPtyRegistry, pane_id: &str, agent_id: &str) -> bool {
+    registry.spawn_agent_type(agent_id) == Some(crate::event::AgentType::Pi)
+        || registry.inbox().announced_component(pane_id, agent_id)
+            == Some(crate::event::InboxComponent::PiExtension)
+}
+
+fn handle_inbox_fetch(
+    registry: &AgentPtyRegistry,
+    req: &crate::event::InboxFetchRequest,
+    agent_id: &str,
+) -> crate::event::InboxWaitReply {
+    use crate::event::InboxFetchConsumer;
+    use crate::inbox::{AckHow, Consumer};
+    let (consumer, how) = match req.consumer {
+        InboxFetchConsumer::Cli => (Consumer::FetchCli, AckHow::FetchedByCli),
+        InboxFetchConsumer::TurnEndHook => (Consumer::TurnEndHook, AckHow::HookHandover),
+        InboxFetchConsumer::DoorbellHook => (Consumer::DoorbellHook, AckHow::HookHandover),
+    };
+    let budget = req
+        .max_bytes
+        .map(crate::event::InboxBudget::Bytes)
+        .or(req.max_chars.map(crate::event::InboxBudget::Chars));
+    let doorbell = req
+        .doorbell
+        .as_deref()
+        .filter(|id| crate::inbox::is_valid_message_id(id));
+    if req.doorbell.is_some() && doorbell.is_none() {
+        return crate::event::InboxWaitReply::messages(Vec::new());
+    }
+    // PRD #1666 §4, §11: a doorbell substitution by a receipt component binds
+    // its attempts to that component's own stream; one from an OpenCode
+    // plugin below the floor is refused, and its card says why.
+    if let Some(rx) = req.rx {
+        if req
+            .adapter_integration
+            .is_none_or(|declared| declared < crate::inbox_hub::ADAPTER_INTEGRATION)
+        {
+            registry.inbox().refuse_old_adapter(&req.pane_id, agent_id);
+            return crate::event::InboxWaitReply::refused(
+                "adapter_too_old",
+                crate::inbox_display::ADAPTER_TOO_OLD,
+            );
+        }
+        let fetched = registry
+            .inbox()
+            .receipt_fetch(&req.pane_id, agent_id, rx, doorbell, budget);
+        info!(
+            pane_id = %escape_id_for_log(&req.pane_id),
+            consumer = ?req.consumer,
+            rx,
+            count = fetched.as_ref().map_or(0, Vec::len),
+            refused = ?fetched.as_ref().err(),
+            "Received inbox fetch"
+        );
+        return match fetched {
+            Ok(messages) => crate::event::InboxWaitReply::messages(messages),
+            Err(code) => crate::event::InboxWaitReply::refused(
+                code,
+                "the deck could not issue to that receiver",
+            ),
+        };
+    }
+    // PRD #1666 G10: Pi's too — a plain doorbell fetch is an extension from
+    // before the receipt stream.
+    if req.consumer == InboxFetchConsumer::DoorbellHook
+        && (registry.spawn_agent_type(agent_id) == Some(crate::event::AgentType::OpenCode)
+            || pi_generation(registry, &req.pane_id, agent_id))
+    {
+        registry.inbox().refuse_old_adapter(&req.pane_id, agent_id);
+        return crate::event::InboxWaitReply::refused(
+            "adapter_too_old",
+            crate::inbox_display::ADAPTER_TOO_OLD,
+        );
+    }
+    let messages = registry.inbox().fetch_named_within(
+        &req.pane_id,
+        agent_id,
+        consumer,
+        budget,
+        req.ack.then_some(how),
+        doorbell,
+    );
+    info!(
+        pane_id = %escape_id_for_log(&req.pane_id),
+        consumer = ?req.consumer,
+        ack = req.ack,
+        count = messages.len(),
+        "Received inbox fetch"
+    );
+    crate::event::InboxWaitReply::messages(messages)
+}
+
+/// PRD #1666: `inbox_list` — the caller's own inbox, or with `all` an
+/// orchestrator's whole orchestration.
+async fn handle_inbox_list(
+    registry: &AgentPtyRegistry,
+    state: &SharedState,
+    req: &crate::event::InboxListRequest,
+    agent_id: &str,
+) -> Result<crate::event::InboxListReply, Box<crate::event::InboxWaitReply>> {
+    let hub = registry.inbox();
+    let panes: Vec<String> = if req.all {
+        let state = state.read().await;
+        if !state.orchestrator_pane_ids.contains(&req.pane_id) {
+            return Err(Box::new(crate::event::InboxWaitReply::refused(
+                "not_orchestrator",
+                "only an orchestrator pane may list its orchestration's inboxes",
+            )));
+        }
+        let mut panes = vec![req.pane_id.clone()];
+        if let Some(identity) = state.pane_orchestration_map.get(&req.pane_id) {
+            let mut members: Vec<String> = state
+                .pane_orchestration_map
+                .iter()
+                .filter(|(pane, other)| *pane != &req.pane_id && other.id == identity.id)
+                .map(|(pane, _)| pane.clone())
+                .collect();
+            members.sort();
+            panes.extend(members);
+        }
+        panes
+    } else {
+        vec![req.pane_id.clone()]
+    };
+    // PRD #1666 S5: the caller's own pane lists the caller's own inbox — what
+    // its agent generation may take — not a predecessor's history there.
+    let messages = panes
+        .iter()
+        .flat_map(|pane| {
+            let own = *pane == req.pane_id;
+            hub.list(pane).into_iter().filter(move |message| {
+                !own || message
+                    .bind_agent
+                    .as_deref()
+                    .is_none_or(|bound| bound == agent_id)
+            })
+        })
+        .collect();
+    Ok(crate::event::InboxListReply {
+        messages,
+        armed: hub.armed(&req.pane_id, agent_id),
+        wake: hub.announced_wake(&req.pane_id, agent_id),
+        component: hub.summary(&req.pane_id, agent_id).component,
+    })
+}
+
+/// [`HOOK_CONNECTION_IDLE_TIMEOUT`], or its override in milliseconds from
+/// [`HOOK_IDLE_TIMEOUT_ENV`]. The override is a TEST knob: it lets the e2e
+/// tests prove that an inbox waiter outlives the idle window without spending
+/// the production minute. A zero or unparsable value is ignored with a warning.
+fn hook_idle_timeout_from_env() -> Duration {
+    match std::env::var(HOOK_IDLE_TIMEOUT_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => {
+                warn!(
+                    variable = HOOK_IDLE_TIMEOUT_ENV,
+                    "ignoring a hook idle-timeout override that is not a positive number of \
+                     milliseconds"
+                );
+                HOOK_CONNECTION_IDLE_TIMEOUT
+            }
+        },
+        Err(_) => HOOK_CONNECTION_IDLE_TIMEOUT,
+    }
+}
+
+/// Test-only override of [`HOOK_CONNECTION_IDLE_TIMEOUT`], in milliseconds.
+const HOOK_IDLE_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_HOOK_IDLE_TIMEOUT_MS";
 
 async fn run_hook_loop(
     listener: IpcListener,
@@ -4972,7 +5660,7 @@ async fn run_hook_loop(
         pty_registry,
         shutdown,
         worktree_registry,
-        HOOK_CONNECTION_IDLE_TIMEOUT,
+        hook_idle_timeout_from_env(),
     )
     .await
 }
@@ -5031,9 +5719,6 @@ async fn run_hook_loop_with_limits(
     // PRD #1631 (audit A6): held questions wait under a budget of their own,
     // not in the connection pool above.
     let hold_limit = Arc::new(tokio::sync::Semaphore::new(limits.max_holds));
-    // Issue #544: the `work-done` and `dispatch` pane writes handed off by the
-    // connections below — ordered per recipient pane and bounded in number.
-    let deliveries = crate::pane_delivery_queue::PaneDeliveryQueues::new();
     // Whether the cap is currently holding, so the warning below fires on the
     // transition into saturation rather than once per waiting connection.
     let mut at_cap = false;
@@ -5063,16 +5748,16 @@ async fn run_hook_loop_with_limits(
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
                 let worktree_registry = worktree_registry.clone();
-                let deliveries = Arc::clone(&deliveries);
                 tokio::spawn(async move {
                     // Issue #319: the permit rides INTO the task and is dropped
                     // when it returns, so "connections being served" is exactly
                     // what the semaphore counts. Holding it in the loop above
                     // instead would bound accepts rather than tasks, which is
                     // not the thing that grows.
-                    //
-                    // An `Option` because a held question gives its slot back
-                    // while it waits (PRD #1631, audit A6).
+                    // PRD #1666: an `inbox_wait` connection gives its slot back
+                    // (`take`) when it moves into the waiter pool; a held
+                    // question gives its slot back while it waits (PRD #1631,
+                    // audit A6).
                     let mut permit = Some(permit);
                     // PRD #201: split so the read-only `get-seed` verb can write
                     // a reply back on the same connection. The write half now
@@ -5082,6 +5767,16 @@ async fn run_hook_loop_with_limits(
                     // since issue #1129, whose line comes from the provenance
                     // gate above rather than from an arm. Raw `AgentEvent`
                     // traffic is still answered by nothing.
+                    // PRD #1666 hardening M2: the process on the other end,
+                    // as the kernel reports it, for the inbox verbs that bind
+                    // a component to the pane's agent.
+                    //
+                    // PR #1735 third review (F2): recorded with when that
+                    // process started, so every later check names the process
+                    // that connected, not whatever reuses its pid.
+                    let peer_pid = AcceptedPeer::accept(
+                        crate::platform::peercred::peer_pid(&stream).ok(),
+                    );
                     let (read_half, mut write_half) = tokio::io::split(stream);
                     let mut reader = tokio::io::BufReader::new(read_half);
 
@@ -5101,8 +5796,8 @@ async fn run_hook_loop_with_limits(
                         // `HOOK_CONNECTION_IDLE_TIMEOUT`. It wraps the READ and
                         // nothing else, so a connection is never reclaimed while
                         // the daemon is the one working: `dispatch`'s worktree
-                        // creation and `delegate`'s readiness wait both run in
-                        // the arms below, outside this call.
+                        // creation and `delegate`'s `clear = true` respawn both
+                        // run in the arms below, outside this call.
                         let read = crate::bounded_read::read_capped_line(
                             &mut reader,
                             crate::bounded_read::MAX_HOOK_LINE_BYTES,
@@ -5191,6 +5886,11 @@ async fn run_hook_loop_with_limits(
                                 msg.presented_token(),
                                 &*pty_registry,
                             );
+                            // PR #1735 second review: the room a dispatch's
+                            // result will need, held from the moment the
+                            // dispatch is accepted (below) until the result is
+                            // posted in the `Dispatch` arm.
+                            let mut dispatch_result_room = None;
                             match crate::hook_provenance::admits(
                                 &provenance,
                                 crate::hook_provenance::policy(),
@@ -5248,6 +5948,39 @@ async fn run_hook_loop_with_limits(
                                     // returns `None` here and answers in its own
                                     // arm, which is what keeps "exactly one line
                                     // per message" true.
+                                    // PR #1735 second review: a dispatch is
+                                    // accepted only with room held for its
+                                    // result, so a deck that fills up while it
+                                    // runs cannot lose the answer; with no
+                                    // room now the caller is told so and
+                                    // nothing is dispatched.
+                                    if matches!(msg, DaemonMessage::Dispatch(_)) {
+                                        match pty_registry.inbox().reserve_reply() {
+                                            Ok(room) => dispatch_result_room = Some(room),
+                                            Err(error) => {
+                                                warn!(
+                                                    claimed_pane = %escape_id_for_log(msg.claimed_pane()),
+                                                    %error,
+                                                    "hook socket: refused a dispatch; the deck \
+                                                     has no room for its result"
+                                                );
+                                                let refusal = crate::event::SignalAck::refused(
+                                                    "deck_full",
+                                                    &format!(
+                                                        "{error}, so it could not take the result \
+                                                         of this dispatch; nothing was dispatched"
+                                                    ),
+                                                );
+                                                if let Ok(json) = serde_json::to_string(&refusal) {
+                                                    let line = format!("{json}\n");
+                                                    let _ =
+                                                        write_half.write_all(line.as_bytes()).await;
+                                                    let _ = write_half.flush().await;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     if let Some(json) = msg.provenance_ack_reply() {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
@@ -5279,16 +6012,53 @@ async fn run_hook_loop_with_limits(
                                     }
                                 }
                             }
-                            // PRD #1631 (audit A5/A9): the agent the gate
-                            // attested, which owns any question this message
-                            // raises. `None` for a message admitted without
-                            // one.
+                            // PRD #1666: the inbox verbs act only for an agent
+                            // the token ATTESTS. A pane never issued a token is
+                            // admitted above for its status events, but has no
+                            // agent this daemon can bind a message to.
                             let attested_agent = match &provenance {
                                 crate::hook_provenance::Provenance::Attested { agent_id } => {
                                     Some(agent_id.clone())
                                 }
                                 _ => None,
                             };
+                            if msg.requires_attested_agent() && attested_agent.is_none() {
+                                warn!(
+                                    verb = msg.verb(),
+                                    claimed_pane = %escape_id_for_log(msg.claimed_pane()),
+                                    "hook socket: refused an inbox request that no hook \
+                                     capability token attests"
+                                );
+                                if let Some(json) = msg.provenance_refusal_reply(
+                                    INBOX_UNATTESTED,
+                                    INBOX_UNATTESTED_MESSAGE,
+                                ) {
+                                    let line = format!("{json}\n");
+                                    let _ = write_half.write_all(line.as_bytes()).await;
+                                    let _ = write_half.flush().await;
+                                }
+                                continue;
+                            }
+                            if let (Some(claimed), Some(attested)) =
+                                (msg.claimed_agent(), attested_agent.as_deref())
+                                && claimed != attested
+                            {
+                                warn!(
+                                    verb = msg.verb(),
+                                    claimed_pane = %escape_id_for_log(msg.claimed_pane()),
+                                    "hook socket: refused an inbox request naming an agent \
+                                     other than the one its token attests"
+                                );
+                                if let Some(json) = msg.provenance_refusal_reply(
+                                    INBOX_WRONG_AGENT,
+                                    INBOX_WRONG_AGENT_MESSAGE,
+                                ) {
+                                    let line = format!("{json}\n");
+                                    let _ = write_half.write_all(line.as_bytes()).await;
+                                    let _ = write_half.flush().await;
+                                }
+                                continue;
+                            }
                             // And whether it comes from an outside agent: the
                             // rest of the admission verdict, which a question's
                             // status keeps exactly as a raw event's does.
@@ -5297,6 +6067,273 @@ async fn run_hook_loop_with_limits(
                                 crate::hook_provenance::Provenance::Unattested
                             );
                             match msg {
+                                DaemonMessage::InboxWait(req) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    let hub = Arc::clone(pty_registry.inbox());
+                                    if pty_registry.pane_current_agent_id(&req.pane_id).as_deref()
+                                        != Some(agent_id.as_str())
+                                    {
+                                        let reply = crate::event::InboxWaitReply::not_in_deck();
+                                        if let Ok(json) = serde_json::to_string(&reply) {
+                                            let line = format!("{json}\n");
+                                            let _ = write_half.write_all(line.as_bytes()).await;
+                                            let _ = write_half.flush().await;
+                                        }
+                                        continue;
+                                    }
+                                    let instance = match admit_inbox_component(
+                                        peer_pid,
+                                        req.pid,
+                                        pty_registry.child_pid(&agent_id),
+                                        ComponentUse::Receiver,
+                                        // A waiter is handed the agent's mail.
+                                        Evidence::Required,
+                                    ) {
+                                        Ok(instance) => instance,
+                                        Err(why) => {
+                                            warn!(
+                                                pane_id = %escape_id_for_log(&req.pane_id),
+                                                component = ?req.component,
+                                                why,
+                                                "hook socket: refused an inbox wait from outside \
+                                                 the pane's agent"
+                                            );
+                                            let reply = crate::event::InboxWaitReply::refused(
+                                                INBOX_NOT_AGENT_PROCESS,
+                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                            );
+                                            if let Ok(json) = serde_json::to_string(&reply) {
+                                                let line = format!("{json}\n");
+                                                let _ = write_half.write_all(line.as_bytes()).await;
+                                                let _ = write_half.flush().await;
+                                            }
+                                            continue;
+                                        }
+                                    };
+                                    info!(
+                                        pane_id = %escape_id_for_log(&req.pane_id),
+                                        mode = ?req.mode,
+                                        component = ?req.component,
+                                        source = ?req.session.as_ref().and_then(|s| s.source.as_deref()),
+                                        pid = ?req.pid,
+                                        "Received inbox wait"
+                                    );
+                                    // Out of the hook-ingest pool, and out of its
+                                    // idle timeout: a waiter is idle by design, and
+                                    // the waiter pool bounds it instead.
+                                    drop(permit.take());
+                                    let arm = crate::inbox_hub::ReceiptArm {
+                                        adapter_integration: req.adapter_integration,
+                                        doorbell_only: req.doorbell_only,
+                                        resumed: req.resumed,
+                                    };
+                                    crate::inbox_hub::serve_waiter(
+                                        hub,
+                                        req.pane_id,
+                                        agent_id,
+                                        req.mode,
+                                        req.component,
+                                        instance,
+                                        arm,
+                                        reader,
+                                        write_half,
+                                        |agent: &str| pty_registry.nudge_repaint(agent),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                DaemonMessage::InboxAnnounce(req) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    // PR #1735 third review (F1): an announce
+                                    // pins the receiver and opens the
+                                    // native-wake grace, so it needs the same
+                                    // positive evidence as arming a waiter: an
+                                    // unproven one could pin a dead process and
+                                    // lock the real integration out.
+                                    let instance = match admit_inbox_component(
+                                        peer_pid,
+                                        req.pid,
+                                        pty_registry.child_pid(&agent_id),
+                                        ComponentUse::Receiver,
+                                        Evidence::Required,
+                                    ) {
+                                        Ok(instance) => instance,
+                                        Err(why) => {
+                                        warn!(
+                                            pane_id = %escape_id_for_log(&req.pane_id),
+                                            component = ?req.component,
+                                            why,
+                                            "hook socket: refused an inbox announce from outside \
+                                             the pane's agent"
+                                        );
+                                        if let Ok(json) =
+                                            serde_json::to_string(&crate::event::SignalAck::refused(
+                                                INBOX_NOT_AGENT_PROCESS,
+                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                            ))
+                                        {
+                                            let line = format!("{json}\n");
+                                            let _ = write_half.write_all(line.as_bytes()).await;
+                                            let _ = write_half.flush().await;
+                                        }
+                                        continue;
+                                    }
+                                    };
+                                    let announced = pty_registry.inbox().announce(
+                                        &req.pane_id,
+                                        &agent_id,
+                                        req.wake,
+                                        req.component,
+                                        instance,
+                                    );
+                                    info!(
+                                        pane_id = %escape_id_for_log(&req.pane_id),
+                                        component = ?req.component,
+                                        wake = ?req.wake,
+                                        pid = ?req.pid,
+                                        refused = ?announced.err(),
+                                        "Received inbox announce"
+                                    );
+                                    let ack = match announced {
+                                        Ok(()) => crate::event::SignalAck::accepted(),
+                                        Err(error) => crate::event::SignalAck::refused(
+                                            error.code(),
+                                            &error.message(),
+                                        ),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&ack) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::InboxFetch(req) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    let reply = if mail_taker_admitted(
+                                        &pty_registry,
+                                        peer_pid,
+                                        &agent_id,
+                                        "inbox_fetch",
+                                        &req.pane_id,
+                                    ) {
+                                        handle_inbox_fetch(&pty_registry, &req, &agent_id)
+                                    } else {
+                                        crate::event::InboxWaitReply::refused(
+                                            INBOX_NOT_AGENT_PROCESS,
+                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                        )
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::InboxList(req) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    let json = match handle_inbox_list(
+                                        &pty_registry,
+                                        &state,
+                                        &req,
+                                        &agent_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(reply) => serde_json::to_string(&reply),
+                                        Err(refusal) => serde_json::to_string(&refusal),
+                                    };
+                                    if let Ok(json) = json {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::InboxPublish(_)
+                                | DaemonMessage::InboxOffer(_)
+                                | DaemonMessage::InboxComplete(_)
+                                | DaemonMessage::InboxRelease(_) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    // Hardening M2 for the verbs that reach
+                                    // other agents or move a job between them:
+                                    // only the agent's own process tree may
+                                    // use its token.
+                                    if let Err(why) = admit_inbox_component(
+                                        peer_pid,
+                                        None,
+                                        pty_registry.child_pid(&agent_id),
+                                        ComponentUse::Cli,
+                                        Evidence::BestEffort,
+                                    ) {
+                                        warn!(
+                                            verb = msg.verb(),
+                                            pane_id = %escape_id_for_log(msg.claimed_pane()),
+                                            why,
+                                            "hook socket: refused an inbox post from outside the \
+                                             pane's agent"
+                                        );
+                                        if let Some(json) = msg.provenance_refusal_reply(
+                                            INBOX_NOT_AGENT_PROCESS,
+                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                        ) {
+                                            let line = format!("{json}\n");
+                                            let _ = write_half.write_all(line.as_bytes()).await;
+                                            let _ = write_half.flush().await;
+                                        }
+                                        continue;
+                                    }
+                                    let json = match &msg {
+                                        DaemonMessage::InboxPublish(req) => serde_json::to_string(
+                                            &crate::inbox_pubsub::handle_publish(
+                                                &pty_registry,
+                                                &state,
+                                                req,
+                                                &agent_id,
+                                            )
+                                            .await,
+                                        ),
+                                        DaemonMessage::InboxOffer(req) => serde_json::to_string(
+                                            &crate::inbox_pubsub::handle_offer(
+                                                &pty_registry,
+                                                &state,
+                                                req,
+                                                &agent_id,
+                                            )
+                                            .await,
+                                        ),
+                                        DaemonMessage::InboxComplete(req) => serde_json::to_string(
+                                            &crate::inbox_pubsub::handle_claim(
+                                                &pty_registry,
+                                                req,
+                                                &agent_id,
+                                                true,
+                                            ),
+                                        ),
+                                        DaemonMessage::InboxRelease(req) => serde_json::to_string(
+                                            &crate::inbox_pubsub::handle_claim(
+                                                &pty_registry,
+                                                req,
+                                                &agent_id,
+                                                false,
+                                            ),
+                                        ),
+                                        _ => continue,
+                                    };
+                                    if let Ok(json) = json {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
                                 DaemonMessage::Delegate(signal) => {
                                     info!(
                                         pane_id = %escape_id_for_log(&signal.pane_id),
@@ -5305,18 +6342,17 @@ async fn run_hook_loop_with_limits(
                                     );
                                     // PRD #93 round-5: one path for both
                                     // modes. The daemon owns the role map
-                                    // and the PTY registry, so it routes
-                                    // the prompt directly into the worker
-                                    // pane's PTY — no broadcast hop, no
-                                    // detach-window loss surface.
+                                    // and the inboxes, so it posts the task
+                                    // to the worker's inbox itself — no
+                                    // broadcast hop, no detach-window loss
+                                    // surface (PRD #1666).
                                     //
                                     // PRD #92 F9 followup-6: pass the
-                                    // daemon-wide hook-event sender too so
-                                    // per-target dispatch tasks can wait
-                                    // for the freshly-spawned agent's
-                                    // `SessionStart` event before writing
-                                    // the prompt (event-driven readiness,
-                                    // replacing the F9 250ms fixed delay).
+                                    // daemon-wide event sender too, for the
+                                    // events a per-target dispatch task
+                                    // sends about a `clear = true`
+                                    // replacement (a replaced worker's lifted
+                                    // quota block, an eviction notice).
                                     // Issue #606: `_with_state` so a `clear = true`
                                     // respawn that had to RE-CREATE the worker pane
                                     // (its record removed by a concurrent close) can
@@ -5532,39 +6568,21 @@ async fn run_hook_loop_with_limits(
                                     )
                                     .await;
 
-                                    // Deliver result to the caller (doesn't need any
-                                    // AppState lock — uses the PTY registry).
-                                    //
-                                    // Issue #544: QUEUED rather than awaited, because
-                                    // this is a first write that may wait up to the
-                                    // draft cap for the caller's unsent draft, and
-                                    // awaiting it here would hold this connection —
-                                    // one of `MAX_CONCURRENT_HOOK_CONNECTIONS` — for
-                                    // that long. Nothing below depends on it
-                                    // finishing: the caller's CLI was acked at the
-                                    // provenance gate above, the outcome is logged
-                                    // inside `deliver_dispatch_result`, and its
-                                    // return value was never read here. The queue
-                                    // keeps writes to one pane in the order they
-                                    // were queued and bounds how many are pending —
-                                    // see `crate::pane_delivery_queue`.
-                                    let registry = pty_registry.clone();
-                                    let caller_pane_id = signal.pane_id.clone();
-                                    let message = result.message;
-                                    deliveries
-                                        .enqueue(
-                                            &signal.pane_id,
-                                            Box::pin(async move {
-                                                deliver_dispatch_result(
-                                                    &registry,
-                                                    &caller_pane_id,
-                                                    &caller_agent_id,
-                                                    &message,
-                                                )
-                                                .await;
-                                            }),
-                                        )
-                                        .await;
+                                    // PRD #1666 S5: the acknowledgement goes to the
+                                    // caller's inbox, bound to the caller generation
+                                    // captured before the dispatch ran.
+                                    let Some(room) = dispatch_result_room.take() else {
+                                        continue;
+                                    };
+                                    crate::dispatch_return::post_dispatch_result(
+                                        &pty_registry,
+                                        room,
+                                        &signal.pane_id,
+                                        &caller_agent_id,
+                                        &signal.name,
+                                        result.success,
+                                        &result.message,
+                                    );
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
@@ -5572,39 +6590,60 @@ async fn run_hook_loop_with_limits(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    // Issue #544: the write happens AFTER the read
-                                    // guard is released. It may wait for the
-                                    // orchestrator's unsent draft, and a read guard
-                                    // held across that wait queues every
-                                    // `state.write()` — and every reader behind it —
-                                    // for as long. See `WorkDoneDelivery`.
-                                    //
-                                    // The write is also QUEUED rather than awaited
-                                    // on this connection, for the reason given on
-                                    // the `Dispatch` arm's `deliver_dispatch_result`:
-                                    // awaited inline, a deferred write holds one of
-                                    // the `MAX_CONCURRENT_HOOK_CONNECTIONS` permits
-                                    // for up to the draft cap. `deliver` logs its
-                                    // own outcome. The state changes
-                                    // `prepare_work_done` makes stay inline; only
-                                    // the PTY write moves, into the recipient
-                                    // pane's queue, behind every report already
-                                    // queued for that pane.
+                                    // The report is posted AFTER the read guard is
+                                    // released: `prepare_work_done` runs under it
+                                    // and `deliver` after it. PRD #1666 S5:
+                                    // `deliver` is an inbox post and waits on
+                                    // nothing.
                                     //
                                     // PRD #1631: the `work-done` CLI is acked
-                                    // HERE, once its report is queued, not at the
+                                    // HERE, once its report is posted, not at the
                                     // provenance gate. Acked at the gate, a
-                                    // worker's second report could be queued
-                                    // ahead of its first, which was still on its
-                                    // way to the queue, and the two reached the
-                                    // orchestrator reversed. Acked after the
-                                    // queue push, a sender that waits for its ack
-                                    // is ordered, and the wait is the state
-                                    // change and the push, never the delivery.
+                                    // worker's second report could reach the
+                                    // orchestrator ahead of its first. Acked
+                                    // after the post, a sender that waits for its
+                                    // ack is ordered, and the wait is the state
+                                    // change and the post, never the agent
+                                    // reading it.
                                     // PRD #1589 D5: the completion mark `close`
                                     // reads, bound to the attested sender. Before
                                     // the return route's own handling, which is
                                     // unchanged.
+                                    //
+                                    // PR #1735 fifth review (N3): room for the
+                                    // report is held BEFORE anything is taken on —
+                                    // the completion mark, the delegation, a
+                                    // dispatched unit's return edge — so a report
+                                    // the worker is told was accepted cannot then
+                                    // be refused by its orchestrator's full inbox
+                                    // or a deck that filled meanwhile. With no room
+                                    // now the work-done is refused, visibly, and
+                                    // nothing it would have consumed is touched.
+                                    let room = match pty_registry.inbox().reserve_reply() {
+                                        Ok(room) => room,
+                                        Err(error) => {
+                                            warn!(
+                                                pane_id = %escape_id_for_log(&signal.pane_id),
+                                                %error,
+                                                "hook socket: refused a work-done; the deck has \
+                                                 no room for its report"
+                                            );
+                                            let refusal = crate::event::SignalAck::refused(
+                                                "deck_full",
+                                                &format!(
+                                                    "{error}, so it could not take this work-done \
+                                                     report; nothing was reported, so run \
+                                                     work-done again once the deck has room"
+                                                ),
+                                            );
+                                            if let Ok(json) = serde_json::to_string(&refusal) {
+                                                let line = format!("{json}\n");
+                                                let _ = write_half.write_all(line.as_bytes()).await;
+                                                let _ = write_half.flush().await;
+                                            }
+                                            continue;
+                                        }
+                                    };
                                     mark_dispatched_unit_completion(
                                         &pty_registry,
                                         &signal,
@@ -5615,19 +6654,9 @@ async fn run_hook_loop_with_limits(
                                         .await
                                         .prepare_work_done(signal, &pty_registry)
                                         .await;
-                                    if let Some(target) =
-                                        delivery.target_pane_id().map(str::to_string)
-                                    {
-                                        let registry = pty_registry.clone();
-                                        deliveries
-                                            .enqueue(
-                                                &target,
-                                                Box::pin(async move {
-                                                    delivery.deliver(&registry).await;
-                                                }),
-                                            )
-                                            .await;
-                                    }
+                                    // PRD #1666 S5: a post, not a write — nothing
+                                    // waits on the recipient.
+                                    delivery.deliver(&pty_registry, room).await;
                                     if let Ok(json) = serde_json::to_string(
                                         &crate::event::SignalAck::accepted(),
                                     ) {
@@ -5649,42 +6678,77 @@ async fn run_hook_loop_with_limits(
                                         } => Some(agent_id.as_str()),
                                         _ => None,
                                     };
-                                    let delivery = handle_delivery_ack(
-                                        &pty_registry,
-                                        &signal,
-                                        attested_agent_id,
-                                    );
-                                    if let Ok(json) = serde_json::to_string(
-                                        &crate::event::SignalAck::acknowledged(delivery),
-                                    ) {
+                                    // PRD #1666: every id is an inbox message's,
+                                    // acknowledged for the agent the token attests,
+                                    // and only from that agent's own process tree
+                                    // (PR #1735 review).
+                                    let ack = match attested_agent_id {
+                                        Some(agent_id)
+                                            if !mail_taker_admitted(
+                                                &pty_registry,
+                                                peer_pid,
+                                                agent_id,
+                                                "ack",
+                                                &signal.pane_id,
+                                            ) =>
+                                        {
+                                            crate::event::SignalAck::refused(
+                                                INBOX_NOT_AGENT_PROCESS,
+                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                            )
+                                        }
+                                        Some(agent_id) => crate::event::SignalAck::acknowledged(
+                                            handle_inbox_ack(&pty_registry, &signal, agent_id),
+                                        ),
+                                        None => crate::event::SignalAck::acknowledged(
+                                            crate::event::AckDelivery::Unknown,
+                                        ),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
                                         let _ = write_half.flush().await;
                                     }
                                 }
                                 DaemonMessage::GetSeed(req) => {
-                                    // PRD #201 native prompt delivery: hand the
-                                    // pane's pending seed to the caller (the
-                                    // extension's `get-seed`) and CLEAR it, so
-                                    // the daemon's PTY-injection safety net
-                                    // won't also deliver it. `take_..._native`
-                                    // marks the delivery as native for the
-                                    // real-pi e2e proof. `None` → `{"seed":null}`.
+                                    // PRD #1666 S5 (the design's S9 alias): a
+                                    // seed is the pane's first inbox message, so
+                                    // `get-seed` hands over the agent's oldest
+                                    // queued message, rendered, and acknowledges
+                                    // it — the verb a Pi extension that predates
+                                    // the inbox used. A Pi generation is refused
+                                    // since G10 (`pi` below). `None` →
+                                    // `{"seed":null}`.
                                     //
-                                    // Issue #916: the pane id is CALLER-SUPPLIED
-                                    // and this socket authenticates nobody, so
-                                    // the take is scoped by the caller's own
-                                    // agent id when it presents one and skips
-                                    // exited records either way — the filtering
-                                    // every other registry lookup applies and
-                                    // this one did not. `req.agent_id` is
-                                    // `None` for a caller the daemon injected no
-                                    // id into, which falls back to the pane's
-                                    // live occupant; the reasoning for that
-                                    // choice is on `take_pending_seed_native_for`.
-                                    let seed = pty_registry.take_pending_seed_native_for(
+                                    // Hardening H2: it acts only for the agent
+                                    // the token attests, never for an id the
+                                    // caller names or the pane's occupant
+                                    // ([`get_seed_inbox_alias`]).
+                                    //
+                                    // PR #1735 review: and only from that agent's
+                                    // own process tree; a refusal answers as "no
+                                    // seed pending" does.
+                                    let attested = attested_agent.as_deref().filter(|agent| {
+                                        mail_taker_admitted(
+                                            &pty_registry,
+                                            peer_pid,
+                                            agent,
+                                            "get_seed",
+                                            &req.pane_id,
+                                        )
+                                    });
+                                    let pi = attested.is_some_and(|agent| {
+                                        pi_generation(&pty_registry, &req.pane_id, agent)
+                                    });
+                                    let seed = get_seed_inbox_alias(
+                                        pty_registry.inbox(),
                                         &req.pane_id,
                                         req.agent_id.as_deref(),
+                                        attested,
+                                        pty_registry
+                                            .pane_current_agent_id(&req.pane_id)
+                                            .as_deref(),
+                                        pi,
                                     );
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
@@ -5923,6 +6987,16 @@ async fn run_hook_loop_with_limits(
                             // Issue #714: normalise the quota-block keys, and hand
                             // a Codex event's rollout and turn to the tailer.
                             admit_producer_event(&mut event);
+                            // PRD #1666 S6: a prompt that is the deck's own
+                            // message is acknowledged and labelled here, for the
+                            // agent the token attests, before anything reads it.
+                            // After the admission above, which discards a
+                            // producer's own marker.
+                            crate::inbox_prompt::stamp_deck_message_prompt(
+                                &mut event,
+                                attested_agent.as_deref(),
+                                pty_registry.inbox(),
+                            );
                             // PRD #1401: a pull request report is the
                             // daemon's alone — its URL is what a card's badge
                             // opens — so a producer's copy goes no further.
@@ -6496,6 +7570,179 @@ mod quota_admission_tests {
         admit_producer_event(&mut subagent);
         assert_eq!(subagent.metadata.len(), 2, "{:?}", subagent.metadata);
         assert!(subagent.is_from_subagent());
+    }
+
+    /// PRD #1666 long-turn delivery: only the daemon says a message it reported
+    /// not delivered reached the agent after all. A producer frame carrying the
+    /// `delivery_notice_cleared` key loses it at the hook ingress, so it cannot
+    /// lift the card's not-delivered Error. The frame is a Codex wrapper's
+    /// output frame, which asserts no status of its own, so the card moves only
+    /// if the key survives.
+    #[test]
+    fn a_producer_frame_cannot_clear_the_decks_delivery_notice() {
+        use crate::event::{
+            DELIVERY_NOTICE_CLEARED_METADATA_KEY, DELIVERY_NOTICE_CLEARED_METADATA_VALUE,
+            DELIVERY_NOTICE_METADATA_KEY, EventType, WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY,
+            WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE,
+        };
+        use crate::state::{AppState, SessionStatus};
+        let notice = crate::inbox_display::NOTICE_MAX_DELIVER;
+        let codex = |event_type| {
+            let mut event = quota_frame(event_type);
+            event.agent_type = AgentType::Codex;
+            event
+        };
+        let noticed = || {
+            let mut state = AppState::default();
+            state.register_pane("pane-1".to_string());
+            state.apply_event(codex(EventType::SessionStart));
+            let mut report = codex(EventType::Error);
+            report.agent_type = AgentType::None;
+            report.tool_detail = Some(notice.to_string());
+            report
+                .metadata
+                .insert(DELIVERY_NOTICE_METADATA_KEY.to_string(), notice.to_string());
+            state.apply_daemon_report_event(report);
+            assert_eq!(state.sessions["s"].delivery_notice(), Some(notice));
+            state
+        };
+        let forged = || {
+            let mut event = codex(EventType::Thinking);
+            event.metadata.insert(
+                WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+                WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+            );
+            event.metadata.insert(
+                DELIVERY_NOTICE_CLEARED_METADATA_KEY.to_string(),
+                DELIVERY_NOTICE_CLEARED_METADATA_VALUE.to_string(),
+            );
+            event
+        };
+
+        // The control: unadmitted, the key would lift the card.
+        let mut unadmitted = noticed();
+        unadmitted.apply_event(forged());
+        assert_eq!(unadmitted.sessions["s"].status, SessionStatus::Thinking);
+
+        let mut admitted = forged();
+        admit_producer_event(&mut admitted);
+        assert!(
+            !admitted
+                .metadata
+                .contains_key(DELIVERY_NOTICE_CLEARED_METADATA_KEY),
+            "{:?}",
+            admitted.metadata
+        );
+        assert!(!admitted.is_delivery_notice_cleared());
+        assert!(!admitted.is_daemon_synthetic());
+        let mut state = noticed();
+        state.apply_event(admitted);
+        let card = &state.sessions["s"];
+        assert_eq!(card.status, SessionStatus::Error);
+        assert_eq!(card.delivery_notice(), Some(notice));
+    }
+
+    /// Scenario (PRD #1666 §2.8): a producer frame forges the daemon's
+    /// card-surfacing start for its pane, carrying an inbox with an
+    /// integration warning and queued messages. Unadmitted, a client would
+    /// take that inbox as the pane's and draw it on the card; after the hook
+    /// ingress's admission the inbox is gone and the card shows none.
+    #[test]
+    fn a_producer_frame_cannot_carry_a_surfaced_inbox() {
+        use crate::event::{
+            CARD_SURFACE_SESSION_START_ORIGIN, SESSION_START_ORIGIN_METADATA_KEY,
+            SURFACED_AGENT_ID_METADATA_KEY, SURFACED_INBOX_METADATA_KEY,
+        };
+        use crate::state::AppState;
+        let forged = || {
+            let mut event = quota_frame(crate::event::EventType::SessionStart);
+            let inbox = crate::inbox_hub::InboxSummary {
+                queued: 3,
+                fetched: 0,
+                claimed: 0,
+                undeliverable: 0,
+                last_acked_at: None,
+                wake: crate::inbox_hub::WakePath::Doorbell,
+                component: None,
+                wake_stalled: false,
+                notices: crate::inbox_hub::InboxCardNotices {
+                    integration: Some(crate::inbox_display::IntegrationNotice::RefreshFailedPi),
+                    ..Default::default()
+                },
+            };
+            for (key, value) in [
+                (
+                    SESSION_START_ORIGIN_METADATA_KEY,
+                    CARD_SURFACE_SESSION_START_ORIGIN.to_string(),
+                ),
+                (SURFACED_AGENT_ID_METADATA_KEY, "1".to_string()),
+                (
+                    SURFACED_INBOX_METADATA_KEY,
+                    serde_json::to_string(&inbox).unwrap(),
+                ),
+            ] {
+                event.metadata.insert(key.to_string(), value);
+            }
+            event
+        };
+        let shown = |event: AgentEvent| {
+            let mut state = AppState::default();
+            state.apply_event(event);
+            state
+                .sessions
+                .values()
+                .find_map(crate::state::SessionState::card_inbox)
+        };
+
+        // The control: unadmitted, the forged inbox reaches the card.
+        assert!(shown(forged()).is_some());
+
+        let mut admitted = forged();
+        admit_producer_event(&mut admitted);
+        assert!(
+            !admitted.metadata.contains_key(SURFACED_INBOX_METADATA_KEY),
+            "{:?}",
+            admitted.metadata
+        );
+        assert_eq!(shown(admitted), None);
+    }
+
+    /// Scenario (PRD #1666 audit M-A1): a producer frame carries the deck's
+    /// own `deck_message` marker beside a prompt it typed. Unadmitted, the
+    /// marker would keep that prompt out of the card's prompt history; after
+    /// the hook ingress's admission the marker is gone and the prompt is
+    /// recorded like any other.
+    #[test]
+    fn a_producer_frame_cannot_label_its_prompt_as_a_deck_message() {
+        use crate::inbox_prompt::{DECK_MESSAGE_METADATA_KEY, is_deck_message};
+        use crate::state::AppState;
+        let prompt = "please fix the build";
+        let forged = || {
+            let mut event = quota_frame(crate::event::EventType::Thinking);
+            event.user_prompt = Some(prompt.to_string());
+            event
+                .metadata
+                .insert(DECK_MESSAGE_METADATA_KEY.to_string(), "1".to_string());
+            event
+        };
+        let recorded = |event: AgentEvent| {
+            let mut state = AppState::default();
+            state.register_pane("pane-1".to_string());
+            state.apply_event(event);
+            let card = &state.sessions["s"];
+            (card.last_user_prompt.clone(), card.first_prompts.clone())
+        };
+
+        // The control: unadmitted, the marker hides the prompt.
+        assert_eq!(recorded(forged()), (None, Vec::new()));
+
+        let mut admitted = forged();
+        admit_producer_event(&mut admitted);
+        assert!(!is_deck_message(&admitted), "{:?}", admitted.metadata);
+        assert_eq!(
+            recorded(admitted),
+            (Some(prompt.to_string()), vec![prompt.to_string()])
+        );
     }
 
     /// Issue #1359: a failed Codex turn read from the rollout becomes one
@@ -7119,6 +8366,68 @@ mod hook_ingestion_tests {
         );
     }
 
+    /// Scenario (PRD #1666 audit M-A1): a producer sends an unheld `question`
+    /// envelope whose status event carries a prompt and the deck's own
+    /// `deck_message` marker, and no question. The event the daemon relays
+    /// carries no marker, and the card records the prompt in its history, as
+    /// the same event on the raw hook ingress would.
+    #[tokio::test]
+    async fn a_question_envelope_cannot_label_its_prompt_as_a_deck_message() {
+        use crate::inbox_prompt::{DECK_MESSAGE_METADATA_KEY, is_deck_message};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane("pane-1".to_string());
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let prompt = "please fix the build";
+        let mut event =
+            super::quota_admission_tests::quota_frame(crate::event::EventType::Thinking);
+        event.agent_id = None;
+        event.user_prompt = Some(prompt.to_string());
+        event
+            .metadata
+            .insert(DECK_MESSAGE_METADATA_KEY.to_string(), "1".to_string());
+        let signal = crate::event::QuestionSignal {
+            pane_id: "pane-1".to_string(),
+            token: None,
+            event,
+            hold: false,
+            ack: false,
+            confirm_hold: false,
+        };
+        let mut reader = tokio::io::BufReader::new(tokio::io::empty());
+        let mut writer = tokio::io::sink();
+        let mut slot = None;
+        let holds = Arc::new(tokio::sync::Semaphore::new(1));
+        let reply = handle_question_signal(
+            signal,
+            None,
+            false,
+            &state,
+            &event_tx,
+            &registry,
+            QuestionConnection {
+                reader: &mut reader,
+                writer: &mut writer,
+                slot: &mut slot,
+                holds: &holds,
+                hold_deadline: Duration::from_secs(5),
+            },
+        )
+        .await;
+        assert!(reply.is_some(), "an unheld question is released at once");
+        let BroadcastMsg::Event(relayed) = rx.try_recv().expect("the event is relayed") else {
+            panic!("expected an event");
+        };
+        assert!(!is_deck_message(&relayed), "{:?}", relayed.metadata);
+        let state = state.read().await;
+        let card = &state.sessions["s"];
+        assert_eq!(card.last_user_prompt.as_deref(), Some(prompt));
+        assert_eq!(card.first_prompts, vec![prompt.to_string()]);
+        drop(state);
+        registry.shutdown_all();
+    }
+
     /// Issue #714 (audit N1/N2): a Codex worker stand-in and an orchestrator
     /// stand-in (both `cat`), the daemon's `AppState` with the registry
     /// ownership oracle installed as `run_daemon_with` installs it, and an
@@ -7269,16 +8578,14 @@ mod hook_ingestion_tests {
                 .count()
         }
 
-        /// [`Self::notices`], polled until at least two occurrences (one
-        /// notice's echo and output) have landed and the count has stopped
-        /// moving. A quiet gap after just the echo does not mean the stand-in
-        /// has read its input.
+        /// [`Self::notices`], polled until at least one notice has been posted
+        /// and the count has stopped moving.
         async fn settled_notices(&self) -> usize {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let mut last = self.notices().await;
             loop {
                 let now = self.notices().await;
-                if now >= 2 && now == last {
+                if now >= 1 && now == last {
                     return now;
                 }
                 assert!(
@@ -7289,13 +8596,16 @@ mod hook_ingestion_tests {
             }
         }
 
-        /// How many blocked-worker notices have reached the orchestrator's
-        /// pane, after giving an in-flight echo time to land.
+        /// PRD #1666 S5: how many blocked-worker notices have been posted to
+        /// the orchestrator's inbox, after giving an in-flight post time to land.
         async fn notices(&self) -> usize {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let snap = self.registry.snapshot(&self.orch_id).expect("orchestrator");
-            let needle = Self::NOTICE.as_bytes();
-            snap.windows(needle.len()).filter(|w| *w == needle).count()
+            self.registry
+                .inbox()
+                .rendered(self.orch_pane)
+                .into_iter()
+                .filter(|delivery| delivery.text.contains(Self::NOTICE))
+                .count()
         }
     }
 
@@ -7371,11 +8681,10 @@ mod hook_ingestion_tests {
         );
 
         // A second block of the SAME delegation (not re-armed): the refused
-        // claim was released, so the notice is delivered — once (`cat` shows it
-        // twice: the tty echo and its output) — and claimed.
+        // claim was released, so the notice is posted — once — and claimed.
         fx.report_block().await;
         let delivered = fx.settled_notices().await;
-        assert_eq!(delivered, 2, "expected exactly one notice (echo + output)");
+        assert_eq!(delivered, 1, "expected exactly one notice");
         assert!(
             fx.registry
                 .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
@@ -7390,73 +8699,12 @@ mod hook_ingestion_tests {
         fx.registry.shutdown_all();
     }
 
-    /// Issue #714 (audit F-A2): block 1 claims the blocked-worker notice and
-    /// waits on the orchestrator's writer, which is held busy. A work hook lifts
-    /// block 1 and the worker reports block 2 of the SAME delegation while the
-    /// writer is still busy, so block 2 finds the notice claimed and skips it.
-    /// When the writer frees, block 1's write is refused and released — and the
-    /// notice is then delivered for block 2, exactly once. A third block of the
-    /// delegation reports nothing more.
-    #[tokio::test]
-    async fn quota_refused_notice_hands_the_claim_to_a_newer_block() {
-        let fx = QuotaNoticeFixture::new("quota-handoff-worker", "quota-handoff-orch").await;
-        let writer = fx
-            .registry
-            .agent_writer(&fx.orch_id)
-            .expect("the orchestrator's writer");
-        let mut held = Some(writer.lock().await);
-
-        let first = bounded_while_holding(&mut held, "latching block 1", fx.latch_block()).await;
-        let notice = fx
-            .registry
-            .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
-            .expect("block 1 claims the notice");
-        let delivery = {
-            let registry = Arc::clone(&fx.registry);
-            let (pane, agent) = (fx.worker_pane.to_string(), fx.worker_id.clone());
-            tokio::spawn(async move {
-                registry
-                    .deliver_worker_blocked_notice(&pane, &agent, first, notice)
-                    .await;
-            })
-        };
-        // Let block 1's write reach the busy writer.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !delivery.is_finished(),
-            "precondition: the write waits on the writer"
-        );
-
-        bounded_while_holding(&mut held, "the work hook", fx.work_hook()).await;
-        let second = bounded_while_holding(&mut held, "reporting block 2", fx.report_block()).await;
-        assert_ne!(second, first);
-        assert_eq!(fx.blocked_cards().await, 1, "precondition: block 2 applied");
-
-        drop(held.take());
-        tokio::time::timeout(Duration::from_secs(30), delivery)
-            .await
-            .expect("block 1's refused write never returned once the writer freed")
-            .expect("the delivery task");
-        let delivered = fx.settled_notices().await;
-        assert_eq!(delivered, 2, "expected exactly one notice (echo + output)");
-        assert!(
-            fx.registry
-                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
-                .is_none(),
-            "block 2's delivered notice was not claimed"
-        );
-
-        fx.work_hook().await;
-        fx.report_block().await;
-        assert_eq!(fx.notices().await, delivered, "the delegation re-notified");
-        fx.registry.shutdown_all();
-    }
-
     /// Issue #714 (review): every pane's hooks pass through `ingest_event`, so
     /// ingesting a worker's block must not wait on the orchestrator's pane
     /// writer. Hold that writer and ingest the worker's `quota_blocked`: it
-    /// returns at once with the card Blocked and the notice already claimed,
-    /// and the notice lands — once — only when the writer frees.
+    /// returns at once with the card Blocked, and — PRD #1666 S5 — the notice is
+    /// a post to the orchestrator's inbox, which waits on no writer either: it
+    /// is there, once, while the writer is still held.
     #[tokio::test]
     async fn quota_publish_does_not_wait_on_a_busy_orchestrator_writer() {
         let fx = QuotaNoticeFixture::new("quota-busy-worker", "quota-busy-orch").await;
@@ -7468,112 +8716,16 @@ mod hook_ingestion_tests {
 
         bounded_while_holding(&mut held, "ingesting a block", fx.report_block()).await;
         assert_eq!(fx.blocked_cards().await, 1);
-        assert_eq!(
-            fx.notices().await,
-            0,
-            "precondition: the notice waits on the held writer"
-        );
+        let delivered =
+            bounded_while_holding(&mut held, "posting the notice", fx.settled_notices()).await;
+        assert_eq!(delivered, 1, "expected exactly one notice");
         assert!(
             fx.registry
                 .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
                 .is_none(),
-            "the notice must be claimed before its write is spawned"
+            "the delivered notice keeps its claim"
         );
-
         drop(held.take());
-        assert_eq!(
-            fx.settled_notices().await,
-            2,
-            "expected exactly one notice (echo + output)"
-        );
-        fx.registry.shutdown_all();
-    }
-
-    /// Scenario: hold an orchestrator's writer and repeatedly supersede a
-    /// delegation to a blocked worker. Release the writer and wait for the
-    /// terminal echo and stand-in output, proving only the current notice lands
-    /// (issue #714, review).
-    #[tokio::test]
-    async fn superseded_blocked_notices_do_not_queue_on_a_stalled_orchestrator_writer() {
-        let fx = QuotaNoticeFixture::new("quota-stall-worker", "quota-stall-orch").await;
-        let writer = fx
-            .registry
-            .agent_writer(&fx.orch_id)
-            .expect("the orchestrator's writer");
-        let mut held = Some(writer.lock().await);
-
-        bounded_while_holding(&mut held, "ingesting the block", fx.report_block()).await;
-        assert_eq!(
-            fx.blocked_cards().await,
-            1,
-            "precondition: the block applied"
-        );
-
-        let mut tasks = Vec::new();
-        for _ in 0..8 {
-            let armed = fx
-                .registry
-                .arm_outstanding_delegation(
-                    fx.worker_pane,
-                    "coder",
-                    fx.orch_pane,
-                    &fx.orch_id,
-                    None,
-                )
-                .expect("arm the delegation");
-            fx.registry
-                .bind_delegation_worker_agent_id(fx.worker_pane, armed.seq, &fx.worker_id);
-            tasks.push(
-                fx.registry
-                    .report_published_block_to_new_delegation(
-                        fx.worker_pane,
-                        armed.seq,
-                        &fx.worker_id,
-                    )
-                    .expect("each new delegation is reported"),
-            );
-        }
-
-        // A failure bound only: an abort lands on the task's next poll.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let pending = tasks.iter().filter(|t| !t.is_finished()).count();
-            if pending <= 1 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{pending} notice tasks still queued on the stalled writer"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let last = tasks.pop().expect("the current delegation's task");
-        assert!(
-            tasks.iter().all(|t| t.is_finished()),
-            "a superseded delegation's notice task is still waiting"
-        );
-        assert!(
-            !last.is_finished(),
-            "the current delegation's notice must still be waiting on the writer"
-        );
-        assert_eq!(fx.notices().await, 0, "precondition: nothing written yet");
-
-        drop(held.take());
-        tokio::time::timeout(Duration::from_secs(30), last)
-            .await
-            .expect("the current notice was delivered once the writer freed")
-            .expect("the notice task");
-        assert_eq!(
-            fx.settled_notices().await,
-            2,
-            "expected exactly one notice, the current delegation's (echo + output)"
-        );
-        assert!(
-            fx.registry
-                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
-                .is_none(),
-            "the current delegation keeps the claim its delivered notice took"
-        );
         fx.registry.shutdown_all();
     }
 
@@ -7647,6 +8799,7 @@ mod hook_ingestion_tests {
             delivery_id: "cap-exhausted-257".to_string(),
             session_id: None,
             detail: "a spawn-time prompt was written into this pane but the daemon is already watching its maximum number of unconfirmed deliveries, so this one is NOT being confirmed or retried; check whether the pane acted on its task",
+            cleared: false,
         });
         let report = tokio::time::timeout(Duration::from_millis(300), async {
             loop {
@@ -7672,6 +8825,114 @@ mod hook_ingestion_tests {
                     && session.status == crate::state::SessionStatus::Error
             }),
             "the attached TUI's broadcast-only card must visibly become Error"
+        );
+    }
+
+    /// PRD #1666 long-turn delivery: through the production sink, a "delivered
+    /// after all" notice lifts the daemon's card from the deck's not-delivered
+    /// Error to Thinking and broadcasts the lift; once the card no longer shows
+    /// that notice, a second lift is not broadcast at all, so a client that
+    /// predates the lift never reads it as a stray Thinking.
+    #[tokio::test]
+    async fn a_delivered_after_all_notice_lifts_only_a_card_showing_the_decks_notice() {
+        const PANE_ID: &str = "late-ack-card";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the recipient pane");
+        let daemon_state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        {
+            let mut state = daemon_state.write().await;
+            state.register_pane(PANE_ID.to_string());
+            state.apply_event(AgentEvent {
+                session_id: "gen-late".to_string(),
+                agent_type: AgentType::Pi,
+                event_type: crate::event::EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: std::collections::HashMap::new(),
+                pane_id: Some(PANE_ID.to_string()),
+                agent_id: Some(agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                background: None,
+                background_revision: None,
+            });
+        }
+        let (event_tx, mut attached_rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        install_delivery_notice_sink(&registry, daemon_state.clone(), event_tx.clone());
+        let notice = |cleared| DeliveryNotice {
+            pane_id: PANE_ID.to_string(),
+            agent_id: agent_id.clone(),
+            delivery_id: "m-k3xzq2ab-0123456789abcdef".to_string(),
+            session_id: None,
+            detail: if cleared {
+                crate::inbox_display::NOTICE_DELIVERED_LATE
+            } else {
+                crate::inbox_display::NOTICE_MAX_DELIVER
+            },
+            cleared,
+        };
+        let next_event = |rx: &mut broadcast::Receiver<BroadcastMsg>| {
+            let rx = rx.resubscribe();
+            async move {
+                let mut rx = rx;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Ok(BroadcastMsg::Event(event)) = rx.recv().await
+                            && event.pane_id.as_deref() == Some(PANE_ID)
+                        {
+                            break event;
+                        }
+                    }
+                })
+                .await
+                .ok()
+            }
+        };
+        let status = |state: &crate::state::AppState| state.sessions["gen-late"].status.clone();
+
+        let reported = next_event(&mut attached_rx);
+        registry.publish_delivery_notice(notice(false));
+        let reported = reported
+            .await
+            .expect("the not-delivered report is broadcast");
+        assert_eq!(reported.event_type, crate::event::EventType::Error);
+        assert_eq!(
+            status(&*daemon_state.read().await),
+            crate::state::SessionStatus::Error
+        );
+
+        let lifted = next_event(&mut attached_rx);
+        registry.publish_delivery_notice(notice(true));
+        let lifted = lifted.await.expect("the lift is broadcast");
+        assert!(lifted.is_delivery_notice_cleared(), "{lifted:?}");
+        assert_eq!(
+            status(&*daemon_state.read().await),
+            crate::state::SessionStatus::Thinking
+        );
+
+        // The sink applies notices one at a time in the order they arrive, so
+        // a second report published after the second lift is the next event
+        // broadcast only if that lift broadcast nothing.
+        let next = next_event(&mut attached_rx);
+        registry.publish_delivery_notice(notice(true));
+        registry.publish_delivery_notice(notice(false));
+        let next = next.await;
+        registry.shutdown_all();
+        let next = next.expect("the second report is broadcast");
+        assert!(
+            !next.is_delivery_notice_cleared() && next.event_type == crate::event::EventType::Error,
+            "a card that no longer shows the notice gets no lift: {next:?}"
         );
     }
 
@@ -10526,161 +11787,511 @@ mod hook_ingestion_tests {
         );
     }
 
-    /// Scenario: PRD #201 native prompt delivery over the hook socket. Spawn a
-    /// shell agent tagged with a pane id, stash a seed for it via
-    /// `set_pending_seed`, run the real `run_hook_loop`, then send a `get_seed`
-    /// request line and read the reply. The daemon must reply with the exact
-    /// seed, mark it delivered-native, and clear it — a second request replies
-    /// `{"seed":null}`. This is the request/response path the pi extension's
-    /// `get-seed` verb rides (the one hook-socket message that reads a reply).
-    ///
-    /// Issue #916 added the identity arms, over the real socket rather than
-    /// against the registry method: a request naming an agent that does not hold
-    /// the pane gets `null` and consumes nothing, a request naming the pane's own
-    /// agent is answered, and a request naming NO agent — the pre-#916 client, and
-    /// any producer the daemon injected no id into — is still answered rather than
-    /// refused.
-    #[tokio::test]
-    async fn run_hook_loop_answers_get_seed_and_clears_it() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let agent_gs = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-gs".to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn shell agent");
-        let token_gs = registry
-            .hook_token_of(&agent_gs)
-            .expect("a spawned agent carries a hook capability token");
-        registry.set_pending_seed(
-            "pane-gs",
-            "Acknowledge your role and wait for instructions.",
+    /// PRD #1666 hardening M2: a component is admitted only from the pane's
+    /// agent process tree, and only under an instance that is the caller's own
+    /// ancestry; where the platform cannot say, it is not checked.
+    #[test]
+    fn admit_component_process_binds_to_the_agent_process_tree() {
+        // 1 ── 10 (agent) ── 11 (plugin host) ── 12 (watcher CLI)
+        //  └── 20 (unrelated) ── 21
+        let parents = |pid: u32| match pid {
+            10 | 20 => Some(1),
+            11 => Some(10),
+            12 => Some(11),
+            21 => Some(20),
+            _ => None,
+        };
+        let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        assert_eq!(
+            admit_component_process(Some(12), Some(11), Some(10), descends, Evidence::BestEffort),
+            Ok(Some(11))
         );
+        assert_eq!(
+            admit_component_process(Some(12), None, Some(10), descends, Evidence::BestEffort),
+            Ok(None)
+        );
+        assert!(
+            admit_component_process(Some(21), Some(20), Some(10), descends, Evidence::BestEffort)
+                .is_err()
+        );
+        assert!(
+            admit_component_process(Some(12), Some(20), Some(10), descends, Evidence::BestEffort)
+                .is_err()
+        );
+        assert!(
+            admit_component_process(Some(11), Some(12), Some(10), descends, Evidence::BestEffort)
+                .is_err()
+        );
+        assert!(
+            admit_component_process(Some(12), Some(10), Some(10), descends, Evidence::BestEffort)
+                .is_ok()
+        );
+        // Cannot say: unknown pids, or no agent process to check against.
+        assert_eq!(
+            admit_component_process(Some(99), Some(98), Some(10), descends, Evidence::BestEffort),
+            Ok(Some(98))
+        );
+        assert_eq!(
+            admit_component_process(Some(21), Some(20), None, descends, Evidence::BestEffort),
+            Ok(Some(20))
+        );
+    }
 
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("chmod tempdir");
-        let sock = dir.path().join("hook.sock");
-        let listener =
-            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
-        let state: SharedState =
-            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
-        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn({
-            let registry = registry.clone();
-            let wtr = crate::issue_dispatch_run::new_worktree_registry();
-            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
-        });
+    /// PR #1735 second review: a verb that takes the agent's mail is admitted
+    /// only on positive evidence. A peer whose ancestry cannot be read — it
+    /// exited, as a connection's creator can on purpose — is refused, and so
+    /// are a missing peer and a pane with no agent process; the agent's own
+    /// tree is still admitted.
+    #[test]
+    fn a_mail_taker_must_prove_it_is_the_agents() {
+        // 1 ── 10 (agent) ── 11 (hook shell) ── 12 (hook CLI); 99 exited.
+        let parents = |pid: u32| match pid {
+            10 => Some(1),
+            11 => Some(10),
+            12 => Some(11),
+            _ => None,
+        };
+        let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        let required = |peer, claimed, root| {
+            admit_component_process(peer, claimed, root, descends, Evidence::Required)
+        };
+        assert_eq!(required(Some(12), None, Some(10)), Ok(None));
+        assert_eq!(required(Some(12), Some(11), Some(10)), Ok(Some(11)));
+        assert_eq!(required(Some(10), None, Some(10)), Ok(None));
+        assert!(required(Some(99), None, Some(10)).is_err());
+        assert!(required(None, None, Some(10)).is_err());
+        assert!(required(Some(12), None, None).is_err());
+        assert!(required(Some(12), Some(98), Some(10)).is_err());
+        // The same callers under best effort, as the posting verbs see them.
+        let best_effort = |peer, claimed, root| {
+            admit_component_process(peer, claimed, root, descends, Evidence::BestEffort)
+        };
+        assert!(best_effort(Some(99), None, Some(10)).is_ok());
+        assert!(best_effort(None, None, Some(10)).is_ok());
+        assert!(best_effort(Some(12), None, None).is_ok());
+    }
 
-        // Helper: send one get_seed request line and read the single reply line.
-        // `agent_id` is what the real CLI reads out of `DOT_AGENT_DECK_AGENT_ID`
-        // (issue #916); `None` is the pre-#916 client, and the shape a producer
-        // the daemon injected no id into still sends.
-        async fn ask_get_seed_as(
-            sock: &std::path::Path,
-            pane_id: &str,
-            agent_id: Option<&str>,
-            token: &str,
-        ) -> String {
-            let req = crate::event::DaemonMessage::GetSeed(crate::event::GetSeedRequest {
-                pane_id: pane_id.to_string(),
-                agent_id: agent_id.map(|a| a.to_string()),
-                // Issue #1077: the pane's own hook capability token, which the
-                // real `get-seed` CLI reads out of `DOT_AGENT_DECK_PANE_CAPABILITY`.
-                // Supplied on every arm below so each one still tests the
-                // identity question #916 is about rather than being refused one
-                // layer earlier for want of provenance.
-                token: Some(token.to_string()),
-            });
-            let line = format!("{}\n", serde_json::to_string(&req).unwrap());
-            let mut stream = UnixStream::connect(sock).await.expect("connect");
-            stream.write_all(line.as_bytes()).await.unwrap();
-            stream.flush().await.unwrap();
-            stream.shutdown().await.unwrap();
-            let mut buf = String::new();
-            stream.read_to_string(&mut buf).await.unwrap();
-            buf
+    /// PR #1735 third review (F2): a connection's creator exited and its pid
+    /// was reused by a process inside the agent's tree. The pid now descends
+    /// from the agent, but it names a process that started later than the one
+    /// accepted, so every inbox verb refuses it — taking mail, posting, arming
+    /// and announcing alike. The accepted process itself is still admitted; one
+    /// whose start time cannot be read now, or could not be at the accept, is
+    /// refused only where positive evidence is required.
+    #[test]
+    fn a_reused_peer_pid_is_refused_though_it_descends_from_the_agent() {
+        // 1 ── 10 (agent) ── 11 (hook shell) ── 12 (hook CLI, started at 2000).
+        // The connection was accepted from an earlier 12, started at 1000.
+        let lookups = ProcessLookups {
+            descends: |pid, root| {
+                crate::platform::proc::descends_from_with(pid, root, |pid| match pid {
+                    10 => Some(1),
+                    11 => Some(10),
+                    12 => Some(11),
+                    _ => None,
+                })
+            },
+            parent_of: |pid| match pid {
+                10 => Some(1),
+                11 => Some(10),
+                12 => Some(11),
+                _ => None,
+            },
+            executable_of: |_| None,
+            started: |pid| match pid {
+                10 => Some(100),
+                11 => Some(1500),
+                12 => Some(2000),
+                _ => None,
+            },
+        };
+        let admit = |peer, claimed, used_as, evidence| {
+            admit_inbox_component_with(peer, claimed, Some(10), used_as, evidence, &lookups)
+        };
+        let reused = AcceptedPeer {
+            pid: 12,
+            started: Some(1000),
+        };
+        let accepted = AcceptedPeer {
+            pid: 12,
+            started: Some(2000),
+        };
+        let unread_at_accept = AcceptedPeer {
+            pid: 12,
+            started: None,
+        };
+        for evidence in [Evidence::Required, Evidence::BestEffort] {
+            for (used_as, claimed) in [
+                (ComponentUse::Cli, None),
+                (ComponentUse::Receiver, Some(11)),
+            ] {
+                assert_eq!(
+                    admit(Some(reused), claimed, used_as, evidence),
+                    Err("the connecting process has exited, and its process id now names another"),
+                    "{used_as:?} {evidence:?}"
+                );
+                assert_eq!(
+                    admit(Some(accepted), claimed, used_as, evidence),
+                    Ok(claimed),
+                    "{used_as:?} {evidence:?}"
+                );
+            }
         }
-
-        // Issue #916: a pull that NAMES an agent which does not hold this pane
-        // is refused, and refused without consuming anything — the seed is still
-        // there for its owner two blocks down. Asserted first for that reason:
-        // after a successful pull there is nothing left to prove it did not eat.
-        let stranger = ask_get_seed_as(&sock, "pane-gs", Some("agent-999"), &token_gs).await;
-        let stranger_resp: crate::event::GetSeedResponse =
-            serde_json::from_str(stranger.trim()).expect("parse stranger get-seed reply");
         assert!(
-            stranger_resp.seed.is_none(),
-            "a pull naming an agent that does not hold this pane must get nothing"
+            admit(
+                Some(unread_at_accept),
+                None,
+                ComponentUse::Cli,
+                Evidence::Required
+            )
+            .is_err()
         );
         assert!(
-            !registry.seed_delivered_native("pane-gs"),
-            "…and must not have consumed the seed on its way to being refused"
+            admit(
+                Some(unread_at_accept),
+                None,
+                ComponentUse::Cli,
+                Evidence::BestEffort
+            )
+            .is_ok()
         );
+        let gone = AcceptedPeer {
+            pid: 12,
+            started: Some(2000),
+        };
+        let without_12 = ProcessLookups {
+            started: |pid| (pid != 12).then_some(1),
+            ..lookups
+        };
+        assert!(
+            admit_inbox_component_with(
+                Some(gone),
+                None,
+                Some(10),
+                ComponentUse::Cli,
+                Evidence::Required,
+                &without_12
+            )
+            .is_err(),
+            "a start time that cannot be read now refuses where evidence is required"
+        );
+    }
 
-        // First pull: the daemon returns the seed…
-        let reply = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs), &token_gs).await;
-        let resp: crate::event::GetSeedResponse =
-            serde_json::from_str(reply.trim()).expect("parse get-seed reply");
+    /// The real process table: this test process reads its own start time, the
+    /// same each time, on a platform that has one.
+    #[test]
+    fn a_process_start_time_is_stable_for_one_process() {
+        let me = std::process::id();
+        let first = crate::platform::proc::process_start_of(me);
+        assert_eq!(first, crate::platform::proc::process_start_of(me));
+        if crate::platform::proc::ANCESTRY_LOOKUP {
+            assert!(first.is_some(), "this platform reads start times");
+        }
+    }
+
+    /// Audit F3 (b): a component registering the agent's native receiver is
+    /// refused when a process between it and the instance it names runs that
+    /// instance's executable — an agent of the same kind, started inside the
+    /// one whose receiver it claims to be. The launch shapes the deck's own
+    /// integrations use (the watcher a direct child of its agent, a hook run
+    /// through a shell, an agent under a wrapper of its own kind) still pass,
+    /// and so does a walk that cannot say. A hook run through a shell is
+    /// pinned by the agent above the shell, so every hook of one agent names
+    /// the same receiver.
+    #[test]
+    fn a_nested_agent_of_the_same_kind_cannot_name_the_outer_agent_as_its_receiver() {
+        // 1 ── 10 claude ── 11 bash (a tool) ── 12 claude (nested) ── 13 sh ── 14 CLI
+        //   │            │                 └── 19 CLI (a waiter the tool runs)
+        //   │            ├── 15 sh ── 16 CLI (the outer agent's hook)
+        //   │            └── 17 sh ── 18 CLI (its next hook, in a new shell)
+        //   └── 20 node (npx) ── 21 sh ── 22 node (pi) ── 23 CLI (its watcher)
+        let parents = |pid: u32| match pid {
+            10 | 20 => Some(1),
+            11 | 15 | 17 => Some(10),
+            12 | 19 => Some(11),
+            13 => Some(12),
+            14 => Some(13),
+            16 => Some(15),
+            18 => Some(17),
+            21 => Some(20),
+            22 => Some(21),
+            23 => Some(22),
+            _ => None,
+        };
+        let executables = |pid: u32| {
+            let exe = match pid {
+                10 | 12 => "/opt/claude",
+                11 => "/bin/bash",
+                13 | 15 | 17 | 21 => "/bin/sh",
+                14 | 16 | 18 | 19 | 23 => "/opt/dot-agent-deck",
+                20 | 22 => "/usr/bin/node",
+                _ => return None,
+            };
+            Some(std::path::PathBuf::from(exe))
+        };
+        let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        let admit = |peer, claimed, root| {
+            admit_receiver_process(
+                peer,
+                claimed,
+                root,
+                descends,
+                parents,
+                executables,
+                Evidence::BestEffort,
+            )
+        };
+
+        // The outer agent's hooks, each through its own shell, naming the
+        // shell or the agent: all are the agent's one receiver.
+        assert_eq!(admit(Some(16), Some(15), Some(10)), Ok(Some(10)));
+        assert_eq!(admit(Some(18), Some(17), Some(10)), Ok(Some(10)));
+        assert_eq!(admit(Some(16), Some(10), Some(10)), Ok(Some(10)));
+        // Pi's watcher, a direct child of Pi under an npx wrapper that runs node too.
+        assert_eq!(admit(Some(23), Some(22), Some(20)), Ok(Some(22)));
+        // The nested agent of the same kind naming the outer agent as its
+        // instance is refused.
+        assert!(admit(Some(14), Some(10), Some(10)).is_err());
+        // Naming its own shell, or itself, it is the nested agent's own
+        // instance, which the pin refuses once the outer agent has armed or
+        // announced (`InboxHub::arm`).
+        assert_eq!(admit(Some(14), Some(13), Some(10)), Ok(Some(12)));
+        assert_eq!(admit(Some(14), Some(12), Some(10)), Ok(Some(12)));
+        // Audit D1, the boundary: a waiter the agent's tool shell runs resolves
+        // to the agent, the same receiver as its hooks.
+        assert_eq!(admit(Some(19), Some(11), Some(10)), Ok(Some(10)));
+        // A walk that cannot say does not refuse, and pins what was named.
         assert_eq!(
-            resp.seed.as_deref(),
-            Some("Acknowledge your role and wait for instructions.")
+            admit_receiver_process(
+                Some(14),
+                Some(10),
+                Some(10),
+                descends,
+                parents,
+                |_| None,
+                Evidence::BestEffort
+            ),
+            Ok(Some(10))
         );
-        // …marks it delivered-native and clears it.
-        assert!(
-            registry.seed_delivered_native("pane-gs"),
-            "answering get-seed must mark the delivery native"
-        );
-
-        // Second pull: nothing left — the seed was delivered exactly once.
-        let reply2 = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs), &token_gs).await;
-        let resp2: crate::event::GetSeedResponse =
-            serde_json::from_str(reply2.trim()).expect("parse second get-seed reply");
-        assert!(
-            resp2.seed.is_none(),
-            "seed must be cleared after the first pull"
-        );
-
-        // Issue #916: the pre-#916 / id-less client still works. It presents no
-        // agent id, and the take falls back to the pane's LIVE occupant rather
-        // than refusing — the decision recorded on `take_pending_seed_native_for`.
-        registry.set_pending_seed("pane-gs", "a second opening task");
-        let legacy = ask_get_seed_as(&sock, "pane-gs", None, &token_gs).await;
-        let legacy_resp: crate::event::GetSeedResponse =
-            serde_json::from_str(legacy.trim()).expect("parse id-less get-seed reply");
         assert_eq!(
-            legacy_resp.seed.as_deref(),
-            Some("a second opening task"),
-            "a caller the daemon injected no agent id into must not lose its seed"
+            admit_receiver_process(
+                Some(16),
+                Some(15),
+                Some(10),
+                descends,
+                parents,
+                |_| None,
+                Evidence::BestEffort
+            ),
+            Ok(Some(15))
         );
+    }
 
-        // Unknown pane → null, harmless, whether or not an id is presented.
-        //
-        // Issue #1077 made these hold for a STRONGER reason than they used to:
-        // the token presented here was minted for `pane-gs`, so naming any other
-        // pane is refused at the boundary (`Refusal::WrongPane`) before the
-        // registry is consulted at all, and a refused `get-seed` answers exactly
-        // as "no seed pending" does. The assertions are unchanged because the
-        // observable answer is unchanged.
-        let reply3 = ask_get_seed_as(&sock, "pane-unknown", None, &token_gs).await;
-        let resp3: crate::event::GetSeedResponse =
-            serde_json::from_str(reply3.trim()).expect("parse unknown-pane get-seed reply");
-        assert!(resp3.seed.is_none());
-        let reply4 = ask_get_seed_as(&sock, "pane-unknown", Some(&agent_gs), &token_gs).await;
-        let resp4: crate::event::GetSeedResponse =
-            serde_json::from_str(reply4.trim()).expect("parse cross-pane get-seed reply");
-        assert!(
-            resp4.seed.is_none(),
-            "an agent naming a pane it does not hold must get nothing"
+    /// Review nit 1: a chain of shells deeper than the walk reads, below the
+    /// agent, pins what was named — as a walk that cannot say does — rather
+    /// than whichever shell the walk stopped on.
+    #[test]
+    fn a_shell_chain_deeper_than_the_walk_pins_the_named_instance() {
+        // 1 ── 10 agent ── 11 sh ── 12 sh ── … ── 30 sh ── 31 CLI
+        let parents = |pid: u32| match pid {
+            10 => Some(1),
+            11..=31 => Some(pid - 1),
+            _ => None,
+        };
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                10 => "/opt/agent",
+                11..=30 => "/bin/sh",
+                31 => "/opt/dot-agent-deck",
+                _ => return None,
+            }))
+        };
+        assert_eq!(receiver_instance(30, Some(10), parents, executables), 30);
+        assert_eq!(receiver_instance(12, Some(10), parents, executables), 10);
+    }
+
+    /// Audit F3 (b), on this machine's real process table: a shell started
+    /// inside a shell, with a process below it, is seen as nested between that
+    /// process and the outer shell, and not between it and its own parent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_between_reads_the_real_process_table() {
+        use std::io::BufRead;
+        let mut outer = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sh -c 'sleep 30 & echo $!; wait'; :")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the outer shell");
+        let mut line = String::new();
+        std::io::BufReader::new(outer.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let caller: u32 = line
+            .trim()
+            .parse()
+            .expect("the nested shell names its child");
+        let parent = crate::platform::proc::parent_pid_of;
+        let nested = parent(caller).expect("the caller's parent");
+        assert_eq!(parent(nested), Some(outer.id()));
+        let seen = |claimed| {
+            nested_between(
+                caller,
+                claimed,
+                parent,
+                crate::platform::proc::executable_of,
+            )
+        };
+        assert_eq!(seen(outer.id()), Some(true));
+        assert_eq!(seen(nested), Some(false));
+        // SAFETY: `caller` is the `sleep` this test started, still running.
+        unsafe { libc::kill(caller as libc::pid_t, libc::SIGKILL) };
+        let _ = outer.wait();
+    }
+
+    /// PRD #1666 hardening H2: the inbox half of get-seed hands over only the
+    /// attested agent's own message, and only while it is the pane's live one.
+    #[test]
+    fn get_seed_inbox_alias_acts_only_for_the_attested_live_agent() {
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::parse("k3xzq2ab").unwrap(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
         );
+        let id = hub
+            .post_direct(
+                crate::inbox::Recipient::bound("p", "new"),
+                crate::inbox::Content::from_deck("seed", "task", "the successor's task"),
+            )
+            .unwrap();
+        let queued = || {
+            hub.list("p")
+                .iter()
+                .any(|m| m.id == id && m.state == crate::inbox::StateName::Queued)
+        };
+        for (requested, attested, live) in [
+            (Some("new"), Some("old"), Some("new")),
+            (None, Some("old"), Some("new")),
+            (Some("new"), None, Some("new")),
+            (None, None, Some("new")),
+            (Some("old"), Some("new"), Some("new")),
+            (None, Some("new"), Some("newer")),
+        ] {
+            assert_eq!(
+                get_seed_inbox_alias(&hub, "p", requested, attested, live, false),
+                None,
+                "{requested:?} {attested:?} {live:?}"
+            );
+            assert!(queued(), "{requested:?} {attested:?} {live:?}");
+        }
+        let seed = get_seed_inbox_alias(&hub, "p", Some("new"), Some("new"), Some("new"), false)
+            .expect("its own agent gets it");
+        assert!(seed.contains("the successor's task"));
+    }
 
-        handle.abort();
-        let _ = handle.await;
-        registry.shutdown_all();
+    /// Scenario: A Pi generation whose extension predates the receipt stream holds a queued deck message. Its stream without the deck's integration, its plain doorbell fetch and its get-seed are each refused as an out-of-date adapter: the message stays queued and the card says to restart the agent. An OpenCode generation's stream is refused the same way, and a Claude hook's plain doorbell fetch is still served.
+    #[spec("inbox/boundary/030")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boundary_030_a_pi_extension_from_before_the_receipt_stream_is_refused() {
+        use crate::event::{InboxComponent, InboxWaitMode};
+        use crate::inbox_display::IntegrationNotice;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let registry = AgentPtyRegistry::new();
+        let hub = Arc::clone(registry.inbox());
+        let queued = |pane: &str, id: &crate::inbox::MessageId| {
+            hub.list(pane)
+                .iter()
+                .any(|m| m.id == *id && m.state == crate::inbox::StateName::Queued)
+        };
+        let post = |pane: &str, agent: &str| {
+            hub.post_direct(
+                crate::inbox::Recipient::bound(pane, agent),
+                crate::inbox::Content::from_deck("seed", "task", "the task"),
+            )
+            .unwrap()
+        };
+        // An old stream, for Pi and for OpenCode.
+        for (pane, component) in [
+            ("pi", InboxComponent::PiExtension),
+            ("oc", InboxComponent::OpenCodePlugin),
+        ] {
+            let id = post(pane, "a");
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let (read, write) = tokio::io::split(server);
+            let serve = tokio::spawn(crate::inbox_hub::serve_waiter(
+                Arc::clone(&hub),
+                pane.to_string(),
+                "a".to_string(),
+                InboxWaitMode::Stream,
+                component,
+                None,
+                crate::inbox_hub::ReceiptArm::default(),
+                BufReader::new(read),
+                write,
+                |_: &str| {},
+            ));
+            let mut lines = BufReader::new(client).lines();
+            let reply: crate::event::InboxWaitReply =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(reply.refused.as_deref(), Some("adapter_too_old"), "{pane}");
+            serve.await.unwrap();
+            assert!(queued(pane, &id), "{pane}: the message stays queued");
+            assert_eq!(
+                hub.integration_notice(pane, "a"),
+                Some(IntegrationNotice::AdapterTooOld),
+                "{pane}"
+            );
+        }
+        // A plain doorbell fetch and get-seed from a Pi generation.
+        hub.announce(
+            "p",
+            "a",
+            crate::event::InboxWake::Native,
+            InboxComponent::PiExtension,
+            None,
+        )
+        .unwrap();
+        let id = post("p", "a");
+        let fetch = |pane: &str| -> crate::event::InboxFetchRequest {
+            serde_json::from_value(serde_json::json!({
+                "pane_id": pane, "consumer": "doorbell_hook",
+                "doorbell": id.as_str(), "max_chars": 65536
+            }))
+            .unwrap()
+        };
+        let reply = handle_inbox_fetch(&registry, &fetch("p"), "a");
+        assert_eq!(reply.refused.as_deref(), Some("adapter_too_old"));
+        assert_eq!(
+            get_seed_inbox_alias(
+                &hub,
+                "p",
+                None,
+                Some("a"),
+                Some("a"),
+                pi_generation(&registry, "p", "a")
+            ),
+            None
+        );
+        assert!(queued("p", &id), "no seed, no fetch: it stays queued");
+        assert_eq!(
+            hub.integration_notice("p", "a"),
+            Some(IntegrationNotice::AdapterTooOld)
+        );
+        // A Claude hook's doorbell fetch is still served.
+        hub.announce(
+            "c",
+            "a",
+            crate::event::InboxWake::Native,
+            InboxComponent::ClaudeHooks,
+            None,
+        )
+        .unwrap();
+        let claude = post("c", "a");
+        let mut req = fetch("c");
+        req.doorbell = Some(claude.as_str().to_string());
+        let reply = handle_inbox_fetch(&registry, &req, "a");
+        assert_eq!(reply.refused, None);
+        assert_eq!(reply.messages.map(|m| m.len()), Some(1));
     }
 
     // ---------------------------------------------------------------------
@@ -10935,54 +12546,18 @@ mod hook_ingestion_tests {
             )
         }
 
-        /// Issue #1383: send one `ack` line claiming `claimed_pane` and read the
-        /// daemon's acknowledgement, the way [`Self::work_done`] does.
-        async fn ack(
-            &self,
-            claimed_pane: &str,
-            token: Option<&str>,
-            delivery_id: &str,
-        ) -> Option<crate::event::SignalAck> {
-            self.ack_as(claimed_pane, token, delivery_id, None).await
-        }
-
-        /// [`Self::ack`] with the payload's own, sender-chosen `agent_id`.
-        async fn ack_as(
-            &self,
-            claimed_pane: &str,
-            token: Option<&str>,
-            delivery_id: &str,
-            agent_id: Option<&str>,
-        ) -> Option<crate::event::SignalAck> {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let msg = crate::event::DaemonMessage::Ack(crate::event::AckSignal {
-                pane_id: claimed_pane.to_string(),
-                delivery_id: delivery_id.to_string(),
-                agent_id: agent_id.map(str::to_string),
-                token: token.map(str::to_string),
-            });
-            let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
-            let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
-            stream.write_all(line.as_bytes()).await.unwrap();
-            stream.flush().await.unwrap();
-            stream.shutdown().await.unwrap();
-            let mut buf = String::new();
-            stream.read_to_string(&mut buf).await.unwrap();
-            if buf.trim().is_empty() {
-                return None;
-            }
-            Some(
-                serde_json::from_str(buf.trim())
-                    .unwrap_or_else(|e| panic!("ack reply was not a SignalAck ({e}): {buf:?}")),
-            )
-        }
-
         /// Whether the ORCHESTRATOR's PTY has seen `needle` yet, polled for
         /// `budget`. `handle_work_done` writes its feedback there, so this is
         /// how a work-done that ran is told from one that was refused.
+        /// PRD #1666 S5: whether `needle` reached the orchestrator — in its
+        /// inbox, where the daemon now posts, or typed into its PTY, which it no
+        /// longer does — polled for `budget`.
         async fn orchestrator_saw(&self, needle: &str, budget: Duration) -> bool {
             let deadline = tokio::time::Instant::now() + budget;
             loop {
+                if pane_inbox_contains(&self.registry, PROV_ORCH_PANE, needle) {
+                    return true;
+                }
                 if let Ok(bytes) = self.registry.snapshot(&self.orchestrator_agent)
                     && String::from_utf8_lossy(&bytes).contains(needle)
                 {
@@ -10995,13 +12570,23 @@ mod hook_ingestion_tests {
             }
         }
 
-        /// Whether the worker's PTY has seen the delegate pointer yet, polled
-        /// for `budget`. The pointer is what `handle_delegate` writes, so its
-        /// presence is proof the handler ran and its absence (after a wait) is
-        /// proof it did not.
+        /// Whether the worker has been handed the delegated task yet, polled
+        /// for `budget`. PRD #1666 S5: `handle_delegate` posts the task to the
+        /// worker's inbox, so its presence there (or, as before, in the PTY) is
+        /// proof the handler ran and its absence (after a wait) is proof it did
+        /// not.
         async fn worker_saw_pointer(&self, budget: Duration) -> bool {
             let deadline = tokio::time::Instant::now() + budget;
             loop {
+                if pane_inbox_contains(&self.registry, PROV_WORKER_PANE, "worker-task-worker.md")
+                    || pane_inbox_contains(
+                        &self.registry,
+                        PROV_WORKER_PANE,
+                        "from the orchestrator]",
+                    )
+                {
+                    return true;
+                }
                 if let Ok(bytes) = self.registry.snapshot(&self.worker_agent)
                     && String::from_utf8_lossy(&bytes).contains("worker-task-worker.md")
                 {
@@ -11019,6 +12604,168 @@ mod hook_ingestion_tests {
             let _ = self.handle.await;
             self.registry.shutdown_all();
         }
+    }
+
+    /// PRD #1666 S5: whether any message in `pane_id`'s inbox, rendered whole,
+    /// contains `needle`.
+    fn pane_inbox_contains(registry: &AgentPtyRegistry, pane_id: &str, needle: &str) -> bool {
+        registry
+            .inbox()
+            .rendered(pane_id)
+            .into_iter()
+            .any(|delivery| delivery.text.contains(needle))
+    }
+
+    /// Scenario: A Pi worker reports a turn starting before its receipt watcher registers, is then handed a deck message it holds, and the hub's own clock runs with a short not-started window. Nothing shows while the turn runs; once the worker's own attested Idle ends it, and while more Idles keep arriving, the card lists the message as one that may not have reached the agent. A predecessor's Thinking, a ToolEnd and an unattested Thinking leave the row; the worker's attested Thinking withdraws it, and after a Cancel it never returns.
+    #[spec("inbox/boundary/044")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boundary_044_a_pi_workers_attested_turns_drive_the_not_started_row() {
+        use crate::event::{InboxComponent, InboxWaitMode};
+        use crate::inbox_display::AttentionKind;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let _lock = HOOK_PROVENANCE_ENV_LOCK.lock().await;
+        // SAFETY: nextest runs each test in its own process; the hub reads it
+        // once, when it is created below.
+        unsafe { std::env::set_var(crate::inbox_hub::ENV_NOT_STARTED_MS, "300") };
+        let fx = ProvenanceFixture::start().await;
+        let (pane, agent) = (PROV_WORKER_PANE, fx.worker_agent.clone());
+        let hub = Arc::clone(fx.registry.inbox());
+        let send = |agent_id: String, kind: &'static str, token: Option<String>| {
+            let sock = fx.sock.clone();
+            async move {
+                let mut payload = serde_json::json!({
+                    "session_id": "pi-session", "pane_id": pane, "agent_id": agent_id,
+                    "agent_type": "pi", "event_type": kind, "timestamp": chrono::Utc::now(),
+                });
+                if let Some(token) = token {
+                    payload["token"] = serde_json::Value::String(token);
+                }
+                let mut stream = UnixStream::connect(&sock).await.unwrap();
+                stream
+                    .write_all(format!("{payload}\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                let mut reply = String::new();
+                let _ = stream.read_to_string(&mut reply).await;
+            }
+        };
+        let own = || Some(fx.worker_token.clone());
+        let row = || {
+            hub.summary(pane, &agent)
+                .notices
+                .attention
+                .iter()
+                .find(|item| item.kind == AttentionKind::NotStarted)
+                .cloned()
+        };
+        let quiet_for = |span: Duration| {
+            let row = &row;
+            async move {
+                let until = std::time::Instant::now() + span;
+                while std::time::Instant::now() < until {
+                    assert!(row().is_none(), "the row stayed off");
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        };
+        let raised = || {
+            let row = &row;
+            async move {
+                let until = std::time::Instant::now() + Duration::from_secs(5);
+                while row().is_none() {
+                    assert!(std::time::Instant::now() < until, "the row appears");
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        };
+        // A turn starts before the watcher registers.
+        send(agent.clone(), "thinking", own()).await;
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(server);
+        let serve = tokio::spawn(crate::inbox_hub::serve_waiter(
+            Arc::clone(&hub),
+            pane.to_string(),
+            agent.clone(),
+            InboxWaitMode::Stream,
+            InboxComponent::PiExtension,
+            None,
+            crate::inbox_hub::ReceiptArm {
+                adapter_integration: Some(crate::inbox_hub::ADAPTER_INTEGRATION),
+                ..Default::default()
+            },
+            BufReader::new(read),
+            write,
+            |_: &str| {},
+        ));
+        let (from, mut to) = tokio::io::split(client);
+        let mut lines = BufReader::new(from).lines();
+        let id = hub
+            .post_direct(
+                crate::inbox::Recipient::bound(pane, &agent),
+                crate::inbox::Content::from_deck("seed", "task", "the task"),
+            )
+            .unwrap();
+        let handed = loop {
+            let line = lines.next_line().await.unwrap().unwrap();
+            let reply: crate::event::InboxWaitReply = serde_json::from_str(&line).unwrap();
+            if let Some(messages) = reply.messages {
+                break messages;
+            }
+        };
+        let at = handed[0].attempt.clone().expect("a receipt attempt");
+        let r = serde_json::json!({"id": id.as_str(), "a": at.a, "e": at.e});
+        let control =
+            serde_json::json!({"possess": {"seq": 1, "seen": at.d, "held": [r]}, "handed": [r]});
+        to.write_all(format!("{control}\n").as_bytes())
+            .await
+            .unwrap();
+        quiet_for(Duration::from_millis(900)).await;
+        // The worker's own Idle ends the turn; the window then runs out while
+        // more Idles keep arriving, since a repeated Idle does not restart it.
+        let until = std::time::Instant::now() + Duration::from_secs(3);
+        while row().is_none() {
+            assert!(
+                std::time::Instant::now() < until,
+                "the row appears while repeated Idles arrive"
+            );
+            send(agent.clone(), "idle", own()).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for (who, kind, token) in [
+            ("a-predecessor".to_string(), "thinking", None),
+            (agent.clone(), "tool_end", own()),
+            (agent.clone(), "thinking", None),
+        ] {
+            send(who.clone(), kind, token).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(row().is_some(), "{who} {kind}: the row stays");
+        }
+        // An attested predecessor generation's edge is the registry's to
+        // refuse: it names an agent that no longer owns the pane.
+        assert_eq!(
+            fx.registry
+                .note_turn(pane, "a-predecessor", crate::agent_pty::TurnEdge::Started),
+            None,
+            "a non-owner's turn edge is not numbered for the clock"
+        );
+        send(agent.clone(), "thinking", own()).await;
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while row().is_some() {
+            assert!(
+                std::time::Instant::now() < until,
+                "a started turn withdraws it"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        send(agent.clone(), "idle", own()).await;
+        raised().await;
+        let item = row().unwrap();
+        hub.inbox_action(pane, &agent, id.as_str(), item.revision, false, "tui-1");
+        quiet_for(Duration::from_millis(900)).await;
+        drop(to);
+        drop(lines);
+        let _ = serve.await;
     }
 
     async fn assert_agent_event_refused(kind: &str, token_kind: &str, policy: &str) {
@@ -11327,7 +13074,8 @@ mod hook_ingestion_tests {
         assert!(
             fx.orchestrator_saw("WORKDONE-ATTESTED-5a1c", Duration::from_secs(20))
                 .await,
-            "the ack was written but the handler never ran — the report never reached the              orchestrator's PTY"
+            "the ack was written but the handler never ran — the report never reached the \
+             orchestrator"
         );
         fx.stop().await;
     }
@@ -11369,286 +13117,6 @@ mod hook_ingestion_tests {
             !fx.orchestrator_saw("WORKDONE-FORGED-2b7e", Duration::from_secs(2))
                 .await,
             "the refused work-done still reached the orchestrator's PTY — the caller was told              but the handler ran anyway"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: issue #1383 — a delegate delivery to the worker is pending a
-    /// retry, with a silent-worker watch armed beside it. The worker sends
-    /// `ack` for that delivery id with its own pane's token. The daemon must
-    /// admit it, stop the retry and cancel the watch — an ack is not an agent
-    /// event, so the watch could never have seen it otherwise.
-    #[tokio::test]
-    async fn delivery_ack_from_the_attested_pane_stops_the_retry_and_its_silence_watch() {
-        let fx = ProvenanceFixture::start().await;
-        let silence = fx
-            .registry
-            .arm_silence_watch(PROV_WORKER_PANE, PROV_ORCH_PANE, Some(&fx.worker_agent))
-            .expect("arm silence watch");
-        let mut armed = fx.registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            &fx.worker_agent,
-            Some(silence.seq),
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let token = fx.worker_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abcd")
-            .await
-            .expect("an admitted ack is answered");
-        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
-        assert_eq!(
-            ack.delivery,
-            Some(crate::event::AckDelivery::Stopped),
-            "the reply must say the id matched, not only that the gate admitted it"
-        );
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while fx
-            .registry
-            .pending_deliveries()
-            .is_pending(PROV_WORKER_PANE)
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(
-            !fx.registry
-                .pending_deliveries()
-                .is_pending(PROV_WORKER_PANE),
-            "the ack did not stop the pending delivery"
-        );
-        assert!(
-            armed.cancel.try_recv().is_err(),
-            "the retry loop's cancel must resolve"
-        );
-        assert!(
-            !fx.registry
-                .cancel_silence_watch_if(PROV_WORKER_PANE, silence.seq),
-            "the ack must also cancel the silent-worker watch armed for the same delivery"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: issue #1383 — the orchestrator presents its own token while
-    /// claiming the WORKER's pane, to ack the worker's delivery. The gate must
-    /// refuse it on the connection and leave the pending delivery armed, so one
-    /// pane cannot switch off another pane's retry.
-    #[tokio::test]
-    async fn delivery_ack_claiming_another_pane_is_refused() {
-        let fx = ProvenanceFixture::start().await;
-        let armed = fx.registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            &fx.worker_agent,
-            None,
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let token = fx.orchestrator_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abcd")
-            .await
-            .expect("a refused ack is reported to the caller");
-        assert!(ack.is_signal_ack() && !ack.accepted, "{ack:?}");
-        assert!(
-            fx.registry
-                .pending_deliveries()
-                .is_current(PROV_WORKER_PANE, armed.seq),
-            "a refused ack must not stop the delivery"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: PR #1414 review — an attested ack whose delivery id is shaped
-    /// correctly but is not the pane's delivery (mistyped, or an earlier
-    /// task's) is answered as admitted but UNKNOWN, so the CLI does not print
-    /// "Acknowledged", and the pending delivery stays armed.
-    #[tokio::test]
-    async fn delivery_ack_with_an_unknown_id_is_answered_as_unknown() {
-        let fx = ProvenanceFixture::start().await;
-        let armed = fx.registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            &fx.worker_agent,
-            None,
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let token = fx.worker_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abce")
-            .await
-            .expect("answered");
-        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
-        assert_eq!(ack.delivery, Some(crate::event::AckDelivery::Unknown));
-        assert!(
-            fx.registry
-                .pending_deliveries()
-                .is_current(PROV_WORKER_PANE, armed.seq),
-            "an unknown id must not stop the delivery"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: PR #1414 review (Qodo) — the pane's pending delivery belongs to
-    /// a newer worker generation, and the fixture's worker, still holding a
-    /// valid token for the same pane, acks that delivery id with no `agent_id`
-    /// in the payload. The daemon must identify it by its token, answer
-    /// UNKNOWN, and leave the newer generation's retry running.
-    #[tokio::test]
-    async fn delivery_ack_from_an_older_generation_s_token_without_an_agent_id_does_not_stop_the_retry()
-     {
-        let fx = ProvenanceFixture::start().await;
-        let armed = fx.registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            "agent-newer-generation",
-            None,
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let token = fx.worker_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abcd")
-            .await
-            .expect("answered");
-        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
-        assert_eq!(
-            ack.delivery,
-            Some(crate::event::AckDelivery::Unknown),
-            "another generation's ack must not read as recorded"
-        );
-        assert!(
-            fx.registry
-                .pending_deliveries()
-                .is_current(PROV_WORKER_PANE, armed.seq),
-            "an older generation's ack stopped the newer generation's retry"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: PR #1414 review (Qodo) — the daemon runs with
-    /// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`. The worker pane's current delivery
-    /// has no retry pending (the retry is off) and is bound to the pane's
-    /// current worker and its silent-worker watch. An older generation of that
-    /// pane, which read the overwritten role file, acks the new delivery id
-    /// with no token and a self-chosen `agent_id`. The gate admits it, and the
-    /// daemon must answer UNKNOWN — not "Acknowledged" — and leave the watch
-    /// armed for the worker's own ack, which is then recorded.
-    #[tokio::test]
-    async fn delivery_ack_from_an_older_generation_under_warn_is_unknown_with_nothing_pending() {
-        let _provenance = HOOK_PROVENANCE_ENV_LOCK.lock().await;
-        let _warn = HookProvenanceEnv::set("warn");
-        let fx = ProvenanceFixture::start().await;
-        let silence = fx
-            .registry
-            .arm_silence_watch(PROV_WORKER_PANE, PROV_ORCH_PANE, Some(&fx.worker_agent))
-            .expect("arm silence watch");
-        let deliveries = fx.registry.pending_deliveries();
-        deliveries.note_delivery(PROV_WORKER_PANE, "d-1383abcd");
-        assert!(deliveries.bind_current(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            &fx.worker_agent,
-            Some(silence.seq),
-        ));
-        assert!(!deliveries.is_pending(PROV_WORKER_PANE));
-
-        let ack = fx
-            .ack_as(
-                PROV_WORKER_PANE,
-                None,
-                "d-1383abcd",
-                Some("agent-older-generation"),
-            )
-            .await
-            .expect("an ack admitted under warn is answered");
-        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
-        assert_eq!(
-            ack.delivery,
-            Some(crate::event::AckDelivery::Unknown),
-            "an older generation must not be told its ack of the new delivery was recorded"
-        );
-        assert_eq!(
-            deliveries.current_for_test(PROV_WORKER_PANE),
-            Some(("d-1383abcd".to_string(), Some(silence.seq))),
-            "the older generation's ack must leave the watch bound"
-        );
-
-        let token = fx.worker_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abcd")
-            .await
-            .expect("answered");
-        assert_eq!(ack.delivery, Some(crate::event::AckDelivery::NotPending));
-        assert!(
-            !fx.registry
-                .cancel_silence_watch_if(PROV_WORKER_PANE, silence.seq),
-            "the worker's own ack must cancel the watch"
-        );
-        fx.stop().await;
-    }
-
-    /// Scenario: PR #1414 review (Qodo) — an ack the gate admitted without
-    /// attesting a sender, carrying the pane's current delivery id and no
-    /// `agent_id`, reaches the handler. Nobody can say which worker sent it, so
-    /// it must answer UNKNOWN and leave the retry running.
-    #[test]
-    fn delivery_ack_with_no_identity_at_all_does_not_stop_the_retry() {
-        let registry = AgentPtyRegistry::new();
-        let armed = registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            "agent-worker",
-            None,
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let signal = crate::event::AckSignal {
-            pane_id: PROV_WORKER_PANE.to_string(),
-            delivery_id: "d-1383abcd".to_string(),
-            agent_id: None,
-            token: None,
-        };
-        assert_eq!(
-            handle_delivery_ack(&registry, &signal, None),
-            crate::event::AckDelivery::Unknown
-        );
-        assert!(
-            registry
-                .pending_deliveries()
-                .is_current(PROV_WORKER_PANE, armed.seq)
-        );
-        // The same ack from the worker it was armed for does stop it.
-        assert_eq!(
-            handle_delivery_ack(&registry, &signal, Some("agent-worker")),
-            crate::event::AckDelivery::Stopped
-        );
-        assert!(!registry.pending_deliveries().is_pending(PROV_WORKER_PANE));
-    }
-
-    /// Scenario: issue #1383 — an attested ack whose delivery id is not shaped
-    /// like one the daemon mints is answered (the gate admitted it) and then
-    /// ignored: nothing is looked up, and the pending delivery stays armed.
-    #[tokio::test]
-    async fn delivery_ack_with_a_malformed_id_is_ignored() {
-        let fx = ProvenanceFixture::start().await;
-        let armed = fx.registry.pending_deliveries().arm(
-            PROV_WORKER_PANE,
-            "d-1383abcd",
-            &fx.worker_agent,
-            None,
-            crate::delegate_retry::RetypePolicy::Allowed,
-        );
-        let token = fx.worker_token.clone();
-        let ack = fx
-            .ack(PROV_WORKER_PANE, Some(&token), "d-1383ABCD\n")
-            .await
-            .expect("answered");
-        assert!(ack.accepted, "{ack:?}");
-        assert_eq!(ack.delivery, Some(crate::event::AckDelivery::Unknown));
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            fx.registry
-                .pending_deliveries()
-                .is_current(PROV_WORKER_PANE, armed.seq)
         );
         fx.stop().await;
     }
@@ -11749,6 +13217,43 @@ mod hook_ingestion_tests {
             fx.orchestrator_saw("WORKDONE-QUEUED-FIRST-7d2e", Duration::from_secs(20))
                 .await,
             "the acknowledged report never reached the orchestrator's PTY"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: PR #1735 fifth review (N3) — the orchestrator is busy and its
+    /// inbox is full when a worker reports `work-done`. The worker is told its
+    /// report was accepted, so the report must reach the orchestrator's inbox
+    /// anyway, rather than be refused there and kept only in the daemon log.
+    #[tokio::test]
+    async fn a_work_done_reaches_an_orchestrator_whose_inbox_is_full() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let fx = ProvenanceFixture::start().await;
+        let orchestrator =
+            crate::inbox::Recipient::bound(PROV_ORCH_PANE, fx.orchestrator_agent.as_str());
+        while fx
+            .registry
+            .inbox()
+            .post_direct(
+                orchestrator.clone(),
+                crate::inbox::Content::from_deck("seed", "filler", "filler"),
+            )
+            .is_ok()
+        {}
+        let stream = open_work_done(&fx, "WORKDONE-FULL-INBOX-91c4").await;
+        let mut reply = BufReader::new(stream);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(20), reply.read_line(&mut line))
+            .await
+            .expect("the work-done was never answered")
+            .expect("read the answer");
+        let ack: crate::event::SignalAck = serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("work_done reply was not a SignalAck ({e}): {line:?}"));
+        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
+        assert!(
+            fx.orchestrator_saw("WORKDONE-FULL-INBOX-91c4", Duration::from_secs(20))
+                .await,
+            "an accepted report never reached the orchestrator whose inbox was full"
         );
         fx.stop().await;
     }
@@ -12007,7 +13512,7 @@ mod hook_ingestion_tests {
     /// REJECTS (it names an orchestration the caller's directory does not
     /// define) is still acknowledged as `accepted`, and that acknowledgement is
     /// the only line the connection ever carries. The rejection reaches the
-    /// caller as a `dispatch:` line typed into its own pane instead.
+    /// caller as a `dispatch:` message in its own inbox instead.
     ///
     /// This pins what `dot-agent-deck dispatch`'s exit status actually asserts,
     /// which the CLI's help, the dispatcher seed and both dispatcher-mode pages
@@ -12056,8 +13561,8 @@ mod hook_ingestion_tests {
         );
         assert!(
             fx.orchestrator_saw(MISSING, Duration::from_secs(20)).await,
-            "the handler's rejection must reach the caller's pane, the one place the dispatch's \
-             outcome is reported"
+            "the handler's rejection must reach the caller's inbox, the one place the \
+             dispatch's outcome is reported"
         );
         fx.stop().await;
     }
@@ -12899,7 +14404,7 @@ mod legacy_alias_tests {
 #[cfg(all(test, unix))]
 mod hook_provenance_audit_tests {
     use super::*;
-    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, PtyWritePause, SpawnOptions};
     use crate::state::{AppState, MAX_UNPROVEN_SESSIONS, SessionStatus};
     use spec::spec;
     use std::os::unix::fs::PermissionsExt;
@@ -14169,6 +15674,720 @@ mod hook_provenance_audit_tests {
             "a report attested to the replaced generation must not lift its \
              successor's quota block"
         );
+    }
+
+    /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, agent A
+    /// exits and agent B replaces it on a pane; B reports Thinking and the
+    /// user presses Escape twice into B. A's Idle naming A, and an Idle naming
+    /// no agent but attested to A's token, must leave B's Escapes holding the
+    /// doorbell, and so must A's Thinking then Idle after B's own Idle and a
+    /// second Escape pair, and B's own Idle with no Thinking of B's before it;
+    /// B's own Idle releases them once B has reported Thinking.
+    #[spec("inbox/doorbell/020")]
+    #[tokio::test]
+    async fn doorbell_020_a_replaced_generations_idle_cannot_release_its_successors_escapes() {
+        for agent_type in ["claude_code", "codex", "opencode", "pi"] {
+            let pane = format!("escape-generation-{agent_type}");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let old = spawn(&registry, Some(&pane), "/usr/bin/true");
+            wait_until_nothing_lives(&registry).await;
+            let new = spawn(&registry, Some(&pane), "cat");
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            let (event_tx, _events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let ingest = async |kind: &str, agent: Option<&str>, attested: Option<&str>| {
+                let mut payload = line(&format!("{pane}-session"), Some(&pane), agent, kind, None);
+                payload["agent_type"] = agent_type.into();
+                ingest_event_unless(
+                    &state,
+                    &event_tx,
+                    &registry,
+                    event_of(payload),
+                    false,
+                    attested,
+                    |_| false,
+                )
+                .await;
+            };
+            let writer = registry.agent_writer(&new).expect("the successor's writer");
+            let escape_twice = async || {
+                writer
+                    .lock()
+                    .await
+                    .write_user(&[0x1b, 0x1b])
+                    .await
+                    .expect("Escape twice reaches the successor");
+            };
+
+            ingest("thinking", Some(&new), None).await;
+            escape_twice().await;
+            assert!(
+                registry.draft_pending(&pane),
+                "{agent_type}: precondition: the successor's interrupt holds"
+            );
+            ingest("idle", Some(&old), None).await;
+            let after_tagged = registry.draft_pending(&pane);
+            ingest("idle", None, Some(&old)).await;
+            let after_attested = registry.draft_pending(&pane);
+            ingest("idle", Some(&new), None).await;
+            let after_own = registry.draft_pending(&pane);
+
+            escape_twice().await;
+            ingest("thinking", Some(&old), None).await;
+            ingest("idle", Some(&old), None).await;
+            let after_old_turn = registry.draft_pending(&pane);
+            ingest("idle", Some(&new), None).await;
+            let after_own_idle_alone = registry.draft_pending(&pane);
+            ingest("thinking", Some(&new), None).await;
+            ingest("idle", Some(&new), None).await;
+            let after_own_again = registry.draft_pending(&pane);
+            registry.shutdown_all();
+
+            assert!(
+                after_tagged,
+                "{agent_type}: an Idle naming the replaced generation released \
+                 its successor's Escapes"
+            );
+            assert!(
+                after_attested,
+                "{agent_type}: an untagged Idle attested to the replaced \
+                 generation released its successor's Escapes"
+            );
+            assert!(
+                !after_own,
+                "{agent_type}: the successor's own Idle must release its Escapes"
+            );
+            assert!(
+                after_old_turn,
+                "{agent_type}: the replaced generation's Thinking then Idle \
+                 released the successor's Escapes on an Idle agent"
+            );
+            assert!(
+                after_own_idle_alone,
+                "{agent_type}: the successor's Idle with no turn under way \
+                 released the Escapes that opened a menu on an Idle agent"
+            );
+            assert!(
+                !after_own_again,
+                "{agent_type}: the successor's own turn ending must release them again"
+            );
+        }
+    }
+
+    /// PRD #1666 (r8k R8G-02): one pane with a live `cat` agent of
+    /// `agent_type`, and the daemon's own ingest path for its hook reports.
+    struct TurnPane {
+        registry: Arc<AgentPtyRegistry>,
+        state: SharedState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        pane: String,
+        agent: String,
+        agent_type: &'static str,
+    }
+
+    impl TurnPane {
+        fn new(pane: &str, agent_type: &'static str) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let agent = spawn(&registry, Some(pane), "cat");
+            Self::with(registry, pane, agent, agent_type)
+        }
+
+        fn with(
+            registry: Arc<AgentPtyRegistry>,
+            pane: &str,
+            agent: String,
+            agent_type: &'static str,
+        ) -> Self {
+            let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            Self {
+                registry,
+                state: Arc::new(tokio::sync::RwLock::new(AppState::default())),
+                event_tx,
+                pane: pane.to_string(),
+                agent,
+                agent_type,
+            }
+        }
+
+        /// The agent reports `kind` (`thinking`, `idle`, …) about itself.
+        async fn report(&self, kind: &str) {
+            self.report_with(kind, serde_json::json!({})).await;
+        }
+
+        /// `kind` as `dot-agent-deck wrap` classifies it from the agent's
+        /// output, in its name.
+        async fn report_classified(&self, kind: &str) {
+            let mut metadata = serde_json::Map::new();
+            metadata.insert(
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.into(),
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.into(),
+            );
+            self.report_with(kind, metadata.into()).await;
+        }
+
+        async fn report_with(&self, kind: &str, metadata: serde_json::Value) {
+            let mut payload = line(
+                &format!("{}-session", self.pane),
+                Some(&self.pane),
+                Some(&self.agent),
+                kind,
+                None,
+            );
+            payload["agent_type"] = self.agent_type.into();
+            payload["metadata"] = metadata;
+            ingest_event_unless(
+                &self.state,
+                &self.event_tx,
+                &self.registry,
+                event_of(payload),
+                false,
+                None,
+                |_| false,
+            )
+            .await;
+        }
+
+        /// The user's keys `bytes`, through the agent's writer.
+        async fn keys(&self, bytes: &[u8]) {
+            let writer = self
+                .registry
+                .agent_writer(&self.agent)
+                .expect("the agent's writer");
+            writer
+                .lock()
+                .await
+                .write_user(bytes)
+                .await
+                .expect("the keys reach the agent");
+        }
+
+        /// [`Self::keys`] on a task of its own, for a write parked at a seam.
+        fn keys_in_background(&self, bytes: &'static [u8]) -> tokio::task::JoinHandle<()> {
+            let writer = self
+                .registry
+                .agent_writer(&self.agent)
+                .expect("the agent's writer");
+            tokio::spawn(async move {
+                writer
+                    .lock()
+                    .await
+                    .write_user(bytes)
+                    .await
+                    .expect("the keys reach the agent");
+            })
+        }
+
+        fn holds(&self) -> bool {
+            self.registry.draft_pending(&self.pane)
+        }
+    }
+
+    /// Wait, off the runtime, for a test seam's "reached" signal.
+    async fn reached(rx: std::sync::mpsc::Receiver<()>, what: &'static str) {
+        tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{what}"))
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, the agent
+    /// finishes a turn (Thinking, then Idle), the user presses Escape twice
+    /// on the Idle agent — a menu — and the agent then reports Idle twice
+    /// more, as OpenCode does. The repeated Idle ends no turn, so the Escapes
+    /// must keep holding the doorbell; the agent's next Thinking then Idle
+    /// releases them.
+    #[spec("inbox/doorbell/021")]
+    #[tokio::test]
+    async fn doorbell_021_a_repeated_idle_releases_no_menus_escapes() {
+        for agent_type in ["claude_code", "codex", "opencode", "pi"] {
+            let pane = TurnPane::new(&format!("repeated-idle-{agent_type}"), agent_type);
+            pane.report("thinking").await;
+            pane.report("idle").await;
+            pane.keys(&[0x1b, 0x1b]).await;
+            pane.report("idle").await;
+            pane.report("idle").await;
+            let after_repeats = pane.holds();
+            pane.report("thinking").await;
+            pane.report("idle").await;
+            let after_turn = pane.holds();
+            pane.registry.shutdown_all();
+
+            assert!(
+                after_repeats,
+                "{agent_type}: a repeated Idle released a menu's Escapes"
+            );
+            assert!(
+                !after_turn,
+                "{agent_type}: the agent's next turn ending must release them"
+            );
+        }
+    }
+
+    /// Scenario: The agent reports Thinking and the user presses Escape twice.
+    /// The PTY takes both keys, and the agent's Idle is ingested after the
+    /// write returned but before the keys are recorded. The Escapes reached
+    /// the agent before its turn ended, so they were the interrupt, and must
+    /// not hold the doorbell once recorded.
+    #[spec("inbox/doorbell/022")]
+    #[tokio::test]
+    async fn doorbell_022_an_interrupt_recorded_after_its_idle_holds_nothing() {
+        let pane = TurnPane::new("escape-recorded-late", "opencode");
+        pane.report("thinking").await;
+        let (at_record, release) = pane
+            .registry
+            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::BeforeRecord);
+        let write = pane.keys_in_background(&[0x1b, 0x1b]);
+        reached(at_record, "the write never reached its record").await;
+        pane.report("idle").await;
+        release.send(()).unwrap();
+        write.await.unwrap();
+        let holds = pane.holds();
+        pane.registry.shutdown_all();
+        assert!(
+            !holds,
+            "an interrupt recorded after the Idle that ended its turn held the doorbell"
+        );
+    }
+
+    /// Scenario: The agent reports Thinking and the user presses Escape twice,
+    /// and the agent's Idle is ingested before the PTY write: once with the
+    /// whole write parked before it, and once while the second part of a
+    /// write the PTY took one byte at a time is still in progress (three
+    /// Escapes, the last two after the Idle). Escapes that reach an agent
+    /// already Idle open a menu, so in both the Escapes must hold the doorbell.
+    #[spec("inbox/doorbell/023")]
+    #[tokio::test]
+    async fn doorbell_023_escapes_written_after_the_idle_keep_the_menu_held() {
+        let pane = TurnPane::new("escape-written-late", "opencode");
+        pane.report("thinking").await;
+        let (at_write, release) = pane
+            .registry
+            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::BeforeWrite);
+        let write = pane.keys_in_background(&[0x1b, 0x1b]);
+        reached(at_write, "the write never reached the PTY").await;
+        pane.report("idle").await;
+        release.send(()).unwrap();
+        write.await.unwrap();
+        let whole_write_holds = pane.holds();
+        pane.registry.shutdown_all();
+
+        let pane = TurnPane::new("escape-partial-write", "opencode");
+        let second_part = Arc::new(SecondPartGate::default());
+        let _displaced = pane
+            .registry
+            .replace_agent_writer_for_test(
+                &pane.agent,
+                Box::new(OneByteThenGated {
+                    calls: 0,
+                    gate: second_part.clone(),
+                }),
+            )
+            .await;
+        pane.report("thinking").await;
+        let write = pane.keys_in_background(&[0x1b, 0x1b, 0x1b]);
+        second_part.wait_until_reached().await;
+        pane.report("idle").await;
+        second_part.release();
+        write.await.unwrap();
+        let partial_write_holds = pane.holds();
+        pane.registry.shutdown_all();
+
+        assert!(
+            whole_write_holds,
+            "Escapes written after the Idle were read as the ended turn's interrupt"
+        );
+        assert!(
+            partial_write_holds,
+            "the part of a write the PTY took after the Idle was read as the \
+             ended turn's interrupt"
+        );
+    }
+
+    /// A writer that takes one byte on its first call, then parks its second
+    /// call until [`SecondPartGate::release`] and takes the rest.
+    struct OneByteThenGated {
+        calls: usize,
+        gate: Arc<SecondPartGate>,
+    }
+
+    impl std::io::Write for OneByteThenGated {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Ok(buf.len().min(1));
+            }
+            if self.calls == 2 {
+                self.gate.park();
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct SecondPartGate {
+        state: std::sync::Mutex<(bool, bool)>,
+        wake: std::sync::Condvar,
+    }
+
+    impl SecondPartGate {
+        fn park(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.wake.notify_all();
+            while !state.1 {
+                state = self.wake.wait(state).unwrap();
+            }
+        }
+
+        async fn wait_until_reached(self: &Arc<Self>) {
+            let gate = self.clone();
+            tokio::task::spawn_blocking(move || {
+                let state = gate.state.lock().unwrap();
+                let (state, timeout) = gate
+                    .wake
+                    .wait_timeout_while(state, Duration::from_secs(10), |state| !state.0)
+                    .unwrap();
+                assert!(
+                    !timeout.timed_out() && state.0,
+                    "the write's second part never started"
+                );
+            })
+            .await
+            .unwrap();
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, a freshly
+    /// started agent reports Thinking before the user has typed anything into
+    /// its pane, the user presses Escape twice, and the agent reports Idle.
+    /// That first turn counts, so the interrupt must not hold the doorbell.
+    #[spec("inbox/doorbell/024")]
+    #[tokio::test]
+    async fn doorbell_024_a_first_turn_reported_before_any_input_is_a_turn() {
+        for agent_type in ["claude_code", "codex", "opencode", "pi"] {
+            let pane = TurnPane::new(&format!("fresh-stream-{agent_type}"), agent_type);
+            pane.report("thinking").await;
+            pane.keys(&[0x1b, 0x1b]).await;
+            pane.report("idle").await;
+            let holds = pane.holds();
+            pane.registry.shutdown_all();
+            assert!(
+                !holds,
+                "{agent_type}: the first turn's Thinking, reported before any \
+                 input, was lost and its interrupt held the doorbell"
+            );
+        }
+    }
+
+    /// Scenario: An agent is started on a pane and reports Thinking while its
+    /// start is still being registered, before the deck publishes it. Once
+    /// it is published, the user presses Escape twice and the agent reports
+    /// Idle: the early Thinking began that turn, so the interrupt must not
+    /// hold the doorbell.
+    #[spec("inbox/doorbell/025")]
+    #[tokio::test]
+    async fn doorbell_025_a_turn_reported_before_publication_is_kept() {
+        let temp = crate::test_temp::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        let script = temp.path().join("reserved-agent.sh");
+        crate::test_isolation::write_script(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$DOT_AGENT_DECK_AGENT_ID\" > \"$TURN_TEST_IDENTITY\"\nexec /bin/cat\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (forked, publish) = registry.pause_next_publish_for_test();
+        let spawning = tokio::task::spawn_blocking({
+            let registry = registry.clone();
+            let identity = identity.clone();
+            move || {
+                registry.spawn_agent(SpawnOptions {
+                    command: Some(script.to_str().unwrap()),
+                    env: vec![
+                        (
+                            DOT_AGENT_DECK_PANE_ID.into(),
+                            "busy-before-publication".into(),
+                        ),
+                        (
+                            "TURN_TEST_IDENTITY".into(),
+                            identity.to_string_lossy().into_owned(),
+                        ),
+                    ],
+                    ..Default::default()
+                })
+            }
+        });
+        reached(forked, "the child never forked").await;
+        let agent = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&identity)
+                    && text.ends_with('\n')
+                {
+                    break text.trim().to_string();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the child never wrote its id"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .await
+        .unwrap();
+        let pane = TurnPane::with(registry, "busy-before-publication", agent, "opencode");
+        assert!(
+            pane.registry.agent_writer(&pane.agent).is_none(),
+            "precondition: the agent is not published yet"
+        );
+        pane.report("thinking").await;
+        publish.send(()).unwrap();
+        let published = spawning.await.unwrap().expect("the spawn publishes");
+        assert_eq!(published, pane.agent);
+        pane.keys(&[0x1b, 0x1b]).await;
+        pane.report("idle").await;
+        let holds = pane.holds();
+        pane.registry.shutdown_all();
+        assert!(
+            !holds,
+            "a Thinking reported before publication was lost and the first \
+             turn's interrupt held the doorbell"
+        );
+    }
+
+    /// Scenario: The agent reports Thinking and the user's interrupt arrives
+    /// as two separate Escape writes; the agent reports Idle and the
+    /// interrupt must not hold the doorbell. On an Idle agent two separate
+    /// Escape writes are a menu and hold it. And when the first of two
+    /// Escapes is recorded only after the Idle that ended its turn (it
+    /// reached the agent before), the second Escape, written after, does not
+    /// pair with it and holds nothing.
+    #[spec("inbox/doorbell/026")]
+    #[tokio::test]
+    async fn doorbell_026_split_escapes_pair_only_within_one_turn() {
+        let pane = TurnPane::new("split-interrupt", "opencode");
+        pane.report("thinking").await;
+        pane.keys(&[0x1b]).await;
+        pane.keys(&[0x1b]).await;
+        pane.report("idle").await;
+        let interrupt_holds = pane.holds();
+        pane.keys(&[0x1b]).await;
+        pane.keys(&[0x1b]).await;
+        let menu_holds = pane.holds();
+        pane.registry.shutdown_all();
+
+        let pane = TurnPane::new("split-across-the-idle", "opencode");
+        pane.report("thinking").await;
+        let (at_record, release) = pane
+            .registry
+            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::BeforeRecord);
+        let write = pane.keys_in_background(&[0x1b]);
+        reached(at_record, "the first Escape never reached its record").await;
+        pane.report("idle").await;
+        release.send(()).unwrap();
+        write.await.unwrap();
+        pane.keys(&[0x1b]).await;
+        let across_holds = pane.holds();
+        pane.registry.shutdown_all();
+
+        assert!(
+            !interrupt_holds,
+            "an interrupt split across two writes held the doorbell"
+        );
+        assert!(
+            menu_holds,
+            "two Escape writes on an Idle agent are a menu and must hold"
+        );
+        assert!(
+            !across_holds,
+            "an Escape after the Idle paired with one that reached the agent \
+             before it"
+        );
+    }
+
+    /// Scenario: The agent reports Thinking and the user presses Escape
+    /// twice. The PTY takes both keys, and the agent's Idle — the turn the
+    /// Escapes interrupted ending — is ingested after the write returned but
+    /// before the deck reads the turn count for those keys. The deck cannot
+    /// tell that Idle from one that came before the keys, so the Escapes
+    /// must hold the doorbell until the user's Enter — pressed twice, since
+    /// an Enter right after an Escape reads as Alt+Enter.
+    #[spec("inbox/doorbell/027")]
+    #[tokio::test]
+    async fn doorbell_027_an_idle_between_the_write_and_its_count_holds_the_doorbell() {
+        let pane = TurnPane::new("escape-idle-before-count", "opencode");
+        pane.report("thinking").await;
+        let (after_write, release) = pane
+            .registry
+            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::AfterWrite);
+        let write = pane.keys_in_background(&[0x1b, 0x1b]);
+        reached(after_write, "the write never returned").await;
+        pane.report("idle").await;
+        release.send(()).unwrap();
+        write.await.unwrap();
+        let held = pane.holds();
+        pane.keys(b"\r").await;
+        pane.keys(b"\r").await;
+        let after_enter = pane.holds();
+        pane.registry.shutdown_all();
+        assert!(
+            held,
+            "an Idle ingested between the write and its turn-count reading \
+             released the Escapes"
+        );
+        assert!(!after_enter, "the user's Enter must release them");
+    }
+
+    /// Scenario: Agent A is sent keys, and its PTY takes them, but the deck
+    /// has not recorded them yet when A exits on its own and agent B replaces
+    /// it on the pane. B finishes a turn and the user presses Escape twice
+    /// on Idle B, which holds the doorbell, and A's Escapes, recorded late,
+    /// must not release B's. When A's late keys are text instead, B, with
+    /// nothing typed, must hold nothing, since A's keys are not B's input.
+    #[spec("inbox/doorbell/028")]
+    #[tokio::test]
+    async fn doorbell_028_a_replaced_agents_late_keys_do_not_reach_its_successors_input() {
+        async fn late_keys_after_handover(
+            pane_id: &str,
+            late: &'static [u8],
+            successor: impl AsyncFnOnce(&TurnPane),
+        ) -> bool {
+            let temp = crate::test_temp::tempdir().unwrap();
+            let exit_file = temp.path().join("exit");
+            let script = temp.path().join("exits-on-request.sh");
+            crate::test_isolation::write_script(
+                &script,
+                "#!/bin/sh\nwhile [ ! -e \"$EXIT_FILE\" ]; do sleep 0.01; done\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let old = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(script.to_str().unwrap()),
+                    env: vec![
+                        (DOT_AGENT_DECK_PANE_ID.into(), pane_id.into()),
+                        ("EXIT_FILE".into(), exit_file.to_string_lossy().into_owned()),
+                    ],
+                    ..Default::default()
+                })
+                .expect("spawn the agent that exits");
+            let old_pane = TurnPane::with(registry.clone(), pane_id, old, "opencode");
+            let (at_record, release) =
+                registry.pause_next_pty_write_for_test(pane_id, PtyWritePause::BeforeRecord);
+            let write = old_pane.keys_in_background(late);
+            reached(at_record, "the old agent's write never reached its record").await;
+            std::fs::write(&exit_file, b"").unwrap();
+            wait_until_nothing_lives(&registry).await;
+            let new = spawn(&registry, Some(pane_id), "cat");
+            let pane = TurnPane::with(registry.clone(), pane_id, new, "opencode");
+            successor(&pane).await;
+            release.send(()).unwrap();
+            write.await.unwrap();
+            let holds = pane.holds();
+            registry.shutdown_all();
+            holds
+        }
+
+        let menu_holds = late_keys_after_handover(
+            "late-escapes-after-handover",
+            &[0x1b, 0x1b],
+            async |pane: &TurnPane| {
+                pane.report("thinking").await;
+                pane.report("idle").await;
+                pane.keys(&[0x1b, 0x1b]).await;
+                assert!(pane.holds(), "precondition: the successor's menu holds");
+            },
+        )
+        .await;
+        let text_holds =
+            late_keys_after_handover("late-text-after-handover", b"a", async |_: &TurnPane| {})
+                .await;
+
+        assert!(
+            menu_holds,
+            "the replaced agent's Escapes, recorded late, released its \
+             successor's menu"
+        );
+        assert!(
+            !text_holds,
+            "the replaced agent's keys, recorded late, were taken as its \
+             successor's draft"
+        );
+    }
+
+    /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, the agent
+    /// reports Thinking and the user presses Escape twice. An Idle that
+    /// `dot-agent-deck wrap` classified from the agent's output then arrives,
+    /// as a wrapped Codex's quiet output sends it. Output going quiet is not
+    /// the agent reporting its turn over, so the Escapes must keep holding
+    /// the doorbell; the agent's own Idle then releases them.
+    #[spec("inbox/doorbell/029")]
+    #[tokio::test]
+    async fn doorbell_029_a_wrapper_classified_idle_ends_no_reported_turn() {
+        for agent_type in ["claude_code", "codex", "opencode", "pi"] {
+            let pane = TurnPane::new(&format!("classified-idle-{agent_type}"), agent_type);
+            pane.report("thinking").await;
+            pane.keys(&[0x1b, 0x1b]).await;
+            pane.report_classified("idle").await;
+            let after_classified = pane.holds();
+            pane.report("idle").await;
+            let after_own = pane.holds();
+            pane.registry.shutdown_all();
+
+            assert!(
+                after_classified,
+                "{agent_type}: a wrapper-classified Idle ended the turn the \
+                 agent reported, releasing its Escapes"
+            );
+            assert!(
+                !after_own,
+                "{agent_type}: the agent's own Idle must release them"
+            );
+        }
+    }
+
+    /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, the agent
+    /// finishes a turn (Thinking, then Idle) and the user presses Escape
+    /// twice on the Idle agent — a menu. A ToolEnd of that finished turn
+    /// then arrives late, followed by another Idle. A tool finishing starts
+    /// no turn, so the Escapes must keep holding the doorbell; the agent's
+    /// next Thinking then Idle releases them.
+    #[spec("inbox/doorbell/030")]
+    #[tokio::test]
+    async fn doorbell_030_a_late_tool_end_starts_no_turn() {
+        for agent_type in ["claude_code", "codex", "opencode", "pi"] {
+            let pane = TurnPane::new(&format!("late-tool-end-{agent_type}"), agent_type);
+            pane.report("thinking").await;
+            pane.report("idle").await;
+            pane.keys(&[0x1b, 0x1b]).await;
+            pane.report("tool_end").await;
+            pane.report("idle").await;
+            let after_late_tool_end = pane.holds();
+            pane.report("thinking").await;
+            pane.report("idle").await;
+            let after_turn = pane.holds();
+            pane.registry.shutdown_all();
+
+            assert!(
+                after_late_tool_end,
+                "{agent_type}: a late ToolEnd then Idle released a menu's Escapes"
+            );
+            assert!(
+                !after_turn,
+                "{agent_type}: the agent's next turn ending must release them"
+            );
+        }
     }
 
     /// Scenario: Agent A exits and agent B replaces it on a pane, and an

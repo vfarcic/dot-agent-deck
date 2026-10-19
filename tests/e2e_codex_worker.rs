@@ -2,7 +2,6 @@
 
 //! L2 real-Codex orchestration-worker proof for PRD #20.
 
-use std::path::Path;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
@@ -16,16 +15,6 @@ const WORKER_PANE: &str = "codex-worker-pane";
 const WORKER_ROLE: &str = "coder";
 const SENTINEL_NAME: &str = "codex_worker_sentinel_c81f2a.txt";
 const SENTINEL_CONTENT: &str = "CODEX_WORKER_SENTINEL_OK";
-
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
 
 /// Scenario: Start a real cheap-model Codex as the `coder` role through the
 /// normal wrapper spawn seam, then have a synthetic orchestrator delegate a
@@ -53,16 +42,6 @@ fn codex_worker_001_real_worker_receives_delegate_and_signals_work_done() {
 #[spec("codex/worker/002")]
 #[test]
 fn codex_worker_002_clear_false_delegate_to_a_starting_worker_arrives_whole() {
-    // The pointer's in-place re-send off: this test is about the FIRST write.
-    // With it on, a pointer lost in a starting Codex is pressed in again 20 s
-    // later, and the test would pass whether or not the deck waited for Codex.
-    // SAFETY: a stated residual, not a proof (issue #1516). Set at the top of
-    // the sync entry point, before the availability probe and the tokio
-    // runtime exist, and never written again; nextest runs each test in its
-    // own process, so the change cannot reach another test.
-    unsafe {
-        std::env::set_var("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", "0");
-    }
     skip_unless!(common::check_codex_available());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -148,7 +127,10 @@ async fn codex_worker_inner(launch: WorkerLaunch) {
                     "DOT_AGENT_DECK_SOCKET".to_string(),
                     daemon.hook_path.display().to_string(),
                 ),
-                ("PATH".to_string(), path_with_binary_dir()),
+                ("PATH".to_string(), common::path_with_binary_dir()),
+                // This fixture owns a PTY even when the test runner's parent
+                // uses pipes and advertises TERM=dumb.
+                ("TERM".to_string(), "xterm-256color".to_string()),
                 (
                     "HOME".to_string(),
                     codex_home
@@ -215,7 +197,10 @@ async fn codex_worker_inner(launch: WorkerLaunch) {
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: format!(
-            "First create {SENTINEL_NAME} in the current working directory with the exact contents {SENTINEL_CONTENT} and no trailing newline. Then run the dot-agent-deck work-done command from the completion instructions below. Do not stop before both steps are complete."
+            "First create the file {} containing exactly {SENTINEL_CONTENT}. Then run the dot-agent-deck work-done command from the completion instructions below. Do not stop before both steps are complete.",
+            // PRD #1666: the absolute path, so the model need not infer its
+            // working directory (one inferred it from the deck binary's path).
+            cwd.path().join(SENTINEL_NAME).display()
         ),
         to: vec![WORKER_ROLE.to_string()],
         supersede: false,
@@ -232,6 +217,9 @@ async fn codex_worker_inner(launch: WorkerLaunch) {
     let sentinel = cwd.path().join(SENTINEL_NAME);
     // Poll the CONTENT, not existence: a shell redirect creates the file before
     // the write lands, so an existence wait can read it empty (issue #244).
+    // Compared trimmed, which is why the task does not ask for "no trailing
+    // newline": asked that, the cheap model reached for `truncate` and twice
+    // wrote a padded or cut sentinel, or stopped before work-done (2026-10-14).
     // `codex/worker/002` runs inside nextest's 180 s terminate-after, so its
     // wait ends early enough for the panic below to show the pane.
     let sentinel_wait = match launch {

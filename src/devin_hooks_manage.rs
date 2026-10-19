@@ -273,8 +273,9 @@ fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
 /// Whether a re-install by `binary_path` may REPLACE `command`: it is either
 /// this binary's own prior deck command, or a deck command naming a pin the deck
 /// cannot use — missing, bare or relative, non-executable, or a build-artifact
-/// path — under this binary's basename. The union of
-/// [`command_is_this_binary`] and [`command_is_dead_deck`], named once because
+/// path — under this binary's basename — or naming an install this copy
+/// supersedes. The union of [`command_is_this_binary`],
+/// [`command_is_dead_deck`] and [`command_is_superseded_deck`], named once because
 /// [`install_impl`] applies it in two places — the installed events and the
 /// retired-event sweep — and the two must not drift apart (issue #730).
 ///
@@ -287,7 +288,17 @@ fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
 /// this as pruning only what is positively gone; it prunes what the deck would
 /// refuse to write.
 fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
-    command_is_this_binary(command, binary_path) || command_is_dead_deck(command, binary_path)
+    command_is_this_binary(command, binary_path)
+        || command_is_dead_deck(command, binary_path)
+        || command_is_superseded_deck(command, binary_path)
+}
+
+/// Whether `command` is a deck command naming an install this copy supersedes
+/// ([`crate::agent_hook_config::pin_is_superseded_sibling`]), whose rule under a
+/// retired event the takeover would otherwise leave behind.
+fn command_is_superseded_deck(command: &str, binary_path: &str) -> bool {
+    deck_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::pin_is_superseded_sibling(&exe, binary_path))
 }
 
 /// Whether an install by `binary_path` owns `command` under an event it
@@ -342,7 +353,10 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
     // That is issue #730's own defect one door along.
     //
     // The consequence, stated rather than left to be discovered: a FOREIGN
-    // install's retired-event hook is left in place by install, with the two
+    // install's retired-event hook is left in place by install — unless this
+    // copy supersedes that install (issue #1637's takeover), which repointed its
+    // installed events here and leaves nothing else to remove its retired ones
+    // (`command_is_superseded_deck`) — with the two
     // exceptions the Codex writer applies (PRD #1497 audit F4,
     // `remediate_retired_deck_handlers`), and like it only to a command naming
     // a deck install (this binary, or an executable sharing its basename;

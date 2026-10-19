@@ -15,6 +15,8 @@
 //! `pane <verb>` family), not another entry in `tests/pane_restart.rs`.
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::time::Duration;
 
@@ -101,14 +103,13 @@ fn run_delegate_cli(
 /// failure, not a wait condition. Once restarted, prove the pane is
 /// genuinely reachable — not merely that the daemon's own registry says so —
 /// by running the REAL `dot-agent-deck delegate --to coder` CLI and
-/// confirming the delegated task's one-line file-pointer
-/// (`compose_delegate_prompt`'s "Read .dot-agent-deck/worker-task-coder..."
-/// text, the same substring `tests/e2e_pi_live.rs` already waits for to
-/// prove a delegate landed) actually renders in `coder`'s pane through the
-/// STILL-ATTACHED TUI once focused there. A daemon that only fixes its own
-/// bookkeeping but never gets an already-attached viewer to follow the pane
-/// onto its new agent would pass every handler-level `pane/restart/*` test
-/// and still fail this one.
+/// confirming the task is posted to `coder`'s inbox bound to the RESTARTED
+/// generation (PRD #1666: the deck posts a task rather than typing it), then
+/// focusing `coder` in the STILL-ATTACHED TUI and typing a probe that must
+/// render as `cat`'s echo inside the restarted pane. A daemon that only fixes
+/// its own bookkeeping but never gets an already-attached viewer to follow
+/// the pane onto its new agent would pass every handler-level
+/// `pane/restart/*` test and still fail this one.
 #[spec("pane/restart/009")]
 #[test]
 fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
@@ -199,32 +200,57 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
         String::from_utf8_lossy(&delegate_output.stderr)
     );
 
+    // The task reached the RESTARTED generation: one message in coder's inbox,
+    // bound to the agent id the daemon lists for coder now.
+    let (coder_agent, coder_pane) =
+        role_agent_id(&deck, CODER_ROLE).expect("coder's restarted generation is listed");
+    let task = "prove the restarted pane is reachable";
+    assert!(
+        inbox_view::wait_for(
+            deck.attach_socket_path(),
+            &coder_pane,
+            task,
+            Duration::from_secs(15)
+        ),
+        "the delegate to the just-restarted coder never reached its inbox; inbox = {:?}",
+        inbox_view::messages(deck.attach_socket_path(), &coder_pane)
+    );
+    let bound: Vec<_> = inbox_view::messages(deck.attach_socket_path(), &coder_pane)
+        .into_iter()
+        .filter(|message| message.text.as_deref().is_some_and(|t| t.contains(task)))
+        .collect();
+    assert!(
+        bound.len() == 1 && bound[0].bind_agent.as_deref() == Some(coder_agent.as_str()),
+        "the delegated task must be one message bound to coder's restarted generation \
+         {coder_agent}; matching messages = {bound:?}"
+    );
+
     // Focus coder's own role pane (command mode via Ctrl+d, then `2` jumps to
     // role card 2 and focuses its pane -- coder is the second role declared
-    // in the fixture, after the start-role orchestrator) so its live,
-    // verbatim-echoed PTY content is what the detail panel actually draws.
-    // `cat` carries no recognized agent identity, so the role card's own
-    // unfocused preview field never activates for it -- the delegated
-    // pointer text is only ever observable through the raw PTY echo, which
-    // requires focus.
+    // in the fixture, after the start-role orchestrator), then type a probe.
+    // `cat`'s echo of it can only render if the still-attached TUI follows the
+    // pane onto its restarted agent's live PTY.
     //
     // A single `2` press, then a pure wait -- not a retry. The digit jump
     // only resolves in `UiMode::Normal`; a successful `focus_deck` switches
     // straight to `UiMode::PaneInput`, so only the FIRST `2` after `\x04` is
     // ever interpreted as a jump -- resending `2` on a retry would land as a
-    // literal keystroke forwarded into whichever pane is already focused,
-    // not a jump, so it could never recover from the race it would be trying
-    // to guard against. Waiting once for the needle after a single press is
-    // both correct and sufficient here.
+    // literal keystroke forwarded into whichever pane is already focused.
     deck.send_bytes(b"\x04"); // PaneInput -> Command Mode
+    deck.wait_for_absence("[Command Mode Ctrl+D]");
     deck.send_bytes(b"2"); // jump to role card 2 (coder) and focus it
+    // Back in PaneInput: the probe below goes to the focused pane, never to
+    // Command Mode's key bindings.
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    let probe = "RESTART-PROBE-009";
+    deck.send_bytes(probe.as_bytes());
     assert!(
-        deck.wait_for_grid_string_within("worker-task-coder", Duration::from_secs(15)),
+        deck.wait_for_grid_string_within(probe, Duration::from_secs(15)),
         "a role restarted via `pane restart` must stay genuinely reachable in an \
-         ALREADY-ATTACHED TUI -- after focusing coder's role card, the delegated \
-         task's file-pointer text never rendered in coder's pane, meaning a \
-         still-attached TUI failed to render the restarted pane's live PTY once \
-         focused after the fact.\nGrid:\n{}",
+         ALREADY-ATTACHED TUI -- after focusing coder's role card, a probe typed into \
+         it never rendered as the restarted `cat`'s echo, meaning a still-attached TUI \
+         failed to render the restarted pane's live PTY once focused after the fact.\n\
+         Grid:\n{}",
         deck.snapshot_grid()
     );
 }

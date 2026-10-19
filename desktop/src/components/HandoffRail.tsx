@@ -1,11 +1,13 @@
 import { ArrowRight, CheckCircle2, CircleDashed, RefreshCw, Send, XCircle } from "lucide-react";
+import { INBOX_WORDS } from "../lib/inboxWords";
 import type { HandoffEdge } from "../types";
 
+/** PRD #1666: the inbox's words, which the TUI uses for the same states (rule 22). */
 const STATUS_LABEL: Record<HandoffEdge["status"], string> = {
-  delegated: "delegated",
-  delivered: "delivered · working",
-  failed: "FAILED",
-  done: "work-done",
+  delegated: `delegated · ${INBOX_WORDS.queued}`,
+  delivered: `${INBOX_WORDS.delivered} · working`,
+  failed: INBOX_WORDS.notDelivered,
+  done: INBOX_WORDS.workDone,
 };
 
 function StatusIcon({ status }: { status: HandoffEdge["status"] }) {
@@ -17,8 +19,8 @@ function StatusIcon({ status }: { status: HandoffEdge["status"] }) {
 
 /**
  * Live delegation chain (handoff-visibility PRD D2): one row per delegation,
- * newest first, driven entirely by the daemon's delegation events. A failed
- * edge shows its reason inline — the whole point is that a dropped delegation
+ * newest first, driven entirely by the daemon's inbox notices
+ * (`applyHandoffEvent`). An undelivered edge shows its reason inline — the whole point is that a dropped delegation
  * is impossible to miss. The UI says "delegation" (issue #1045); the
  * `Handoff*` identifiers and `handoff-*` classes keep their original names.
  */

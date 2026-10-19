@@ -1,149 +1,37 @@
-//! Issue #544: an automatic FIRST write waits while the user has an unsent
-//! draft in the target pane.
-//!
-//! Every daemon-originated first write — a delegate task pointer, a work-done
-//! hand-off, a dispatch return, a scheduled or spawn-time seed, a reuse fire,
-//! the deck's own status reports — is payload + CR. Written into an input box
-//! that already holds a half-typed user message, that CR submits both as one
-//! turn: `draft-textRead .dot-agent-deck/worker-task-coder.md for your task.`
-//! Issue #424 closed the RETRY half of that (a repeat of bytes we already wrote
-//! is refused once the user has typed since); this module is the first-write
-//! half.
+//! Issue #544: whether the user has an unsent draft in a pane.
 //!
 //! The daemon cannot see an agent's input box, but it does see every byte that
 //! reaches it: what a deck client forwards (`PaneWriter`'s `Write` impl in
 //! [`crate::agent_pty`]) and what the daemon writes itself. So it keeps one bit
-//! per pane — [`DraftTracker`]: "the
-//! user has sent input since their last submit or clear" — and a first write
-//! consults it through [`decide_first_write`]: while the bit is set the write
-//! WAITS, re-checking about every [`DRAFT_POLL_INTERVAL`], until the user
-//! submits or clears, or until [`draft_defer_cap`] has passed. At the cap it
-//! writes exactly as it did before this module existed and says so on the
-//! pane's card. It never refuses and never drops, which is what lets it coexist
-//! with #424's "a seed prompt must arrive" constraint.
+//! per pane — [`DraftTracker`]: "the user has sent input since their last
+//! submit or clear". The doorbell reads it and writes nothing while it is set
+//! (PRD #1666): the deck never types over a draft.
 //!
-//! The bit is a PROXY, and it is wrong in both directions in ways that are all
-//! bounded. Text an agent puts into its own box (history recall, autocomplete,
-//! a restored message) is invisible to it, as is a partial clear it reads as a
-//! full one, so those still concatenate as before. A key that edits nothing (a
-//! menu answer with no Enter, a draft backspaced to empty) sets it, which costs
-//! a delay of at most the cap and is cleared by the user's next Enter.
-//!
-//! Kept below both [`crate::agent_pty`] (which enforces the gate at its single
-//! guarded writer) and [`crate::spawn`] (whose reuse fire shares its cap
-//! budget), so neither has to depend on the other for it.
+//! The bit is a PROXY, and it is wrong in both directions. Text an agent puts
+//! into its own box (history recall, autocomplete, a restored message) is
+//! invisible to it, as is a partial clear it reads as a full one. A key that
+//! edits nothing (a menu answer with no Enter, a draft backspaced to empty)
+//! sets it until the user's next Enter. The one exception is a run of Escape
+//! keys and nothing else, the way the user interrupts a turn (OpenCode's
+//! interrupt is Escape twice): besides a submit or clear, the end of the
+//! turn it interrupted can release it ([`DraftTracker::turn_ended`]). A turn
+//! ends when the pane's own agent reports Idle after reporting itself
+//! working, and `crate::agent_pty` applies that end only to the bytes that
+//! reached the PTY before it (PRD #1666 r8k R8G-02). An Escape run on an
+//! agent that is already Idle opens a menu in some agents, and holds the bit
+//! until a later turn of that agent ends or a submit or clear: a repeated
+//! Idle releases nothing. Where the deck cannot tell whether an Idle came
+//! before the Escapes reached the agent or after, it holds. An agent whose busy reports
+//! never reach the deck has no turn end to release on, and its Escapes hold
+//! until a submit or clear.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// Issue #544: overrides [`DEFAULT_DRAFT_DEFER_CAP`], in **milliseconds**. `0`
-/// switches the gate off, restoring the pre-#544 immediate write exactly. A
-/// non-numeric value falls back to the default with a `warn!`; a value above
-/// [`MAX_DRAFT_DEFER_CAP`] is clamped to it.
-///
-/// Read once, when the daemon's [`crate::agent_pty::AgentPtyRegistry`] is
-/// constructed, so it is set on the daemon's environment rather than the
-/// client's.
-pub const DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS: &str = "DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS";
-
-/// Issue #544: how long an automatic first write waits for the user's draft
-/// before writing anyway. Sixty seconds, the same bound as
-/// [`crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`] and the scheduler's
-/// reuse hard timeout: long enough to finish a thought, short enough that an
-/// unattended orchestration stalled on a stray keystroke moves again on its
-/// own.
-pub const DEFAULT_DRAFT_DEFER_CAP: Duration = Duration::from_secs(60);
-
-/// Issue #544: ceiling for [`DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS`]. Past ten
-/// minutes an orchestration waiting on a draft nobody is finishing is stalled
-/// rather than deferred.
-pub const MAX_DRAFT_DEFER_CAP: Duration = Duration::from_secs(600);
-
-/// Issue #544: how often a deferred first write re-reads the draft bit. It sets
-/// how promptly delivery follows the user's Enter, and costs one mutex read per
-/// waiting write per tick.
+/// How often the idle-worker watch re-reads a delegation whose task is still
+/// queued or not yet acknowledged (`wait_out_pointer_deferral` in
+/// `crate::state`). Issue #544 introduced it as the poll of a deferred first
+/// write; PRD #1666 removed those writes.
 pub const DRAFT_POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// The fixed `DeliveryNotice` detail published when a first write has waited
-/// out the whole cap and is about to be written on top of the draft — published
-/// just before the bytes go in. The daemon's sink carries it on a synthetic
-/// `Error` event, as `tool_detail` and under `DELIVERY_NOTICE_METADATA_KEY`,
-/// but no client renders that text today: the TUI's session card shows only
-/// the `Error` badge, and the desktop app shows the `error` status and a
-/// generic error entry. The readable record of why is the `warn!` logged beside
-/// the publish, present only when the daemon runs with `DOT_AGENT_DECK_LOG`.
-/// Must contain the word `draft`: `scheduler/dispatch/023` keys on it.
-pub const DRAFT_CAP_NOTICE: &str = "a deck prompt waited for the unsent draft in this pane until \
-                                    the draft-deferral cap and was then submitted on top of it, so \
-                                    your draft may have been sent together with it";
-
-/// Issue #544 (PR #1398 review): the fixed `DeliveryNotice` detail published
-/// when a delegated task pointer waited for the unsent draft in a worker pane
-/// and, by the time it could be written, the worker it was meant for had been
-/// replaced — most often by `pane restart`, which does not wait for a delegate's
-/// draft wait to end. The pointer is not written to the replacement. Reported on
-/// the pane's current occupant when a live one exists by then, the only one
-/// whose card the sink will mark; like [`DRAFT_CAP_NOTICE`], what a user sees of
-/// it is the card turning `Error`. When the refusal lands while the replacement
-/// is not yet live, nothing is published and only the daemon log records it.
-pub const DRAFT_WAIT_WORKER_REPLACED_NOTICE: &str = "a delegated task pointer waited for the \
-                                                     unsent draft in this pane, and the worker \
-                                                     it was meant for was replaced before it \
-                                                     could be written, so it was not delivered";
-
-/// Resolve the cap from the environment. See
-/// [`DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS`].
-pub fn draft_defer_cap_from_env() -> Duration {
-    parse_draft_defer_cap(
-        std::env::var(DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS)
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// [`draft_defer_cap_from_env`] on an already-read value, so the parsing is
-/// unit-testable without touching the process environment.
-pub(crate) fn parse_draft_defer_cap(raw: Option<&str>) -> Duration {
-    raw.and_then(|raw| {
-        crate::state::parse_bounded_ms_override(
-            DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS,
-            raw,
-            MAX_DRAFT_DEFER_CAP,
-        )
-    })
-    .unwrap_or(DEFAULT_DRAFT_DEFER_CAP)
-}
-
-/// What a first write should do right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FirstWriteDecision {
-    /// Write. `capped` is `true` when the write goes ahead only because the cap
-    /// has passed with the draft still pending — the degraded case that is
-    /// reported on the pane's card.
-    Now { capped: bool },
-    /// Do not write yet; look again after this long.
-    Wait { after: Duration },
-}
-
-/// Issue #544: the pure gate. `started` is when this delivery's wait budget
-/// began (for a reuse fire, when its idle debounce began — the two share one
-/// budget), and a zero `cap` means the gate is off.
-pub fn decide_first_write(
-    draft_pending: bool,
-    now: Instant,
-    started: Instant,
-    cap: Duration,
-) -> FirstWriteDecision {
-    if !draft_pending || cap.is_zero() {
-        return FirstWriteDecision::Now { capped: false };
-    }
-    let elapsed = now.saturating_duration_since(started);
-    if elapsed >= cap {
-        return FirstWriteDecision::Now { capped: true };
-    }
-    FirstWriteDecision::Wait {
-        after: DRAFT_POLL_INTERVAL.min(cap - elapsed),
-    }
-}
 
 /// Where [`DraftTracker`] is inside an escape sequence.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -250,6 +138,12 @@ const MAX_STRING_LEN: u16 = 4096;
 #[derive(Debug, Default)]
 pub(crate) struct DraftTracker {
     pending: bool,
+    /// Set instead of `pending` by the user's lone Escape keys (`ESC ESC`):
+    /// cleared like `pending` by a submit or clear, and also by
+    /// [`Self::turn_ended`], which `crate::agent_pty` calls
+    /// for the end of a turn of the pane's own agent that came after these
+    /// keys reached it.
+    escapes: bool,
     escape: Escape,
     /// Whether a USER byte is part of the sequence being parsed, counting the
     /// bytes AFTER the `ESC` that opened it — and that `ESC` too inside a
@@ -279,7 +173,25 @@ pub(crate) enum ByteOrigin {
 
 impl DraftTracker {
     pub(crate) fn pending(&self) -> bool {
-        self.pending
+        self.pending || self.escapes
+    }
+
+    /// A turn of the agent's ended after everything fed so far reached it:
+    /// the agent reported Idle having reported itself working. The caller
+    /// decides that (`crate::agent_pty`'s turn edges, and its ordering of the
+    /// end against the PTY write that carried each byte), and calls this for
+    /// no other Idle. Escape keys the user sent before it, with nothing else
+    /// since the last submit or clear, were that turn's interrupt, which
+    /// leaves the box as it was, or a menu the agent has since left by
+    /// working a turn; they hold the bit no longer. Anything else the user
+    /// sent still holds it, and so does a lone Escape still waiting for its
+    /// next byte, but it is no longer counted as half of `ESC ESC`, so an
+    /// Escape after this one does not inherit it.
+    pub(crate) fn turn_ended(&mut self) {
+        self.escapes = false;
+        if self.escape == (Escape::Esc { paste: false }) {
+            self.esc_user = false;
+        }
     }
 
     /// Feed one byte of the pane's input stream. `submits` is whether it
@@ -297,6 +209,7 @@ impl DraftTracker {
             // Enter is a hard reset, whoever pressed it: the box was
             // submitted, and whatever sequence was being parsed is over.
             self.pending = false;
+            self.escapes = false;
             self.escape = Escape::Ground;
             return;
         }
@@ -364,9 +277,13 @@ impl DraftTracker {
                 // counted only when the user sent it (`esc_user`, not this
                 // byte's origin) AND is the one who went on typing: a deck
                 // ESC is never theirs, and a lone Escape keypress followed by
-                // a deck write edits nothing of theirs.
+                // a deck write edits nothing of theirs. It counts as an
+                // Escape key, released only by the end of a turn the agent
+                // reported starting — a known busy-to-Idle edge, ordered
+                // after these keys reached it ([`Self::turn_ended`]) — or by
+                // a submit or clear.
                 ESC => {
-                    self.pending |= self.esc_user && self.by_user;
+                    self.escapes |= self.esc_user && self.by_user;
                     self.ground(byte, in_paste)
                 }
                 // `Alt+<key>`, `Alt+Enter`, `Alt+Backspace`: an edit, and the
@@ -554,6 +471,7 @@ impl DraftTracker {
             0x15 | 0x03 if !in_paste => {
                 if self.by_user {
                     self.pending = false;
+                    self.escapes = false;
                 }
                 Escape::Ground
             }
@@ -587,93 +505,6 @@ mod tests {
         let mut tracker = DraftTracker::default();
         feed(&mut tracker, bytes);
         tracker.pending()
-    }
-
-    #[test]
-    fn decide_first_write_writes_when_no_draft_is_pending() {
-        let now = Instant::now();
-        assert_eq!(
-            decide_first_write(false, now, now, DEFAULT_DRAFT_DEFER_CAP),
-            FirstWriteDecision::Now { capped: false }
-        );
-    }
-
-    #[test]
-    fn decide_first_write_waits_one_poll_while_a_draft_is_pending() {
-        let started = Instant::now();
-        assert_eq!(
-            decide_first_write(
-                true,
-                started + Duration::from_secs(1),
-                started,
-                DEFAULT_DRAFT_DEFER_CAP
-            ),
-            FirstWriteDecision::Wait {
-                after: DRAFT_POLL_INTERVAL
-            }
-        );
-    }
-
-    #[test]
-    fn decide_first_write_never_sleeps_past_the_cap() {
-        let started = Instant::now();
-        let cap = Duration::from_millis(1000);
-        assert_eq!(
-            decide_first_write(true, started + Duration::from_millis(950), started, cap),
-            FirstWriteDecision::Wait {
-                after: Duration::from_millis(50)
-            }
-        );
-    }
-
-    #[test]
-    fn decide_first_write_writes_capped_at_and_after_the_cap() {
-        let started = Instant::now();
-        let cap = Duration::from_millis(1000);
-        for elapsed in [1000, 5000] {
-            assert_eq!(
-                decide_first_write(true, started + Duration::from_millis(elapsed), started, cap),
-                FirstWriteDecision::Now { capped: true },
-                "{elapsed} ms"
-            );
-        }
-    }
-
-    #[test]
-    fn decide_first_write_zero_cap_is_the_gate_off() {
-        let now = Instant::now();
-        assert_eq!(
-            decide_first_write(true, now, now, Duration::ZERO),
-            FirstWriteDecision::Now { capped: false }
-        );
-    }
-
-    #[test]
-    fn decide_first_write_tolerates_a_start_in_the_future() {
-        let now = Instant::now();
-        assert_eq!(
-            decide_first_write(
-                true,
-                now,
-                now + Duration::from_secs(5),
-                Duration::from_secs(1)
-            ),
-            FirstWriteDecision::Wait {
-                after: DRAFT_POLL_INTERVAL
-            }
-        );
-    }
-
-    #[test]
-    fn draft_defer_cap_parses_default_zero_value_and_ceiling() {
-        assert_eq!(parse_draft_defer_cap(None), DEFAULT_DRAFT_DEFER_CAP);
-        assert_eq!(parse_draft_defer_cap(Some("0")), Duration::ZERO);
-        assert_eq!(
-            parse_draft_defer_cap(Some("1500")),
-            Duration::from_millis(1500)
-        );
-        assert_eq!(parse_draft_defer_cap(Some("99999999")), MAX_DRAFT_DEFER_CAP);
-        assert_eq!(parse_draft_defer_cap(Some("soon")), DEFAULT_DRAFT_DEFER_CAP);
     }
 
     #[test]
@@ -962,6 +793,57 @@ mod tests {
         feed(&mut tracker, b"\x1b");
         feed_as(&mut tracker, b"\x1b[200~NOTICE\x1b[201~", ByteOrigin::Deck);
         assert!(!tracker.pending(), "a lone Escape before our paste");
+    }
+
+    /// PRD #1666 (live `inbox/opencode/022`): OpenCode's interrupt is Escape,
+    /// a pause, Escape. Escape keys and nothing else hold the bit only until
+    /// the agent reports Idle, and an Escape after that Idle is not half of a
+    /// double Escape with the interrupt's. A draft typed before or after the
+    /// Escapes, or around them, still holds it, and so does a double Escape
+    /// on an agent that is already Idle until the next Idle.
+    #[test]
+    fn an_interrupts_escapes_hold_the_bit_only_until_the_agent_is_idle() {
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b");
+        feed(&mut tracker, b"\x1b");
+        assert!(tracker.pending(), "before Idle an Escape run may be a menu");
+        tracker.turn_ended();
+        assert!(!tracker.pending(), "the interrupt held the bit after Idle");
+        feed(&mut tracker, b"\x1b");
+        assert!(
+            !tracker.pending(),
+            "an Escape after Idle paired with the interrupt's"
+        );
+        feed(&mut tracker, b"\x1b");
+        assert!(tracker.pending(), "a double Escape on an Idle agent");
+
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b\x1b");
+        tracker.turn_ended();
+        feed(&mut tracker, b"x");
+        assert!(tracker.pending(), "typing after the interrupt");
+
+        for (bytes, why) in [
+            (&b"draft\x1b\x1b"[..], "typed, then Escape"),
+            (b"\x1b\x1bdraft", "Escape, then typed"),
+            (b"dr\x1b\x1baft", "Escape inside a draft"),
+            (b"draft\x1b", "typed, then one Escape"),
+        ] {
+            let mut tracker = DraftTracker::default();
+            feed(&mut tracker, bytes);
+            tracker.turn_ended();
+            assert!(tracker.pending(), "{why}");
+        }
+
+        // A submit still clears an Escape run, and so does a Ctrl+U once the
+        // second Escape is no longer waiting for its next byte (right after
+        // it, `ESC Ctrl+U` is `Alt+Ctrl+U`, an edit).
+        for clear in [&b"\r"[..], b"x\x15"] {
+            let mut tracker = DraftTracker::default();
+            feed(&mut tracker, b"\x1b\x1b");
+            feed(&mut tracker, clear);
+            assert!(!tracker.pending(), "{clear:?}");
+        }
     }
 
     /// Sweep (PR #1398): CSI intermediate bytes are bounded like parameter

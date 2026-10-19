@@ -1,0 +1,17 @@
+---
+source: tests/render_inbox_attention.rs
+expression: rendered
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+  ┌ Deck messages ───────────────────────────────────────────────────────────────────────────────┐  
+  │▸ the orchestrator · review 850                                                               │  
+  │    a deck message may or may not have reached this agent. Retry sends it again marked as a   │  
+  │    possible repeat; Cancel stops delivering it.                                              │  
+  │  the orchestrator · review 851                                                               │  
+  │    out of attempts: the deck sent this message as many times as it allows. Cancel it, or pos…│  
+  │                                                                                              │  
+  │  [Retry r] [Cancel c] [Close]                                                                │  
+  │  r Retry · c Cancel · Esc to close                                                           │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -107,6 +107,16 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {
+        name: "agent-messaging",
+        description: "Planner and builder working with one queued inbox message each.",
+        clients: &[Client::Tui, Client::Desktop],
+    },
+    Scenario {
+        name: "inbox-attention",
+        description: "A Pi card whose first prompt may not have reached the agent, with Deck messages open.",
+        clients: &[Client::Tui, Client::Desktop],
+    },
+    Scenario {
         name: "agent-pane",
         description: "The desktop agent pane over the Dashboard.",
         clients: &[Client::Desktop],

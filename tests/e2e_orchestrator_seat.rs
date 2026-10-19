@@ -4,8 +4,8 @@
 //! orchestrator (issue #523).
 //!
 //! One question — "who is the orchestrator?" — decides four user-visible
-//! things on a tab: which role's pane has focus when the tab opens, which pane
-//! the orchestrator prompt is delivered into, which pane the daemon lets
+//! things on a tab: which role's pane has focus when the tab opens, whose inbox
+//! the orchestrator prompt is posted to, which pane the daemon lets
 //! `delegate`, and which card `daemon status` marks `(orchestrator)`. Before
 //! #523 the `Ctrl+n` path answered it from the bare `start = true` flag and
 //! fell back to role 0 when no role set it, while the daemon's dispatched and
@@ -18,15 +18,19 @@
 //!
 //! The roles are `tee` stand-ins that print a ready sentinel and then copy
 //! whatever reaches their PTY both back to the pane and into a per-role file,
-//! so "which pane received the bytes" is a plain substring question about that
-//! file. The file, not the rendered pane, is asserted on because the prompt
-//! delivery's own control bytes are echoed raw and redraw the pane. They stand
-//! in for a real agent only in that they are processes in a pane; nothing here
-//! depends on an agent reading anything.
+//! so "which pane received the keystrokes" is a plain substring question about
+//! that file. Since PRD #1666 the deck types nothing of its own into a pane:
+//! the orchestrator prompt and a delegated task are posted to the role's
+//! inbox, which the test reads over the attach socket. The stand-ins report no
+//! status, so the doorbell never rings them. They stand in for a real agent
+//! only in that they are processes in a pane; nothing here depends on an agent
+//! reading anything.
 //! The config deliberately puts the worker FIRST, so the pre-#523 role-0
 //! fallback lands on a pane that is visibly the wrong one.
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output};
@@ -89,7 +93,7 @@ fn received(deck: &TuiDeck, role: &str) -> String {
 }
 
 /// The first complete `orchestrator-context-<32 hex>.md` name in `text` — the
-/// per-tab context file a delivered pointer names (issue #1233).
+/// per-tab context file a posted pointer names (issue #1233).
 fn context_file_named(text: &str) -> Option<String> {
     const PREFIX: &str = "orchestrator-context-";
     text.match_indices(PREFIX).find_map(|(at, _)| {
@@ -170,9 +174,9 @@ fn open_orchestration(deck: &TuiDeck) {
 /// `coder` comes first and whose second role is named `orchestrator`, and open
 /// it with `Ctrl+n` — once with `start = true` on `orchestrator` and once with
 /// no `start` anywhere. In both, what the user types lands in `orchestrator`'s
-/// pane, the orchestrator prompt is delivered there and nowhere else, it is the
+/// pane, the orchestrator prompt is posted to its inbox and no other, it is the
 /// one card `daemon status` marks `(orchestrator)`, and its `delegate` reaches
-/// `coder` while `coder`'s own `delegate` is refused.
+/// `coder`'s inbox while `coder`'s own `delegate` is refused.
 #[spec("tabs/orchestration/001")]
 #[test]
 fn tabs_orchestration_001_ctrl_n_tab_seats_one_orchestrator() {
@@ -207,31 +211,36 @@ fn tabs_orchestration_001_ctrl_n_tab_seats_one_orchestrator() {
             "[{case}] the keystroke must not also reach `coder`"
         );
 
-        // Orchestrator prompt: the pointer to the context file lands in the
-        // orchestrator's pane. A `cat` stand-in never reports SessionStart, so
-        // this waits out the delivery fallback. Each tab's context is its own
+        // Orchestrator prompt: the pointer to the context file is posted to the
+        // orchestrator's inbox. Each tab's context is its own
         // `orchestrator-context-<32 hex>.md` (issue #1233), so the prefix is
         // what is waited for and the file read is the one the pointer names.
+        let attach = deck.attach_socket_path();
+        let orch_pane = role_agent(&deck, "orchestrator")
+            .pane_id_env
+            .expect("orchestrator pane id");
+        let coder_pane = role_agent(&deck, "coder")
+            .pane_id_env
+            .expect("coder pane id");
         let pointer = "orchestrator-context-";
         assert!(
-            common::wait_until(Duration::from_secs(45), || context_file_named(&received(
-                &deck,
-                "orchestrator"
-            ))
+            common::wait_until(Duration::from_secs(45), || context_file_named(
+                &inbox_view::text(attach, &orch_pane)
+            )
             .is_some()),
-            "[{case}] the orchestrator prompt should be delivered into `orchestrator`'s pane.\n\
-             orchestrator received:\n{}\ncoder received:\n{}",
-            received(&deck, "orchestrator"),
-            received(&deck, "coder"),
+            "[{case}] the orchestrator prompt should be posted to `orchestrator`'s inbox.\n\
+             orchestrator inbox:\n{}\ncoder inbox:\n{}",
+            inbox_view::text(attach, &orch_pane),
+            inbox_view::text(attach, &coder_pane),
         );
         assert!(
-            !received(&deck, "coder").contains(pointer),
-            "[{case}] the orchestrator prompt must not reach `coder`:\n{}",
-            received(&deck, "coder")
+            !inbox_view::text(attach, &coder_pane).contains(pointer),
+            "[{case}] the orchestrator prompt must not reach `coder`'s inbox:\n{}",
+            inbox_view::text(attach, &coder_pane)
         );
         // What the pointer points at: the orchestrator's own template, and
         // `coder` — not the orchestrator itself — offered as the team.
-        let named = context_file_named(&received(&deck, "orchestrator"))
+        let named = context_file_named(&inbox_view::text(attach, &orch_pane))
             .expect("the pointer names a context file");
         let context = std::fs::read_to_string(deck.workdir().join(".dot-agent-deck").join(&named))
             .unwrap_or_else(|e| panic!("[{case}] read the pointed-at {named}: {e}"));
@@ -270,10 +279,14 @@ fn tabs_orchestration_001_ctrl_n_tab_seats_one_orchestrator() {
             String::from_utf8_lossy(&accepted.stderr)
         );
         assert!(
-            common::wait_until(Duration::from_secs(15), || received(&deck, "coder")
-                .contains("worker-task-coder")),
-            "[{case}] the accepted delegate should write the task pointer into `coder`:\n{}",
-            received(&deck, "coder")
+            inbox_view::wait_for(
+                attach,
+                &coder_pane,
+                "seat-delegate-523",
+                Duration::from_secs(15)
+            ),
+            "[{case}] the accepted delegate should post the task to `coder`'s inbox:\n{}",
+            inbox_view::text(attach, &coder_pane)
         );
     }
 }

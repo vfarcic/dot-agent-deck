@@ -57,7 +57,7 @@
       "agent-tester-oc":    ["opencode --model openai/gpt-6.1-sol"],
       "agent-release":      ["claude --model sonnet"],
       "pi-big":             ["pi --model anthropic/claude-opus-4-8 --thinking high --approve"],
-      "pi-sol":             ["pi --provider openai --model gpt-6.1-sol --thinking high --approve"],
+      "pi-sol":             ["pi --provider openai-codex --model gpt-6.1-sol --thinking high --approve"],
       "oc-big":             ["opencode --model openai/gpt-6.1-sol"],
       "oc-release":         ["opencode --model openai/gpt-6.1-sol"],
       "oc-kimi":            ["opencode --model openrouter/moonshotai/kimi-k2.6"],

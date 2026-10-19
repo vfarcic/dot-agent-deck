@@ -5729,3 +5729,145 @@ fn codex_probe_refusal_matches_only_a_refused_model() {
         );
     }
 }
+
+/// Scenario: Choose the Pi real-agent model with no override, with an empty
+/// one, and with several `<provider>/<model>` values, then with malformed ones.
+/// No override means the measured GPT default on the stored ChatGPT login
+/// (`openai-codex/gpt-5.6-luna`, PRD #1666) — never Anthropic, since the
+/// change is permanent rather than a fallback; an override is split at its
+/// first `/`; anything without both halves is refused rather than read as
+/// "skip"; and only the API-key providers name an env key.
+#[test]
+fn pi_test_model_selection_reads_provider_slash_model() {
+    let default = pi_test_model_from(None).expect("the default parses");
+    assert_eq!(default.provider, "openai-codex");
+    assert_eq!(default.model, "gpt-5.6-luna");
+    assert_eq!(default.to_string(), PI_TEST_MODEL_DEFAULT);
+    assert_eq!(
+        default.cli_args(),
+        "--provider openai-codex --model gpt-5.6-luna"
+    );
+    assert_eq!(default.env_key(), None, "the stored login authenticates it");
+    for blank in ["", "   "] {
+        assert_eq!(pi_test_model_from(Some(blank)).unwrap(), default);
+    }
+
+    let keyed = pi_test_model_from(Some(" openai/gpt-5-nano ")).unwrap();
+    assert_eq!(keyed.cli_args(), "--provider openai --model gpt-5-nano");
+    assert_eq!(keyed.env_key(), Some(OPENAI_API_KEY_ENV));
+    let routed = pi_test_model_from(Some("openrouter/openai/gpt-5.1-codex-mini")).unwrap();
+    assert_eq!(routed.provider, "openrouter");
+    assert_eq!(routed.model, "openai/gpt-5.1-codex-mini");
+
+    for bad in [
+        "gpt-5.6-luna",
+        "/gpt-5.6-luna",
+        "openai-codex/",
+        "openai codex/x",
+    ] {
+        let err = pi_test_model_from(Some(bad)).expect_err(bad);
+        assert!(err.contains(PI_TEST_MODEL_ENV), "{bad}: {err}");
+    }
+}
+
+/// Scenario: Turn the host's stored Pi login into the copy a scratch agent
+/// directory gets. An OAuth login with hours left loses its refresh token and
+/// keeps the rest; one about to expire, already expired, or carrying a refresh
+/// token with no expiry is refused with the remedy (log in again with `pi`)
+/// rather than copied; a login with no refresh token is copied as it is.
+#[test]
+fn a_scratch_pi_login_carries_no_refresh_token_and_a_run_margin() {
+    let now = std::time::SystemTime::now();
+    let ms = |offset: Duration, ahead: bool| {
+        let at = if ahead { now + offset } else { now - offset };
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let login = |expires: Option<u64>| {
+        let mut entry = serde_json::json!({
+            "type": "oauth",
+            "access": "ACCESS-TOKEN",
+            "refresh": "REFRESH-TOKEN",
+            "refreshToken": "REFRESH-TOKEN-2",
+            "accountId": "ACCOUNT",
+        });
+        if let Some(expires) = expires {
+            entry["expires"] = expires.into();
+        }
+        entry
+    };
+
+    let hours = ms(Duration::from_secs(3 * 3600), true);
+    let copied = pi_scratch_login(login(Some(hours)), now).expect("hours left is enough");
+    assert_eq!(
+        copied,
+        serde_json::json!({
+            "type": "oauth",
+            "access": "ACCESS-TOKEN",
+            "accountId": "ACCOUNT",
+            "expires": hours,
+        }),
+        "the copy keeps the access token and drops every refresh token"
+    );
+
+    for (expires, why) in [
+        (Some(ms(Duration::from_secs(600), true)), "ten minutes left"),
+        (Some(ms(Duration::from_secs(600), false)), "already expired"),
+        (None, "a refresh token with no expiry"),
+    ] {
+        let err = pi_scratch_login(login(expires), now).expect_err(why);
+        assert!(err.contains("/login"), "{why}: {err}");
+        assert!(
+            !err.contains("TOKEN"),
+            "{why}: the refusal must not quote a secret: {err}"
+        );
+    }
+
+    let keyed = serde_json::json!({ "type": "api_key", "key": "API-KEY" });
+    assert_eq!(
+        pi_scratch_login(keyed.clone(), now).expect("nothing to refresh"),
+        keyed
+    );
+}
+
+/// Scenario: Look for a missing sentinel's name around where it was expected.
+/// With nothing of that name nearby the note is empty; with a file of that name
+/// one level up — where a real agent once wrote it after inferring its working
+/// directory from the deck binary's path (PRD #1666) — or in an extra candidate
+/// directory, the note names that place as MISPLACED.
+#[test]
+fn a_missing_sentinel_found_elsewhere_is_reported_as_misplaced() {
+    let root = harness_tempdir().unwrap();
+    let work = root.path().join("project");
+    std::fs::create_dir_all(&work).unwrap();
+    let expected = work.join("sentinel-1666.txt");
+    let other = root.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    assert_eq!(
+        misplaced_note_among(&expected, std::slice::from_ref(&other)),
+        ""
+    );
+
+    std::fs::write(root.path().join("sentinel-1666.txt"), "DONE").unwrap();
+    let note = misplaced_note_among(&expected, std::slice::from_ref(&other));
+    assert!(note.contains("MISPLACED"), "{note}");
+    assert!(
+        note.contains(&root.path().join("sentinel-1666.txt").display().to_string()),
+        "{note}"
+    );
+
+    std::fs::remove_file(root.path().join("sentinel-1666.txt")).unwrap();
+    std::fs::write(other.join("sentinel-1666.txt"), "DONE").unwrap();
+    let note = misplaced_note_among(&expected, std::slice::from_ref(&other));
+    assert!(
+        note.contains(&other.join("sentinel-1666.txt").display().to_string()),
+        "{note}"
+    );
+    std::fs::write(&expected, "DONE").unwrap();
+    assert!(
+        !misplaced_note_among(&expected, std::slice::from_ref(&work))
+            .contains(&expected.display().to_string()),
+        "the expected path itself is never reported as misplaced"
+    );
+}

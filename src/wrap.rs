@@ -328,9 +328,9 @@ impl Emitter {
     /// `cmd.spawn()` returns. Its ONLY job is to surface the dashboard card so a
     /// slow-booting agent isn't invisible — the child is typically just the
     /// launcher (`devbox`, a shell) at this point, seconds away from the real
-    /// agent TUI. Stamping [`SESSION_START_ORIGIN_METADATA_KEY`] lets readiness
-    /// gates tell this apart from a genuine "the session is up and accepting
-    /// input" signal; see [`crate::state::wait_for_session_start`].
+    /// agent TUI. Stamping [`SESSION_START_ORIGIN_METADATA_KEY`] lets a reader
+    /// tell this apart from a genuine "the session is up and accepting input"
+    /// signal.
     fn emit_fork_session_start(&self) {
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -341,22 +341,24 @@ impl Emitter {
     }
 
     /// Issue #243: the INTERFACE-READY `SessionStart` this wrapper emits once it
-    /// has observed the wrapped child's interface come up — the pre-prompt
-    /// readiness signal a delegate/scheduler gate can actually wait for.
+    /// has observed the wrapped child's interface come up — the deck's only
+    /// sign that a wrapped agent is up before its first prompt. Its `Idle` is
+    /// what the card and the doorbell go by until the agent's own hooks report
+    /// (see [`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]).
     ///
     /// Distinct from BOTH the events that existed before it. It is not
     /// [`Self::emit_fork_session_start`], which fires at `cmd.spawn()` when the
     /// child is typically still a launcher; and it is not the agent's own native
     /// `SessionStart`, which for codex-cli fires when the first TURN starts — a
-    /// consequence of the very prompt the gate is withholding, which is why the
-    /// gate never fast-pathed and every Codex delegate cost ~31 s.
+    /// consequence of the first prompt, so it cannot announce the agent before
+    /// one.
     ///
     /// It carries the origin value of the FACT that fired
     /// ([`InterfaceFact::origin`]) rather than arriving unmarked, so a consumer
     /// can tell "the deck WATCHED this interface come up" from "an agent session
     /// announced itself" — and, since issue #243's review, can also tell the
-    /// strong observation (raw input mode) from the weak guess (output settled)
-    /// and price them differently. This event carries the WRAPPER's session id,
+    /// strong observation (raw input mode) from the weak guess (output settled).
+    /// This event carries the WRAPPER's session id,
     /// not the agent's, so it must never bind a conversation. See
     /// [`crate::event::AgentEvent::is_wrapper_session_start`].
     ///
@@ -1932,22 +1934,25 @@ const INTERFACE_SETTLE_WINDOW: Duration = Duration::from_millis(750);
 /// session either.
 ///
 /// Five seconds, the same budget `crate::hook`'s request/response paths give a
-/// daemon that is merely busy. Losing the event costs latency and nothing else —
-/// the readiness gate falls back to the behaviour it has without this signal —
-/// so the bound is deliberately generous rather than tight.
+/// daemon that is merely busy, and deliberately generous rather than tight:
+/// losing the event is not free. The card and the doorbell then wait for the
+/// agent's own hooks, and for Codex those are first-turn-driven (its native
+/// `SessionStart` arrives with the first turn), so an inbox task delivered to a
+/// fresh Codex whose announcement was lost stays pending until a native event
+/// or someone typing into the pane starts a turn. Nothing bounds that wait: no
+/// readiness fallback stands behind this event (PRD #1666).
 #[cfg(unix)]
 const INTERFACE_READY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Issue #243 (review finding 1): WHICH of [`InterfaceWatch`]'s two facts fired.
 ///
 /// Reported rather than collapsed to a bool because the two are not equally
-/// strong and are priced differently by the daemon — see [`InterfaceWatch`] for
-/// what each one is worth and why.
+/// strong — see [`InterfaceWatch`] for what each one is worth and why.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InterfaceFact {
     /// The child cleared `ICANON`/`ECHO` on the inner PTY — fact 1, an
-    /// observation of input-readiness.
+    /// observation that the child reads raw keystrokes.
     RawInputMode,
     /// The child wrote at least one byte and then stayed quiet for
     /// [`INTERFACE_SETTLE_WINDOW`] — fact 2, a guess.
@@ -1957,8 +1962,7 @@ enum InterfaceFact {
 #[cfg(unix)]
 impl InterfaceFact {
     /// The `session_start_origin` value this fact rides to the daemon. Distinct
-    /// per fact so the daemon can price them separately; see
-    /// [`InterfaceWatch`].
+    /// per fact so the event records which one fired; see [`InterfaceWatch`].
     fn origin(self) -> &'static str {
         match self {
             Self::RawInputMode => WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
@@ -1966,8 +1970,9 @@ impl InterfaceFact {
         }
     }
 
-    /// A short, stable label for the log line — the answer to "why did readiness
-    /// fire on this pane?", which used to be computed and then discarded.
+    /// A short, stable label for the log line — the answer to "why did the
+    /// interface event fire on this pane?", which used to be computed and then
+    /// discarded.
     fn reason(self) -> &'static str {
         match self {
             Self::RawInputMode => "raw-input-mode",
@@ -1986,8 +1991,8 @@ impl InterfaceFact {
 ///
 /// TWO independent facts are accepted — [`InterfaceFact`] — and they are NOT
 /// equally strong, which is why the watch reports WHICH one fired rather than a
-/// bare bool. They ride distinct `session_start_origin` values so the daemon can
-/// price them separately (issue #243 review finding 1), and they are latched
+/// bare bool. They ride distinct `session_start_origin` values so the event
+/// records which one fired (issue #243 review finding 1), and they are latched
 /// SEPARATELY so a session that produces the weak one can still produce the
 /// strong one afterwards — which, for the production launch shape, is every
 /// session (see [`InterfaceWatch::claim`]):
@@ -2009,9 +2014,8 @@ impl InterfaceFact {
 ///    measured on real codex-cli 0.149.0 at 85 ms after a direct exec, and by
 ///    `orchestration/delegate/009` at fork + 100 ms, where a prompt written on it
 ///    parked unsubmitted in the composer and no turn ever started. So this fact
-///    is the best RELEASE signal the deck has and still owes a post-readiness
-///    buffer on the daemon side; see
-///    `crate::state::WRAPPER_INTERFACE_READINESS_BUFFER`.
+///    does not prove the composer is listening, which is why, until Codex's own
+///    hooks report, the doorbell's writer also waits for Codex's composer.
 /// 2. **Output SETTLED** ([`InterfaceFact::OutputSettled`]) — the child wrote
 ///    something and then stopped for [`INTERFACE_SETTLE_WINDOW`]. The fallback
 ///    for an interface that stays in cooked mode (a line-oriented REPL, and the
@@ -2032,11 +2036,8 @@ impl InterfaceFact {
 ///    after announcing it ([`InterfaceWatch::claim`] latches per fact, not per
 ///    session), so if the launcher was merely slow the strong fact follows later
 ///    on the same wrapper session — a few seconds warm, and a measured ~15 s on a
-///    cold `devbox` that installs packages first — and the daemon holds an upgrade
-///    window on fact 2 for exactly that reason rather than releasing on it
-///    immediately. See
-///    `crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN` and
-///    `crate::state::INTERFACE_UPGRADE_WINDOW`.
+///    cold `devbox` that installs packages first. See
+///    `crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`.
 ///
 /// What is deliberately NOT accepted: elapsed time since `exec`, and the child's
 /// FIRST byte. A wall-clock timer fires for a child that has not started, and a
@@ -2044,7 +2045,7 @@ impl InterfaceFact {
 /// deck straight back into writing a prompt into something that is not an agent.
 /// A child that writes nothing and never leaves cooked mode is never announced
 /// ready by this watch at all, which is correct: nothing about it is observable,
-/// so the gate falls back to the behaviour it has today.
+/// so the card and the doorbell wait for the agent's own hooks.
 ///
 /// **What this watch observes is the inner PTY, which is not private to the
 /// child.** A same-uid process can find it (`/proc/<wrapper-pid>/fd` → the pts
@@ -2121,9 +2122,9 @@ impl InterfaceWatch {
     /// [`InterfaceFact::RawInputMode`] has been claimed.
     ///
     /// The identity of the fact is part of the answer, not a diagnostic
-    /// afterthought: the two are priced differently downstream (see
-    /// [`InterfaceWatch`]), so a caller that collapses them back to a bool
-    /// reintroduces the launcher-settle hazard fact 2 carries.
+    /// afterthought: the two are not equally strong (see [`InterfaceWatch`]),
+    /// so a caller that collapses them back to a bool loses the difference
+    /// anything granting more to the strong fact would need.
     ///
     /// **Per fact, not per session** (issue #243 regression fix). This used to
     /// latch once for the whole wrapper, which made whichever fact happened to
@@ -2822,7 +2823,7 @@ fn run_wrap_pty(
         // finding #12: forward a pending signal to the child group and escalate.
         fwd.tick();
 
-        // Issue #243: the pre-prompt readiness signal. Polled here rather than
+        // Issue #243: the interface-ready `SessionStart`. Polled here rather than
         // pushed from the tee threads because one of the two facts it reads —
         // the inner PTY's line discipline — is state, not an event, and because
         // the settle window has to be noticed by SOMEBODY once the output stops
