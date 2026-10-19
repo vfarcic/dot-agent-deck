@@ -168,6 +168,8 @@ interface Passed {
 	suspect: boolean;
 	/** Released `lost`: it waits for a commit only. */
 	lost: boolean;
+	/** Pi sat idle with nothing queued for `INBOX_UNSEEN_RECHECK_MS` while it held back the next hand-over: it holds back nothing more (`admitting`). */
+	stalled?: boolean;
 }
 
 /** The session instance currently receiving deck messages. */
@@ -206,6 +208,8 @@ interface InboxProcess {
 	runs: number;
 	/** `pending` is being handed over, one attempt at a time, oldest first (`pump`). */
 	pumping: boolean;
+	/** Armed while a hand-over Pi has not admitted holds back `pending` (`armAdmission`). */
+	admission: ReturnType<typeof setTimeout> | undefined;
 	/** Every status report, across instances, in the order the handlers queued them. */
 	reportQueue: <T>(task: () => Promise<T>) => Promise<T>;
 	rechecks: Map<string, ReturnType<typeof setTimeout>>;
@@ -306,6 +310,7 @@ function refuse(proc: InboxProcess, ref: InboxRef): void {
 	if (holds(proc, ref)) {
 		proc.receiver.notHanded(ref);
 	}
+	pump(proc);
 }
 
 function clearRecheck(proc: InboxProcess, key: string): void {
@@ -392,12 +397,84 @@ function deliver(proc: InboxProcess, message: InboxMessage): void {
 }
 
 /**
- * Hand `pending` to the current session, oldest first, one attempt at a time.
- * It stops while nothing can be handed over — the process disposed, no
- * session current, no watcher registered — and a session start or a
- * registration starts it again. The attempt in hand stays at the head of
- * `pending` until it is sent or refused, so a session swap, a watcher restart
- * or a version replacement during its approval finds it there, uncalled.
+ * The current session's earlier hand-over Pi has not admitted yet: sent and
+ * not seen at the gate, or past it and neither started (`commit`), seen
+ * queued behind a run (`watchQueue`), released, nor stalled. Pi 0.84.4 runs
+ * one prompt at a time, and a hand-over sent while it reads no run active
+ * goes through a preflight to start one; a second that leaves its preflight
+ * while the first's run is active is refused, and that refusal's settle
+ * clears Pi's running flag while the run goes on, so the hand-overs after it
+ * take the preflight and are refused too — one admitted per burst, each of
+ * the others costing a delivery (PRD #1666, the `load_003` burst). Holding
+ * the next one back until the one before it is decided keeps two of ours out
+ * of that preflight together, short of one stalled there longer than
+ * `INBOX_UNSEEN_RECHECK_MS` (`armAdmission`). An earlier attempt of `id`
+ * itself holds nothing back: the deck issues another attempt of a message
+ * only once the earlier one is in doubt (released, or the user's Retry of one
+ * Pi never started), and a commit of either commits the message, so they
+ * cannot run it twice.
+ */
+function admitting(proc: InboxProcess, id: string): string[] {
+	const token = proc.current?.token;
+	const keys: string[] = [];
+	for (const [key, sent] of proc.sent) {
+		if (sent.token === token && sent.ref.id !== id) {
+			keys.push(key);
+		}
+	}
+	for (const [key, passed] of proc.passed) {
+		if (passed.token === token && passed.ref.id !== id && !passed.lost && !passed.queued && !passed.stalled && !proc.committed.has(key)) {
+			keys.push(key);
+		}
+	}
+	return keys;
+}
+
+/**
+ * While `keys` hold back `pending`, check once `INBOX_UNSEEN_RECHECK_MS` has
+ * passed: one Pi still has not started on while it sits idle with no run and
+ * nothing queued ended in its preflight (a compaction or an auth check
+ * refused it), so it is marked stalled and no longer holds the rest back. It
+ * stays held as it was. A sent one the gate never saw is settled by its own
+ * recheck (`armRecheck`).
+ */
+function armAdmission(proc: InboxProcess, keys: string[]): void {
+	if (proc.admission !== undefined) {
+		return;
+	}
+	const timer = setTimeout(() => {
+		proc.admission = undefined;
+		try {
+			if (proc.disposed) {
+				return;
+			}
+			const ctx = proc.current?.ctx;
+			if (askRunning(ctx) === false && askIdle(ctx) === true && askQueued(ctx) === false) {
+				for (const key of keys) {
+					const passed = proc.passed.get(key);
+					if (passed !== undefined) {
+						passed.stalled = true;
+					}
+				}
+			}
+			pump(proc);
+		} catch {
+			// Never let a timer callback throw into Pi.
+		}
+	}, INBOX_UNSEEN_RECHECK_MS);
+	(timer as { unref?: () => void }).unref?.();
+	proc.admission = timer;
+}
+
+/**
+ * Hand `pending` to the current session, oldest first, one attempt at a time,
+ * each once Pi admitted the one before it (`admitting`); what decides that
+ * one starts it again. It stops while nothing can be handed over — the
+ * process disposed, no session current, no watcher registered — and a
+ * session start or a registration starts it again. The attempt in hand stays
+ * at the head of `pending` until it is sent or refused, so a session swap, a
+ * watcher restart or a version replacement during its approval finds it
+ * there, uncalled.
  */
 function pump(proc: InboxProcess): void {
 	if (proc.pumping) {
@@ -407,6 +484,11 @@ function pump(proc: InboxProcess): void {
 	void (async () => {
 		try {
 			while (!proc.disposed && proc.current !== undefined && proc.receiver.rx() !== undefined && proc.pending.length > 0) {
+				const holding = admitting(proc, proc.pending[0].id);
+				if (holding.length > 0) {
+					armAdmission(proc, holding);
+					break;
+				}
 				const message = proc.pending[0];
 				if (await handOver(proc, message)) {
 					const at = proc.pending.indexOf(message);
@@ -589,6 +671,7 @@ function watchQueue(proc: InboxProcess, key: string, ctx: ExtensionContext | und
 		}
 		if (askQueued(ctx) === true) {
 			passed.queued = true;
+			pump(proc);
 			return false;
 		}
 		return true;
@@ -745,6 +828,7 @@ function commit(proc: InboxProcess, instance: Instance, message: unknown): void 
 	}
 	if (refs.length > 0) {
 		proc.receiver.committed(refs);
+		pump(proc);
 	}
 }
 
@@ -810,6 +894,7 @@ function settled(proc: InboxProcess, instance: Instance, ctx: ExtensionContext):
 			}
 		}
 	}
+	pump(proc);
 }
 
 /** One extension instance: Pi builds one per session (`/new`, resume, fork, reload). */
@@ -977,6 +1062,7 @@ function createProcess(transfer?: Transfer, replaced = false, tokenFloor = 0): I
 		tagPrefix: transfer?.tagPrefix ?? (Math.random().toString(36).slice(2, 10) || "0"),
 		runs: transfer?.runs ?? 0,
 		pumping: false,
+		admission: undefined,
 		// The outgoing receiver's queue, so its instances' last reports and
 		// this one's stay in Pi's order.
 		reportQueue: transfer?.reportQueue ?? createSerialQueue(),

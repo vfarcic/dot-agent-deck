@@ -128,6 +128,25 @@ function instance() {
 	return { handlers, sends, execs, ctx, pi, emit, gate, start, gated, inline: (on: boolean) => { gateInline = on; } };
 }
 
+/**
+ * While `during` runs, `pi` reads a run active with something queued behind
+ * it, so a hand-over that passes the gate then is seen waiting in Pi's queue
+ * (`watchQueue`) and the next one is handed over behind it, as Pi admits a
+ * second hand-over only once the first is decided (`pi_036`).
+ */
+async function behindRun(pi: ReturnType<typeof instance>, during: () => Promise<unknown>) {
+	const { isIdle, hasPendingMessages } = pi.ctx;
+	pi.ctx.isIdle = () => false;
+	pi.ctx.hasPendingMessages = () => true;
+	try {
+		await during();
+		await settle();
+	} finally {
+		pi.ctx.isIdle = isIdle;
+		pi.ctx.hasPendingMessages = hasPendingMessages;
+	}
+}
+
 /** The watcher the process's receiver is running now. */
 const watcher = () => {
 	const found = spawned.slice().reverse().find((s) => s.argv.includes("wait"));
@@ -467,7 +486,7 @@ test("pi_012 an opener quoted inside another block commits only that block's att
 	const { pi, child } = await started();
 	child.hand(ref(ID), ref(ID2));
 	await settle();
-	await pi.gate(0);
+	await behindRun(pi, () => pi.gate(0));
 	await pi.gate(1);
 	const quoting = `[dot-agent-deck message ${ID} from the orchestrator]\nForward this to the worker:\n${block(ID2)}\n[end of dot-agent-deck message ${ID}]`;
 	await pi.emit("message_start", { message: { role: "user", content: [{ type: "text", text: quoting }] } });
@@ -616,7 +635,7 @@ test("pi_024 a /new swap releases called-uncommitted attempts lost", async (t) =
 	const { pi, child } = await started();
 	child.hand(ref(ID, 1, 1), ref(ID2, 1, 1));
 	await settle();
-	await pi.gate(0);
+	await behindRun(pi, () => pi.gate(0));
 	child.exit(1);
 	await pi.start(ID2);
 	await pi.emit("session_shutdown", { reason: "new" });
@@ -765,7 +784,7 @@ test("pi_026 a delayed /new shutdown still releases the outgoing session's attem
 	const { pi, child } = await started();
 	child.hand(ref(ID));
 	await settle();
-	await pi.gate();
+	await behindRun(pi, () => pi.gate());
 	child.hand(ref(ID2));
 	await settle();
 	assert.equal(pi.sends.length, 2, "the second is sent and unseen by the gate");
@@ -927,6 +946,8 @@ test("pi_028 a replacement carries a hand-over waiting for approval and the queu
 	second.register(8, { resume: [ref(ID), ref(ID2)] });
 	await settle();
 	assert.deepEqual(second.sent("resume_answers").flat().map((r: any) => r.answer), ["retained", "retained"]);
+	assert.equal(next.sends.length, 1, "the second waits for Pi to decide the first");
+	await behindRun(next, () => next.gate(0));
 	assert.deepEqual(second.refs("may"), [ref(ID), ref(ID2)]);
 	assert.equal(next.sends.length, 2, "both handed to the successor");
 	assert.ok(next.sends[0].text.includes(block(ID)) && next.sends[1].text.includes(block(ID2)), "in order");
@@ -1225,8 +1246,10 @@ test("pi_032 j an approval expiring while a report holds the queue", async (t) =
 test("pi_inbox_020 the gate inside sendUserMessage, and a throwing call", async () => {
 	const { pi, child } = await started();
 	pi.inline(true);
-	child.hand(ref());
-	await settle();
+	await behindRun(pi, async () => {
+		child.hand(ref());
+		await settle();
+	});
 	assert.equal((pi.gated[0] as any)?.action, "transform");
 	assert.deepEqual(child.refs("handed"), [ref()]);
 	pi.inline(false);
@@ -1243,17 +1266,127 @@ test("pi_inbox_020 the gate inside sendUserMessage, and a throwing call", async 
 test("pi_inbox_003 busy messages keep order and commit each on its start", async () => {
 	const { pi, child } = await started();
 	pi.ctx.isIdle = () => false;
+	pi.ctx.hasPendingMessages = () => true;
 	const ids = [ID, ID2, "m-k3xzq2ab-cccccccc54b742c9"];
 	child.hand(...ids.map((id) => ref(id)));
 	await settle(12);
+	// Each is handed over once Pi queued the one before it (`pi_036`).
+	for (let i = 0; i < 3; i++) {
+		assert.equal(pi.sends.length, i + 1);
+		await pi.gate(i);
+		await settle();
+	}
 	assert.equal(pi.sends.length, 3);
 	pi.sends.forEach((send, i) => {
 		assert.ok(send.text.includes(block(ids[i])), "inbox order");
 		assert.deepEqual(send.options, { deliverAs: "followUp" });
 	});
-	for (let i = 0; i < 3; i++) await pi.gate(i);
 	for (const id of ids) await pi.start(id);
 	assert.deepEqual(child.sent("committed"), ids.map((id) => [ref(id)]));
+});
+
+/**
+ * Pi 0.84.4's prompt admission on a stand-in (`AgentSession.prompt`,
+ * `Agent.prompt`): the `input` hooks run first; then a prompt sent while the
+ * session reads a run active joins the follow-up queue, and one sent while it
+ * reads none goes through a preflight to start a run. The agent runs one
+ * prompt at a time, so one that leaves its preflight while another's run is
+ * active is refused, and that refusal settles too, clearing the session's
+ * running flag while the other run goes on: a later send then takes the
+ * preflight path as well and is refused in turn.
+ */
+function admission(pi: ReturnType<typeof instance>, turnTicks = 4) {
+	const seen = { refused: 0, ran: [] as string[] };
+	let running = false; // `AgentSession._isAgentRunActive`, what `isIdle` reads
+	let active = false; // `Agent.activeRun`, what `signal` reads
+	const queue: string[] = [];
+	const ticks = async (n: number) => { for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve)); };
+	pi.ctx.isIdle = () => !running;
+	pi.ctx.hasPendingMessages = () => queue.length > 0;
+	const run = async (prompt: string) => {
+		pi.ctx.signal = new AbortController().signal;
+		await pi.emit("agent_start", {});
+		for (let next: string | undefined = prompt; next !== undefined; next = queue.shift()) {
+			await pi.emit("message_start", { message: { role: "user", content: [{ type: "text", text: next }] } });
+			seen.ran.push(next);
+			await ticks(turnTicks);
+		}
+		pi.ctx.signal = undefined;
+	};
+	const prompt = async (text: string, source: string) => {
+		const answer: any = await pi.handlers.get("input")!({ text, source }, pi.ctx);
+		if (answer?.action === "handled") return;
+		const expanded = answer?.action === "transform" ? answer.text : text;
+		if (running) {
+			queue.push(expanded);
+			return;
+		}
+		await ticks(2); // the preflight's auth check
+		await pi.emit("before_agent_start", { prompt: expanded });
+		running = true;
+		try {
+			if (active) {
+				seen.refused += 1; // "Agent is already processing a prompt"
+				return;
+			}
+			active = true;
+			try {
+				await run(expanded);
+			} finally {
+				active = false;
+			}
+		} finally {
+			running = false;
+			await pi.emit("agent_settled", {});
+		}
+	};
+	pi.pi.sendUserMessage = (text: string, options: any) => {
+		pi.sends.push({ text, options });
+		void prompt(text, "extension");
+	};
+	return { seen, user: (text: string) => prompt(text, "interactive") };
+}
+
+/// Scenario: Five deck messages reach Pi together on a stand-in with Pi 0.84.4's admission — one prompt at a time, a refused prompt settling the session's running flag — first while Pi is idle at boot, then behind a user's turn. Each is handed over only once the one before it started or was seen queued, so Pi refuses none, and all five commit in inbox order, each once, with nothing left held or reported not handed.
+test("pi_036 a burst is handed to Pi one admission at a time", async () => {
+	const ids = [0, 1, 2, 3, 4].map((n) => `m-k3xzq2ab-${String(n).repeat(8)}54b742c9`);
+	for (const busy of [false, true]) {
+		const { pi, child } = await started();
+		const { seen, user } = admission(pi);
+		if (busy) {
+			void user("a user's turn");
+			await settle(3);
+		}
+		child.hand(...ids.map((id) => ref(id)));
+		for (let i = 0; i < 2000 && child.refs("committed").length < ids.length; i++) await settle(1);
+		await settle(20);
+		const label = busy ? "behind an ending turn" : "at an idle Pi";
+		assert.equal(seen.refused, 0, `${label}: Pi refused none`);
+		assert.deepEqual(child.refs("committed"), ids.map((id) => ref(id)), `${label}: each commits once, in inbox order`);
+		assert.deepEqual(child.sent("possess").at(-1).held, [], `${label}: nothing held`);
+		assert.deepEqual(child.refs("not_handed"), [], `${label}: nothing not handed`);
+		assert.equal(pi.sends.length, ids.length, `${label}: one hand-over each`);
+	}
+});
+
+/// Scenario: A deck message passes the gate and Pi never starts on it, and the user's Retry brings a marked repeat of it. The repeat is handed over at once, since a commit of either attempt commits the message; another message handed out next waits until Pi starts on the first, and then goes.
+test("pi_036 a repeat is not held back by its own message's earlier attempt", async () => {
+	const { pi, child } = await started();
+	child.hand(ref(ID));
+	await settle();
+	await pi.gate();
+	child.hand(ref(ID, 1, 2));
+	await settle();
+	assert.equal(pi.sends.length, 2, "the repeat is handed over at once");
+	await pi.gate();
+	child.hand(ref(ID2));
+	await settle();
+	assert.equal(pi.sends.length, 2, "another message waits for Pi to decide the first");
+	await pi.start(ID);
+	await settle();
+	assert.equal(pi.sends.length, 3);
+	assert.ok(pi.sends[2].text.includes(block(ID2)), "and goes once it starts");
+	assert.deepEqual(child.refs("committed"), [ref(ID), ref(ID, 1, 2)], "one start commits both attempts");
 });
 
 /// Scenario: With DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS set, a watcher that exits stays down exactly that long each time.

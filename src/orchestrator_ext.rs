@@ -1595,6 +1595,13 @@ mod tests {
         node_pin("test/inbox.test.ts", "pi_032");
     }
 
+    /// Scenario: Five deck messages reach Pi together on a stand-in with Pi 0.84.4's admission — one prompt at a time, a refused prompt settling the session's running flag — first while Pi is idle at boot, then behind a user's turn. Each is handed over only once the one before it started or was seen queued, so Pi refuses none, and all five commit in inbox order, each once, with nothing left held or reported not handed. A marked repeat of a message Pi never started is handed over at once, while another message waits until Pi starts on the first.
+    #[spec("inbox/pi/036")]
+    #[test]
+    fn pi_036_a_burst_is_handed_to_pi_one_admission_at_a_time() {
+        node_pin("test/inbox.test.ts", "pi_036");
+    }
+
     /// The extension's own Node suites — its inbox delivery and
     /// acknowledgement (`inbox.test.ts`) and its orchestrator helpers
     /// (`orchestrator.test.ts`) — run here, so a change to the extension this

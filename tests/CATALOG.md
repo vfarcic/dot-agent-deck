@@ -10673,6 +10673,14 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Real Pi model execution or the desktop app.
 - **Platform coverage:** mac+linux (prints `SKIP:` without Node 23.6+).
 
+##### inbox/pi/036 — A burst of deck messages is handed to Pi one admission at a time.
+- **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi modelling Pi 0.84.4's prompt admission.
+- **Agent:** none.
+- **Asserts:** Five messages handed out together, at an idle Pi and behind a user's turn, are each sent only once the one before it started or was seen queued: the stand-in refuses none, all five commit once in inbox order, and none is left held or reported `not_handed`. Sending them without waiting has the stand-in refuse four of five at an idle Pi. A marked repeat of a message that passed the gate and never started is handed over at once, while another message waits until that message starts; one start commits both of its attempts.
+- **Does not assert:** Real Pi's timing under CPU pressure (`inbox/load/003`, lane 2), or a run ending while a hand-over is between the gate and Pi's queue.
+- **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
+- **Cost:** under a second.
+
 #### inbox/publish
 
 ##### inbox/publish/001 — Subscription names are validated at every configuration seam.
