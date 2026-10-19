@@ -491,5 +491,77 @@ mod tests {
             "no such agent"
         );
         assert!(snapshots[1]["detail"]["error"].is_string());
+        drop(data);
+
+        // A stream of responses (or empty output frames) must leave bounded
+        // evidence of refusal, rather than losing the entire oversized event.
+        for kind in [KIND_RESP, KIND_STREAM_OUT] {
+            let startup = StartupTrace::new(
+                scratch.path().join(format!("flood-diagnostics-{kind}")),
+                scratch.path().join("home"),
+                scratch.path().into(),
+                scratch.path().join("work"),
+            );
+            let listener = std::os::unix::net::UnixListener::bind(
+                scratch.path().join(format!("flood-{kind}.sock")),
+            )
+            .expect("bind snapshot flood fixture");
+            let socket = listener.local_addr().expect("snapshot flood address");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept snapshot flood");
+                let mut header = [0; 5];
+                stream
+                    .read_exact(&mut header)
+                    .expect("read snapshot request header");
+                let mut request = vec![
+                    0;
+                    u32::from_be_bytes(header[1..].try_into().expect("four length bytes"))
+                        as usize
+                ];
+                stream
+                    .read_exact(&mut request)
+                    .expect("read snapshot request");
+                let body = if kind == KIND_RESP {
+                    br#"{"ok":true}"#.as_slice()
+                } else {
+                    b"".as_slice()
+                };
+                let mut frames = Vec::new();
+                for _ in 0..LIMIT / 16 {
+                    frames.push(kind);
+                    frames.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                    frames.extend_from_slice(body);
+                }
+                frames.push(KIND_STREAM_END);
+                frames.extend_from_slice(&0_u32.to_be_bytes());
+                // The bounded reader may close while this flood is in flight.
+                let _ = stream.write_all(&frames);
+            });
+            assert!(
+                startup
+                    .trace
+                    .snapshot(socket.as_pathname().expect("pathname socket"), "flood")
+                    .is_empty()
+            );
+            server.join().expect("snapshot flood server completes");
+            let data = startup.trace.inner.data.lock().expect("startup trace data");
+            let event = data
+                .events
+                .iter()
+                .rev()
+                .find(|event| event["stage"] == "snapshot")
+                .expect("snapshot flood must retain bounded refusal evidence");
+            assert!(
+                event["detail"]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("bound")),
+                "snapshot flood must report its aggregate bound: {}",
+                event["detail"]["error"]
+            );
+            assert!(
+                event["detail"]["frames"].to_string().len() <= LIMIT,
+                "snapshot frame metadata must stay within the aggregate trace budget"
+            );
+        }
     }
 }

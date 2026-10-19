@@ -226,22 +226,10 @@ export default {id:'deck-test-route',tui:async(api)=>{
         let observations = diagnostics.join("first-observed.json");
         let trace = startup.trace.clone();
         let observer = std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader, Write};
             let mut first = json!({});
             let mut previous_armed = Value::Null;
             while !stop.load(Ordering::Relaxed) {
-                let sample = || -> Option<Value> {
-                    let mut stream = std::os::unix::net::UnixStream::connect(&socket).ok()?;
-                    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(1)))
-                        .ok()?;
-                    writeln!(stream, "{request}").ok()?;
-                    let mut line = String::new();
-                    BufReader::new(stream).read_line(&mut line).ok()?;
-                    serde_json::from_str(&line).ok()
-                };
-                if let Some(listing) = sample() {
+                if let Some(listing) = sample(&socket, &request, Duration::from_secs(1)) {
                     if listing["armed"] != previous_armed {
                         previous_armed = listing["armed"].clone();
                         trace.event("inbox_armed", json!({"armed":previous_armed}));
@@ -633,10 +621,10 @@ export default {id:'deck-test-route',tui:async(api)=>{
         );
     }
     pub fn delegate(&self, name: &str) -> String {
-        self.delegate_body(&format!("Use the shell to run exactly: printf '{CONTENT}' > '{}'. Then give a brief final reply and end your turn. Do this once for this delivery id.",self.work.join(name).display()))
+        self.delegate_body(&format!("Use the shell to run exactly: {}. Then give a brief final reply and end your turn. Do this once for this delivery id.", work_command(&self.work.join(name), None)))
     }
     pub fn delegate_execution(&self, name: &str, token_suffix: &str) -> String {
-        self.delegate_body(&format!("Use the shell to run exactly: printf '{CONTENT}' > '{}'; printf '%s%s\\n' 'NATIVE-EXEC-' '{token_suffix}'. Then give a brief final reply and end your turn. Do this once for this delivery id.",self.work.join(name).display()))
+        self.delegate_body(&format!("Use the shell to run exactly: {}. Then give a brief final reply and end your turn. Do this once for this delivery id.", work_command(&self.work.join(name), Some(token_suffix))))
     }
     pub fn visible_execution(&self, id: &str, name: &str, token: &str) {
         let frame = format!("[end of dot-agent-deck message {id}]");
@@ -987,7 +975,7 @@ impl Drop for OpenCode {
     fn drop(&mut self) {
         self.observer_stop.store(true, Ordering::Relaxed);
         if let Some(observer) = self.observer.take() {
-            let _ = observer.join();
+            join_observer(observer, Duration::from_secs(2));
         }
         // Do not let a diagnostic failure cause a second panic during unwinding.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.save_diagnostics()));
@@ -1000,4 +988,108 @@ fn normalize(text: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn work_command(path: &std::path::Path, token_suffix: Option<&str>) -> String {
+    let mut command = format!("printf '{CONTENT}' > '{}'", path.display());
+    if let Some(suffix) = token_suffix {
+        command.push_str(&format!("; printf '%s%s\\n' 'NATIVE-EXEC-' '{suffix}'"));
+    }
+    command
+}
+
+fn sample(socket: &std::path::Path, request: &Value, budget: Duration) -> Option<Value> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(budget)).ok()?;
+    stream.set_write_timeout(Some(budget)).ok()?;
+    writeln!(stream, "{request}").ok()?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).ok()?;
+    serde_json::from_str(&line).ok()
+}
+
+fn join_observer(observer: std::thread::JoinHandle<()>, _budget: Duration) {
+    let _ = observer.join();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbox_observer_bounds_the_entire_sample() {
+        use std::io::{BufRead, BufReader, Write};
+        let scratch = common::harness_tempdir().expect("observer socket fixture");
+        let socket = scratch.path().join("slow.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind observer fixture");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept observer sample");
+            let mut request = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut request)
+                .expect("read observer request");
+            // Progress arrives within each read timeout, but the whole reply
+            // takes much longer than the one-sample budget.
+            for byte in b"{\"ok\":true}\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let result = sample(
+            &socket,
+            &json!({"op":"inbox_list"}),
+            Duration::from_millis(25),
+        );
+        server.join().expect("observer fixture completes");
+        assert!(
+            result.is_none(),
+            "inbox observer must reject a reply exceeding its overall sample deadline"
+        );
+    }
+
+    #[test]
+    fn inbox_observer_drop_bounds_a_stalled_thread() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let observer = std::thread::spawn(move || {
+            let _ = held.recv_timeout(Duration::from_millis(500));
+        });
+        let start = std::time::Instant::now();
+        join_observer(observer, Duration::from_millis(25));
+        let elapsed = start.elapsed();
+        let _ = release.send(());
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "diagnostic observer teardown must be bounded, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn delegated_shell_command_preserves_quoted_work_paths_and_tokens() {
+        let scratch = common::harness_tempdir().expect("shell command fixture");
+        for suffix in [None, Some("suffix' with spaces")] {
+            let path = scratch.path().join("worker's sentinel file");
+            let output = Command::new("sh")
+                .args(["-c", &work_command(&path, suffix)])
+                .output()
+                .expect("run delegated sentinel command");
+            assert!(
+                output.status.success(),
+                "delegated command must accept quoted paths: {output:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("delegated sentinel exists"),
+                CONTENT
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                suffix
+                    .map(|suffix| format!("NATIVE-EXEC-{suffix}\n"))
+                    .unwrap_or_default()
+            );
+        }
+    }
 }
