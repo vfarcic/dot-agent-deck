@@ -668,6 +668,9 @@ pub struct InboxEvent {
     /// An offer that left a holder: who held it and why it left, so that
     /// holder's card is told and the offerer learns of an expired claim.
     pub returned: Option<OfferReturn>,
+    /// The message went back to the queue from being taken (fetched or
+    /// claimed) — a hand-back, not a new post.
+    pub requeued: bool,
 }
 
 /// An offer leaving the holder it was assigned to.
@@ -2009,6 +2012,11 @@ impl Inbox {
     /// event.
     fn transition(&mut self, index: usize, now: Instant, state: MessageState) {
         let message = &mut self.messages[index];
+        let requeued = matches!(state, MessageState::Queued)
+            && matches!(
+                message.state,
+                MessageState::Fetched { .. } | MessageState::Claimed { .. }
+            );
         message.state = state;
         if !matches!(message.state, MessageState::Queued) {
             message.assign_deadline = None;
@@ -2031,6 +2039,7 @@ impl Inbox {
                 _ => None,
             },
             returned: None,
+            requeued,
         });
     }
 
@@ -2596,6 +2605,32 @@ mod tests {
         );
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].deliveries, 2);
+    }
+
+    /// Reviewer R9Q-03: a fetched message's return to the queue is marked as a
+    /// hand-back on its event, and its post is not, so a client can tell a
+    /// message going back to the queue from a new one.
+    #[test]
+    fn a_return_to_the_queue_is_marked_as_a_hand_back() {
+        let t0 = Instant::now();
+        let mut inbox = inbox();
+        let id = inbox.post_direct(t0, worker(), from_deck()).unwrap();
+        inbox.fetch(t0, "2", "agent-w1", Consumer::FetchCli, None);
+        inbox.tick(t0 + DEFAULT_ACK_WAIT);
+        assert_eq!(state_of(&inbox, &id, "2"), StateName::Queued);
+        let events: Vec<_> = inbox
+            .drain_events()
+            .into_iter()
+            .map(|event| (event.state, event.requeued))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                (StateName::Queued, false),
+                (StateName::Fetched, false),
+                (StateName::Queued, true),
+            ]
+        );
     }
 
     /// Scenario: Fetch a message and let every ack-wait expire, five times.

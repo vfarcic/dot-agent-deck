@@ -3168,6 +3168,7 @@ fn drain_events(st: &mut HubState) {
                 wake_stalled: false,
                 wake_update: false,
                 attention_update: false,
+                requeued: false,
                 notices: InboxCardNotices::default(),
             }));
         }
@@ -3187,6 +3188,7 @@ fn drain_events(st: &mut HubState) {
             wake_stalled: false,
             wake_update: false,
             attention_update: false,
+            requeued: event.requeued,
             notices: InboxCardNotices::default(),
         }));
     }
@@ -3218,6 +3220,7 @@ fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, 
         wake_stalled: stalled,
         wake_update: true,
         attention_update: false,
+        requeued: false,
         notices: InboxCardNotices::default(),
     }));
 }
@@ -4793,6 +4796,30 @@ mod tests {
                 .any(|m| m.id == other && m.state == StateName::Queued)
         );
         assert_eq!(hub.summary("p", "a").undeliverable, 1);
+    }
+
+    /// Reviewer R9Q-03: the notice of a fetched message going back to the
+    /// queue says it is a hand-back; its post's notice does not.
+    #[test]
+    fn a_hand_back_is_broadcast_as_one() {
+        let hub = hub();
+        let (tx, mut rx) = broadcast::channel(16);
+        hub.set_broadcast(tx);
+        let mut next = || match rx.try_recv() {
+            Ok(BroadcastMsg::Inbox(notice)) => (notice.state, notice.requeued),
+            other => panic!("expected an inbox broadcast, got {other:?}"),
+        };
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content("hello"))
+            .unwrap()
+            .to_string();
+        hub.fetch("p", "a", Consumer::FetchCli, None, None);
+        hub.run_out_ack_wait(&id, "p");
+        use crate::inbox::StateName::{Fetched, Queued};
+        assert_eq!(
+            [next(), next(), next()],
+            [(Queued, false), (Fetched, false), (Queued, true)]
+        );
     }
 
     #[tokio::test]

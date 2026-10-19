@@ -1555,7 +1555,7 @@ pub struct AppState {
     /// as a number. Read by the dashboard's creation-order sort for a card
     /// that has no `agent_id` of its own yet — a live-surfaced card before its
     /// agent's first real hook, or a pane that never sends one. Order only:
-    /// nothing here is identity, and dropped with the pane.
+    /// nothing in this map is identity, and it is dropped with the pane.
     pane_surfaced_agent_seq: HashMap<String, u64>,
     /// PRD #1666 §2.8: per pane, what this client knows of the inbox of the
     /// agent in it — the daemon's last account of it and the messages seen
@@ -6405,7 +6405,9 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
 enum SeenMessage {
     /// Pending, and posted after the summary, so not in its count.
     PendingNew,
-    /// Pending, and first seen already taken, so one the summary counted.
+    /// Pending, and first seen already taken or handed back from being taken
+    /// ([`crate::event::InboxNotice::requeued`]), so taken before the summary
+    /// and one it counted.
     PendingCounted,
     /// Acknowledged or undeliverable.
     Settled,
@@ -6423,13 +6425,24 @@ const MAX_RETIRED_INBOX_AGENTS: usize = 8;
 /// a frame repeated or a hand-back (`fetched` → `queued`) counts nothing twice.
 #[derive(Debug, Clone, Default)]
 struct PaneInbox {
-    /// The agent generation the counts belong to; a different one in the pane
-    /// starts them over.
+    /// The agent generation the counts belong to. A daemon account naming
+    /// another starts them over; so does a notice naming another, unless
+    /// [`Self::owned`].
     agent_id: Option<String>,
-    /// Earlier agent generations of the pane, newest last: a notice naming one
-    /// is late and changes nothing ([`Self::fold`]). A daemon account naming
-    /// another agent than [`Self::agent_id`], or a notice naming a new one,
-    /// retires the one before ([`Self::retire`]).
+    /// Reviews R9Q-A03: [`Self::agent_id`] is the daemon's — this account
+    /// came from its summary ([`Self::from_summary`]), which is ordered with
+    /// its notices — rather than learned from a notice. Such an account takes
+    /// no notice naming another agent: a new generation in the pane is
+    /// established by the daemon's next account of it (its surfacing start or
+    /// a snapshot), and a notice naming any other generation is late, whether
+    /// or not this client ever held an account of that generation.
+    owned: bool,
+    /// Earlier agent generations of the pane, newest last, at most
+    /// [`MAX_RETIRED_INBOX_AGENTS`]: a notice naming one changes nothing
+    /// ([`Self::fold`]). This is what fences an account learned from notices,
+    /// which [`Self::owned`] does not cover. A daemon account naming another
+    /// agent than [`Self::agent_id`], or a notice naming a new one, retires the
+    /// one before ([`Self::retire`]).
     retired: Vec<String>,
     /// Pending messages the summary counted that no notice has settled yet.
     baseline: usize,
@@ -6479,6 +6492,7 @@ impl PaneInbox {
     fn from_summary(agent_id: &str, summary: &crate::inbox_hub::InboxSummary) -> Self {
         Self {
             agent_id: Some(agent_id.to_string()),
+            owned: true,
             retired: Vec::new(),
             // A claimed job is taken and not yet acknowledged, as a fetch is.
             baseline: summary
@@ -6492,9 +6506,10 @@ impl PaneInbox {
         }
     }
 
-    /// `next`, the daemon's account of the pane, in place of this one; the
-    /// generations this one retired stay retired, and its own, when `next`
-    /// names another, joins them.
+    /// `next`, a new account of the pane, in place of this one. The
+    /// generations this one's history retains are carried over, less the one
+    /// `next` names and beyond the [`MAX_RETIRED_INBOX_AGENTS`] newest, and
+    /// its own joins them when `next` names another.
     fn retire(&mut self, mut next: PaneInbox) {
         let mut retired = std::mem::take(&mut self.retired);
         if let Some(previous) = self.agent_id.take()
@@ -6513,10 +6528,11 @@ impl PaneInbox {
         *self = next;
     }
 
-    /// Take one notice ([`AppState::apply_inbox_notice`]); one naming another
-    /// agent generation than the counts belong to starts them over, unless it
-    /// names a generation the pane has already left behind, whose notice is
-    /// late and changes nothing.
+    /// Take one notice ([`AppState::apply_inbox_notice`]). One naming another
+    /// agent generation than the counts belong to changes nothing when the
+    /// daemon established those counts' generation ([`Self::owned`]) or the
+    /// pane's retained history names it ([`Self::retired`]); otherwise it
+    /// starts the counts over.
     fn fold(&mut self, notice: &crate::event::InboxNotice) {
         if notice
             .agent_id
@@ -6526,6 +6542,7 @@ impl PaneInbox {
             return;
         }
         match (&self.agent_id, &notice.agent_id) {
+            (Some(held), Some(named)) if held != named && self.owned => return,
             (Some(held), Some(named)) if held != named => {
                 self.retire(PaneInbox {
                     agent_id: Some(named.clone()),
@@ -6551,7 +6568,7 @@ impl PaneInbox {
             } else {
                 notice.state
             };
-            self.apply(&notice.message_id, state);
+            self.apply(&notice.message_id, state, notice.requeued);
         }
     }
 
@@ -6592,7 +6609,7 @@ impl PaneInbox {
         }
     }
 
-    fn apply(&mut self, id: &str, state: crate::inbox::StateName) {
+    fn apply(&mut self, id: &str, state: crate::inbox::StateName, requeued: bool) {
         use crate::inbox::StateName;
         // A claimed offer is taken and not yet acknowledged, as a fetch is.
         let taken = matches!(state, StateName::Fetched | StateName::Claimed);
@@ -6602,7 +6619,11 @@ impl PaneInbox {
         let next = match (self.seen.get(id).copied(), pending) {
             (Some(SeenMessage::Settled), _) => SeenMessage::Settled,
             (Some(kept), true) => kept,
-            (None, true) if taken && unclaimed => SeenMessage::PendingCounted,
+            // Reviewer R9Q-03: a message unseen since the summary and handed
+            // back from being taken was taken before it, as one first seen
+            // taken was; a message first seen queued and not handed back is a
+            // new post.
+            (None, true) if (taken || requeued) && unclaimed => SeenMessage::PendingCounted,
             (None, true) => SeenMessage::PendingNew,
             (Some(SeenMessage::PendingCounted), false) => {
                 self.baseline = self.baseline.saturating_sub(1);
@@ -13102,11 +13123,14 @@ impl AppState {
         }
 
         // Issue #1507: a daemon card-surfacing start names the registry id of
-        // the agent it draws, for creation order only — the session's own
+        // the agent it draws, read here for creation order — the session's own
         // `agent_id` stays `None` so the agent's real `SessionStart` still
         // supersedes it. Only the daemon's marked start is read: a hook cannot
         // move a card by claiming an id. (The marker is producer-writable, so a
-        // forged one can reorder a card, which is all this key can do.)
+        // forged one can reorder a card. The key's other use, naming the
+        // generation of the start's inbox summary (`take_surfaced_inbox`),
+        // needs that summary, which the hook ingress strips from producer
+        // frames.)
         if event.is_card_surface_session_start()
             && let Some(pane_id) = event.pane_id.as_ref()
             && let Some(seq) = event
@@ -19361,6 +19385,7 @@ mod tests {
             wake_stalled: false,
             wake_update: false,
             attention_update: false,
+            requeued: false,
             notices: Default::default(),
         }
     }
@@ -19703,6 +19728,87 @@ mod tests {
         ));
         let shown = pane_card_inbox(&state, "pane-q").unwrap_or_default();
         assert_eq!((shown.pending, shown.integration), (0, None));
+    }
+
+    /// PRD #1666 §2.8 (reviewer R9Q-03): a message the daemon's account counts
+    /// as fetched, whose first change since is a hand-back to the queue (a
+    /// receipt recovery or an ack-wait redelivery), is the message the account
+    /// counted, not a new one: the card shows one pending message through its
+    /// requeue, fetch and acknowledgement, and none after. A message genuinely
+    /// posted meanwhile, first seen queued, still counts on top.
+    #[test]
+    fn a_hand_back_of_a_message_the_account_counted_counts_it_once() {
+        use crate::inbox::StateName::{Acknowledged, Fetched, Queued};
+        let mut summary = held_summary(0, None);
+        summary.fetched = 1;
+        let mut state = AppState::default();
+        state.apply_event(surfacing_start("pane-q", "agent-q", &summary));
+        let pending = |state: &AppState| pane_card_inbox(state, "pane-q").map(|i| i.pending);
+        assert_eq!(pending(&state), Some(1));
+        let notice = |id: &str, step, requeued| crate::event::InboxNotice {
+            requeued,
+            ..inbox_notice("pane-q", id, step)
+        };
+        for (id, step, requeued, shown, what) in [
+            ("m-1", Queued, true, 1, "m-1 handed back"),
+            ("m-new", Queued, false, 2, "a new post on top"),
+            ("m-1", Fetched, false, 2, "m-1 fetched again"),
+            ("m-1", Acknowledged, false, 1, "m-1 delivered, m-new left"),
+            ("m-new", Fetched, false, 1, "m-new fetched"),
+            ("m-new", Acknowledged, false, 0, "nothing pending"),
+        ] {
+            state.apply_inbox_notice(&notice(id, step, requeued));
+            assert_eq!(pending(&state), Some(shown), "{what}");
+        }
+    }
+
+    /// PRD #1666 §2.8 (auditor R9Q-A03): a new agent's surfacing start reaches
+    /// a client that never held an account of the pane's earlier occupant, so
+    /// no retained history names it. That occupant's cleanup — its reader
+    /// publishes its exit before the hub settles its inbox, so a replacement
+    /// can surface first — arrives afterwards: a message made undeliverable,
+    /// its warning cleared, a message queued. None of it moves the card or the
+    /// picker off the new agent, whose own notices keep counting.
+    #[test]
+    fn a_late_notice_from_a_generation_never_accounted_for_changes_nothing() {
+        use crate::inbox::StateName::{Queued, Undeliverable};
+        use crate::inbox_display::IntegrationNotice::RefreshFailedPi;
+        let item = crate::inbox_hub::InboxAttentionItem {
+            message_id: "m-held".to_string(),
+            revision: 1,
+            kind: crate::inbox_display::AttentionKind::HeldLong,
+            from_label: "the orchestrator".to_string(),
+            subject: "subject".to_string(),
+            task_id: None,
+        };
+        let mut summary = held_summary(1, Some(RefreshFailedPi));
+        summary.notices.attention = vec![item];
+        let mut state = AppState::default();
+        state.apply_event(surfacing_start("pane-q", "agent-new", &summary));
+        let old = |id: &str, state| crate::event::InboxNotice {
+            agent_id: Some("agent-old".to_string()),
+            ..inbox_notice("pane-q", id, state)
+        };
+        state.apply_inbox_notice(&old("m-old", Undeliverable));
+        state.apply_inbox_notice(&integration_notice("pane-q", "agent-old", None));
+        state.apply_inbox_notice(&old("m-old-2", Queued));
+        state.apply_inbox_notice(&crate::event::InboxNotice {
+            agent_id: Some("agent-new".to_string()),
+            ..inbox_notice("pane-q", "m-new", Queued)
+        });
+        let shown = pane_card_inbox(&state, "pane-q").expect("the card");
+        assert_eq!(
+            (shown.pending, shown.integration, shown.held_long),
+            (2, Some(RefreshFailedPi), 1),
+            "the new agent's account and its own later message"
+        );
+        assert_eq!(
+            state
+                .inbox_attention("pane-q")
+                .map(|(agent, items)| (agent.map(str::to_string), items.len())),
+            Some((Some("agent-new".to_string()), 1)),
+            "the picker stays on the new agent"
+        );
     }
 
     /// PRD #1666 §2.8: a resync's reply is the account of every listed pane's

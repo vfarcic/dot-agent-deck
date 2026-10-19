@@ -738,6 +738,7 @@ mod tests {
             wake_stalled: false,
             wake_update: false,
             attention_update: false,
+            requeued: false,
             notices: Default::default(),
         };
 

@@ -599,6 +599,7 @@ mod tests {
             wake_stalled: false,
             wake_update: false,
             attention_update: true,
+            requeued: false,
             notices: notices.clone(),
         }));
         assert_eq!(view.needs_fetch(now), Some(FetchReason::Inbox));

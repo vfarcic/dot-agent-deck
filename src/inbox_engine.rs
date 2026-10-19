@@ -1326,6 +1326,7 @@ fn send_notices(st: &HubState, key: &AgentKey, notices: InboxCardNotices) {
         wake_stalled: false,
         wake_update: false,
         attention_update: true,
+        requeued: false,
         notices,
     }));
 }

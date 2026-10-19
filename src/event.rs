@@ -438,9 +438,15 @@ pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 /// TUI can place the live card in creation order before the agent's first real
 /// hook — and at all for a pane that never sends one (a shell, `cat`).
 ///
-/// ORDER ONLY, never identity: the event's own `agent_id` stays `None` so the
+/// Not the SESSION's identity: the event's own `agent_id` stays `None` so the
 /// agent's real `SessionStart` still supersedes the placeholder (see
-/// `surface_spawned_pane`). Additive on the wire: an older daemon sends no key
+/// `surface_spawned_pane`). For the card it is order only. PRD #1666 §2.8 adds
+/// one identity use: it names the agent generation the start's
+/// [`SURFACED_INBOX_METADATA_KEY`] summary belongs to, which becomes the
+/// pane's inbox owner. The key is producer-writable, so a hook can forge it to
+/// reorder a card, but not that inbox use: the hook ingress strips the
+/// companion summary from producer frames, and without one this key
+/// establishes no inbox. Additive on the wire: an older daemon sends no key
 /// and the card falls back to the pane-id order, and an older TUI ignores it.
 pub const SURFACED_AGENT_ID_METADATA_KEY: &str = "surfaced_agent_id";
 
@@ -454,8 +460,8 @@ pub const SURFACED_AGENT_ID_METADATA_KEY: &str = "surfaced_agent_id";
 /// [`BroadcastMsg::Inbox`] notice is sent under, so on the ordered event
 /// stream the summary includes every notice for the pane before the start and
 /// none after it. A client takes it as the pane's inbox at that point and
-/// applies the later notices on top; notices for a pane it has had no such
-/// account of are dropped. The notices the daemon raises while it spawns an
+/// applies the later notices on top; notices for a pane it neither manages nor
+/// has had such an account of are dropped. The notices the daemon raises while it spawns an
 /// agent — a failed integration refresh among them — therefore reach the card
 /// through this start, whether or not the agent ever sends a hook.
 ///
@@ -3028,6 +3034,13 @@ pub struct InboxNotice {
     /// them. Additive: a client that does not know it ignores them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub attention_update: bool,
+    /// Reviewer R9Q-03: `state` is `queued` because the message went back to
+    /// the queue from being taken — a hand-back, not a new post — so a client
+    /// whose account of the pane counted it as taken, without having seen it
+    /// yet, does not count it again. Additive: a client that does not know it
+    /// reads every unseen queued message as new, as before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requeued: bool,
     #[serde(flatten, default)]
     pub notices: crate::inbox_hub::InboxCardNotices,
 }

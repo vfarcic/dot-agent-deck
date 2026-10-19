@@ -12042,6 +12042,7 @@ mod tests {
             wake_stalled: false,
             wake_update: false,
             attention_update: false,
+            requeued: false,
             notices: Default::default(),
         });
         let value = serde_json::to_value(&msg).unwrap();

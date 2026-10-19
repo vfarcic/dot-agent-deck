@@ -1737,7 +1737,8 @@ fn surface_spawned_pane(
     // start that named nothing and so has no friendly title to carry.
     task_name: Option<&str>,
     // Issue #1507: the registry id of the agent this card draws, for the TUI's
-    // creation order only — see `SURFACED_AGENT_ID_METADATA_KEY`.
+    // creation order and, with `inbox`, the generation its inbox summary
+    // belongs to — see `SURFACED_AGENT_ID_METADATA_KEY`.
     agent_id: &str,
     // PRD #1666 §2.8: the inbox whose summary for that agent the start
     // carries, read and broadcast under its lock — see
