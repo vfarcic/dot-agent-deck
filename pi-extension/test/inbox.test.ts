@@ -188,6 +188,24 @@ test("pi_007 a repeated hand-out is sent once, and a marked repeat is its own at
 	assert.equal(pi.sends.length, 2, "the marked repeat is its own attempt, sent once");
 });
 
+/// Scenario: Pi starts on a deck message, and the deck then hands the same attempt out again and a marked repeat of it, as it does when the commit has not reached it. Pi runs the message once: neither is sent to Pi or asks for an approval, each is reported committed, and nothing is left held.
+test("pi_007 an attempt of a message Pi already committed is reported committed, not sent again", async () => {
+	const { pi, child } = await started();
+	child.hand(ref());
+	await settle();
+	await pi.gate();
+	await pi.start(ID);
+	assert.deepEqual(child.refs("committed"), [ref()], "precondition: the first attempt committed");
+	child.hand(ref());
+	await settle();
+	child.hand(ref(ID, 1, 2));
+	await settle();
+	assert.equal(pi.sends.length, 1, "Pi runs the message once");
+	assert.deepEqual(child.refs("may"), [ref()], "no approval is asked for the replay or the repeat");
+	assert.deepEqual(child.refs("committed"), [ref(), ref(), ref(ID, 1, 2)], "each is reported committed");
+	assert.deepEqual(child.sent("possess").at(-1).held, [], "nothing is left held");
+});
+
 /// Scenario: An attempt is submitted to Pi but no gate has seen it when the session is replaced by /new. The successor submits the same attempt again behind a fresh approval; the first submission's tag is consumed at either instance's gate, and the attempt passes a gate once.
 test("pi_007 a submission no gate saw is submitted again to a /new successor, and passes one gate", async () => {
 	const { pi, child } = await started();

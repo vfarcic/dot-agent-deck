@@ -252,6 +252,36 @@ function rememberKey(set: Set<string>, key: string): void {
 	}
 }
 
+/** Whether this process committed some attempt of deck message `id` (`proc.committed`). */
+function committedMessage(proc: InboxProcess, id: string): boolean {
+	const prefix = id + "|";
+	for (const key of proc.committed) {
+		if (key.startsWith(prefix)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * PR #1735 review 4306950747: an attempt of a message this process already
+ * committed — that same attempt again, or a new one the deck issued before it
+ * read the commit (a lost or late receipt) — is not handed to Pi a second
+ * time. It is reported committed instead, so its watcher publishes the
+ * receipt and the deck settles the message rather than keeping the attempt
+ * held or repeating it.
+ */
+function alreadyCommitted(proc: InboxProcess, message: InboxMessage): boolean {
+	const ref = inboxRef(message as InboxRef);
+	const key = inboxKey(ref);
+	if (!proc.committed.has(key) && !committedMessage(proc, message.id)) {
+		return false;
+	}
+	rememberKey(proc.committed, key);
+	proc.receiver.committed([ref]);
+	return true;
+}
+
 function rememberTag(proc: InboxProcess, tag: string, key: string): void {
 	proc.tags.set(tag, key);
 	while (proc.tags.size > INBOX_REMEMBERED) {
@@ -347,8 +377,11 @@ function armRecheck(proc: InboxProcess, key: string): void {
  */
 function deliver(proc: InboxProcess, message: InboxMessage): void {
 	const key = inboxKey(message as InboxRef);
-	if (proc.sent.has(key) || proc.passed.has(key) || proc.committed.has(key)) {
-		// Its hand-over is under way or over; a marked repeat is a new attempt.
+	if (alreadyCommitted(proc, message)) {
+		return;
+	}
+	if (proc.sent.has(key) || proc.passed.has(key)) {
+		// Its hand-over is under way.
 		return;
 	}
 	if (proc.pending.some((held) => inboxKey(held as InboxRef) === key)) {
@@ -610,7 +643,11 @@ async function doorbell(proc: InboxProcess, instance: Instance, ids: string[], c
 	}
 	proc.receiver.take(fetched as InboxReceiverMessage[]);
 	// No await from here to the return.
-	const refs = fetched.map((m) => inboxRef(m as InboxRef));
+	const handing = fetched.filter((m) => !alreadyCommitted(proc, m));
+	if (handing.length === 0) {
+		return HANDLED;
+	}
+	const refs = handing.map((m) => inboxRef(m as InboxRef));
 	const live =
 		!proc.disposed &&
 		!instance.shutdown &&
@@ -635,7 +672,7 @@ async function doorbell(proc: InboxProcess, instance: Instance, ids: string[], c
 		noteId(proc, ref);
 	}
 	proc.receiver.handed(refs);
-	return { action: "transform", text: inboxUserText(fetched) };
+	return { action: "transform", text: inboxUserText(handing) };
 }
 
 /**
