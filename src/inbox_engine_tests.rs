@@ -2136,21 +2136,36 @@ async fn a_commit_after_running_out_of_attempts_corrects_the_sender_and_the_card
         state_of(&hub, "p", task.as_str()) == StateName::Undeliverable
     })
     .await;
+    // Owed notices are posted after the hub lock is released, by whichever
+    // call releases it: the stream's own task may be posting them.
+    until("the orchestrator to be told", || {
+        !orchestrator_notices(&hub).is_empty()
+    })
+    .await;
     let told = orchestrator_notices(&hub);
     assert_eq!(
         told.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
         vec![UNDELIVERED_SUBJECT],
         "precondition: the orchestrator was told the task is undeliverable"
     );
-    assert!(
-        cards.lock().unwrap().iter().any(|n| !n.cleared),
-        "precondition: the card was told of the error"
-    );
+    until("the card to be told of the error", || {
+        cards.lock().unwrap().iter().any(|n| !n.cleared)
+    })
+    .await;
 
     peer.send(serde_json::json!({"committed": [at(&last)]}))
         .await;
     until("the commit to settle the task", || {
         state_of(&hub, "p", task.as_str()) == StateName::Acknowledged
+    })
+    .await;
+    until("the correction and the card's clearing", || {
+        orchestrator_notices(&hub).len() >= 2
+            && cards
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n.cleared && n.delivery_id == task.as_str())
     })
     .await;
     let told = orchestrator_notices(&hub);
