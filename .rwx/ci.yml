@@ -4,13 +4,25 @@
 # fmt, clippy, the release build, the fast tier and the e2e tier run in
 # parallel.
 #
+# Every task runs on 4 CPU / 16 GB, the size of GitHub's `ubuntu-latest`, so a
+# push compares the two on comparable hardware. Raising `cpus:` on a task buys
+# speed per task (measured 2026-10-18: compile tasks on 16 CPUs took the run
+# from 6.3 to 5.0 minutes, at roughly twice the cost).
+#
 # Keep the versions below in step with ci.yml (Renovate does not update this
 # file).
 
-# CLI only: `rwx run` from a worktree runs the local uncommitted changes on
-# top of the pushed HEAD. There is deliberately no `github:` trigger, so a push
-# to this branch starts nothing on RWX (and `ci.yml` does not run on it either).
+# A push to `rwx` runs this on RWX and `.github/workflows/ci.yml` on GitHub
+# Actions side by side; `rwx run` from a worktree runs local uncommitted
+# changes on top of the pushed HEAD. Push-triggered runs on a public repository
+# can use the tool-cache vault only with its "Allow public repositories" switch
+# on (vault → Access Control).
 on:
+  github:
+    push:
+      if: ${{ event.git.branch == 'rwx' }}
+      init:
+        commit-sha: ${{ event.git.sha }}
   cli:
     init:
       commit-sha: ${{ event.git.sha }}
@@ -26,6 +38,11 @@ base:
 # evaluation: `rwx vaults create --name dot_agent_deck_rwx_eval --unlocked`).
 tool-cache:
   vault: dot_agent_deck_rwx_eval
+
+defaults:
+  runner:
+    cpus: 4
+    memory: 16gb
 
 tasks:
   - key: system-packages
@@ -77,9 +94,6 @@ tasks:
   - key: clippy
     use: [system-packages, code, rust]
     tool-cache: ci-clippy-v2
-    runner:
-      cpus: 16
-      memory: 64gb
     env:
       CARGO_INCREMENTAL: "0"
     run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
@@ -87,9 +101,6 @@ tasks:
   - key: build-release
     use: [system-packages, code, rust]
     tool-cache: ci-build-release-v2
-    runner:
-      cpus: 16
-      memory: 64gb
     run: cargo build --release
 
   - key: linkage-check
@@ -99,9 +110,6 @@ tasks:
   - key: test
     use: [system-packages, code, rust, nextest, go-task, node]
     tool-cache: ci-test-v2
-    runner:
-      cpus: 16
-      memory: 64gb
     env:
       DAD_REQUIRE_GO_TASK: "1"
       # Line tables keep file:line in panics and backtraces but drop the rest
@@ -123,15 +131,13 @@ tasks:
             framework: cargo-nextest
 
   # Compile the e2e tier once into a nextest archive. The partitions run the
-  # archive, so they never invoke cargo: a cargo run there rebuilds the
-  # workspace crates, whose sources get fresh mtimes in every task.
+  # archive, so they never build the tier: a cargo build there would rebuild
+  # the workspace crates, whose sources get fresh mtimes in every task.
   - key: e2e-build
     use: [system-packages, code, rust, nextest, node]
     tool-cache: ci-e2e-build-v2
     # The e2e `target/` plus its archive needs well over the default 50 GB.
     runner:
-      cpus: 16
-      memory: 64gb
       disk: 150gb
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -157,8 +163,6 @@ tasks:
         - shard: "4"
         - shard: version
     runner:
-      cpus: 4
-      memory: 16gb
       disk: 150gb
     env:
       SHARD: ${{ parallel.shard }}
