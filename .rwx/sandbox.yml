@@ -45,14 +45,22 @@ tasks:
       curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "$HOME/.cargo/bin"
       cargo nextest --version
 
+  # Some fast-tier tests run `node` (e.g. tests/pi_native_observer.rs); GitHub's
+  # ubuntu-latest image and the devbox shell both ship Node 24, the RWX base
+  # image does not. Exact X.Y.Z is required by the package.
+  - key: node
+    call: nodejs/install 1.2.0
+    with:
+      node-version: "24.22.0"
+
   - key: go-task
     run: |
-      curl -LsSf https://github.com/go-task/task/releases/download/v3.53.1/task_linux_amd64.tar.gz \
+      curl -LsSf https://github.com/go-task/task/releases/download/v3.54.0/task_linux_amd64.tar.gz \
         | sudo tar zxf - -C /usr/local/bin task
       task --version
 
   - key: sandbox
-    use: [system-packages, code, rust, nextest, go-task]
+    use: [system-packages, code, rust, nextest, go-task, node]
     runner:
       cpus: 16
       memory: 64gb
