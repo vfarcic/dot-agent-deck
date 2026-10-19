@@ -10275,6 +10275,14 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
+##### inbox/opencode/055 — A hand-over check pending across a watcher restart is asked again, not refused.
+- **Layer:** Fast (`src/opencode_manage.rs`), the generated receiver under Node with a stand-in watcher.
+- **Agent:** none.
+- **Asserts:** a callback's `may` is outstanding when its watcher exits; nothing is reported `not_handed`, the respawned watcher's registration finds the attempt `retained`, the callback asks once more under the new incarnation and, granted, reaches OpenCode once and reports the attempt handed.
+- **Does not assert:** a successor that never registers within five seconds (the check then resolves refused), or a real watcher process.
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
 ##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`)
 - **Agent:** generated server plugin under mini, full-TUI, run, serve and attach argv.

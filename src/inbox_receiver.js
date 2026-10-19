@@ -172,7 +172,43 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     }
     flush();
   };
+  // Outstanding `may` questions by number. A watcher that ends voids its
+  // questions (`null`): the asker waits for the successor's registration and
+  // asks again (`nextRegistration`, PR #1735 review 4305713311). A stop or a
+  // drain refuses them (`false`).
   const grants = new Map();
+  const voidGrants = (answer) => {
+    for (const [, resolve] of grants) resolve(answer);
+    grants.clear();
+  };
+  // Askers waiting for the next registration; told `false` by a stop or a
+  // drain, or once INBOX_GRANT_TIMEOUT_MS passed with none.
+  let registrations = [];
+  const nextRegistration = () =>
+    new Promise((resolve) => {
+      if (!active() || draining) {
+        resolve(false);
+        return;
+      }
+      if (child && rx !== undefined) {
+        resolve(true);
+        return;
+      }
+      registrations.push(resolve);
+      const timer = setTimeout(() => {
+        const at = registrations.indexOf(resolve);
+        if (at >= 0) {
+          registrations.splice(at, 1);
+          resolve(false);
+        }
+      }, INBOX_GRANT_TIMEOUT_MS);
+      timer.unref?.();
+    });
+  const wakeRegistrations = (registered) => {
+    const waiting = registrations;
+    registrations = [];
+    for (const resolve of waiting) resolve(registered);
+  };
   let watermark = { seen: 0, above: new Set() };
   let child;
   let epoch = 0;
@@ -254,6 +290,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
       flush();
       snapshot();
       registered?.();
+      wakeRegistrations(true);
     }
     for (const rebound of Array.isArray(reply.rebound) ? reply.rebound : []) {
       const entry = held.get(inboxKey(rebound));
@@ -292,8 +329,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     runs += 1;
     epoch += 1;
     rx = undefined;
-    for (const [, resolve] of grants) resolve(false);
-    grants.clear();
+    voidGrants(null);
     let spawned;
     try {
       spawned = spawn(hookBinary(), args, { stdio: ["pipe", "pipe", "inherit"] });
@@ -327,6 +363,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
       if (child === spawned) {
         child = undefined;
         rx = undefined;
+        voidGrants(null);
       }
       exited?.(code);
       if (!active() || spawned.stdin.writableEnded) return;
@@ -362,8 +399,8 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     drain: () =>
       new Promise((resolve) => {
         draining = true;
-        for (const [, resolve] of grants) resolve(false);
-        grants.clear();
+        voidGrants(false);
+        wakeRegistrations(false);
         const gone = child;
         if (!gone || typeof gone.exitCode === "number" || gone.signalCode) {
           child = undefined;
@@ -409,8 +446,8 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
       const gone = child;
       child = undefined;
       rx = undefined;
-      for (const [, resolve] of grants) resolve(false);
-      grants.clear();
+      voidGrants(false);
+      wakeRegistrations(false);
       inboxStop(gone);
     },
     rx: () => rx,
@@ -423,24 +460,33 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     },
     // §3: the daemon's final hand-over check; resolves to the approval (its
     // epoch and when it was asked for), or undefined when it was refused or
-    // went unanswered.
+    // went unanswered. A question the watcher's restart voided is asked once
+    // more under the successor, once it registers (PR #1735 review
+    // 4305713311), so a restart alone never reads as a refusal; if none
+    // registers within INBOX_GRANT_TIMEOUT_MS it resolves undefined.
     may: async (ref) => {
-      if (!child || rx === undefined || draining) return undefined;
-      const asked = approval();
-      q += 1;
-      const id = q;
-      const answered = new Promise((resolve) => {
-        grants.set(id, resolve);
-        const timer = setTimeout(() => {
-          if (grants.delete(id)) resolve(false);
-        }, INBOX_GRANT_TIMEOUT_MS);
-        timer.unref?.();
-      });
-      if (!inboxWrite(child, { may: { q: id, ...ref } })) {
-        grants.delete(id);
-        return undefined;
-      }
-      return (await answered) ? asked : undefined;
+      const ask = async () => {
+        if (!child || rx === undefined || draining) return undefined;
+        const asked = approval();
+        q += 1;
+        const id = q;
+        const answered = new Promise((resolve) => {
+          grants.set(id, resolve);
+          const timer = setTimeout(() => {
+            if (grants.delete(id)) resolve(false);
+          }, INBOX_GRANT_TIMEOUT_MS);
+          timer.unref?.();
+        });
+        if (!inboxWrite(child, { may: { q: id, ...ref } })) {
+          grants.delete(id);
+          return undefined;
+        }
+        const answer = await answered;
+        return answer === null ? null : answer ? asked : undefined;
+      };
+      const granted = await ask();
+      if (granted !== null) return granted;
+      return (await nextRegistration()) ? ((await ask()) ?? undefined) : undefined;
     },
     // An approval the deck gives in this synchronous step: a doorbell fetch
     // issues its attempts under the deck's lock.

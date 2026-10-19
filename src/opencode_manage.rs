@@ -1528,8 +1528,10 @@ const inboxRefusedBeforeAcceptance = (result) => {
 // hand-over check: the deck's approval, then — with no await between them and
 // the call — this context's own synchronous check and the caller's `valid`,
 // which re-reads what the await may have changed (the session on screen, a
-// dialog). An approval voided by a watcher restart is asked for once more
-// under the new incarnation; any other refusal drops the callback before the
+// dialog). An approval voided by a watcher restart, or a check still pending
+// when the watcher ended (the receiver's `may` waits for the successor's
+// registration), is asked for once more under the new incarnation; any other
+// refusal drops the callback before the
 // call, so the attempt was positively not handed. Once the call began, only
 // OpenCode's refusal before acceptance is a not-handed witness; any other
 // failure is lost, for a marked repeat. Returns whether it was handed.
@@ -4727,6 +4729,47 @@ feed({ grant: { q: sent().filter((c) => c.may).pop().may.q, ok: true } });
 await third;
 check(called, 1, "a retired context's approved callback never reaches OpenCode");
 check(sent().filter((c) => c.not_handed).map((c) => c.not_handed[0].e), [2], "it reports not handed");
+"#,
+        );
+    }
+
+    /// Scenario: A callback asks the deck's final hand-over check, and its watcher exits before the deck answers. The exit is not read as a refusal: nothing is reported not handed, and once the respawned watcher registers and the attempt is answered `retained`, the callback asks again under the new incarnation, reaches OpenCode once and reports the attempt handed.
+    #[spec("inbox/opencode/055")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_055_a_check_pending_across_a_watcher_restart_is_asked_again() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+const ref = { id, a: 1, e: 1 };
+feed({ messages: [{ ...ref, subject: "s", from: "x", text: "t", d: 1 }] });
+let called = 0;
+const pending = inboxHandOver(receiver, ref, "s1", async () => { called += 1; return {}; });
+await tick();
+const first = current();
+check(first.written.filter((c) => c.may).length, 1, "the check is asked");
+first.emit("exit");
+await new Promise((r) => setTimeout(r, 10));
+check(first.written.filter((c) => c.not_handed).length, 0, "the watcher's exit is not a refusal");
+// The fixed backoff is an hour: respawn by hand, as the timer would.
+receiver.start();
+feed({ registered: { rx: 5, slot: "opencode_tui", keepalive_ms: 30000 }, resume: [ref] });
+check(sent().find((c) => c.resume_answers).resume_answers[0].answer, "retained", "the attempt is retained");
+await tick();
+const asked = sent().filter((c) => c.may);
+check(asked.length, 1, "asked again under the new incarnation");
+feed({ grant: { q: asked[0].may.q, ok: true } });
+check(await pending, true, "handed over");
+check(called, 1, "OpenCode is called once");
+check(sent().filter((c) => c.not_handed).length, 0, "never reported not handed");
+check(sent().filter((c) => c.handed).map((c) => c.handed), [[ref]], "reported handed");
 "#,
         );
     }
