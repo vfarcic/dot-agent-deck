@@ -84,16 +84,38 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
                 deck.snapshot_grid()
             )
         });
+    // The delegate is the orchestration's task message, carried inline or
+    // spilled to the worker's task file by its size: either way it must name
+    // this task and be acknowledged by a coder other than the one replaced.
+    let command = format!(
+        "printf '{CONTENT}' > '{}'",
+        deck.workdir().join(SENTINEL).display()
+    );
+    let is_task = |m: &dot_agent_deck::inbox::MessageSummary| {
+        let from_orchestration = matches!(
+            &m.from,
+            dot_agent_deck::inbox::Sender::Agent { orchestration: Some(o), .. } if o == "codex-delegate"
+        );
+        let carries_task = match m.spill_path.as_deref() {
+            Some(path) => path.ends_with(".dot-agent-deck/worker-task-coder.md"),
+            None => m
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(&command)),
+        };
+        from_orchestration
+            && carries_task
+            && m.bind_agent
+                .as_deref()
+                .is_some_and(|agent| original != agent)
+            && m.state == dot_agent_deck::inbox::StateName::Acknowledged
+    };
     assert!(
-        common::wait_until(Duration::from_secs(15), || inbox_view::all_messages(
-            deck.attach_socket_path()
-        )
-        .iter()
-        .any(|m| m
-            .spill_path
-            .as_deref()
-            .is_some_and(|path| path.ends_with(".dot-agent-deck/worker-task-coder.md"))
-            && m.state == dot_agent_deck::inbox::StateName::Acknowledged)),
+        common::wait_until(Duration::from_secs(15), || {
+            inbox_view::all_messages(deck.attach_socket_path())
+                .iter()
+                .any(is_task)
+        }),
         "delegate must be acknowledged through inbox: {:?}",
         inbox_view::all_messages(deck.attach_socket_path())
     );
