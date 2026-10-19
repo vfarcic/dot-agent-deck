@@ -179,6 +179,9 @@ fn proxy_connection(
 /// response on the TUI side without a sleep or scheduler-timing assumption.
 struct AttachRaceGate {
     path: PathBuf,
+    /// Where the TUI's e2e subscriber seam records each event it applied to
+    /// its state (`DOT_AGENT_DECK_E2E_APPLIED_LOG`).
+    applied_log: PathBuf,
     list_snapshot_rx: Receiver<Option<usize>>,
     subscription_rx: Receiver<()>,
     event_rx: Receiver<Vec<u8>>,
@@ -194,6 +197,7 @@ impl AttachRaceGate {
     fn new(upstream_path: &Path) -> Self {
         let tempdir = common::harness_tempdir().expect("create attach-race proxy tempdir");
         let path = tempdir.path().join("attach-race.sock");
+        let applied_log = tempdir.path().join("applied.log");
         let listener = UnixListener::bind(&path).expect("bind attach-race proxy");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("make attach-race proxy owner-only");
@@ -248,6 +252,7 @@ impl AttachRaceGate {
 
         Self {
             path,
+            applied_log,
             list_snapshot_rx,
             subscription_rx,
             event_rx,
@@ -331,6 +336,24 @@ impl AttachRaceGate {
             event.is_card_surface_session_start(),
             "attach-race attempt {attempt}: the event crossing before hydration must be the \
              daemon-authored card-surface SessionStart"
+        );
+    }
+
+    /// Reviewer R9T-05: the surface event reached the socket
+    /// ([`Self::wait_for_surface_event`]); wait until the TUI's subscriber has
+    /// also APPLIED it to the TUI's state, so hydration released after this
+    /// lands on a state that already holds the card.
+    fn wait_for_applied_surface_event(&self, attempt: usize, pane_id: &str) {
+        let line = format!("{pane_id}\tSessionStart");
+        let applied = common::wait_until(attach_race_wait(), || {
+            std::fs::read_to_string(&self.applied_log)
+                .is_ok_and(|log| log.lines().any(|applied| applied == line))
+        });
+        assert!(
+            applied,
+            "attach-race attempt {attempt}: the TUI's subscriber never applied {pane_id}'s \
+             card-surface SessionStart to its state while hydration was held. Applied: {:?}",
+            std::fs::read_to_string(&self.applied_log).unwrap_or_default()
         );
     }
 
@@ -612,7 +635,21 @@ fn run_mid_attach_start_attempt(attempt: usize) {
     let cwd = common::harness_tempdir().expect("create attach-race desktop-selected cwd");
     let pane_id = desktop_pane_id(100 + attempt);
     let label = format!("desktop-attach-race-{attempt}");
-    let deck = launch_tui_against_sockets(&gate.path, &daemon.hook_socket);
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            gate.path.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_E2E_APPLIED_LOG",
+            gate.applied_log.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
 
     // The daemon has answered ListAgents with an empty typed snapshot, but the
     // proxy withholds it from startup hydration. In parallel the TUI's live
@@ -627,9 +664,11 @@ fn run_mid_attach_start_attempt(attempt: usize) {
         "attach-race attempt {attempt}: the desktop start must reach the daemon registry"
     );
 
-    // Prove the exact card-surface event crossed the subscription before the
-    // stale empty hydration response is allowed to reach the TUI.
+    // Prove the exact card-surface event crossed the subscription, and was
+    // applied to the TUI's state, before the stale empty hydration response
+    // is allowed to reach the TUI.
     gate.wait_for_surface_event(attempt, &pane_id);
+    gate.wait_for_applied_surface_event(attempt, &pane_id);
     gate.release_hydration();
 
     assert!(
@@ -1088,8 +1127,9 @@ fn visibility_001_desktop_refetch_after_first_start_keeps_tui_visible() {
 
 /// Scenario: On three fresh real-TUI launches, freeze startup after the daemon
 /// captures an empty hydration snapshot, then deliver a desktop-shaped start
-/// through the already-live event subscription before releasing that snapshot.
-/// The first agent must remain visible without selection after startup settles.
+/// through the already-live event subscription, wait until the TUI has applied
+/// it, and only then release that snapshot. The first agent must remain visible
+/// without selection after startup settles.
 #[spec("newagent/visibility/001")]
 #[test]
 fn visibility_001_desktop_started_plain_agent_survives_mid_attach_hydration() {

@@ -2922,6 +2922,8 @@ fn spawn_event_subscriber(
         drop_event: Some(e2e_subscriber_drops),
         #[cfg(feature = "e2e")]
         break_on_event: Some(e2e_subscriber_breaks),
+        #[cfg(feature = "e2e")]
+        applied: Some(e2e_subscriber_applied),
         ..SubscriberConfig::default()
     };
     tokio::spawn(run(DaemonClient::new(attach_path), state, config));
@@ -2973,6 +2975,31 @@ fn e2e_subscriber_breaks(event: &dot_agent_deck::event::AgentEvent) -> bool {
     event.pane_id.as_deref() == Some(pane)
         && format!("{:?}", event.event_type) == kind
         && !FIRED.swap(true, Ordering::SeqCst)
+}
+
+/// Reviewer R9T-05 e2e seam: when `DOT_AGENT_DECK_E2E_APPLIED_LOG` names a
+/// file, append `<pane id>\t<EventType>` to it for each event this subscriber
+/// has applied to the TUI's state, so a PTY test can hold a step until an
+/// event is in that state rather than merely on the socket
+/// (`newagent/visibility/001`'s attach race). Compiled only into the `e2e`
+/// build, like the seams above.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_applied(event: &dot_agent_deck::event::AgentEvent) {
+    let Some(path) = std::env::var_os("DOT_AGENT_DECK_E2E_APPLIED_LOG") else {
+        return;
+    };
+    let line = format!(
+        "{}\t{:?}\n",
+        event.pane_id.as_deref().unwrap_or(""),
+        event.event_type
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
 }
 
 /// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an

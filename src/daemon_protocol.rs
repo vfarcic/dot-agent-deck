@@ -9703,6 +9703,7 @@ mod tests {
                 max_delay: Duration::from_millis(50),
                 drop_event: None,
                 break_on_event: None,
+                applied: None,
             },
         ));
         {

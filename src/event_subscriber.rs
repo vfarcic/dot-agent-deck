@@ -38,6 +38,11 @@ pub struct SubscriberConfig {
     /// events it never forwarded. `None` in a shipped binary, like
     /// [`Self::drop_event`].
     pub break_on_event: Option<fn(&AgentEvent) -> bool>,
+    /// Reviewer R9T-05 e2e seam: told of each event once it is applied to the
+    /// state, so a PTY test can wait for an event to be in the TUI's state,
+    /// not only on its socket. `None` in a shipped binary, like
+    /// [`Self::drop_event`].
+    pub applied: Option<fn(&AgentEvent)>,
 }
 
 impl Default for SubscriberConfig {
@@ -51,6 +56,7 @@ impl Default for SubscriberConfig {
             max_delay: Duration::from_secs(5),
             drop_event: None,
             break_on_event: None,
+            applied: None,
         }
     }
 }
@@ -87,7 +93,11 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
                         if config.break_on_event.is_some_and(|brk| brk(&event)) {
                             break;
                         }
+                        let applied = config.applied.map(|applied| (applied, event.clone()));
                         state.write().await.apply_event(event);
+                        if let Some((applied, event)) = applied {
+                            applied(&event);
+                        }
                     }
                     // PRD #120: a daemon-spawned orchestration (issue
                     // dispatch). Queue it for the render loop, which owns
@@ -642,6 +652,7 @@ mod tests {
             max_delay: Duration::from_millis(50),
             drop_event: None,
             break_on_event: None,
+            applied: None,
         };
         let subscriber = tokio::spawn(run(DaemonClient::new(socket), Arc::clone(&state), config));
 
@@ -772,6 +783,7 @@ mod tests {
             max_delay: Duration::from_millis(50),
             drop_event: None,
             break_on_event: None,
+            applied: None,
         };
         let subscriber = tokio::spawn(run(DaemonClient::new(socket), Arc::clone(&state), config));
 
@@ -1090,6 +1102,7 @@ mod tests {
             max_delay: Duration::from_millis(20),
             drop_event: None,
             break_on_event: None,
+            applied: None,
         };
         let subscriber = tokio::spawn(run(
             DaemonClient::new(socket.clone()),
