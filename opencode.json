@@ -22,7 +22,10 @@
     "external_directory": {
       "{env:HOME}/.cargo/**": "allow",
       "{env:HOME}/.rustup/toolchains/**": "allow",
-      "*/node_modules/@earendil-works/pi-coding-agent/**": "allow"
+      "*/lib/node_modules": "allow",
+      "*/lib/node_modules/*": "allow",
+      "{env:HOME}/.local/lib": "allow",
+      "{env:HOME}/.local/lib/*": "allow"
     }
   }
 }
