@@ -7685,9 +7685,14 @@ fn poll_inbox_attention(ui: &mut UiState, snapshot: &AppState) {
     let Some(dialog) = ui.inbox_attention.as_mut() else {
         return;
     };
-    if let Some((retry, outcome)) = answer {
-        dialog.answer = Some(match outcome {
-            Ok(outcome) => crate::inbox_display::action_text(retry, &outcome).to_string(),
+    // An answer for another pane or agent than the open picker's is not its
+    // own (PR #1735 review 4301453654).
+    if let Some(answer) = answer
+        && answer.pane_id == dialog.pane_id
+        && answer.agent_id == dialog.agent_id
+    {
+        dialog.answer = Some(match answer.outcome {
+            Ok(outcome) => crate::inbox_display::action_text(answer.retry, &outcome).to_string(),
             Err(why) => why,
         });
     }
@@ -23781,6 +23786,37 @@ pub fn render_new_pane_form_schedule_to_buffer(
 
 #[cfg(test)]
 mod tests {
+    /// PR #1735 review (4301453654): the picker shows the answer to a press
+    /// made for its own pane and agent, and not one for another.
+    #[test]
+    fn the_inbox_picker_shows_only_its_own_presss_answer() {
+        let (sender, _) = crate::embedded_pane::InboxActionSender::recording();
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.inbox_action_sender = Some(sender.clone());
+        ui.inbox_attention = Some(InboxAttentionDialog {
+            pane_id: "p".to_string(),
+            agent_id: "a".to_string(),
+            items: Vec::new(),
+            selected: 0,
+            answer: None,
+        });
+        let answer = |pane: &str| crate::embedded_pane::InboxActionAnswer {
+            pane_id: pane.to_string(),
+            agent_id: "a".to_string(),
+            retry: false,
+            outcome: Err("the deck did not answer in time".to_string()),
+        };
+        sender.answer_for_test(answer("other"));
+        poll_inbox_attention(&mut ui, &AppState::default());
+        assert_eq!(ui.inbox_attention.as_ref().unwrap().answer, None);
+        sender.answer_for_test(answer("p"));
+        poll_inbox_attention(&mut ui, &AppState::default());
+        assert_eq!(
+            ui.inbox_attention.as_ref().unwrap().answer.as_deref(),
+            Some("the deck did not answer in time")
+        );
+    }
+
     use super::*;
 
     /// Issue #523 review (Qodo, PR #1388): a rebuilt tab is seated from the

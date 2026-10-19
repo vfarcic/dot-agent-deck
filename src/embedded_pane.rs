@@ -715,16 +715,48 @@ impl HostMetricsReader {
     }
 }
 
-/// The answer to a Retry (`true`) or Cancel press: the daemon's outcome, or
-/// why none came.
-type InboxActionAnswer = (bool, Result<String, String>);
+/// The answer to a Retry or Cancel press: the pane and agent generation the
+/// press was for, whether it was a Retry, and the daemon's outcome or why
+/// none came.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxActionAnswer {
+    pub pane_id: String,
+    pub agent_id: String,
+    pub retry: bool,
+    pub outcome: Result<String, String>,
+}
+
+/// The latest press and, once it arrived, the answer to it. An answer to an
+/// earlier press is dropped, so the picker shows what its last press did,
+/// whichever answer comes back first (PR #1735 review 4301453654).
+#[derive(Debug, Default)]
+struct InboxActionSlot {
+    press: u64,
+    answer: Option<InboxActionAnswer>,
+}
+
+impl InboxActionSlot {
+    /// A new press: the answer to any earlier one is no longer wanted.
+    fn begin(&mut self) -> u64 {
+        self.press += 1;
+        self.answer = None;
+        self.press
+    }
+
+    /// The answer to `press`, kept only while it is the latest.
+    fn land(&mut self, press: u64, answer: InboxActionAnswer) {
+        if press == self.press {
+            self.answer = Some(answer);
+        }
+    }
+}
 
 /// PRD #1666 §6.4: sends the TUI's Retry and Cancel presses to the daemon off
 /// the event loop, and holds the answer for the picker to show.
 #[derive(Clone)]
 pub struct InboxActionSender {
     to: InboxActionTarget,
-    slot: Arc<Mutex<Option<InboxActionAnswer>>>,
+    slot: Arc<Mutex<InboxActionSlot>>,
 }
 
 /// One recorded press: pane, agent, message, revision and whether it was a
@@ -767,6 +799,7 @@ impl InboxActionSender {
             }
         };
         let slot = Arc::clone(&self.slot);
+        let press = slot.lock().unwrap_or_else(|p| p.into_inner()).begin();
         let (pane_id, agent_id, message_id) = (
             pane_id.to_string(),
             agent_id.to_string(),
@@ -801,15 +834,34 @@ impl InboxActionSender {
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(_) => Err("the deck did not answer in time".to_string()),
             };
-            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((retry, answer));
+            slot.lock().unwrap_or_else(|p| p.into_inner()).land(
+                press,
+                InboxActionAnswer {
+                    pane_id,
+                    agent_id,
+                    retry,
+                    outcome: answer,
+                },
+            );
         });
     }
 
-    /// The answer to the last press, once it has arrived: whether it was a
-    /// Retry, and the daemon's outcome (`applied`, `stale`, …) or why none
-    /// came.
+    /// The answer to the last press, once it has arrived: what it was for,
+    /// and the daemon's outcome (`applied`, `stale`, …) or why none came.
     pub fn take(&self) -> Option<InboxActionAnswer> {
-        self.slot.lock().unwrap_or_else(|p| p.into_inner()).take()
+        self.slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .answer
+            .take()
+    }
+
+    /// Test seam: `answer` arrives for a press made now.
+    #[cfg(test)]
+    pub(crate) fn answer_for_test(&self, answer: InboxActionAnswer) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        let press = slot.begin();
+        slot.land(press, answer);
     }
 
     /// The TUI's L1 seam: a sender that records each press, and the record.
@@ -867,7 +919,7 @@ impl EmbeddedPaneController {
                 client: self.client.clone(),
                 runtime: self.runtime.clone(),
             },
-            slot: Arc::new(Mutex::new(None)),
+            slot: Arc::default(),
         }
     }
 
@@ -4466,6 +4518,26 @@ impl PaneController for EmbeddedPaneController {
 
 #[cfg(test)]
 mod tests {
+    /// PR #1735 review (4301453654): two presses whose answers come back out
+    /// of order leave the later press's answer, and the earlier one's is
+    /// dropped.
+    #[test]
+    fn an_earlier_presss_late_answer_is_dropped() {
+        let answer = |message: &str| super::InboxActionAnswer {
+            pane_id: "p".to_string(),
+            agent_id: "a".to_string(),
+            retry: true,
+            outcome: Ok(message.to_string()),
+        };
+        let mut slot = super::InboxActionSlot::default();
+        let first = slot.begin();
+        let second = slot.begin();
+        slot.land(second, answer("second"));
+        slot.land(first, answer("first"));
+        assert_eq!(slot.answer.take(), Some(answer("second")));
+        assert_eq!(slot.answer, None);
+    }
+
     use super::*;
 
     /// The whole point of `PaneLostReason` is that the user reads it, so guard
