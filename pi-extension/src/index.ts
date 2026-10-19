@@ -121,9 +121,10 @@ inboxBinary(() => (isAbsoluteOverride(deckBin, process.platform) ? deckBin : und
  * same-version reload keeps the old receiver and the old module's closures
  * (`deliver`, `pump`), so a change the bump is skipped for never reaches a
  * process that already runs the extension. 3: `pending` is handed over one
- * admitted attempt at a time (`admitting`).
+ * admitted attempt at a time (`admitting`). 4: a hold is re-checked when the
+ * approval a held-back-by sent attempt went out under lapses (`armLapse`).
  */
-export const INBOX_VERSION = 3;
+export const INBOX_VERSION = 4;
 /**
  * The oldest version whose state a replacement carries: 2 is the first
  * receipt-stream version, and 1 never shipped, so a receiver older than 2 is
@@ -214,6 +215,8 @@ interface InboxProcess {
 	pumping: boolean;
 	/** Armed while a hand-over Pi has not admitted holds back `pending` (`armAdmission`). */
 	admission: ReturnType<typeof setTimeout> | undefined;
+	/** Armed while a sent attempt holds back `pending`, for when its approval lapses (`armLapse`). */
+	lapse: ReturnType<typeof setTimeout> | undefined;
 	/** Every status report, across instances, in the order the handlers queued them. */
 	reportQueue: <T>(task: () => Promise<T>) => Promise<T>;
 	rechecks: Map<string, ReturnType<typeof setTimeout>>;
@@ -464,7 +467,7 @@ function mayPass(proc: InboxProcess, sent: Sent): boolean {
  * preflight ended. The attempt itself stays held as it was. A sent one the
  * gate never saw is settled by its own recheck (`armRecheck`), and stops
  * holding the rest back once the receiver no longer authorizes it
- * (`admitting`).
+ * (`admitting`); its approval lapsing re-pumps at once (`armLapse`).
  */
 function armAdmission(proc: InboxProcess, keys: string[]): void {
 	if (proc.admission !== undefined) {
@@ -495,6 +498,48 @@ function armAdmission(proc: InboxProcess, keys: string[]): void {
 }
 
 /**
+ * While `keys` hold back `pending`, re-pump once the earliest approval a sent
+ * one among them went out under lapses (at most `INBOX_GRANT_TIMEOUT_MS`
+ * after it was asked for): from then the receiver no longer authorizes it,
+ * so it holds nothing back (`admitting`), and no event marks that moment.
+ * Re-armed on every hold, so it tracks the attempts holding now. A lapse
+ * `INBOX_UNSEEN_RECHECK_MS` or more away is left to `armAdmission`. The
+ * approval's `at` is the receiver's clock, `performance.now()`.
+ */
+function armLapse(proc: InboxProcess, keys: string[]): void {
+	if (proc.lapse !== undefined) {
+		clearTimeout(proc.lapse);
+		proc.lapse = undefined;
+	}
+	let due: number | undefined;
+	for (const key of keys) {
+		const granted = proc.sent.get(key)?.granted;
+		if (granted !== undefined) {
+			due = Math.min(due ?? Infinity, granted.at + granted.valid);
+		}
+	}
+	if (due === undefined) {
+		return;
+	}
+	const delay = Math.max(0, Math.ceil(due - performance.now()));
+	if (delay >= INBOX_UNSEEN_RECHECK_MS) {
+		return;
+	}
+	const timer = setTimeout(() => {
+		proc.lapse = undefined;
+		try {
+			if (!proc.disposed) {
+				pump(proc);
+			}
+		} catch {
+			// Never let a timer callback throw into Pi.
+		}
+	}, delay);
+	(timer as { unref?: () => void }).unref?.();
+	proc.lapse = timer;
+}
+
+/**
  * Hand `pending` to the current session, oldest first, one attempt at a time,
  * each once Pi admitted the one before it (`admitting`); what decides that
  * one starts it again. It stops while nothing can be handed over — the
@@ -515,6 +560,7 @@ function pump(proc: InboxProcess): void {
 				const holding = admitting(proc, proc.pending[0].id);
 				if (holding.length > 0) {
 					armAdmission(proc, holding);
+					armLapse(proc, holding);
 					break;
 				}
 				const message = proc.pending[0];
@@ -1091,6 +1137,7 @@ function createProcess(transfer?: Transfer, replaced = false, tokenFloor = 0): I
 		runs: transfer?.runs ?? 0,
 		pumping: false,
 		admission: undefined,
+		lapse: undefined,
 		// The outgoing receiver's queue, so its instances' last reports and
 		// this one's stay in Pi's order.
 		reportQueue: transfer?.reportQueue ?? createSerialQueue(),

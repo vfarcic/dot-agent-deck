@@ -1434,10 +1434,12 @@ test("pi_036 a revoked hand-over Pi never saw holds nothing back", async (t) => 
 	assert.equal((await pi.gate(1))?.action, "transform");
 });
 
-/// Scenario: Pi is busy, so a deck message it was handed has not reached its gate, and a second message waits behind it. Once the approval the first was sent under is past its validity, the gate would consume it, so it holds nothing back: the next periodic check hands the second over although Pi is still busy.
+/// Scenario: Pi is busy, so a deck message it was handed has not reached its gate, and a second message waits behind it. The moment the approval the first was sent under is past its validity, the gate would consume it, so it holds nothing back: the second is handed over then, although Pi is still busy, not at the 30-second periodic check.
 test("pi_036 a hand-over whose approval expired holds nothing back", async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const { pi, child } = await started();
+	let now = performance.now();
+	t.mock.method(performance, "now", () => now);
 	pi.ctx.isIdle = () => false;
 	pi.ctx.hasPendingMessages = () => false;
 	child.hand(ref(ID));
@@ -1445,11 +1447,14 @@ test("pi_036 a hand-over whose approval expired holds nothing back", async (t) =
 	child.hand(ref(ID2));
 	await settle();
 	assert.equal(pi.sends.length, 1, "precondition: the second waits behind the first");
-	const now = performance.now();
-	t.mock.method(performance, "now", () => now + 6000);
-	t.mock.timers.tick(INBOX_UNSEEN_RECHECK_MS);
+	// The registration's 1000 ms keepalive leaves the approval its full 5 s.
+	t.mock.timers.tick(4999);
 	await settle();
-	assert.equal(pi.sends.length, 2, "the second is handed over once the first can no longer pass the gate");
+	assert.equal(pi.sends.length, 1, "the second waits while the first's approval stands");
+	now += 5000;
+	t.mock.timers.tick(1);
+	await settle();
+	assert.equal(pi.sends.length, 2, "the second is handed over the moment the first can no longer pass the gate");
 	assert.ok(pi.sends[1].text.includes(block(ID2)));
 	assert.equal((await pi.gate(0))?.action, "handled", "the expired hand-over's late gate is consumed");
 	assert.equal((await pi.gate(1))?.action, "transform");
