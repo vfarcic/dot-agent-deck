@@ -4,6 +4,8 @@
 use crate::{common, inbox};
 #[path = "../opencode_composer.rs"]
 mod composer;
+#[path = "opencode_startup_trace.rs"]
+mod startup_trace;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::Command;
@@ -17,6 +19,8 @@ pub const BUDGET: Duration = Duration::from_secs(120);
 pub const CONTENT: &str = "OPENCODE_INBOX_OK";
 
 pub struct OpenCode {
+    // Drop the trace (and preserve failure logs) before deck's scratch HOME.
+    startup: startup_trace::StartupTrace,
     pub pane: inbox::Pane,
     pub deck: common::TuiDeck,
     pub work: PathBuf,
@@ -124,6 +128,23 @@ export default {id:'deck-test-route',tui:async(api)=>{
                 "scratch prior session: {output:?}"
             );
         }
+        let diagnostics = std::env::var_os("DOT_AGENT_DECK_OPENCODE_DIAGNOSTICS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".dot-agent-deck/opencode-live-runs")
+            })
+            .join(format!(
+                "{}-{}-{}",
+                std::thread::current().name().unwrap_or("opencode"),
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            ));
+        let mut startup = startup_trace::StartupTrace::new(
+            diagnostics.clone(),
+            deck.home_dir().into(),
+            deck.workdir().into(),
+            work.clone(),
+        );
         let command = format!(
             "opencode --model {} --auto {}",
             common::opencode_test_model(),
@@ -140,7 +161,10 @@ export default {id:'deck-test-route',tui:async(api)=>{
         };
         // A clear delegate respawns from this role command, rather than the
         // initial attach request. Capture the replacement's own capability too.
-        let role_command = common::capability_export_command(&format!("exec {command}"));
+        let launch_command = format!(
+            "printf '%s %s %s\\n' \"$$\" \"$(date +%s%N)\" \"$(command -v opencode)\" > opencode-launcher.trace; exec {command}"
+        );
+        let role_command = common::capability_export_command(&launch_command);
         std::fs::write(work.join(".dot-agent-deck.toml"),format!(
             "[[orchestrations]]\nname = \"opencode-inbox\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"./delegate-loop.sh\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {role_command:?}\nagent = \"opencode\"\nclear = {clear}\n"
         )).unwrap();
@@ -161,18 +185,27 @@ export default {id:'deck-test-route',tui:async(api)=>{
             ]
         ]);
         // Start through the same public attach operation desktop clients use.
-        let mut worker = json!({"op":"start-agent","command":common::capability_export_command(&format!("exec {command}")),"cwd":work,"agent_type":"opencode","rows":40,"cols":140,"env":extra,"display_name":"coder","tab_membership":{"kind":"orchestration","name":"opencode-inbox","role_name":"coder","role_index":1,"is_start_role":false,"orchestration_cwd":work,"orchestration_id":"opencode-inbox-test"}});
+        let mut worker = json!({"op":"start-agent","command":role_command,"cwd":work,"agent_type":"opencode","rows":40,"cols":140,"env":extra,"display_name":"coder","tab_membership":{"kind":"orchestration","name":"opencode-inbox","role_name":"coder","role_index":1,"is_start_role":false,"orchestration_cwd":work,"orchestration_id":"opencode-inbox-test"}});
         worker["env"]
             .as_array_mut()
             .unwrap()
             .push(json!(["DOT_AGENT_DECK_PANE_ID", "opencode-inbox-coder"]));
         let reply = inbox::attach(&deck, worker);
+        startup.trace.event(
+            "start_agent_reply",
+            json!({"ok":reply["ok"],"id":reply["id"],"error":reply["error"]}),
+        );
         assert_eq!(reply["ok"], true, "worker spawn: {reply}");
         let agent = reply["id"].as_str().unwrap().to_owned();
+        startup.attach(deck.attach_socket_path().into(), agent.clone());
         let token = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(common::recorded_hook_capability(&work, &agent))
             .unwrap();
+        common::register_diagnostic_redactions([token.clone()]);
+        startup
+            .trace
+            .event("capability_marker_observed", json!({"agent":agent}));
         let pane = inbox::Pane {
             id: "opencode-inbox-coder".into(),
             agent,
@@ -186,26 +219,16 @@ export default {id:'deck-test-route',tui:async(api)=>{
             json!({"op":"start-agent","command":common::capability_export_command("exec ./delegate-loop.sh"),"cwd":work,"rows":40,"cols":140,"env":[["DOT_AGENT_DECK_PANE_ID","opencode-inbox-orchestrator"],["PATH",path]],"display_name":"orchestrator","tab_membership":{"kind":"orchestration","name":"opencode-inbox","role_name":"orchestrator","role_index":0,"is_start_role":true,"orchestration_cwd":work,"orchestration_id":"opencode-inbox-test"}}),
         );
         assert_eq!(reply["ok"], true, "orchestrator spawn: {reply}");
-        let diagnostics = std::env::var_os("DOT_AGENT_DECK_OPENCODE_DIAGNOSTICS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".dot-agent-deck/opencode-live-runs")
-            })
-            .join(format!(
-                "{}-{}-{}",
-                std::thread::current().name().unwrap_or("opencode"),
-                std::process::id(),
-                chrono::Utc::now().timestamp_nanos_opt().unwrap()
-            ));
-        std::fs::create_dir_all(&diagnostics).unwrap();
         let observer_stop = Arc::new(AtomicBool::new(false));
         let stop = observer_stop.clone();
         let socket = deck.hook_socket_path().to_owned();
         let request = inbox::request(&pane, "inbox_list");
         let observations = diagnostics.join("first-observed.json");
+        let trace = startup.trace.clone();
         let observer = std::thread::spawn(move || {
             use std::io::{BufRead, BufReader, Write};
             let mut first = json!({});
+            let mut previous_armed = Value::Null;
             while !stop.load(Ordering::Relaxed) {
                 let sample = || -> Option<Value> {
                     let mut stream = std::os::unix::net::UnixStream::connect(&socket).ok()?;
@@ -219,6 +242,10 @@ export default {id:'deck-test-route',tui:async(api)=>{
                     serde_json::from_str(&line).ok()
                 };
                 if let Some(listing) = sample() {
+                    if listing["armed"] != previous_armed {
+                        previous_armed = listing["armed"].clone();
+                        trace.event("inbox_armed", json!({"armed":previous_armed}));
+                    }
                     for message in listing["messages"].as_array().into_iter().flatten() {
                         let Some(id) = message["id"].as_str() else {
                             continue;
@@ -233,15 +260,13 @@ export default {id:'deck-test-route',tui:async(api)=>{
                         }
                         first[id]["latest"] = message.clone();
                     }
-                    let _ = std::fs::write(
-                        &observations,
-                        common::redact_credentials_for_output(&first.to_string()),
-                    );
+                    let _ = std::fs::write(&observations, trace.redact(&first.to_string()));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
         let result = Self {
+            startup,
             pane,
             deck,
             work,
@@ -251,6 +276,10 @@ export default {id:'deck-test-route',tui:async(api)=>{
             observer: Some(observer),
         };
         result.wait_screen("Ask anything");
+        result
+            .startup
+            .trace
+            .event("first_ready_snapshot", json!({"needle":"Ask anything"}));
         if watcher {
             assert!(
                 common::wait_until(
@@ -312,10 +341,12 @@ export default {id:'deck-test-route',tui:async(api)=>{
             record["cols"].as_u64().unwrap() as u16,
             0,
         );
-        parser.process(&common::pane_snapshot_on(
-            self.deck.attach_socket_path(),
-            &self.pane.agent,
-        ));
+        parser.process(
+            &self
+                .startup
+                .trace
+                .snapshot(self.deck.attach_socket_path(), &self.pane.agent),
+        );
         parser.screen().contents()
     }
     pub fn wait_screen(&self, needle: &str) {
@@ -377,6 +408,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
     fn save_diagnostics(&self) {
         // Only scratch-session content and public terminal/log surfaces, never
         // configuration or auth files. Every persisted byte uses the harness redactor.
+        self.startup.trace.save(std::thread::panicking());
         let snapshot = self.diagnostics.join(format!(
             "snapshot-{}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap()
@@ -390,7 +422,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
             ("inbox.json", inbox::listing(&self.deck, &self.pane).to_string()),
             ("capture.json", json!({"at": chrono::Utc::now().to_rfc3339(), "panicking": std::thread::panicking(), "record": self.record()}).to_string()),
         ] {
-            let _ = std::fs::write(snapshot.join(name), common::redact_credentials_for_output(&text));
+            let _ = std::fs::write(snapshot.join(name), self.startup.trace.redact(&text));
         }
     }
     pub fn input(&self, text: &str) -> common::AttachInput {

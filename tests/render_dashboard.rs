@@ -4671,8 +4671,25 @@ fn status_011_live_subscriber_updates_the_rendered_inbox_card() {
             let (mut stream, _) = listener.accept().await.unwrap();
             let (kind, payload) = read_frame(&mut stream).await.unwrap().unwrap();
             assert_eq!(kind, KIND_REQ);
+            let request = serde_json::from_slice::<AttachRequest>(&payload).unwrap();
+            // The ordered first-subscription path probes capabilities before
+            // subscribing. An old daemon advertises none and receives the plain
+            // subscription on the next connection. Also accept the pre-probe
+            // subscriber so this test keeps its rendered-card claim on either
+            // side of that production change.
+            let request = if matches!(request, AttachRequest::Hello { .. }) {
+                write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&AttachResponse::ok()).unwrap())
+                    .await.unwrap();
+                drop(stream);
+                stream = listener.accept().await.unwrap().0;
+                let (kind, payload) = read_frame(&mut stream).await.unwrap().unwrap();
+                assert_eq!(kind, KIND_REQ);
+                serde_json::from_slice::<AttachRequest>(&payload).unwrap()
+            } else {
+                request
+            };
             assert!(matches!(
-                serde_json::from_slice::<AttachRequest>(&payload).unwrap(),
+                request,
                 AttachRequest::SubscribeEvents
             ));
             write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&AttachResponse::ok()).unwrap())
