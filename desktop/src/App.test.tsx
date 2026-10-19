@@ -391,6 +391,26 @@ describe("ControlDeck", () => {
   });
 
   /**
+   * Scenario: two runs of one orchestration each have a Coder, beside a
+   * standalone agent. The command palette's Focus entries name each Coder by
+   * its run's title and its role (issue #1668) and the standalone agent by its
+   * role as before, and the second run's entry selects that run's tile.
+   */
+  it("names the palette's Focus entries for orchestration agents by run title and role", () => {
+    const member = (id: string, run: string, title: string): AgentSession => ({ ...agentIn(id, "/tmp/project"), role: "Coder", displayName: "Coder", tab: { kind: "orchestration", orchestrationId: run, name: "mixed", displayTitle: title, roleName: "coder", roleIndex: 1, isStartRole: false } });
+    const standalone = { ...agentIn("solo", "/tmp/project"), role: "Claude code", displayName: "Changelog sweep" };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: liveSnapshot([member("coder-a", "run-a", "prd-1401"), member("coder-b", "run-b", "prd-1500"), standalone]) })} />);
+    fireEvent.keyDown(document.body, { key: "k", metaKey: true });
+    expect(screen.getByRole("button", { name: /Focus prd-1401 Coder/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Focus Claude code/ })).toBeVisible();
+    expect(screen.queryByRole("button", { name: /^Focus Coder/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Focus prd-1500 Coder/ }));
+    const [first, second] = screen.getAllByTestId("agent-tile-coder");
+    expect(second.className).toContain("is-selected");
+    expect(first.className).not.toContain("is-selected");
+  });
+
+  /**
    * Scenario: render the daemon and activate Planner's keyboard-reachable open
    * control. The tile navigates with Planner's composite identity and records
    * that closing the resulting agent pane must return to the daemon.

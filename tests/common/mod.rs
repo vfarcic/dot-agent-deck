@@ -122,6 +122,33 @@ pub const CLAUDE_PROMPT_SUBMIT_BASE: Duration = Duration::from_secs(20);
 /// after one Enter before pressing it again.
 pub const CLAUDE_SUBMIT_RETRY: Duration = Duration::from_secs(3);
 
+/// What Claude Code draws in its input box in place of text it took as a paste
+/// too long to show (`[Pasted text #1]`, or `[Pasted text #1 +3 lines]`). See
+/// [`TuiDeck::submit_claude_prompt`] for when a prompt ends up there.
+pub const CLAUDE_PASTE_PLACEHOLDER: &str = "[Pasted text #";
+
+/// The longest prompt [`TuiDeck::submit_claude_prompt`] types; a longer one it
+/// pastes. Claude Code 2.1.296 takes any single read of more than 800
+/// characters as a paste (its input handler's `key.length > 800`), so a prompt
+/// no longer than this cannot be read as one, however its keystrokes are
+/// batched on the way.
+pub const CLAUDE_TYPED_PROMPT_MAX_CHARS: usize = 800;
+
+/// What [`TuiDeck::submit_claude_prompt`] types after a
+/// [`CLAUDE_PASTE_PLACEHOLDER`], so the model is asked, outside the paste, to
+/// act on it. Starts with a space so it does not run into the placeholder.
+pub const CLAUDE_PASTE_DIRECTIVE: &str = " Follow the pasted instructions.";
+
+/// How Claude Code's input showed a prompt before
+/// [`TuiDeck::submit_claude_prompt_shown`] pressed Enter on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudePromptShown {
+    /// Its own text, probe through last word.
+    Text,
+    /// A new [`CLAUDE_PASTE_PLACEHOLDER`] in its place.
+    PastePlaceholder,
+}
+
 /// Issue #709's measurement behind [`load_scaled`]: the 1-minute load average
 /// per CPU, or `None` where this platform does not publish one cheaply (every
 /// target but Linux and macOS). [`load_factor`] says why an unmeasurable load
@@ -164,6 +191,13 @@ pub(crate) const MAX_LOAD_FACTOR: f64 = 6.0;
 /// path and is paid only where the alternative was a wrong verdict. A negative
 /// window is the opposite — it is always paid in full, and its length is part of
 /// what the test asserts.
+///
+/// PRD #1631's broad `cargo test-e2e` run met the same gap: thirteen tests
+/// failed with `io full` at 52-79% of their windows, and a reading on the same
+/// box afterwards showed a 1-minute load of 16.8 on 16 CPUs (a factor of 1.05)
+/// beside `io full avg10=60.5` (a factor of 2.5). `version_001`'s isolated rerun
+/// logged `io-full=71.9%` at a load of 11.2 on 16 CPUs — a factor of exactly
+/// 1.0 from the load average. Both readings share [`MAX_LOAD_FACTOR`]'s cap.
 pub fn load_scaled(base: Duration) -> Duration {
     base.mul_f64(contention_factor(
         machine_load_per_cpu(),
@@ -2033,6 +2067,34 @@ impl TuiDeck {
     /// `e2e_codex_wrapper.rs` retries Codex's Enter on the same outcome-based
     /// reasoning.
     ///
+    /// **A prompt over [`CLAUDE_TYPED_PROMPT_MAX_CHARS`] is pasted, not typed,
+    /// and submitted with an instruction to follow it.** Claude Code takes a
+    /// single read of more than 800 characters as a paste, and whether a long
+    /// typed prompt's keystrokes arrive in one read is up to the machine's
+    /// load. Measured on `background_008` (a ~900-character prompt, typed)
+    /// on Claude Code 2.1.296, three outcomes: the text rendered; the input
+    /// read `[Pasted text #1]` and nothing else for 46 s (io-full 56%), which
+    /// the probe wait could never see; and, on a quiet machine, the input held
+    /// only the prompt's last 53 characters, starting mid-word, under a
+    /// "paste again to expand" hint — the head taken as a paste and then lost
+    /// when the tail was typed straight after it. The last is a lost prompt no
+    /// reading of the screen can recover. A bracketed paste marks its own end
+    /// rather than leaving Claude Code to infer it from how the bytes were
+    /// read, so a long prompt is sent as one, and every run since has ended in
+    /// the second outcome (four, on `harness/claude-prompt/001` and
+    /// `background_008`). A paste that long is drawn as
+    /// [`CLAUDE_PASTE_PLACEHOLDER`] instead of its text, so a placeholder that
+    /// was not on screen before the prompt was sent is read as the prompt
+    /// sitting in the input. Submitting it sends the whole text, but as pasted
+    /// content, and Haiku declines instructions that arrive only inside a
+    /// paste: measured with `harness/claude-prompt/001`, it echoed all of the
+    /// text and then asked what to do with it. So the helper types
+    /// [`CLAUDE_PASTE_DIRECTIVE`] after the placeholder, waits for it to render,
+    /// and then presses Enter, which is what a user who pasted a task would
+    /// type. That the submission carried the prompt's text and not the
+    /// placeholder's is what the hook-text match below checks, as it does for
+    /// a rendered prompt.
+    ///
     /// Only a `Thinking` event that carries prompt text and arrives AFTER the
     /// prompt is typed counts, so an earlier turn on the same agent — or a
     /// prompt-less `Thinking` such as `PostCompact`'s — cannot satisfy it, and
@@ -2049,6 +2111,20 @@ impl TuiDeck {
         prompt: &str,
         probe: &str,
     ) -> dot_agent_deck::event::AgentEvent {
+        self.submit_claude_prompt_shown(events, agent_id, prompt, probe)
+            .0
+    }
+
+    /// [`TuiDeck::submit_claude_prompt`], also returning how the input showed
+    /// the prompt before it was submitted.
+    #[cfg(unix)]
+    pub fn submit_claude_prompt_shown(
+        &self,
+        events: &EventSub,
+        agent_id: &str,
+        prompt: &str,
+        probe: &str,
+    ) -> (dot_agent_deck::event::AgentEvent, ClaudePromptShown) {
         assert!(
             prompt.contains(probe) && !probe.contains(char::is_whitespace) && !probe.is_empty(),
             "submit_claude_prompt: the probe {probe:?} must be a non-empty, space-free \
@@ -2068,7 +2144,16 @@ impl TuiDeck {
                 && e.user_prompt.is_some()
         };
         let before = events.snapshot().iter().filter(|e| is_submit(e)).count();
-        self.send_keys(prompt.as_bytes());
+        let placeholders = |grid: &str| grid.matches(CLAUDE_PASTE_PLACEHOLDER).count();
+        let placeholders_before = placeholders(&self.snapshot_grid());
+        if prompt.chars().count() > CLAUDE_TYPED_PROMPT_MAX_CHARS {
+            let mut pasted = b"\x1b[200~".to_vec();
+            pasted.extend_from_slice(prompt.as_bytes());
+            pasted.extend_from_slice(b"\x1b[201~");
+            self.send_keys(&pasted);
+        } else {
+            self.send_keys(prompt.as_bytes());
+        }
         // ONE deadline for both halves, so the helper reports its own failure
         // well inside a test's nextest kill window instead of being killed
         // between two back-to-back ceilings.
@@ -2078,24 +2163,59 @@ impl TuiDeck {
         // appearing after it proves the rest did. Word-wrap moves a whole word
         // to the next row rather than splitting it, so a space-free token is
         // matchable on one row.
-        let typed = || {
-            let grid = self.snapshot_grid();
+        let rendered = |grid: &str| {
             let Some(at) = grid.find(probe) else {
                 return false;
             };
             let after = &grid[at + probe.len()..];
             probe.ends_with(tail) || after.contains(tail)
         };
-        while !typed() {
+        let shown = loop {
+            let grid = self.snapshot_grid();
+            if rendered(&grid) {
+                break ClaudePromptShown::Text;
+            }
+            if placeholders(&grid) > placeholders_before {
+                eprintln!(
+                    "[harness] submit_claude_prompt: Claude Code shows the prompt as \
+                     {CLAUDE_PASTE_PLACEHOLDER}N]; typing \
+                     {CLAUDE_PASTE_DIRECTIVE:?} after it and submitting that"
+                );
+                break ClaudePromptShown::PastePlaceholder;
+            }
             if Instant::now() >= deadline {
                 panic!(
-                    "PROMPT NOT DELIVERED: the typed prompt never finished rendering in Claude \
-                     Code's input — no {probe:?} followed by its last word {tail:?} within \
-                     {budget:?} — so nothing after this point was exercised.\nFinal grid:\n{}",
+                    "PROMPT NOT DELIVERED: the prompt never finished rendering in Claude \
+                     Code's input — no {probe:?} followed by its last word {tail:?}, and no new \
+                     {CLAUDE_PASTE_PLACEHOLDER}N] placeholder, within {budget:?} — so nothing \
+                     after this point was exercised.\nFinal grid:\n{}",
                     self.snapshot_grid()
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
+        };
+        if shown == ClaudePromptShown::PastePlaceholder {
+            self.send_keys(CLAUDE_PASTE_DIRECTIVE.as_bytes());
+            let directive_tail = CLAUDE_PASTE_DIRECTIVE
+                .split_whitespace()
+                .last()
+                .expect("a non-empty directive");
+            let directive_typed = |grid: &str| {
+                grid.rfind(CLAUDE_PASTE_PLACEHOLDER)
+                    .is_some_and(|at| grid[at..].contains(directive_tail))
+            };
+            while !directive_typed(&self.snapshot_grid()) {
+                if Instant::now() >= deadline {
+                    panic!(
+                        "PROMPT NOT DELIVERED: Claude Code shows the prompt as a paste, but the \
+                         {CLAUDE_PASTE_DIRECTIVE:?} typed after its placeholder never rendered \
+                         within {budget:?} — so nothing after this point was exercised.\n\
+                         Final grid:\n{}",
+                        self.snapshot_grid()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         // The hook reports the submitted text truncated to 200 bytes, so the
         // match catches a prefix submitted short of that and a garbled one; a
@@ -2134,7 +2254,7 @@ impl TuiDeck {
                              only after Enter #{enters}"
                         );
                     }
-                    return ev;
+                    return (ev, shown);
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -5636,21 +5756,35 @@ pub(crate) const OPENCODE_PROBE_PROMPT: &str =
     "Reply with only the number equal to 4000 plus 444. Do not use tools.";
 const OPENCODE_PROBE_ANSWER: &str = "4444";
 
-/// Upper bound on the [`check_opencode_available`] model probe.
+/// Upper bound on the [`check_opencode_available`] model probe on a quiet box;
+/// the probe waits [`load_scaled`] of it (issue #709's helper), so a quiet box
+/// still gives up after 60 s and a starved one waits up to [`MAX_LOAD_FACTOR`]
+/// times as long.
 ///
 /// 4.3 s warm, measured 2026-09-08 (`opencode run --model
 /// anthropic/claude-haiku-4-5-20251001` in a virgin HOME), so this is ~14x the
 /// observation — generous, because a cold OpenCode has a provider list to fetch
-/// and this must not become a flake source.
+/// and this must not become a flake source. Generous was still not enough on a
+/// starved box: during PRD #1631's lane-2 run `question_live_005`'s probe
+/// failed with "did not finish within 60s" at `io full` 70.7% of the window,
+/// and the same test passed alone. A flat ceiling cannot be generous enough
+/// there without being slow to fail on a quiet box, which is what scaling it
+/// avoids.
 ///
-/// FINITE, which the sibling [`check_codex_available`] probe is not. An
+/// FINITE, as the sibling [`check_codex_available`] preflight has also been
+/// since PRD #1631 ([`CODEX_PREFLIGHT_BASE`]). An
 /// unbounded probe that wedges spends the test's entire nextest kill window
 /// (3 x 60 s by default here; some callers widen theirs in
 /// `.config/nextest.toml`), after which the process is SIGKILLed — producing
 /// no skip, no failure message and no diagnostics whatever. 60 s leaves two
 /// thirds of the default window for the scenario the probe is only the gate
-/// for.
-const OPENCODE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// for. Scaled, it can reach 360 s, past that default window, so a test that
+/// keeps the default window loses its diagnostics to the kill once the box is
+/// starved enough to scale the probe past ~120 s — where the flat 60 s failed
+/// it anyway. When this was written, three OpenCode-probing tests kept the
+/// default: `prompt_voice_keys_005`, `reading_reply_004` and
+/// `status_blocked_023`.
+const OPENCODE_PROBE_BASE: Duration = Duration::from_secs(60);
 
 /// One bounded, minimal turn against [`opencode_test_model`], so a model these
 /// credentials cannot reach SKIPS with the model named rather than failing deep
@@ -5678,7 +5812,8 @@ fn opencode_model_probe() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("could not run the OpenCode model probe: {e}"))?;
 
-    let deadline = Instant::now() + OPENCODE_PROBE_TIMEOUT;
+    let ceiling = load_scaled(OPENCODE_PROBE_BASE);
+    let deadline = Instant::now() + ceiling;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -5702,7 +5837,7 @@ fn opencode_model_probe() -> Result<(), String> {
     // here and they need different fixes; #878/#921 is the cautionary case for
     // a diagnostic that picked one and asserted it.
     let observed = match status {
-        None => format!("did not finish within {OPENCODE_PROBE_TIMEOUT:?}"),
+        None => format!("did not finish within {ceiling:?}"),
         Some(s) if !s.success() => format!("exited unsuccessfully ({s})"),
         Some(_) => format!("exited 0 but never answered {OPENCODE_PROBE_ANSWER:?}"),
     };
@@ -5938,10 +6073,66 @@ pub fn opencode_test_model() -> &'static str {
     })
 }
 
+/// Upper bound on [`check_codex_available`]'s two `codex` calls together — the
+/// `login status` check and the model probe — on a quiet box. They share one
+/// deadline of [`load_scaled`] of this, as [`OPENCODE_PROBE_BASE`] bounds the
+/// OpenCode probe, so a starved box waits up to [`MAX_LOAD_FACTOR`] times as
+/// long.
+///
+/// Unbounded until PRD #1631's lane-2 run, where `codex_hooks_001`'s isolated
+/// retry spent more than 120 s here (its deck was built only after the +120 s
+/// load sample) on a box with `io full` near 70%, ran its scenario green in
+/// about 40 s, and was SIGKILLed at nextest's 180 s with no skip, no failure
+/// message and no grid. A wedged `codex` now reports here instead, naming the
+/// call and the ceiling. Scaled to the maximum the ceiling is 360 s, which is
+/// why `codex_hooks_001`'s kill window in `.config/nextest.toml` sits above it.
+const CODEX_PREFLIGHT_BASE: Duration = Duration::from_secs(60);
+
+/// Run one preflight `codex` call to completion or to `deadline`, killing it
+/// there. Output goes to a FILE rather than pipes for the reason
+/// [`opencode_model_probe`] gives. Returns the exit status, or `None` when the
+/// deadline killed it, with stdout and stderr together.
+fn run_codex_preflight(
+    command: &mut std::process::Command,
+    deadline: Instant,
+) -> Result<(Option<std::process::ExitStatus>, String), String> {
+    let sink = harness_tempfile()
+        .map_err(|e| format!("could not create the Codex preflight output file: {e}"))?;
+    let open = || {
+        sink.as_file()
+            .try_clone()
+            .map_err(|e| format!("could not open the Codex preflight output file: {e}"))
+    };
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(open()?))
+        .stderr(std::process::Stdio::from(open()?))
+        .spawn()
+        .map_err(|e| format!("could not run the Codex preflight: {e}"))?;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => return Err(format!("could not wait on the Codex preflight: {e}")),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok((
+        status,
+        std::fs::read_to_string(sink.path()).unwrap_or_default(),
+    ))
+}
+
 /// Runtime-skip helper for real Codex coverage. A version check alone is not
 /// enough: this verifies persisted auth and performs one minimal model request,
 /// so expired credentials, 401 responses, and unreachable accounts skip cleanly
-/// before the PTY scenario starts.
+/// before the PTY scenario starts. Both `codex` calls share one load-scaled
+/// deadline ([`CODEX_PREFLIGHT_BASE`]).
 ///
 /// **One outcome panics instead of skipping**: a logged-in Codex that refuses
 /// the model ([`codex_probe_refused_model`]), since issue #656 — see the comment
@@ -5969,24 +6160,32 @@ pub fn check_codex_available() -> Result<(), String> {
         );
     }
 
-    let login = std::process::Command::new("codex")
-        .args(["login", "status"])
-        .env("CODEX_HOME", &codex_home)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("could not check Codex login status: {e}"))?;
-    let login_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&login.stdout),
-        String::from_utf8_lossy(&login.stderr)
-    );
-    if !login.status.success() || login_text.to_ascii_lowercase().contains("not logged") {
+    let ceiling = load_scaled(CODEX_PREFLIGHT_BASE);
+    let deadline = Instant::now() + ceiling;
+    let timed_out = |call: &str| {
+        format!(
+            "Codex preflight `{call}` did not finish within {ceiling:?} (the shared ceiling \
+             for `codex login status` and the model probe, scaled with contention)"
+        )
+    };
+
+    let (login_status, login_text) = run_codex_preflight(
+        std::process::Command::new("codex")
+            .args(["login", "status"])
+            .env("CODEX_HOME", &codex_home),
+        deadline,
+    )?;
+    let Some(login_status) = login_status else {
+        return Err(timed_out("codex login status"));
+    };
+    if !login_status.success() || login_text.to_ascii_lowercase().contains("not logged") {
         return Err("Codex is not authenticated — log in with `codex login`".into());
     }
 
     let final_message =
         harness_tempfile().map_err(|e| format!("could not create Codex probe output file: {e}"))?;
-    let probe = std::process::Command::new("codex")
+    let mut probe = std::process::Command::new("codex");
+    probe
         .args([
             "exec",
             "--ephemeral",
@@ -6004,15 +6203,11 @@ pub fn check_codex_available() -> Result<(), String> {
         .arg("--output-last-message")
         .arg(final_message.path())
         .arg("Reply with exactly CODEX_AUTH_OK and do not use tools.")
-        .env("CODEX_HOME", &codex_home)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("could not run Codex model probe: {e}"))?;
-    let probe_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&probe.stdout),
-        String::from_utf8_lossy(&probe.stderr)
-    );
+        .env("CODEX_HOME", &codex_home);
+    let (probe_status, probe_text) = run_codex_preflight(&mut probe, deadline)?;
+    let Some(probe_status) = probe_status else {
+        return Err(timed_out("codex exec"));
+    };
     let lower = probe_text.to_ascii_lowercase();
     let model_reply = std::fs::read_to_string(final_message.path()).unwrap_or_default();
     // Issue #656: a refused MODEL fails the test instead of skipping it. By this
@@ -6036,7 +6231,7 @@ pub fn check_codex_available() -> Result<(), String> {
             CODEX_TEST_MODEL_API_KEY_DEFAULT,
         );
     }
-    if !probe.status.success()
+    if !probe_status.success()
         || !model_reply.contains("CODEX_AUTH_OK")
         || [
             "401",
@@ -9592,7 +9787,7 @@ pub fn spawn_daemon_serve_with_env(
     }
     let child = cmd.spawn().expect("spawn `dot-agent-deck daemon serve`");
 
-    let proc = DaemonProc {
+    let mut proc = DaemonProc {
         child,
         hook_socket,
         attach_socket,
@@ -9610,20 +9805,30 @@ pub fn spawn_daemon_serve_with_env(
 #[allow(dead_code)]
 impl DaemonProc {
     /// Block until the attach socket file exists (the daemon finished
-    /// binding) or a bounded timeout elapses.
+    /// binding), failing at once if the daemon exits first and otherwise after
+    /// `load_scaled(DAEMON_START_POLL_TIMEOUT)`.
     ///
     /// PRD #1258: the bound is the binary's own lazy-spawn bound
     /// ([`DAEMON_START_POLL_TIMEOUT`], which covers the daemon's pre-bind work)
     /// widened by [`load_scaled`]. It was a fixed 10 s, shorter than the time
     /// the deck itself gives a daemon to bind, and a STARVED lane-1 run lost
     /// seven tests to it — `deck.log` from the same run showed one daemon's
-    /// pre-bind work alone taking 5.7 s.
-    fn wait_for_attach_socket(&self) {
+    /// pre-bind work alone taking 5.7 s. PRD #1631 met the same flat 10 s
+    /// failing six tests at `io full` 52-72%, which `load_scaled`'s stall
+    /// share now widens for.
+    fn wait_for_attach_socket(&mut self) {
         let budget = load_scaled(DAEMON_START_POLL_TIMEOUT);
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if self.attach_socket.exists() {
                 return;
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "daemon exited ({status}) before binding its attach socket at {}; stderr:\n{}",
+                    self.attach_socket.display(),
+                    std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -11327,7 +11532,7 @@ pub fn wait_for_file_lines(path: &Path, want: usize, timeout: Duration) -> Resul
 /// prefer it over [`wait_for_path_async`] + an immediate read: a shell
 /// redirect creates the file before the write lands (issue #244).
 #[allow(dead_code)]
-async fn wait_for_file_matching_async(
+pub async fn wait_for_file_matching_async(
     path: &Path,
     timeout: Duration,
     matches: impl Fn(&str) -> bool,
@@ -11552,7 +11757,7 @@ impl Drop for InProcDaemon {
 #[allow(dead_code)]
 pub const INPROC_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bring up an in-process daemon and block until its hook socket accepts
+/// Bring up an in-process daemon and block until its hook and attach sockets accept
 /// connections (so an agent's first CLI call can't race startup). Mirrors
 /// `e2e_delegate_work_done_chain.rs::spawn_daemon`, centralized so the readiness
 /// poll lives in `common`.
@@ -11623,7 +11828,8 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     }
     assert!(
         ready,
-        "in-process daemon hook socket was not accepting connections within {budget:?}"
+        "in-process daemon hook socket {} was not accepting connections within {budget:?}",
+        hook_path.display()
     );
 
     // Issue #954: and the ATTACH socket too, because this function hands one

@@ -404,6 +404,7 @@ fn make_session(
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
     }
@@ -2971,6 +2972,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         last_activity_ms: None,
         blocked: None,
         hook_generation: None,
+        pending_question: None,
         pull_request: None,
         pull_request_revision: None,
         background: None,
@@ -3126,6 +3128,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         last_activity_ms: None,
                         blocked: None,
                         hook_generation: None,
+                        pending_question: None,
                         pull_request: None,
                         pull_request_revision: None,
                         background: None,
@@ -3270,6 +3273,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
     };
@@ -3390,6 +3394,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
         output_set_status: false,
+        pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
     };

@@ -5157,6 +5157,24 @@ mod load_context_tests {
         assert_eq!(parse_psi_avg10("", "full"), None);
     }
 
+    /// Scenario: Read the `full` line of real `/proc/pressure/io` captures as a
+    /// fraction, taking the larger of `avg10` and `avg60`, and get `None` for a
+    /// file with no usable `full` line.
+    #[test]
+    fn psi_full_share_takes_the_larger_recent_average() {
+        let io = "some avg10=71.28 avg60=52.51 avg300=58.16 total=285448512127\n\
+                  full avg10=60.50 avg60=47.42 avg300=52.35 total=240720008324\n";
+        assert_eq!(parse_psi_recent_full_share(io), Some(0.605));
+        let lull = "full avg10=3.00 avg60=72.00 avg300=50.00 total=1\n";
+        assert_eq!(parse_psi_recent_full_share(lull), Some(0.72));
+        assert_eq!(
+            parse_psi_recent_full_share("some avg10=9.00 avg60=9.00\n"),
+            None
+        );
+        assert_eq!(parse_psi_recent_full_share("full avg10=x avg60=y\n"), None);
+        assert_eq!(parse_psi_recent_full_share(""), None);
+    }
+
     /// Scenario: Two readings ten seconds apart whose stall counters grew by
     /// 6 s, 0.5 s and nothing yield 60%, 5% and 0% of the window; a counter
     /// that went backwards, a missing source and a zero-length window yield

@@ -380,19 +380,42 @@ pub(crate) fn parse_psi_total(text: &str, kind: &str) -> Option<u64> {
 /// `load_scaled` in `mod.rs` — sizes a wait at the moment the wait starts and
 /// has no earlier reading of its own to take a difference against.
 pub(crate) fn parse_psi_avg10(text: &str, kind: &str) -> Option<f64> {
+    parse_psi_average(text, kind, "avg10=")
+}
+
+/// One `avgNN=` field (`field` names it with its `=`) of the `some` or `full`
+/// line of a PSI file, as [`parse_psi_avg10`] reads `avg10=`.
+fn parse_psi_average(text: &str, kind: &str, field: &str) -> Option<f64> {
     let percent: f64 = text
         .lines()
         .find(|line| line.split_whitespace().next() == Some(kind))?
         .split_whitespace()
-        .find_map(|field| field.strip_prefix("avg10="))?
+        .find_map(|f| f.strip_prefix(field))?
         .parse()
         .ok()?;
     (percent.is_finite() && percent >= 0.0).then(|| (percent / 100.0).min(1.0))
 }
 
-/// Issue #709 follow-up: the larger of the `io full` and `memory full` ten-second
-/// averages — the share of the last ten seconds during which NOTHING runnable on
-/// the machine made progress — or `None` where neither file is readable.
+/// The larger of the `avg10` and `avg60` fields on the `full` line of a PSI
+/// file, as a fraction, or `None` where neither is usable.
+///
+/// `avg10` sees a stall that began seconds before the wait did, and `avg60`
+/// keeps a lull of a few seconds inside a starved minute from reading as a
+/// quiet box (PRD #1631).
+pub(crate) fn parse_psi_recent_full_share(text: &str) -> Option<f64> {
+    match (
+        parse_psi_avg10(text, "full"),
+        parse_psi_average(text, "full", "avg60="),
+    ) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (one, other) => one.or(other),
+    }
+}
+
+/// Issue #709 follow-up: the larger of the `io full` and `memory full` recent
+/// averages ([`parse_psi_recent_full_share`]) — the share of recent time during
+/// which NOTHING runnable on the machine made progress — or `None` where neither
+/// file is readable.
 ///
 /// `cpu some` is deliberately not folded in: CPU contention is what the load
 /// average already measures for `load_scaled`, while an I/O stall is precisely
@@ -403,7 +426,7 @@ pub(crate) fn full_stall_share() -> Option<f64> {
     let psi = |file: &str| {
         std::fs::read_to_string(format!("/proc/pressure/{file}"))
             .ok()
-            .and_then(|text| parse_psi_avg10(&text, "full"))
+            .and_then(|text| parse_psi_recent_full_share(&text))
     };
     match (psi("io"), psi("memory")) {
         (Some(io), Some(memory)) => Some(io.max(memory)),

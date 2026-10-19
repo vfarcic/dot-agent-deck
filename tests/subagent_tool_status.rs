@@ -27,7 +27,7 @@
 #[path = "../src/test_temp.rs"]
 mod test_temp;
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -71,23 +71,54 @@ fn invoke_hook(agent: &str, payload: &Value) -> AgentEvent {
         .expect("hook stdin")
         .write_all(payload.to_string().as_bytes())
         .expect("write hook payload");
-    let output = child.wait_with_output().expect("wait for hook command");
-    assert!(
-        output.status.success(),
-        "`hook --agent {agent}` rejected a payload: status={} stderr={}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let mut line = String::new();
+                // PRD #1631: a Claude `PermissionRequest` arrives as a held
+                // `question` envelope and waits for an answer on the same
+                // connection, so read ONE line rather than to EOF, unwrap the
+                // event, and release the hook.
+                //
+                // The stream is accepted while the hook is still running, so
+                // its line may not have arrived yet. On macOS an accepted
+                // socket inherits the listener's O_NONBLOCK (Linux's does
+                // not), and the read would fail with `WouldBlock`; make it
+                // blocking, bounded by the same deadline as the accept loop.
+                //
+                // The bound is best-effort. macOS refuses `SO_RCVTIMEO` with
+                // EINVAL once the peer has closed its end, which a short-lived
+                // hook can do before this line runs. A peer that is gone
+                // cannot hang the read: it returns what is buffered and then
+                // EOF, so a refused timeout costs nothing.
                 stream
-                    .read_to_string(&mut line)
+                    .set_nonblocking(false)
+                    .expect("make the accepted stream blocking");
+                let _ = stream.set_read_timeout(Some(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(1)),
+                ));
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut line)
                     .expect("read emitted AgentEvent");
-                return serde_json::from_str(line.trim()).expect("parse emitted AgentEvent");
+                let value: Value = serde_json::from_str(line.trim()).expect("parse emitted line");
+                if value["message_type"] == "question" {
+                    stream
+                        .write_all(b"{\"question_id\":\"\",\"outcome\":\"released\",\"reason\":\"cleared\"}\n")
+                        .expect("release the held hook");
+                    let _ = child.wait();
+                    return serde_json::from_value(value["event"].clone())
+                        .expect("parse the held question's AgentEvent");
+                }
+                let output = child.wait_with_output().expect("wait for hook command");
+                assert!(
+                    output.status.success(),
+                    "`hook --agent {agent}` rejected a payload: status={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return serde_json::from_value(value).expect("parse emitted AgentEvent");
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(

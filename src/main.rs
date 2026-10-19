@@ -315,6 +315,24 @@ enum Commands {
     /// PTY keystroke injection. Uses `DOT_AGENT_DECK_PANE_ID` to scope the
     /// request, exactly like `agent-event`.
     GetSeed,
+    /// Report a question an agent is asking and wait for the deck's answer
+    /// (PRD #1631). Run by the deck's OpenCode plugin and Pi extension, not by
+    /// hand: prints one line — what the producer should answer the agent with —
+    /// or nothing, and always exits 0.
+    #[command(hide = true)]
+    AwaitAnswer {
+        /// The producer: `opencode` (the question on stdin) or `pi`.
+        #[arg(long)]
+        agent: String,
+        /// The question, for a producer that cannot write stdin (Pi).
+        #[arg(long)]
+        question: Option<String>,
+        /// After printing the answer, read one line from stdin — whether the
+        /// agent took it — and pass it to the deck (the OpenCode plugin). The
+        /// question is then the first line of stdin rather than all of it.
+        #[arg(long)]
+        ack: bool,
+    },
     /// Print the user documentation for this version, embedded in the binary
     /// (no network, no daemon). With no topic, list the topics; with a topic
     /// (e.g. `orchestration`, `desktop/voice`), print that page's Markdown;
@@ -972,8 +990,10 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
 ///   the signal and said why.
 ///
 /// An `accepted: true` ack says the gate admitted the message, **not** that the
-/// handler behind it succeeded — the daemon writes it before the handler runs.
-/// See `dot_agent_deck::event::SignalAck` for what stays invisible.
+/// handler behind it succeeded — for `dispatch` the daemon writes it before the
+/// handler runs, and for `work-done` once the report is queued, before it is
+/// written into any pane. See `dot_agent_deck::event::SignalAck` for what
+/// stays invisible.
 fn send_signal_and_report_ack(json: &str, verb: &str, subject: &str) -> ExitCode {
     use dot_agent_deck::hook::SocketReply;
     match dot_agent_deck::hook::send_and_await_signal_ack(json) {
@@ -1727,6 +1747,11 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some(Commands::AwaitAnswer {
+            agent,
+            question,
+            ack,
+        }) => dot_agent_deck::hook::handle_await_answer(&agent, question.as_deref(), ack),
         Some(Commands::Upgrade { check, yes }) => {
             dot_agent_deck::self_upgrade::cli::main(dot_agent_deck::self_upgrade::cli::Args {
                 check,

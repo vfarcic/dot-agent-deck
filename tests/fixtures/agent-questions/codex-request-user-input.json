@@ -1,0 +1,47 @@
+{
+  "session_id": "01a10439-d77d-7583-965a-8a42375bf7b7",
+  "turn_id": "01a1043c-5f68-7623-9cbb-f6f44a2a451a",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-5.6-luna",
+  "permission_mode": "default",
+  "tool_name": "request_user_input",
+  "tool_input": {
+    "questions": [
+      {
+        "header": "Colour",
+        "id": "colour",
+        "question": "Which colour?",
+        "options": [
+          {
+            "label": "Red",
+            "description": "Choose red."
+          },
+          {
+            "label": "Green",
+            "description": "Choose green."
+          },
+          {
+            "label": "Blue",
+            "description": "Choose blue."
+          }
+        ]
+      },
+      {
+        "header": "Size",
+        "id": "size",
+        "question": "Which size?",
+        "options": [
+          {
+            "label": "Small",
+            "description": "Choose small."
+          },
+          {
+            "label": "Large",
+            "description": "Choose large."
+          }
+        ]
+      }
+    ]
+  },
+  "tool_use_id": "call_3X65ZJFbHuMzyWg4gOyBg1vK"
+}

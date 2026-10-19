@@ -392,7 +392,7 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
 
     // The orchestration tab must be rebuilt AND shown (start cursor): its
     // non-start role panes render as deck cards by role name, in saved order.
-    let rebuilt = common::wait_until(Duration::from_secs(15), || {
+    let rebuilt = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
         let g = deck.snapshot_grid();
         g.contains("coder") && g.contains("reviewer")
     });
@@ -424,7 +424,7 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
         &record,
         "Build the feature end to end",
         1,
-        Duration::from_secs(15),
+        common::load_scaled(Duration::from_secs(15)),
     );
     assert!(
         replayed,

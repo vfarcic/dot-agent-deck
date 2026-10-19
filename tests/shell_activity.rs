@@ -435,7 +435,12 @@ fn shell_activity_002_descendant_walk_terminates_on_a_ppid_cycle() {
         let _ = tx.send(pids);
     });
 
-    let mut pids = rx.recv_timeout(std::time::Duration::from_secs(2)).expect(
+    // A hang detector, not a performance bound: a walk that terminates returns
+    // in microseconds, so the ceiling is paid only by a looping regression. It
+    // was 2 s, which a starved box overran without any loop (`io full` 82% in
+    // PRD #1631's broad `cargo test-e2e` run); this file does not link the
+    // harness's `load_scaled`, so the ceiling is a flat 30 s instead.
+    let mut pids = rx.recv_timeout(std::time::Duration::from_secs(30)).expect(
         "descendants() must terminate on a synthetic ppid cycle instead of looping forever",
     );
     pids.sort_unstable();

@@ -337,6 +337,42 @@ fn background_008_real_background_subagent_clears_on_paired_stop() {
     );
 }
 
+/// Scenario: Start real interactive Haiku Claude through Ctrl+N with trust/onboarding seeded, then submit, through the harness's Claude prompt helper, a one-line prompt of over 1,000 characters whose only instruction, at its very end, is to touch a uniquely named sentinel file. The helper pastes a prompt that long, and Claude Code shows `[Pasted text #1]` instead of the text; the helper must take that as the prompt sitting in the input, type its short follow-the-paste instruction after it, press Enter, see the hook report the prompt's own text, and the sentinel must appear — proof the whole pasted text, tail included, was submitted.
+#[spec("harness/claude-prompt/001")]
+#[test]
+fn claude_prompt_001_long_prompt_is_pasted_and_submitted_whole() {
+    skip_unless!(common::check_claude_available());
+    const SENTINEL: &str = "claude-prompt-001-paste-5e81c0d4.txt";
+    let (deck, events, agent_id) = background_live_fixture("claude-prompt-001-haiku");
+    // One line, well past the 800 characters at which Claude Code collapses a
+    // paste, with the only instruction after all of it: a prompt that arrived
+    // short of its end cannot create the sentinel.
+    let filler =
+        "This sentence is padding for a long pasted prompt and asks for nothing. ".repeat(15);
+    let prompt = format!(
+        "{filler}Ignore the padding above. Your only task: use Bash exactly once to run touch \
+         {SENTINEL} in the current directory, then reply DONE. Do not use any other tool."
+    );
+    assert!(
+        prompt.chars().count() > common::CLAUDE_TYPED_PROMPT_MAX_CHARS,
+        "the prompt must be long enough for the helper to paste it"
+    );
+    let (submitted, shown) = deck.submit_claude_prompt_shown(&events, &agent_id, &prompt, SENTINEL);
+    assert_eq!(
+        shown,
+        common::ClaudePromptShown::PastePlaceholder,
+        "PRECONDITION NOT MET: Claude Code showed the pasted prompt's text rather than a \
+         placeholder, so this run did not exercise a collapsed paste"
+    );
+    assert_eq!(submitted.agent_id.as_deref(), Some(agent_id.as_str()));
+    assert!(
+        common::wait_for_path(&deck.workdir().join(SENTINEL), Duration::from_secs(120)),
+        "the agent never created {SENTINEL}, the instruction at the end of the pasted prompt, \
+         so the submission did not carry the whole text.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
 const PANE_NAME_SUFFIX: &str = "shell-activity-005-haiku";
 /// Unique so the prompt unambiguously names one real file rather than
 /// leaving the model to invent a command — the sentinel + directive-prompt

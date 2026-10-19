@@ -1083,13 +1083,15 @@ pub(crate) mod tests {
             state["agents_on_screen"],
             serde_json::json!([
                 {
-                    "label": "tester",
+                    "label": "build tester",
+                    "role": "tester",
                     "agent_type": "Claude Code",
                     "orchestration": "build",
                     "status": "running",
                 },
                 {
-                    "label": "orchestrator",
+                    "label": "build orchestrator",
+                    "role": "orchestrator",
                     "agent_type": "Claude Code",
                     "orchestration": "build",
                     "status": "running",
@@ -1138,13 +1140,15 @@ pub(crate) mod tests {
             state["agents_on_screen"],
             serde_json::json!([
                 {
-                    "label": "tester",
+                    "label": "build tester",
+                    "role": "tester",
                     "agent_type": "Claude Code",
                     "orchestration": "build",
                     "status": "waiting_for_input",
                 },
                 {
-                    "label": "orchestrator",
+                    "label": "build orchestrator",
+                    "role": "orchestrator",
                     "agent_type": "Claude Code",
                     "orchestration": "build",
                     "status": "working",
@@ -1168,7 +1172,7 @@ pub(crate) mod tests {
         assert_eq!(
             state["agents_on_screen"],
             serde_json::json!([{
-                "label": "Smith",
+                "label": "build Smith",
                 "role": "tester",
                 "cli": "opencode",
                 "agent_type": "Claude Code",
@@ -1204,7 +1208,8 @@ pub(crate) mod tests {
         assert_eq!(
             state_with["agents_on_screen"],
             serde_json::json!([{
-                "label": "tester",
+                "label": "build tester",
+                "role": "tester",
                 "agent_type": "Claude Code",
                 "orchestration": "build",
                 "status": "running",
@@ -1326,7 +1331,7 @@ pub(crate) mod tests {
         assert!(!state.to_string().contains("scroll jump"), "{state}");
         assert_eq!(on_screen[2]["newest_rank"], 1);
         assert_eq!(on_screen[3]["orchestration"], "prd-1487");
-        assert_eq!(on_screen[3]["label"], "reviewer");
+        assert_eq!(on_screen[3]["label"], "prd-1487 reviewer");
         assert_eq!(on_screen[4]["orchestration"], "docs-1502");
         assert_eq!(on_screen[4]["directory"], "handbook");
     }

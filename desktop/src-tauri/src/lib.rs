@@ -3175,27 +3175,60 @@ async fn desktop_voice_start(
 }
 
 /// Close the microphone and transcribe what it heard. Recording →
-/// transcribing → done or failed.
+/// transcribing → done or failed. `on_split` gets one message once the
+/// recording is split, before transcription ([`stop_and_transcribe`]).
 #[tauri::command]
 async fn desktop_voice_stop(
     webview: Webview,
     voice_state: State<'_, VoiceState>,
+    on_split: Channel<()>,
 ) -> Result<voice::VoiceTranscription, String> {
     ensure_main_webview(&webview)?;
-    // Blocking, like the open in `desktop_voice_start`: closing the device
-    // joins its thread, and a driver that is slow to let go would otherwise
-    // park a runtime worker for as long as it takes.
-    let hold = voice_state.hold.clone();
-    let audio = tauri::async_runtime::spawn_blocking(move || hold.stop())
+    stop_and_transcribe(
+        &voice_state.hold,
+        // A webview that has gone away cannot be told; the stop goes on, and
+        // a webview that missed the message closes its segment when this
+        // command answers instead.
+        move || {
+            let _ = on_split.send(());
+        },
+        || {
+            voice::transcriber_for(
+                &voice_speech_settings(),
+                Arc::new(KeychainSecretStore::new()),
+            )
+        },
+    )
+    .await
+}
+
+/// [`desktop_voice_stop`]'s work: close the microphone, call `split`, then
+/// transcribe with the backend `transcriber` builds.
+///
+/// `split` runs once the recording has been split — this utterance's audio
+/// taken, the kept device (PR #1451) recording the next one — and before
+/// transcription starts (PRD #1631). The webview
+/// counts the app's own speech against this utterance only until then: speech
+/// that starts after the split is not in this audio, however long the
+/// transcription takes. A stop the device refuses never calls it.
+async fn stop_and_transcribe(
+    hold: &voice::VoiceHold,
+    split: impl FnOnce(),
+    transcriber: impl FnOnce() -> Box<dyn voice::Transcriber>,
+) -> Result<voice::VoiceTranscription, String> {
+    // Blocking, like the open in `desktop_voice_start`: a device the length
+    // cap closed is let go here, which joins its thread, and a driver that is
+    // slow to let go would otherwise park a runtime worker for as long as it
+    // takes.
+    let stopping = hold.clone();
+    let audio = tauri::async_runtime::spawn_blocking(move || stopping.stop())
         .await
         .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?
         .map_err(report_capture_error)?;
-    let transcriber = voice::transcriber_for(
-        &voice_speech_settings(),
-        Arc::new(KeychainSecretStore::new()),
-    );
+    split();
+    let transcriber = transcriber();
     let result = voice::handle_audio(transcriber.as_ref(), &audio).await;
-    voice_state.hold.settle(result.outcome.is_heard());
+    hold.settle(result.outcome.is_heard());
     Ok(result)
 }
 
@@ -3780,6 +3813,259 @@ async fn desktop_voice_number(
     validate_voice_numbered(&heard)?;
     Ok(voice::numbers::answer(&utterance, &heard, generation))
 }
+
+/// PRD #1631: the most selections a webview may send for one form —
+/// [`dot_agent_deck::question::MAX_QUESTIONS`], which is the most questions a
+/// form carries.
+const MAX_VOICE_FORM_SELECTIONS: usize = dot_agent_deck::question::MAX_QUESTIONS;
+
+/// Refuse a form no real question could have produced: more selections than a
+/// form has questions, more options than a question has, words longer than an
+/// answer may be, or ids no deck mints.
+fn validate_voice_question_form(
+    deck_id: &str,
+    agent_id: &str,
+    question_id: &str,
+    form: &[voice::question::Selection],
+) -> Result<(), String> {
+    let bad_id = |value: &str| value.is_empty() || value.len() > MAX_VOICE_DECK_ID_BYTES;
+    if bad_id(deck_id)
+        || bad_id(agent_id)
+        || question_id.is_empty()
+        || question_id.chars().count() > dot_agent_deck::question::MAX_ID_CHARS
+        || form.len() > MAX_VOICE_FORM_SELECTIONS
+        || form.iter().any(|selection| {
+            selection.option_indices.len() > dot_agent_deck::question::MAX_OPTIONS
+                || selection.text.as_deref().is_some_and(|text| {
+                    text.chars().count() > dot_agent_deck::question::MAX_ANSWER_TEXT_CHARS
+                })
+        })
+    {
+        return Err("the answer sent with that utterance is not one this app offers".to_string());
+    }
+    Ok(())
+}
+
+/// PRD #1631: the question `agent_id` on `deck_id` is waiting on, as the
+/// deck's snapshot has it now — never the webview's copy.
+async fn pending_question_on(
+    state: &DesktopState,
+    deck_id: &str,
+    agent_id: &str,
+) -> Result<Option<crate::dto::DesktopPendingQuestion>, String> {
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let snapshot = crate::daemon_bridge::snapshot_of(scope.endpoint(), &state.daemon).await;
+    Ok(snapshot
+        .agents
+        .into_iter()
+        .find(|agent| agent.id == agent_id)
+        .and_then(|agent| agent.pending_question))
+}
+
+/// PRD #1631: one utterance said on an agent's own screen while that agent
+/// waits on a question — which of its options it picks, if it is about the
+/// question at all ([`voice::question::resolve`]).
+///
+/// The question is read HERE, from the deck's snapshot, for
+/// [`desktop_voice_resolve`]'s reason; the webview names which one it saw so
+/// a question that changed meanwhile is reported as that rather than answered.
+/// `form` and `awaiting_text` are the answer so far, the webview's state, and
+/// are held to the snapshot's question before anything uses them. `agent` is
+/// the name the pane shows, used only in a sentence.
+///
+/// A `not_answer` verdict is the webview's cue to resolve the utterance as a
+/// command ([`desktop_voice_resolve`]). Nothing here sends anything to the
+/// agent: [`desktop_voice_answer_question`] does, after the countdown.
+/// `local_only` is the webview's typing mode (PR #1698): then nothing said is
+/// sent to the Commands service, and only an option matched on this machine
+/// answers the question. Absent reads as off, as an older webview sends it.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn desktop_voice_question(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    agent_id: String,
+    agent: String,
+    question_id: String,
+    utterance: String,
+    form: Vec<voice::question::Selection>,
+    awaiting_text: Option<voice::question::TextSlot>,
+    local_only: Option<bool>,
+) -> Result<voice::question::QuestionResult, String> {
+    ensure_main_webview(&webview)?;
+    if utterance.len() > MAX_UTTERANCE_BYTES {
+        return Err(format!(
+            "that answer is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
+        ));
+    }
+    validate_voice_question_form(&deck_id, &agent_id, &question_id, &form)?;
+    let agent = voice_agent_name(&agent);
+    // Read per call, for `desktop_voice_resolve`'s reason, and off the async
+    // runtime: it is a file read, and a stalled one must not hold up the
+    // runtime every other command shares.
+    let settings = tauri::async_runtime::spawn_blocking(|| {
+        crate::settings::load_settings_without_decks()
+            .voice
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|error| safe_message(format!("reading the voice settings failed: {error}")))?;
+    let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
+    let Some(question) = pending_question_on(&state, &deck_id, &agent_id).await? else {
+        // Nothing is waiting any more: the utterance is the user's next
+        // command, not an answer to a question that is gone.
+        return Ok(voice::question::QuestionResult {
+            verdict: voice::question::QuestionVerdict::NotAnswer,
+            resolve_ms: None,
+            backend: resolver.backend_name(),
+        });
+    };
+    if question.id != question_id {
+        return Ok(voice::question::QuestionResult {
+            verdict: voice::question::QuestionVerdict::Refused {
+                sentence: voice::question::QUESTION_MOVED_ON.to_string(),
+            },
+            resolve_ms: None,
+            backend: resolver.backend_name(),
+        });
+    }
+    Ok(voice::question::resolve(
+        resolver.as_ref(),
+        &agent,
+        &question,
+        &form,
+        awaiting_text,
+        voice::Transcript::new(utterance),
+        local_only.unwrap_or(false),
+    )
+    .await)
+}
+
+/// The bound on one answer once the deck's link is held, for
+/// `claim_focus_on`'s reason: a wedged daemon must not hold the command open.
+/// A held answer is written to a waiting producer and a keys answer types at
+/// most a few keys with a short gap, so this is generous.
+const VOICE_ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// PRD #1631: send a whole answered form, after the webview's countdown.
+///
+/// Checked against the deck's snapshot first — the same question, every
+/// selection still valid, every question answered, and the "always" option
+/// confirmed ([`voice::question::check_form`]) — and only then sent, through
+/// `DaemonClient::answer_question_while`, which withholds the request from a
+/// daemon that does not advertise `answer-question`. Every outcome, the
+/// daemon's refusals included, comes back as a sentence for the outcome row.
+///
+/// **Bound to the question's revision** (`revision`, audit A4): the one the
+/// webview read, which must still be the snapshot's, and which the daemon is
+/// told so it refuses the answer if the question was registered again under
+/// the same id before the request lands.
+///
+/// **Sent under the panel's lease** (`lease`, audit A8): the panel cancels it
+/// ([`desktop_voice_answer_cancel`]) the moment the answer stops being wanted,
+/// and the lease is `answer_question_while`'s `still_wanted` gate, checked
+/// immediately before the request is written — so a pane change during a
+/// stalled snapshot read or link sends nothing, and one that lands after the
+/// write is reported as too late rather than as nothing sent.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn desktop_voice_answer_question(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    agent_id: String,
+    agent: String,
+    question_id: String,
+    form: Vec<voice::question::Selection>,
+    confirmed_always: bool,
+    lease: String,
+    revision: Option<u64>,
+) -> Result<voice::question::AnswerOutcome, String> {
+    ensure_main_webview(&webview)?;
+    validate_voice_question_form(&deck_id, &agent_id, &question_id, &form)?;
+    if !voice::lease::is_valid_lease(&lease) {
+        return Err("the answer sent with that utterance is not one this app offers".to_string());
+    }
+    let lease = state.voice_answer_leases.begin(&lease);
+    let agent = voice_agent_name(&agent);
+    let Some(question) = pending_question_on(&state, &deck_id, &agent_id).await? else {
+        return Ok(voice::question::AnswerOutcome {
+            kind: "refused",
+            code: Some("no_pending_question"),
+            sentence: "No question is waiting in this agent.".to_string(),
+        });
+    };
+    if let Err(refused) =
+        voice::question::check_form(&agent, &question, &question_id, &form, confirmed_always)
+    {
+        return Ok(refused);
+    }
+    // Audit A4: the registration the webview resolved the answer against must
+    // still be the pending one, and the daemon is told which one it is.
+    let revision = match voice::question::check_revision(revision, question.revision) {
+        Ok(revision) => revision,
+        Err(stale) => return Ok(stale),
+    };
+    let answers = voice::question::answers_of(&form);
+    let leased = voice::lease::send_leased(&lease, |still_wanted| async {
+        if !still_wanted() {
+            return Ok(dot_agent_deck::daemon_client::AnswerReport::Superseded);
+        }
+        let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+        let daemon = state.daemon.trusted(scope.endpoint()).await?;
+        daemon.require_compatible()?;
+        let sent = daemon.client.answer_question_while(
+            still_wanted,
+            &agent_id,
+            &question_id,
+            revision,
+            answers,
+            confirmed_always,
+        );
+        match tokio::time::timeout(VOICE_ANSWER_TIMEOUT, sent).await {
+            Ok(report) => report.map_err(|error| safe_message(error.to_string())),
+            Err(_) => Err("the deck did not answer in time".to_string()),
+        }
+    })
+    .await?;
+    Ok(voice::question::leased_outcome(
+        &agent, &question, &form, leased,
+    ))
+}
+
+/// PRD #1631 (audit A8): the voice panel no longer wants the answer it is
+/// sending under `lease` — see [`desktop_voice_answer_question`]. Never
+/// refused, and a no-op for a lease no send names.
+#[tauri::command]
+fn desktop_voice_answer_cancel(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    lease: String,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    if voice::lease::is_valid_lease(&lease) {
+        state.voice_answer_leases.cancel(&lease);
+    }
+    Ok(())
+}
+
+/// The pane's name as the webview sent it, made safe for a sentence and
+/// bounded — it is only ever quoted.
+fn voice_agent_name(agent: &str) -> String {
+    let name: String = crate::dto::safe_display_text(agent)
+        .chars()
+        .take(MAX_VOICE_AGENT_NAME_CHARS)
+        .collect();
+    if name.trim().is_empty() {
+        "This agent".to_string()
+    } else {
+        name
+    }
+}
+
+/// The longest pane name a voice sentence quotes.
+const MAX_VOICE_AGENT_NAME_CHARS: usize = 120;
 
 /// [`desktop_voice_choice`] once the live state is read. The decks are the
 /// ones a resolve would have offered; for [`voice::SWITCH_DECK_ROW`] they are
@@ -6529,6 +6815,9 @@ pub fn run() {
             desktop_voice_reading_stop,
             desktop_voice_choice,
             desktop_voice_number,
+            desktop_voice_question,
+            desktop_voice_answer_question,
+            desktop_voice_answer_cancel,
             desktop_voice_commands,
             desktop_voice_speech_plan,
             desktop_voice_speech_audio,
@@ -7930,6 +8219,93 @@ mod tests {
             stopped,
             counts,
         )
+    }
+
+    /// PRD #1631 (review M2): the stop tells the webview the recording split
+    /// once this utterance's audio is taken, and before the transcription
+    /// starts, so speech the app starts while transcribing is
+    /// not counted against this utterance.
+    #[tokio::test]
+    async fn voice_stop_reports_the_split_once_the_utterance_is_taken() {
+        struct Ordered {
+            inner: voice::StubTranscriber,
+            order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+        impl voice::Transcriber for Ordered {
+            fn transcribe<'a>(
+                &'a self,
+                audio: &'a voice::Pcm16,
+            ) -> voice::transcribe::TranscribeFuture<'a> {
+                self.order.lock().unwrap().push("transcribe");
+                self.inner.transcribe(audio)
+            }
+            fn backend_name(&self) -> &'static str {
+                self.inner.backend_name()
+            }
+        }
+
+        // Real (synthesised) speech, so the audio gate in front of the
+        // transcriber lets it through and the transcriber is called.
+        let speech: Vec<f32> = include_bytes!("voice/fixtures/speech/stop-john.pcm")
+            .chunks_exact(2)
+            .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0)
+            .collect();
+        let hold = voice::VoiceHold::with_parts(
+            Arc::new(voice::CaptureSession::new(Arc::new(
+                voice::StubSource::new(
+                    voice::AudioFormat::new(voice::TARGET_SAMPLE_RATE, 1),
+                    speech,
+                ),
+            ))),
+            Arc::new(voice::WakeLock::new(Arc::new(voice::StubInhibitor::new()))),
+        );
+        hold.start().expect("the stub device opens");
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let split = {
+            let order = Arc::clone(&order);
+            let hold = hold.clone();
+            move || {
+                // `stop` moves the session to Transcribing under the lock it
+                // takes the utterance's audio under.
+                assert_eq!(
+                    hold.status().state,
+                    voice::CaptureState::Transcribing,
+                    "the utterance is taken at the split"
+                );
+                order.lock().unwrap().push("split");
+            }
+        };
+        let transcriber = {
+            let order = Arc::clone(&order);
+            move || -> Box<dyn voice::Transcriber> {
+                Box::new(Ordered {
+                    inner: voice::StubTranscriber::hearing("yes"),
+                    order,
+                })
+            }
+        };
+
+        let result = stop_and_transcribe(&hold, split, transcriber)
+            .await
+            .expect("the stop transcribes");
+
+        assert!(result.outcome.is_heard());
+        assert_eq!(*order.lock().unwrap(), ["split", "transcribe"]);
+    }
+
+    /// A stop the device refuses — nothing is recording — reports no split.
+    #[tokio::test]
+    async fn a_refused_voice_stop_reports_no_split() {
+        let (voice_state, _stopped, _counts) = stub_voice_state(1.0);
+        let mut split = false;
+        let refused = stop_and_transcribe(
+            &voice_state.hold,
+            || split = true,
+            || -> Box<dyn voice::Transcriber> { Box::new(voice::StubTranscriber::hearing("yes")) },
+        )
+        .await;
+        assert!(refused.is_err(), "nothing was recording: {refused:?}");
+        assert!(!split);
     }
 
     /// PRD #802 audit blocker: the app exiting releases the microphone.

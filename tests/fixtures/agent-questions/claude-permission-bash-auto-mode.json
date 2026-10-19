@@ -1,0 +1,11 @@
+{
+  "session_id": "3f0c7d52-9a41-4c1e-8f2b-5d6e7a8b9c01",
+  "prompt_id": "b7e2a1c4-6d3f-4e58-9a0b-1c2d3e4f5a6b",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git push origin main",
+    "description": "Push the commit"
+  }
+}

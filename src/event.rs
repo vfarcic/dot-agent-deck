@@ -54,9 +54,12 @@ pub enum EventType {
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
-    /// without another `PROTOCOL_VERSION` bump. Deserialize-only — never
-    /// produced by this build. Treated as a no-op wherever `EventType` is
-    /// matched (never proof of agent activity, never changes `SessionStatus`).
+    /// without another `PROTOCOL_VERSION` bump. No producer sends it; the one
+    /// frame this build emits with it is the daemon's own question release
+    /// ([`QUESTION_RELEASED_BY_DECK_METADATA_KEY`]), chosen precisely because
+    /// every build reads it as a no-op. Treated as a no-op wherever `EventType`
+    /// is matched (never proof of agent activity, never changes
+    /// `SessionStatus`).
     #[serde(other)]
     Unknown,
 }
@@ -1049,11 +1052,71 @@ pub const PROMPT_REPORTS_DECLARED_METADATA_VALUE: &str = "1";
 /// would end too.
 pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
 
+/// PRD #1631: the question an event raises, as a JSON-encoded
+/// [`crate::question::PendingQuestion`] riding the free-form `metadata` map.
+///
+/// A metadata key rather than a new [`AgentEvent`] field, deliberately: the
+/// map is already on every producer's wire and every reader's decode, so the
+/// question moves no wire at all — an older daemon or TUI ignores an unknown
+/// key — and the dozens of places that build an `AgentEvent` stay as they are.
+/// Every reader decodes it through [`AgentEvent::question`], which sanitizes
+/// it ([`crate::question::PendingQuestion::sanitized`]); the daemon also
+/// rewrites it sanitized, or drops it, on arrival.
+pub const QUESTION_METADATA_KEY: &str = "pending_question";
+
+/// PRD #1631 (PR #1698 review): a fingerprint of a tool call's `tool_input`
+/// ([`tool_input_digest`]), stamped by the Claude-shaped hook on a `PreToolUse`
+/// (`ToolStart`) and a `PermissionRequest`. Claude Code's and Codex's
+/// `PermissionRequest` payloads carry no `tool_use_id`, but the call's own
+/// `PreToolUse` does, and carries the same input, so the state ties a question
+/// to the one call in flight whose input it was raised for
+/// ([`crate::state`]'s `question_call`). Additive like
+/// [`SUBAGENT_ID_METADATA_KEY`]: an older daemon ignores it, an older hook
+/// never sets it, and a question left untied clears by tool name as before.
+pub const TOOL_INPUT_DIGEST_METADATA_KEY: &str = "tool_input_digest";
+
+/// PRD #1631 (PR #1698 review): the [`TOOL_INPUT_DIGEST_METADATA_KEY`] value
+/// for `input` — SHA-256, in hex, of its JSON. `serde_json` keeps an object's
+/// keys sorted in this build (no `preserve_order`), so the same input digests
+/// alike whatever order the producer wrote its keys in.
+pub fn tool_input_digest(input: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.to_string().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// PRD #1631: the id of a question the AGENT reports answered — OpenCode's
+/// `permission.replied` / `question.replied` / `question.rejected` name their
+/// request id here. An event carrying it clears that question if it is the
+/// pending one. It can only take a question away, never raise one, so a forged
+/// value costs nothing a plain `Idle` would not.
+pub const QUESTION_RESOLVED_METADATA_KEY: &str = "question_resolved_id";
+
+/// PRD #1631: the daemon's marker on the event it ingests after answering a
+/// question itself. The daemon's alone: stripped from every producer frame,
+/// and [`AgentEvent::is_daemon_synthetic`] counts it.
+pub const QUESTION_ANSWERED_BY_DECK_METADATA_KEY: &str = "question_answered_by_deck";
+
+/// The value of [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`] and
+/// [`QUESTION_RELEASED_BY_DECK_METADATA_KEY`] — only the key is read.
+pub const QUESTION_ANSWERED_BY_DECK_METADATA_VALUE: &str = "1";
+
+/// PRD #1631: the daemon's marker on the event it ingests when a held
+/// question's producer stopped waiting without an answer (Claude Code kills its
+/// hook on a keyboard No or Esc [observed]). The event is an
+/// [`EventType::Unknown`] carrying [`QUESTION_RESOLVED_METADATA_KEY`], so a
+/// reader that knows the key drops the question and every reader leaves the
+/// status alone — an older client decodes `unknown` as the no-op it has always
+/// been. The daemon's alone, like [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`].
+pub const QUESTION_RELEASED_BY_DECK_METADATA_KEY: &str = "question_released_by_deck";
+
 /// Where a permission prompt stands, on the events the OpenCode hook builds
 /// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
+/// PRD #1631: a question form's answer or dismissal is marked replied too.
 pub const PERMISSION_STATE_METADATA_KEY: &str = "permission_state";
 
-/// [`PERMISSION_STATE_METADATA_KEY`]'s value on an answered permission prompt.
+/// [`PERMISSION_STATE_METADATA_KEY`]'s value on an answered permission prompt
+/// or question form.
 pub const PERMISSION_STATE_REPLIED: &str = "replied";
 
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
@@ -1281,7 +1344,8 @@ impl AgentEvent {
     /// Issue #1678: is this a subagent's answered permission prompt — a
     /// `Thinking` carrying both [`SUBAGENT_ID_METADATA_KEY`] and
     /// [`PERMISSION_STATE_METADATA_KEY`] = [`PERMISSION_STATE_REPLIED`], which
-    /// the OpenCode hook builds from a child session's `permission.replied`?
+    /// the OpenCode hook builds from a child session's `permission.replied`
+    /// (and, PRD #1631, its `question.replied` or `question.rejected`)?
     /// It ends that subagent's share of a wait and says nothing about the main
     /// thread. `false` for every event an older hook CLI builds.
     pub fn is_subagent_permission_reply(&self) -> bool {
@@ -1597,6 +1661,38 @@ impl AgentEvent {
             || self.is_card_surface_session_start()
             || self.is_daemon_pane_closed()
             || self.is_unproven_eviction()
+            || self
+                .metadata
+                .contains_key(QUESTION_ANSWERED_BY_DECK_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(QUESTION_RELEASED_BY_DECK_METADATA_KEY)
+    }
+
+    /// PRD #1631: the question this event raises, sanitized — `None` when it
+    /// carries none, or one that does not decode or does not survive
+    /// [`crate::question::PendingQuestion::sanitized`].
+    pub fn question(&self) -> Option<crate::question::PendingQuestion> {
+        let raw = self.metadata.get(QUESTION_METADATA_KEY)?;
+        serde_json::from_str::<crate::question::PendingQuestion>(raw)
+            .ok()?
+            .sanitized()
+    }
+
+    /// PRD #1631: put `question` on this event.
+    pub fn set_question(&mut self, question: &crate::question::PendingQuestion) {
+        if let Ok(json) = serde_json::to_string(question) {
+            self.metadata
+                .insert(QUESTION_METADATA_KEY.to_string(), json);
+        }
+    }
+
+    /// PRD #1631: the question id this event reports the agent answered, if
+    /// any ([`QUESTION_RESOLVED_METADATA_KEY`]).
+    pub fn resolved_question_id(&self) -> Option<&str> {
+        self.metadata
+            .get(QUESTION_RESOLVED_METADATA_KEY)
+            .map(String::as_str)
     }
 }
 
@@ -1717,6 +1813,21 @@ pub enum DaemonMessage {
     /// reports as harmless.
     #[serde(rename = "ack")]
     Ack(AckSignal),
+    /// PRD #1631: a producer reports a question and, with `hold`, keeps this
+    /// connection open for the daemon's answer — the Claude Code
+    /// `PermissionRequest` hook, and the `await-answer` child the OpenCode
+    /// plugin and the Pi extension start. The daemon applies the event exactly
+    /// as a bare one and, for a held question it accepted, writes one
+    /// [`crate::question::QuestionReply`] line when the question is answered
+    /// or let go; otherwise it answers a `released` reply at once.
+    ///
+    /// Additive on the unversioned hook socket, so it does NOT move the attach
+    /// `PROTOCOL_VERSION`. An older daemon decodes it as neither a
+    /// `DaemonMessage` nor an [`AgentEvent`], logs it as malformed and answers
+    /// nothing; the producer then exits with no decision and the agent shows
+    /// its own prompt, as it did before.
+    #[serde(rename = "question")]
+    Question(Box<QuestionSignal>),
 }
 
 impl DaemonMessage {
@@ -1736,6 +1847,7 @@ impl DaemonMessage {
             DaemonMessage::RestartRole(s) => &s.pane_id,
             DaemonMessage::SpawnRole(s) => &s.pane_id,
             DaemonMessage::Ack(s) => &s.pane_id,
+            DaemonMessage::Question(s) => &s.pane_id,
         }
     }
 
@@ -1751,6 +1863,7 @@ impl DaemonMessage {
             DaemonMessage::RestartRole(s) => s.token.as_deref(),
             DaemonMessage::SpawnRole(s) => s.token.as_deref(),
             DaemonMessage::Ack(s) => s.token.as_deref(),
+            DaemonMessage::Question(s) => s.token.as_deref(),
         }
     }
 
@@ -1766,6 +1879,7 @@ impl DaemonMessage {
             DaemonMessage::RestartRole(_) => "restart_role",
             DaemonMessage::SpawnRole(_) => "spawn_role",
             DaemonMessage::Ack(_) => "ack",
+            DaemonMessage::Question(_) => "question",
         }
     }
 
@@ -1816,6 +1930,15 @@ impl DaemonMessage {
             DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) | DaemonMessage::Ack(_) => {
                 serde_json::to_string(&SignalAck::refused(reason, message))
             }
+            // A refused question is released as `refused`: the producer prints
+            // no decision, the agent's own prompt stays on screen, and the
+            // producer re-sends the event as a plain one so it is not lost.
+            DaemonMessage::Question(s) => {
+                serde_json::to_string(&crate::question::QuestionReply::released(
+                    &s.question_id().unwrap_or_default(),
+                    crate::question::ReleaseReason::Refused,
+                ))
+            }
         };
         json.ok()
     }
@@ -1824,11 +1947,11 @@ impl DaemonMessage {
     /// provenance gate, or `None` for a verb whose own handler answers on the
     /// connection.
     ///
-    /// Only the two fire-and-forget verbs (`work_done` and `dispatch`) are
-    /// `Some`, and the exhaustive `match` is what enforces the invariant the hook
-    /// loop depends on: **exactly one line per message**. `delegate`,
-    /// `restart_role`, `spawn_role`, `list_targets`, `get_seed` and `ack` all
-    /// write their own response after their handler runs, so an admission line
+    /// Only `dispatch` is `Some`, and the exhaustive `match` is what enforces
+    /// the invariant the hook loop depends on: **exactly one line per
+    /// message**. `work_done`, `delegate`, `restart_role`, `spawn_role`,
+    /// `list_targets`, `get_seed` and `ack` all write their own response after
+    /// their handler runs, so an admission line
     /// here would be a second one and the caller — which reads exactly one line
     /// — would take the ack for the answer. `ack` answers after its handler
     /// (PR #1414 review) because admission is not what its caller needs to know:
@@ -1842,17 +1965,25 @@ impl DaemonMessage {
     /// as the dispatch takes. The price is stated in [`SignalAck::accepted`]: an
     /// admitted message is one the gate let through, not one whose work
     /// succeeded.
+    ///
+    /// `work_done` was acknowledged here too until PRD #1631, and that ordered
+    /// nothing: a worker whose first report was acked here could send its
+    /// second before the first was queued for delivery, and the two could reach
+    /// the recipient reversed (`orchestration/work-done/010`). Its handler
+    /// acknowledges once the report is queued — a state change under the
+    /// `state` read lock and a queue push, not the delivery, which may wait for
+    /// the recipient's draft — so a sender that waits for its ack is ordered.
     pub fn provenance_ack_reply(&self) -> Option<String> {
         match self {
-            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) => {
-                serde_json::to_string(&SignalAck::accepted()).ok()
-            }
-            DaemonMessage::Delegate(_)
+            DaemonMessage::Dispatch(_) => serde_json::to_string(&SignalAck::accepted()).ok(),
+            DaemonMessage::WorkDone(_)
+            | DaemonMessage::Delegate(_)
             | DaemonMessage::RestartRole(_)
             | DaemonMessage::SpawnRole(_)
             | DaemonMessage::ListTargets(_)
             | DaemonMessage::GetSeed(_)
-            | DaemonMessage::Ack(_) => None,
+            | DaemonMessage::Ack(_)
+            | DaemonMessage::Question(_) => None,
         }
     }
 }
@@ -1876,8 +2007,10 @@ impl DaemonMessage {
 /// # What it claims, and what it does not
 ///
 /// It claims exactly one thing: **this daemon admitted the message past the
-/// provenance gate**. It is written before the handler runs, so it is not a
-/// receipt for the work. In particular these remain invisible to the sender, as
+/// provenance gate**. It is not a receipt for the work: `dispatch`'s is written
+/// before its handler runs, and `work_done`'s once the handler has made its
+/// state changes and queued the report for delivery (PRD #1631), before the
+/// report is written into any pane. In particular these remain invisible to the sender, as
 /// they were before:
 ///
 /// - a `dispatch` from a pane the registry holds no record for, which the hook
@@ -2926,6 +3059,44 @@ pub struct AckSignal {
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.
+/// PRD #1631: [`DaemonMessage::Question`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionSignal {
+    pub pane_id: String,
+    /// The hook capability token (issue #1077), as on every verb.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The event to apply. It carries the question
+    /// ([`QUESTION_METADATA_KEY`]).
+    pub event: AgentEvent,
+    /// Keep this connection open for the answer.
+    #[serde(default)]
+    pub hold: bool,
+    /// PRD #1631: after an answered reply this producer writes one
+    /// [`crate::question::ReplyAck`] line saying whether the agent took the
+    /// answer, and the daemon reports the answer only once it has. Only the
+    /// OpenCode plugin's `await-answer` child sets it: it hands the answer to
+    /// OpenCode's reply API, which can refuse it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ack: bool,
+    /// PRD #1631 (PR #1698 review): when the daemon starts holding the
+    /// question, it says so at once, with a [`crate::question::QuestionReply`]
+    /// whose outcome is `held`, before the reply that ends the hold. A
+    /// producer that asks for it can tell a daemon that took the hold from
+    /// one that never will: a daemon from before `question` existed reads the
+    /// line as a malformed event and answers nothing, and the producer then
+    /// sends the event as a plain one so the card still reads Needs Input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirm_hold: bool,
+}
+
+impl QuestionSignal {
+    /// The id of the question the event carries, as the producer sent it.
+    pub fn question_id(&self) -> Option<String> {
+        self.event.question().map(|q| q.id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkDoneSignal {
     pub pane_id: String,
@@ -3148,10 +3319,9 @@ mod tests {
         let ty: EventType = serde_json::from_str("\"some_future_event_type\"").unwrap();
         assert_eq!(ty, EventType::Unknown);
 
-        // Deserialize-only: `Unknown` is never produced by this build, so it
-        // has no "own" wire name to round-trip through — unlike
-        // `AgentType::None`, which legitimately serializes as `"none"`.
-        // Confirm the REAL variants this build DOES produce still round-trip
+        // No producer sends `Unknown`; the daemon's question release is its
+        // one emitter (`QUESTION_RELEASED_BY_DECK_METADATA_KEY`), and that
+        // frame relies on it reading back as the same no-op. Confirm the REAL variants this build DOES produce still round-trip
         // cleanly, so the catch-all didn't disturb ordinary encode/decode.
         assert_eq!(
             serde_json::from_str::<EventType>(
@@ -3803,12 +3973,13 @@ mod tests {
     /// The invariant the hook loop rests on: **exactly one line per message**.
     /// A verb that answers in its own arm must return `None` from
     /// `provenance_ack_reply`, or the caller — which reads exactly one line —
-    /// would take the admission for the answer.
+    /// would take the admission for the answer. `work_done` answers in its own
+    /// arm since PRD #1631, once its report is queued.
     #[test]
-    fn only_the_fire_and_forget_verbs_are_acknowledged_at_the_gate() {
+    fn only_dispatch_is_acknowledged_at_the_gate() {
         for msg in one_of_every_variant() {
             let acked = msg.provenance_ack_reply().is_some();
-            let expected = matches!(msg, DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_));
+            let expected = matches!(msg, DaemonMessage::Dispatch(_));
             assert_eq!(
                 acked,
                 expected,
@@ -3859,17 +4030,14 @@ mod tests {
 
     /// The admission is affirmative: it identifies itself and carries no error.
     #[test]
-    fn an_admitted_fire_and_forget_verb_answers_an_affirmative_ack() {
-        let msg = DaemonMessage::WorkDone(WorkDoneSignal {
-            pane_id: "p".into(),
-            task: "t".into(),
-            done: false,
-            timestamp: chrono::Utc::now(),
-            token: None,
-        });
+    fn an_admitted_dispatch_answers_an_affirmative_ack() {
+        let msg = one_of_every_variant()
+            .into_iter()
+            .find(|msg| matches!(msg, DaemonMessage::Dispatch(_)))
+            .expect("a dispatch");
         let line = msg
             .provenance_ack_reply()
-            .expect("work_done is acknowledged");
+            .expect("dispatch is acknowledged at the gate");
         let ack: SignalAck = serde_json::from_str(&line).expect("the ack parses");
         assert!(ack.is_signal_ack());
         assert!(ack.accepted);

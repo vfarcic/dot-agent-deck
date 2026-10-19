@@ -423,7 +423,8 @@ EXACTLY AS PUSHING IS — a rerun and a dispatch are the same act by two names.
     `workflow_dispatch:`, so `gh workflow run ci.yml --ref <headRefName>`
     dispatches it — take the run id from the URL it prints, because a listing
     on a branch with an open PR returns the PR's run, not yours. Reach for it
-    when the box is loaded, when a change needs build-macos or build-windows,
+    when the box is loaded, when a change needs build-macos (build-windows is
+    `if: false` until Windows ships, so a dispatch does not run it),
     or as a sweep after your fixes. It relieves no gate: the gates
     `cargo xtask affected-checks --run` selects run before a commit exists, so
     they have already passed by the time there is anything to dispatch. Never

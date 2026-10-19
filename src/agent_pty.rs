@@ -4172,6 +4172,16 @@ struct PaneInputState {
     /// maps here drop a pane's entry when the pane is closed for good
     /// ([`Self::forget_closed_pane`]), not when it changes hands.
     user_input_at: HashMap<String, Instant>,
+    /// PRD #1631 (audit N1): a sequence number for HUMAN input, ordering it
+    /// against a question's arrival and the deck's own answer keys without a
+    /// clock. [`Self::input_seq`] is the counter, global and monotonic, and
+    /// moves only on a human keystroke; [`Self::human_input_seq`] holds, per
+    /// pane, the counter value of that pane's last one. A voice answer's keys
+    /// ([`ByteSource::Answer`]) stamp `user_input_at` as before but never move
+    /// it, so "has a human typed since X" is `human_input_seq > X`, read under
+    /// the same lock that records the keystroke.
+    input_seq: u64,
+    human_input_seq: HashMap<String, u64>,
     /// Issue #424 F1: what THIS daemon's guarded sends put into each pane.
     automatic: HashMap<String, AutomaticWrite>,
     /// Issue #424 S1: where each pane's user-input stream is, so that neither a
@@ -4187,13 +4197,32 @@ fn is_sentinel_pane_id(pane_id_env: &str) -> bool {
 }
 
 impl PaneInputState {
-    /// Record that a USER keystroke reached `pane_id_env`.
+    /// Record that a USER keystroke reached `pane_id_env` — a human's, so it
+    /// also moves the human-input sequence (PRD #1631, audit N1).
     fn note_user_input(&mut self, pane_id_env: &str) {
         if is_sentinel_pane_id(pane_id_env) {
             return;
         }
+        self.stamp_user_input(pane_id_env);
+        self.input_seq += 1;
+        self.human_input_seq
+            .insert(pane_id_env.to_string(), self.input_seq);
+    }
+
+    /// Stamp the user-input clock alone — for a voice answer's keys, which are
+    /// the user's answer but not a human at the keyboard.
+    fn stamp_user_input(&mut self, pane_id_env: &str) {
         self.user_input_at
             .insert(pane_id_env.to_string(), Instant::now());
+    }
+
+    /// PRD #1631 (audit N1): the counter value of `pane_id_env`'s last human
+    /// keystroke, `0` when it has had none.
+    fn human_input_seq(&self, pane_id_env: &str) -> u64 {
+        self.human_input_seq
+            .get(pane_id_env)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Record the user's actual bytes — the stamp above, plus the one thing the
@@ -4216,10 +4245,20 @@ impl PaneInputState {
     /// newline keys; reading any of them as a submission drained the records of
     /// a box that still held both our payload and the user's draft.
     fn note_user_bytes(&mut self, pane_id_env: &str, bytes: &[u8]) {
+        self.note_user_bytes_as(pane_id_env, bytes, true);
+    }
+
+    /// [`Self::note_user_bytes`], for a human's bytes (`human`) or a voice
+    /// answer's, which leave the human-input sequence alone (PRD #1631).
+    fn note_user_bytes_as(&mut self, pane_id_env: &str, bytes: &[u8], human: bool) {
         if is_sentinel_pane_id(pane_id_env) || bytes.is_empty() {
             return;
         }
-        self.note_user_input(pane_id_env);
+        if human {
+            self.note_user_input(pane_id_env);
+        } else {
+            self.stamp_user_input(pane_id_env);
+        }
         let submitted = self
             .input
             .entry(pane_id_env.to_string())
@@ -4312,6 +4351,7 @@ impl PaneInputState {
     /// box itself is gone.
     fn forget_closed_pane(&mut self, pane_id_env: &str) {
         self.user_input_at.remove(pane_id_env);
+        self.human_input_seq.remove(pane_id_env);
         self.automatic.remove(pane_id_env);
         self.input.remove(pane_id_env);
     }
@@ -4619,6 +4659,43 @@ impl PaneWriter {
         Ok(())
     }
 
+    /// PRD #1631 (audit N1): write a voice answer's keys, like
+    /// [`Self::write_user`] but as [`ByteSource::Answer`], and return the
+    /// human-input counter as it stood once the PTY took them — read while the
+    /// caller still holds this writer, which every human keystroke also needs,
+    /// so no keystroke can fall between the write and the value. A later human
+    /// keystroke on the pane has a higher sequence number than the one
+    /// returned.
+    ///
+    /// Audit T1: the PTY thread writes the keys only if `gate` still holds when
+    /// it comes to them — [`AnswerWrite::Superseded`], with nothing written,
+    /// otherwise.
+    pub(crate) async fn write_answer(
+        &self,
+        bytes: &[u8],
+        gate: AnswerGate,
+        queued: impl FnOnce(),
+    ) -> std::io::Result<AnswerWrite> {
+        match self
+            .pty
+            .run_queued(PtyOp::Answer(bytes.to_vec(), gate), queued)
+            .await
+        {
+            PtyJobOutcome::Done(PtyJobDone { result: Err(e), .. })
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<AnswerSuperseded>()) =>
+            {
+                return Ok(AnswerWrite::Superseded);
+            }
+            PtyJobOutcome::Done(done) => done.result?,
+            PtyJobOutcome::Gone => return Err(PtyWriterThread::gone()),
+            PtyJobOutcome::Withdrawn | PtyJobOutcome::Stalled => {
+                unreachable!("an unbounded job is neither withdrawn nor stalled")
+            }
+        }
+        Ok(AnswerWrite::Written(self.state.lock().unwrap().input_seq))
+    }
+
     /// Issue #525: the PTY thread's progress, readable without this writer's
     /// lock — see [`RunningAgent::pty_progress`].
     pub(crate) fn pty_progress(&self) -> Arc<PtyInFlight> {
@@ -4641,6 +4718,10 @@ impl PaneWriter {
 enum ByteSource {
     Deck,
     User,
+    /// PRD #1631: a voice answer's keys — recorded as the user's input (they
+    /// are the user's answer) without moving the human-input sequence (audit
+    /// N1), so the deck's own keys are never mistaken for a human's.
+    Answer,
 }
 
 /// Issue #525: what [`PtyWriterThread`] records into [`PaneInputState`] for the
@@ -4669,6 +4750,7 @@ impl InputRecorder {
         match source {
             ByteSource::Deck => state.note_deck_bytes(pane_id, accepted),
             ByteSource::User => state.note_user_bytes(pane_id, accepted),
+            ByteSource::Answer => state.note_user_bytes_as(pane_id, accepted, false),
         }
     }
 }
@@ -4684,6 +4766,10 @@ enum PtyOp {
     /// one round trip to this thread instead of two matters on a starved
     /// machine, where each costs a scheduling delay.
     WriteAll(Vec<u8>, ByteSource, bool),
+    /// PRD #1631 (audit T1): a voice answer's keys — a flushed
+    /// [`Self::WriteAll`] as [`ByteSource::Answer`], written only if its
+    /// [`AnswerGate`] still holds when the thread comes to it.
+    Answer(Vec<u8>, AnswerGate),
     Flush,
     /// Test seam: hand the PTY writer back and stop the thread — see
     /// [`AgentPtyRegistry::replace_agent_writer_for_test`].
@@ -4906,6 +4992,22 @@ impl PtyWriterThread {
                             }
                             done
                         }
+                        PtyOp::Answer(buf, mut gate) => {
+                            if gate.still_pending() {
+                                let mut done =
+                                    write_all_recorded(inner.as_mut(), &buf, |accepted| {
+                                        recorder.record(ByteSource::Answer, accepted)
+                                    });
+                                done.flushed = Some(inner.flush());
+                                done
+                            } else {
+                                PtyJobDone {
+                                    accepted: 0,
+                                    result: Err(std::io::Error::other(AnswerSuperseded)),
+                                    flushed: None,
+                                }
+                            }
+                        }
                         PtyOp::Flush => PtyJobDone {
                             accepted: 0,
                             result: inner.flush(),
@@ -4965,6 +5067,37 @@ impl PtyWriterThread {
     /// started.
     async fn run(&self, op: PtyOp, bound: Option<Duration>) -> PtyJobOutcome {
         self.run_committing(op, bound, None).await
+    }
+
+    /// [`Self::run`] with no bound, calling `queued` as soon as the job is in
+    /// the thread's queue — before its outcome is awaited. Jobs are written in
+    /// the order they are queued, so a caller that holds a lock only until
+    /// `queued` runs has fixed where its bytes land relative to every later
+    /// JOB without holding that lock across the write itself. That orders
+    /// nothing else: whatever the lock serialises can happen after `queued`
+    /// and before the thread reaches the job, which is why a voice answer's
+    /// key re-checks its question on the thread ([`AnswerGate`], PRD #1631
+    /// audit T1). A job still queued when the caller is dropped is withdrawn,
+    /// as [`Self::run`]'s is, and so never written.
+    async fn run_queued(&self, op: PtyOp, queued: impl FnOnce()) -> PtyJobOutcome {
+        let (tx, rx) = oneshot::channel();
+        let Some(state) = self.submit(op, PtyReply::Async(tx)) else {
+            queued();
+            return PtyJobOutcome::Gone;
+        };
+        queued();
+        let mut guard = WithdrawUnlessAnswered {
+            in_flight: &self.in_flight,
+            state: &state,
+            committed: None,
+            armed: true,
+        };
+        let outcome = match rx.await {
+            Ok(done) => PtyJobOutcome::Done(done),
+            Err(_) => PtyJobOutcome::Gone,
+        };
+        guard.armed = false;
+        outcome
     }
 
     /// [`Self::run`], setting `committed` once the thread has started the job
@@ -5395,6 +5528,643 @@ impl Drop for AdmissionFreeze<'_> {
 #[cfg(test)]
 type EchoWatchPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
 
+/// PRD #1631: the hook-socket connections producers hold open for a
+/// question's answer, keyed by the pane that raised it AND its question id.
+///
+/// A producer — the Claude Code `PermissionRequest` hook, the OpenCode
+/// plugin's and Pi extension's `await-answer` child — sends
+/// `DaemonMessage::Question` with `hold` and waits on its connection. The hook
+/// loop registers it here ([`Self::hold`]) and then waits on the receiver and
+/// on the connection at once. The daemon's `AnswerQuestion` handler sends the
+/// answer ([`Self::answer`]); every path that makes a question stop being the
+/// pending one releases its hold ([`Self::release_pane_except`]), and a
+/// producer that dies closes the connection, which the hook loop reports by
+/// dropping the hold ([`Self::forget`]).
+///
+/// **Owned, not global (audit A5).** A question id is the producer's own
+/// (OpenCode's request id, a Codex `tool_use_id`) or minted by it, so two panes
+/// can carry the same one. A hold is therefore keyed by its pane, records the
+/// agent its provenance gate attested, and is answered only for that pane AND
+/// that agent. Each registration also gets a unique generation, and
+/// [`Self::forget`] removes a hold only when the generation matches — so a
+/// superseded handler whose connection closes late cannot drop the hold that
+/// replaced it.
+///
+/// **The generation is the question's revision (audit A4).** The daemon stamps
+/// a held question with the generation its own registration captured — carried
+/// into ingestion beside the event, never looked up afterwards, and refused if
+/// that registration is no longer the one held (audit R1) — and mints every
+/// other question's revision from the same counter ([`Self::mint_revision`]),
+/// so one number names one registration, and one content, on a pane.
+/// Registration, publication, reconciliation and answering all run under the
+/// pane's question lifecycle ([`QuestionAnswers::lock_lifecycle`]).
+/// [`Self::answer`] delivers only to the registration whose generation is the
+/// revision the answer was validated against: a same-id replacement that
+/// registered in between has another one, and the answer is refused rather
+/// than handed to a question it was not checked against.
+#[derive(Default)]
+pub struct HeldQuestions {
+    holds: Mutex<HashMap<(String, String), HeldQuestion>>,
+    generation: AtomicU64,
+}
+
+struct HeldQuestion {
+    agent_id: String,
+    generation: u64,
+    tx: tokio::sync::oneshot::Sender<HeldReply>,
+}
+
+/// What a held connection's handler is handed: the reply to write, and — for
+/// an answer — where to report what became of it ([`ReplyDelivery`]).
+pub struct HeldReply {
+    pub reply: crate::question::QuestionReply,
+    pub delivery: Option<tokio::sync::oneshot::Sender<ReplyDelivery>>,
+}
+
+impl HeldReply {
+    fn released(question_id: &str, reason: crate::question::ReleaseReason) -> Self {
+        Self {
+            reply: crate::question::QuestionReply::released(question_id, reason),
+            delivery: None,
+        }
+    }
+}
+
+/// PRD #1631: what became of a held answer once the handler wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyDelivery {
+    /// Written to a producer that does not acknowledge (it acts on the line
+    /// itself), or acknowledged as taken by the agent.
+    Delivered,
+    /// The producer reported that the agent did not take it, and why.
+    NotAccepted(String),
+    /// The producer asked to acknowledge and did not, in time — or the line
+    /// could not be written. The agent may or may not have the answer.
+    Unconfirmed,
+}
+
+/// One registration in [`HeldQuestions`]: the receiver the answer arrives on,
+/// and the generation [`HeldQuestions::forget`] must name.
+pub struct QuestionHold {
+    pub generation: u64,
+    pub rx: tokio::sync::oneshot::Receiver<HeldReply>,
+}
+
+impl HeldQuestions {
+    /// Register a hold for `question_id` raised on `pane_id` by `agent_id` —
+    /// the agent the provenance gate attested, not one the event claims. A
+    /// hold already registered for the same pane and id is released as
+    /// superseded: one question is one connection.
+    pub fn hold(&self, pane_id: &str, agent_id: &str, question_id: &str) -> QuestionHold {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let previous = self.holds.lock().unwrap().insert(
+            (pane_id.to_string(), question_id.to_string()),
+            HeldQuestion {
+                agent_id: agent_id.to_string(),
+                generation,
+                tx,
+            },
+        );
+        if let Some(previous) = previous {
+            let _ = previous.tx.send(HeldReply::released(
+                question_id,
+                crate::question::ReleaseReason::Superseded,
+            ));
+        }
+        QuestionHold { generation, rx }
+    }
+
+    /// A fresh question revision, from the counter hold generations come from
+    /// — for a question nothing holds (audit A4).
+    pub fn mint_revision(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The generation of the hold registered for `question_id` on `pane_id`,
+    /// if one is.
+    pub fn generation_of(&self, pane_id: &str, question_id: &str) -> Option<u64> {
+        self.holds
+            .lock()
+            .unwrap()
+            .get(&(pane_id.to_string(), question_id.to_string()))
+            .map(|held| held.generation)
+    }
+
+    /// Whether `question_id` is held on `pane_id`.
+    pub fn is_held(&self, pane_id: &str, question_id: &str) -> bool {
+        self.holds
+            .lock()
+            .unwrap()
+            .contains_key(&(pane_id.to_string(), question_id.to_string()))
+    }
+
+    /// How many holds are registered, across every pane.
+    pub fn len(&self) -> usize {
+        self.holds.lock().unwrap().len()
+    }
+
+    /// Whether no hold is registered.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Send the answer down the connection holding `question_id` on `pane_id`,
+    /// when `agent_id` is the agent that registered it and `revision` is that
+    /// registration's generation — the revision the answer was validated
+    /// against (audit A4). `false` when nothing holds it, it belongs to another
+    /// agent or another registration (either of which is left alone), or the
+    /// holder has already gone; otherwise the receiver the handler reports
+    /// the answer's [`ReplyDelivery`] on, once it has written it.
+    pub fn answer(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+        reply: crate::question::QuestionReply,
+    ) -> Option<tokio::sync::oneshot::Receiver<ReplyDelivery>> {
+        let held = {
+            let mut holds = self.holds.lock().unwrap();
+            let key = (pane_id.to_string(), question_id.to_string());
+            match holds.get(&key) {
+                Some(held) if held.agent_id == agent_id && Some(held.generation) == revision => {
+                    holds.remove(&key)
+                }
+                _ => None,
+            }
+        };
+        let (delivery, delivered) = tokio::sync::oneshot::channel();
+        held?
+            .tx
+            .send(HeldReply {
+                reply,
+                delivery: Some(delivery),
+            })
+            .ok()?;
+        Some(delivered)
+    }
+
+    /// Release every hold on `pane_id` except `keep` — the question pending
+    /// there now, if any, as its id and revision. A hold is kept only when it
+    /// IS that registration: its id and its generation both match (audit R3),
+    /// so a same-id registration the pending question does not name is let go
+    /// rather than kept on the strength of its id. Called under the pane's
+    /// question lifecycle ([`QuestionAnswers::lock_lifecycle`]), so a hold
+    /// registered here is always already published, and the pending question
+    /// is the registration to keep. Returns how many were released.
+    pub fn release_pane_except(
+        &self,
+        pane_id: &str,
+        keep: Option<(&str, Option<u64>)>,
+        reason: crate::question::ReleaseReason,
+    ) -> usize {
+        let released: Vec<(String, HeldQuestion)> = {
+            let mut holds = self.holds.lock().unwrap();
+            let keys: Vec<(String, String)> = holds
+                .iter()
+                .filter(|((pane, id), held)| {
+                    pane == pane_id
+                        && keep.is_none_or(|(keep_id, revision)| {
+                            keep_id != id.as_str() || revision != Some(held.generation)
+                        })
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| holds.remove(&key).map(|held| (key.1, held)))
+                .collect()
+        };
+        let count = released.len();
+        for (id, held) in released {
+            let _ = held.tx.send(HeldReply::released(&id, reason));
+        }
+        count
+    }
+
+    /// Release every hold — the daemon is shutting down.
+    pub fn release_all(&self, reason: crate::question::ReleaseReason) {
+        let all: Vec<((String, String), HeldQuestion)> =
+            self.holds.lock().unwrap().drain().collect();
+        for ((_, id), held) in all {
+            let _ = held.tx.send(HeldReply::released(&id, reason));
+        }
+    }
+
+    /// Drop the hold `generation` registered for `question_id` on `pane_id`
+    /// without answering — its connection closed, or its deadline passed.
+    /// Returns whether it was still held — `false` after an answer or a release
+    /// already took it, and `false`, leaving it alone, when a later
+    /// registration replaced it.
+    pub fn forget(&self, pane_id: &str, question_id: &str, generation: u64) -> bool {
+        let mut holds = self.holds.lock().unwrap();
+        let key = (pane_id.to_string(), question_id.to_string());
+        if holds
+            .get(&key)
+            .is_some_and(|held| held.generation == generation)
+        {
+            holds.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// PRD #1631 (audit A4): what the daemon's `AnswerQuestion` handler keeps so
+/// two answers can never both reach the agent.
+///
+/// - **One answer at a time per agent.** [`Self::slot`] is a lock the handler
+///   holds from its first read of the pending question to its last write. It
+///   is taken with `try_lock`, never waited for: a second client's answer that
+///   finds it held is refused at once
+///   ([`crate::question::AnswerRefusal::AnswerInProgress`]) rather than queued
+///   behind a delivery that may be slow, since by the time that delivery
+///   lands the question it names is gone or changed. A slot holds nothing
+///   else, so pruning an idle one loses nothing.
+/// - **Not answered twice in a row.** [`Self::mark_answered`] remembers, per
+///   pane, the LAST question the deck emitted an answer for — its id and the
+///   revision answered — so that revision is refused even if the event that
+///   clears it was not applied. Once the answer is settled
+///   ([`Self::settle_answered`]) the mark covers the id at every revision, so
+///   the producer raising it again under the same id before anything else is
+///   answered there is refused too. A same-id replacement registered while the
+///   answer was still being sent is not covered: the mark is not settled when
+///   the replacement is what is pending at the end (audit A4, Qodo #1561), so
+///   the replacement stays answerable. It is one id per pane, not a history:
+///   once the deck answers another question on the pane, an earlier id raised
+///   again is no longer recognised. Kept per pane and never pruned while the
+///   daemon runs — one mark per pane ever seen, the same bound the registry's
+///   per-pane dispatch locks accept.
+/// - **When the question arrived.** [`Self::note_pending`] records, per pane,
+///   the pending question's id and revision and the human-input sequence
+///   number at the moment the daemon first saw that revision (audit N1), so the
+///   keys channel can tell whether a human typed into the pane after it — keys
+///   typed into a prompt the keyboard has already moved on would land
+///   somewhere else.
+///
+/// - **One question transition at a time per pane** — the question lifecycle
+///   ([`Self::lock_lifecycle`]), below.
+///
+/// # The question lifecycle (audit R1–R3)
+///
+/// Every change the daemon makes to a pane's question — in its state, its
+/// holds, or by delivering an answer — is made holding that pane's lifecycle
+/// lock, over the span each item below names, and re-checks the registration
+/// it acts on at the point it commits:
+///
+/// - **registration and publication** — a held question's hold is registered
+///   and its event ingested under one acquisition, so no other transition ever
+///   sees a hold that is registered but not yet published, and the event is
+///   stamped with the generation its own registration captured, never one
+///   borrowed from whatever the hold map holds by then;
+/// - **every ingested event** on the pane (`crate::daemon::ingest_event`), any
+///   of which can raise, replace or clear the question, and the reconciliation
+///   of holds it ends with;
+/// - **cleanup** of a hold whose producer went or whose deadline passed;
+/// - **the keyboard-only mark** on a question the deck typed part of an
+///   answer into;
+/// - **delivery** of an answer: a held reply from its revalidation to the
+///   deck's clearing event, and each key from its revalidation until the write
+///   is queued on the pane's PTY thread. The lifecycle is not held across the
+///   write itself, so the thread checks the key's question again before
+///   writing it ([`AnswerGate`], audit T1) — against the record
+///   [`Self::note_pending`] keeps, updated wherever the daemon changes which
+///   question is pending on the pane.
+///
+/// Every transition above that the daemon ingests as an event takes the
+/// lifecycle of the pane the event lands on: the pane it names, or, for an
+/// event that names none, the pane of the session it resolves to (audit T2).
+///
+/// **Lock order**, and every path keeps it: the agent's answer
+/// [`Self::slot`] → the pane's writer → the pane's question lifecycle → the
+/// daemon's `AppState` lock → the registry's own `std` mutexes (the hold map,
+/// these maps, the registry's inner state). Nothing that holds the lifecycle
+/// waits on a writer or a slot, and the lifecycle is never awaited with the
+/// `AppState` lock held.
+#[derive(Default)]
+pub struct QuestionAnswers {
+    slots: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    lifecycles: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Shared with every [`AnswerGate`], which reads it on a PTY thread.
+    raised: Arc<Mutex<HashMap<String, RaisedQuestion>>>,
+    answered: Mutex<HashMap<String, AnsweredMark>>,
+    #[cfg(test)]
+    barriers: Mutex<HashMap<&'static str, QuestionBarrier>>,
+}
+
+/// See [`QuestionAnswers::arm_barrier`]: the "reached" sender and the
+/// "resume" receiver of one armed barrier.
+#[cfg(test)]
+type QuestionBarrier = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+/// The last question the deck answered on a pane — see
+/// [`QuestionAnswers::mark_answered`].
+struct AnsweredMark {
+    id: String,
+    revision: Option<u64>,
+    /// Covers `id` at every revision, not only `revision` — set by
+    /// [`QuestionAnswers::settle_answered`].
+    settled: bool,
+}
+
+/// The question pending on a pane, as [`QuestionAnswers::note_pending`] saw it
+/// arrive.
+struct RaisedQuestion {
+    id: String,
+    revision: Option<u64>,
+    input_seq: u64,
+}
+
+/// PRD #1631 (audit T1): what a voice answer's key is written under — the
+/// question pending on its pane must still be the one, at the revision, the
+/// key was checked against. Carried by the key's PTY job and checked by the
+/// pane's PTY thread immediately before it writes the key, against the record
+/// [`QuestionAnswers::note_pending`] keeps, which is updated under the pane's
+/// lifecycle wherever the daemon changes which question is pending there. A question replaced or cleared
+/// while the key waited in the queue drops it unwritten.
+///
+/// What it cannot stop is a change that lands after the check: once the
+/// thread has found the question unchanged it writes the key, and a
+/// replacement ingested in that instant, or one the agent draws with no event
+/// at all, receives it.
+pub(crate) struct AnswerGate {
+    raised: Arc<Mutex<HashMap<String, RaisedQuestion>>>,
+    pane_id: String,
+    question_id: String,
+    revision: Option<u64>,
+    /// Test seam: the PTY thread stops here before its check — see
+    /// [`QuestionAnswers::arm_barrier`] and [`ANSWER_KEY_ON_PTY_THREAD`].
+    #[cfg(test)]
+    pause: Option<QuestionBarrier>,
+}
+
+impl AnswerGate {
+    /// Whether the question the key was checked against is still the one
+    /// pending on its pane. Called on the PTY thread.
+    fn still_pending(&mut self) -> bool {
+        #[cfg(test)]
+        if let Some((reached, resume)) = self.pause.take() {
+            let _ = reached.send(());
+            let _ = resume.blocking_recv();
+        }
+        self.raised
+            .lock()
+            .unwrap()
+            .get(&self.pane_id)
+            .is_some_and(|seen| seen.id == self.question_id && seen.revision == self.revision)
+    }
+}
+
+/// How [`PaneWriter::write_answer`] ended when the PTY thread did not fail.
+pub(crate) enum AnswerWrite {
+    /// The keys are written; the human-input sequence number they were
+    /// committed at.
+    Written(u64),
+    /// The question changed while the keys were queued: nothing was written
+    /// (audit T1).
+    Superseded,
+}
+
+/// The error a PTY thread reports for an answer whose [`AnswerGate`] no longer
+/// held — told apart from a failed write by its type.
+#[derive(Debug)]
+struct AnswerSuperseded;
+
+impl std::fmt::Display for AnswerSuperseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the question changed before the key was written")
+    }
+}
+
+impl std::error::Error for AnswerSuperseded {}
+
+/// Test seam: the barrier name an [`AnswerGate`] stops the PTY thread at.
+#[cfg(test)]
+pub(crate) const ANSWER_KEY_ON_PTY_THREAD: &str = "answer_key:on_pty_thread";
+
+/// Slots kept before idle ones are pruned: one per agent that was ever
+/// answered, so this only matters to a very long-lived daemon. The same bound
+/// applies to the per-pane lifecycle locks.
+const QUESTION_ANSWER_SLOTS_PRUNE_AT: usize = 256;
+
+/// One pane's question lifecycle, held — see
+/// [`QuestionAnswers::lock_lifecycle`]. Dropping it lets the next transition
+/// on the pane in.
+pub struct QuestionLifecycle {
+    pane_id: String,
+    _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl QuestionLifecycle {
+    /// The pane whose lifecycle this is.
+    pub fn pane_id(&self) -> &str {
+        &self.pane_id
+    }
+}
+
+impl QuestionAnswers {
+    /// Take `pane_id`'s question lifecycle — see the type's "question
+    /// lifecycle" section for what must hold it and the lock order. Waits
+    /// while another transition on the pane holds it.
+    ///
+    /// An idle lock (nobody holds or waits on it) is pruned past
+    /// [`QUESTION_ANSWER_SLOTS_PRUNE_AT`]; that is safe because a lock is
+    /// handed out only under this map's mutex, so a pruned one has no holder
+    /// a fresh one could fail to serialize against.
+    pub async fn lock_lifecycle(&self, pane_id: &str) -> QuestionLifecycle {
+        let lock = {
+            let mut lifecycles = self.lifecycles.lock().unwrap();
+            if lifecycles.len() >= QUESTION_ANSWER_SLOTS_PRUNE_AT {
+                lifecycles.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
+            Arc::clone(lifecycles.entry(pane_id.to_string()).or_default())
+        };
+        QuestionLifecycle {
+            pane_id: pane_id.to_string(),
+            _held: lock.lock_owned().await,
+        }
+    }
+
+    /// `agent_id`'s answer lock.
+    pub fn slot(&self, agent_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut slots = self.slots.lock().unwrap();
+        if slots.len() >= QUESTION_ANSWER_SLOTS_PRUNE_AT {
+            // An idle slot (nobody holds or waits on it) carries no state.
+            slots.retain(|_, slot| Arc::strong_count(slot) > 1);
+        }
+        Arc::clone(slots.entry(agent_id.to_string()).or_default())
+    }
+
+    /// Record that `pending` — a question id and its revision — is the question
+    /// pending on `pane_id` now (`None`: nothing is), first seen when the
+    /// human-input sequence stood at `input_seq`. The record is kept from the
+    /// first time a revision is seen, so a later event repeating the same
+    /// question does not move it.
+    ///
+    /// It is also what a queued answer key is checked against on the PTY
+    /// thread ([`AnswerGate`], audit T1), so every path that changes a pane's
+    /// pending question calls this after it, under the pane's question
+    /// lifecycle and the `AppState` lock that applied the change.
+    pub fn note_pending(
+        &self,
+        pane_id: &str,
+        pending: Option<(&str, Option<u64>)>,
+        input_seq: u64,
+    ) {
+        let mut raised = self.raised.lock().unwrap();
+        match pending {
+            None => {
+                raised.remove(pane_id);
+            }
+            Some((id, revision)) => {
+                if raised
+                    .get(pane_id)
+                    .is_none_or(|seen| seen.id != id || seen.revision != revision)
+                {
+                    raised.insert(
+                        pane_id.to_string(),
+                        RaisedQuestion {
+                            id: id.to_string(),
+                            revision,
+                            input_seq,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// The human-input sequence number when the daemon first saw `question_id`
+    /// at `revision` pending on `pane_id`, or `None` when it has no record of
+    /// that registration there.
+    pub fn raised_input_seq(
+        &self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+    ) -> Option<u64> {
+        self.raised
+            .lock()
+            .unwrap()
+            .get(pane_id)
+            .filter(|seen| seen.id == question_id && seen.revision == revision)
+            .map(|seen| seen.input_seq)
+    }
+
+    /// Whether the deck already emitted an answer for `question_id` at
+    /// `revision` on `pane_id` — or for `question_id` at any revision, once
+    /// that answer was settled ([`Self::settle_answered`]).
+    pub fn is_answered(&self, pane_id: &str, question_id: &str, revision: Option<u64>) -> bool {
+        self.answered
+            .lock()
+            .unwrap()
+            .get(pane_id)
+            .is_some_and(|mark| {
+                mark.id == question_id && (mark.settled || mark.revision == revision)
+            })
+    }
+
+    /// Record that the deck emitted (part of) an answer for `question_id` at
+    /// `revision` on `pane_id`. Until it is settled the mark covers that
+    /// revision only, so a same-id replacement registered while the answer is
+    /// still being sent is not refused as already answered.
+    pub fn mark_answered(&self, pane_id: &str, question_id: &str, revision: Option<u64>) {
+        self.answered.lock().unwrap().insert(
+            pane_id.to_string(),
+            AnsweredMark {
+                id: question_id.to_string(),
+                revision,
+                settled: false,
+            },
+        );
+    }
+
+    /// Widen the mark [`Self::mark_answered`] made for `question_id` at
+    /// `revision` on `pane_id` to the id at every revision, when it is still
+    /// the pane's mark — so the producer raising the answered question again
+    /// is refused. Called under the pane's question lifecycle once the answer
+    /// is over, and only when the pane's pending question is not a same-id
+    /// replacement registered while it was being sent: that one was never
+    /// answered and stays answerable.
+    pub fn settle_answered(&self, pane_id: &str, question_id: &str, revision: Option<u64>) {
+        if let Some(mark) = self.answered.lock().unwrap().get_mut(pane_id)
+            && mark.id == question_id
+            && mark.revision == revision
+        {
+            mark.settled = true;
+        }
+    }
+
+    /// Forget that the deck answered `question_id` at `revision` on
+    /// `pane_id`, when that answer's mark is still the pane's — the agent
+    /// reported that it did not take the answer, so the same question raised
+    /// again must be answerable. Bound to the revision as
+    /// [`Self::settle_answered`] is: a mark a later answer to a same-id
+    /// question made while this one waited for its acknowledgement is that
+    /// answer's, and stays (PR #1698 review). Called under the pane's question
+    /// lifecycle, as the settle is.
+    pub fn unmark_answered(&self, pane_id: &str, question_id: &str, revision: Option<u64>) {
+        let mut answered = self.answered.lock().unwrap();
+        if answered
+            .get(pane_id)
+            .is_some_and(|mark| mark.id == question_id && mark.revision == revision)
+        {
+            answered.remove(pane_id);
+        }
+    }
+
+    /// Test seam: make the next [`Self::barrier`] named `name` report that it
+    /// was reached and then wait until the test resumes it.
+    #[cfg(test)]
+    pub fn arm_barrier(&self, name: &'static str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        self.barriers
+            .lock()
+            .unwrap()
+            .insert(name, (reached_tx, resume_rx));
+        (reached_rx, resume_tx)
+    }
+
+    /// The [`AnswerGate`] a key answering `question_id` at `revision` on
+    /// `pane_id` is written under.
+    pub(crate) fn answer_gate(
+        &self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+    ) -> AnswerGate {
+        AnswerGate {
+            raised: Arc::clone(&self.raised),
+            pane_id: pane_id.to_string(),
+            question_id: question_id.to_string(),
+            revision,
+            #[cfg(test)]
+            pause: self
+                .barriers
+                .lock()
+                .unwrap()
+                .remove(ANSWER_KEY_ON_PTY_THREAD),
+        }
+    }
+
+    /// A point a test can stop the question paths at ([`Self::arm_barrier`]);
+    /// nothing in a production build.
+    pub(crate) async fn barrier(&self, name: &'static str) {
+        #[cfg(test)]
+        {
+            let armed = self.barriers.lock().unwrap().remove(name);
+            if let Some((reached, resume)) = armed {
+                let _ = reached.send(());
+                let _ = resume.await;
+            }
+        }
+        #[cfg(not(test))]
+        let _ = name;
+    }
+}
+
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
 /// the in-process API; M1.2 wires it to the streaming attach protocol via
 /// [`AgentBus`] and [`AttachHandle`].
@@ -5431,6 +6201,12 @@ pub struct AgentPtyRegistry {
     /// [`AgentPtyRegistry::pane_dispatch_order_lock`]. Never pruned, for the
     /// same reason `dispatch_mutexes` is not.
     dispatch_order_mutexes: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// PRD #1631: the hook-socket connections a producer holds open for a
+    /// question's answer, by question id — see [`HeldQuestions`].
+    question_holds: HeldQuestions,
+    /// PRD #1631 (audit A4): per-agent answer serialization — see
+    /// [`QuestionAnswers`].
+    question_answers: QuestionAnswers,
     /// Total number of explicit `KIND_DETACH` frames the daemon has observed
     /// across all attach-stream connections. Plain socket close (implicit
     /// detach) does *not* increment this — only the M2.5 explicit-detach
@@ -5621,6 +6397,10 @@ pub struct AgentPtyRegistry {
     /// [`Self::pause_next_echo_watch_for_test`].
     #[cfg(test)]
     echo_watch_pause: EchoWatchPause,
+    /// Issue #544 test seam: how many times a first write has gone to sleep
+    /// waiting for a pending draft — see [`Self::draft_polls_for_test`].
+    #[cfg(test)]
+    draft_polls: tokio::sync::watch::Sender<u64>,
     /// PRD #1487 audit A2 test seam: when set, the next spawn reports that its
     /// child is forked and waits, before it takes the publishing lock — see
     /// [`Self::pause_next_publish_for_test`].
@@ -7669,6 +8449,8 @@ impl AgentPtyRegistry {
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             dispatch_order_mutexes: Mutex::new(HashMap::new()),
+            question_holds: HeldQuestions::default(),
+            question_answers: QuestionAnswers::default(),
             detach_count: AtomicU64::new(0),
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
@@ -7694,6 +8476,8 @@ impl AgentPtyRegistry {
             #[cfg(test)]
             echo_watch_pause: Mutex::new(None),
             #[cfg(test)]
+            draft_polls: tokio::sync::watch::Sender::new(0),
+            #[cfg(test)]
             publish_pause: Mutex::new(None),
             #[cfg(test)]
             close_failures: Mutex::new(HashSet::new()),
@@ -7708,6 +8492,116 @@ impl AgentPtyRegistry {
             close_revalidation_pause: Mutex::new(None),
             #[cfg(test)]
             named_pauses: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// PRD #1631: the held question channels — see [`HeldQuestions`].
+    pub fn question_holds(&self) -> &HeldQuestions {
+        &self.question_holds
+    }
+
+    /// PRD #1631 (audit A4): per-agent answer state — see [`QuestionAnswers`].
+    pub fn question_answers(&self) -> &QuestionAnswers {
+        &self.question_answers
+    }
+
+    /// PRD #1631 (audit A4/N1): whether a HUMAN keystroke reached `pane_id`
+    /// after the daemon first saw `question_id` at `revision` pending there, and
+    /// after `committed` — the human-input sequence number the deck's own last
+    /// answer key was written at ([`Self::write_answer_keys`]). Sequence
+    /// numbers, not clocks: the deck's keys never move the sequence, and the
+    /// value they return was read under the writer every human keystroke also
+    /// needs, so no keystroke can be mistaken for the deck's. With no record of
+    /// when the question arrived, any human keystroke ever counts — the safe
+    /// reading for a channel that types into the pane; every question the
+    /// daemon ingests has one.
+    pub fn user_typed_since_question(
+        &self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+        committed: Option<u64>,
+    ) -> bool {
+        let human = self.pane_input.lock().unwrap().human_input_seq(pane_id);
+        let baseline = committed
+            .or_else(|| {
+                self.question_answers
+                    .raised_input_seq(pane_id, question_id, revision)
+            })
+            .unwrap_or_default();
+        human > baseline
+    }
+
+    /// PRD #1631 (audit N1): the human-input counter now — what a question
+    /// arriving now is compared against.
+    pub fn human_input_counter(&self) -> u64 {
+        self.pane_input.lock().unwrap().input_seq
+    }
+
+    /// PRD #1631: type `keys` into `agent_id`'s PTY to answer a question, with
+    /// no Enter after them, under that agent's writer — the keys channel.
+    ///
+    /// `revalidate` is asked with the writer held, immediately before the
+    /// write, and a `false` writes nothing: the daemon passes "is the question
+    /// still the pending revision, and has no human typed since", so keys aimed
+    /// at a question the keyboard already answered are never typed into
+    /// whatever replaced it. Written as the user's answer
+    /// ([`PaneWriter::write_answer`]) — it IS the user's answer, given by voice
+    /// — without moving the human-input sequence, and returns the sequence
+    /// number it was committed at, for the next key's check (audit N1).
+    ///
+    /// **Under the pane's question lifecycle (audit R2).** `pane_id`'s lifecycle
+    /// ([`QuestionAnswers::lock_lifecycle`]) is taken after the writer and held
+    /// from `revalidate` until the write is queued on the PTY thread, so no
+    /// event that replaces or clears the question can be ingested between the
+    /// check and the queueing.
+    ///
+    /// **Checked again on the PTY thread (audit T1).** Queued is not written:
+    /// the lifecycle is released at the queueing — holding it across a PTY
+    /// write would hold every event for the pane behind an agent that is not
+    /// reading — and the thread may reach the key later. So the key carries
+    /// `question_id` at `revision` ([`AnswerGate`]), and the thread writes it
+    /// only if that is still the question pending on the pane when it comes to
+    /// it; a replacement or clear ingested in between drops it unwritten. One
+    /// ingested after that check is not stopped: the key is already going to
+    /// the PTY, and only the next key's check detects the change. A redraw the
+    /// agent makes with no hook is detected by neither check.
+    pub async fn write_answer_keys<Fut>(
+        &self,
+        agent_id: &str,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+        keys: &[u8],
+        revalidate: impl FnOnce() -> Fut,
+    ) -> Result<u64, &'static str>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        let target = self
+            .writer_target_for_agent(agent_id)
+            .ok_or("the agent is not running")?;
+        let writer = target.writer.lock().await;
+        let lifecycle = self.question_answers.lock_lifecycle(pane_id).await;
+        if target.exited.load(Ordering::SeqCst) {
+            return Err("the agent exited");
+        }
+        if !revalidate().await {
+            return Err("the question changed before the keys were typed");
+        }
+        self.question_answers
+            .barrier("answer_keys:revalidated")
+            .await;
+        let gate = self
+            .question_answers
+            .answer_gate(pane_id, question_id, revision);
+        match writer
+            .write_answer(keys, gate, move || drop(lifecycle))
+            .await
+        {
+            Ok(AnswerWrite::Written(at)) => Ok(at),
+            Ok(AnswerWrite::Superseded) => Err("the question changed before the keys were typed"),
+            Err(_) => Err("writing to the agent's terminal failed"),
         }
     }
 
@@ -10201,6 +11095,16 @@ impl AgentPtyRegistry {
         (reached_rx, release_tx)
     }
 
+    /// Issue #544 test seam: a running count of the draft polls first writes
+    /// have begun — one per sleep while the draft is pending. A count that
+    /// has moved says a write is inside its draft wait, which no clock the
+    /// test reads can say: a starved runtime can start the write long after
+    /// the test armed its own timer.
+    #[cfg(test)]
+    pub(crate) fn draft_polls_for_test(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.draft_polls.subscribe()
+    }
+
     /// PRD #1487 audit A2 test seam: park the next spawn after its child is
     /// forked and before it takes the lock that publishes it. The first
     /// receiver yields once the spawn is parked; sending on (or dropping) the
@@ -12273,6 +13177,8 @@ impl AgentPtyRegistry {
                 if let Some(hold) = park.as_deref_mut() {
                     hold.park();
                 }
+                #[cfg(test)]
+                self.draft_polls.send_modify(|polls| *polls += 1);
                 let slept = Instant::now();
                 tokio::time::sleep(after).await;
                 deferred += slept.elapsed();
@@ -22575,6 +23481,7 @@ mod spawn_tests {
                 last_activity_ms: None,
                 blocked: None,
                 hook_generation: None,
+                pending_question: None,
                 pull_request: None,
                 pull_request_revision: None,
                 background: None,
@@ -26167,15 +27074,25 @@ mod spawn_tests {
                 writer.write_all(bytes).expect("type");
             }
         };
+        let mut draft_polls = registry.draft_polls_for_test();
         type_bytes(b"draft").await;
+        // That the immediate entry did not wait is read off the draft polls,
+        // not a clock: a wall-clock bound is also a bound on how starved the
+        // runner is (a cold, loaded run overran 2 s). The timeout is only a
+        // hang guard, kept under the 60 s cap a draft wait would run to.
         let immediate = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(30),
             registry.write_and_submit_guarded(PANE, "IMMEDIATE", &agent, || async { true }),
         )
         .await
-        .expect("the immediate entry must not wait for the draft")
+        .expect("the immediate entry must not wait out the draft cap")
         .expect("immediate write");
         assert_eq!(immediate, GuardedSend::Applied);
+        assert_eq!(
+            *draft_polls.borrow_and_update(),
+            0,
+            "the immediate entry waited for the draft"
+        );
 
         type_bytes(b"second draft").await;
         let started = Instant::now();
@@ -26194,6 +27111,19 @@ mod spawn_tests {
                     .await
             })
         };
+        // The window opens once the write is asleep in its draft wait, not
+        // when it was spawned. A runtime starved between the two started the
+        // write's first poll ~400 ms into a window armed at the spawn, so the
+        // Ctrl+U landed during it and one 200 ms poll was all it reported.
+        // Opened here, the draft stays pending for 600 ms of a wait that has
+        // already begun, and a stall can only lengthen the poll it lands in.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            draft_polls.wait_for(|polls| *polls >= 1),
+        )
+        .await
+        .expect("the first write must wait for the draft")
+        .expect("the registry keeps its seam");
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(
             !waiting.is_finished(),
@@ -26231,6 +27161,18 @@ mod spawn_tests {
     /// someone else holds, with no draft pending, it gives up at the deadline
     /// rather than a whole draft cap later; waiting for a draft, it is not
     /// dropped for having waited past the deadline.
+    ///
+    /// PRD #1631: the deferred half's deadline is also the whole budget for the
+    /// work the write does after the draft clears — the writer lock, the PTY
+    /// going idle, `revalidate` and the echo watch's blocking-pool setup —
+    /// because none of that is draft time. A flat 300 ms budget failed cold at
+    /// io full 75%, and a 400 ms stall injected into the echo watch's setup
+    /// drops the write under that budget the same way every time, which is
+    /// the deadline doing its job (it is `Applied` under 700 ms). So the
+    /// budget is load-scaled, and the draft window is kept longer than it:
+    /// every check after the draft clears then runs past the unshifted
+    /// deadline, and an implementation that counted the draft wait would drop
+    /// the write. The window stays under the draft cap at any load factor.
     #[cfg(unix)]
     #[tokio::test]
     async fn first_write_within_bounds_only_the_time_not_spent_on_the_draft() {
@@ -26248,9 +27190,10 @@ mod spawn_tests {
 
         let target = registry.writer_target_for_pane(PANE).expect("target");
         let held = target.writer.lock().await;
+        let cap = registry.draft_defer_cap();
         let began = Instant::now();
         let queued = tokio::time::timeout(
-            Duration::from_secs(5),
+            cap,
             registry.write_and_submit_guarded_first_write_within(
                 PANE,
                 "QUEUED",
@@ -26266,7 +27209,15 @@ mod spawn_tests {
             matches!(queued, Err(AgentPtyError::DeadlineElapsed)),
             "queued on a held writer past the deadline: {queued:?}"
         );
-        assert!(began.elapsed() < Duration::from_secs(2));
+        // Gave up at the deadline, not a cap later. Load-scaled because the
+        // return is something that must happen, and never past the cap, which
+        // is the distinction this half exists to draw.
+        let gave_up = crate::test_budget::load_scaled(Duration::from_secs(2)).min(cap);
+        assert!(
+            began.elapsed() < gave_up,
+            "queued on a held writer, the write outlived its deadline by {:?}",
+            began.elapsed()
+        );
         drop(held);
 
         let type_bytes = |bytes: &'static [u8]| {
@@ -26279,6 +27230,15 @@ mod spawn_tests {
             }
         };
         type_bytes(b"draft").await;
+        // The budget for the write's non-draft work, and a draft window that
+        // outlasts it: the Ctrl+U goes in `window` after the write's first
+        // draft poll, so by then the unshifted deadline has passed.
+        let budget = crate::test_budget::load_scaled(Duration::from_millis(700));
+        let window = budget + Duration::from_millis(200);
+        // Counted before the write starts, so the wait below needs a poll of
+        // this write's own: the queued write above may already have polled.
+        let mut draft_polls = registry.draft_polls_for_test();
+        let base = *draft_polls.borrow_and_update();
         let waiting = {
             let registry = Arc::clone(&registry);
             let agent = agent.clone();
@@ -26290,29 +27250,42 @@ mod spawn_tests {
                         &agent,
                         || async { true },
                         Instant::now(),
-                        Instant::now() + Duration::from_millis(300),
+                        Instant::now() + budget,
                     )
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        // Opened once the write is asleep in its draft wait, for the reason
+        // given in `only_the_first_write_entry_waits_for_a_pending_draft`.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            draft_polls.wait_for(|polls| *polls > base),
+        )
+        .await
+        .expect("the first write waits for the draft")
+        .expect("the registry keeps its seam");
+        tokio::time::sleep(window).await;
         assert!(
             !waiting.is_finished(),
             "the first write waits for the draft"
         );
         type_bytes(b"\x15").await;
-        let sent = tokio::time::timeout(Duration::from_secs(3), waiting)
-            .await
-            .expect("released by Ctrl+U")
-            .expect("join")
-            .expect("a wait past the deadline must not drop the write");
+        let sent = tokio::time::timeout(
+            crate::test_budget::load_scaled(Duration::from_secs(3)),
+            waiting,
+        )
+        .await
+        .expect("released by Ctrl+U")
+        .expect("join")
+        .expect("a wait past the deadline must not drop the write");
         assert_eq!(
             sent.detail,
             GuardedSendDetail::Outcome(GuardedSend::Applied)
         );
         assert!(
-            sent.deferred >= Duration::from_millis(700),
-            "{:?}",
+            sent.deferred >= budget,
+            "the write must have waited past its deadline for this to prove anything: {:?} \
+             against a {budget:?} deadline",
             sent.deferred
         );
         registry.shutdown_all();

@@ -23495,6 +23495,7 @@ pub fn render_orchestration_frame_to_buffer(
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
             },
@@ -24292,6 +24293,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
             },
@@ -26713,6 +26715,7 @@ mod tests {
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
                 output_set_status: false,
+                pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
             },
@@ -30252,6 +30255,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
         };
@@ -33177,6 +33181,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
         };
@@ -33973,6 +33978,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
         }
@@ -34411,6 +34417,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
         };
@@ -34454,6 +34461,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
         };
@@ -34488,6 +34496,7 @@ mod tests {
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
             output_set_status: false,
+            pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
         };

@@ -29,8 +29,9 @@ fn background_001_reporting_turn_stays_idle_while_command_runs() {
     );
     assert!(
         f.deck
-            .wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid.contains("Idle")
-                && grid.contains("Background: 1 command")),
+            .wait_for_grid_predicate_within(common::load_scaled(Duration::from_secs(10)), |grid| {
+                grid.contains("Idle") && grid.contains("Background: 1 command")
+            }),
         "Idle and background count must be visible:\n{}",
         f.deck.snapshot_grid()
     );
@@ -75,12 +76,13 @@ fn background_001_reporting_turn_stays_idle_while_command_runs() {
                         revision > ended["background_revision"].as_u64().unwrap()
                     })
         },
-        Duration::from_secs(10),
+        common::load_scaled(Duration::from_secs(10)),
     );
     assert!(
         f.deck
-            .wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid.contains("Idle")
-                && !grid.contains("Background:"))
+            .wait_for_grid_predicate_within(common::load_scaled(Duration::from_secs(10)), |grid| {
+                grid.contains("Idle") && !grid.contains("Background:")
+            })
     );
 
     // Legacy reducer control: no genuine report and no aggregate field.
@@ -276,8 +278,9 @@ fn background_010_opencode_child_session_counts_as_a_subagent() {
     assert_eq!(f.live()["status"], json!("Idle"));
     assert!(
         f.deck
-            .wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid.contains("Idle")
-                && grid.contains("Background: 1 subagent")),
+            .wait_for_grid_predicate_within(common::load_scaled(Duration::from_secs(10)), |grid| {
+                grid.contains("Idle") && grid.contains("Background: 1 subagent")
+            }),
         "Idle and the background subagent must be visible:\n{}",
         f.deck.snapshot_grid()
     );
@@ -304,8 +307,9 @@ fn background_010_opencode_child_session_counts_as_a_subagent() {
     assert_eq!(f.live()["status"], json!("Idle"));
     assert!(
         f.deck
-            .wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid.contains("Idle")
-                && !grid.contains("Background:")),
+            .wait_for_grid_predicate_within(common::load_scaled(Duration::from_secs(10)), |grid| {
+                grid.contains("Idle") && !grid.contains("Background:")
+            }),
         "the line clears when the child goes idle:\n{}",
         f.deck.snapshot_grid()
     );
@@ -363,7 +367,7 @@ fn background_014_natural_exit_clears_the_attached_card_only() {
             event.agent_id.as_deref() == Some(&f.agent_id)
                 && event.event_type == EventType::ShellIdle
         },
-        Duration::from_secs(10),
+        common::load_scaled(Duration::from_secs(10)),
     );
     f.hook(
         "claude-code",
@@ -373,8 +377,9 @@ fn background_014_natural_exit_clears_the_attached_card_only() {
     let ended = f.hook("claude-code", "Stop", json!({}));
     assert!(
         f.deck
-            .wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid
-                .contains("Background: 1 subagent")),
+            .wait_for_grid_predicate_within(common::load_scaled(Duration::from_secs(10)), |grid| {
+                grid.contains("Background: 1 subagent")
+            }),
         "precondition: background is visible:\n{}",
         f.deck.snapshot_grid()
     );
@@ -382,7 +387,7 @@ fn background_014_natural_exit_clears_the_attached_card_only() {
     let before = f.events.snapshot().len();
     std::fs::write(f.deck.workdir().join("parent-exit.run"), "exit naturally").unwrap();
     assert!(
-        common::wait_until(Duration::from_secs(10), || {
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
             let records = f.runtime.block_on(f.client.list_agents()).unwrap();
             !records.iter().any(|record| record.id == old_id)
         }),
@@ -390,7 +395,7 @@ fn background_014_natural_exit_clears_the_attached_card_only() {
     );
     let cleared = f
         .deck
-        .wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+        .wait_for_grid_predicate_within(common::load_scaled(Duration::from_secs(5)), |grid| {
             !grid.contains("Background:")
         });
     let departed_grid = f.deck.snapshot_grid();

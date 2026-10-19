@@ -224,6 +224,54 @@ impl RemoteResolver {
     }
 
     async fn run(&self, request: IntentRequest<'_>) -> Result<IntentAnswer, IntentError> {
+        let body = match self.protocol {
+            Protocol::Anthropic => request_body(&request, self.model.as_str(), self.max_tokens),
+            Protocol::OpenAiCompatible { reasoning_effort } => super::openai::request_body(
+                &request,
+                self.model.as_str(),
+                self.max_tokens,
+                reasoning_effort,
+            ),
+        };
+        let payload = self.post(body).await?;
+        match self.protocol {
+            Protocol::Anthropic => parse_response(&payload, self.max_tokens),
+            Protocol::OpenAiCompatible { .. } => {
+                super::openai::parse_response(&payload, self.max_tokens)
+            }
+        }
+    }
+
+    /// PRD #1631: the question call — the same transport, credential and
+    /// failure wording as [`Self::run`], with [`super::question`]'s body and
+    /// reply reader for the protocol.
+    async fn run_question(
+        &self,
+        request: super::question::QuestionRequest<'_>,
+    ) -> Result<super::question::ModelAnswer, IntentError> {
+        let body = match self.protocol {
+            Protocol::Anthropic => {
+                super::question::anthropic_body(&request, self.model.as_str(), self.max_tokens)
+            }
+            Protocol::OpenAiCompatible { reasoning_effort } => super::question::openai_body(
+                &request,
+                self.model.as_str(),
+                self.max_tokens,
+                reasoning_effort,
+            ),
+        };
+        let payload = self.post(body).await?;
+        match self.protocol {
+            Protocol::Anthropic => super::question::parse_anthropic(&payload, self.max_tokens),
+            Protocol::OpenAiCompatible { .. } => {
+                super::question::parse_openai(&payload, self.max_tokens)
+            }
+        }
+    }
+
+    /// One request body to the endpoint, and its successful reply's JSON — the
+    /// transport both calls share.
+    async fn post(&self, body: Value) -> Result<Value, IntentError> {
         // No key for a loopback endpoint; see `endpoint_credential`.
         let secret = endpoint_credential(&self.endpoint, &self.secrets)
             .await
@@ -237,15 +285,6 @@ impl RemoteResolver {
             ));
         };
 
-        let body = match self.protocol {
-            Protocol::Anthropic => request_body(&request, self.model.as_str(), self.max_tokens),
-            Protocol::OpenAiCompatible { reasoning_effort } => super::openai::request_body(
-                &request,
-                self.model.as_str(),
-                self.max_tokens,
-                reasoning_effort,
-            ),
-        };
         let mut post = client
             .post(self.endpoint.as_str())
             .timeout(REMOTE_TIMEOUT)
@@ -285,12 +324,7 @@ impl RemoteResolver {
         if !status.is_success() {
             return Err(IntentError::Backend(api_error_detail(status, &payload)));
         }
-        match self.protocol {
-            Protocol::Anthropic => parse_response(&payload, self.max_tokens),
-            Protocol::OpenAiCompatible { .. } => {
-                super::openai::parse_response(&payload, self.max_tokens)
-            }
-        }
+        Ok(payload)
     }
 }
 
@@ -362,6 +396,13 @@ pub(super) fn authorise(
 impl IntentResolver for RemoteResolver {
     fn resolve<'a>(&'a self, request: IntentRequest<'a>) -> ResolveFuture<'a> {
         Box::pin(self.run(request))
+    }
+
+    fn resolve_question<'a>(
+        &'a self,
+        request: super::question::QuestionRequest<'a>,
+    ) -> super::resolver::QuestionFuture<'a> {
+        Box::pin(self.run_question(request))
     }
 
     fn backend_name(&self) -> &'static str {
@@ -777,7 +818,7 @@ mod tests {
         assert!(system.contains("open_agent"), "{system}");
         // The observed labels are NOT in the system role (audit finding A2).
         assert!(!system.contains("\"agents_on_screen\":"), "{system}");
-        assert!(!system.contains("\"label\":\"tester\""), "{system}");
+        assert!(!system.contains("\"label\":\"build tester\""), "{system}");
         assert!(!system.contains("show me the tester"), "{system}");
         assert_eq!(body["messages"].as_array().expect("an array").len(), 1);
         assert_eq!(body["messages"][0]["role"], "user");
@@ -785,7 +826,7 @@ mod tests {
         assert_eq!(content.len(), 2, "{body}");
         let data = content[0]["text"].as_str().expect("a string");
         assert!(data.starts_with(UNTRUSTED_STATE_PREAMBLE), "{data}");
-        assert!(data.contains("\"label\":\"tester\""), "{data}");
+        assert!(data.contains("\"label\":\"build tester\""), "{data}");
         // The utterance is last, verbatim.
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "show me the tester");

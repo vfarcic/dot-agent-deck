@@ -1332,6 +1332,20 @@ pub enum FocusReport {
     Superseded,
 }
 
+/// PRD #1631 — what became of an answer to an agent's question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerReport {
+    /// The daemon answered the question through the agent's own channel.
+    Answered,
+    /// The daemon does not advertise `answer-question`, so nothing was sent.
+    Withheld,
+    /// The caller's `still_wanted` returned `false` at the last moment the
+    /// answer could be dropped, so nothing was sent.
+    Superseded,
+    /// The daemon refused the answer, and says why.
+    Refused(crate::question::AnswerRefusal),
+}
+
 /// PRD #1258 — what [`DaemonClient::host_metrics`] got.
 ///
 /// `NotAvailable` is an **outcome, not an error**, for the reason
@@ -2670,6 +2684,66 @@ impl DaemonClient {
             ));
         }
         Ok(FocusReport::Recorded)
+    }
+
+    /// PRD #1631 — answer the question `agent_id` is waiting on, naming the
+    /// `revision` of it the answer was worked out against, as the snapshot
+    /// carried it ([`crate::question::PendingQuestion::revision`], audit A4):
+    /// the daemon refuses the answer as stale unless that revision — `None`
+    /// included — is still the pending one.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_ANSWER_QUESTION`]**, answering
+    /// [`AnswerReport::Withheld`] with nothing sent, so no call site needs a
+    /// capability check of its own. `still_wanted` is asked after the
+    /// connection is open and immediately before the request is written, as
+    /// [`Self::focus_gained_while`] asks it: an answer whose countdown was
+    /// cancelled, or whose question changed on screen, is dropped there and
+    /// reported [`AnswerReport::Superseded`]. A refusal is an outcome
+    /// ([`AnswerReport::Refused`]), not an error; `Err` is a transport failure
+    /// or an error the daemon did not classify.
+    pub async fn answer_question_while(
+        &self,
+        still_wanted: impl Fn() -> bool,
+        agent_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+        answers: Vec<crate::question::QuestionAnswer>,
+        confirmed_always: bool,
+    ) -> Result<AnswerReport, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_ANSWER_QUESTION)
+        {
+            return Ok(AnswerReport::Withheld);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        if !still_wanted() {
+            return Ok(AnswerReport::Superseded);
+        }
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::AnswerQuestion {
+                agent_id: agent_id.to_string(),
+                question_id: question_id.to_string(),
+                answers,
+                confirmed_always,
+                revision,
+            },
+        )
+        .await?;
+        if resp.ok {
+            return Ok(AnswerReport::Answered);
+        }
+        match resp.answer_refusal {
+            Some(refusal) => Ok(AnswerReport::Refused(refusal)),
+            None => Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "answer-question failed".into()),
+            )),
+        }
     }
 
     /// PRD #1258 — ask the daemon for its host's disk, load and memory.
@@ -7843,5 +7917,103 @@ start = true
             run_now_outcome_from_agents(&Some(vec![])),
             RunNowOutcome::Started
         );
+    }
+
+    /// Scenario: The answer verb is advertised on both platforms' capability
+    /// lists. Against an older daemon — one that advertises no capabilities,
+    /// and one that advertises up to `focus-gained` — the client withholds an
+    /// answer and sends nothing; against this build's daemon it sends it, and a
+    /// refusal comes back as an outcome naming its reason, not as an error.
+    #[cfg(unix)]
+    #[spec("question/answer/004")]
+    #[test]
+    fn question_answer_004_answer_question_is_capability_gated() {
+        let source = include_str!("daemon_protocol.rs");
+        let lists = source
+            .split("pub const DAEMON_CAPABILITIES: &[&str] = &[")
+            .skip(1)
+            .map(|rest| rest.split("];").next().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(lists.len(), 2, "one list per platform");
+        for list in lists {
+            assert!(list.contains("CAP_ANSWER_QUESTION"), "{list}");
+        }
+        assert!(DAEMON_CAPABILITIES.contains(&crate::daemon_protocol::CAP_ANSWER_QUESTION));
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            for advertised in [
+                None,
+                Some(&[CAP_LIST_PROJECTS, crate::daemon_protocol::CAP_FOCUS_GAINED][..]),
+            ] {
+                let (dir, path, listener) = {
+                    let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("older-daemon.sock");
+                    let listener = bind_attach_listener(&path).expect("bind older daemon");
+                    (dir, path, listener)
+                };
+                let other_requests = Arc::new(AtomicUsize::new(0));
+                let counted = other_requests.clone();
+                let server = tokio::spawn(async move {
+                    while let Ok(Ok(mut stream)) = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        listener.accept(),
+                    )
+                    .await
+                    {
+                        let Some((KIND_REQ, payload)) = read_frame(&mut stream).await.unwrap()
+                        else {
+                            continue;
+                        };
+                        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        let response = if request["op"] == "hello" {
+                            AttachResponse {
+                                capabilities: advertised
+                                    .map(|list| list.iter().map(|c| c.to_string()).collect()),
+                                ..AttachResponse::hello(PROTOCOL_VERSION)
+                            }
+                        } else {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            AttachResponse::err("malformed request: unknown variant")
+                        };
+                        crate::daemon_protocol::write_resp(&mut stream, &response)
+                            .await
+                            .unwrap();
+                    }
+                });
+                let client = DaemonClient::new(path);
+                let report = client
+                    .answer_question_while(|| true, "1", "q-1", None, Vec::new(), false)
+                    .await
+                    .expect("a withhold is not an error");
+                assert_eq!(report, AnswerReport::Withheld, "advertised {advertised:?}");
+                assert_eq!(other_requests.load(Ordering::SeqCst), 0, "nothing was sent");
+                drop(client);
+                server.await.unwrap();
+                drop(dir);
+            }
+
+            let (_dir, path, _registry) = spawn_test_server().await;
+            let client = DaemonClient::new(path);
+            assert_eq!(
+                client
+                    .answer_question_while(|| false, "1", "q-1", None, Vec::new(), false)
+                    .await
+                    .unwrap(),
+                AnswerReport::Superseded
+            );
+            assert_eq!(
+                client
+                    .answer_question_while(|| true, "no-such-agent", "q-1", None, Vec::new(), false)
+                    .await
+                    .unwrap(),
+                AnswerReport::Refused(crate::question::AnswerRefusal::AgentNotFound)
+            );
+        });
     }
 }
