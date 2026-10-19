@@ -1456,9 +1456,23 @@ const inboxCovered = (users, pending, assistant) => {
     return !!user && user.sessionID === sessionID && user.seq <= parent.seq;
   });
 };
-// The deck message ids whose opener `text` carries.
-const inboxIdsIn = (text) =>
-  typeof text === "string" ? [...new Set([...text.matchAll(INBOX_OPENER)].map((m) => m[1]))] : [];
+// The deck message ids whose blocks `text` carries at its top level. A block
+// runs from its opener to the closer naming the same id, and an opener inside
+// it — one a trusted body quotes — names no block of its own; an opener with
+// no closer runs to the end of `text`.
+const inboxIdsIn = (text) => {
+  if (typeof text !== "string") return [];
+  const opener = new RegExp(INBOX_OPENER.source, "g");
+  const ids = new Set();
+  for (let found = opener.exec(text); found !== null; found = opener.exec(text)) {
+    ids.add(found[1]);
+    const closer = "[end of dot-agent-deck message " + found[1] + "]";
+    const end = text.indexOf(closer, opener.lastIndex);
+    if (end < 0) break;
+    opener.lastIndex = end + closer.length;
+  }
+  return [...ids];
+};
 // `--model provider/model` (or `-m`, or `--model=`) from the user's argv.
 const inboxArgvModel = () => {
   const argv = process.argv.slice(2);
@@ -5549,6 +5563,52 @@ check(inboxCovered(users, pending, { parentID: "u2", sessionID: "s2" }), ["u2"],
 
 for (let i = 0; i < 4 * INBOX_MAX_TRACKED; i++) inboxObserveUsers(users, user("x" + i, "s3"));
 check(users.size <= INBOX_MAX_TRACKED, true, "the user-message record grows without bound");
+"#
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .expect("run node");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// PR #1735 review (4309348163): a prompt commits the deck messages whose
+    /// blocks it carries, not one whose opener a trusted body quotes inside
+    /// its own block. An unclosed block still names its id.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_an_opener_quoted_inside_a_block_names_no_message() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let script = format!(
+            "{}\n{}",
+            inbox_js(""),
+            r#"
+const check = (actual, expected, what) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    console.error(what + ": " + JSON.stringify(actual) + " != " + JSON.stringify(expected));
+    process.exit(1);
+  }
+};
+const A = "m-k3xzq2ab-0000000000000001";
+const B = "m-k3xzq2ab-0000000000000002";
+const C = "m-k3xzq2ab-0000000000000003";
+const block = (id, body) =>
+  "[dot-agent-deck message " + id + " from x]\n" + body + "\n[end of dot-agent-deck message " + id + "]";
+check(inboxIdsIn(INBOX_FRAMING + "\n\n" + block(A, "Forward this:\n" + block(B, "work")) + "\n\n" + block(C, "more")),
+  [A, C], "a quoted block names a message");
+check(inboxIdsIn("[dot-agent-deck message " + A + " from x]\nhead"), [A], "an unclosed block still names its id");
 "#
         );
         let output = std::process::Command::new("node")

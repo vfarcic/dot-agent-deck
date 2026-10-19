@@ -892,13 +892,28 @@ export function buildInboxDoorbellFetchArgv(id: string, rx: number, integration:
 	return ["inbox", "fetch", "--json", "--doorbell", id, "--adapter-integration", String(integration), "--rx", String(rx)];
 }
 
-/** The ids of the deck message blocks whose opener `text` carries, in order, once each. */
+/**
+ * The ids of the deck message blocks `text` carries at its top level, in
+ * order, once each. A block runs from its opener to the closer naming the same
+ * id, and an opener inside it — one a trusted body quotes — names no block of
+ * its own; an opener with no closer runs to the end of `text`.
+ */
 export function inboxIdsIn(text: unknown): string[] {
 	if (typeof text !== "string") {
 		return [];
 	}
 	const opener = new RegExp(`\\[dot-agent-deck message ${MESSAGE_ID}`, "g");
-	return [...new Set([...text.matchAll(opener)].map((m) => m[1]))];
+	const ids = new Set<string>();
+	for (let found = opener.exec(text); found !== null; found = opener.exec(text)) {
+		ids.add(found[1]);
+		const closer = `[end of dot-agent-deck message ${found[1]}]`;
+		const end = text.indexOf(closer, opener.lastIndex);
+		if (end < 0) {
+			break;
+		}
+		opener.lastIndex = end + closer.length;
+	}
+	return [...ids];
 }
 
 /**

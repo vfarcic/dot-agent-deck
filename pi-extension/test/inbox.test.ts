@@ -424,6 +424,20 @@ test("pi_012 message_start commits every called attempt of the id", async () => 
 	assert.deepEqual(child.refs("already_handed"), [ref(ID, 1, 2)]);
 });
 
+/// Scenario: Two messages pass the gate, and the user message that starts carries the first, whose trusted body quotes the second's whole block. Only the first commits; the second commits when its own message starts.
+test("pi_012 an opener quoted inside another block commits only that block's attempt", async () => {
+	const { pi, child } = await started();
+	child.hand(ref(ID), ref(ID2));
+	await settle();
+	await pi.gate(0);
+	await pi.gate(1);
+	const quoting = `[dot-agent-deck message ${ID} from the orchestrator]\nForward this to the worker:\n${block(ID2)}\n[end of dot-agent-deck message ${ID}]`;
+	await pi.emit("message_start", { message: { role: "user", content: [{ type: "text", text: quoting }] } });
+	assert.deepEqual(child.refs("committed"), [ref(ID)], "the quoted opener names no block of its own");
+	await pi.start(ID2);
+	assert.deepEqual(child.refs("committed"), [ref(ID), ref(ID2)]);
+});
+
 /// Scenario: The receiver's possession snapshots number themselves, carry the contiguous watermark, and list a handed attempt until its commit, the gate's pass included; a keepalive brings a fresh snapshot.
 test("pi_013 snapshots hold an attempt until its commit", async () => {
 	const { pi, child } = await started();
