@@ -887,6 +887,30 @@ test("pi_028 a version replacement: dispose, drain, transfer", async (t) => {
 	}
 });
 
+/// Scenario: A process runs the extension's previous inbox version with three deck messages waiting to be handed to Pi, and a reload brings this version. The bump replaces the receiver, so the replacement's one-at-a-time hand-over applies: the successor is sent the first message only, and the next only once Pi took the first.
+test("pi_028 a reload from the previous inbox version hands its queue over one admission at a time", async () => {
+	assert.ok(INBOX_VERSION > 2, "the admission hold (pi_036) needs a bump over version 2, or a reload keeps version 2's pump");
+	const { pi, child } = await started();
+	child.grant = undefined;
+	child.hand(ref(ID), ref(ID2), ref("m-k3xzq2ab-dddddddd54b742c9"));
+	await settle();
+	(globalThis as any)[PROCESS].version = INBOX_VERSION - 1;
+	await pi.emit("session_shutdown", { reason: "reload" });
+	const next = instance();
+	const start = next.emit("session_start", { reason: "reload" });
+	await settle();
+	assert.equal(child.ended, true, "the previous version is replaced, not kept");
+	child.exit(0);
+	await start;
+	const second = watcher();
+	second.register(8, { resume: [ref(ID), ref(ID2)] });
+	await settle();
+	assert.deepEqual(second.sent("resume_answers").flat().map((r: any) => r.answer), ["retained", "retained"], "its state is carried");
+	assert.equal(next.sends.length, 1, "one at a time");
+	await behindRun(next, () => next.gate(0));
+	assert.equal(next.sends.length, 2, "the next once Pi took the first");
+});
+
 const ID3 = "m-k3xzq2ab-cccccccc54b742c9";
 
 /**
@@ -1242,7 +1266,7 @@ test("pi_032 j an approval expiring while a report holds the queue", async (t) =
 	assert.deepEqual(child.refs("not_handed"), []);
 });
 
-/// Scenario: Pi runs the gate inside sendUserMessage, as it does for an idle agent, and a callback throws synchronously. The inline gate passes the hand-over recorded before the call, and a throwing sendUserMessage is reported not handed without crashing Pi.
+/// Scenario: While a run is active, Pi runs the gate inside sendUserMessage, and a later callback throws synchronously. The inline gate passes the hand-over recorded before the call, and a throwing sendUserMessage is reported not handed without crashing Pi.
 test("pi_inbox_020 the gate inside sendUserMessage, and a throwing call", async () => {
 	const { pi, child } = await started();
 	pi.inline(true);
@@ -1387,6 +1411,48 @@ test("pi_036 a repeat is not held back by its own message's earlier attempt", as
 	assert.equal(pi.sends.length, 3);
 	assert.ok(pi.sends[2].text.includes(block(ID2)), "and goes once it starts");
 	assert.deepEqual(child.refs("committed"), [ref(ID), ref(ID, 1, 2)], "one start commits both attempts");
+});
+
+/// Scenario: Pi is busy, so a deck message it was handed has not reached its gate, and a second message waits behind it. The user cancels the first: the deck's revoke is answered revoked_ack and the second is handed over at once, with no timer run. The first's late arrival at the gate is consumed, and it is not reported not handed.
+test("pi_036 a revoked hand-over Pi never saw holds nothing back", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const { pi, child } = await started();
+	pi.ctx.isIdle = () => false;
+	pi.ctx.hasPendingMessages = () => false;
+	child.hand(ref(ID));
+	await settle();
+	child.hand(ref(ID2));
+	await settle();
+	assert.equal(pi.sends.length, 1, "precondition: the second waits behind the first");
+	child.say({ revoke: [ref(ID)] });
+	await settle();
+	assert.deepEqual(child.refs("revoked_ack"), [ref(ID)]);
+	assert.equal(pi.sends.length, 2, "the second is handed over once the first is revoked");
+	assert.ok(pi.sends[1].text.includes(block(ID2)));
+	assert.equal((await pi.gate(0))?.action, "handled", "the revoked hand-over's late gate is consumed");
+	assert.deepEqual(child.refs("not_handed"), []);
+	assert.equal((await pi.gate(1))?.action, "transform");
+});
+
+/// Scenario: Pi is busy, so a deck message it was handed has not reached its gate, and a second message waits behind it. Once the approval the first was sent under is past its validity, the gate would consume it, so it holds nothing back: the next periodic check hands the second over although Pi is still busy.
+test("pi_036 a hand-over whose approval expired holds nothing back", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const { pi, child } = await started();
+	pi.ctx.isIdle = () => false;
+	pi.ctx.hasPendingMessages = () => false;
+	child.hand(ref(ID));
+	await settle();
+	child.hand(ref(ID2));
+	await settle();
+	assert.equal(pi.sends.length, 1, "precondition: the second waits behind the first");
+	const now = performance.now();
+	t.mock.method(performance, "now", () => now + 6000);
+	t.mock.timers.tick(INBOX_UNSEEN_RECHECK_MS);
+	await settle();
+	assert.equal(pi.sends.length, 2, "the second is handed over once the first can no longer pass the gate");
+	assert.ok(pi.sends[1].text.includes(block(ID2)));
+	assert.equal((await pi.gate(0))?.action, "handled", "the expired hand-over's late gate is consumed");
+	assert.equal((await pi.gate(1))?.action, "transform");
 });
 
 /// Scenario: With DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS set, a watcher that exits stays down exactly that long each time.

@@ -1608,10 +1608,11 @@ fn cancel(op: &OpenCode, id: &str) -> Value {
 #[spec("inbox/opencode/047")]
 #[test]
 fn opencode_047_a_cancel_racing_a_commits_publication_keeps_the_offer_bound() {
-    // As in `opencode_052`: two minutes outlasts every step from the commit
-    // report to the end of the test, so the Cancel always lands while the
-    // commit is still being published. A three-second delay raced it under
-    // load. A replacement watcher, should one start, publishes at once.
+    // As in `opencode_052`: two minutes outlasted every step from the commit
+    // report to the end of the test in the runs we measured, and the test
+    // asserts that the commit is still being published when the Cancel lands.
+    // A three-second delay raced it under load. A replacement watcher, should
+    // one start, publishes at once.
     let op = OpenCode::new(
         "session",
         json!({"offerPool":"review","publishDelayMs":"120000",

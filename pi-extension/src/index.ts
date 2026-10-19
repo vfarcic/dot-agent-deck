@@ -117,13 +117,17 @@ inboxBinary(() => (isAbsoluteOverride(deckBin, process.platform) ? deckBin : und
 
 /**
  * Bumped whenever this file's inbox code changes: a reload that evaluates a
- * different version replaces the process's receiver (`replaceVersion`).
+ * different version replaces the process's receiver (`replaceVersion`). A
+ * same-version reload keeps the old receiver and the old module's closures
+ * (`deliver`, `pump`), so a change the bump is skipped for never reaches a
+ * process that already runs the extension. 3: `pending` is handed over one
+ * admitted attempt at a time (`admitting`).
  */
-export const INBOX_VERSION = 2;
+export const INBOX_VERSION = 3;
 /**
- * The first receipt version a release carries. Version 1 was never released,
- * so a receiver older than this one is replaced as incompatible: nothing is
- * carried from it (`carriesState`).
+ * The oldest version whose state a replacement carries: 2 is the first
+ * receipt-stream version, and 1 never shipped, so a receiver older than 2 is
+ * replaced as incompatible and nothing is carried from it (`carriesState`).
  */
 const FIRST_RECEIPT_VERSION = 2;
 /**
@@ -168,7 +172,7 @@ interface Passed {
 	suspect: boolean;
 	/** Released `lost`: it waits for a commit only. */
 	lost: boolean;
-	/** Pi sat idle with nothing queued for `INBOX_UNSEEN_RECHECK_MS` while it held back the next hand-over: it holds back nothing more (`admitting`). */
+	/** While it held back the next hand-over, the check `INBOX_UNSEEN_RECHECK_MS` later read no run, Pi idle and nothing queued: it holds back nothing more (`admitting`). */
 	stalled?: boolean;
 }
 
@@ -397,9 +401,15 @@ function deliver(proc: InboxProcess, message: InboxMessage): void {
 }
 
 /**
- * The current session's earlier hand-over Pi has not admitted yet: sent and
- * not seen at the gate, or past it and neither started (`commit`), seen
- * queued behind a run (`watchQueue`), released, nor stalled. Pi 0.84.4 runs
+ * The current session's earlier hand-over Pi has not admitted yet: sent, not
+ * seen at the gate, and still one the receiver would let pass it (`ready`);
+ * or past it and neither started (`commit`), seen queued behind a run
+ * (`watchQueue`), released, nor stalled. A sent one the receiver no longer
+ * authorizes — revoked, its approval past its validity (at most
+ * `INBOX_GRANT_TIMEOUT_MS` from when it was asked for), its watcher
+ * restarted, the receiver draining or inactive — is consumed if it reaches
+ * the gate now, so it holds nothing back; its record stays, for that gate
+ * and its recheck. Pi 0.84.4 runs
  * one prompt at a time, and a hand-over sent while it reads no run active
  * goes through a preflight to start one; a second that leaves its preflight
  * while the first's run is active is refused, and that refusal's settle
@@ -407,18 +417,22 @@ function deliver(proc: InboxProcess, message: InboxMessage): void {
  * take the preflight and are refused too — one admitted per burst, each of
  * the others costing a delivery (PRD #1666, the `load_003` burst). Holding
  * the next one back until the one before it is decided keeps two of ours out
- * of that preflight together, short of one stalled there longer than
- * `INBOX_UNSEEN_RECHECK_MS` (`armAdmission`). An earlier attempt of `id`
- * itself holds nothing back: the deck issues another attempt of a message
- * only once the earlier one is in doubt (released, or the user's Retry of one
- * Pi never started), and a commit of either commits the message, so they
- * cannot run it twice.
+ * of that preflight together, short of one marked stalled (`armAdmission`).
+ * A passed one Pi neither starts nor settles holds the rest back for as long
+ * as Pi stays busy, or its context cannot be read: nothing but Pi's own
+ * events, or a check that reads it stalled, ends that wait. An earlier
+ * attempt of `id` itself holds nothing back: the deck issues another attempt
+ * of a message only once the earlier one is in doubt (released, or the
+ * user's Retry of one Pi never started), and this extension records one
+ * commit for the message whichever attempt Pi starts. That does not stop two
+ * attempts that both passed the gate from both running; keeping the second
+ * from running is best-effort.
  */
 function admitting(proc: InboxProcess, id: string): string[] {
 	const token = proc.current?.token;
 	const keys: string[] = [];
 	for (const [key, sent] of proc.sent) {
-		if (sent.token === token && sent.ref.id !== id) {
+		if (sent.token === token && sent.ref.id !== id && mayPass(proc, sent)) {
 			keys.push(key);
 		}
 	}
@@ -430,13 +444,26 @@ function admitting(proc: InboxProcess, id: string): string[] {
 	return keys;
 }
 
+/** Whether the receiver would still let `sent` pass the gate; a throw reads as no, as it does there. */
+function mayPass(proc: InboxProcess, sent: Sent): boolean {
+	try {
+		return proc.receiver.ready(sent.ref, sent.granted);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * While `keys` hold back `pending`, check once `INBOX_UNSEEN_RECHECK_MS` has
- * passed: one Pi still has not started on while it sits idle with no run and
- * nothing queued ended in its preflight (a compaction or an auth check
- * refused it), so it is marked stalled and no longer holds the rest back. It
- * stays held as it was. A sent one the gate never saw is settled by its own
- * recheck (`armRecheck`).
+ * passed, and re-pump. A passed one Pi still has not started on, when that
+ * check reads no run active, Pi idle and nothing queued, is taken to have
+ * ended in its preflight (a compaction or an auth check refused it): it is
+ * marked stalled and no longer holds the rest back. That reading is of the
+ * moment the timer fires, not of the whole period, and it does not prove the
+ * preflight ended. The attempt itself stays held as it was. A sent one the
+ * gate never saw is settled by its own recheck (`armRecheck`), and stops
+ * holding the rest back once the receiver no longer authorizes it
+ * (`admitting`).
  */
 function armAdmission(proc: InboxProcess, keys: string[]): void {
 	if (proc.admission !== undefined) {
@@ -1031,7 +1058,7 @@ function reporting(proc: InboxProcess, instance: Instance, eventName: string): b
 }
 
 /**
- * Whether a replacement carries `old`'s state: a released receipt version
+ * Whether a replacement carries `old`'s state: a receipt-stream version
  * whose `Transfer` shape is this one's.
  */
 function carriesState(old: Partial<InboxProcess>): boolean {
@@ -1083,6 +1110,8 @@ function createProcess(transfer?: Transfer, replaced = false, tokenFloor = 0): I
 			}
 		},
 		registered: () => pump(proc),
+		// A revoked sent attempt holds nothing back any more (`admitting`).
+		revokeAnswered: () => pump(proc),
 		state: (transfer?.receiver as InboxReceiverState | undefined) ?? (replaced ? { forgot: true } : undefined),
 	});
 	// What a sent attempt the old receiver never saw at the gate waits for now.

@@ -107,12 +107,13 @@ const inboxRef = (entry) => ({ id: entry.id, a: entry.a, e: entry.e });
 //
 // `exited` is told each watcher's exit code before the receiver decides
 // whether to respawn it, and `registered` each registration once its resume
-// answers, held reports and snapshot are sent. `state` is what another
+// answers, held reports and snapshot are sent; `revokeAnswered`, if given,
+// is told after each revoke is answered. `state` is what another
 // receiver's `exportState`
 // gave up (the Pi extension's replacement across a reload of a different
 // version): this one starts holding it, and registers `--resumed` from its
 // first watcher, so the deck asks about those attempts.
-const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, registered, state }) => {
+const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, registered, revokeAnswered, state }) => {
   const held = new Map((state?.held ?? []).map((entry) => [inboxKey(entry), { ...entry }]));
   // Attempts revoked here, so neither a late doorbell fetch nor an approval
   // still outstanding brings one back (`take`, `ready`). Bounded, oldest
@@ -315,6 +316,7 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
       held.delete(key);
       inboxWrite(child, { revoked_ack: [ref] });
     }
+    revokeAnswered?.();
   };
   const onLine = (line) => {
     let reply;

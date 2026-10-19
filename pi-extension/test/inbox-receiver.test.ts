@@ -123,6 +123,30 @@ test("pi_031 a hand-out missing its text is neither held nor delivered", { skip:
 	assert.deepEqual(held, ["m-good"]);
 });
 
+/// Scenario: The watcher hands out a message, then revokes it and an attempt the receiver never held. The receiver tells its owner once per revoke, each time after it answered that revoke, so the revoked message is no longer held when it hears.
+test("pi_031 each answered revoke is reported to the receiver's owner", { skip: process.platform === "win32" }, async () => {
+	const watcher = fakeWatcher("watcher", [
+		REGISTERED,
+		{ messages: [{ id: "m-held", a: 1, e: 1, d: 1, text: "hello" }] },
+		{ revoke: [{ id: "m-held", a: 1, e: 1 }, { id: "m-never", a: 1, e: 1 }] },
+	]);
+	inboxBinary(() => watcher);
+	const heard: string[][] = [];
+	let on = true;
+	const receiver = inboxReceiver({
+		agent: "pi",
+		active: () => on,
+		deliver: () => {},
+		revokeAnswered: () => heard.push((receiver.exportState().held ?? []).map((entry: { id: string }) => entry.id)),
+	});
+	receiver.start();
+	for (let waited = 0; heard.length < 2 && waited < 3000; waited += 20) await settle(20);
+	await settle(50);
+	on = false;
+	receiver.stop();
+	assert.deepEqual(heard, [[], []], "once per revoke, after the revoked message is dropped");
+});
+
 /// Scenario: The watcher revokes more attempts than the receiver remembers. It keeps the newest ones only, up to its bound.
 test("pi_031 the receiver's memory of revoked attempts is bounded", { skip: process.platform === "win32" }, async () => {
 	const revoke = Array.from({ length: 4100 }, (_, n) => ({ id: "m-" + n, a: 1, e: 1 }));

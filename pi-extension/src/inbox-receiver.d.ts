@@ -30,6 +30,7 @@ export interface InboxReceiverOptions {
   deliver?: (message: InboxMessage) => void;
   exited?: (code: number | null) => void;
   registered?: () => void;
+  revokeAnswered?: () => void;
   state?: InboxReceiverState;
 }
 export interface InboxReceiver {

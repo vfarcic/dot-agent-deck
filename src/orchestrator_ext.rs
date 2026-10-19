@@ -156,12 +156,17 @@ pub fn default_extension_dir() -> Option<PathBuf> {
 ///
 /// Creates `target_dir` (and parents) if needed and (over)writes each embedded
 /// file, so re-running is idempotent and refreshes a stale copy. Each file is
-/// published by an atomic rename of an owner-only temp file, and a destination
-/// that is a symlink is refused (PRD #1666 hardening M8). Every destination is
-/// judged and every changed file written to its temp file before any is
-/// renamed, and the renames run in embed order, each file after those it
-/// imports: a refusal or a failed write changes nothing, and a failed rename
-/// leaves `index.ts` the old one (PR #1735 review 4309809295). Returns the
+/// published by an atomic rename of a temp file created exclusively and
+/// owner-only, then given the existing destination's mode (owner-only for a
+/// new file) before it is written, and a destination that is a symlink is
+/// refused (PRD #1666 hardening M8). Every destination is judged and every
+/// changed file written to its temp file before any is renamed, and the
+/// renames run in embed order, each file after those it imports: a refusal or
+/// a failed write changes nothing, and a failed rename leaves `index.ts` the
+/// old one (PR #1735 review 4309809295). Each rename is atomic on its own; the
+/// set is not a transaction, so a failed rename partway through, a crash, a
+/// concurrent writer or a concurrent load can see a mix of old and new files.
+/// Returns the
 /// list of paths written, in embed order. Hermetic — pass any directory
 /// (a temp dir in tests, the real `~/.pi/...` in the CLI); it never reads the
 /// environment.
@@ -194,8 +199,9 @@ pub fn materialize(target_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         let path = target_dir.join(name);
         // An identical file is not rewritten (PRD #1487).
         if !std::fs::read(&path).is_ok_and(|existing| existing == contents.as_bytes()) {
-            // Hardening M8: an owner-only temp file created exclusively, then
-            // renamed over the destination, so Pi never loads a partial file
+            // Hardening M8: a temp file created exclusively and owner-only,
+            // given the existing destination's mode, written, then renamed
+            // over the destination, so Pi never loads a partial file
             // and a concurrent refresh never truncates one in place. A staged
             // file dropped unpublished is removed.
             staged.push(crate::agent_hook_config::stage_atomic(
@@ -326,7 +332,10 @@ pub fn refresh_for_spawn(env: &[(String, String)], cwd: ChildDir<'_>) -> Vec<Str
 /// beneath the directory `base` holds open rather than by pathname: each
 /// component is created (`mkdirat`) and opened (`openat`) from the one before
 /// it, and each file is judged, compared and published by an atomic rename
-/// (`renameat`) of an owner-only temp file in the directory reached that way.
+/// (`renameat`) of a temp file in the directory reached that way, created
+/// owner-only and given the existing destination's mode (owner-only for a
+/// new file) before it is written. As in [`materialize`], each rename is
+/// atomic on its own and the set is not a transaction.
 /// `shown` is the pathname the target had when it was resolved, for the test
 /// containment guard and for messages; nothing is written through it. A `..`
 /// or a symlinked component is followed, as the child following the same
