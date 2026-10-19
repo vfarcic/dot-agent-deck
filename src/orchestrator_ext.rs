@@ -37,14 +37,16 @@ pub const ENV_PI_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 
 /// The embedded extension files, as `(filename, contents)` pairs.
 ///
-/// The files materialized beside the entry point:
-///   - `index.ts`           — the Pi-API glue (default-export factory),
-///   - `orchestrator.ts`    — the pure logic it imports via `./orchestrator.ts`,
-///     and
+/// The files materialized beside the entry point, each after the files it
+/// imports, which is the order they are published in (PR #1735 review
+/// 4309809295):
 ///   - `inbox-receiver.js`  — the deck's inbox receiver, generated from
 ///     `src/inbox_receiver.js` ([`crate::inbox_receiver::pi_module`]; PRD
 ///     #1666), which `index.ts` imports. Its `.d.ts` is for the extension's
-///     type check only and is not materialized.
+///     type check only and is not materialized,
+///   - `orchestrator.ts`    — the pure logic `index.ts` imports via
+///     `./orchestrator.ts`, and
+///   - `index.ts`           — the Pi-API glue (default-export factory).
 ///
 /// A `package.json` is intentionally **not** embedded: the subdirectory
 /// `index.ts` discovery layout does not require one: the extension's one
@@ -55,15 +57,15 @@ pub const ENV_PI_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 /// `include_str!` paths are relative to this source file (`src/`), so they
 /// reference the real `pi-extension/` sources and stay in sync on rebuild.
 pub const EXTENSION_FILES: &[(&str, &str)] = &[
-    ("index.ts", include_str!("../pi-extension/src/index.ts")),
-    (
-        "orchestrator.ts",
-        include_str!("../pi-extension/src/orchestrator.ts"),
-    ),
     (
         "inbox-receiver.js",
         include_str!("../pi-extension/src/inbox-receiver.js"),
     ),
+    (
+        "orchestrator.ts",
+        include_str!("../pi-extension/src/orchestrator.ts"),
+    ),
+    ("index.ts", include_str!("../pi-extension/src/index.ts")),
 ];
 
 /// Pi's agent directory under a given HOME: `<home>/.pi/agent` (the default
@@ -155,7 +157,11 @@ pub fn default_extension_dir() -> Option<PathBuf> {
 /// Creates `target_dir` (and parents) if needed and (over)writes each embedded
 /// file, so re-running is idempotent and refreshes a stale copy. Each file is
 /// published by an atomic rename of an owner-only temp file, and a destination
-/// that is a symlink is refused (PRD #1666 hardening M8). Returns the
+/// that is a symlink is refused (PRD #1666 hardening M8). Every destination is
+/// judged and every changed file written to its temp file before any is
+/// renamed, and the renames run in embed order, each file after those it
+/// imports: a refusal or a failed write changes nothing, and a failed rename
+/// leaves `index.ts` the old one (PR #1735 review 4309809295). Returns the
 /// list of paths written, in embed order. Hermetic — pass any directory
 /// (a temp dir in tests, the real `~/.pi/...` in the CLI); it never reads the
 /// environment.
@@ -168,8 +174,7 @@ pub fn materialize(target_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         crate::config_write_guard::ensure_config_write_allowed(&target_dir.join(name))?;
     }
     std::fs::create_dir_all(target_dir)?;
-    let mut written = Vec::with_capacity(EXTENSION_FILES.len());
-    for (name, contents) in EXTENSION_FILES {
+    for (name, _) in EXTENSION_FILES {
         let path = target_dir.join(name);
         // PRD #1666 hardening M8: a destination that is a symlink is refused,
         // so the extension is never written through a link to another file.
@@ -182,14 +187,27 @@ pub fn materialize(target_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
                 ),
             ));
         }
+    }
+    let mut written = Vec::with_capacity(EXTENSION_FILES.len());
+    let mut staged = Vec::with_capacity(EXTENSION_FILES.len());
+    for (name, contents) in EXTENSION_FILES {
+        let path = target_dir.join(name);
         // An identical file is not rewritten (PRD #1487).
         if !std::fs::read(&path).is_ok_and(|existing| existing == contents.as_bytes()) {
             // Hardening M8: an owner-only temp file created exclusively, then
             // renamed over the destination, so Pi never loads a partial file
-            // and a concurrent refresh never truncates one in place.
-            crate::agent_hook_config::write_atomic(target_dir, &path, contents.as_bytes())?;
+            // and a concurrent refresh never truncates one in place. A staged
+            // file dropped unpublished is removed.
+            staged.push(crate::agent_hook_config::stage_atomic(
+                target_dir,
+                &path,
+                contents.as_bytes(),
+            )?);
         }
         written.push(path);
+    }
+    for file in staged {
+        file.publish()?;
     }
     Ok(written)
 }
@@ -345,11 +363,14 @@ pub fn materialize_beneath(
         };
         dir = beneath::open_dir(std::os::fd::AsFd::as_fd(&dir), name)?;
     }
-    for (name, contents) in EXTENSION_FILES {
+    // As in `materialize`: every file is judged, then every changed one
+    // staged, before any is renamed, in embed order.
+    let mut existing = Vec::with_capacity(EXTENSION_FILES.len());
+    for (name, _) in EXTENSION_FILES {
         let name = std::ffi::OsStr::new(name);
-        let existing = beneath::lstat(&dir, name)?;
+        let mode = beneath::lstat(&dir, name)?;
         // PRD #1666 hardening M8, as in `materialize`.
-        if existing.is_some_and(|mode| mode & libc::S_IFMT == libc::S_IFLNK) {
+        if mode.is_some_and(|mode| mode & libc::S_IFMT == libc::S_IFLNK) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
@@ -358,6 +379,11 @@ pub fn materialize_beneath(
                 ),
             ));
         }
+        existing.push(mode);
+    }
+    let mut staged = beneath::Staged::new(&dir);
+    for ((name, contents), existing) in EXTENSION_FILES.iter().zip(existing) {
+        let name = std::ffi::OsStr::new(name);
         // An identical file is not rewritten (PRD #1487).
         if existing.is_some() {
             let mut current = Vec::new();
@@ -371,18 +397,12 @@ pub fn materialize_beneath(
         }
         let landed = existing.map_or(0o600, |mode| mode & 0o777);
         let (mut file, tmp) = beneath::create_temp(&dir, name)?;
-        let written = (|| {
-            beneath::set_mode(&file, landed)?;
-            file.write_all(contents.as_bytes())?;
-            file.sync_all()
-        })();
-        drop(file);
-        if let Err(error) = written.and_then(|()| beneath::rename(&dir, &tmp, name)) {
-            beneath::unlink(&dir, &tmp);
-            return Err(error);
-        }
+        staged.push(tmp, name);
+        beneath::set_mode(&file, landed)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
     }
-    Ok(())
+    staged.publish()
 }
 
 /// The `*at` system calls [`materialize_beneath`] is made of, each relative
@@ -537,6 +557,44 @@ mod beneath {
         if let Ok(name) = c_name(name) {
             // SAFETY: a valid descriptor and a NUL-terminated name.
             unsafe { libc::unlinkat(at.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+
+    /// Temp files beneath one directory, each staged for its destination
+    /// name. [`Staged::publish`] renames them in the order they were pushed;
+    /// any it has not renamed when it returns or is dropped are removed.
+    pub(super) struct Staged<'a> {
+        at: &'a OwnedFd,
+        files: Vec<(OsString, OsString)>,
+    }
+
+    impl<'a> Staged<'a> {
+        pub(super) fn new(at: &'a OwnedFd) -> Self {
+            Self {
+                at,
+                files: Vec::new(),
+            }
+        }
+
+        pub(super) fn push(&mut self, tmp: OsString, name: &OsStr) {
+            self.files.push((tmp, name.to_owned()));
+        }
+
+        pub(super) fn publish(mut self) -> std::io::Result<()> {
+            while !self.files.is_empty() {
+                let (tmp, name) = &self.files[0];
+                rename(self.at, tmp, name)?;
+                self.files.remove(0);
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Staged<'_> {
+        fn drop(&mut self) {
+            for (tmp, _) in &self.files {
+                unlink(self.at, tmp);
+            }
         }
     }
 }
@@ -839,6 +897,88 @@ mod tests {
         );
     }
 
+    /// A stale extension, as an older deck left it, in `target`.
+    #[cfg(unix)]
+    fn stale_extension(target: &Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for (name, _) in EXTENSION_FILES {
+            std::fs::write(target.join(name), format!("// old {name}")).unwrap();
+        }
+    }
+
+    /// Both ways the deck writes the extension: by pathname, and beneath a
+    /// held directory.
+    #[cfg(unix)]
+    fn both_materializations(target: &Path) -> [std::io::Result<()>; 2] {
+        let by_path = materialize(target).map(drop);
+        let parent = std::fs::File::open(target.parent().unwrap()).unwrap();
+        let name = Path::new(target.file_name().unwrap());
+        let held = materialize_beneath(std::os::fd::AsFd::as_fd(&parent), name, target);
+        [by_path, held]
+    }
+
+    /// PR #1735 review 4309809295: a file that cannot be published leaves the
+    /// old `index.ts`, never a new one importing a module that is not there.
+    /// Here the receiver's name is taken by a directory, so its rename fails:
+    /// `index.ts`, which imports it, is published after it and so is never
+    /// published, and no temp file is left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_dependency_that_cannot_be_published_leaves_the_old_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("dot-agent-deck");
+        stale_extension(&target);
+        std::fs::remove_file(target.join("inbox-receiver.js")).unwrap();
+        std::fs::create_dir_all(target.join("inbox-receiver.js").join("taken")).unwrap();
+        for (how, result) in ["by path", "beneath"]
+            .into_iter()
+            .zip(both_materializations(&target))
+        {
+            assert!(result.is_err(), "{how}: the receiver cannot be published");
+            assert_eq!(
+                std::fs::read_to_string(target.join("index.ts")).unwrap(),
+                "// old index.ts",
+                "{how}: index.ts is not published ahead of what it imports"
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&target)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file left: {leftovers:?}");
+    }
+
+    /// PR #1735 review 4309809295: every destination is judged before any
+    /// file is published, so a refusal at the last one changes none of the
+    /// files before it.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_destination_publishes_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("dot-agent-deck");
+        stale_extension(&target);
+        let (last, _) = EXTENSION_FILES[EXTENSION_FILES.len() - 1];
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        std::fs::remove_file(target.join(last)).unwrap();
+        std::os::unix::fs::symlink(&victim, target.join(last)).unwrap();
+        for (how, result) in ["by path", "beneath"]
+            .into_iter()
+            .zip(both_materializations(&target))
+        {
+            assert!(result.is_err(), "{how}: the symlink is refused");
+            for (name, _) in &EXTENSION_FILES[..EXTENSION_FILES.len() - 1] {
+                assert_eq!(
+                    std::fs::read_to_string(target.join(name)).unwrap(),
+                    format!("// old {name}"),
+                    "{how}: {name} is untouched"
+                );
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+    }
+
     /// Hardening M8: a new file is published whole and owner-only, and a
     /// stale copy is replaced by a rename over it, not truncated in place.
     #[cfg(unix)]
@@ -864,7 +1004,7 @@ mod tests {
         materialize(&target).unwrap();
         assert_eq!(
             std::fs::read_to_string(&stale).unwrap(),
-            EXTENSION_FILES[0].1
+            embedded("index.ts")
         );
         assert_ne!(
             std::fs::metadata(&stale).unwrap().ino(),

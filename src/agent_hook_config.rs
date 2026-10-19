@@ -263,6 +263,32 @@ pub(crate) fn overridable_command_word(quoted_exe: &str, windows_dialect: bool) 
 /// publish lands is still the destination's own, applied by `fchmod`, which no
 /// umask filters.
 pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    stage_atomic(dir, dest, bytes)?.publish()
+}
+
+/// A temp file [`stage_atomic`] wrote and synced in its destination's
+/// directory, published by [`Staged::publish`]. Dropped unpublished, it is
+/// removed, so a caller can stage several files and publish them only once
+/// every one of them is written.
+pub(crate) struct Staged {
+    tmp: PathBuf,
+    dest: PathBuf,
+    cleanup: TempFileGuard,
+}
+
+impl Staged {
+    /// Rename the temp file over the destination.
+    pub(crate) fn publish(mut self) -> io::Result<()> {
+        std::fs::rename(&self.tmp, &self.dest)?;
+        self.cleanup.disarm();
+        Ok(())
+    }
+}
+
+/// [`write_atomic`] up to its rename: the temp file is created, given the
+/// destination's mode and written and synced, and the destination is not
+/// touched until [`Staged::publish`].
+pub(crate) fn stage_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<Staged> {
     // PRD #1487: before the temp file exists, so a refused test write leaves
     // nothing behind. The temp sits in `dest`'s own directory, so judging
     // `dest` judges it too.
@@ -275,7 +301,7 @@ pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<
     let (mut file, tmp) = create_temp(dir, name)?;
     // Removes the temp file on every early return AND on unwind; disarmed only
     // once the rename has consumed it.
-    let mut cleanup = TempFileGuard::new(tmp.clone());
+    let cleanup = TempFileGuard::new(tmp.clone());
 
     // Everything after the create is fallible with a temp file already on disk,
     // so it runs in one closure and shares a single cleanup path. The previous
@@ -298,9 +324,12 @@ pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<
     })();
     drop(file);
 
-    written.and_then(|()| std::fs::rename(&tmp, dest))?;
-    cleanup.disarm();
-    Ok(())
+    written?;
+    Ok(Staged {
+        tmp,
+        dest: dest.to_path_buf(),
+        cleanup,
+    })
 }
 
 /// How long a writer waits without seeing the config published before it
