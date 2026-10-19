@@ -8512,7 +8512,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/boundary/002 — Returning a reservation removes the attempt's files.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub served over an in-memory duplex, real spool under a temp state directory
 - **Agent:** none.
-- **Asserts:** after a commit settles a message, its attempt's `handed` and `committed` records, caps and revoke marker are removed.
+- **Asserts:** after a commit settles a message, its attempt's `handed` and `committed` records and its revoke marker are all removed; the wait covers every one of them, since the hub removes them one at a time, the marker last.
 - **Does not assert:** Windows (the spool tests there are CI's).
 - **Platform coverage:** mac+linux.
 

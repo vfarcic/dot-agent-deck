@@ -317,20 +317,25 @@ async fn boundary_002_returning_a_reservation_removes_the_attempts_files() {
             .join(format!("{id}.{}.{}.{stage}", first.a, first.e))
     };
     assert!(record("handed").exists() && record("committed").exists());
+    assert!(spool.revoked(id.as_str(), first.a, first.e));
     peer.send(serde_json::json!({"committed": [at(&handed[0])]}))
         .await;
     until("the commit to settle", || {
         state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
     })
     .await;
-    until("the reclaimed attempt's files to go", || {
-        !record("handed").exists() && !record("committed").exists()
-    })
+    // The hub removes the files one at a time on the thread that took the
+    // commit, the revoke marker last, so wait for all of them: the records
+    // going says nothing yet about the marker.
+    until(
+        "the reclaimed attempt's records and revoke marker to go",
+        || {
+            !record("handed").exists()
+                && !record("committed").exists()
+                && !spool.revoked(id.as_str(), first.a, first.e)
+        },
+    )
     .await;
-    assert!(
-        !spool.revoked(id.as_str(), first.a, first.e),
-        "the revoke marker went too"
-    );
     peer.close().await;
 }
 
