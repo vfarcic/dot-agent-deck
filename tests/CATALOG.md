@@ -10453,8 +10453,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/007 — Pi submits a repeated hand-out once, and an unseen submission again after a swap.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** A repeated hand-out of one attempt is sent once, after one `may`; a marked repeat (new `e`) is sent once; an attempt submitted and seen by no gate when `/new` replaces the session is submitted again to the successor behind a second `may` (two `sendUserMessage` calls for one attempt), the first submission's tag is consumed at either instance's gate, and one `handed` is reported.
-- **Does not assert:** The daemon's repeat policy.
+- **Asserts:** A repeated hand-out of one attempt is sent once, after one `may`; a marked repeat (new `e`) is sent once; an attempt submitted and seen by no gate when `/new` replaces the session is submitted again to the successor behind a second `may` (two `sendUserMessage` calls for one attempt), the first submission's tag is consumed at either instance's gate, and one `handed` is reported. An attempt of a message Pi already committed (the same attempt replayed, or a marked repeat) is reported `committed` without a `may` or a send, and so is a marked repeat whose `may` was outstanding when the original committed and is granted afterwards: one `sendUserMessage`, no `not_handed`, nothing left held.
+- **Does not assert:** The daemon's repeat policy, or suppression once the message's last committed attempt key has been evicted from the 4096 remembered.
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.
 

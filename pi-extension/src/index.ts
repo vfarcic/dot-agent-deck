@@ -435,6 +435,11 @@ function pump(proc: InboxProcess): void {
 async function handOver(proc: InboxProcess, message: InboxMessage): Promise<boolean> {
 	const ref = inboxRef(message as InboxRef);
 	const key = inboxKey(ref);
+	// A repeat left pending across a session swap or a restart, whose message
+	// committed meanwhile, is not asked about again (PR #1735 review 4306950747).
+	if (alreadyCommitted(proc, message)) {
+		return true;
+	}
 	const token = proc.current?.token;
 	const epoch = proc.receiver.epoch();
 	if (token === undefined) {
@@ -443,7 +448,19 @@ async function handOver(proc: InboxProcess, message: InboxMessage): Promise<bool
 	const granted = await proc.receiver.may(ref);
 	// No await from here to the call.
 	const current = proc.current;
-	if (proc.disposed || current?.token !== token || proc.receiver.epoch() !== epoch) {
+	if (proc.disposed) {
+		return false;
+	}
+	// Another attempt of the message can commit while this one's approval is
+	// asked for; a grant the deck gave before it read that commit hands
+	// nothing to Pi (PRD #1666 r9v, reviewer R9U-01). A commit is a fact
+	// about the message, not the session, so this runs before the staleness
+	// check below. Once an attempt is sent, `noteId` lists it for `commit`,
+	// which settles it before its gate.
+	if (alreadyCommitted(proc, message)) {
+		return true;
+	}
+	if (current?.token !== token || proc.receiver.epoch() !== epoch) {
 		return false;
 	}
 	let ready = false;

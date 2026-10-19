@@ -206,6 +206,26 @@ test("pi_007 an attempt of a message Pi already committed is reported committed,
 	assert.deepEqual(child.sent("possess").at(-1).held, [], "nothing is left held");
 });
 
+/// Scenario: Pi is handed a deck message and it passes the gate; the deck then hands out a marked repeat of it, whose approval is still being asked for when Pi starts on the first attempt. The deck then approves the repeat, as it can before it reads the commit. Pi runs the message once: the repeat is reported committed instead of being sent, nothing is reported not handed, and nothing is left held.
+test("pi_007 a repeat waiting on its approval when the original commits is reported committed, not sent", async () => {
+	const { pi, child } = await started();
+	child.hand(ref());
+	await settle();
+	await pi.gate();
+	child.grant = undefined;
+	child.hand(ref(ID, 1, 2));
+	await settle();
+	assert.deepEqual(child.refs("may"), [ref(), ref(ID, 1, 2)], "precondition: the repeat's approval is outstanding");
+	await pi.start(ID);
+	assert.deepEqual(child.refs("committed"), [ref()], "precondition: the first attempt committed");
+	child.say({ grant: { q: child.sent("may").at(-1).q, ok: true } });
+	await settle();
+	assert.equal(pi.sends.length, 1, "Pi runs the message once");
+	assert.deepEqual(child.refs("committed"), [ref(), ref(ID, 1, 2)], "the repeat is reported committed");
+	assert.deepEqual(child.refs("not_handed"), [], "nothing is reported not handed");
+	assert.deepEqual(child.sent("possess").at(-1).held, [], "nothing is left held");
+});
+
 /// Scenario: An attempt is submitted to Pi but no gate has seen it when the session is replaced by /new. The successor submits the same attempt again behind a fresh approval; the first submission's tag is consumed at either instance's gate, and the attempt passes a gate once.
 test("pi_007 a submission no gate saw is submitted again to a /new successor, and passes one gate", async () => {
 	const { pi, child } = await started();
