@@ -424,6 +424,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # only main's caches are readable by other runs; see ci.yml's cache note
           key: ${{ matrix.target }}
       - name: Install cross
         if: matrix.use_cross
@@ -769,6 +770,8 @@ jobs:
           toolchain: 1.98.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # only main's caches are readable by other runs; see ci.yml's cache note
       # The first six are ci.yml's compile set, needed because this job builds
       # `dot-agent-deck-desktop` — five for Tauri and `libasound2-dev` for PRD
       # #802 M7's `cpal`, whose `alsa-sys` build script resolves `alsa` through

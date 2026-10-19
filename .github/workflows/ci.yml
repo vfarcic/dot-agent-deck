@@ -90,6 +90,21 @@ permissions:
   # anything to inspect.
   pull-requests: read
 
+# Rust caches are SAVED only from `main` (`save-if` on every
+# `Swatinem/rust-cache` step) and RESTORED everywhere. A cache saved by a PR or
+# a branch is scoped to that ref — no other PR can read it — yet it counts
+# against the repository's 10 GB limit like any other, and `main`'s own set
+# already fills ~9 GB of it (Rust caches for ten jobs plus the devbox Nix
+# store). Every PR saving its own copies pushed the total over the limit, so
+# GitHub evicted entries continuously — `main`'s included, which every PR
+# restores from — and about half of `main`'s runs restored no Rust cache at all
+# (measured 2026-10-18: 11.9 GB in 1,628 entries). With saves on `main` only,
+# a PR restores `main`'s warm cache and adds nothing. A PR that changes
+# Cargo.lock restores the nearest older `main` entry (rust-cache falls back by
+# key prefix) and builds the difference. The devbox job's
+# `devbox-install-action` cache has no equivalent switch and still saves per
+# ref.
+#
 # Issue #811 — every `actions/checkout` in this file carries
 # `persist-credentials: false`. The action defaults that input to TRUE, which
 # makes it run `git config --local http.https://github.com/.extraheader` in the
@@ -499,6 +514,8 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       # Exact, and in lockstep with devbox.json — see `desktop-web` above.
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
@@ -594,6 +611,8 @@ jobs:
           toolchain: 1.98.1
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       # The desktop crate's Linux build deps, needed because clippy/nextest below
       # run with --workspace, which includes desktop/src-tauri
       # (dot-agent-deck-desktop). Without them that crate fails to build on this
@@ -674,6 +693,8 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       # The desktop crate's Linux build deps — the comment on `clippy`'s copy of
       # this step has why, and where else the same set is declared.
       - run: |
@@ -703,6 +724,8 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-nextest@0.9.146
@@ -891,6 +914,8 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-nextest@0.9.146
@@ -1076,6 +1101,8 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, and
       # both of the harness's namespaces are unprivileged ones. The runner is a
       # throwaway VM, so lifting that confinement for the job is the setting it
@@ -1238,6 +1265,8 @@ jobs:
           toolchain: 1.98.1
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - name: Type-check the workspace for Windows from Linux
         run: |
           set -euo pipefail
@@ -1346,6 +1375,8 @@ jobs:
           targets: x86_64-pc-windows-msvc
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-nextest@0.9.146
@@ -1419,6 +1450,8 @@ jobs:
           toolchain: 1.98.1
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-nextest@0.9.146
@@ -1487,6 +1520,8 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
