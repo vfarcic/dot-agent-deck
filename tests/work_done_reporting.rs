@@ -10,11 +10,13 @@
 //!
 //! These tests drive the real `AppState::handle_delegate` /
 //! `AppState::handle_work_done` against daemon-owned PTYs, with the role maps
-//! populated exactly as `StartAgent` would populate them. The orchestrator pane is
-//! a raw, no-echo `cat`, so every byte the daemon submits into it appears exactly
-//! once in its observable snapshot and nothing else does — which makes both
-//! "this text was submitted" and "this text was NOT submitted" directly
-//! observable. Worker panes are plain `cat`.
+//! populated exactly as `StartAgent` would populate them. Since PRD #1666 S5 the
+//! daemon types nothing: what it tells a pane is a message in that pane's inbox,
+//! so the observable is the inbox, read whole and rendered as `inbox fetch`
+//! would print it ([`AgentPtyRegistry::inbox`]'s `rendered`) — which makes both
+//! "this was posted" and "this was NOT posted" directly observable. The panes
+//! are still real PTYs (raw `cat`s), so a test can also prove that nothing was
+//! typed into one.
 //!
 //! The first three cases are the three things the old code could not tell apart:
 //! a completion nobody commissioned (#448), a commissioned completion whose
@@ -33,7 +35,7 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DoorbellWrite, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::dispatch_return::DispatchCaller;
 use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
@@ -49,10 +51,12 @@ const WORKER_ROLE: &str = "coder";
 const ORCHESTRATION: &str = "work-done-test-orchestration";
 const ORCHESTRATION_INSTANCE: &str = "work-done-test-orchestration-instance-1";
 
-/// The daemon's unchanged happy-path pointer. Its ABSENCE is the assertion in two
-/// of these tests: pointing an orchestrator at a file the daemon did not write is
-/// exactly the #433 defect, and it is what the daemon used to do unconditionally.
-const POINTER_NEEDLE: &str = "Read .dot-agent-deck/work-done-coder.md for their full report.";
+/// The daemon's happy-path note that the report was filed. Its ABSENCE is the
+/// assertion in two of these tests: pointing an orchestrator at a file the daemon
+/// did not write is exactly the #433 defect, and it is what the daemon used to do
+/// unconditionally.
+const POINTER_NEEDLE: &str =
+    "Their full report is also saved at .dot-agent-deck/work-done-coder.md.";
 
 /// The #448 label. Spelled out here rather than imported from `src/` so a silent
 /// rewording of the daemon's own template fails these tests instead of following
@@ -178,12 +182,12 @@ impl WorkDoneHarness {
             event_tx,
             orchestrator_agent_id,
         };
-        let ready = harness
-            .wait_for_orchestrator(
-                |snapshot| snapshot.contains("ORCH-READY"),
-                Duration::from_secs(5),
-            )
-            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut ready = harness.orchestrator_pty();
+        while !ready.contains("ORCH-READY") && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            ready = harness.orchestrator_pty();
+        }
         assert!(
             ready.contains("ORCH-READY"),
             "orchestrator raw-cat stub never became ready; snapshot = {ready:?}"
@@ -232,7 +236,9 @@ impl WorkDoneHarness {
         self.cwd.path().join(".dot-agent-deck/work-done-coder.md")
     }
 
-    fn orchestrator_snapshot(&self) -> String {
+    /// What the orchestrator's PTY has shown — its readiness marker, and any
+    /// byte typed into it.
+    fn orchestrator_pty(&self) -> String {
         String::from_utf8_lossy(
             &self
                 .registry
@@ -240,6 +246,12 @@ impl WorkDoneHarness {
                 .unwrap_or_default(),
         )
         .into_owned()
+    }
+
+    /// Everything the daemon has posted to the orchestrator pane's inbox, in
+    /// order, each message rendered whole as `inbox fetch` would print it.
+    fn orchestrator_snapshot(&self) -> String {
+        inbox_text(&self.registry, ORCH_PANE)
     }
 
     async fn wait_for_orchestrator(
@@ -262,6 +274,28 @@ impl Drop for WorkDoneHarness {
     fn drop(&mut self) {
         self.registry.shutdown_all();
     }
+}
+
+/// PRD #1666 S5: every message in `pane_id`'s inbox, live and recent history,
+/// rendered whole and joined in order. Reading it changes no state.
+fn inbox_text(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+    registry
+        .inbox()
+        .rendered(pane_id)
+        .into_iter()
+        .map(|delivery| delivery.text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// PRD #1666 S5: the agent ids `pane_id`'s inbox messages are bound to.
+fn bound_agents(registry: &AgentPtyRegistry, pane_id: &str) -> Vec<Option<String>> {
+    registry
+        .inbox()
+        .list(pane_id)
+        .into_iter()
+        .map(|message| message.bind_agent)
+        .collect()
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -317,7 +351,7 @@ fn work_done_001_unsolicited_completion_is_labelled_and_clobbers_nothing() {
     });
 }
 
-/// Scenario: On a project whose config sets `worker_response_timeout_minutes = 0` — the idle detector switched off, so neither delegation watch arms anything at all — delegate to `coder` and then have it report `work-done`. The orchestrator pane must receive the ordinary completion pointer, with no unsolicited label anywhere, and the summary file must hold the new report.
+/// Scenario: On a project whose config sets `worker_response_timeout_minutes = 0` — the idle detector switched off, so neither delegation watch arms anything at all — delegate to `coder` and then have it report `work-done`. The orchestrator's inbox must receive the ordinary completion, naming the filed report, with the report itself framed as untrusted and no unsolicited label anywhere, and the summary file must hold the new report.
 #[spec("orchestration/work-done/002")]
 #[test]
 fn work_done_002_disabled_idle_detector_still_reports_a_genuine_completion() {
@@ -353,8 +387,8 @@ fn work_done_002_disabled_idle_detector_still_reports_a_genuine_completion() {
              snapshot = {snapshot:?}"
         );
         assert!(
-            !snapshot.contains(REPORT_FRAME_NEEDLE),
-            "the happy path stays a short pointer; the report belongs in the file; \
+            snapshot.contains(REPORT_FRAME_NEEDLE) && snapshot.contains(FRESH_SENTINEL),
+            "the report itself travels in the message, framed as untrusted; \
              snapshot = {snapshot:?}"
         );
         assert!(
@@ -412,38 +446,22 @@ fn work_done_003_failed_summary_write_inlines_the_report_instead_of_pointing_at_
 }
 
 /// The daemon's own respawn-failure report's opening clause, and the test's
-/// synchronization edge: `dispatch_one_owned` submits it into the orchestrator
-/// pane immediately before the error return under audit, so observing it proves
-/// the dispatch task has reached that arm and the test never has to guess at
-/// timing. Spelled out here rather than imported, like the needles above.
+/// synchronization edge: `dispatch_one_owned` posts it to the orchestrator's
+/// inbox immediately before the error return under audit, so observing it
+/// proves the dispatch task has reached that arm and the test never has to
+/// guess at timing. Spelled out here rather than imported, like the needles
+/// above.
 const RESPAWN_FAILED_NEEDLE: &str =
     "delegated worker respawn failed (dot-agent-deck daemon report)";
 
-/// Issue #1337: the report's stable FINAL clause. It ends in `.`, which the
-/// payload encoding's trailing-whitespace trim cannot eat, so the byte after it
-/// is exactly the terminator the daemon chose — CR if it SUBMITTED the report,
-/// LF if it left it as deferred scrollback.
+/// The report's stable final clause.
 const RESPAWN_FAILED_TAIL: &str = "daemon log names the role and the error.";
 
-/// Issue #1337: the byte after each respawn-failure report's final clause, in
-/// order — one entry per opening clause, `None` for a report whose final clause
-/// or terminator has not landed yet. Anchored to the report's own opening and
-/// final clauses rather than to the first line break after it began, so an
-/// unrelated line break cannot be mistaken for the terminator in either
-/// direction.
-fn respawn_failed_terminators(snapshot: &str) -> Vec<Option<u8>> {
-    snapshot
-        .match_indices(RESPAWN_FAILED_NEEDLE)
-        .map(|(start, _)| {
-            let rest = &snapshot[start..];
-            let end = rest.find(RESPAWN_FAILED_TAIL)? + RESPAWN_FAILED_TAIL.len();
-            rest.as_bytes().get(end).copied()
-        })
-        .collect()
-}
+/// The label every daemon notice is posted under.
+const DAEMON_NOTICE_LABEL: &str = "from dot-agent-deck (daemon notice)]";
 
-/// Issue #1337: every respawn-failure report in the pane, from its opening
-/// clause to its final clause, so the test can say what the text carries.
+/// Every respawn-failure report in the inbox text, from its opening clause to
+/// its final clause, so the test can say what the text carries.
 fn respawn_failed_reports(snapshot: &str) -> Vec<&str> {
     snapshot
         .match_indices(RESPAWN_FAILED_NEEDLE)
@@ -455,7 +473,7 @@ fn respawn_failed_reports(snapshot: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Scenario: On a project whose `coder` role sets `clear = true`, points at a binary that does not exist, and whose idle detector is switched off, delegate so the respawn kills the live worker and then fails to replace it, then have that same worker pane report `work-done` — the case of a person tasking it directly afterwards. The orchestrator pane must be handed a SUBMITTED respawn-failure report that names no role, and must then report the completion as one it never commissioned, never pointing at a summary file. After the user types into the orchestrator, a second delegate must produce a second, identical report that is still submitted.
+/// Scenario: A failed clear-enabled respawn must post a notice, release its commission, label the next work-done unsolicited, and permit a second delegation. Separately, hold an admitted non-clearing dispatch, remove its live worker, then release the dispatch; the unresolved target must get no task and its following report must also remain unsolicited, with no commissioned summary file.
 #[spec("orchestration/work-done/005")]
 #[test]
 fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
@@ -500,19 +518,10 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
              snapshot = {after_delegate:?}"
         );
 
-        // Issue #1337, both halves. The report must be SUBMITTED — an LF line
-        // in scrollback reaches nobody in an unattended dispatched unit — and it
-        // must interpolate no config-supplied role name (PRD #249 finding B3);
-        // the pane id is masked first because it happens to contain the role's
-        // name. Verified red on the pre-fix build: the old text was
-        // `⚠ respawn failed for role 'coder' on pane work-done-coder-pane (see
-        // daemon log for details)` followed by LF (`terminator = Some(10)`).
-        let after_delegate = harness
-            .wait_for_orchestrator(
-                |snapshot| matches!(respawn_failed_terminators(snapshot).first(), Some(Some(_))),
-                Duration::from_secs(5),
-            )
-            .await;
+        // Issue #1337: the report interpolates no config-supplied role name
+        // (PRD #249 finding B3); the pane id is masked first because it happens
+        // to contain the role's name. PRD #1666 S5: it is a daemon notice in the
+        // orchestrator's inbox, not text typed into its pane.
         let report = respawn_failed_reports(&after_delegate)
             .first()
             .copied()
@@ -526,14 +535,20 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
             report.contains(WORKER_PANE),
             "the report must name the worker pane it is about; report = {report:?}"
         );
-        assert_eq!(
-            respawn_failed_terminators(&after_delegate)
-                .first()
-                .copied()
-                .flatten(),
-            Some(b'\r'),
-            "the respawn-failure report must be SUBMITTED (CR after its final clause), not left \
-             as an LF line in scrollback; snapshot = {after_delegate:?}"
+        assert!(
+            after_delegate.contains(DAEMON_NOTICE_LABEL),
+            "the respawn-failure report must be posted as a daemon notice; \
+             inbox = {after_delegate:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(
+                &harness
+                    .registry
+                    .snapshot(&harness.orchestrator_agent_id)
+                    .unwrap_or_default()
+            )
+            .contains(RESPAWN_FAILED_NEEDLE),
+            "nothing of the report may be typed into the orchestrator's pane"
         );
         // The ledger is settled before the report goes out, so anything that
         // answers the report finds no commission left to spend. Released after
@@ -576,29 +591,72 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
 
         // Second-failure arm (issue #1337): the role command is still broken,
         // so the next delegate fails the same way and composes a BYTE-IDENTICAL
-        // report. A person typing into the orchestrator in between arms the
-        // repeat-payload refusal; the report's payload record must have been
-        // released on `Applied`, or the second report is refused as a repeat of
-        // the user's own input and the orchestrator is never told.
+        // report. A person typing into the orchestrator in between holds nothing
+        // back: the report is a message, not a write into the user's input.
         harness.registry.note_user_input(ORCH_PANE);
         harness.delegate().await;
         let after_second = harness
             .wait_for_orchestrator(
-                |snapshot| {
-                    let terminators = respawn_failed_terminators(snapshot);
-                    terminators.len() >= 2 && terminators[1].is_some()
-                },
+                |snapshot| respawn_failed_reports(snapshot).len() >= 2,
                 Duration::from_secs(5),
             )
             .await;
-        let terminators = respawn_failed_terminators(&after_second);
+        let reports = respawn_failed_reports(&after_second);
         assert_eq!(
-            terminators.get(1).copied().flatten(),
-            Some(b'\r'),
-            "a second, byte-identical respawn-failure report must still be submitted after user \
-             input; terminators so far = {terminators:?}; snapshot = {after_second:?}"
+            reports.len(),
+            2,
+            "a second, byte-identical respawn-failure report must still be posted after user \
+             input; inbox = {after_second:?}"
         );
+        assert_eq!(reports[0], reports[1], "the two reports are the same text");
+        assert_queued_dispatch_with_an_unresolved_worker_releases_its_commission().await;
     });
+}
+
+async fn assert_queued_dispatch_with_an_unresolved_worker_releases_its_commission() {
+    let harness = WorkDoneHarness::new(Some("worker_response_timeout_minutes = 0\n")).await;
+    let order = harness.registry.pane_dispatch_order_lock(WORKER_PANE);
+    let held = order.lock().await;
+    let response = harness.delegate().await;
+    assert_eq!(
+        response.message_ids.len(),
+        1,
+        "delegate must be admitted before the worker exits"
+    );
+    // A deterministic dispatch-time refusal: queue the real handler while the
+    // worker is live, remove that generation, then let its dispatch proceed.
+    let worker = harness.registry.pane_current_agent_id(WORKER_PANE).unwrap();
+    harness
+        .registry
+        .close_agent(&worker)
+        .expect("close only this worker");
+    drop(held);
+    let notice = harness
+        .wait_for_orchestrator(
+            |text| text.contains("delegated worker never came up"),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        notice.contains("NOT delivered"),
+        "unresolved worker must be reported: {notice}"
+    );
+    assert!(harness.registry.inbox().rendered(WORKER_PANE).is_empty());
+    harness
+        .work_done("UNSOLICITED-AFTER-UNRESOLVED-DISPATCH")
+        .await;
+    let report = harness
+        .wait_for_orchestrator(
+            |text| text.contains("UNSOLICITED-AFTER-UNRESOLVED-DISPATCH"),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        report.contains(UNSOLICITED_NEEDLE),
+        "refused dispatch must release its own commission: {report}"
+    );
+    assert!(!report.contains(POINTER_NEEDLE), "{report}");
+    assert!(!harness.summary_path().exists());
 }
 
 /// A raw, no-echo `cat` successor for the orchestrator pane, carrying the same
@@ -641,12 +699,13 @@ const SUCCESSOR_READY: &str = "SUCCESSOR-ORCH-READY";
 const SUCCESSOR_BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-4d02";
 
 /// Scenario: Delegate to `coder` and let it report `work-done` once, proving this
-/// fixture delivers the completion feedback into the orchestrator pane; then
-/// delegate again and restart the orchestrator in place — the pane keeps its id,
-/// role and orchestration, but a NEW agent owns it — before the worker reports.
-/// The second completion must not be typed into that successor: its scrollback
-/// must still hold its own readiness marker and a later authorized write, and
-/// none of the feedback.
+/// fixture posts the completion to the orchestrator's inbox; then delegate again
+/// and restart the orchestrator in place — the pane keeps its id, role and
+/// orchestration, but a NEW agent owns it — before the worker reports. The
+/// second completion was commissioned by the old orchestrator, so it must not
+/// reach that successor: nothing in the pane's inbox is bound to the successor,
+/// no second report is posted, and its scrollback holds its own readiness
+/// marker and a later authorized write, and none of the feedback.
 #[spec("orchestration/work-done/006")]
 #[test]
 fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() {
@@ -713,18 +772,25 @@ fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() 
             .work_done(&format!("Finished the second delegation. {FRESH_SENTINEL}"))
             .await;
 
-        // A barrier rather than a sleep: an authorized write that has
-        // demonstrably arrived proves the successor's PTY has drained past the
-        // point where leaked feedback would have landed.
+        // A barrier rather than a sleep: an authorized write — the doorbell's,
+        // the one automatic writer the deck keeps — that has demonstrably
+        // arrived proves the successor's PTY has drained past the point where
+        // leaked feedback would have landed.
         let barrier = harness
             .registry
-            .write_and_submit_guarded(ORCH_PANE, SUCCESSOR_BARRIER, &successor, || async { true })
-            .await
-            .expect("the barrier write must reach the registry");
+            .write_doorbell(
+                ORCH_PANE,
+                &successor,
+                false,
+                None,
+                Some(SUCCESSOR_BARRIER),
+                || async { true },
+            )
+            .await;
         assert_eq!(
             barrier,
-            GuardedSend::Applied,
-            "the successor owns the pane, so a write bound to IT must be applied — otherwise \
+            DoorbellWrite::Written,
+            "the successor owns the pane, so a write bound to IT must go in — otherwise \
              this test proves nothing about the refusal"
         );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -738,6 +804,21 @@ fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() 
             snapshot.contains(SUCCESSOR_BARRIER),
             "the barrier write never reached the successor's PTY, so the absence below is \
              untested; snapshot = {snapshot:?}"
+        );
+        assert!(
+            !bound_agents(&harness.registry, ORCH_PANE).contains(&Some(successor.clone())),
+            "a previous conversation's completion report was posted to an agent that merely \
+             inherited the orchestrator's pane id; inbox = {:?}",
+            harness.registry.inbox().list(ORCH_PANE)
+        );
+        assert_eq!(
+            harness
+                .orchestrator_snapshot()
+                .matches(POINTER_NEEDLE)
+                .count(),
+            1,
+            "only the first completion may have been posted; inbox = {:?}",
+            harness.orchestrator_snapshot()
         );
         assert!(
             !snapshot.contains(POINTER_NEEDLE)
@@ -841,13 +922,14 @@ async fn barrier_dispatch_return_observer(
     barrier: &str,
 ) -> String {
     let outcome = registry
-        .write_and_submit_guarded(pane_id, barrier, agent_id, || async { true })
-        .await
-        .expect("the barrier write must reach the registry");
+        .write_doorbell(pane_id, agent_id, false, None, Some(barrier), || async {
+            true
+        })
+        .await;
     assert_eq!(
         outcome,
-        GuardedSend::Applied,
-        "the observer owns the pane, so its barrier write must be applied"
+        DoorbellWrite::Written,
+        "the observer owns the pane, so its barrier write must go in"
     );
     let snapshot = wait_for_dispatch_return_snapshot(registry, agent_id, barrier).await;
     assert!(
@@ -941,7 +1023,7 @@ impl Drop for DispatchReturnHarness {
     }
 }
 
-/// Scenario: Retain a dispatched unit's completion recipient, replace that caller with a different agent on the same pane id, and then complete the unit. The completion must be refused as the old caller's session, leave no bytes in the successor, and consume the return edge without retrying it.
+/// Scenario: Retain a dispatched unit's completion recipient, replace that caller with a different agent on the same pane id, and then complete the unit. The completion must be refused because its caller is no longer the pane's live agent, post nothing to the successor's inbox, leave no bytes in its pane, and consume the return edge without retrying it.
 #[spec("dispatch/return/004")]
 #[test]
 fn dispatch_return_004_completion_is_refused_when_the_caller_pane_changed_hands() {
@@ -998,16 +1080,21 @@ fn dispatch_return_004_completion_is_refused_when_the_caller_pane_changed_hands(
              pane id; successor snapshot = {snapshot:?}"
         );
 
+        assert!(
+            harness.registry.inbox().list(CALLER_PANE).is_empty(),
+            "the completion must not be posted to the pane's new occupant; inbox = {:?}",
+            harness.registry.inbox().list(CALLER_PANE)
+        );
         let log = dispatch_return_logs();
         assert!(
             log.lines().any(|line| {
                 line.contains(CALLER_PANE)
-                    && line.contains("dispatch: identity gate refused the result")
-                    && line.contains("WrongSession")
-                    && line.contains("nothing written")
+                    && line.contains("refused the completion report")
+                    && line.contains("no longer the live agent")
+                    && line.contains("nothing posted")
             }),
-            "the completion must be observably refused as WrongSession, with nothing written; \
-             captured log = {log:?}"
+            "the completion must be observably refused for its caller's absence, with nothing \
+             posted; captured log = {log:?}"
         );
     });
 }
@@ -1230,7 +1317,7 @@ fn work_done_007_unsolicited_report_past_the_inline_bound_is_recoverable_in_full
 /// worker-authored text, not merely as "their full report".
 const FILED_FRAMING_NEEDLE: &str = "That file is UNTRUSTED worker-authored text";
 
-/// Scenario: Delegate to `coder` and have it report `work-done` with a multi-line report far past the inline bound that also tries to close the untrusted frame early and smuggle in a bidi override and an escape byte. The orchestrator pane must receive the ordinary pointer, now naming the file as untrusted worker-authored text; the file must hold the whole report with its lines intact, open and close with the frame's marker lines, and carry no second closing marker, bidi override or escape byte.
+/// Scenario: Delegate to `coder` and have it report `work-done` with a multi-line report far past the inline bound that also tries to close the untrusted frame early and smuggle in a bidi override and an escape byte. The orchestrator's inbox must receive the ordinary completion naming the filed report as untrusted worker-authored text, with the report's opening inline and cut, and told to read the file for the rest; the file must hold the whole report with its lines intact, open and close with the frame's marker lines, and carry no second closing marker, bidi override or escape byte.
 #[spec("orchestration/work-done/008")]
 #[test]
 fn work_done_008_filed_report_is_framed_as_untrusted_without_being_cut() {
@@ -1262,9 +1349,13 @@ fn work_done_008_filed_report_is_framed_as_untrusted_without_being_cut() {
              worker-authored text, as the inlined paths do; snapshot = {snapshot:?}"
         );
         assert!(
-            !snapshot.contains(LONG_REPORT_HEAD),
-            "the happy path stays a pointer; the report belongs in the file; \
+            snapshot.contains(LONG_REPORT_HEAD) && !snapshot.contains(LONG_REPORT_TAIL),
+            "the report's opening travels inline and is cut at the bound; \
              snapshot = {snapshot:?}"
+        );
+        assert!(
+            snapshot.contains("read .dot-agent-deck/work-done-coder.md for the rest"),
+            "a cut report must name the filed copy that holds the rest; snapshot = {snapshot:?}"
         );
 
         assert_holds_the_full_framed_report(&harness.summary_path(), &clean);
@@ -1286,7 +1377,7 @@ fn work_done_008_filed_report_is_framed_as_untrusted_without_being_cut() {
     });
 }
 
-/// Scenario: Retain a dispatched unit's return edge and complete the unit with a multi-line report far past the 4000-character inline bound. The caller pane must receive the completion turn with the report's opening inline, and must be told a file path that holds the whole report, line structure intact and framed as untrusted.
+/// Scenario: Retain a dispatched unit's return edge and complete the unit with a multi-line report far past the 4000-character inline bound. The caller's inbox must receive the completion with the report's opening inline, and must be told a file path that holds the whole report, line structure intact and framed as untrusted.
 #[spec("dispatch/return/007")]
 #[test]
 fn dispatch_return_007_report_past_the_inline_bound_is_recoverable_in_full() {
@@ -1303,12 +1394,12 @@ fn dispatch_return_007_report_past_the_inline_bound_is_recoverable_in_full() {
         let report = long_report("dispatch-d7");
         harness.complete(UNIT_PANE, &report).await;
 
-        let snapshot = wait_for_dispatch_return_snapshot(
-            &harness.registry,
-            &harness.caller_agent_id,
-            LONG_REPORT_HEAD,
-        )
-        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut snapshot = inbox_text(&harness.registry, CALLER_PANE);
+        while !snapshot.contains(LONG_REPORT_HEAD) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            snapshot = inbox_text(&harness.registry, CALLER_PANE);
+        }
         assert!(
             snapshot.contains("dispatch: a unit you dispatched has completed")
                 && snapshot.contains(REPORT_FRAME_NEEDLE)
@@ -1416,9 +1507,19 @@ fn work_done_011_abandoned_close_does_not_make_the_deck_deny_a_real_delegation()
 /// its own — no `StopAgent`, no close, nothing the daemon asked for.
 const WORKER_EXIT_TRIGGER: &str = "worker-exit-now";
 
-/// The pointer `handle_delegate` writes into the worker's pane, matched with
-/// whitespace squeezed out because a long pointer wraps at the pane's width.
-const WORKER_TASK_POINTER: &str = "worker-task-coder.md";
+/// PRD #1666 S5: how many delegated tasks in `pane_id`'s inbox are bound to
+/// `agent_id` — what `handle_delegate` now posts instead of typing a pointer.
+fn tasks_bound_to(registry: &AgentPtyRegistry, pane_id: &str, agent_id: &str) -> usize {
+    registry
+        .inbox()
+        .list(pane_id)
+        .into_iter()
+        .filter(|message| {
+            message.bind_agent.as_deref() == Some(agent_id)
+                && message.subject.starts_with("task from the orchestrator")
+        })
+        .count()
+}
 
 /// Poll `condition` every 20 ms until it holds or `timeout` elapses, without
 /// blocking the runtime the dispatch tasks run on.
@@ -1440,18 +1541,7 @@ async fn poll_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
 /// laundered completion would overwrite.
 const COMMISSIONED_SENTINEL: &str = "commissioned-report-body-5e2c";
 
-/// How many times `needle` occurs in `pane`'s scrollback, with whitespace
-/// squeezed out of both so a pointer wrapped at the pane's width still counts.
-fn squeezed_count(registry: &AgentPtyRegistry, agent_id: &str, needle: &str) -> usize {
-    let squeezed: String =
-        String::from_utf8_lossy(&registry.snapshot(agent_id).unwrap_or_default())
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-    squeezed.matches(needle).count()
-}
-
-/// Scenario: Delegate to `coder` and let it report, so the deck files that report at `.dot-agent-deck/work-done-coder.md`; delegate again and wait until the task pointer is in its pane, then let the worker's process EXIT ON ITS OWN — no `StopAgent`, no pane close — and start a different agent in the same pane id. That successor was never delegated to, so when it reports `work-done` the orchestrator must be told the deck has no outstanding delegation on record, must not get a second "has completed their task" pointer, and the first report must still be the one in `work-done-coder.md`.
+/// Scenario: Delegate to `coder` and let it report, so the deck files that report at `.dot-agent-deck/work-done-coder.md`; delegate again and wait until the task is in its inbox, then let the worker's process EXIT ON ITS OWN — no `StopAgent`, no pane close — and start a different agent in the same pane id. That successor was never delegated to, so when it reports `work-done` the orchestrator must be told the deck has no outstanding delegation on record, must not get a second "has completed their task" pointer, and the first report must still be the one in `work-done-coder.md`.
 #[spec("orchestration/work-done/014")]
 #[test]
 fn work_done_014_a_successor_in_an_exited_worker_s_pane_does_not_inherit_its_commission() {
@@ -1496,14 +1586,13 @@ fn work_done_014_a_successor_in_an_exited_worker_s_pane_does_not_inherit_its_com
         // ---- A SECOND DELEGATION, OWED BY THE FIRST WORKER -----------------
         harness.delegate().await;
         let delivered = poll_until(Duration::from_secs(20), || {
-            squeezed_count(&harness.registry, &first_worker, WORKER_TASK_POINTER) >= 2
+            tasks_bound_to(&harness.registry, WORKER_PANE, &first_worker) >= 2
         })
         .await;
         assert!(
             delivered,
-            "control — the second task pointer never reached the first worker's pane; \
-             snapshot = {:?}",
-            String::from_utf8_lossy(&harness.registry.snapshot(&first_worker).unwrap_or_default())
+            "control — the second task never reached the first worker's inbox; inbox = {:?}",
+            harness.registry.inbox().list(WORKER_PANE)
         );
         assert!(
             harness
@@ -1581,7 +1670,7 @@ fn work_done_014_a_successor_in_an_exited_worker_s_pane_does_not_inherit_its_com
     });
 }
 
-/// Scenario: Delegate to `coder` and wait for the task pointer, then delegate again without `--supersede` and see it refused as busy, because that worker still owes a `work-done`. Let the worker's process EXIT ON ITS OWN without reporting and start a different agent in the same pane id; a delegate to `coder` must now be accepted without `--supersede`, and its task pointer must reach the successor.
+/// Scenario: Delegate to `coder` and wait for the task to reach its inbox, then delegate again without `--supersede` and see it refused as busy, because that worker still owes a `work-done`. Let the worker's process EXIT ON ITS OWN without reporting and start a different agent in the same pane id; a delegate to `coder` must now be accepted without `--supersede`, and its task must be posted to the successor.
 #[spec("orchestration/delegate/050")]
 #[test]
 fn delegate_050_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_busy() {
@@ -1606,13 +1695,13 @@ fn delegate_050_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
             "control — a delegate to the idle first worker must be dispatched; reply = {first:?}"
         );
         let delivered = poll_until(Duration::from_secs(20), || {
-            squeezed_count(&harness.registry, &first_worker, WORKER_TASK_POINTER) >= 1
+            tasks_bound_to(&harness.registry, WORKER_PANE, &first_worker) >= 1
         })
         .await;
         assert!(
             delivered,
-            "control — the task pointer never reached the first worker's pane; snapshot = {:?}",
-            String::from_utf8_lossy(&harness.registry.snapshot(&first_worker).unwrap_or_default())
+            "control — the task never reached the first worker's inbox; inbox = {:?}",
+            harness.registry.inbox().list(WORKER_PANE)
         );
 
         // ---- CONTROL: the busy refusal is live while that worker owes it ------
@@ -1675,13 +1764,13 @@ fn delegate_050_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
              delegate; reply = {reply:?}"
         );
         let reached = poll_until(Duration::from_secs(20), || {
-            squeezed_count(&harness.registry, &successor, WORKER_TASK_POINTER) >= 1
+            tasks_bound_to(&harness.registry, WORKER_PANE, &successor) >= 1
         })
         .await;
         assert!(
             reached,
-            "the task pointer never reached the successor; snapshot = {:?}",
-            String::from_utf8_lossy(&harness.registry.snapshot(&successor).unwrap_or_default())
+            "the task never reached the successor's inbox; inbox = {:?}",
+            harness.registry.inbox().list(WORKER_PANE)
         );
     });
 }

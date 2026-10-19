@@ -13,7 +13,7 @@ use std::time::Duration;
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
 use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
-use dot_agent_deck::event::SendResult;
+
 use serde_json::{Value, json};
 use spec::spec;
 
@@ -213,8 +213,7 @@ fn newagent_live_001_a_real_agent_reports_a_sentinel_from_the_browsed_directory(
         })
         .to_string();
 
-    let session_id =
-        events.wait_for_session_start_on_pane(PANE_ID, &agent_id, Duration::from_secs(180));
+    events.wait_for_session_start_on_pane(PANE_ID, &agent_id, Duration::from_secs(180));
     deck.wait_for_absence("No active agents");
     deck.send_keys(b"1");
 
@@ -228,22 +227,8 @@ fn newagent_live_001_a_real_agent_reports_a_sentinel_from_the_browsed_directory(
         eprintln!("warning: the new-agent pane never settled within 180s; delivering anyway");
     }
 
-    let delivery = common::write_and_submit_with_identity_on(
-        &socket,
-        PANE_ID,
-        DIRECTIVE_PROMPT,
-        &agent_id,
-        Some(&session_id),
-    )
-    .expect("WriteAndSubmit the directive prompt over the attach socket");
-    assert_eq!(
-        delivery.send_result,
-        Some(SendResult::Applied),
-        "the daemon refused to deliver the directive to pane {PANE_ID}: error={:?}, \
-         send_result={:?}",
-        delivery.error,
-        delivery.send_result
-    );
+    common::post_message_on(&socket, PANE_ID, &agent_id, DIRECTIVE_PROMPT)
+        .expect("post the directive prompt to the agent's inbox");
 
     const REPORT_WAIT: Duration = Duration::from_secs(240);
     let reported = common::wait_for_pane_text_on(&socket, &agent_id, SENTINEL, REPORT_WAIT);

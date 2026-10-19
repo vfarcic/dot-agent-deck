@@ -51,48 +51,6 @@ describe("terminalInputState", () => {
   );
 
   /**
-   * Scenario: a pane that reads perfectly writable returns `wrong-session` from
-   * a guarded send. That is the whole reason this derivation is hybrid — after
-   * a rollover the lease says `write` precisely when a send would fail — so the
-   * returned verdict has to be able to block a lease that says otherwise.
-   */
-  it("blocks on a wrong-session verdict even though the lease says write", () => {
-    expect(terminalInputState(pane("write"), "wrong-session")).toEqual({
-      state: "wrong-session",
-      readOnly: true,
-      tone: "blocked",
-      notice: "Terminal input unavailable — the pane handle no longer maps to that agent's session.",
-    });
-  });
-
-  /**
-   * Scenario: the three verdicts that mean delivery was not CONFIRMED rather
-   * than that the pane is dead. They warn and leave the input working: the
-   * daemon flattens a refusal caused by the user typing into the pane into
-   * `stale`, so disabling on it would shut the input precisely because somebody
-   * was using it.
-   */
-  it.each(["stale", "ambiguous", "unknown"] satisfies SendResult[])(
-    "warns without disabling on %s",
-    (verdict) => {
-      expect(terminalInputState(pane("write"), verdict)).toEqual({
-        state: verdict,
-        readOnly: false,
-        tone: "unconfirmed",
-        notice: `Delivery was not confirmed — ${sendResultReason(verdict)}.`,
-      });
-    },
-  );
-
-  /**
-   * Scenario: a delivered verdict is not a condition at all — the pane is in
-   * the same state it would be in had nothing been sent.
-   */
-  it.each(["applied", "queued"] satisfies SendResult[])("leaves the input open after a delivered %s", (verdict) => {
-    expect(terminalInputState(pane("write"), verdict)).toEqual({ state: "applied", readOnly: false, tone: "open" });
-  });
-
-  /**
    * Scenario: the three agent statuses that had no work in progress to type at
    * before this change, and still do not. The terminal is disabled and carries
    * the status sentence, and no `data-input-state` is claimed — nothing here

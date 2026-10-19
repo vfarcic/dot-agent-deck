@@ -99,6 +99,21 @@ pub const TOOL_NAME: &str = "run_deck_action";
 /// third prompt intervention on this branch to move a failure rather than
 /// remove one, which is the reason to reach for a fixture or a `description`
 /// before reaching for this paragraph.
+///
+/// # The start sentence says where a start goes, not where it does not
+///
+/// The stop rule used to end "Words that start something — launch, start,
+/// create, run — never ask to stop, however urgently they are said" (issue
+/// #1491). Saying where a start does NOT go pulled it there: a bare "start it"
+/// with the New agent dialog closed was answered `stop_agent` in 34 of 60
+/// replays of the captured request against `gpt-5-mini` with that sentence and
+/// the stop's own "start it is never this one" (2026-10-15, PRD #1666). With
+/// both removed it was 0–5 of 60, but other fixtures lost runs without the
+/// sentence ("show me everything" 14 of 20 against 19, "Daemon BuildBoxDeck."
+/// 15 of 20 against 20). Naming the action a start IS answered by keeps them
+/// (20 and 19 of 20) at 9 of 60 stop picks; "ask to start" in its place left
+/// 28 of 60. A stop picked for words that hold no stop word is refused, or read
+/// as the start those words ground (`outcome::UNGROUNDED_READS_AS`).
 pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked for. Pick exactly one. \
     Every action is listed whether or not it can run right now: `callable: false` \
     means it exists but the current screen cannot run it, and picking it is the \
@@ -159,8 +174,8 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     action that stops nothing, and pick a stop only for words that can only mean \
     stopping. An action that stops something only ASKS: the app shows a \
     confirmation and the user confirms by hand, so pick it whenever the user \
-    asked to stop, however urgently. Words that start something — launch, start, \
-    create, run — never ask to stop, however urgently they are said. Write no prose; the app writes what the \
+    asked to stop, however urgently. A request to start something — launch, start, \
+    create, run — is answered by an action that starts or opens it, however urgently it is said. Write no prose; the app writes what the \
     user reads.";
 
 /// One row as the model sees it, with its availability on the screen the

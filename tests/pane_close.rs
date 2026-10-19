@@ -336,6 +336,7 @@ async fn handle_connection(
                         crashed: None,
                         orchestrator_context_path: None,
                         authoring_kind: None,
+                        inbox: None,
                     }]
                 })
                 .unwrap_or_default();

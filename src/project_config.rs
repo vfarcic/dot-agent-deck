@@ -3,6 +3,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::event::AgentType;
+use crate::inbox::{OrchestrationSubscriptions, RoleSubscriptions, Subscriptions};
 
 pub const CONFIG_FILE_NAME: &str = ".dot-agent-deck.toml";
 
@@ -136,6 +137,57 @@ pub struct ProjectConfig {
     /// Appended at the end of the file it would silently become a key of the
     /// last table and be ignored.
     pub worker_response_timeout_minutes: u64,
+    /// PRD #1666: the topics and offer pools this file subscribes its panes
+    /// to — `subscribe` on an orchestration and on a role, `take_offers` on a
+    /// role, `subscribe` under `[dispatch]`. Kept beside the orchestrations
+    /// rather than on them, index-aligned, so the many places that build a
+    /// role or an orchestration by hand need not know about the inbox.
+    pub inbox: InboxConfig,
+}
+
+/// PRD #1666: what [`ProjectConfig::inbox`] holds, as written (after
+/// `extends`). [`ProjectConfig::subscriptions`] keys it by orchestration name
+/// for the daemon.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InboxConfig {
+    /// One entry per [`ProjectConfig::orchestrations`] entry, same order.
+    pub orchestrations: Vec<OrchestrationSubscriptions>,
+    /// `[dispatch] subscribe`: the topics a pane that dispatched a unit
+    /// receives from that unit's tree.
+    pub dispatch: Vec<String>,
+}
+
+impl ProjectConfig {
+    /// The subscriptions by orchestration name, for scope resolution. Two
+    /// blocks that share a name (a validation warning) subscribe to the
+    /// union of theirs.
+    pub fn subscriptions(&self) -> Subscriptions {
+        let mut out = Subscriptions {
+            dispatch: self.inbox.dispatch.clone(),
+            ..Subscriptions::default()
+        };
+        for (orchestration, subs) in self.orchestrations.iter().zip(&self.inbox.orchestrations) {
+            let entry = out
+                .orchestrations
+                .entry(orchestration.name.clone())
+                .or_default();
+            union(&mut entry.subscribe, &subs.subscribe);
+            for (role, role_subs) in &subs.roles {
+                let into = entry.roles.entry(role.clone()).or_default();
+                union(&mut into.subscribe, &role_subs.subscribe);
+                union(&mut into.take_offers, &role_subs.take_offers);
+            }
+        }
+        out
+    }
+}
+
+fn union(into: &mut Vec<String>, from: &[String]) {
+    for item in from {
+        if !into.contains(item) {
+            into.push(item.clone());
+        }
+    }
 }
 
 /// PRD #126: two hours — long enough that a worker chewing through a real
@@ -400,6 +452,15 @@ struct RawProjectConfig {
     orchestrations: Vec<RawOrchestration>,
     #[serde(default = "default_worker_response_timeout_minutes")]
     worker_response_timeout_minutes: u64,
+    /// PRD #1666: `[dispatch] subscribe`.
+    #[serde(default)]
+    dispatch: Option<RawDispatch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDispatch {
+    #[serde(default)]
+    subscribe: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,6 +483,10 @@ struct RawOrchestration {
     /// file does not contain would be a rule nobody could read off the file.
     #[serde(default)]
     extends: Option<String>,
+    /// PRD #1666: topics every role of this orchestration receives. Omitted in
+    /// a block that `extends` another, the parent's apply.
+    #[serde(default)]
+    subscribe: Option<Vec<String>>,
     #[serde(default)]
     roles: Vec<RawRole>,
 }
@@ -455,16 +520,27 @@ struct RawRole {
     prompt_template: Option<String>,
     #[serde(default)]
     clear: Option<bool>,
+    /// PRD #1666: topics this role receives, beyond its orchestration's.
+    #[serde(default)]
+    subscribe: Option<Vec<String>>,
+    /// PRD #1666: the offer pools this role takes jobs from.
+    #[serde(default)]
+    take_offers: Option<Vec<String>>,
 }
 
 impl TryFrom<RawProjectConfig> for ProjectConfig {
     type Error = String;
 
     fn try_from(raw: RawProjectConfig) -> Result<Self, Self::Error> {
+        let (orchestrations, subscriptions) = resolve_orchestrations(&raw.orchestrations)?;
         Ok(ProjectConfig {
             legacy_modes_declared: raw.modes.is_some(),
-            orchestrations: resolve_orchestrations(&raw.orchestrations)?,
+            orchestrations,
             worker_response_timeout_minutes: raw.worker_response_timeout_minutes,
+            inbox: InboxConfig {
+                orchestrations: subscriptions,
+                dispatch: raw.dispatch.and_then(|d| d.subscribe).unwrap_or_default(),
+            },
         })
     }
 }
@@ -477,15 +553,19 @@ impl TryFrom<RawProjectConfig> for ProjectConfig {
 /// symptom ("orchestration must have at least 2 roles") names neither the typo
 /// nor the file it is in. Loud beats plausible here, and every caller already
 /// distinguishes an unparseable config from an absent one.
-fn resolve_orchestrations(raw: &[RawOrchestration]) -> Result<Vec<OrchestrationConfig>, String> {
-    let mut resolved: Vec<Option<OrchestrationConfig>> = vec![None; raw.len()];
+type ResolvedOrchestration = (OrchestrationConfig, OrchestrationSubscriptions);
+
+fn resolve_orchestrations(
+    raw: &[RawOrchestration],
+) -> Result<(Vec<OrchestrationConfig>, Vec<OrchestrationSubscriptions>), String> {
+    let mut resolved: Vec<Option<ResolvedOrchestration>> = vec![None; raw.len()];
     for i in 0..raw.len() {
         resolve_orchestration_at(raw, i, &mut resolved, &mut Vec::new())?;
     }
     Ok(resolved
         .into_iter()
         .map(|o| o.expect("every index was just resolved"))
-        .collect())
+        .unzip())
 }
 
 /// Resolve one block, resolving its parent first. `stack` carries the chain
@@ -494,7 +574,7 @@ fn resolve_orchestrations(raw: &[RawOrchestration]) -> Result<Vec<OrchestrationC
 fn resolve_orchestration_at(
     raw: &[RawOrchestration],
     index: usize,
-    resolved: &mut Vec<Option<OrchestrationConfig>>,
+    resolved: &mut Vec<Option<ResolvedOrchestration>>,
     stack: &mut Vec<usize>,
 ) -> Result<(), String> {
     if resolved[index].is_some() {
@@ -514,73 +594,101 @@ fn resolve_orchestration_at(
     }
 
     let this = &raw[index];
-    let base: Vec<OrchestrationRoleConfig> = match &this.extends {
-        None => Vec::new(),
-        Some(parent) => {
-            // An unnamed block's `name` is still `""` here — `load_project_config`
-            // normalises it to the cwd basename only AFTER this runs — so an
-            // empty `extends` would silently adopt the first unnamed block as a
-            // parent. Refused rather than allowed, because the rule this module
-            // documents is that a block with no `name` cannot be one, and an
-            // empty value is a typo in every case where it is not.
-            if parent.trim().is_empty() {
-                return Err(format!(
-                    "orchestration '{}' has an empty `extends`. Name the orchestration to inherit \
+    let (base, base_subscriptions): (Vec<OrchestrationRoleConfig>, OrchestrationSubscriptions) =
+        match &this.extends {
+            None => Default::default(),
+            Some(parent) => {
+                // An unnamed block's `name` is still `""` here — `load_project_config`
+                // normalises it to the cwd basename only AFTER this runs — so an
+                // empty `extends` would silently adopt the first unnamed block as a
+                // parent. Refused rather than allowed, because the rule this module
+                // documents is that a block with no `name` cannot be one, and an
+                // empty value is a typo in every case where it is not.
+                if parent.trim().is_empty() {
+                    return Err(format!(
+                        "orchestration '{}' has an empty `extends`. Name the orchestration to inherit \
                      from, or drop the key.",
-                    this.name
-                ));
-            }
-            // Duplicate orchestration names are only a WARNING in
-            // `validate_config`, so a file can legally carry two blocks called
-            // `mixed` — and `position` would silently inherit from whichever was
-            // written first. Without `extends` a duplicate name is merely
-            // confusing (two chips wearing one label); with it, it silently
-            // decides WHICH AGENTS RUN, which is the same position-decides-in-
-            // silence failure issue #704 is about. Refuse instead (Greptile P1 on
-            // PR #711).
-            if raw.iter().filter(|o| o.name == *parent).count() > 1 {
-                return Err(format!(
-                    "orchestration '{}' extends '{parent}', but '{parent}' names more than one \
+                        this.name
+                    ));
+                }
+                // Duplicate orchestration names are only a WARNING in
+                // `validate_config`, so a file can legally carry two blocks called
+                // `mixed` — and `position` would silently inherit from whichever was
+                // written first. Without `extends` a duplicate name is merely
+                // confusing (two chips wearing one label); with it, it silently
+                // decides WHICH AGENTS RUN, which is the same position-decides-in-
+                // silence failure issue #704 is about. Refuse instead (Greptile P1 on
+                // PR #711).
+                if raw.iter().filter(|o| o.name == *parent).count() > 1 {
+                    return Err(format!(
+                        "orchestration '{}' extends '{parent}', but '{parent}' names more than one \
                      `[[orchestrations]]` block in this file, so which one it inherits would be \
                      decided by their order. Give them distinct names.",
-                    this.name
-                ));
-            }
-            let parent_index = raw.iter().position(|o| o.name == *parent).ok_or_else(|| {
-                let defined: Vec<&str> = raw
-                    .iter()
-                    .filter(|o| !o.name.is_empty())
-                    .map(|o| o.name.as_str())
-                    .collect();
-                format!(
-                    "orchestration '{}' extends '{parent}', which is not defined in this \
+                        this.name
+                    ));
+                }
+                let parent_index = raw.iter().position(|o| o.name == *parent).ok_or_else(|| {
+                    let defined: Vec<&str> = raw
+                        .iter()
+                        .filter(|o| !o.name.is_empty())
+                        .map(|o| o.name.as_str())
+                        .collect();
+                    format!(
+                        "orchestration '{}' extends '{parent}', which is not defined in this \
                          file{}",
-                    this.name,
-                    if defined.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (defined: {})", defined.join(", "))
-                    }
-                )
-            })?;
-            stack.push(index);
-            let outcome = resolve_orchestration_at(raw, parent_index, resolved, stack);
-            stack.pop();
-            outcome?;
-            resolved[parent_index]
-                .as_ref()
-                .expect("the parent was just resolved")
-                .roles
-                .clone()
-        }
-    };
+                        this.name,
+                        if defined.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (defined: {})", defined.join(", "))
+                        }
+                    )
+                })?;
+                stack.push(index);
+                let outcome = resolve_orchestration_at(raw, parent_index, resolved, stack);
+                stack.pop();
+                outcome?;
+                let (parent, parent_subscriptions) = resolved[parent_index]
+                    .as_ref()
+                    .expect("the parent was just resolved");
+                (parent.roles.clone(), parent_subscriptions.clone())
+            }
+        };
 
-    resolved[index] = Some(OrchestrationConfig {
-        name: this.name.clone(),
-        default: this.default,
-        roles: apply_role_patches(&this.name, base, &this.roles)?,
-    });
+    let roles = apply_role_patches(&this.name, base, &this.roles)?;
+    let subscriptions = apply_subscription_patches(base_subscriptions, this);
+    resolved[index] = Some((
+        OrchestrationConfig {
+            name: this.name.clone(),
+            default: this.default,
+            roles,
+        },
+        subscriptions,
+    ));
     Ok(())
+}
+
+/// PRD #1666: this block's `subscribe` and its roles' `subscribe` and
+/// `take_offers` over the ones it inherited. The same patch rule as a role's
+/// other fields: an omitted key keeps the parent's value, a written one
+/// replaces it (an empty list clears it).
+fn apply_subscription_patches(
+    mut inherited: OrchestrationSubscriptions,
+    this: &RawOrchestration,
+) -> OrchestrationSubscriptions {
+    if let Some(subscribe) = &this.subscribe {
+        inherited.subscribe = subscribe.clone();
+    }
+    for role in &this.roles {
+        let entry: &mut RoleSubscriptions = inherited.roles.entry(role.name.clone()).or_default();
+        if let Some(subscribe) = &role.subscribe {
+            entry.subscribe = subscribe.clone();
+        }
+        if let Some(take_offers) = &role.take_offers {
+            entry.take_offers = take_offers.clone();
+        }
+    }
+    inherited
 }
 
 /// Merge this block's roles onto the ones it inherited.

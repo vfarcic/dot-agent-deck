@@ -689,7 +689,7 @@ fn selected_style() -> Style {
 /// (the core's checksum command carries two spaces between a hash and a path,
 /// and they must reach the screen as two). A stretch with no such space that
 /// is wider than a row is broken at the row's edge.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
     let mut rows = Vec::new();

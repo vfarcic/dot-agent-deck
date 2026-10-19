@@ -434,6 +434,7 @@ enum CredentialImport {
     OpenCode,
     Codex,
     Devin,
+    Pi,
 }
 
 /// Builder for [`TuiDeck`]. Use the test surface
@@ -451,6 +452,7 @@ pub struct TuiDeckBuilder {
     suppress_success_recording: bool,
     suppress_agent_credentials: bool,
     launch_subdir: Option<PathBuf>,
+    launch_cargo_artifact: bool,
 }
 
 impl TuiDeckBuilder {
@@ -515,6 +517,21 @@ impl TuiDeckBuilder {
         self
     }
 
+    /// Opt out of the checkout containment every other launch gets: run the
+    /// deck straight from cargo's `CARGO_BIN_EXE_…`, a path under the developer's
+    /// checkout, and leave cargo's build directory on `PATH` as the test put it.
+    ///
+    /// For the tests whose subject IS a deck running as a cargo build artifact:
+    /// the durable-path resolver refuses to pin an artifact into agent config
+    /// (`hooks/install/005`), and a deck running from the contained link is not
+    /// one. Nothing that can reach a real agent may use this — the guard in
+    /// `orchestration/dispatch/007` refuses it in every `e2e-live` file — because
+    /// the deck spells its own path into agent text ([`contained_deck_binary`]).
+    pub fn launching_the_cargo_artifact(mut self) -> Self {
+        self.launch_cargo_artifact = true;
+        self
+    }
+
     /// Override the initial PTY size. Resize tests do this when the
     /// behaviour under test depends on a non-default geometry.
     pub fn with_pty_size(mut self, cols: u16, rows: u16) -> Self {
@@ -576,6 +593,20 @@ impl TuiDeckBuilder {
     /// skip a real-Codex test instead of failing during TUI launch.
     pub fn with_imported_codex_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::Codex);
+        self
+    }
+
+    /// Seed Pi's credential for [`pi_test_model`]'s provider into the isolated
+    /// per-test HOME's `.pi/agent` ([`import_pi_credentials`]), where a pane's
+    /// `pi` — and a test that sets `PI_CODING_AGENT_DIR` to that directory —
+    /// reads it. When the provider authenticates through an environment
+    /// variable instead ([`PiTestModel::env_key`]), that variable is forwarded.
+    /// Pair with [`check_pi_available`].
+    pub fn with_imported_pi_credentials(mut self) -> Self {
+        self.credential_imports.push(CredentialImport::Pi);
+        if let Some((key, value)) = pi_env_key() {
+            self = self.with_env(key, value);
+        }
         self
     }
 
@@ -725,6 +756,11 @@ pub struct TuiDeck {
     home: PathBuf,
     hook_socket: PathBuf,
     attach_socket: PathBuf,
+    /// The final attach override, exactly as the deck was launched with it.
+    /// Teardown stops the daemon listening there only when that daemon was
+    /// itself launched with this value ([`stop_fixture_daemon`]), and never
+    /// falls back to the developer's default endpoint.
+    teardown_attach_socket: Option<PathBuf>,
     fixture_path: PathBuf,
     test_name: String,
     cols: u16,
@@ -927,6 +963,7 @@ impl TuiDeck {
             suppress_success_recording: false,
             suppress_agent_credentials: false,
             launch_subdir: None,
+            launch_cargo_artifact: false,
         }
     }
 
@@ -1000,10 +1037,17 @@ impl TuiDeck {
 
         let home = work.join("home");
         std::fs::create_dir_all(&home).expect("create per-test HOME");
+        // The binary this deck runs as: the contained link (PRD #1666), unless
+        // the test opted out with `launching_the_cargo_artifact`.
+        let deck_binary: PathBuf = if builder.launch_cargo_artifact {
+            PathBuf::from(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        } else {
+            contained_deck_binary().to_path_buf()
+        };
         // PRD #381: the durable-path candidate the deck's hook installers
         // resolve, pointed at the binary under test. See `seed_durable_binary`.
         #[cfg(unix)]
-        seed_durable_binary(&home);
+        seed_durable_binary(&home, &deck_binary);
 
         // PRD #201: the per-test HOME deliberately starts WITHOUT the bundled Pi
         // extension. Because `TuiDeck` drives the REAL binary, its lazy-spawned
@@ -1064,6 +1108,12 @@ impl TuiDeck {
                 CredentialImport::Devin => {
                     recording_redactions
                         .extend(import_devin_credentials(&home).map_err(|e| e.to_string())?);
+                }
+                CredentialImport::Pi => {
+                    recording_redactions.extend(
+                        import_pi_credentials(&home.join(".pi").join("agent"))
+                            .map_err(|e| e.to_string())?,
+                    );
                 }
             }
         }
@@ -1167,8 +1217,10 @@ impl TuiDeck {
         // test. The `env!()` evaluates at compile time so the harness
         // always launches whatever the current test build produced
         // (debug vs. release matches the test's profile).
-        let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-        let mut cmd = CommandBuilder::new(bin);
+        //
+        // Run through `contained_deck_binary` rather than from that path
+        // directly, unless the test opted out: see that function.
+        let mut cmd = CommandBuilder::new(&deck_binary);
         // Default: launch at the fixture root. `with_launch_subdir` moves the
         // deck's cwd below it without moving the fixture (issue #577).
         let launch_dir = match &builder.launch_subdir {
@@ -1243,29 +1295,6 @@ impl TuiDeck {
             // within 300s instead of leaking to PID 1 for hours/days. Idle
             // shutdown stays disabled (above) for determinism.
             ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "300"),
-            // PRD #249 M3: the daemon reports a delegated worker that emits no
-            // event within a window (30s by default) as "possibly not
-            // delivered", writing a notice into the ORCHESTRATOR's pane. Most
-            // e2e delegate tests drive stand-in workers (`cat`, recorder
-            // scripts) that legitimately emit nothing, so the report would fire
-            // on every one of them and dirty panes that tests assert stay clean
-            // (`orchestration/delegate/001`). Pinned off here rather than via
-            // `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS=0`, which would also
-            // disable PRD #126's idle-worker detection that other tests
-            // exercise. A test that wants the report overrides it via
-            // `with_env`.
-            ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0"),
-            // PRD #249 M1: ordinary e2e scenarios do not pay the production
-            // post-respawn buffer. The two real readiness scenarios opt back in
-            // explicitly after this pin.
-            ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "0"),
-            // Issue #1383: the daemon re-sends a delegate's task pointer into the
-            // same worker while nothing proves it arrived. Stand-in workers
-            // declared as a real agent emit no event, and several tests count
-            // pointer occurrences, so the production schedule would type
-            // duplicate pointers into them. Pinned off here; a test that wants
-            // the retry overrides it via `with_env`.
-            ("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", "0"),
         ];
         // PATH is required for the deck to spawn its own daemon
         // subcommand (it shells out via `current_exe`, but lookups like
@@ -1350,11 +1379,25 @@ impl TuiDeck {
                 final_env.remove(k);
             }
         }
+        // After the `with_env` layer, because the tests that need the branch
+        // build to win `PATH` put cargo's build directory there themselves.
+        if !builder.launch_cargo_artifact
+            && let Some(path) = final_env.get("PATH")
+        {
+            let contained = contain_path(path);
+            final_env.insert("PATH".into(), contained);
+        }
         // Read AFTER the `with_env` layer, so a test that moves the state dir
         // still gets its own daemon's log dumped rather than a missing path.
         let daemon_log_path = final_env
             .get("DOT_AGENT_DECK_STATE_DIR")
             .map(|dir| PathBuf::from(dir).join("daemon.log"));
+        // Kept verbatim: teardown matches the daemon's own environment against
+        // this value, and a relative one names no fixture, so teardown leaves
+        // it alone rather than this resolving it.
+        let teardown_attach_socket = final_env
+            .get("DOT_AGENT_DECK_ATTACH_SOCKET")
+            .map(PathBuf::from);
         let deck_log_path = final_env
             .get("DOT_AGENT_DECK_LOG")
             .map(PathBuf::from)
@@ -1464,6 +1507,7 @@ impl TuiDeck {
             home,
             hook_socket,
             attach_socket,
+            teardown_attach_socket,
             fixture_path: work,
             test_name,
             cols: builder.cols,
@@ -2225,7 +2269,7 @@ impl TuiDeck {
         // no wider (a trailing NBSP stays significant) (PR #1408 review).
         let is_ours = |e: &dot_agent_deck::event::AgentEvent| {
             e.user_prompt.as_deref().is_some_and(|reported| {
-                dot_agent_deck::prompt_delivery::prompt_submission_matches(prompt, reported)
+                dot_agent_deck::submitted_prompt::prompt_submission_matches(prompt, reported)
             })
         };
         // Submissions reported since typing began. The FIRST one carrying THIS
@@ -2663,9 +2707,8 @@ impl Drop for TuiDeck {
         // makes the spawned deck a session/process-group leader (pgid == pid),
         // so a negative-pid `kill` signals every non-detached descendant in its
         // group (best-effort; ignore errors). Then the normal child kill+wait
-        // as the fallback. (The deck's own lazy-spawned daemon setsid's into a
-        // separate session and escapes this group — its
-        // `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap is the net for that.)
+        // as the fallback. The lazy-spawned daemon has its own session, so it
+        // is identified and stopped separately below.
         #[cfg(unix)]
         if let Some(pid) = self.child.process_id() {
             // SAFETY: kill(2) with a negative pid signals the process group;
@@ -2676,6 +2719,13 @@ impl Drop for TuiDeck {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+
+        // Stop after the TUI so it cannot lazily respawn a daemon, and before
+        // TempDir deletes the agents' working directories. The daemon's
+        // SIGTERM shutdown drains its managed agent trees. Keep the lifetime
+        // cap as the backstop for SIGKILL or a refused or hung stop: Drop
+        // cannot run after a killed test process.
+        self.stop_sandbox_daemon();
 
         if let Some(h) = self.reader_handle.take() {
             let _ = h.join();
@@ -2719,6 +2769,359 @@ impl Drop for TuiDeck {
             }
         }
     }
+}
+
+impl TuiDeck {
+    fn stop_sandbox_daemon(&self) {
+        let Some(socket) = &self.teardown_attach_socket else {
+            return;
+        };
+        match stop_fixture_daemon(self.tempdir.path(), socket) {
+            // A test that points the deck at a daemon it spawned elsewhere
+            // (`DaemonProc`) owns that daemon's teardown; nothing to say.
+            FixtureDaemonStop::OutsideFixture
+            | FixtureDaemonStop::NoDaemon
+            | FixtureDaemonStop::Stopped { .. } => {}
+            outcome => eprintln!("[tui-harness] sandbox daemon at {socket:?}: {outcome:?}"),
+        }
+    }
+}
+
+/// What [`stop_fixture_daemon`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixtureDaemonStop {
+    /// The attach socket is not an absolute path inside the fixture, so no
+    /// daemon there is the fixture's to stop. Nothing was connected to.
+    OutsideFixture,
+    /// Nothing listens at the socket: no file, a stale inode, or a listener
+    /// that exited before it could be identified.
+    NoDaemon,
+    /// The listener carrying the fixture's marker exited after `SIGTERM`.
+    Stopped { pid: u32 },
+    /// It was still running when the grace window ended, and was sent
+    /// `SIGKILL`.
+    Killed { pid: u32 },
+    /// The listener did not carry the fixture's marker, or could not be
+    /// checked, so it was not signalled.
+    Refused(String),
+    /// The listener carried the marker, but stopping it failed.
+    Failed(String),
+}
+
+/// Stop the daemon that a fixture rooted at `fixture_root` launched with
+/// `DOT_AGENT_DECK_ATTACH_SOCKET=<attach_socket>` (audit A2-1). What it
+/// signals is the listener connected at `attach_socket` when that listener
+/// carries the fixture's marker, that variable set to exactly
+/// `attach_socket` — a check of the marker, not proof that this fixture
+/// launched the process. The platform notes below say where the check is
+/// weaker than that.
+///
+/// The path only says where to look. A name inside the fixture can still reach
+/// an outside daemon — a symlink or a same-filesystem hard link to another
+/// deck's socket, put there before or after any check of the path — so the
+/// listener is identified by what it is rather than where it was found: the
+/// peer of a connection to the socket is signalled only when its own
+/// environment carries `DOT_AGENT_DECK_ATTACH_SOCKET` set to exactly
+/// `attach_socket`. That value must be an absolute path lexically inside
+/// `fixture_root`, a fresh temp directory, so a daemon started outside this
+/// fixture does not carry it unless it was given this fixture's environment.
+/// (A process the fixture's daemon spawned inherits the value too, and is the
+/// fixture's own.) A listener that fails the check is refused; there is no
+/// fallback to a pattern, a pidfile or endpoint discovery. The marker is an
+/// environment value, not a launch identity: a same-user process that
+/// knows the fixture's socket path can start a listener carrying it, and the
+/// check accepts that listener. What it separates is the fixture's daemon
+/// from an ordinary daemon started elsewhere, such as the developer's own.
+///
+/// The stop is the daemon's own graceful path — `SIGTERM`, which stops its
+/// managed agents — then `SIGKILL` after `daemon stop --force`'s windows.
+///
+/// * **Linux:** the environment is read from `/proc/<pid>/environ` and the
+///   marker must be one exact entry. The pidfd that both signals go through
+///   is opened from the connection's peer pid and held from before that read,
+///   so a pid reused after the read is not signalled. It is opened after the
+///   peer pid is read, so in that interval the pid can name a new process;
+///   that process is signalled only if it carries the marker.
+/// * **macOS:** `ps -E` prints the arguments and the environment as one
+///   space-separated text, so the marker is accepted as any
+///   whitespace-separated word of it: an environment entry, an argument
+///   spelling the same assignment, or a word inside some other argument or
+///   value. The
+///   signals go by numeric pid with the marker re-checked before each, so a
+///   pid reused between a check and its signal is signalled without that
+///   process being shown to carry the marker.
+/// * **Other platforms** stop nothing and refuse, leaving the daemon to its
+///   `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap.
+pub fn stop_fixture_daemon(fixture_root: &Path, attach_socket: &Path) -> FixtureDaemonStop {
+    use std::path::Component;
+    let inside = attach_socket.is_absolute()
+        && attach_socket != fixture_root
+        && attach_socket.starts_with(fixture_root)
+        && attach_socket
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+    if !inside {
+        return FixtureDaemonStop::OutsideFixture;
+    }
+    stop_identified_daemon(attach_socket)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stop_identified_daemon(attach_socket: &Path) -> FixtureDaemonStop {
+    let stream = match std::os::unix::net::UnixStream::connect(attach_socket) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return FixtureDaemonStop::NoDaemon;
+        }
+        Err(error) => return FixtureDaemonStop::Refused(format!("connect: {error}")),
+    };
+    let pid = match socket_peer_pid(&stream) {
+        Ok(pid) if pid != 0 && pid != std::process::id() => pid,
+        Ok(pid) => return FixtureDaemonStop::Refused(format!("peer pid {pid} is not a daemon")),
+        Err(error) => return FixtureDaemonStop::Refused(format!("peer pid: {error}")),
+    };
+    let mut expected = b"DOT_AGENT_DECK_ATTACH_SOCKET=".to_vec();
+    expected.extend_from_slice(std::os::unix::ffi::OsStrExt::as_bytes(
+        attach_socket.as_os_str(),
+    ));
+    signal_identified_daemon(pid, &expected, stream)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn stop_identified_daemon(_attach_socket: &Path) -> FixtureDaemonStop {
+    FixtureDaemonStop::Refused("this platform cannot identify the socket's listener".into())
+}
+
+/// The pid of the process listening on the other end of `stream`.
+#[cfg(target_os = "linux")]
+fn socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a zeroed `ucred` is a valid out-buffer; `len` is its size, and
+    // `getsockopt` writes at most that many bytes. The fd is borrowed from
+    // `stream` for the duration of the call.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(cred.pid as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn socket_peer_pid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` is a stack `pid_t` and `len` its size; `getsockopt` writes
+    // at most that many bytes. The fd is borrowed from `stream`.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pid as u32)
+}
+
+/// Linux: hold `pid` as a pidfd, then check that `/proc/<pid>/environ` holds
+/// `expected` as one exact entry, then signal it through the pidfd.
+#[cfg(target_os = "linux")]
+fn signal_identified_daemon(
+    pid: u32,
+    expected: &[u8],
+    stream: std::os::unix::net::UnixStream,
+) -> FixtureDaemonStop {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let flags: libc::c_uint = 0;
+    // SAFETY: pidfd_open(2) reads its two scalar arguments and returns a new
+    // fd or -1.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, flags) };
+    if raw < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return FixtureDaemonStop::NoDaemon;
+        }
+        return FixtureDaemonStop::Refused(format!("pidfd_open({pid}): {error}"));
+    }
+    // SAFETY: `raw` is a fresh fd that nothing else owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as std::os::fd::RawFd) };
+    // The connection named the pid; from here on the pidfd holds it.
+    drop(stream);
+    let launched_with = std::fs::read(format!("/proc/{pid}/environ"))
+        .map(|environ| environ.split(|b| *b == 0).any(|entry| entry == expected));
+    // A pid is reused only after its process exits, and an exit is permanent
+    // on the pidfd: still running after the read means the read was of the
+    // process the pidfd holds.
+    if pidfd_exited(&pidfd, Duration::ZERO) {
+        return FixtureDaemonStop::NoDaemon;
+    }
+    match launched_with {
+        Ok(true) => {}
+        Ok(false) => {
+            return FixtureDaemonStop::Refused(format!(
+                "pid {pid} was not launched with this fixture's attach socket"
+            ));
+        }
+        Err(error) => {
+            return FixtureDaemonStop::Refused(format!("read pid {pid}'s environment: {error}"));
+        }
+    }
+    if let Err(error) = pidfd_signal(&pidfd, libc::SIGTERM) {
+        return FixtureDaemonStop::Failed(format!("SIGTERM pid {pid}: {error}"));
+    }
+    if pidfd_exited(&pidfd, dot_agent_deck::daemon_stop::STOP_GRACE_TIMEOUT) {
+        return FixtureDaemonStop::Stopped { pid };
+    }
+    if let Err(error) = pidfd_signal(&pidfd, libc::SIGKILL) {
+        return FixtureDaemonStop::Failed(format!("SIGKILL pid {pid}: {error}"));
+    }
+    if pidfd_exited(&pidfd, dot_agent_deck::daemon_stop::STOP_FORCE_KILL_TIMEOUT) {
+        FixtureDaemonStop::Killed { pid }
+    } else {
+        FixtureDaemonStop::Failed(format!("pid {pid} still running after SIGKILL"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_signal(pidfd: &std::os::fd::OwnedFd, signal: libc::c_int) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let flags: libc::c_uint = 0;
+    // SAFETY: pidfd_send_signal(2) with a null `siginfo` and no flags reads
+    // only its scalar arguments; the fd is borrowed for the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            flags,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether the process `pidfd` holds exits within `within` (a pidfd polls
+/// readable once it has).
+#[cfg(target_os = "linux")]
+fn pidfd_exited(pidfd: &std::os::fd::OwnedFd, within: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let deadline = Instant::now() + within;
+    loop {
+        let mut entry = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        let timeout = left.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: one valid `pollfd`, alive for the duration of the call.
+        let rc = unsafe { libc::poll(&mut entry, 1, timeout) };
+        if rc >= 0 {
+            return rc > 0;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
+/// macOS: check that `pid`'s `ps -E` text — its arguments and environment
+/// together — holds `expected` as a whitespace-separated word, then signal
+/// it by pid, re-checking before the escalation.
+#[cfg(target_os = "macos")]
+fn signal_identified_daemon(
+    pid: u32,
+    expected: &[u8],
+    stream: std::os::unix::net::UnixStream,
+) -> FixtureDaemonStop {
+    let launched_with = || -> std::io::Result<bool> {
+        let out = std::process::Command::new("/bin/ps")
+            .args(["-E", "-ww", "-o", "command=", "-p", &pid.to_string()])
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()?;
+        // `ps` prints the arguments and then the environment, space-separated,
+        // so an argument spelling the same assignment, or the same word inside
+        // any argument or value, would also match.
+        Ok(out
+            .stdout
+            .split(u8::is_ascii_whitespace)
+            .any(|word| word == expected))
+    };
+    let confirmed = launched_with();
+    drop(stream);
+    match confirmed {
+        Ok(true) => {}
+        Ok(false) if !process_running(pid as i32) => return FixtureDaemonStop::NoDaemon,
+        Ok(false) => {
+            return FixtureDaemonStop::Refused(format!(
+                "pid {pid} was not launched with this fixture's attach socket"
+            ));
+        }
+        Err(error) => {
+            return FixtureDaemonStop::Refused(format!("read pid {pid}'s environment: {error}"));
+        }
+    }
+    let wait_gone = |within: Duration| wait_until(within, || !process_running(pid as i32));
+    if let Err(error) = signal_pid(pid, libc::SIGTERM) {
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return FixtureDaemonStop::NoDaemon;
+        }
+        return FixtureDaemonStop::Failed(format!("SIGTERM pid {pid}: {error}"));
+    }
+    if wait_gone(dot_agent_deck::daemon_stop::STOP_GRACE_TIMEOUT) {
+        return FixtureDaemonStop::Stopped { pid };
+    }
+    if !matches!(launched_with(), Ok(true)) {
+        return FixtureDaemonStop::Refused(format!(
+            "pid {pid} no longer matches the fixture's daemon; not sending SIGKILL"
+        ));
+    }
+    if let Err(error) = signal_pid(pid, libc::SIGKILL) {
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return FixtureDaemonStop::Stopped { pid };
+        }
+        return FixtureDaemonStop::Failed(format!("SIGKILL pid {pid}: {error}"));
+    }
+    if wait_gone(dot_agent_deck::daemon_stop::STOP_FORCE_KILL_TIMEOUT) {
+        FixtureDaemonStop::Killed { pid }
+    } else {
+        FixtureDaemonStop::Failed(format!("pid {pid} still running after SIGKILL"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn signal_pid(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: kill(2) reads its two scalar arguments; the caller confirmed
+    // `pid`'s identity immediately before.
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// How much of a failed run's `daemon.log` [`eprint_daemon_log_tail`] echoes.
@@ -4768,30 +5171,33 @@ pub(crate) fn terminal_reached(
 }
 
 /// PRD #381: seed `<home>/.local/bin/dot-agent-deck` as a **symlink to the
-/// binary under test**, so the deck's durable-path resolver lands inside the
-/// sandbox instead of on the host.
+/// binary under test** (`target`, which the deck itself runs as), so the deck's
+/// durable-path resolver lands inside the sandbox instead of on the host.
 ///
 /// Without this, every e2e test that relies on installed hooks would silently
-/// exercise the wrong binary. The resolver refuses to write a
-/// `target/{debug,release}` path into agent config, and under `cargo test-e2e`
-/// the binary under test IS one — so it falls to step 2a
-/// (`$HOME/.local/bin/dot-agent-deck`) and then step 2b (`$PATH`). This harness
-/// passes the HOST `PATH` through (`inherit_pass`, below), and a developer box
-/// commonly has a real installed deck on it: hooks would then point at the
-/// host's deck and the tier would test stale code, while a machine with no
-/// installed deck would get a refusal and no hooks at all. Seeding step 2a
-/// makes the resolution order run for real and land on this build.
+/// exercise the wrong binary. The resolver looks for an installed copy before
+/// it falls back on the running binary, and this harness passes the HOST `PATH`
+/// through (`inherit_pass`, below), where a developer box commonly has a real
+/// installed deck: hooks would then point at the host's deck and the tier would
+/// test stale code. Seeding `~/.local/bin` makes the resolution order run for
+/// real and land on this build.
 ///
 /// A **symlink**, not a copy: the resolver deliberately does not canonicalize
 /// its 2a candidate, so the durable symlink path is what gets written while the
 /// bytes executed are the freshly-built ones. A copy would go stale on the next
-/// `cargo build` and cost the binary's size per test.
+/// `cargo build` and cost the binary's size per test. Pointed at the file the
+/// deck runs as — [`contained_deck_binary`] for every launch that did not opt
+/// out — so the daemon recognises the hooks this symlink is written into as its
+/// own (`hook_binary::DeckIdentity`), as it did when both were cargo's build
+/// artifact, and the resolver pins this same `~/.local/bin` path, now through
+/// its "an installed name for the running binary" step rather than its install
+/// fallback.
 ///
 /// `#[cfg(unix)]` because the L2 tier is Unix-only, and best-effort because a
 /// failure here can only degrade a test to the pre-#381 host-`PATH` behaviour,
 /// never corrupt anything.
 #[cfg(unix)]
-fn seed_durable_binary(home: &Path) {
+fn seed_durable_binary(home: &Path, target: &Path) {
     let bin_dir = home.join(".local").join("bin");
     if std::fs::create_dir_all(&bin_dir).is_err() {
         return;
@@ -4799,7 +5205,223 @@ fn seed_durable_binary(home: &Path) {
     // `DEFAULT_BINARY_NAME`'s value, spelled out: the resolver looks for the
     // crate's package name, not whatever the test binary happens to be called.
     let link = bin_dir.join("dot-agent-deck");
-    let _ = std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dot-agent-deck"), link);
+    let _ = std::os::unix::fs::symlink(target, link);
+}
+
+/// [`contained_deck_binary`] and the directory [`contain_path`] puts on `PATH`
+/// in place of cargo's build directory.
+struct ContainedDeck {
+    binary: PathBuf,
+    path_dir: PathBuf,
+}
+
+static CONTAINED_DECK: OnceLock<ContainedDeck> = OnceLock::new();
+
+/// The binary under test as every harness launch runs it (PRD #1666): a hard
+/// link at `<harness temp root>/deck-under-test/dot-agent-deck`, outside the
+/// developer's checkout. `TuiDeck`, [`spawn_daemon_serve_with_env`] and the
+/// in-process daemon's `binary_name()` override all go through it, and a test
+/// hands it — never `CARGO_BIN_EXE_…` — to anything an agent runs or reads.
+///
+/// **Why.** The deck spells itself into agent text as its own absolute path
+/// (`binary_name()`: the work-done footer of every delegated task, the
+/// orchestrator context, inbox instructions, dispatch prompts). Run from cargo's
+/// `CARGO_BIN_EXE_…` that path is `<checkout>/target/<profile>/dot-agent-deck`,
+/// and a real agent told to work "in the current directory" was measured
+/// resolving that to the checkout and writing its file there
+/// (`orchestration/dispatch/002`) — a real-agent test writing into the
+/// repository it was built from. `orchestration/dispatch/006` pins the text;
+/// `orchestration/dispatch/007` pins that lane-2 code cannot route around this.
+///
+/// A **hard link**, not a symlink: Linux's `/proc/self/exe` resolves a symlink
+/// back to cargo's build directory, while a hard link is reported by the name it
+/// was executed through. A copy is the fallback where the temp root is on
+/// another filesystem than the build directory; it costs the binary's size once
+/// per test process. Either way this changes the pathname the deck reports, and
+/// nothing else: the hard link shares the build artifact's inode, and a
+/// same-user agent is not sandboxed from the checkout by never being told its
+/// path. One per process rather than per test HOME, so the
+/// in-process daemon's process-wide override and every launch agree on one file;
+/// it goes with the harness temp root at process exit.
+///
+/// A deck run from here is not a cargo build artifact, so the resolver's
+/// artifact refusal does not apply to it. The tests about that refusal opt out
+/// with [`TuiDeckBuilder::launching_the_cargo_artifact`].
+#[allow(dead_code)]
+pub fn contained_deck_binary() -> &'static Path {
+    &contained_deck().binary
+}
+
+/// The directory [`contain_path`] puts on `PATH`: it holds only a
+/// `dot-agent-deck` symlink to [`contained_deck_binary`], so a lookup by name
+/// finds the build under test.
+///
+/// Not the link's own directory, deliberately. The resolver treats a running
+/// binary whose directory is on `PATH` as installed and pins THAT path into
+/// agent config, which would move every hook command off the
+/// `~/.local/bin/dot-agent-deck` the tests assert on.
+#[allow(dead_code)]
+pub fn contained_deck_path_dir() -> &'static Path {
+    &contained_deck().path_dir
+}
+
+fn contained_deck() -> &'static ContainedDeck {
+    CONTAINED_DECK.get_or_init(|| {
+        let dir = harness_temp_root().join("deck-under-test");
+        let path_dir = dir.join("path");
+        std::fs::create_dir_all(&path_dir)
+            .unwrap_or_else(|e| panic!("create {}: {e}", path_dir.display()));
+        let name = format!("dot-agent-deck{}", std::env::consts::EXE_SUFFIX);
+        let binary = dir.join(&name);
+        let built = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        if std::fs::hard_link(built, &binary).is_err() {
+            std::fs::copy(built, &binary).unwrap_or_else(|e| {
+                panic!(
+                    "link or copy the binary under test {} to {}: {e}",
+                    built.display(),
+                    binary.display()
+                )
+            });
+        }
+        let on_path = path_dir.join(&name);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&binary, &on_path);
+        #[cfg(not(unix))]
+        let linked = std::fs::hard_link(&binary, &on_path);
+        linked
+            .unwrap_or_else(|e| panic!("link {} to {}: {e}", on_path.display(), binary.display()));
+        // A base the developer moved into the checkout (`DAD_E2E_TMPDIR`) puts
+        // every per-test directory there too, and no link can contain that.
+        if is_inside_checkout(&binary) {
+            eprintln!(
+                "[harness] WARNING: the harness temp root {} is inside the checkout {}, so \
+                 real agents run by this suite are shown paths inside it. Point \
+                 DAD_E2E_TMPDIR outside the checkout.",
+                dir.display(),
+                env!("CARGO_MANIFEST_DIR"),
+            );
+        }
+        ContainedDeck { binary, path_dir }
+    })
+}
+
+/// Whether `path` is the developer's checkout or below it, lexically or through
+/// its canonical spelling.
+fn is_inside_checkout(path: &Path) -> bool {
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
+    path.starts_with(checkout)
+        || std::fs::canonicalize(checkout).is_ok_and(|canonical| path.starts_with(canonical))
+}
+
+/// `path` (a `PATH` value) with the developer's checkout taken out of it, for an
+/// environment the harness hands a deck or an agent (PRD #1666).
+///
+/// - cargo's build directory, which a test puts first so the branch build wins
+///   a lookup by name, becomes [`contained_deck_path_dir`] in the same position;
+/// - a **relative** entry, the empty one included, is dropped: it names a
+///   directory only once the child's cwd is known, and an agent's cwd can be
+///   anywhere, the checkout included;
+/// - every other entry is judged by where it RESOLVES ([`resolved_entry`]), not
+///   by how it is spelled. One that resolves inside the checkout is dropped,
+///   whether it is spelled inside it or is an outside symlink into it (a
+///   `~/bin/project-tools` pointing at `<checkout>/scripts`). One spelled inside
+///   the checkout that resolves outside it becomes that canonical path — a
+///   devbox shell's `<checkout>/.devbox/nix/profile/default/bin` is a symlink
+///   into `/nix/store`, so `git`, `cargo` and every other tool it provides still
+///   resolve;
+/// - everything else is kept as spelled, in order;
+/// - when nothing is kept, the result is [`contained_deck_path_dir`] alone,
+///   never the empty string: an empty `PATH` on unix is one zero-length entry,
+///   which searches the child's current directory — the relative lookup this
+///   function drops. The contained directory is absolute and, as this harness
+///   initialises it, holds the build under test, which every caller wants
+///   reachable by name anyway ([`path_with_binary_dir`] puts it first), so a
+///   unix `PATH` search for another name finds nothing in it instead of
+///   reaching whatever the child's cwd holds. That is a statement about
+///   `PATH` search on unix only: Windows also looks in the application's and
+///   the current directory whatever `PATH` says, and the directory is the
+///   same user's to write, so what it holds once a child has run is not
+///   guaranteed.
+///
+/// **This is pathname hygiene, not isolation.** It keeps the checkout out of
+/// what an agent reads in its `PATH` (`which dot-agent-deck`, `echo $PATH`) and
+/// out of what a lookup by name reaches, as resolved when this runs — the same
+/// leak as the task text by another route. A same-user agent can still reach
+/// the checkout by any absolute path it learns some other way, and a symlink
+/// created or retargeted after this ran is not seen.
+#[allow(dead_code)]
+pub fn contain_path(path: &str) -> String {
+    let cargo_dir = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .parent()
+        .expect("the binary under test has a parent directory");
+    let cargo_canonical = std::fs::canonicalize(cargo_dir).ok();
+    let deck_dir = contained_deck_path_dir();
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for entry in std::env::split_paths(path) {
+        if !entry.is_absolute() {
+            continue;
+        }
+        let resolved = resolved_entry(&entry);
+        let is_cargo_dir = entry == cargo_dir || cargo_canonical.as_ref() == Some(&resolved);
+        let kept = if is_cargo_dir {
+            deck_dir.to_path_buf()
+        } else if is_inside_checkout(&resolved) {
+            continue;
+        } else if is_inside_checkout(&entry) {
+            resolved
+        } else {
+            entry
+        };
+        if kept.as_path() != deck_dir || !entries.iter().any(|e| e.as_path() == deck_dir) {
+            entries.push(kept);
+        }
+    }
+    if entries.is_empty() {
+        entries.push(deck_dir.to_path_buf());
+    }
+    std::env::join_paths(entries)
+        .expect("PATH entries rejoin")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Where the absolute `entry` resolves: its deepest existing ancestor's
+/// canonical path with the rest of `entry` appended, so a directory that does
+/// not exist yet is judged by the symlinks above it. `entry` itself when not
+/// even the root canonicalizes.
+fn resolved_entry(entry: &Path) -> PathBuf {
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut existing = entry;
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            return rest
+                .iter()
+                .rev()
+                .fold(canonical, |path, part| path.join(part));
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return entry.to_path_buf();
+        };
+        rest.push(name);
+        existing = parent;
+    }
+}
+
+/// The host `PATH` with the build under test first, for an environment the test
+/// builds itself — the deck's own `with_env("PATH", …)`, or an agent spawned
+/// into an in-process daemon — so an agent's `dot-agent-deck delegate` /
+/// `work-done` / `agent-event` resolves to this build, never to a deck
+/// installed on the host. Contained: the directory is
+/// [`contained_deck_path_dir`] and the rest went through [`contain_path`].
+#[allow(dead_code)]
+pub fn path_with_binary_dir() -> String {
+    let host = std::env::var("PATH").unwrap_or_default();
+    let joined = std::env::join_paths(
+        std::iter::once(contained_deck_path_dir().to_path_buf())
+            .chain(std::env::split_paths(&host)),
+    )
+    .expect("PATH entries join");
+    contain_path(&joined.to_string_lossy())
 }
 
 fn locate_fixture(name: &str) -> PathBuf {
@@ -5971,6 +6593,333 @@ pub fn codex_test_model() -> &'static str {
 pub(crate) fn codex_probe_refused_model(lower_output: &str) -> bool {
     lower_output.contains("model is not supported when using codex")
         || lower_output.contains("model not found")
+}
+
+/// Env var that overrides [`pi_test_model`], as `<provider>/<model>` — e.g.
+/// `openai/gpt-5-nano` on a host that authenticates Pi with `OPENAI_API_KEY`
+/// rather than a stored login.
+pub const PI_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_PI_TEST_MODEL";
+
+/// The cheap model every real-agent Pi test runs on, as `<provider>/<model>`.
+/// See [`pi_test_model`].
+///
+/// Measured 2026-10-15 on pi 0.84.4 with the ChatGPT Plus/Pro (Codex) login
+/// Pi's `/login` stores as `openai-codex` in `~/.pi/agent/auth.json`, by a
+/// one-turn `pi -p` asked to run one bash command writing a sentinel:
+/// `gpt-5.6-luna` wrote it, while `gpt-5.4-mini` and `gpt-5.3-codex-spark`
+/// (the two cheaper ids `pi --list-models openai-codex` offers) were refused
+/// with "The '<id>' model is not supported when using Codex with a ChatGPT
+/// account" — the refusal `tests/common` records for Codex itself
+/// ([`CODEX_TEST_MODEL_CHATGPT_DEFAULT`] is the same model, issue #656).
+///
+/// PERMANENT, not a fallback (PRD #1666): Pi's real-agent tests ran on
+/// Anthropic Haiku (`--provider anthropic --model claude-haiku-4-5`) until this
+/// host's Anthropic account hit its monthly spend limit. There is deliberately
+/// no fallback to another provider when this one refuses: a refused model fails
+/// the test ([`check_pi_available`]), so a dead id surfaces instead of quietly
+/// moving the coverage somewhere else.
+pub(crate) const PI_TEST_MODEL_DEFAULT: &str = "openai-codex/gpt-5.6-luna";
+
+/// One Pi model choice, split into what `pi --provider … --model …` takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiTestModel {
+    pub provider: String,
+    pub model: String,
+}
+
+impl PiTestModel {
+    /// `--provider <provider> --model <model>`, for a role or pane command.
+    pub fn cli_args(&self) -> String {
+        format!("--provider {} --model {}", self.provider, self.model)
+    }
+
+    /// The environment variable that authenticates this provider when no
+    /// stored login does, or `None` for a login-only provider (`openai-codex`).
+    pub fn env_key(&self) -> Option<&'static str> {
+        match self.provider.as_str() {
+            "openai" => Some(OPENAI_API_KEY_ENV),
+            "anthropic" => Some(ANTHROPIC_API_KEY_ENV),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PiTestModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.provider, self.model)
+    }
+}
+
+/// [`pi_test_model`]'s choice from the raw override value, with no
+/// environment read — the seam the fast-tier unit test drives. Unset, empty and
+/// whitespace-only all mean "use [`PI_TEST_MODEL_DEFAULT`]"; anything else must
+/// be `<provider>/<model>` with both halves non-empty. The model half may hold
+/// further slashes (an OpenRouter id is `openrouter/openai/gpt-…`): only the
+/// first separates the provider.
+pub(crate) fn pi_test_model_from(raw: Option<&str>) -> Result<PiTestModel, String> {
+    let value = raw
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(PI_TEST_MODEL_DEFAULT);
+    match value.split_once('/') {
+        Some((provider, model))
+            if !provider.trim().is_empty()
+                && !model.trim().is_empty()
+                && !value.contains(char::is_whitespace) =>
+        {
+            Ok(PiTestModel {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            })
+        }
+        _ => Err(format!(
+            "{PI_TEST_MODEL_ENV}={value:?} is not `<provider>/<model>` (e.g. {PI_TEST_MODEL_DEFAULT:?})"
+        )),
+    }
+}
+
+/// The Pi provider and model every real-agent Pi test launches:
+/// [`PI_TEST_MODEL_ENV`] when set, otherwise [`PI_TEST_MODEL_DEFAULT`].
+///
+/// Single source of truth, the [`codex_test_model`] shape: [`check_pi_available`]
+/// probes this model and [`import_pi_credentials`] seeds this provider's login,
+/// so the gate, the credential and the command a test launches cannot disagree.
+/// A malformed override panics — it is a configuration defect, and reading it
+/// as "skip" would report a test that never ran as passed.
+pub fn pi_test_model() -> &'static PiTestModel {
+    static MODEL: std::sync::OnceLock<PiTestModel> = std::sync::OnceLock::new();
+    MODEL.get_or_init(|| {
+        pi_test_model_from(std::env::var(PI_TEST_MODEL_ENV).ok().as_deref())
+            .unwrap_or_else(|why| panic!("{why}"))
+    })
+}
+
+/// Pi's agent directory on the host: `PI_CODING_AGENT_DIR` when set, else
+/// `~/.pi/agent`, where `pi`'s `/login` stores `auth.json`. Read only.
+fn host_pi_agent_dir() -> PathBuf {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| host_home().join(".pi").join("agent"))
+}
+
+/// The host's stored Pi login for `provider`, as its JSON entry, or `None` when
+/// `auth.json` is missing, a symlink, unparsable or has no such entry. No
+/// value leaves this function except to be written into an isolated copy.
+fn host_pi_login(provider: &str) -> Option<serde_json::Value> {
+    let bytes = read_credential_file_no_symlink(
+        &host_pi_agent_dir().join("auth.json"),
+        "Pi credentials not found",
+        "~/.pi/agent/auth.json",
+    )
+    .ok()?;
+    let mut auth: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    auth.as_object_mut()?
+        .remove(provider)
+        .filter(serde_json::Value::is_object)
+}
+
+/// How long a Pi OAuth access token must still be valid when a scratch copy is
+/// made of it ([`pi_scratch_login`]): the copy carries no refresh token, so a
+/// test that outlives the token fails rather than refreshing. One hour covers a
+/// lane-2 Pi test with its preflight many times over.
+const PI_LOGIN_RUN_MARGIN: Duration = Duration::from_secs(3600);
+
+/// The copy of the host's stored Pi login `entry` that a scratch agent
+/// directory gets: every refresh token taken out, and refused unless its access
+/// token is still valid for [`PI_LOGIN_RUN_MARGIN`] after `now`.
+///
+/// **Why no refresh token.** A refresh run in the scratch copy writes the new
+/// tokens only there, and they go when the directory does. On a provider that
+/// rotates refresh tokens, that leaves the host's own login holding a refresh
+/// token the provider has already spent — a test run logging the developer out.
+/// With only the access token copied, the scratch Pi has nothing to refresh
+/// with, so no test run can move the provider's credential state.
+///
+/// **So the access token has to last the run.** An entry that carries a refresh
+/// token is refused when it has no numeric `expires` (milliseconds since the
+/// epoch, Pi's shape) or when that is less than the margin away, with the
+/// remedy: log in again with `pi`, which refreshes the HOST login, where a
+/// rotated token is kept. An entry with no refresh token (an API key) is copied
+/// as it is. The refusal names no value from the entry.
+pub(crate) fn pi_scratch_login(
+    mut entry: serde_json::Value,
+    now: std::time::SystemTime,
+) -> Result<serde_json::Value, String> {
+    let Some(fields) = entry.as_object_mut() else {
+        return Ok(entry);
+    };
+    let refresh_keys: Vec<String> = fields
+        .keys()
+        .filter(|key| key.to_ascii_lowercase().contains("refresh"))
+        .cloned()
+        .collect();
+    if refresh_keys.is_empty() {
+        return Ok(entry);
+    }
+    let remedy = "log in again with `pi` and `/login` to refresh the host login; the test \
+                  copy carries no refresh token, so it cannot refresh on its own";
+    let Some(expires) = fields.get("expires").and_then(serde_json::Value::as_u64) else {
+        return Err(format!(
+            "the stored Pi login has a refresh token but no `expires` time, so the harness \
+             cannot tell whether its access token lasts the run; {remedy}"
+        ));
+    };
+    let now_ms = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    let left_ms = u128::from(expires).saturating_sub(now_ms);
+    if left_ms < PI_LOGIN_RUN_MARGIN.as_millis() {
+        return Err(format!(
+            "the stored Pi login's access token expires in {} min, less than the {} min a \
+             test run needs; {remedy}",
+            left_ms / 60_000,
+            PI_LOGIN_RUN_MARGIN.as_secs() / 60
+        ));
+    }
+    for key in refresh_keys {
+        fields.remove(&key);
+    }
+    Ok(entry)
+}
+
+/// Seed Pi's credential for [`pi_test_model`]'s provider into the ISOLATED agent
+/// directory `agent_dir` (a scratch HOME's `.pi/agent`, or whatever a test
+/// passes as `PI_CODING_AGENT_DIR`), the shape [`import_codex_credentials`] has
+/// for Codex. Only that one provider's entry is written, mode 0600, so neither
+/// the host's other logins nor anything else in its `~/.pi/agent` reaches the
+/// test. Nothing is ever written under the host's `~/.pi`.
+///
+/// A provider authenticated through its environment variable instead
+/// ([`PiTestModel::env_key`] set and no stored login) writes nothing: the
+/// caller forwards that variable. Returns the values a recording must redact,
+/// which are also registered for diagnostic redaction here.
+///
+/// A stored OAuth login is copied WITHOUT its refresh token, and refused when
+/// its access token would not last the run ([`pi_scratch_login`]), so a scratch
+/// Pi can never refresh, and so never rotate the host's login out from under
+/// it. The refresh token is still registered for redaction, with every other
+/// value of the host entry, before anything is written.
+pub fn import_pi_credentials(agent_dir: &Path) -> std::io::Result<Vec<String>> {
+    let model = pi_test_model();
+    let Some(entry) = host_pi_login(&model.provider) else {
+        if pi_env_key().is_some() {
+            return Ok(Vec::new());
+        }
+        return Err(std::io::Error::other(format!(
+            "no stored Pi login for provider {:?} in ~/.pi/agent/auth.json — run `pi` and \
+             `/login`, or set {PI_TEST_MODEL_ENV} to a model your credentials reach",
+            model.provider
+        )));
+    };
+    // Every value of the HOST entry, refresh token included, is registered
+    // before anything is written or refused, so no later diagnostic can print
+    // one in the clear.
+    let mut redactions = Vec::new();
+    collect_credential_values(
+        &serde_json::json!({ model.provider.clone(): entry.clone() }),
+        None,
+        CredentialScope::AuthDocument,
+        false,
+        &mut redactions,
+    );
+    normalise_redactions(&mut redactions);
+    register_diagnostic_redactions(redactions.clone());
+    let entry = pi_scratch_login(entry, std::time::SystemTime::now()).map_err(|why| {
+        std::io::Error::other(format!("Pi login for provider {:?}: {why}", model.provider))
+    })?;
+    let document = serde_json::json!({ model.provider.clone(): entry });
+    std::fs::create_dir_all(agent_dir)?;
+    let bytes = serde_json::to_vec(&document).map_err(std::io::Error::other)?;
+    write_credential_file_atomic_0o600(&agent_dir.join("auth.json"), &bytes)?;
+    Ok(redactions)
+}
+
+/// The environment variable that authenticates [`pi_test_model`]'s provider and
+/// its value, when the provider takes one and it is set — for a test that
+/// builds a Pi child's environment by hand (an in-process daemon's
+/// `SpawnOptions.env`). A secret: thread it into the child, never print it.
+pub fn pi_env_key() -> Option<(String, String)> {
+    let key = pi_test_model().env_key()?;
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| (key.to_string(), value))
+}
+
+/// Does this `pi` output say the MODEL was refused, as opposed to the
+/// credential, the network or a quota? Takes the output already lowercased.
+/// Pi relays the provider's own wording: [`codex_probe_refused_model`]'s two
+/// (measured through Pi on 2026-10-15 for the ChatGPT one), plus Pi's own
+/// unknown-model message.
+pub(crate) fn pi_probe_refused_model(lower_output: &str) -> bool {
+    codex_probe_refused_model(lower_output)
+        || (lower_output.contains("model") && lower_output.contains("not found"))
+}
+
+/// Runtime-skip helper for every real-agent Pi test: `pi` on PATH, a credential
+/// for [`pi_test_model`]'s provider (a stored login, or its env key), and one
+/// minimal `pi -p` turn on that model in an isolated agent directory seeded by
+/// [`import_pi_credentials`]. Prints the provider/model it checked, so a run's
+/// output names what it spent.
+///
+/// **A refused model panics instead of skipping** (issue #656's rule, applied to
+/// Pi by PRD #1666): Pi is installed and authenticated by then, so the model id
+/// is the one thing wrong, and a skip would be counted as a pass. A credential,
+/// network or quota failure still skips.
+pub fn check_pi_available() -> Result<(), String> {
+    install_credential_redaction();
+    let model = pi_test_model();
+    eprintln!("[e2e] real-agent Pi model: {model}");
+    if !cli_invocable("pi") {
+        return Err("pi CLI not installed (could not invoke `pi --version`)".into());
+    }
+    let probe_home = race_safe_tempdir();
+    let agent_dir = probe_home.path().join(".pi").join("agent");
+    import_pi_credentials(&agent_dir).map_err(|e| e.to_string())?;
+
+    let ceiling = load_scaled(CODEX_PREFLIGHT_BASE);
+    let mut probe = std::process::Command::new("pi");
+    probe
+        .args(["--provider", &model.provider, "--model", &model.model])
+        .args([
+            "--no-approve",
+            "-p",
+            "Reply with exactly PI_AUTH_OK and do not use tools.",
+        ])
+        .current_dir(probe_home.path())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", probe_home.path())
+        .env("PI_CODING_AGENT_DIR", &agent_dir);
+    if let Some((key, value)) = pi_env_key() {
+        probe.env(key, value);
+    }
+    let (status, output) = run_codex_preflight(&mut probe, Instant::now() + ceiling)?;
+    let Some(status) = status else {
+        return Err(format!(
+            "Pi preflight on {model} did not finish within {ceiling:?}"
+        ));
+    };
+    let lower = output.to_ascii_lowercase();
+    if !output.contains("PI_AUTH_OK") && pi_probe_refused_model(&lower) {
+        discard_previous_recording(&current_test_name());
+        panic!(
+            "Pi is installed and has a credential for provider {:?}, but it refused model \
+             {model}, so this real-agent test cannot run. Set {PI_TEST_MODEL_ENV} to a \
+             `<provider>/<model>` these credentials accept, or update PI_TEST_MODEL_DEFAULT \
+             ({PI_TEST_MODEL_DEFAULT:?}) in tests/common/mod.rs if the id was retired.",
+            model.provider
+        );
+    }
+    if !status.success() || !output.contains("PI_AUTH_OK") {
+        return Err(format!(
+            "Pi could not complete a one-turn probe on {model} (expired login, network or \
+             quota); run `pi` and `/login`, or set {PI_TEST_MODEL_ENV}"
+        ));
+    }
+    Ok(())
 }
 
 /// Compiled-in default cheap model for real-agent OpenCode e2e coverage.
@@ -9674,9 +10623,12 @@ pub fn spawn_daemon_serve_with_env(
     let work = tempdir.path().to_path_buf();
     let home = work.join("home");
     std::fs::create_dir_all(&home).expect("create per-test HOME");
+    // PRD #1666: the daemon runs as the contained link, like `TuiDeck`'s deck,
+    // because it is the process that spells its own path into agent text.
+    let bin = contained_deck_binary();
     // PRD #381: same durable-path seeding as `TuiDeck` — a `daemon serve` spawns
     // wrapped agents, and `wrap` runs the Codex hook installer.
-    seed_durable_binary(&home);
+    seed_durable_binary(&home, bin);
     let state_dir = work.join("state");
     let mut hook_socket = work.join("hook.sock");
     let mut attach_socket = work.join("attach.sock");
@@ -9727,34 +10679,6 @@ pub fn spawn_daemon_serve_with_env(
     for (k, v) in config_containment_env() {
         env.push((k.into(), v));
     }
-    // PRD #127: the scheduler spawn primitive gates a fresh fire's prompt
-    // delivery on the spawned agent's `SessionStart` (readiness), falling back
-    // after a timeout for commands that emit no hook (bare `cat`, the recorder
-    // scripts these tests use). Shrink that fallback from the production 10s so
-    // the no-hook delivery tests don't race their ~10s observation windows;
-    // 5000ms stays comfortably above spawn/005's 2s "not yet delivered" window
-    // and below every 10s delivery window. A test may override via `extra_env`.
-    env.push(("DOT_AGENT_DECK_SESSION_START_WAIT_MS".into(), "5000".into()));
-    // PRD #249 M3: same pin as the TuiDeck harness above — the silent-worker
-    // report would fire on every stand-in worker that emits no events and write
-    // a notice into an orchestrator pane. Off by default here; a test that wants
-    // the report sets it in `extra_env`, which is layered after this.
-    env.push((
-        "DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS".into(),
-        "0".into(),
-    ));
-    // PRD #249 M1: same zero pin as `TuiDeck`; targeted scenarios layer a
-    // non-zero value through `extra_env` after this baseline.
-    env.push((
-        "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS".into(),
-        "0".into(),
-    ));
-    // Issue #1383: same pin as `TuiDeck` — the in-place delegate retry is off
-    // by default here; a test that wants it sets it in `extra_env`.
-    env.push((
-        "DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS".into(),
-        "0".into(),
-    ));
     for (k, v) in extra_env {
         match *k {
             "DOT_AGENT_DECK_SOCKET" => hook_socket = PathBuf::from(v),
@@ -9763,8 +10687,18 @@ pub fn spawn_daemon_serve_with_env(
         }
         env.push(((*k).to_string(), (*v).to_string()));
     }
+    // After `extra_env`, which may name cargo's build directory itself: the
+    // last `PATH` wins, as it would on the command, and goes in contained.
+    if let Some(path) = env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| contain_path(v))
+    {
+        env.retain(|(k, _)| k != "PATH");
+        env.push(("PATH".into(), path));
+    }
 
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("daemon").arg("serve");
     cmd.env_clear();
@@ -9805,8 +10739,8 @@ pub fn spawn_daemon_serve_with_env(
 #[allow(dead_code)]
 impl DaemonProc {
     /// Block until the attach socket file exists (the daemon finished
-    /// binding), failing at once if the daemon exits first and otherwise after
-    /// `load_scaled(DAEMON_START_POLL_TIMEOUT)`.
+    /// binding) and takes connections, failing at once if the daemon exits
+    /// first and otherwise after `load_scaled(DAEMON_START_POLL_TIMEOUT)`.
     ///
     /// PRD #1258: the bound is the binary's own lazy-spawn bound
     /// ([`DAEMON_START_POLL_TIMEOUT`], which covers the daemon's pre-bind work)
@@ -9816,11 +10750,23 @@ impl DaemonProc {
     /// pre-bind work alone taking 5.7 s. PRD #1631 met the same flat 10 s
     /// failing six tests at `io full` 52-72%, which `load_scaled`'s stall
     /// share now widens for.
+    ///
+    /// PR #1735 third review: and until a connection to it is not refused.
+    /// The file appears at `bind(2)`, and the daemon's `listen(2)` follows it,
+    /// so a connect in between is refused (`ECONNREFUSED`); a starved run
+    /// landed a test's first request in that gap (`inbox/protocol/010`). The
+    /// probe connection is closed at once, which the daemon reads as a clean
+    /// end of a connection that sent nothing.
     fn wait_for_attach_socket(&mut self) {
         let budget = load_scaled(DAEMON_START_POLL_TIMEOUT);
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
-            if self.attach_socket.exists() {
+            if self.attach_socket.exists()
+                && !matches!(
+                    std::os::unix::net::UnixStream::connect(&self.attach_socket),
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused
+                )
+            {
                 return;
             }
             if let Ok(Some(status)) = self.child.try_wait() {
@@ -9846,6 +10792,11 @@ impl DaemonProc {
     /// Public point-in-time liveness check (the daemon process has not exited).
     pub fn is_alive_public(&mut self) -> bool {
         self.is_alive()
+    }
+
+    /// The daemon's pid.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// Assert the daemon stays alive for the whole `window` — polls
@@ -9895,8 +10846,7 @@ impl DaemonProc {
     /// Run `dot-agent-deck schedule <args…>` from an explicit `cwd` (used to
     /// prove the writer targets the global path regardless of cwd).
     pub fn run_schedule_cli_from(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
-        let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-        let mut cmd = std::process::Command::new(bin);
+        let mut cmd = std::process::Command::new(contained_deck_binary());
         cmd.arg("schedule");
         cmd.args(args);
         cmd.current_dir(cwd);
@@ -10148,8 +11098,9 @@ impl DaemonProc {
         agent_id: Option<&str>,
         state: &str,
     ) -> std::process::Output {
-        let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-        let mut cmd = std::process::Command::new(bin);
+        // The daemon's own binary, so the line's sender stamp names the file
+        // the daemon runs as, as it did when both were cargo's build artifact.
+        let mut cmd = std::process::Command::new(contained_deck_binary());
         cmd.arg("agent-event").arg("--type").arg(state);
         cmd.current_dir(&self.home);
         cmd.env_clear();
@@ -10526,30 +11477,36 @@ pub fn attach_request_on(
     attach_json_request_on(socket, &payload)
 }
 
-/// Send a guarded `WriteAndSubmit` request over a daemon attach socket.
-///
-/// The identity fields are additive JSON keys rather than fields on
-/// `AttachRequest`, so E2E clients use this helper when they need to model the
-/// production seed/orchestrator prompt-delivery RPC.
+/// Post `body` to the inbox of the agent `expected_agent_id` in `pane_id`, the
+/// way the deck hands an agent a task (PRD #1666): the agent's inbox component
+/// takes it, or the doorbell rings for it. Answers the message id, or the
+/// daemon's refusal as an error.
 #[cfg(unix)]
 #[allow(dead_code)]
-pub fn write_and_submit_with_identity_on(
+pub fn post_message_on(
     socket: &Path,
     pane_id: &str,
-    text: &str,
     expected_agent_id: &str,
-    expected_session_id: Option<&str>,
-) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
-    let mut request = serde_json::json!({
-        "op": "write-and-submit",
-        "pane_id": pane_id,
-        "text": text,
-        "expected_agent_id": expected_agent_id,
-    });
-    if let Some(session_id) = expected_session_id {
-        request["expected_session_id"] = serde_json::Value::String(session_id.to_string());
+    body: &str,
+) -> std::io::Result<String> {
+    let resp = attach_request_on(
+        socket,
+        &dot_agent_deck::daemon_protocol::AttachRequest::PostMessage {
+            pane_id: pane_id.to_string(),
+            expected_agent_id: Some(expected_agent_id.to_string()),
+            subject: "task".to_string(),
+            body: body.to_string(),
+            spill_path: None,
+            origin: dot_agent_deck::inbox_hub::PostOrigin::Seed,
+        },
+    )?;
+    match (resp.ok, resp.id) {
+        (true, Some(id)) => Ok(id),
+        _ => Err(std::io::Error::other(format!(
+            "the daemon refused the post: {:?}",
+            resp.error
+        ))),
     }
-    attach_json_request_on(socket, &request)
 }
 
 /// Send one JSON request over a daemon attach socket and read its response.
@@ -11446,9 +12403,66 @@ fn describe_read(path: &Path, read: std::io::Result<String>) -> String {
     match read {
         Ok(contents) => format!("{} contains {contents:?}", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            format!("{} does not exist", path.display())
+            format!("{} does not exist{}", path.display(), misplaced_note(path))
         }
         Err(e) => format!("{} is unreadable: {e}", path.display()),
+    }
+}
+
+/// PRD #1666: where a file named like the missing `expected` turned up instead,
+/// so a real agent that wrote its sentinel in the wrong directory reads as
+/// MISPLACED work rather than missing work. Empty when none is found.
+///
+/// The candidates are the places an agent was measured or can be expected to
+/// mistake for its working directory: each ancestor of `expected`'s directory
+/// (one level up was the measured case: a model inferred its directory from
+/// the deck binary's path), the directory two levels above the contained deck
+/// binary, and the checkout (`CARGO_MANIFEST_DIR`). A file found there may be
+/// an earlier run's leftover, which the note's "may" leaves open; it is a
+/// diagnostic, never an assertion.
+#[allow(dead_code)]
+pub fn misplaced_note(expected: &Path) -> String {
+    let mut extra: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = contained_deck_binary().parent().and_then(Path::parent) {
+        extra.push(dir.to_path_buf());
+    }
+    extra.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    misplaced_note_among(expected, &extra)
+}
+
+/// [`misplaced_note`] with the non-ancestor candidates passed in — the seam its
+/// fast-tier unit test drives, with no deck binary to resolve.
+pub(crate) fn misplaced_note_among(expected: &Path, extra: &[PathBuf]) -> String {
+    let Some(name) = expected.file_name() else {
+        return String::new();
+    };
+    let mut dirs: Vec<PathBuf> = expected
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .skip(1)
+        .take(4)
+        .map(Path::to_path_buf)
+        .collect();
+    dirs.extend(extra.iter().cloned());
+    let mut found: Vec<String> = Vec::new();
+    for dir in dirs {
+        let candidate = dir.join(name);
+        if candidate != expected && candidate.is_file() {
+            let shown = candidate.display().to_string();
+            if !found.contains(&shown) {
+                found.push(shown);
+            }
+        }
+    }
+    if found.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; MISPLACED: a file of that name is at {} — the agent may have written it \
+             outside its working directory",
+            found.join(", ")
+        )
     }
 }
 
@@ -11774,16 +12788,17 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     // this libtest binary, and a generated `work-done` command would hand a
     // real worker `<libtest binary> work-done …`, which libtest reads as a
     // test-name filter rather than the deck's CLI. Inject the real built
-    // deck binary's path so `binary_name()` names it instead. `#[cfg]`'d
+    // deck binary's path so `binary_name()` names it instead — through the
+    // contained link (PRD #1666), so that path is not the checkout's either. `#[cfg]`'d
     // rather than unconditional: this file is also compiled into fast-tier
     // (non-`e2e`) test binaries such as `daemon_status.rs` and
     // `delegate_prompt_injection.rs`, where `set_test_current_exe_override`
     // does not exist in the linked library at all (CLAUDE.md rule 5 — see
     // that function's doc for why it's `e2e`-gated in the first place).
     #[cfg(feature = "e2e")]
-    dot_agent_deck::platform::paths::set_test_current_exe_override(std::path::PathBuf::from(env!(
-        "CARGO_BIN_EXE_dot-agent-deck"
-    )));
+    dot_agent_deck::platform::paths::set_test_current_exe_override(
+        contained_deck_binary().to_path_buf(),
+    );
 
     let (dir, hook_path, attach_path) = {
         let _g = INPROC_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());

@@ -218,8 +218,9 @@ fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
 /// Whether a re-install by `binary_path` may REPLACE `command`: it is either
 /// this binary's own prior deck command, or a deck command naming a pin the deck
 /// cannot use — missing, bare or relative, non-executable, or a build-artifact
-/// path — under this binary's basename. The union of
-/// [`command_is_this_binary`] and [`command_is_dead_deck`], named once because
+/// path — under this binary's basename — or naming an install this copy
+/// supersedes. The union of [`command_is_this_binary`],
+/// [`command_is_dead_deck`] and [`command_is_superseded_deck`], named once because
 /// [`install_impl`] applies it in two places — the installed events and the
 /// retired-event sweep — and the two must not drift apart (issue #730).
 ///
@@ -232,7 +233,17 @@ fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
 /// this as pruning only what is positively gone; it prunes what the deck would
 /// refuse to write.
 fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
-    command_is_this_binary(command, binary_path) || command_is_dead_deck(command, binary_path)
+    command_is_this_binary(command, binary_path)
+        || command_is_dead_deck(command, binary_path)
+        || command_is_superseded_deck(command, binary_path)
+}
+
+/// Whether `command` is a deck command naming an install this copy supersedes
+/// ([`crate::agent_hook_config::pin_is_superseded_sibling`]), whose rule under a
+/// retired event the takeover would otherwise leave behind.
+fn command_is_superseded_deck(command: &str, binary_path: &str) -> bool {
+    deck_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::pin_is_superseded_sibling(&exe, binary_path))
 }
 
 /// Whether an install by `binary_path` owns `command` under an event it
@@ -411,7 +422,10 @@ fn install_impl(
     // probe, so the class is real but not every name is in it.)
     //
     // The consequence, stated rather than left to be discovered: a FOREIGN
-    // install's retired-event hook is left in place by install, with two
+    // install's retired-event hook is left in place by install — unless this
+    // copy supersedes that install (issue #1637's takeover), which repointed its
+    // installed events here and leaves nothing else to remove its retired ones
+    // (`command_is_superseded_deck`) — with two
     // exceptions (PRD #1497 audit F4, `remediate_retired_deck_handlers`),
     // which apply only to a command naming a deck install (this binary, or an
     // executable sharing its basename; audit A1): a user's own executable
@@ -871,14 +885,8 @@ const HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// `config.toml` trust write each take a cross-process lock that waits up to
 /// 10 s (`crate::agent_hook_config::lock_config`), so the whole prep can hold
 /// Codex's launch for about 50 s. Threading one deadline through
-/// `crate::wrap::codex_spawn_prep` is left to the readiness work in #1663. A
-/// delegate that respawned that pane can then pay for it twice: its readiness
-/// fallback (`crate::state::SESSION_START_WAIT_TIMEOUT`, also 30 s) is counted
-/// from the respawn, so when the prep takes most of its 30 s the fallback can
-/// expire before Codex has drawn its interface, and the task pointer is typed
-/// into a pane Codex is not yet reading. That is the fixed-timer readiness
-/// problem tracked in #1663 (and #1662 for Pi), which this bound does not
-/// address.
+/// `crate::wrap::codex_spawn_prep` is not done here. A task delegated to the
+/// pane meanwhile waits in its inbox until Codex is up to take it.
 /// The daemon's startup install and `hooks install` keep the shorter bound: the
 /// startup one sits before the daemon binds its sockets (issue #1665), and
 /// neither is about to launch Codex.

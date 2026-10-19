@@ -12,8 +12,7 @@ import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
 import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
-import { isDelivered } from "../types";
-import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, RuntimeMode, SendResult, TerminalBuffer } from "../types";
+import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -136,39 +135,6 @@ export function useDeckRuntime(): DeckRuntimeState {
   const terminalBuffersRef = useRef<Record<string, TerminalBuffer>>({});
   const terminalListenersRef = useRef<Map<string, Set<(buffer: TerminalBuffer) => void>>>(new Map());
 
-  /**
-   * Issue #1042 — the last non-delivered verdict per agent, which is the only
-   * route by which `wrong-session` (and its `stale`/`ambiguous`/`unknown`
-   * siblings) can reach the screen: the daemon decides them at write time and
-   * carries them in no snapshot field.
-   *
-   * Held here rather than in a tile because the send that produces one is not
-   * the tile's — the composer that used to own this is gone, and what remains
-   * are PROGRAMMATIC sends: the orchestrator's seed prompt at orchestration activation,
-   * and whatever else dispatches through the guarded verb.
-   *
-   * A record here is one PAST ATTEMPT, never current state, which is why
-   * {@link adoptFleet} drops it the moment a newer snapshot arrives. Without
-   * that rule a recorded `wrong-session` outranks a writable lease
-   * (`terminalInput.ts`) and holds a live pane disabled with no route back: the
-   * user's own typing goes through `sendTerminalInput`, never `submit_text`, so
-   * nothing the user can do clears it, and a write lease can return to this
-   * client with no PTY respawn to trip the generation route below.
-   */
-  const [terminalInputResults, setTerminalInputResults] = useState<Record<string, SendResult>>({});
-  const noteTerminalInputResult = useCallback((key: string, verdict: SendResult | undefined) => {
-    setTerminalInputResults((current) => {
-      if (current[key] === verdict) return current;
-      if (verdict === undefined) {
-        if (!(key in current)) return current;
-        const next = { ...current };
-        delete next[key];
-        return next;
-      }
-      return { ...current, [key]: verdict };
-    });
-  }, []);
-
   const terminalFeed = useMemo(() => ({
     get: (deckId: string | undefined, agentId: string) => terminalBuffersRef.current[agentKey(deckId, agentId)],
     subscribe: (deckId: string | undefined, agentId: string, listener: (buffer: TerminalBuffer) => void) => {
@@ -195,20 +161,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     const next = applyTerminalChunk(current, { ...event, data });
     if (next === current) return;
     terminalBuffersRef.current[key] = next;
-    // A new stream generation means the PTY was respawned, so any recorded
-    // verdict describes a pane that no longer exists. Without this a
-    // `wrong-session` would disable the input forever: the condition is only
-    // knowable by SENDING, and the input it disabled is the thing that would
-    // have sent again.
-    //
-    // Reached on the `replace` a fresh attach delivers, which is how a respawn
-    // arrives. `applyTerminalChunk` DROPS an `append` whose generation does not
-    // match the buffer's — returning the buffer unchanged — so that case exits
-    // above and never reaches here, which is correct: a dropped chunk changed
-    // no state to reconcile against.
-    if (current && next.generation !== current.generation) noteTerminalInputResult(key, undefined);
     for (const listener of terminalListenersRef.current.get(key) ?? []) listener(next);
-  }, [noteTerminalInputResult]);
+  }, []);
 
   /**
    * Replace the SELECTED deck and leave the rest of the fleet where it is.
@@ -235,22 +189,6 @@ export function useDeckRuntime(): DeckRuntimeState {
   const adoptFleet = useCallback((next: DeckFleet) => {
     if (!next.length) return;
     setFleet(next);
-    // Issue #1042 — a snapshot supersedes every recorded verdict, because a
-    // verdict is a record of one attempt that has already happened and this is
-    // newer state about the same panes. The notice is therefore transient —
-    // shown until the next push — rather than sticky, which is the honest
-    // trade: a permanent false-disable of a pane the snapshot says is writable
-    // is the worse failure of the two.
-    //
-    // This is the whole of the "drop it on the next snapshot" rule, and a
-    // per-entry snapshot epoch would be inert beside it. The state has exactly
-    // three mutation sites — this one, and `noteTerminalInputResult` reached
-    // from `runAction`'s verdict and from `updateTerminal`'s generation clear —
-    // and neither of the other two runs inside this funnel, which every
-    // snapshot passes through synchronously. So every record that survives to
-    // here is by construction older than the snapshot arriving, and an epoch
-    // tag could never read otherwise.
-    setTerminalInputResults((current) => (Object.keys(current).length ? {} : current));
   }, []);
 
   const reconnect = useCallback(async () => {
@@ -306,17 +244,6 @@ export function useDeckRuntime(): DeckRuntimeState {
     const sentToDeckId = selectedDeckIdRef.current;
     try {
       const result = await bridge.runAction(action);
-      // The guarded verb reports a non-delivery as `ok: false` with a named
-      // verdict rather than by raising, so a caller that only awaits the promise
-      // cannot tell delivery from silent loss (`types.ts`). Recording it here is
-      // what puts that verdict on the agent's terminal.
-      if (action.type === "submit_text") {
-        // The deck the action was SENT to, read before the await settles: every
-        // action this runtime dispatches goes to the selected deck, and a
-        // verdict about it must not be filed under whichever deck happens to be
-        // selected by the time the reply lands.
-        noteTerminalInputResult(agentKey(sentToDeckId, action.agentId), isDelivered(result) ? undefined : result.sendResult);
-      }
       return result;
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
@@ -334,7 +261,7 @@ export function useDeckRuntime(): DeckRuntimeState {
       }
       throw cause;
     }
-  }, [bridge, noteTerminalInputResult]);
+  }, [bridge]);
 
   /*
    * Issue #1046: the toast in `App.tsx` renders on `notice || error`, and its
@@ -449,6 +376,12 @@ export function useDeckRuntime(): DeckRuntimeState {
   const upgradeDaemon = useMemo(() => (typeof bridge.upgradeDaemon === "function"
     ? (deckId: string, onEvent: (event: UpgradeEvent) => void) => bridge.upgradeDaemon(deckId, onEvent)
     : undefined), [bridge]);
+  // PRD #1666 §6.4: Retry and Cancel on a listed deck message. The answer is
+  // the row's to show, so this bypasses `runAction` too.
+  const inboxAction = useMemo(() => (typeof bridge.inboxAction === "function"
+    ? (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) =>
+      bridge.inboxAction!(target, item, verb)
+    : undefined), [bridge]);
   const decideUpgrade = useMemo(() => (typeof bridge.decideUpgrade === "function"
     ? (upgradeId: string, questionId: number, choice: UpgradeChoice) => bridge.decideUpgrade(upgradeId, questionId, choice)
     : undefined), [bridge]);
@@ -503,7 +436,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     runAction,
     ...(upgradeDaemon ? { upgradeDaemon } : {}),
     ...(decideUpgrade ? { decideUpgrade } : {}),
-    terminalInputResults,
+    ...(inboxAction ? { inboxAction } : {}),
     sendTerminalInput,
     resizeTerminal,
     setShownTerminals,

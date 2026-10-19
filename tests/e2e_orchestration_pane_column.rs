@@ -48,7 +48,9 @@ fn has_role_status(grid: &str, role: &str, status: &str) -> bool {
 /// resolving correctly on PATH — a dev machine may have a separately
 /// installed `dot-agent-deck` shadowing the build under test.
 fn write_beta_agent(deck: &TuiDeck) {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let bin = common::contained_deck_binary()
+        .to_str()
+        .expect("the contained deck path is UTF-8");
     let body = format!(
         "#!/bin/sh\n\
          printf 'BETA_ROLE_SENTINEL\\n'\n\

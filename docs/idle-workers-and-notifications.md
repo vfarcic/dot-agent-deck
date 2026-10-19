@@ -6,12 +6,12 @@ Reports are sent only inside an orchestration: an orchestration tab in the TUI, 
 
 ## The reports
 
-Each report is typed into the orchestrator's pane and submitted as a new message, in both clients. It says it is a `dot-agent-deck daemon report` so the orchestrator does not mistake it for you, and it asks the orchestrator to decide what to do.
+Each report waits in the orchestrator's inbox and reaches its conversation through the installed integration, in both clients. Its `Sent by:` line identifies a deck notice, and it asks the orchestrator to decide what to do. The TUI card and desktop tile show the [delivery badge](orchestration.md#delivery-in-the-tui-and-desktop-app); the desktop handoff rail also tracks worker handoffs.
 
 | Report starts with | Sent when | Setting |
 |---|---|---|
 | `A delegated worker has not responded with work-done` | The worker has not run `work-done` within `worker_response_timeout_minutes` (default 120) of receiving its task. | [`worker_response_timeout_minutes`](#change-how-long-a-worker-may-take) |
-| `⚠ delegated worker went quiet` | The worker showed no sign of starting its task: no event from its agent and no `ack`. Sent 30 seconds after delivery (or after `worker_response_timeout_minutes`, if shorter), or, when the deck is [re-sending the task](orchestration.md#a-lost-task-is-re-sent-into-the-same-worker), after the re-sends run out: about 3 minutes 40 seconds with the default schedule. | `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS` |
+| `Task m-… to the worker in role … has not reached the worker` | The task still has no receipt after five minutes; the report says whether it is queued or was taken without acknowledgement. | none needed for normal use |
 | `A delegated worker is waiting for input` | A worker that has not finished its task has been waiting for input for 30 seconds. | `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS` |
 | `⚠ delegated worker exited without work-done` | The worker's agent exited before it reported. | none |
 | `⚠ delegated worker never came up` | A `clear = true` worker restarted for a new task exited before it took the task, so the task was not delivered. | none |
@@ -20,7 +20,8 @@ Each report is typed into the orchestrator's pane and submitted as a new message
 
 What each report means for the orchestrator's next step:
 
-- **Went quiet** and **waiting for input** include the last lines the worker's pane shows (the agent idle at its input, a permission prompt, a login screen), so the orchestrator can tell "stuck at a prompt" from "never got the task". A worker that ran `ack`, or shows **Blocked**, is not reported as quiet.
+- **A task not yet acknowledged** produces a delivery notice for the orchestrator. Check the worker's inbox badge and pane before asking it to repeat the task.
+- **Waiting for input** includes the last lines of the worker's pane, so the orchestrator can see what needs an answer.
 - **Waiting for input** depends on the agent. For Claude Code it means a permission prompt; a Claude Code worker that asks a question in plain text simply ends its turn, so only the timeout report covers it. [Session Management](session-management.md) lists what each status means per agent.
 - **Exited:** the worker still counts as busy with its task. Run `dot-agent-deck pane restart <role>`, or delegate with `--supersede`, before giving that role new work ([One task per worker at a time](orchestration.md#one-task-per-worker-at-a-time)). A `work-done` that arrives just after this report is to be trusted over it.
 - **Never came up** and **respawn failed:** re-delegating to the same role runs the same `command` and fails the same way until the role's configuration is fixed, so the orchestrator should tell you or give the task to another role. See [A delegated worker never came up](orchestration.md#a-delegated-worker-never-came-up).
@@ -28,7 +29,7 @@ What each report means for the orchestrator's next step:
 
 The exited, never-came-up, respawn-failed and blocked reports name the worker by its pane id, not by its role. The pane id usually contains a form of the orchestration's name. The [daemon log](troubleshooting.md#enabling-debug-logs) line written beside each report names the role and, where there is one, the error.
 
-If you are part-way through typing in the orchestrator's pane, a report waits until you send or clear your text, for at most 60 seconds; see [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft).
+Native delivery leaves your input box alone. If the doorbell is needed, it waits until you send or clear your draft; see [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft).
 
 ## Change how long a worker may take
 
@@ -37,7 +38,7 @@ The idle-worker report (`A delegated worker has not responded with work-done`) i
 | Value | Effect |
 |---|---|
 | not set | `120` minutes |
-| `0` | The idle-worker report is off. So is the went-quiet report, unless `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS` is set to a non-zero value. `work-done` still reaches the orchestrator. |
+| `0` | The idle-worker timeout report is off. Message-delivery notices and `work-done` still reach the orchestrator. |
 | `1`–`10080` | That many minutes (up to seven days). |
 | anything larger | Ignored: `120` minutes is used and the daemon log records a warning. |
 
@@ -79,17 +80,16 @@ Comments and blank lines before it are fine. **Check:** the first non-comment, n
 
 ## Tune or turn off the other reports
 
-Two environment variables control the went-quiet and waiting reports. They are read by the daemon, so set them on the command that starts the daemon and restart a daemon that is already running; see [Setting the delivery variables](orchestration.md#setting-the-delivery-variables).
+The waiting report has one environment setting. They are read by the daemon, so set them on the command that starts the daemon and restart a daemon that is already running; see [Setting the delivery variables](orchestration.md#setting-the-delivery-variables).
 
 | Variable | Default | Values |
 |---|---|---|
-| `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS` | 30 seconds, or `worker_response_timeout_minutes` if shorter; none when that is `0` | Milliseconds, at most `30000` (larger values are capped). `0` turns the went-quiet report off. A non-zero value turns it on even when `worker_response_timeout_minutes = 0`. |
 | `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS` | `30000` | Milliseconds a worker must stay waiting before it is reported, at most `600000` (larger values are capped). `0` turns the waiting report off. |
 
 The waiting report is sent at most once per wait, and at most once per worker every four debounce windows (two minutes by default); a worker still waiting when that interval ends is reported then. A prompt you answer yourself within the debounce window produces no report.
 
 ```bash
-DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS=0 DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS=0 dot-agent-deck
+DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS=0 dot-agent-deck
 ```
 
 ## What to expect
@@ -98,12 +98,13 @@ DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS=0 DOT_AGENT_DECK_WAITING_NOTICE_DEBOU
 - **A `work-done` cancels the pending reports for that task**, even one that arrives a second before the deadline.
 - **Closing the worker's pane, or `dot-agent-deck pane restart <role>`, cancels them too.** A task that was still being handed to the worker when you restarted it goes to the replacement and is watched as usual.
 - **Reports go only to the orchestrator that delegated the task.** If that orchestrator is gone when a report is due (its pane closed, or a different agent now runs in it), the report is dropped.
-- **Reports do not act on the worker.** Sending a report does not stop, restart or interrupt the worker; the orchestrator decides what happens next. (Re-sending a lost task, which the deck does before the went-quiet report, does type into the worker's pane; see [A lost task is re-sent into the same worker](orchestration.md#a-lost-task-is-re-sent-into-the-same-worker).)
+- **Reports do not act on the worker.** Sending a report does not stop, restart or interrupt the worker; the orchestrator decides what happens next.
 - **Restarting the daemon forgets the tasks in progress.** Tasks delegated before the restart are not reported; tasks delegated after it are.
 - **The timeout counts time, not activity.** A worker busy on a long task is still reported when the timeout passes; the orchestrator can ignore it. That is why the default is two hours.
 - **Two overlapping tasks for one worker** (possible only with `delegate --supersede`) can occasionally produce one report too many, or leave one task unreported.
 - **Waiting reports can outlive the prompt.** A wait raised by a Claude Code or Codex subagent ends when that subagent stops or fails: the worker's TUI card leaves **Needs Input** (its desktop row leaves **needs input**), and a waiting report not yet sent is cancelled. One already sent stays sent, so the orchestrator can receive a report about a prompt that is gone.
 - **The deck sends no report about the orchestrator itself.** If the orchestrator's agent crashes, or the orchestration fails before any agent starts, nobody receives a report.
+
 
 ## Get notified when a run needs you
 

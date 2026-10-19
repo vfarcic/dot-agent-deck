@@ -669,6 +669,8 @@ pub mod test_support {
             blocked: None,
             background: None,
             authoring_kind: None,
+            inbox: None,
+            delivery_notice: None,
             pending_question: None,
             tab: DesktopTab::Dashboard,
             pull_request: None,

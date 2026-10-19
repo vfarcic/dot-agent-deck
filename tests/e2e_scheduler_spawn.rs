@@ -17,6 +17,15 @@
 
 mod common;
 
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_route.rs"]
+mod route;
+#[path = "support/inbox_view.rs"]
+mod view;
+
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::TabMembership;
@@ -149,8 +158,8 @@ fn spawn_001_mkdir_and_uncreatable_path() {
 /// runs `cat`), and one task whose `working_dir` has no config. Fire both via
 /// run-now. Assert the orchestration fire produces an agent in the registry
 /// tagged as the `orchestrator` role of an orchestration tab and that the
-/// prompt is delivered to it (echoed by its PTY); assert the plain fire
-/// produces a non-orchestration single-agent card with the prompt delivered.
+/// prompt is posted to its inbox; assert the plain fire produces a
+/// non-orchestration single-agent card with the prompt posted to its inbox.
 #[spec("scheduler/spawn/002")]
 #[test]
 fn spawn_002_orchestration_vs_single_agent() {
@@ -202,7 +211,15 @@ fn spawn_002_orchestration_vs_single_agent() {
         panic!("orchestration fire must spawn an `orchestrator` role pane, got {records:?}")
     });
     assert!(
-        daemon.attach_and_wait_for_output(&orchestrator.id, PROMPT_MARKER, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            orchestrator
+                .pane_id_env
+                .as_deref()
+                .expect("the agent's pane id"),
+            PROMPT_MARKER,
+            Duration::from_secs(10),
+        ),
         "the prompt must be delivered to the orchestrator role pane"
     );
 
@@ -215,7 +232,12 @@ fn spawn_002_orchestration_vs_single_agent() {
         )
         .expect("plain fire must spawn a non-orchestration single-agent card");
     assert!(
-        daemon.attach_and_wait_for_output(&single.id, PROMPT_MARKER, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            single.pane_id_env.as_deref().expect("the agent's pane id"),
+            PROMPT_MARKER,
+            Duration::from_secs(10),
+        ),
         "the prompt must be delivered to the single-agent card"
     );
 }
@@ -224,7 +246,7 @@ fn spawn_002_orchestration_vs_single_agent() {
 /// `[[orchestrations]]` — a roleless placeholder first, then `first-real`, then
 /// `chosen` carrying `default = true`, each spawnable role running `cat`. Fire it
 /// via run-now and assert the fire opens the `chosen` orchestration's tab and
-/// delivers the prompt to its orchestrator role: not a single-agent card (which
+/// posts the prompt to its orchestrator role's inbox: not a single-agent card (which
 /// the roleless slot-0 used to produce), and not `first-real` (which file order
 /// would produce).
 #[spec("scheduler/spawn/008")]
@@ -281,7 +303,15 @@ fn spawn_008_declared_default_orchestration_beats_slot_zero_and_file_order() {
         })
         .expect("the chosen orchestration must bring up its start role");
     assert!(
-        daemon.attach_and_wait_for_output(&orchestrator.id, PROMPT_MARKER, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            orchestrator
+                .pane_id_env
+                .as_deref()
+                .expect("the agent's pane id"),
+            PROMPT_MARKER,
+            Duration::from_secs(10),
+        ),
         "and the scheduled prompt must actually reach it — selecting the right orchestration and \
          then delivering nowhere is the same outage with a better-looking registry"
     );
@@ -323,109 +353,12 @@ fn spawn_003_command_is_honored() {
     );
 }
 
-/// Scenario: Register a single task and fire it once via run-now. Assert
-/// exactly one agent is spawned (no double-spawn) and the configured prompt is
-/// delivered to it (echoed by its PTY).
+/// Scenario: Fire a single scheduled task without a SessionStart hook. One agent and one bound inbox message appear; the pane fetches the prompt through its fixed doorbell rather than receiving prompt bytes on stdin.
 #[spec("scheduler/spawn/004")]
 #[test]
+#[cfg(unix)]
 fn spawn_004_fires_spawn_exactly_once_and_delivers() {
-    let scratch = common::harness_tempdir().expect("scratch tempdir");
-    let work = scratch.path().join("work");
-    std::fs::create_dir_all(&work).expect("create work dir");
-
-    let toml = task_block("once", &work.to_string_lossy(), Some("cat"));
-    let daemon = common::spawn_daemon_serve(Some(&toml), "0");
-
-    daemon.run_now("once").expect("run-now once");
-
-    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
-    assert_eq!(
-        records.len(),
-        1,
-        "a single fire must spawn exactly one agent, got {records:?}"
-    );
-    // Hold the line: no second tab appears shortly after.
-    daemon.assert_agent_count_stays_at_most(1, Duration::from_secs(2));
-
-    let agent = &daemon.agent_records()[0];
-    assert!(
-        daemon.attach_and_wait_for_output(&agent.id, PROMPT_MARKER, Duration::from_secs(10)),
-        "the configured prompt must be delivered to the spawned agent"
-    );
-}
-
-/// Scenario: Register one single-agent task whose `command` is `cat` (a process
-/// that emits NO `SessionStart` hook of its own) and fire it via run-now. While
-/// no `SessionStart` for the spawned pane has been observed, the prompt must NOT
-/// be delivered — assert it is absent from the pane's PTY output for a window
-/// well past the old flat 300ms buffer. Then inject the agent's real
-/// `SessionStart` hook (carrying the spawned pane's `pane_id` + registry
-/// `agent_id`, exactly as a live agent's hook would) and assert the prompt IS
-/// THEN delivered (echoed by `cat`) — pinning that delivery is gated on agent
-/// readiness, not a flat timer.
-#[spec("scheduler/spawn/005")]
-#[test]
-fn spawn_005_delivery_gated_on_session_start() {
-    let scratch = common::harness_tempdir().expect("scratch tempdir");
-    let work = scratch.path().join("gated");
-    std::fs::create_dir_all(&work).expect("create work dir");
-
-    let toml = task_block("gated", &work.to_string_lossy(), Some("cat"));
-    let daemon = common::spawn_daemon_serve_with_env(
-        Some(&toml),
-        "0",
-        &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")],
-    );
-
-    daemon.run_now("gated").expect("run-now gated");
-
-    // The agent is registered at spawn time (before any prompt delivery). Read
-    // back its pane_id + agent_id — the SessionStart-gate match keys, mirroring
-    // `state.rs::wait_for_session_start` (pane_id AND agent_id must both match).
-    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
-    let agent = records
-        .first()
-        .unwrap_or_else(|| panic!("fire must spawn the single-agent card, got {records:?}"));
-    let agent_id = agent.id.clone();
-    let pane_id = agent
-        .pane_id_env
-        .clone()
-        .expect("scheduler-spawned pane must carry a DOT_AGENT_DECK_PANE_ID for hook routing");
-
-    // GATE (RED today): no SessionStart for this pane has been observed, so the
-    // prompt must NOT be delivered yet. The 2s window is comfortably past the old
-    // flat 300ms buffer that delivered ungated — under the bug the marker is
-    // already echoed by `cat`, so this returns `true` and the assertion trips.
-    assert!(
-        !daemon.attach_and_wait_for_output(&agent_id, PROMPT_MARKER, Duration::from_secs(2)),
-        "the scheduled prompt must NOT be delivered before the agent's SessionStart \
-         is observed (delivery must be gated on readiness, not a flat 300ms timer)"
-    );
-
-    // The agent becomes ready: inject its real SessionStart hook carrying the
-    // spawned pane's pane_id + registry agent_id (what a live claude/opencode
-    // agent's hook emits). This rides the daemon's hook-event broadcast — the
-    // same channel the readiness gate subscribes to — and satisfies the gate.
-    let event = serde_json::json!({
-        "session_id": "gated",
-        "agent_type": "claude_code",
-        "event_type": "session_start",
-        "timestamp": "2026-06-08T12:00:00Z",
-        "pane_id": pane_id,
-        "agent_id": agent_id,
-        "cwd": work.to_string_lossy(),
-    });
-    common::write_hook_line(&daemon.hook_socket, &event.to_string())
-        .expect("write SessionStart hook to the daemon's hook socket");
-
-    // GREEN signal: once the SessionStart lands, the gate releases and the prompt
-    // is delivered (echoed by `cat`). The injection happens ~2s in — well within
-    // the 10s gate fallback — so the delivery is attributable to the SessionStart,
-    // not the timeout safety net.
-    assert!(
-        daemon.attach_and_wait_for_output(&agent_id, PROMPT_MARKER, Duration::from_secs(10)),
-        "after the agent's SessionStart is observed, the gated prompt must be delivered"
-    );
+    route::scheduled(None);
 }
 
 /// Scenario: Fire one scheduled single-agent task whose command is bare Codex
@@ -656,7 +589,12 @@ fn spawn_009_declared_shape_overrides_the_target_dirs_config() {
          not merely open a card"
     );
     assert!(
-        daemon.attach_and_wait_for_output(&single.id, PROMPT_MARKER, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            single.pane_id_env.as_deref().expect("the agent's pane id"),
+            PROMPT_MARKER,
+            Duration::from_secs(10),
+        ),
         "the prompt must be delivered to the forced single-agent card"
     );
     assert_eq!(
@@ -694,7 +632,12 @@ fn spawn_009_declared_shape_overrides_the_target_dirs_config() {
             )
         });
     assert!(
-        daemon.attach_and_wait_for_output(&named.id, PROMPT_MARKER, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            named.pane_id_env.as_deref().expect("the agent's pane id"),
+            PROMPT_MARKER,
+            Duration::from_secs(10),
+        ),
         "the prompt must be delivered to the named orchestration's start role"
     );
 

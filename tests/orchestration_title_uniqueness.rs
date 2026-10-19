@@ -422,6 +422,7 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
             prompt: "review".to_string(),
             resolved_target: None,
             compose_orchestrator_context: None,
+            seed_reason: None,
         },
         &daemon.registry,
         &QuietNotifier,

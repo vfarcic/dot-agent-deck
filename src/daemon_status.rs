@@ -30,6 +30,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::agent_pty::{AgentRecord, TabMembership};
+use crate::inbox_hub::InboxSummary;
 use crate::state::{ActiveTool, SessionStatus};
 
 /// Version of the `--json` document shape. Bump on a field removal or a
@@ -100,6 +101,11 @@ pub struct StatusAgent {
     pub status: Option<SessionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<StatusTool>,
+    /// PRD #1666 S3: the agent's inbox — counts, last acknowledgement and how a
+    /// new message would reach it. Carried as the daemon reports it: none of
+    /// its fields is private content. Additive, so [`SCHEMA_VERSION`] stays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<InboxSummary>,
 }
 
 /// Top-level `--json` document: a [`SCHEMA_VERSION`] and the `agents` array,
@@ -158,6 +164,7 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
         .into_iter()
         .map(|record| {
             let live = record.live;
+            let inbox = record.inbox;
             StatusAgent {
                 agent_id: record.id,
                 pane_id: record.pane_id_env,
@@ -171,6 +178,7 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
                 active_tool: live
                     .and_then(|s| s.active_tool)
                     .map(|tool: ActiveTool| StatusTool { name: tool.name }),
+                inbox,
             }
         })
         .collect()
@@ -182,6 +190,15 @@ fn cell(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or(DASH)
 }
 
+/// The INBOX cell: `2q 1f` for two queued and one fetched message, a dash when
+/// nothing is pending.
+fn inbox_cell(inbox: Option<&InboxSummary>) -> String {
+    match inbox {
+        Some(i) if i.queued > 0 || i.fetched > 0 => format!("{}q {}f", i.queued, i.fetched),
+        _ => DASH.to_string(),
+    }
+}
+
 /// Render the concise, one-row-per-agent human table. Never includes prompt
 /// text or scrollback (see the module docs for why) — only the diagnostic
 /// fields on [`StatusAgent`] are candidates for a column here, and the TOOL
@@ -191,7 +208,7 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
         return "no managed agents\n".to_string();
     }
     let mut out = String::new();
-    out.push_str("PANE\tAGENT\tROLE\tSTATUS\tTOOL\tLABEL\tCWD\n");
+    out.push_str("PANE\tAGENT\tROLE\tSTATUS\tTOOL\tINBOX\tWAKE\tLABEL\tCWD\n");
     for a in agents {
         let status = a
             .status
@@ -203,13 +220,16 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
             .as_ref()
             .map(|t| t.name.as_str())
             .unwrap_or(DASH);
+        let wake = a.inbox.as_ref().map_or(DASH, |i| i.wake.label());
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             cell(&a.pane_id),
             a.agent_id,
             cell(&a.role),
             status,
             tool,
+            inbox_cell(a.inbox.as_ref()),
+            wake,
             cell(&a.label),
             cell(&a.cwd),
         ));
@@ -239,6 +259,7 @@ mod tests {
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         }
     }
 
@@ -256,6 +277,7 @@ mod tests {
             last_activity_ms: None,
             blocked: None,
             hook_generation: None,
+            delivery_notice: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,
@@ -444,5 +466,30 @@ mod tests {
         // that.
         assert_eq!(parsed["schema_version"], 2);
         assert!(json.contains("json-pane"));
+    }
+
+    /// PRD #1666 S3: INBOX shows queued and fetched counts, a dash when both
+    /// are zero or the daemon reported no inbox; WAKE a dash for no inbox.
+    #[test]
+    fn inbox_and_wake_cells() {
+        use crate::inbox_hub::{InboxSummary, WakePath};
+        let summary = |queued, fetched, wake| InboxSummary {
+            queued,
+            fetched,
+            claimed: 0,
+            undeliverable: 3,
+            last_acked_at: None,
+            wake,
+            component: None,
+            wake_stalled: false,
+            notices: Default::default(),
+        };
+        assert_eq!(inbox_cell(Some(&summary(2, 1, WakePath::Native))), "2q 1f");
+        assert_eq!(inbox_cell(Some(&summary(0, 2, WakePath::Native))), "0q 2f");
+        assert_eq!(inbox_cell(Some(&summary(0, 0, WakePath::Native))), "-");
+        assert_eq!(inbox_cell(None), "-");
+        let table = format_human(&build_status_agents(vec![record("1", "p", None)]));
+        let row: Vec<&str> = table.lines().nth(1).unwrap().split('\t').collect();
+        assert_eq!((row[5], row[6]), ("-", "-"));
     }
 }

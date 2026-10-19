@@ -7,8 +7,8 @@
 # (tab A delegates to `coder`, tab B to `reviewer`), so every no-cross-delivery
 # check is a presence/absence question about a pane that has otherwise received
 # NOTHING — no occurrence counting in a redrawing agent TUI — and the two
-# work-done feedback strings the daemon writes back are role-specific
-# ("Worker coder …" vs "Worker reviewer …"), so they stay distinguishable even
+# work-done report opener lines the orchestrators quote are role-specific
+# (`coder` vs `reviewer`), so they stay distinguishable even
 # inside one orchestrator pane.
 #
 # All three roles are REAL, fully interactive Claude Code panes pinned to Haiku
@@ -21,7 +21,7 @@ name = "route-iso"
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write"
 start = true
 
 [[orchestrations.roles]]

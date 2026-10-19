@@ -159,9 +159,7 @@ async fn handle_connection(
     match request {
         AttachRequest::Hello { .. } => {
             let summary = RunningAgentsSummary::from_records(&records.lock().unwrap());
-            let response = AttachResponse::hello(PROTOCOL_VERSION)
-                .with_running_agents(summary)
-                .with_guarded_send();
+            let response = AttachResponse::hello(PROTOCOL_VERSION).with_running_agents(summary);
             write_resp(&mut stream, &response)
                 .await
                 .expect("reply to Hello");
@@ -214,6 +212,7 @@ async fn handle_connection(
                 crashed: None,
                 orchestrator_context_path: None,
                 authoring_kind: None,
+                inbox: None,
             });
             write_resp(&mut stream, &AttachResponse::with_id(id))
                 .await
@@ -315,6 +314,7 @@ fn orchestration_record(
         crashed: None,
         orchestrator_context_path: None,
         authoring_kind: None,
+        inbox: None,
     }
 }
 

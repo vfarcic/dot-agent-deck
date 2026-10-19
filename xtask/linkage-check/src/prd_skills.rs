@@ -714,10 +714,10 @@ fn prd_skills_017_the_documented_body_template_is_prd_content() {
 ///
 /// A fork REPLACES its mirror rather than sitting beside it: two skills with
 /// conflicting procedures for the same job leave an agent no way to tell which
-/// governs, which is the argument the `pr-create` fork (#1052) made. Deleting a
-/// mirror sticks where editing one does not (CHANGELOG, issue #1061), so if a
-/// later sync from `dot-ai` re-adds one of these, this goes red and the fix is
-/// to delete the re-added mirror again — never to edit it.
+/// governs, which is the argument the `pr-create` fork (#1052) made. Syncing
+/// from `dot-ai` has stopped (CLAUDE.md rule 13), so a mirror would come back
+/// only by being re-imported by hand; if one is, this goes red and the fix is
+/// to delete the returned copy, which would otherwise sit beside its fork.
 const FORKS: &[(&str, &str)] = &[
     ("pr-create", "dot-ai-prd-done"),
     ("prd-full", "dot-ai-prd-full"),
@@ -742,7 +742,7 @@ fn prd_skills_015_each_fork_replaced_its_mirror() {
         }
         if skills.join(mirror).exists() {
             bad.push(format!(
-                "{mirror}: the mirror is back beside its fork `{fork}` — delete it, do not edit it"
+                "{mirror}: the mirror is back beside its fork `{fork}` — delete it"
             ));
         }
     }
@@ -751,8 +751,8 @@ fn prd_skills_015_each_fork_replaced_its_mirror() {
 
 /// Nothing that instructs an agent points at a retired mirror — by path
 /// (`.claude/skills/<mirror>/…`) or by slash invocation (`/<mirror>`) — in the
-/// project-local skills, the orchestration role templates, CLAUDE.md and the
-/// maintainer docs. A bare mention is allowed: "forked from the `<mirror>`
+/// skills under `.claude/skills/`, the orchestration role templates, CLAUDE.md
+/// and the maintainer docs. A bare mention is allowed: "forked from the `<mirror>`
 /// mirror" is provenance, and it does not send anyone to a file that is gone.
 #[test]
 fn prd_skills_016_no_instruction_names_a_retired_mirror() {
@@ -773,12 +773,8 @@ fn prd_skills_016_no_instruction_names_a_retired_mirror() {
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
             let p = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
             if p.is_dir() {
-                // The mirrors that remain are upstream's text, not ours.
-                if !name.starts_with("dot-ai-") {
-                    stack.push(p);
-                }
+                stack.push(p);
             } else if p.is_file() {
                 files.push(p);
             }

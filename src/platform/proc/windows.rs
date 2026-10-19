@@ -678,6 +678,101 @@ pub async fn process_table_async(_roots: &[i32]) -> Option<Vec<super::ProcessInf
 // Orphan watchdog (test-gated, OFF in production).
 // ---------------------------------------------------------------------------
 
+/// Audit F3: the executable process `pid` runs. Not implemented on Windows, so
+/// `None`: the caller falls back to not checking.
+pub fn executable_of(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// PRD #1666 hardening M2 (PR #1735 review): the parent of process `pid`,
+/// from a Toolhelp process snapshot. `None` when the snapshot cannot be taken
+/// or does not list `pid` (it is not running).
+///
+/// Windows keeps a process's recorded parent pid after that parent exits, and
+/// reuses pids, so the recorded pid can name an unrelated process started
+/// later. A recorded parent that cannot be opened (it exited, or this user may
+/// not query it), or that started after `pid` did (its pid was reused), is
+/// answered as `Some(0)`: the walk in [`super::descends_from_with`] then ends
+/// as "not a descendant", as an orphan reparented to init does on Linux.
+pub fn parent_pid_of(pid: u32) -> Option<u32> {
+    let recorded = recorded_parent(pid)?;
+    if recorded == 0 {
+        return Some(0);
+    }
+    match (creation_time(pid), creation_time(recorded)) {
+        (_, None) => Some(0),
+        (Some(child_started), Some(parent_started)) if parent_started > child_started => Some(0),
+        _ => Some(recorded),
+    }
+}
+
+/// `pid`'s parent as a Toolhelp snapshot records it, or `None` when the
+/// snapshot cannot be taken or does not list `pid`.
+fn recorded_parent(pid: u32) -> Option<u32> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: a snapshot of every process; no pointer is passed in, and the
+    // handle is closed below on every path.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..PROCESSENTRY32W::default()
+    };
+    let mut found = None;
+    // SAFETY: `snapshot` is a valid snapshot handle and `entry` a stack value
+    // whose `dwSize` is set as both calls require; they write only into it.
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        if entry.th32ProcessID == pid {
+            found = Some(entry.th32ParentProcessID);
+            break;
+        }
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: `snapshot` is a handle this function opened and closes once.
+    unsafe { CloseHandle(snapshot) };
+    found
+}
+
+/// PR #1735 third review (F2): when process `pid` started, in `FILETIME`
+/// units, or `None` when it cannot be opened — see the Unix variant.
+pub fn process_start_of(pid: u32) -> Option<u64> {
+    creation_time(pid)
+}
+
+/// When process `pid` started, in `FILETIME` units, or `None` when it cannot
+/// be opened (it is gone, or this user may not query it).
+fn creation_time(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: `OpenProcess` takes no pointer; a null handle is checked below.
+    let handle: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut times = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
+    let [created, exited, kernel, user] = &mut times;
+    // SAFETY: `handle` was opened with query rights above and the four
+    // pointers name distinct stack values the call writes into.
+    let ok = unsafe { GetProcessTimes(handle, created, exited, kernel, user) } != 0;
+    // SAFETY: `handle` is a handle this function opened and closes once.
+    unsafe { CloseHandle(handle) };
+    ok.then(|| (u64::from(times[0].dwHighDateTime) << 32) | u64::from(times[0].dwLowDateTime))
+}
+
 /// The orphan watchdog has no Windows analogue (`getppid`/pid-1-reparent is
 /// POSIX) and is test-only / OFF in production. Returns a sentinel so
 /// `should_exit_orphaned` never triggers.
@@ -708,6 +803,24 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn the helper process tree")
+    }
+
+    /// PR #1735 review: the inbox's process-tree check reads real ancestry
+    /// here — a child descends from this test process, and this process does
+    /// not descend from its child.
+    #[test]
+    fn parent_lookup_tells_a_child_from_an_unrelated_process() {
+        let mut child = spawn_helper_tree();
+        let pid = child.id();
+        let me = std::process::id();
+        let read = (
+            parent_pid_of(pid),
+            super::super::descends_from(pid, me),
+            super::super::descends_from(me, pid),
+        );
+        let _ = force_kill_pid(pid);
+        let _ = child.wait();
+        assert_eq!(read, (Some(me), Some(true), Some(false)));
     }
 
     /// The escalation state machine's platform input: a live process reads as

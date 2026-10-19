@@ -4,7 +4,6 @@ expression: text
 ---
                                                                                                                         
                                                                                                                         
-                                                                                                                        
         ┌ Help ───────────────────────────────────────────────────────────────────────────────────────────────┐         
         │  Global (chords work from any pane)                 Mouse                                           │         
         │                                                                                                     │         
@@ -36,6 +35,7 @@ expression: text
         │  y / n              Approve / deny permission                                                       │         
         │  s / Ctrl+s         Schedules manager                                                               │         
         │  m / Ctrl+m         Host of this deck                                                               │         
+        │  i                  Deck messages: Retry or Cancel                                                  │         
         │  o                  Open pull request                                                               │         
         │  u / Ctrl+u         Upgrade (update badge)                                                          │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         

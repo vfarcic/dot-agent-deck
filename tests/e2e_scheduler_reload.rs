@@ -12,6 +12,9 @@
 
 mod common;
 
+#[path = "support/inbox_view.rs"]
+mod view;
+
 use std::time::Duration;
 
 use dot_agent_deck::daemon_protocol::AttachRequest;
@@ -224,14 +227,24 @@ fn reload_002_prompt_only_edit_delivers_new_prompt() {
 
     // The NEW prompt must reach the spawned agent.
     assert!(
-        daemon.attach_and_wait_for_output(&agent.id, PROMPT_BRAVO, Duration::from_secs(10)),
+        view::wait_for(
+            &daemon.attach_socket,
+            agent.pane_id_env.as_deref().expect("the agent's pane id"),
+            PROMPT_BRAVO,
+            Duration::from_secs(10),
+        ),
         "after a prompt-only edit + reload, the fire must deliver the NEW prompt \
          {PROMPT_BRAVO}, not the value captured at first registration"
     );
 
     // ...and the stale pre-edit prompt must NOT.
     assert!(
-        !daemon.attach_and_wait_for_output(&agent.id, PROMPT_ALPHA, Duration::from_secs(2)),
+        !view::wait_for(
+            &daemon.attach_socket,
+            agent.pane_id_env.as_deref().expect("the agent's pane id"),
+            PROMPT_ALPHA,
+            Duration::from_secs(2),
+        ),
         "the fire must NOT deliver the stale prompt {PROMPT_ALPHA} after the prompt was edited"
     );
 }

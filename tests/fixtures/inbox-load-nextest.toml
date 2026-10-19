@@ -1,0 +1,9 @@
+# Used only for the explicitly scheduled merge gate, not by ordinary checks.
+# DOT_AGENT_DECK_INBOX_LOAD_TEST=1 DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 \
+# DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-luna cargo test-e2e-live \
+# --config-file tests/fixtures/inbox-load-nextest.toml --test e2e_inbox_load load_ --no-capture
+[profile.default]
+default-filter = 'binary(e2e_inbox_load)'
+test-threads = 1
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 12 }

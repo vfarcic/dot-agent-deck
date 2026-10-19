@@ -33,7 +33,7 @@ use crate::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_SHUTDOWN,
     KIND_SHUTDOWN_ACK, KIND_STREAM_END, KIND_STREAM_OUT, read_frame, write_frame,
 };
-use crate::event::{AgentType, BroadcastMsg, SendResult};
+use crate::event::{AgentType, BroadcastMsg};
 
 /// Errors returned by the client. Server-side error responses are surfaced
 /// as [`ClientError::Server`] with the daemon's message; transport problems
@@ -802,13 +802,13 @@ pub struct StartAgentOptions {
     /// `None` here omits the field from the wire payload so older
     /// daemons keep accepting the request.
     pub agent_type: Option<AgentType>,
-    /// PRD #201 native prompt delivery: a seed/prompt to stash daemon-side for
-    /// this pane at spawn time (via `AgentPtyRegistry::set_pending_seed`), to be
-    /// pulled NATIVELY by the pane's extension via `dot-agent-deck get-seed`
-    /// (→ `pi.sendUserMessage`) instead of typed into the PTY. Set only for a
-    /// Pi start-role (orchestrator) pane. `None` omits the field from the wire
-    /// payload so older daemons keep accepting the request (and, receiving no
-    /// seed, drive the unchanged PTY-injection path).
+    /// The prompt this agent is started with. Forwarded as
+    /// `AttachRequest::StartAgent.seed`; the daemon posts it as the pane's
+    /// first inbox message, bound to the agent it just spawned, for every
+    /// agent type (PRD #1666 S5), and refuses the start when it cannot. The
+    /// TUI sets it for a built-in option's seed (schedule, issue dispatch,
+    /// dispatcher) and for an orchestration's Pi start role (`tab.rs`). `None`
+    /// omits the field from the wire payload.
     pub seed: Option<String>,
 }
 
@@ -878,83 +878,6 @@ pub async fn read_response<R: AsyncRead + Unpin>(
             "expected RESP, got frame kind 0x{kind:02x}"
         ))),
     }
-}
-
-/// Issue #621: a guarded `write-and-submit`'s answer as
-/// [`DaemonClient::write_and_submit_with_identity_reply`] reports it — the
-/// honest [`SendResult`], and on a `stale` refusal of a request that named no
-/// session, the hook-session generation the daemon refused it against
-/// ([`crate::daemon_protocol::AttachResponse::current_session_id`]).
-///
-/// That generation is how a caller whose own event stream never delivered the
-/// pane's `SessionStart` learns which conversation to name. It is advisory:
-/// the retry naming it goes back through the same guard. An older daemon never
-/// sends one, so `None` there means exactly what it always did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GuardedSendReply {
-    pub result: SendResult,
-    pub current_session_id: Option<String>,
-}
-
-/// Issue #621 (review): a guarded `write-and-submit` that produced no outcome,
-/// and whether it could nonetheless have written. `may_have_written` is false
-/// only when the failure provably left the daemon untouched — the capability
-/// probe, the connection, building the request — or when the daemon itself
-/// answered with a refusal; it is true from the moment the request frame
-/// started going out until a decodable answer came back, which is the
-/// lost-response case a delivery has to stay cautious about.
-#[derive(Debug)]
-pub struct GuardedSendFailure {
-    pub error: ClientError,
-    pub may_have_written: bool,
-}
-
-impl GuardedSendFailure {
-    fn unsent(error: ClientError) -> Self {
-        Self {
-            error,
-            may_have_written: false,
-        }
-    }
-
-    fn maybe_written(error: ClientError) -> Self {
-        Self {
-            error,
-            may_have_written: true,
-        }
-    }
-}
-
-/// PRD #20 R20-011: translate a `WriteAndSubmit` [`AttachResponse`] into the
-/// honest [`SendResult`] a caller acts on, enforcing that `ok` AGREES with the
-/// delivered-vs-non-delivered outcome. Three cases:
-///
-/// * A typed `send_result` present → return it, EXCEPT when it claims delivery
-///   (`applied`/`queued`) while `ok = false`. That contradiction (a
-///   forward-compat/hostile daemon, or a bug) must NEVER be reported as success:
-///   `ok = false` wins and we surface a server error. An unknown future variant
-///   decodes to [`SendResult::Unknown`] and is returned verbatim (a non-delivery
-///   the UI matches handle conservatively).
-/// * No `send_result` and `ok = false` → a genuine transport/server failure.
-/// * No `send_result` and `ok = true` → a pre-PRD-20 daemon; legacy
-///   fire-and-forget "assume applied".
-fn interpret_send_response(resp: AttachResponse) -> Result<SendResult, ClientError> {
-    if let Some(result) = resp.send_result {
-        let claims_delivered = matches!(result, SendResult::Applied | SendResult::Queued);
-        if claims_delivered && !resp.ok {
-            return Err(ClientError::Server(resp.error.unwrap_or_else(|| {
-                "daemon reported ok=false with a delivered send_result".into()
-            })));
-        }
-        return Ok(result);
-    }
-    if !resp.ok {
-        return Err(ClientError::Server(
-            resp.error
-                .unwrap_or_else(|| "write-and-submit failed".into()),
-        ));
-    }
-    Ok(SendResult::Applied)
 }
 
 /// One-shot request/response: send `req`, read one RESP, return it. Used for
@@ -1129,9 +1052,7 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
 /// PRD #819 M5: the capability set observed on ONE handshake reply, plus the
 /// client's fail-safe reading of it.
 ///
-/// This is the general form of the [`AttachResponse::guarded_send`] check
-/// (`daemon_advertises_guarded_send` below): it consults the daemon's
-/// **explicit capability advertisement, never the protocol version number**,
+/// It consults the daemon's **explicit capability advertisement, never the protocol version number**,
 /// and it withholds rather than proceeds when the advertisement is missing.
 ///
 /// Three properties, each of which is a decision rather than an accident:
@@ -1677,6 +1598,7 @@ impl DaemonClient {
                     crashed: None,
                     orchestrator_context_path: None,
                     authoring_kind: None,
+                    inbox: None,
                 })
                 .collect(),
             schedule_revision,
@@ -1866,6 +1788,149 @@ impl DaemonClient {
         Ok(GatedQuery::Answered(()))
     }
 
+    /// PRD #1666 S3 — post a deck-generated message (a seed, an orchestrator's
+    /// role context, the configuration-generation prompt) to `pane_id`'s inbox,
+    /// bound to `expected_agent_id` when given. Answers the message id.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_INBOX`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything.
+    pub async fn post_message(
+        &self,
+        pane_id: &str,
+        expected_agent_id: Option<&str>,
+        subject: &str,
+        body: &str,
+        spill_path: Option<&str>,
+        origin: crate::inbox_hub::PostOrigin,
+    ) -> Result<GatedQuery<String>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_INBOX)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::PostMessage {
+                pane_id: pane_id.to_string(),
+                expected_agent_id: expected_agent_id.map(str::to_string),
+                subject: subject.to_string(),
+                body: body.to_string(),
+                spill_path: spill_path.map(str::to_string),
+                origin,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "post-message failed".into()),
+            ));
+        }
+        resp.id
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Server("post-message answered no message id".into()))
+    }
+
+    /// PRD #1666 S3 — the inbox of `pane_id`, or of the whole deck with no
+    /// pane: every message, live and recent history.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_INBOX`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything.
+    /// PRD #1666 §6.4: the user's Retry (`retry`) or Cancel on deck message
+    /// `message_id` that `agent_id`'s card in `pane_id` lists, at the
+    /// `revision` the card showed. `request_id` names the press, so sending it
+    /// again answers as before.
+    ///
+    /// **Withheld from a daemon that does not advertise
+    /// [`crate::daemon_protocol::CAP_INBOX_ACTIONS`]**, which answers
+    /// [`GatedQuery::Unsupported`] without sending anything (CLAUDE.md rule
+    /// 18, second rung): an older daemon would refuse the verb with a generic
+    /// decode error, and a client must not offer a button that cannot work.
+    pub async fn inbox_action(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        message_id: &str,
+        revision: u64,
+        retry: bool,
+        request_id: &str,
+    ) -> Result<GatedQuery<crate::daemon_protocol::InboxActionReply>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_INBOX_ACTIONS)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (pane_id, agent_id, message_id, request_id) = (
+            pane_id.to_string(),
+            agent_id.to_string(),
+            message_id.to_string(),
+            request_id.to_string(),
+        );
+        let request = if retry {
+            AttachRequest::InboxRetry {
+                pane_id,
+                agent_id,
+                message_id,
+                revision,
+                request_id,
+            }
+        } else {
+            AttachRequest::InboxCancel {
+                pane_id,
+                agent_id,
+                message_id,
+                revision,
+                request_id,
+            }
+        };
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(&mut rd, &mut wr, &request).await?;
+        match resp.inbox_action {
+            Some(reply) if resp.ok => Ok(GatedQuery::Answered(reply)),
+            _ => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the deck did not answer the inbox action".into()
+            }))),
+        }
+    }
+
+    pub async fn list_inbox(
+        &self,
+        pane_id: Option<&str>,
+    ) -> Result<GatedQuery<Vec<crate::inbox::MessageSummary>>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_INBOX)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::ListInbox {
+                pane_id: pane_id.map(str::to_string),
+                bodies: false,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "list-inbox failed".into()),
+            ));
+        }
+        Ok(GatedQuery::Answered(
+            resp.inbox_messages.unwrap_or_default(),
+        ))
+    }
+
     /// PRD #1223 M7 — start an AUTHORING agent: the daemon composes `kind`'s
     /// seed (the text the TUI's own `schedule` / `schedule: issues` /
     /// `dispatcher` option types in, naming `opts.cwd`) and delivers it once the
@@ -1959,210 +2024,6 @@ impl DaemonClient {
             .ok_or_else(|| ClientError::Malformed("start-agent ok but no id in response".into()))
     }
 
-    /// PRD #100: route a pane write through the daemon's atomic
-    /// `write_and_submit_guarded` primitive instead of the
-    /// two-`STREAM_IN`-frames-with-gap pattern. Same one-shot connection
-    /// shape as `resize_agent` / `stop_agent`. The daemon holds the
-    /// per-agent writer mutex across `payload → SUBMIT_DELAY → CR`, so a
-    /// concurrent daemon-initiated write (work-done feedback, respawn
-    /// notice) cannot interleave between the payload and the submit CR.
-    ///
-    /// PRD #20 M3: returns the daemon's honest [`SendResult`] rather than a bare
-    /// `()`. A newer daemon reports `applied` for a live target and
-    /// `history-only` / `no-live-target` when the session can't accept live
-    /// input; a pre-PRD-20 daemon omits the field, which we read as
-    /// [`SendResult::Applied`] (the legacy fire-and-forget assumption). A
-    /// transport/`ok=false` failure still surfaces as `Err`.
-    ///
-    /// Issue #608: a write through this identity-less door is refused by a
-    /// current daemon (`no-live-target`, nothing written). On the PANED arm that
-    /// is the change — an absent `expected_agent_id` no longer degrades to
-    /// pane-only authorization. On the PANE-LESS arm nothing changed, because it
-    /// never accepted this shape: `<no-pane>` has always been routed by agent
-    /// identity, so a request naming no agent has always resolved to
-    /// `Writable::None` there.
-    ///
-    /// Issue #608 audit, finding 5: this doc used to say the method was kept for
-    /// PANE-LESS callers, which was never true — that arm declines this shape as
-    /// firmly as the paned one now does. What it is actually kept for is a
-    /// pre-PRD-20 daemon: naming no identity is what keeps
-    /// [`Self::write_and_submit_with_identity`]'s guarded-send capability probe
-    /// out of the way, so this remains the legacy-compatible fire-and-forget
-    /// door. Against a current daemon every caller wants the identity-bearing
-    /// sibling, paned or not; in-tree the only remaining caller of this one is a
-    /// unit test.
-    pub async fn write_and_submit(
-        &self,
-        pane_id: &str,
-        text: &str,
-    ) -> Result<SendResult, ClientError> {
-        self.write_and_submit_with_identity(pane_id, text, None, None, None)
-            .await
-    }
-
-    /// PRD #20 R20-003/R20-004: identity-bearing, idempotent counterpart of
-    /// [`Self::write_and_submit`]. Carries the agent identity + session the
-    /// prompt was queued for (`expected_agent_id` / `expected_session_id`) and a
-    /// stable `delivery_id`. The daemon compares the identity against the exact
-    /// live registry target BEFORE writing and returns `stale` / `wrong-session`
-    /// (without writing) on a rebind, and dedups on `delivery_id` so a retry
-    /// after a lost response replays the first result instead of double-submitting.
-    ///
-    /// The additive fields ride ALONGSIDE the base `WriteAndSubmit` shape as JSON
-    /// rather than widening the [`AttachRequest`] enum — its 2-field
-    /// `WriteAndSubmit { pane_id, text }` literal is depended on by existing call
-    /// sites, and a pre-PRD-20 daemon simply ignores the extra keys (degrading to
-    /// pane-only authorization), so the wire stays forward + backward compatible
-    /// and needs no `PROTOCOL_VERSION` bump.
-    pub async fn write_and_submit_with_identity(
-        &self,
-        pane_id: &str,
-        text: &str,
-        expected_agent_id: Option<&str>,
-        expected_session_id: Option<&str>,
-        delivery_id: Option<&str>,
-    ) -> Result<SendResult, ClientError> {
-        self.write_and_submit_with_identity_reply(
-            pane_id,
-            text,
-            expected_agent_id,
-            expected_session_id,
-            delivery_id,
-        )
-        .await
-        .map(|reply| reply.result)
-        .map_err(|failure| failure.error)
-    }
-
-    /// Issue #621: [`Self::write_and_submit_with_identity`], keeping the
-    /// generation a `stale` refusal names — see [`GuardedSendReply`]. The two
-    /// send exactly the same request; only what is kept from the answer
-    /// differs.
-    pub async fn write_and_submit_with_identity_reply(
-        &self,
-        pane_id: &str,
-        text: &str,
-        expected_agent_id: Option<&str>,
-        expected_session_id: Option<&str>,
-        delivery_id: Option<&str>,
-    ) -> Result<GuardedSendReply, GuardedSendFailure> {
-        // PRD #20 R20-006 (finding #6): an identity-bearing send DEPENDS on the
-        // daemon's guarded-send guarantees (exact agent+session match, atomic
-        // delivery-id dedup). If the daemon doesn't advertise that capability —
-        // an older build that silently IGNORES the identity/idempotency fields
-        // and just returns `ok=true` — FAIL SAFE and do NOT submit. Trusting that
-        // unguarded `ok=true` would (a) let a lost-response retry double-submit
-        // (no dedup), and (b) let a rebind receive the old prompt (no identity
-        // check). Refusing preserves pre-PRD-20 fire-once semantics against an
-        // old daemon. The plain (non-identity) `write_and_submit` path skips this
-        // and stays legacy-compatible.
-        let identity_bearing =
-            expected_agent_id.is_some() || expected_session_id.is_some() || delivery_id.is_some();
-        // Issue #621 (review): everything up to the request frame leaves the
-        // daemon untouched, so a failure there is `unsent` — a caller may treat
-        // it as proof that nothing was written.
-        if identity_bearing
-            && !self
-                .daemon_advertises_guarded_send()
-                .await
-                .map_err(GuardedSendFailure::unsent)?
-        {
-            return Err(GuardedSendFailure::unsent(ClientError::Server(
-                "daemon does not advertise guarded-send support; refusing to submit an \
-                 identity-bearing prompt unguarded (would risk double-submit / mis-deliver)"
-                    .into(),
-            )));
-        }
-        let mut request = serde_json::json!({
-            "op": "write-and-submit",
-            "pane_id": pane_id,
-            "text": text,
-        });
-        if let Some(v) = expected_agent_id {
-            request["expected_agent_id"] = serde_json::Value::String(v.to_string());
-        }
-        if let Some(v) = expected_session_id {
-            request["expected_session_id"] = serde_json::Value::String(v.to_string());
-        }
-        if let Some(v) = delivery_id {
-            request["delivery_id"] = serde_json::Value::String(v.to_string());
-        }
-        let resp = self.issue_json_command(&request).await?;
-        let current_session_id = resp.current_session_id.clone();
-        // A decoded answer is the daemon's own account. `ok = false` with no
-        // delivered outcome is one of its refusals, each of which writes
-        // nothing (a malformed guard, a conflicting or oversized delivery id, a
-        // clean transport failure); only the contradiction — a delivered
-        // outcome beside `ok = false` — leaves the write in doubt.
-        let claims_delivered = matches!(
-            resp.send_result,
-            Some(SendResult::Applied | SendResult::Queued)
-        );
-        let result = interpret_send_response(resp).map_err(|error| GuardedSendFailure {
-            error,
-            may_have_written: claims_delivered,
-        })?;
-        // Kept only beside the outcome it explains, and only when this request
-        // named no session: a generation offered alongside anything else —
-        // including a `stale` for a request that DID name one, which is a lost
-        // target — is not an address this client should ever write to.
-        let current_session_id = current_session_id
-            .filter(|_| result == SendResult::Stale && expected_session_id.is_none());
-        Ok(GuardedSendReply {
-            result,
-            current_session_id,
-        })
-    }
-
-    /// One-shot request/response for a hand-built JSON request. Used by
-    /// [`Self::write_and_submit_with_identity`] to carry additive fields the
-    /// [`AttachRequest`] enum doesn't declare, without widening the enum.
-    ///
-    /// Issue #621 (review): a failure says which side of the request frame it
-    /// happened on. Connecting and building the request leave the daemon
-    /// untouched (`unsent`); from the first byte of the frame on, the daemon
-    /// may have received a whole request and acted on it, and only an answer
-    /// it sent says otherwise.
-    async fn issue_json_command(
-        &self,
-        request: &serde_json::Value,
-    ) -> Result<AttachResponse, GuardedSendFailure> {
-        let (mut rd, mut wr) = self
-            .connect()
-            .await
-            .map_err(|e| GuardedSendFailure::unsent(e.into()))?;
-        let payload = serde_json::to_vec(request).map_err(|e| {
-            GuardedSendFailure::unsent(ClientError::Malformed(format!("request JSON: {e}")))
-        })?;
-        write_frame(&mut wr, KIND_REQ, &payload)
-            .await
-            .map_err(|e| GuardedSendFailure::maybe_written(e.into()))?;
-        read_response(&mut rd)
-            .await
-            .map_err(GuardedSendFailure::maybe_written)
-    }
-
-    /// PRD #20 R20-006 (finding #6): probe whether the daemon advertises the
-    /// guarded-send capability on its `Hello` reply. `Ok(true)` only when the
-    /// reply carries `guarded_send = Some(true)` — i.e. a daemon that enforces
-    /// the identity/idempotency guards. `Ok(false)` for any older daemon that
-    /// omits the field (so the caller fails a guarded send safe). A transport
-    /// error surfaces as `Err` (also fail-safe: the caller does not submit).
-    async fn daemon_advertises_guarded_send(&self) -> Result<bool, ClientError> {
-        let (mut rd, mut wr) = self.connect().await?;
-        let resp = issue_command(
-            &mut rd,
-            &mut wr,
-            &AttachRequest::Hello {
-                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
-                client_build_version: None,
-                follow_on: false,
-            },
-        )
-        .await?;
-        Ok(resp.guarded_send == Some(true))
-    }
-
     /// Issue #1637: the daemon's hook-binary notices, from one `Hello`
     /// exchange. `Ok(None)` from a daemon that predates them.
     pub async fn hook_binary_notices(
@@ -2192,10 +2053,9 @@ impl DaemonClient {
     ///
     /// The first call performs one `Hello` exchange; later calls return the
     /// captured set without touching the socket. That is the whole point of the
-    /// method: the [`Self::daemon_advertises_guarded_send`] probe below opens a
-    /// **fresh connection and sends a second `Hello` every time it is
-    /// consulted**, which is affordable for a check made once per prompt and is
-    /// not affordable for a check made before every project-aware action.
+    /// method: a fresh connection and a second `Hello` every time it is
+    /// consulted is not affordable for a check made before every project-aware
+    /// action.
     ///
     /// **What invalidates it**, and nothing else does:
     ///
@@ -2294,9 +2154,7 @@ impl DaemonClient {
         cached_capabilities_for(guard.as_ref(), &self.socket_path)
     }
 
-    /// PRD #819 M5: the fail-safe check, following the
-    /// [`Self::daemon_advertises_guarded_send`] precedent — it consults the
-    /// explicit capability, NOT the protocol version, and it answers `false`
+    /// PRD #819 M5: the fail-safe check — it consults the explicit capability, NOT the protocol version, and it answers `false`
     /// rather than "probably" when the daemon said nothing.
     ///
     /// `Ok(false)` for an unadvertised daemon; `Err` for a transport failure,
@@ -2443,13 +2301,12 @@ impl DaemonClient {
     ///
     /// # Why the distinct verb, and what it fixes on THIS side of the wire
     ///
-    /// The token used to ride alongside `start-agent` as an extra JSON key, the
-    /// way [`Self::write_and_submit_with_identity`]'s identity fields still do.
+    /// The token used to ride alongside `start-agent` as an extra JSON key.
     /// That was fail-open: `start-agent` is an op every daemon back to PRD #76
     /// accepts, so an older one decoded the base variant, ignored the unknown
     /// key and started the role unenforced — and this client could not see it
     /// happen. A role start is its own short-lived connection: [`Self::connect`]
-    /// is a bare `IpcStream::connect`, [`Self::issue_json_command`] writes one
+    /// is a bare `IpcStream::connect`, a command writes one
     /// request frame and reads one response, and the daemon decodes exactly one
     /// request per connection. There is no `Hello` on it and nowhere to put one,
     /// so no amount of checking beforehand could cover the spawn itself.
@@ -5029,6 +4886,121 @@ mod tests {
         });
     }
 
+    /// Scenario: A desktop or TUI presses Retry or Cancel on a deck message against a daemon that does not advertise `inbox-actions`. The client answers Unsupported and sends no verb; against one that does, the verb goes out with the press's revision and request id.
+    #[spec("inbox/protocol/020")]
+    #[cfg(unix)]
+    #[test]
+    fn protocol_020_inbox_actions_are_withheld_from_a_daemon_that_does_not_advertise_them() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build fake-daemon runtime");
+        runtime.block_on(async {
+            for retry in [true, false] {
+                let (sent, answer) = inbox_action_against(None, retry).await;
+                assert!(
+                    sent.is_empty(),
+                    "nothing is sent without capabilities: {sent:?}"
+                );
+                assert!(matches!(answer, GatedQuery::Unsupported));
+                let (sent, answer) =
+                    inbox_action_against(Some(&[crate::daemon_protocol::CAP_INBOX]), retry).await;
+                assert!(
+                    sent.is_empty(),
+                    "inbox alone does not license the verbs: {sent:?}"
+                );
+                assert!(matches!(answer, GatedQuery::Unsupported));
+                let (sent, answer) =
+                    inbox_action_against(Some(&[crate::daemon_protocol::CAP_INBOX_ACTIONS]), retry)
+                        .await;
+                assert_eq!(sent.len(), 1, "one verb is sent once advertised");
+                let op = if retry { "inbox-retry" } else { "inbox-cancel" };
+                assert_eq!(sent[0]["op"], op);
+                assert_eq!(sent[0]["revision"], 7);
+                assert_eq!(sent[0]["request_id"], "press-1");
+                assert!(matches!(
+                    answer,
+                    GatedQuery::Answered(crate::daemon_protocol::InboxActionReply {
+                        outcome: crate::daemon_protocol::InboxActionOutcome::Stale,
+                        ..
+                    })
+                ));
+            }
+        });
+    }
+
+    /// One Retry or Cancel against a fake daemon advertising `advertised`:
+    /// every non-hello request it saw, and the client's answer.
+    #[cfg(unix)]
+    async fn inbox_action_against(
+        advertised: Option<&'static [&'static str]>,
+        retry: bool,
+    ) -> (
+        Vec<serde_json::Value>,
+        GatedQuery<crate::daemon_protocol::InboxActionReply>,
+    ) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fake-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind fake daemon");
+            (dir, path, listener)
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_seen = seen.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) =
+                    read_frame(&mut stream).await.expect("read request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode request");
+                let response = if request["op"] == "hello" {
+                    AttachResponse {
+                        capabilities: advertised
+                            .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    }
+                } else {
+                    server_seen.lock().unwrap().push(request);
+                    AttachResponse {
+                        ok: true,
+                        inbox_action: Some(crate::daemon_protocol::InboxActionReply {
+                            outcome: crate::daemon_protocol::InboxActionOutcome::Stale,
+                            revision: Some(8),
+                        }),
+                        ..AttachResponse::default()
+                    }
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write response");
+            }
+        });
+        let client = DaemonClient::new(path);
+        let answer = client
+            .inbox_action(
+                "worker",
+                "7",
+                "m-k3xzq2ab-0f3c9a71d2e4b850",
+                7,
+                retry,
+                "press-1",
+            )
+            .await
+            .expect("the fake daemon answers");
+        drop(client);
+        let _ = server.await;
+        drop(dir);
+        let seen = seen.lock().unwrap().clone();
+        (seen, answer)
+    }
+
     #[cfg(unix)]
     async fn close_agents_withheld_inner(advertised: Option<&'static [&'static str]>) {
         use tokio::io::AsyncReadExt;
@@ -6163,11 +6135,6 @@ start = true
             .expect("the answered id is the agent the daemon started");
         assert_eq!(record.display_name.as_deref(), Some("planner"));
         assert_eq!(record.agent_type, Some(AgentType::OpenCode));
-        assert_eq!(
-            registry.take_pending_seed_native_for("configured-planner", Some(&id)),
-            None,
-            "a non-Pi start role's coordinator prompt stays the client's to deliver"
-        );
         registry.close_agent(&id).unwrap();
     }
 
@@ -6547,11 +6514,6 @@ start = true
                 .any(|record| record.id == id),
             "the answered id is the agent the daemon started"
         );
-        assert_eq!(
-            registry.take_pending_seed_native_for("authoring-pane", Some(&id)),
-            None,
-            "a non-Pi agent's seed goes down the spawn delivery, not PRD #201's native stash"
-        );
         registry.close_agent(&id).unwrap();
     }
 
@@ -6709,11 +6671,11 @@ start = true
         registry.close_agent(&id).unwrap();
     }
 
-    /// PRD #1223 M7 — a Pi authoring agent is seeded the way the TUI's Pi
-    /// orchestrators already are: the composed seed is stashed for the
-    /// extension's native `get-seed` pull (PRD #201, with its PTY safety net),
-    /// not typed into the PTY. The type comes from the command here, as it does
-    /// for a client that sends no `agent_type`.
+    /// PRD #1223 M7; PRD #1666 S5 — a Pi authoring agent is seeded the way
+    /// every agent now is: the composed seed is the pane's first inbox message,
+    /// which the extension's `get-seed` alias takes whole, and nothing is typed
+    /// into the PTY. The type comes from the command here, as it does for a
+    /// client that sends no `agent_type`.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pi_authoring_agent_is_given_the_native_seed() {
@@ -6748,10 +6710,21 @@ start = true
         else {
             panic!("a daemon at this build advertises `authoring-kind`");
         };
-        assert_eq!(
-            registry.take_pending_seed_native_for("pi-authoring-pane", Some(&id)),
-            Some(kind.compose_seed(std::path::Path::new(cwd))),
-            "the Pi pane's native seed is the composed authoring seed"
+        // PRD #1666 S5: the seed is the pane's first inbox message, which the
+        // extension's `get-seed` alias takes whole.
+        let seed = registry
+            .inbox()
+            .fetch_first_acked(
+                "pi-authoring-pane",
+                &id,
+                crate::inbox::AckHow::ExtensionConfirmed,
+            )
+            .expect("the Pi pane's first message is its seed");
+        assert!(
+            seed.text
+                .contains(&kind.compose_seed(std::path::Path::new(cwd))),
+            "the Pi pane's seed is the composed authoring seed: {}",
+            seed.text
         );
         registry.close_agent(&id).unwrap();
     }
@@ -6800,270 +6773,6 @@ start = true
         );
 
         registry.close_agent(&id).unwrap();
-    }
-
-    /// Scenario: Decode a future daemon response carrying a send-result value
-    /// this client does not know. The response must remain decodable and the
-    /// unknown value must not be interpreted as delivered.
-    #[spec("prompt/pane-input/011")]
-    #[test]
-    fn pane_input_011_unknown_send_result_decodes_as_safe_non_delivery() {
-        let decoded = serde_json::from_value::<AttachResponse>(serde_json::json!({
-            "ok": false,
-            "send_result": "future-delivery-outcome"
-        }));
-
-        assert!(
-            decoded.is_ok(),
-            "an unknown send_result must not reject the whole AttachResponse: {decoded:?}"
-        );
-        let response = decoded.unwrap();
-        assert!(
-            !matches!(
-                response.send_result,
-                Some(SendResult::Applied | SendResult::Queued)
-            ),
-            "an unknown send_result must degrade to safe non-delivery: {:?}",
-            response.send_result
-        );
-    }
-
-    /// Scenario: Have a synthetic daemon return the inconsistent combination
-    /// `ok=false` with `send_result=applied`. The client must let the failure
-    /// bit win and must not report successful delivery.
-    // PRD #42 M8: drives the Unix-domain-socket attach harness (`BIND_LOCK`,
-    // `bind_attach_listener`), so it is Unix-gated like the other harness tests.
-    #[cfg(unix)]
-    #[spec("prompt/pane-input/012")]
-    #[test]
-    fn pane_input_012_ok_false_overrides_applied_send_result() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("build send-result consistency runtime");
-        runtime.block_on(pane_input_012_ok_false_overrides_applied_send_result_inner());
-    }
-
-    #[cfg(unix)]
-    async fn pane_input_012_ok_false_overrides_applied_send_result_inner() {
-        let (dir, path, listener) = {
-            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("inconsistent-response.sock");
-            let listener = bind_attach_listener(&path).expect("bind synthetic daemon");
-            (dir, path, listener)
-        };
-        let server = tokio::spawn(async move {
-            // PRD #42 M2: `IpcListener::accept()` yields the stream directly (no
-            // `(stream, addr)` tuple like the raw `UnixListener`).
-            let mut stream = listener.accept().await.expect("accept client");
-            let _request = read_frame(&mut stream).await.expect("read request frame");
-            let response = AttachResponse {
-                ok: false,
-                error: Some("delivery was not accepted".into()),
-                send_result: Some(SendResult::Applied),
-                ..Default::default()
-            };
-            crate::daemon_protocol::write_resp(&mut stream, &response)
-                .await
-                .expect("write inconsistent response");
-        });
-        let client = DaemonClient::new(path);
-
-        let result = client
-            .write_and_submit("pane-inconsistent", "must not report success")
-            .await;
-        server.await.unwrap();
-        drop(dir);
-
-        assert!(
-            !matches!(result, Ok(SendResult::Applied | SendResult::Queued)),
-            "ok=false must win over a contradictory delivered result; got {result:?}"
-        );
-    }
-
-    /// Issue #621 (Qodo on #1521): a failed guarded send says whether it could
-    /// have written. Failures before the request frame — no daemon at all, a
-    /// daemon that does not advertise guarded send — and a daemon's own
-    /// refusal are `may_have_written = false`, so a delivery may still bind the
-    /// generation a later `stale` names; a request the daemon read and never
-    /// answered is `true`, because it may have been applied.
-    #[cfg(unix)]
-    #[test]
-    fn guarded_send_failure_says_whether_the_request_could_have_written() {
-        #[derive(Clone, Copy)]
-        enum Script {
-            NoGuardedSend,
-            ReadAndHangUp,
-            Refuse,
-        }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("build guarded-send failure runtime");
-        runtime.block_on(async {
-            let send = |path: PathBuf| async move {
-                DaemonClient::new(path)
-                    .write_and_submit_with_identity_reply(
-                        "pane-621",
-                        "prompt",
-                        Some("agent-621"),
-                        None,
-                        Some("delivery-621"),
-                    )
-                    .await
-            };
-            let scripted = |script: Script| {
-                let (dir, path, listener) = {
-                    let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                    let dir = tempfile::tempdir().unwrap();
-                    let path = dir.path().join("guarded-failure.sock");
-                    let listener = bind_attach_listener(&path).expect("bind synthetic daemon");
-                    (dir, path, listener)
-                };
-                let server = tokio::spawn(async move {
-                    loop {
-                        let Ok(mut stream) = listener.accept().await else {
-                            return;
-                        };
-                        let Ok(Some((_, payload))) = read_frame(&mut stream).await else {
-                            continue;
-                        };
-                        let request: serde_json::Value =
-                            serde_json::from_slice(&payload).expect("decode request");
-                        if request["op"] == "hello" {
-                            let hello = AttachResponse::hello(PROTOCOL_VERSION);
-                            let hello = match script {
-                                Script::NoGuardedSend => hello,
-                                _ => hello.with_guarded_send(),
-                            };
-                            let _ = crate::daemon_protocol::write_resp(&mut stream, &hello).await;
-                            continue;
-                        }
-                        match script {
-                            Script::ReadAndHangUp => drop(stream),
-                            _ => {
-                                let refusal = AttachResponse::err(
-                                    "delivery id reused with a conflicting payload/target",
-                                );
-                                let _ =
-                                    crate::daemon_protocol::write_resp(&mut stream, &refusal).await;
-                            }
-                        }
-                    }
-                });
-                (dir, path, server)
-            };
-
-            let missing = tempfile::tempdir().unwrap();
-            let no_daemon = send(missing.path().join("absent.sock")).await;
-
-            let mut observed = Vec::new();
-            for (name, script) in [
-                ("no guarded-send capability", Script::NoGuardedSend),
-                ("request read, never answered", Script::ReadAndHangUp),
-                ("daemon refusal", Script::Refuse),
-            ] {
-                let (_dir, path, server) = scripted(script);
-                let outcome = send(path).await;
-                server.abort();
-                observed.push((
-                    name,
-                    outcome.map(|r| r.result).map_err(|f| f.may_have_written),
-                ));
-            }
-
-            assert!(
-                matches!(no_daemon, Err(ref f) if !f.may_have_written),
-                "no daemon at all wrote nothing: {no_daemon:?}"
-            );
-            assert_eq!(
-                observed,
-                vec![
-                    ("no guarded-send capability", Err(false)),
-                    ("request read, never answered", Err(true)),
-                    ("daemon refusal", Err(false)),
-                ],
-                "only a request the daemon may have acted on without answering is in doubt"
-            );
-        });
-    }
-
-    /// Scenario: Point a new identity-bearing send client at a synthetic older
-    /// daemon whose handshake does not advertise guarded-send support. The client
-    /// must fail before submitting rather than trust an unsafe legacy `ok=true`.
-    // PRD #42 M8: drives the Unix-domain-socket attach harness (`BIND_LOCK`,
-    // `bind_attach_listener`, `Arc`/`AtomicUsize`), so it is Unix-gated like the
-    // other harness tests.
-    #[cfg(unix)]
-    #[spec("prompt/pane-input/015")]
-    #[test]
-    fn pane_input_015_guarded_send_fails_safe_without_daemon_capability() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("build guarded-send runtime");
-        runtime.block_on(pane_input_015_guarded_send_fails_safe_without_daemon_capability_inner());
-    }
-
-    #[cfg(unix)]
-    async fn pane_input_015_guarded_send_fails_safe_without_daemon_capability_inner() {
-        let (dir, path, listener) = {
-            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("legacy-unguarded-send.sock");
-            let listener = bind_attach_listener(&path).expect("bind legacy daemon");
-            (dir, path, listener)
-        };
-        let submissions = Arc::new(AtomicUsize::new(0));
-        let server_submissions = submissions.clone();
-        let server = tokio::spawn(async move {
-            // PRD #42 M2: `IpcListener::accept()` yields the stream directly.
-            while let Ok(Ok(mut stream)) =
-                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
-            {
-                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
-                    .await
-                    .expect("read legacy request frame")
-                else {
-                    continue;
-                };
-                let request: serde_json::Value =
-                    serde_json::from_slice(&payload).expect("decode legacy request");
-                let response = if request.get("op").and_then(|op| op.as_str()) == Some("hello") {
-                    // Previous daemon shape: protocol version only, no guarded-send capability.
-                    AttachResponse::hello(crate::daemon_protocol::PROTOCOL_VERSION)
-                } else {
-                    server_submissions.fetch_add(1, Ordering::SeqCst);
-                    AttachResponse::with_send_result(SendResult::Applied)
-                };
-                crate::daemon_protocol::write_resp(&mut stream, &response)
-                    .await
-                    .expect("write legacy response");
-            }
-        });
-        let client = DaemonClient::new(path);
-
-        let result = client
-            .write_and_submit_with_identity(
-                "guarded-pane",
-                "must not reach an unguarded daemon",
-                Some("expected-agent"),
-                Some("expected-session"),
-                Some("guarded-delivery-015"),
-            )
-            .await;
-        server.await.unwrap();
-        drop(dir);
-
-        assert!(
-            result.is_err() && submissions.load(Ordering::SeqCst) == 0,
-            "guarded send must fail safe before submission when capability is absent; result={result:?}, submissions={}",
-            submissions.load(Ordering::SeqCst)
-        );
     }
 
     /// PRD #1487: a synthetic daemon that answers `hello` with `hello` and
@@ -7787,6 +7496,7 @@ start = true
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let name = rec
@@ -7853,6 +7563,7 @@ start = true
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -7882,6 +7593,7 @@ start = true
             crashed: None,
             orchestrator_context_path: None,
             authoring_kind: None,
+            inbox: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(
