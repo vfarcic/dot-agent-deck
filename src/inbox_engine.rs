@@ -1140,7 +1140,20 @@ fn sync(st: &mut HubState, key: &AgentKey, now: Instant, returned: &HashSet<Stri
         let Some(message) = st.inbox.get(&id, &key.0) else {
             continue;
         };
-        if message.owner != Some(AssignmentOwner::Receipt) || message.state.is_terminal() {
+        // Reviewer R9T-03: a copy out of attempts follows its model when a
+        // commit settled it after all, as the late ack it is.
+        let late = matches!(
+            (&message.state, &state),
+            (
+                MessageState::Undeliverable {
+                    reason: UndeliverableReason::MaxDeliver,
+                    ..
+                },
+                Delivery::Settled
+            )
+        );
+        if message.owner != Some(AssignmentOwner::Receipt) || (message.state.is_terminal() && !late)
+        {
             continue;
         }
         let fetched = matches!(message.state, MessageState::Fetched { .. });

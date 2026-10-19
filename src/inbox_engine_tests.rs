@@ -2107,6 +2107,77 @@ async fn a_full_stream_queue_is_issued_nothing() {
     peer.close().await;
 }
 
+/// Reviewer R9T-03 (PR #1735 review 4298669219): a task delegated to a Pi
+/// receiver is reported not handed on every attempt, so it runs out of
+/// attempts: the orchestrator is told it is undeliverable and the worker's
+/// card shows the error. The receiver's commit of the last attempt then
+/// contradicts those reports. The task is listed acknowledged, the
+/// orchestrator is corrected once, and the card's error is cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_after_running_out_of_attempts_corrects_the_sender_and_the_card() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let cards: Arc<Mutex<Vec<crate::agent_pty::DeliveryNotice>>> = Arc::default();
+    hub.set_card_notice_sink({
+        let cards = Arc::clone(&cards);
+        Arc::new(move |notice| cards.lock().unwrap().push(notice))
+    });
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::PiExtension, INTEGRATION).await;
+    peer.next().await;
+    let task = delegate_to(&hub, "p", "refused every time");
+    let mut last = None;
+    for _ in 0..crate::inbox::DEFAULT_MAX_DELIVER {
+        let handed = peer.handout_ticking(&hub).await.remove(0);
+        peer.send(serde_json::json!({"not_handed": [at(&handed)]}))
+            .await;
+        last = Some(handed);
+    }
+    let last = last.expect("handed out at least once");
+    until("the task to run out of attempts", || {
+        state_of(&hub, "p", task.as_str()) == StateName::Undeliverable
+    })
+    .await;
+    let told = orchestrator_notices(&hub);
+    assert_eq!(
+        told.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+        vec![UNDELIVERED_SUBJECT],
+        "precondition: the orchestrator was told the task is undeliverable"
+    );
+    assert!(
+        cards.lock().unwrap().iter().any(|n| !n.cleared),
+        "precondition: the card was told of the error"
+    );
+
+    peer.send(serde_json::json!({"committed": [at(&last)]}))
+        .await;
+    until("the commit to settle the task", || {
+        state_of(&hub, "p", task.as_str()) == StateName::Acknowledged
+    })
+    .await;
+    let told = orchestrator_notices(&hub);
+    assert_eq!(
+        told.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+        vec![UNDELIVERED_SUBJECT, LATE_ACK_SUBJECT],
+        "the orchestrator is corrected once: {told:?}"
+    );
+    assert!(
+        told[1].1.contains(&compose_late_ack_notice(
+            task.as_str(),
+            "coder",
+            LateAckReport::Undeliverable
+        )),
+        "{}",
+        told[1].1
+    );
+    let cleared = cards
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|n| n.cleared && n.delivery_id == task.as_str())
+        .count();
+    assert_eq!(cleared, 1, "the card's error is cleared once");
+    peer.close().await;
+}
+
 /// Read out every line the daemon has written to `peer` so far, keepalives
 /// included, until none arrives for a moment.
 async fn drain_lines(peer: &mut Peer) {

@@ -1651,11 +1651,29 @@ impl AttemptModel {
         'rules: {
             // Rule 1: any attempt of the assignment committed.
             if committed {
+                // A message that ran out of attempts on not-handed reports a
+                // commit now contradicts (PR #1735 review 4298669219) reached
+                // the agent after all: it settles, and whoever was told it was
+                // undeliverable is corrected through the hub's late-ack record
+                // when the inbox copy follows (reviewer R9T-03). An offer went
+                // back to its pool and stays out of attempts.
+                if msg.state == MessageState::Undeliverable(UndeliverableReason::MaxDeliver)
+                    && !msg.offer
+                {
+                    msg.set_state(MessageState::Settled);
+                    if !msg.corrected {
+                        msg.corrected = true;
+                        effects.push(Effect::DeliveredAfterAll {
+                            id: id.to_string(),
+                            despite_cancel: false,
+                        });
+                    }
+                    break 'rules;
+                }
                 if msg.state.is_terminal() {
-                    // A message ended as cancelled, or as out of attempts on
-                    // not-handed reports a commit now contradicts (PR #1735
-                    // review 4298669219), reached the agent after all, and
-                    // whoever was told otherwise is told so.
+                    // A message ended as cancelled reached the agent after
+                    // all, and whoever was told otherwise is told so; it
+                    // stays cancelled.
                     let despite_cancel = match msg.state {
                         MessageState::Undeliverable(UndeliverableReason::Cancelled) => Some(true),
                         MessageState::Undeliverable(UndeliverableReason::MaxDeliver) => Some(false),
@@ -2966,6 +2984,11 @@ mod tests {
             id: "refused".into(),
             despite_cancel: false
         }));
+        assert_eq!(
+            m.state("refused"),
+            Some(MessageState::Settled),
+            "the commit settles the message it contradicts"
+        );
         m.stage(t, "refused", 1, issued[0], Stage::Committed, None);
         assert!(
             !m.drain_effects()
