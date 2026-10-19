@@ -8006,7 +8006,7 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Layer:** L1 unit (src/inbox_attempts.rs).
 - **Agent:** none.
 - **Asserts:** a once-waiter's issued attempt whose connection closes with nothing reported is fenced at once and stays possessed while the turn is busy; a spool check prepared while idle and applied after another turn started clears nothing, and nor does one applied in the same `tick_turn` that first reads the turn busy; the next check after the grace clears it, a marked repeat is issued, and the first attempt's late commit settles the message.
-- **Does not assert:** a real waiter process or its connection (part 2's H3). The pin cannot tell `tick_turn` applying the view before or after the checks, since a regained turn voids a token minted in the same locked call: that order is defensive, recorded as an equivalent mutant.
+- **Does not assert:** a real waiter process or its connection (part 2's H3). This pin's state cannot tell `tick_turn` applying the view before or after the checks, since a regained turn voids a token minted in the same locked call; the order is pinned by inbox/attempts/035, where it changes the revision.
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/attempts/030 — A one-shot registration resumes nothing, and a superseded waiter is fenced at once.
@@ -8042,6 +8042,13 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Agent:** none.
 - **Asserts:** `commit_target` names the newest attempt of the current assignment that was not positively not handed, skipping a newer `NotHanded` one; an assignment whose every attempt is `NotHanded` is refused as such, and one with no attempt as none.
 - **Does not assert:** the hub's `ack` acting on the refusal (inbox/boundary/047).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/035 — A turn learned at a tick is applied before the tick decides.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** with one attempt allowed per message, a once-waiter attempt issued while the agent reads idle, and a `tick_turn` well past the idle grace that first reads the turn busy, leaves the message `Attempting` with its revision unchanged: it never passes through `Uncertain(OutOfAttempts)`.
+- **Does not assert:** the engine's clock calling `tick_turn` (inbox/boundary/056 drives the clock with injected instants).
 - **Platform coverage:** mac+linux+windows.
 
 #### inbox/receipt
@@ -8220,7 +8227,28 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Layer:** L1 unit (src/inbox_oneshot.rs).
 - **Agent:** none.
 - **Asserts:** for a batch whose caps are known, none of their hex appears in the block texts, the `may` lines, any control line (hook or waiter, every output, with or without degraded), any fence refusal's `Display` or `Debug`, a hand-over's error, the pinned-spool errors, or the batch's and the approval's `Debug`.
-- **Does not assert:** the one-shot processes' own output (the waiter's stderr, a hook's JSON, `inbox fetch --json`), which part 2's H3 and H4 add.
+- **Does not assert:** the one-shot processes' own output (the waiter's stderr, a hook's JSON, `inbox fetch --json`), which part 2's H3 and H4 add; text the library is given and passes on as it is (a message's text, a `degraded` string, a writer's error).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/026 — A block in several pieces is judged as one.
+- **Layer:** L1 unit (src/inbox_oneshot.rs), a scripted pipe.
+- **Agent:** none.
+- **Asserts:** a block written in two pieces whose prefix is accepted is `Possible`, never `NotHanded`, when the suffix's first write fails or takes only part of it; it is `Written` only when every piece went in full and the flush succeeded; the fence runs once per block, before its first byte, so a block under way is not cut short; a block whose first piece is empty is fenced at its first byte in the second piece, and refused there it writes nothing and is `NotHanded`.
+- **Does not assert:** a real descriptor, or a hook's escaped output producing such pieces (part 2's H3 and H4).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/027 — A terminal line already arrived ends the hand-over.
+- **Layer:** L1 unit (src/inbox_oneshot.rs), tempdir spool, a scripted connection.
+- **Agent:** none.
+- **Asserts:** with a valid approval, no EOF and no revoke marker, a `superseded` line, a `not_in_deck` line or a refusal line already arrived makes the fence refuse block one before its first byte and keep refusing block two when nothing more arrives; a hand-over through it writes no byte of either block and reports both `NotHanded`.
+- **Does not assert:** the daemon sending `superseded` before closing a replaced waiter, or a non-blocking read of a real socket (part 2's H3).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/028 — A line without its newline is never parsed.
+- **Layer:** L1 unit (src/inbox_oneshot.rs), in-memory readers.
+- **Agent:** none.
+- **Asserts:** `read_frame` hands back a whole line; a complete JSON reply whose newline never came before the end of the connection, in one read or two, is `Unterminated` and its bytes are not handed back, although `read_line` hands it back and it parses; an empty connection is `Eof`; a line over the bound is `TooLong`; two whole lines then a cut one read as two lines and `Unterminated`; `classify_frame` calls a write that lost that newline `NotHanded`.
+- **Does not assert:** the one-shot waiter reading its socket through `read_frame`, or the floor that keeps a legacy `read_line` waiter from being sent a once batch (part 2's H3).
 - **Platform coverage:** mac+linux+windows.
 
 #### Protocol and waiter lifecycle
@@ -8936,6 +8964,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** after the receiver reports the message's only attempt not handed, the agent's `ack <id>` is answered `Unknown`; no attempt is committed and no witness violation is raised; the inbox copy and the model both stay `Queued`, the ack does not fall through to the legacy acknowledgement, and once the stream takes pushed mail again the message is handed out again as usual.
 - **Does not assert:** OpenCode, which shares the path; a real Pi.
+- **Platform coverage:** all.
+
+##### inbox/boundary/056 — A fenced waiter's commit authority lasts while the turn clock holds it.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub with a real spool and evidence store, a once-waiter registered on the model directly (no component maps to that slot before part 2's H3), and the receipt clock driven with injected instants.
+- **Agent:** none.
+- **Asserts:** a delegated task issued to a once-waiter that writes its block and dies before any control, with and without its `handed` record published, is fenced and then cancelled; while the turn stays busy, receipt checks four ack-waits in (well past `quiet_at`) keep its caps in the evidence store and its caps file in the spool, and no verify instant is scheduled; the prompt hook's exact lookup then finds the caps, publishes the commit, and the orchestrator is told the task was delivered after all. With the turn ending half an ack-wait after the fence, `next_deadline` names the end of that idle grace, not `quiet_at`; a check past `quiet_at` inside the grace keeps the caps and a commit there still corrects the sender; with no commit, the check at the grace's end returns the evidence, the caps file goes, a later notification finds nothing to commit and no correction is posted.
+- **Does not assert:** a real waiter, Claude's queueing of the notification (inbox/claude/021, lane 2) or the H3 serve path writing the caps file and routing the close.
 - **Platform coverage:** all.
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.

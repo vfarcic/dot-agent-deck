@@ -2715,10 +2715,16 @@ impl InboxHub {
     /// nothing clears a candidate for a repeat; anything else leaves it
     /// uncleared, and the deck's own spool error degrades the generation.
     fn tick_receipts(&self) {
+        self.tick_receipts_with(Instant::now);
+    }
+
+    /// [`Self::tick_receipts`] reading the time from `clock`, before the
+    /// spool IO and again after it.
+    fn tick_receipts_with(&self, clock: impl Fn() -> Instant) {
         use crate::inbox_receipt::{Presence, RecordStage};
         let checks = {
             let st = self.lock();
-            engine::lapse_checks(&st, Instant::now())
+            engine::lapse_checks(&st, clock())
         };
         let mut checked: HashMap<AgentKey, engine::Checked> = HashMap::new();
         if !checks.is_empty() {
@@ -2776,7 +2782,7 @@ impl InboxHub {
         let mut out = engine::Outbox::new();
         {
             let mut st = self.lock();
-            let now = Instant::now();
+            let now = clock();
             engine::tick(&mut st, now, &checked, &mut out);
         }
         engine::flush(out);

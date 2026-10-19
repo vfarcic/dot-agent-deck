@@ -3489,3 +3489,214 @@ async fn boundary_047_an_ack_of_a_message_never_handed_over_changes_nothing() {
     assert_eq!(attempts_of(&hub, "p", "a", id.as_str()), 2);
     peer.close().await;
 }
+
+/// A task delegated to `p`/`a`, issued at `t` to a Claude once-waiter (the
+/// slot no component registers before H3) through the doorbell-fetch path,
+/// with its caps file written as H3's serve path will write it. The waiter
+/// wrote the block — with `handed`, it also published its `handed` record —
+/// and its connection closed before any control reached the deck, so the
+/// attempt is fenced, possibly handed. Answers the task, its attempt, and
+/// the generation's spool.
+fn once_waiter_fenced(
+    hub: &InboxHub,
+    t: Instant,
+    handed: bool,
+) -> (
+    MessageId,
+    (u32, u32),
+    Arc<crate::inbox_receipt::GenerationSpool>,
+) {
+    use crate::inbox_attempts::Slot;
+    use crate::inbox_receipt::{RecordKey, RecordStage};
+    let key: AgentKey = ("p".into(), "a".into());
+    let task = delegate_to(hub, "p", "queued in a busy turn's notification");
+    let spool = hub.generation_spool("p", "a").unwrap().unwrap();
+    let (tx, _lines) = tokio::sync::mpsc::channel(8);
+    let rx = {
+        let mut st = hub.lock();
+        let generation = engine::generation_mut(&mut st, &key, Some(Ok(Arc::clone(&spool))));
+        let rx = generation.model.register(t, Slot::OnceWaiter, false).rx;
+        generation.links.insert(
+            rx,
+            engine::Link {
+                conn_id: 1,
+                tx,
+                component: InboxComponent::ClaudeWaiter,
+                doorbell_only: true,
+            },
+        );
+        rx
+    };
+    let mut out = engine::Outbox::new();
+    let batch = engine::doorbell_fetch(&mut hub.lock(), &key, rx, None, None, t, &mut out).unwrap();
+    drop(out);
+    let at = attempt(&batch[0]);
+    let (a, e) = (at.a, at.e);
+    let caps = hub.lock().receipts.gens[&key]
+        .evidence
+        .lock()
+        .unwrap()
+        .store
+        .caps(task.as_str(), a, e)
+        .cloned()
+        .expect("the deck minted the attempt's caps");
+    spool.write_caps(task.as_str(), a, e, &caps).unwrap();
+    if handed {
+        let key = RecordKey {
+            msg: task.as_str().to_string(),
+            a,
+            e,
+            stage: RecordStage::Handed,
+        };
+        spool.publish(&key, &caps.handed).unwrap();
+    }
+    {
+        let mut st = hub.lock();
+        let generation = st.receipts.gens.get_mut(&key).unwrap();
+        generation.links.remove(&rx);
+        generation.model.connection_closed(t, rx);
+        let mut out = engine::Outbox::new();
+        engine::apply(&mut st, &key, t, &mut out);
+    }
+    (task, (a, e), spool)
+}
+
+/// What Claude's prompt hook does with a submitted notification naming
+/// `(id, A, e)`: an exact caps lookup and, when the caps are there, the
+/// `committed` record. Answers whether it found them.
+fn prompt_commits(
+    spool: &crate::inbox_receipt::GenerationSpool,
+    id: &str,
+    (a, e): (u32, u32),
+) -> bool {
+    use crate::inbox_receipt::{CapsLookup, RecordKey, RecordStage};
+    match spool.read_caps_checked(id, a, e) {
+        CapsLookup::Found(caps) => {
+            let key = RecordKey {
+                msg: id.to_string(),
+                a,
+                e,
+                stage: RecordStage::Committed,
+            };
+            spool.publish(&key, &caps.commit).unwrap();
+            true
+        }
+        CapsLookup::Missing => false,
+        other => panic!("{id}: {other:?}"),
+    }
+}
+
+/// Whether the deck still holds the commit authority of `id`'s attempt: its
+/// evidence store has the caps and the model has not reclaimed it.
+fn authority_held(hub: &InboxHub, id: &str, (a, e): (u32, u32)) -> bool {
+    let key: AgentKey = ("p".into(), "a".into());
+    let caps = hub.lock().receipts.gens[&key]
+        .evidence
+        .lock()
+        .unwrap()
+        .store
+        .caps(id, a, e)
+        .is_some();
+    caps && !reclaimed(hub, "p", id, a, e)
+}
+
+/// Scenario: A Claude once-waiter writes a delegated task's block while the agent is busy and dies before it reports anything, once with its `handed` record published and once without; the deck fences the attempt and the user cancels the task. While the turn stays busy well past the approval window, every receipt check keeps the attempt's caps; when Claude finally submits the queued notification, the prompt hook finds the caps, commits, and the orchestrator is told the task was delivered after all. When the turn ends shortly after the fence, the caps are kept through that idle grace even past the approval window, and the clock is set to wake when the grace ends; a commit inside it still corrects the sender, while with no commit the next check after it returns the evidence, removes the caps file and a later notification commits nothing.
+#[spec("inbox/boundary/056")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_056_a_fenced_waiters_commit_authority_lasts_while_the_turn_clock_holds_it() {
+    use crate::agent_pty::TurnEdge::{Ended, Started};
+    use crate::daemon_protocol::InboxActionOutcome;
+    let wait = Duration::from_secs(60);
+    let key: AgentKey = ("p".into(), "a".into());
+    let cancel = |hub: &InboxHub, task: &MessageId| {
+        let outcome = hub.inbox_action(
+            "p",
+            "a",
+            task.as_str(),
+            revision_of(hub, "p", "a", task.as_str()),
+            false,
+            "tui-1",
+        );
+        assert_eq!(outcome.outcome, InboxActionOutcome::Applied);
+        assert_eq!(state_of(hub, "p", task.as_str()), StateName::Undeliverable);
+    };
+    let corrected = |hub: &InboxHub, task: &MessageId| {
+        orchestrator_notices(hub).iter().any(|(subject, text)| {
+            subject == LATE_ACK_SUBJECT
+                && text.contains(&compose_after_all_notice(task.as_str(), "coder", true))
+        })
+    };
+
+    for handed in [false, true] {
+        let what = if handed { "handed record" } else { "no record" };
+        let (hub, _state) = hub_with_spool(Duration::from_secs(30), wait);
+        let t = Instant::now();
+        hub.note_turn("p", "a", turn(1, Started), t);
+        let (task, attempt, spool) = once_waiter_fenced(&hub, t, handed);
+        cancel(&hub, &task);
+        for n in 1..=4 {
+            hub.tick_receipts_with(|| t + wait * n);
+            assert!(
+                authority_held(&hub, task.as_str(), attempt),
+                "{what}: still held {n} ack-waits into the busy turn"
+            );
+        }
+        assert_eq!(
+            hub.lock().receipts.gens[&key]
+                .model
+                .verify_due_at(t + wait * 4),
+            None,
+            "{what}: a busy turn sets no instant; its end does"
+        );
+        assert!(!corrected(&hub, &task), "{what}: precondition");
+        assert!(
+            prompt_commits(&spool, task.as_str(), attempt),
+            "{what}: the prompt hook finds the caps"
+        );
+        hub.tick_receipts_with(|| t + wait * 5);
+        assert!(corrected(&hub, &task), "{what}: delivered after all");
+    }
+
+    for commit in [true, false] {
+        let what = if commit {
+            "committed"
+        } else {
+            "never submitted"
+        };
+        let (hub, _state) = hub_with_spool(Duration::from_secs(30), wait);
+        let t = Instant::now();
+        hub.note_turn("p", "a", turn(1, Started), t);
+        let (task, attempt, spool) = once_waiter_fenced(&hub, t, false);
+        cancel(&hub, &task);
+        let ended = t + wait / 2;
+        hub.note_turn("p", "a", turn(2, Ended), ended);
+        let grace_ends = ended + wait;
+        assert_eq!(
+            hub.lock().receipts.next_deadline(t + wait),
+            Some(grace_ends),
+            "{what}: the clock wakes when the grace ends, not at the approval's end"
+        );
+        hub.tick_receipts_with(|| t + wait + wait / 4);
+        assert!(
+            authority_held(&hub, task.as_str(), attempt),
+            "{what}: past the approval window, inside the idle grace"
+        );
+        if commit {
+            assert!(prompt_commits(&spool, task.as_str(), attempt));
+            hub.tick_receipts_with(|| grace_ends - Duration::from_secs(1));
+            assert!(corrected(&hub, &task), "{what}");
+        } else {
+            hub.tick_receipts_with(|| grace_ends);
+            assert!(
+                !authority_held(&hub, task.as_str(), attempt),
+                "{what}: retired once the turn clock lets go"
+            );
+            assert!(
+                !prompt_commits(&spool, task.as_str(), attempt),
+                "{what}: the caps file went with the evidence"
+            );
+            hub.tick_receipts_with(|| grace_ends + wait);
+            assert!(!corrected(&hub, &task), "{what}: no correction");
+        }
+    }
+}

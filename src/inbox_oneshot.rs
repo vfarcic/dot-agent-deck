@@ -16,12 +16,15 @@
 //! that is not a whole block followed by a successful flush is possibly
 //! handed, which a stage report can never turn into "not handed".
 //!
-//! The attempts' caps stay inside [`OneShotBatch`]: they are written to the
-//! spool and nowhere else, never to a block, a control line, an error or the
-//! batch's `Debug`.
+//! The attempts' cap fields are private to [`OneShotBatch`]: the library
+//! writes them to the spool, and puts them in none of the blocks, control
+//! lines, errors of its own or the batch's `Debug`. It does not inspect text
+//! it is given and passes on as it is — a message's text, a `degraded`
+//! string, an underlying writer's error — so it makes no claim about what
+//! that text holds.
 //!
-//! Inert: nothing calls it yet. H3 wires Claude's waiter and prompt hook to
-//! it, H4 the other hooks and `inbox fetch`.
+//! Inert: nothing in production calls it yet. H3 wires Claude's waiter and
+//! prompt hook to it, H4 the other hooks and `inbox fetch`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
@@ -188,17 +191,36 @@ impl OneShotBatch {
     }
 
     /// Write `pieces` to `out`, running `fence` immediately before each
-    /// block's first byte and dropping a block it refuses. `out` should be the
-    /// raw descriptor, with no buffer between the count and the pipe. The
-    /// first write error stops the hand-over; every block written in full
-    /// before it, or before a failed flush, is only [`Output::Possible`].
+    /// block's first byte and dropping every piece of a block it refuses.
+    /// `out` should be the raw descriptor, with no buffer between the count
+    /// and the pipe. A block may come in several pieces: its outcome counts
+    /// the bytes accepted across all of them, so it is [`Output::NotHanded`]
+    /// only when none of its bytes was accepted, and [`Output::Written`] only
+    /// when every byte of every piece was. A block's later pieces are not
+    /// fenced again: once its first byte was accepted it is possibly handed,
+    /// and stopping it there would only cut it short. The first write error
+    /// stops the hand-over; every block written in full before it, or before
+    /// a failed flush, is only [`Output::Possible`].
     pub fn hand_over<W: Write>(
         &self,
         out: &mut W,
         pieces: &[Piece<'_>],
         mut fence: impl FnMut(&InboxAttemptRef) -> Result<(), FenceRefusal>,
     ) -> HandOver {
-        let mut outputs = vec![Output::NotHanded; self.blocks.len()];
+        #[derive(Clone, Copy, Default)]
+        struct Progress {
+            len: usize,
+            accepted: usize,
+            fenced: Option<bool>,
+        }
+        let mut progress = vec![Progress::default(); self.blocks.len()];
+        for piece in pieces {
+            if let Piece::Block(i, bytes) = *piece
+                && let Some(block) = progress.get_mut(i)
+            {
+                block.len += bytes.len();
+            }
+        }
         let mut error = None;
         for piece in pieces {
             let (block, bytes) = match *piece {
@@ -207,7 +229,11 @@ impl OneShotBatch {
                     let Some(at) = self.blocks.get(i).map(|block| &block.at) else {
                         continue;
                     };
-                    if fence(at).is_err() {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    let passed = *progress[i].fenced.get_or_insert_with(|| fence(at).is_ok());
+                    if !passed {
                         continue;
                     }
                     (Some(i), bytes)
@@ -215,13 +241,7 @@ impl OneShotBatch {
             };
             let (accepted, failed) = write_counted(out, bytes);
             if let Some(i) = block {
-                outputs[i] = if accepted == bytes.len() {
-                    Output::Written
-                } else if accepted > 0 {
-                    Output::Possible
-                } else {
-                    Output::NotHanded
-                };
+                progress[i].accepted += accepted;
             }
             if failed.is_some() {
                 error = failed;
@@ -231,13 +251,18 @@ impl OneShotBatch {
         if error.is_none() {
             error = out.flush().err();
         }
-        if error.is_some() {
-            for output in &mut outputs {
-                if *output == Output::Written {
-                    *output = Output::Possible;
+        let outputs = progress
+            .iter()
+            .map(|block| {
+                if block.accepted == 0 {
+                    Output::NotHanded
+                } else if block.accepted == block.len && error.is_none() {
+                    Output::Written
+                } else {
+                    Output::Possible
                 }
-            }
-        }
+            })
+            .collect();
         HandOver { outputs, error }
     }
 
@@ -394,6 +419,11 @@ pub enum FenceRefusal {
     NotGranted,
     Expired,
     Closed,
+    /// A newer receiver of the same agent replaced this one.
+    Superseded,
+    /// The deck sent a terminal refusal on the connection: its stable code
+    /// (`not_in_deck` for a caller that is not a live agent of the deck).
+    Refused(String),
     Revoked,
     RevokeMarker,
     MarkerUnreadable(String),
@@ -405,6 +435,8 @@ impl std::fmt::Display for FenceRefusal {
             FenceRefusal::NotGranted => f.write_str("the deck did not approve this hand-over"),
             FenceRefusal::Expired => f.write_str("the deck's approval ran out"),
             FenceRefusal::Closed => f.write_str("the deck closed the connection"),
+            FenceRefusal::Superseded => f.write_str("a newer receiver replaced this one"),
+            FenceRefusal::Refused(code) => write!(f, "the deck refused the connection: {code}"),
             FenceRefusal::Revoked => f.write_str("the deck revoked the hand-over"),
             FenceRefusal::RevokeMarker => f.write_str("the hand-over is marked revoked"),
             FenceRefusal::MarkerUnreadable(error) => {
@@ -420,13 +452,15 @@ impl std::fmt::Display for FenceRefusal {
 /// The check a one-shot runs, synchronously and after its last await,
 /// immediately before each block's first byte (part 2 §2.5). It refuses
 /// when the approval does not cover the attempt or has run out, when the
-/// connection has closed or brought a revoke naming it, and when the
-/// attempt's revoke marker exists or cannot be read.
+/// connection has closed or brought a terminal line (`superseded`,
+/// `not_in_deck`, a refusal) or a revoke naming it, and when the attempt's
+/// revoke marker exists or cannot be read. A close or a terminal line,
+/// once seen, refuses every later block too.
 pub struct Fence<'a, I> {
     approval: &'a Approval,
     spool: &'a GenerationSpool,
     incoming: I,
-    closed: bool,
+    ended: Option<FenceRefusal>,
     revoked: BTreeSet<Key>,
 }
 
@@ -436,7 +470,7 @@ impl<'a, I: Incoming> Fence<'a, I> {
             approval,
             spool,
             incoming,
-            closed: false,
+            ended: None,
             revoked: BTreeSet::new(),
         }
     }
@@ -449,15 +483,17 @@ impl<'a, I: Incoming> Fence<'a, I> {
             return Err(FenceRefusal::Expired);
         }
         let arrived = self.incoming.arrived();
-        self.closed |= arrived.eof;
-        self.revoked.extend(
-            arrived
-                .lines
-                .iter()
-                .flat_map(|line| line.revoke.iter().map(key)),
-        );
-        if self.closed {
-            return Err(FenceRefusal::Closed);
+        for line in &arrived.lines {
+            self.revoked.extend(line.revoke.iter().map(key));
+            if self.ended.is_none() {
+                self.ended = terminal(line);
+            }
+        }
+        if arrived.eof && self.ended.is_none() {
+            self.ended = Some(FenceRefusal::Closed);
+        }
+        if let Some(ended) = &self.ended {
+            return Err(ended.clone());
         }
         if self.revoked.contains(&key(at)) {
             return Err(FenceRefusal::Revoked);
@@ -472,10 +508,75 @@ impl<'a, I: Incoming> Fence<'a, I> {
     }
 }
 
+/// The refusal a line that ends the connection's use stands for, if it is
+/// one.
+fn terminal(line: &InboxWaitReply) -> Option<FenceRefusal> {
+    if line.superseded {
+        Some(FenceRefusal::Superseded)
+    } else if line.not_in_deck {
+        Some(FenceRefusal::Refused("not_in_deck".to_string()))
+    } else {
+        line.refused.clone().map(FenceRefusal::Refused)
+    }
+}
+
+/// One line read from the daemon by [`read_frame`].
+#[derive(Debug)]
+pub enum Frame {
+    /// A whole line, without its newline.
+    Line(Vec<u8>),
+    /// The connection ended between lines.
+    Eof,
+    /// The connection ended inside a line. Its bytes are dropped unread.
+    Unterminated,
+    /// The line ran past the bound before its newline.
+    TooLong,
+    Failed(io::Error),
+}
+
+/// Read one line from the daemon, at most `max` bytes before its newline. A
+/// line is handed back only once its newline has been read: the bytes before
+/// an end of connection inside a line are dropped, never parsed, even when
+/// they would parse (`BufRead::read_line`, which today's legacy waiter uses,
+/// hands them back). That is what [`classify_frame`] relies on.
+pub fn read_frame<R: io::BufRead>(reader: &mut R, max: usize) -> Frame {
+    let mut line = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Frame::Failed(error),
+        };
+        if available.is_empty() {
+            return if line.is_empty() {
+                Frame::Eof
+            } else {
+                Frame::Unterminated
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let taken = newline.map_or(available.len(), |at| at + 1);
+        if line.len() + taken - usize::from(newline.is_some()) > max {
+            return Frame::TooLong;
+        }
+        line.extend_from_slice(&available[..taken]);
+        reader.consume(taken);
+        if newline.is_some() {
+            line.pop();
+            return Frame::Line(line);
+        }
+    }
+}
+
 /// What the daemon's write of a once batch's line (`frame`, ending in its
-/// newline) did, for every attempt in it: a waiter acts only on a whole line,
-/// so a line whose newline was never accepted was never parsed. `accepted` is
-/// `None` when a timeout left the progress unknown.
+/// newline) did, for every attempt in it. A line whose newline was never
+/// accepted is [`Output::NotHanded`]: the peer cannot have read that
+/// newline, and a receiver reading through [`read_frame`] drops a line
+/// without one unparsed. That holds only for such a receiver, so the daemon
+/// may use this only on a connection whose receiver declared the one-shot
+/// integration (part 2 §2.7, H3's waiter); today's legacy waiter reads with
+/// `read_line`, which would parse such a line, and is never classified this
+/// way. `accepted` is `None` when a timeout left the progress unknown.
 pub fn classify_frame(frame: &[u8], accepted: Option<usize>, flushed: bool) -> Output {
     match accepted {
         Some(n) if n < frame.len() && frame.last() == Some(&b'\n') => Output::NotHanded,
@@ -1085,6 +1186,8 @@ mod tests {
             FenceRefusal::NotGranted,
             FenceRefusal::Expired,
             FenceRefusal::Closed,
+            FenceRefusal::Superseded,
+            FenceRefusal::Refused("not_in_deck".to_string()),
             FenceRefusal::Revoked,
             FenceRefusal::RevokeMarker,
             FenceRefusal::MarkerUnreadable("permission denied".to_string()),
@@ -1107,5 +1210,209 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Scenario: Hand over a batch whose first block is written in two
+    /// pieces, as a hook's escaped output may write it: the prefix is
+    /// accepted and the suffix's first write fails; the suffix is accepted
+    /// only in part; a fence that would refuse once the block is under way;
+    /// and a block whose first piece is empty, so its first byte is in the
+    /// second piece, where the fence refuses it. A block with any byte
+    /// accepted is never not handed, one is written only when every piece
+    /// went in full, and the fence runs once, before the block's first
+    /// byte.
+    #[spec("inbox/receipt/026")]
+    #[test]
+    fn receipt_026_a_block_in_several_pieces_is_judged_as_one() {
+        use Output::{NotHanded, Possible, Written};
+        let batch = two_blocks();
+        let text = batch.text(0).unwrap().as_bytes();
+        let (prefix, suffix) = text.split_at(10);
+        let pieces = [
+            Piece::Block(0, prefix),
+            Piece::Block(0, suffix),
+            Piece::Frame(SEP.as_bytes()),
+            Piece::Block(1, batch.text(1).unwrap().as_bytes()),
+        ];
+        for (what, steps, expected) in [
+            (
+                "the suffix's first write fails",
+                vec![
+                    Step::Take(prefix.len()),
+                    Step::Fail(io::ErrorKind::BrokenPipe),
+                ],
+                vec![Possible, NotHanded],
+            ),
+            (
+                "the suffix is accepted in part",
+                vec![
+                    Step::Take(prefix.len()),
+                    Step::Take(3),
+                    Step::Fail(io::ErrorKind::BrokenPipe),
+                ],
+                vec![Possible, NotHanded],
+            ),
+            ("every piece in full", vec![], vec![Written, Written]),
+        ] {
+            let mut out = pipe(steps);
+            let handed = batch.hand_over(&mut out, &pieces, |_| Ok(()));
+            assert_eq!(handed.outputs, expected, "{what}");
+        }
+
+        let mut fenced = Vec::new();
+        let mut out = pipe(vec![]);
+        let handed = batch.hand_over(&mut out, &pieces, |at| {
+            fenced.push(at.clone());
+            if fenced.len() > 1 && at.id == ID1 {
+                Err(FenceRefusal::Revoked)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            fenced,
+            vec![at(ID1, 1, 1), at(ID2, 1, 1)],
+            "one fence per block, before its first byte"
+        );
+        assert_eq!(handed.outputs, vec![Written, Written]);
+        assert!(
+            out.written.starts_with(text),
+            "a block under way is not cut short"
+        );
+
+        let empty_first = [
+            Piece::Block(0, b""),
+            Piece::Block(0, text),
+            Piece::Frame(SEP.as_bytes()),
+            Piece::Block(1, batch.text(1).unwrap().as_bytes()),
+        ];
+        let mut out = pipe(vec![]);
+        let handed = batch.hand_over(&mut out, &empty_first, |at| {
+            if at.id == ID1 {
+                Err(FenceRefusal::Revoked)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(handed.outputs, vec![NotHanded, Written]);
+        assert!(
+            !String::from_utf8(out.written).unwrap().contains(ID1),
+            "refused at its first byte, in its second piece"
+        );
+    }
+
+    /// Scenario: Approve a two-block batch, then let the deck's
+    /// `superseded` line arrive with the connection still open and no revoke
+    /// marker, and separately a `not_in_deck` line and a refusal line. The
+    /// fence refuses block one before its first byte and keeps refusing
+    /// block two when nothing more arrives, so a hand-over writes none of
+    /// either block.
+    #[spec("inbox/receipt/027")]
+    #[test]
+    fn receipt_027_a_terminal_line_already_arrived_ends_the_hand_over() {
+        let deck = deck();
+        let batch = two_blocks();
+        let [one, two] = <[InboxAttemptRef; 2]>::try_from(batch.attempts()).unwrap();
+        let t = Instant::now();
+        let approval = approve(&batch, t, t);
+        for (what, line, refusal) in [
+            (
+                "superseded",
+                InboxWaitReply::superseded(),
+                FenceRefusal::Superseded,
+            ),
+            (
+                "not in deck",
+                InboxWaitReply::not_in_deck(),
+                FenceRefusal::Refused("not_in_deck".to_string()),
+            ),
+            (
+                "refused",
+                InboxWaitReply::refused("unattested", "the caller is not attested"),
+                FenceRefusal::Refused("unattested".to_string()),
+            ),
+        ] {
+            let arrived = || Arrived {
+                lines: vec![line.clone()],
+                eof: false,
+            };
+            let mut fence = Fence::new(&approval, &deck.component, Script(vec![arrived()].into()));
+            assert_eq!(fence.check(&one, t), Err(refusal.clone()), "{what}");
+            assert_eq!(fence.check(&two, t), Err(refusal), "{what}: it stays ended");
+
+            let mut out = pipe(vec![]);
+            let mut fence = Fence::new(&approval, &deck.component, Script(vec![arrived()].into()));
+            let handed = batch.hand_over(&mut out, &batch.plain_pieces("", SEP), |at| {
+                fence.check(at, t)
+            });
+            assert_eq!(
+                handed.outputs,
+                vec![Output::NotHanded, Output::NotHanded],
+                "{what}"
+            );
+            let written = String::from_utf8(out.written).unwrap();
+            assert!(
+                !written.contains(ID1) && !written.contains(ID2),
+                "{what}: no byte of either block: {written:?}"
+            );
+        }
+    }
+
+    /// Scenario: Read the deck's once line through the one-shot's reader:
+    /// a whole line, a complete JSON reply whose newline never came before
+    /// the connection ended (also delivered in two reads), an empty
+    /// connection and an overlong line. Only the whole line is handed back;
+    /// the reply without its newline is dropped unparsed, although
+    /// `read_line` would have handed it back and it parses. The daemon's
+    /// classification of a write that lost that newline matches: not
+    /// handed.
+    #[spec("inbox/receipt/028")]
+    #[test]
+    fn receipt_028_a_line_without_its_newline_is_never_parsed() {
+        use std::io::{BufRead, BufReader, Read};
+        let reply = InboxWaitReply::messages(vec![handout(ID1, 1, 1, None)]);
+        let json = serde_json::to_string(&reply).unwrap();
+        let frame = format!("{json}\n");
+        let max = frame.len();
+
+        match read_frame(&mut frame.as_bytes(), max) {
+            Frame::Line(line) => {
+                serde_json::from_slice::<InboxWaitReply>(&line).unwrap();
+            }
+            other => panic!("a whole line: {other:?}"),
+        }
+
+        let cut = &frame.as_bytes()[..frame.len() - 1];
+        let mut legacy = String::new();
+        let mut legacy_reader = cut;
+        legacy_reader.read_line(&mut legacy).unwrap();
+        assert!(
+            serde_json::from_str::<InboxWaitReply>(&legacy).is_ok(),
+            "precondition: read_line hands it back and it parses"
+        );
+        assert!(matches!(read_frame(&mut &*cut, max), Frame::Unterminated));
+        let (first, second) = cut.split_at(cut.len() / 2);
+        let mut two_reads = BufReader::with_capacity(8, first.chain(second));
+        assert!(matches!(
+            read_frame(&mut two_reads, max),
+            Frame::Unterminated
+        ));
+        assert!(matches!(read_frame(&mut &b""[..], max), Frame::Eof));
+        assert!(matches!(
+            read_frame(&mut frame.as_bytes(), json.len() - 1),
+            Frame::TooLong
+        ));
+        let mut two = format!("{frame}{frame}");
+        two.push_str(&json);
+        let mut lines = two.as_bytes();
+        for _ in 0..2 {
+            assert!(matches!(read_frame(&mut lines, max), Frame::Line(_)));
+        }
+        assert!(matches!(read_frame(&mut lines, max), Frame::Unterminated));
+
+        assert_eq!(
+            classify_frame(frame.as_bytes(), Some(cut.len()), false),
+            Output::NotHanded
+        );
     }
 }

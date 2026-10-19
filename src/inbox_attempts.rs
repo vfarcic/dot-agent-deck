@@ -1138,6 +1138,14 @@ impl AttemptModel {
     /// is left out until that approval has run out (C-4), so a call that
     /// passed its own fence just before can still publish a commit that
     /// corrects the sender.
+    ///
+    /// A once-waiter attempt is also left out for as long as the turn clock
+    /// still possesses it (C-1): its waiter may have written the block before
+    /// it was fenced, and Claude may still be holding that notification for
+    /// the end of a busy turn. Its commit then comes from the prompt that
+    /// carries the block, through the cap file, so the cap stays until the
+    /// turn has been idle for one ack-wait. A turn starting voids a check
+    /// prepared before it (the mark).
     pub fn verify_candidates(&self, now: Instant) -> Vec<LapseCheck> {
         let mut out = Vec::new();
         if self.exited {
@@ -1150,7 +1158,14 @@ impl AttemptModel {
             for at in &msg.attempts {
                 let replaying = at.correcting.is_some_and(|rx| self.live(rx));
                 let quiet = at.quiet_at.is_none_or(|at| now >= at);
-                if at.stage == Stage::Fenced && at.verifier && !at.reclaimed && !replaying && quiet
+                let held = at.slot == Slot::OnceWaiter
+                    && possessed(&self.receivers, &self.limits, self.turn, id, at, now);
+                if at.stage == Stage::Fenced
+                    && at.verifier
+                    && !at.reclaimed
+                    && !replaying
+                    && quiet
+                    && !held
                 {
                     out.push(LapseCheck {
                         id: id.clone(),
@@ -1162,6 +1177,40 @@ impl AttemptModel {
             }
         }
         out
+    }
+
+    /// When the next fenced attempt that keeps its verifier becomes a
+    /// [`Self::verify_candidates`] entry, if that is after `now`, so the
+    /// clock wakes for it: its `quiet_at`, and for a once-waiter attempt the
+    /// end of the turn clock's possession too. While the turn is busy a
+    /// once-waiter attempt has no such instant; the turn's end sets one.
+    pub fn verify_due_at(&self, now: Instant) -> Option<Instant> {
+        if self.exited {
+            return None;
+        }
+        self.messages
+            .values()
+            .filter(|msg| msg.state.is_terminal())
+            .flat_map(|msg| msg.attempts.iter())
+            .filter(|at| {
+                at.stage == Stage::Fenced
+                    && at.verifier
+                    && !at.reclaimed
+                    && !at.correcting.is_some_and(|rx| self.live(rx))
+            })
+            .filter_map(|at| {
+                let held_until = if at.slot == Slot::OnceWaiter {
+                    if self.turn.busy {
+                        return None;
+                    }
+                    Some(once_anchor(at, self.turn) + self.limits.ack_wait)
+                } else {
+                    None
+                };
+                [at.quiet_at, held_until].into_iter().flatten().max()
+            })
+            .filter(|due| *due > now)
+            .min()
     }
 
     /// The verify candidates whose spool lookup found no commit: each one
@@ -2011,17 +2060,32 @@ impl AttemptModel {
     /// the message is not settled, a `Fenced` one's until a spool check after
     /// the message ended).
     ///
-    /// Finality already implies that no approval under a current epoch is
-    /// outstanding, so the model carries no separate approval predicate:
-    /// every path to a final stage is either the approved incarnation
-    /// reporting what its callback did (the approval is spent, or revoked
-    /// locally before a `NotHanded`), a resume answer or its silence (the
-    /// incarnation was retired, which bumps the epoch), the retirement of a
-    /// stream that closed (no sooner than an approval it sent has expired),
-    /// or exit. A refused [`Self::may_hand_over`] is none of these, so it
-    /// stages nothing. That a surviving old JS context honours the epoch bump
-    /// and the expiry before its approved callback resumes is the adapter's
-    /// obligation (inbox/opencode/031, inbox/opencode/046), not this model's.
+    /// For a stream attempt, finality already implies that no approval under
+    /// a current epoch is outstanding, so the model carries no separate
+    /// approval predicate for it: every path to a final stage is either the
+    /// approved incarnation reporting what its callback did (the approval is
+    /// spent, or revoked locally before a `NotHanded`), a resume answer or
+    /// its silence (the incarnation was retired, which bumps the epoch), the
+    /// retirement of a stream that closed (no sooner than an approval it sent
+    /// has expired), or exit. A refused [`Self::may_hand_over`] is none of
+    /// these, so it stages nothing. That a surviving old JS context honours
+    /// the epoch bump and the expiry before its approved callback resumes is
+    /// the adapter's obligation (inbox/opencode/031, inbox/opencode/046), not
+    /// this model's.
+    ///
+    /// A one-shot attempt (once-waiter or hook) does not have that property:
+    /// it is fenced at once when its connection closes, its waiter is
+    /// superseded or its hold runs out (C-2, C-3), while an approval it was
+    /// granted can still be in use, and a once-waiter's block can sit in
+    /// Claude's queued notification for a whole busy turn. So a fenced
+    /// one-shot attempt keeps its verifier until
+    /// [`Self::verify_candidates`] admits it: after its `quiet_at` (C-4) and,
+    /// for a once-waiter, after the turn clock's possession (C-1). What is
+    /// left: a process paused between its fence and its write for longer
+    /// than `grant_ttl`, or a notification Claude submits more than one
+    /// ack-wait after its turn went idle, can deliver after the verifier is
+    /// gone. That loses the sender's late correction, not the message, which
+    /// is already terminal or on the lapse path.
     fn reclaim(&mut self, id: &str) {
         let Some(msg) = self.messages.get_mut(id) else {
             return;
@@ -2111,6 +2175,12 @@ fn once_held(at: &Attempt) -> bool {
     at.slot == Slot::OnceWaiter && !matches!(at.stage, Stage::Committed | Stage::NotHanded)
 }
 
+/// Where a once-waiter attempt's idle grace starts (C-1): the later of its
+/// issue and the end of the last turn.
+fn once_anchor(at: &Attempt, turn: TurnView) -> Instant {
+    at.issued_at.max(turn.idle_since.unwrap_or(at.issued_at))
+}
+
 /// Whether a slot's receivers are one-shot processes (C-2, C-3).
 fn one_shot(slot: Slot) -> bool {
     matches!(slot, Slot::OnceWaiter | Slot::Hook)
@@ -2135,8 +2205,7 @@ fn possessed(
         return false;
     }
     if at.slot == Slot::OnceWaiter {
-        let anchor = at.issued_at.max(turn.idle_since.unwrap_or(at.issued_at));
-        return once_held(at) && (turn.busy || now < anchor + limits.ack_wait);
+        return once_held(at) && (turn.busy || now < once_anchor(at, turn) + limits.ack_wait);
     }
     if matches!(
         at.stage,
@@ -4342,6 +4411,30 @@ mod tests {
             StageOutcome::Applied
         );
         assert_eq!(m.state("m"), Some(MessageState::Settled));
+    }
+
+    /// Scenario: A Claude waiter of an agent allowed one attempt per message
+    /// is issued a message while the agent reads idle. Well past the idle
+    /// grace, the clock's tick is the first to learn that a turn started.
+    /// The message stays attempting with its revision unchanged: the turn
+    /// view is applied before anything decides on the stale idle one, so
+    /// the message never passes through uncertain on the way.
+    #[spec("inbox/attempts/035")]
+    #[test]
+    fn attempts_035_a_turn_learned_at_a_tick_is_applied_before_the_tick_decides() {
+        let limits = Limits {
+            max_attempts: 1,
+            ..Limits::default()
+        };
+        let (mut m, t) = model_with(limits);
+        let rx = m.register(t, Slot::OnceWaiter, false).rx;
+        m.post("m", false);
+        m.issue(t, "m", rx).unwrap();
+        let before = m.delivery("m").unwrap().revision;
+        m.tick_turn(t + limits.ack_wait * 2, &[], busy());
+        let d = m.delivery("m").unwrap();
+        assert_eq!(d.state, MessageState::Attempting);
+        assert_eq!(d.revision, before, "no state passed through on the way");
     }
 
     /// Scenario: While the agent is busy, a Claude waiter holds one message

@@ -287,6 +287,14 @@ impl Receipts {
             .filter_map(|generation| generation.model.revoke_due_at())
             .min()
             .map(|due| due.max(now));
+        // C-1, C-4: a fenced one-shot attempt becomes a verify candidate
+        // once its approval and, for a once-waiter, the turn clock's
+        // possession have run out.
+        let verify = self
+            .gens
+            .values()
+            .filter_map(|generation| generation.model.verify_due_at(now))
+            .min();
         // C-3: a hook receiver is closed when its hold runs out.
         let hold = self
             .gens
@@ -308,6 +316,7 @@ impl Receipts {
             arm,
             check,
             revoke,
+            verify,
             hold,
             not_started,
         ]
