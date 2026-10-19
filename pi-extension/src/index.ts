@@ -413,9 +413,10 @@ function deliver(proc: InboxProcess, message: InboxMessage): void {
  * one prompt at a time, and a hand-over sent while it reads no run active
  * goes through a preflight to start one; a second that leaves its preflight
  * while the first's run is active is refused, and that refusal's settle
- * clears Pi's running flag while the run goes on, so the hand-overs after it
- * take the preflight and are refused too — one admitted per burst, each of
- * the others costing a delivery (PRD #1666, the `load_003` burst). Holding
+ * clears Pi's running flag while the run goes on, so a later hand-over takes
+ * the preflight too and is refused if that run is still active when it
+ * leaves it, each refusal costing a delivery. In the measured `load_003`
+ * burst every one after the first was refused that way (PRD #1666). Holding
  * the next one back until the one before it is decided keeps two of ours out
  * of that preflight together, short of one marked stalled (`armAdmission`).
  * A passed one Pi neither starts nor settles holds the rest back for as long
