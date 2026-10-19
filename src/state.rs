@@ -8540,6 +8540,21 @@ impl AppState {
         self.refresh_card_inbox(pane_id);
     }
 
+    /// PRD #1666 §2.8 (auditor R9S-A01): a new agent generation took a pane
+    /// ([`crate::event::BroadcastMsg::InboxHandover`]). Its inbox becomes the
+    /// pane's account from this point of the stream, so a respawn or a restart
+    /// moves the counts to the new generation without a reconnect, and the
+    /// late notices of the one it replaced change nothing. Applied to the
+    /// panes [`Self::apply_inbox_notice`] applies notices to; any other pane's
+    /// account comes with the start that surfaces it, which follows this.
+    pub fn apply_inbox_handover(&mut self, handover: &crate::event::InboxHandover) {
+        if self.managed_pane_ids.contains(&handover.pane_id)
+            || self.pane_inboxes.contains_key(&handover.pane_id)
+        {
+            self.apply_inbox_summary(&handover.pane_id, &handover.agent_id, &handover.summary);
+        }
+    }
+
     /// PRD #1666 §2.8: one message in the inbox of a pane changed state
     /// ([`crate::event::BroadcastMsg::Inbox`]). Keyed by message id, so a
     /// repeated frame or a message going back and forth between queued and
@@ -17389,6 +17404,228 @@ mod tests {
             "the orchestrator was told its task was refused"
         );
         registry.shutdown_all();
+    }
+
+    /// A worker generation whose exit the hub hears of only when the test
+    /// releases it ([`AgentPtyRegistry::hold_exit_cleanup_for_test`]), or the
+    /// handle is dropped.
+    #[cfg(unix)]
+    struct HeldExitWorker {
+        agent: String,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    #[cfg(unix)]
+    impl HeldExitWorker {
+        fn spawn(registry: &Arc<AgentPtyRegistry>, pane: &str, cwd: &str) -> Self {
+            let agent = stand_in_in(registry, pane, Some(cwd));
+            let release = registry.hold_exit_cleanup_for_test(&agent);
+            Self { agent, release }
+        }
+
+        fn release(&self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    /// What an attached TUI holds for `pane`'s inbox, following the hub's
+    /// broadcasts as the event subscriber does: the generation its account is
+    /// for and the count its card shows. Each message read is kept in `seen`.
+    #[cfg(unix)]
+    fn follow_inbox(
+        client: &mut AppState,
+        rx: &mut broadcast::Receiver<BroadcastMsg>,
+        seen: &mut Vec<BroadcastMsg>,
+        pane: &str,
+    ) -> Option<(Option<String>, usize)> {
+        while let Ok(msg) = rx.try_recv() {
+            match &msg {
+                BroadcastMsg::Inbox(notice) => client.apply_inbox_notice(notice),
+                BroadcastMsg::InboxHandover(handover) => client.apply_inbox_handover(handover),
+                _ => {}
+            }
+            seen.push(msg);
+        }
+        client
+            .pane_inboxes
+            .get(pane)
+            .map(|inbox| (inbox.agent_id.clone(), inbox.card().pending))
+    }
+
+    /// The pane's agent generations replaced on a respawn path, the one
+    /// [`replacement_handover_case`] drives.
+    #[cfg(unix)]
+    enum Replacement {
+        ClearDelegate,
+        Restart,
+    }
+
+    /// Drive a real replacement of `pane`'s worker and check what an attached
+    /// TUI's account of the pane does, with the replaced generation's cleanup
+    /// held until after its successor's first notice.
+    #[cfg(unix)]
+    async fn replacement_handover_case(replacement: Replacement, orch_pane: &str, pane: &str) {
+        let dir = clear_role_dir();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (hub_tx, mut rx) = broadcast::channel(256);
+        registry.inbox().set_broadcast(hub_tx);
+        let orch = stand_in_in(&registry, orch_pane, Some(&cwd));
+        let old = HeldExitWorker::spawn(&registry, pane, &cwd);
+        let mut client = AppState::default();
+        client.register_pane(pane.to_string());
+        let mut seen = Vec::new();
+        follow_inbox(&mut client, &mut rx, &mut seen, pane);
+        // The account a surfacing start or a snapshot gives: the daemon's, for
+        // the old agent.
+        client.apply_inbox_summary(
+            pane,
+            &old.agent,
+            &registry.inbox().summary(pane, &old.agent),
+        );
+        let left = registry
+            .inbox()
+            .post_notice(
+                crate::inbox::Recipient::bound(pane, &old.agent),
+                "left for the old agent",
+                "x",
+            )
+            .expect("post to the old agent");
+        assert_eq!(
+            follow_inbox(&mut client, &mut rx, &mut seen, pane),
+            Some((Some(old.agent.clone()), 1)),
+            "precondition: the TUI's account is the old agent's, with its message"
+        );
+
+        let new_agent = match replacement {
+            Replacement::ClearDelegate => {
+                let task = dispatch_clear_task(
+                    registry.clone(),
+                    orch_pane.into(),
+                    orch.clone(),
+                    pane.into(),
+                    "the task".into(),
+                    cwd.clone(),
+                )
+                .await;
+                let new_agent = registry
+                    .pane_current_agent_id(pane)
+                    .expect("the replacement holds the pane");
+                assert_eq!(
+                    listed_state(&registry, pane, &task),
+                    Some(crate::inbox::StateName::Queued),
+                    "precondition: the task is posted to the replacement"
+                );
+                new_agent
+            }
+            Replacement::Restart => {
+                let orchestration = OrchestrationIdentity {
+                    id: "tab-1".to_string(),
+                    name: "orch".to_string(),
+                };
+                let mut app = AppState::default();
+                let ownership: Arc<dyn AgentOwnership> = registry.clone();
+                app.set_agent_ownership(Arc::downgrade(&ownership));
+                for (role_pane, role, is_orch) in
+                    [(orch_pane, "orchestrator", true), (pane, "fresh", false)]
+                {
+                    app.register_pane(role_pane.to_string());
+                    app.pane_role_map
+                        .insert(role_pane.to_string(), role.to_string());
+                    app.pane_orchestration_map
+                        .insert(role_pane.to_string(), orchestration.clone());
+                    app.pane_cwd_map.insert(role_pane.to_string(), cwd.clone());
+                    if is_orch {
+                        app.orchestrator_pane_ids.insert(role_pane.to_string());
+                    }
+                }
+                let state: SharedState = Arc::new(tokio::sync::RwLock::new(app));
+                let (event_tx, _event_rx) = broadcast::channel(64);
+                let response = handle_restart_role_with_state(
+                    crate::event::RestartRoleSignal {
+                        pane_id: orch_pane.to_string(),
+                        role: "fresh".to_string(),
+                        force: true,
+                        token: None,
+                        timestamp: chrono::Utc::now(),
+                    },
+                    &state,
+                    &registry,
+                    &event_tx,
+                )
+                .await;
+                assert_eq!(response.error, None, "the restart succeeds");
+                let new_agent = registry
+                    .pane_current_agent_id(pane)
+                    .expect("the replacement holds the pane");
+                // The new generation's own first message.
+                registry
+                    .inbox()
+                    .post_notice(
+                        crate::inbox::Recipient::bound(pane, &new_agent),
+                        "for the new agent",
+                        "x",
+                    )
+                    .expect("post to the new agent");
+                new_agent
+            }
+        };
+        assert_ne!(new_agent, old.agent, "precondition: a new generation");
+        assert_eq!(
+            follow_inbox(&mut client, &mut rx, &mut seen, pane),
+            Some((Some(new_agent.clone()), 1)),
+            "without a reconnect, the TUI's account moves to the new agent and counts its \
+             message, not the old agent's"
+        );
+
+        // The old generation's cleanup, late.
+        old.release();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while listed_state(&registry, pane, &left) != Some(crate::inbox::StateName::Undeliverable) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the old agent's exit never settled its inbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let shown = follow_inbox(&mut client, &mut rx, &mut seen, pane);
+        let at = |found: &dyn Fn(&BroadcastMsg) -> bool| seen.iter().position(found);
+        let handed_over =
+            at(&|msg| matches!(msg, BroadcastMsg::InboxHandover(h) if h.agent_id == new_agent));
+        let late = at(&|msg| {
+            matches!(msg, BroadcastMsg::Inbox(n)
+                if n.message_id == left.to_string()
+                    && n.state == crate::inbox::StateName::Undeliverable)
+        });
+        assert!(
+            matches!((handed_over, late), (Some(h), Some(l)) if h < l),
+            "precondition: the old agent's cleanup followed the hand-over ({handed_over:?}, \
+             {late:?})"
+        );
+        assert_eq!(
+            shown,
+            Some((Some(new_agent), 1)),
+            "the old agent's late notice changes nothing"
+        );
+        registry.shutdown_all();
+    }
+
+    /// PRD #1666 §2.8 (auditor R9S-A01): a `clear = true` delegate replaces the
+    /// worker, and an attached TUI's account of the pane moves to the
+    /// replacement in stream order, without a reconnect: the task posted to it
+    /// counts, and the replaced worker's cleanup, arriving after, does not.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clear_delegate_hands_the_panes_inbox_to_the_replacement() {
+        replacement_handover_case(Replacement::ClearDelegate, "ho-c-orch", "ho-c-worker").await;
+    }
+
+    /// PRD #1666 §2.8 (auditor R9S-A01): `pane restart` replaces the worker, and
+    /// an attached TUI's account follows it as on a `clear = true` delegate.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_restart_hands_the_panes_inbox_to_the_replacement() {
+        replacement_handover_case(Replacement::Restart, "ho-r-orch", "ho-r-worker").await;
     }
 
     /// PR #1735 fifth review (RB2-01): a `clear = true` dispatch whose

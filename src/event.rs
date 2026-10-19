@@ -2925,6 +2925,20 @@ pub enum BroadcastMsg {
     /// it reads the tag as [`Self::Unknown`].
     #[serde(rename = "inbox")]
     Inbox(InboxNotice),
+    /// PRD #1666 §2.8 (auditor R9S-A01): a new agent generation took a pane —
+    /// a first start, a `clear = true` respawn, a `pane restart`, a re-created
+    /// pane — with its inbox as it stood then. Sent under the lock every
+    /// [`Self::Inbox`] notice is sent under, so the account it carries covers
+    /// each notice for the pane before it and none after, as a card-surfacing
+    /// start's does ([`SURFACED_INBOX_METADATA_KEY`]). A client that keeps an
+    /// account of the pane takes this as its new one, and notices naming the
+    /// generation it replaced change nothing from here on.
+    ///
+    /// No [`crate::daemon_protocol::PROTOCOL_VERSION`] bump, for
+    /// [`Self::HookBinaryNotice`]'s reason: a client that can attach to a v11
+    /// daemon reads an unknown kind as [`Self::Unknown`].
+    #[serde(rename = "inbox_handover")]
+    InboxHandover(InboxHandover),
     /// Issue #1637: the daemon's hook-binary notices changed — an agent's
     /// hooks were seen running an older `dot-agent-deck`, or stopped doing so.
     /// Carries the whole current list, which replaces what a client holds.
@@ -2988,6 +3002,17 @@ pub enum BroadcastMsg {
     /// makes the NEXT `BroadcastMsg` variant additive.
     #[serde(other)]
     Unknown,
+}
+
+/// PRD #1666 §2.8: the payload of [`BroadcastMsg::InboxHandover`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InboxHandover {
+    /// The pane the generation took.
+    pub pane_id: String,
+    /// The generation that took it.
+    pub agent_id: String,
+    /// That generation's inbox in the pane when it took it.
+    pub summary: crate::inbox_hub::InboxSummary,
 }
 
 /// PRD #1666 S3: the payload of [`BroadcastMsg::Inbox`].

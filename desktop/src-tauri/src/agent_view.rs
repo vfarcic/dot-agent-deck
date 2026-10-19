@@ -291,7 +291,9 @@ impl AgentView {
             BroadcastMsg::WorktreeKept(_) => self.mark(FetchReason::WorktreeKept),
             // PRD #1666 §2.8: an inbox message changed state, and the counts
             // the tile shows ride the record; see `FetchReason::Inbox`.
-            BroadcastMsg::Inbox(_) => self.mark(FetchReason::Inbox),
+            BroadcastMsg::Inbox(_) | BroadcastMsg::InboxHandover(_) => {
+                self.mark(FetchReason::Inbox)
+            }
             // Issue #1637: the notices ride the `Hello` reply, which the held
             // link captured once; re-read it, and the list with it.
             BroadcastMsg::HookBinaryNotice(_) => {

@@ -1659,6 +1659,24 @@ impl InboxHub {
         f(summary_of(&st, pane_id, agent_id))
     }
 
+    /// PRD #1666 §2.8 (auditor R9S-A01): tell attached clients that
+    /// `agent_id` took `pane_id`, with its [`Self::summary`], in a
+    /// [`BroadcastMsg::InboxHandover`] sent under the lock every
+    /// [`BroadcastMsg::Inbox`] notice is sent under. The registry sends it for
+    /// every generation it publishes on a pane, so a client's account follows
+    /// a respawn, a restart or a re-created pane at its place in the stream.
+    pub fn hand_over(&self, pane_id: &str, agent_id: &str) {
+        let st = self.lock();
+        let Some(tx) = st.broadcast.as_ref() else {
+            return;
+        };
+        let _ = tx.send(BroadcastMsg::InboxHandover(crate::event::InboxHandover {
+            pane_id: pane_id.to_string(),
+            agent_id: agent_id.to_string(),
+            summary: summary_of(&st, pane_id, agent_id),
+        }));
+    }
+
     /// PRD #1666 §2.8: [`Self::with_summary`] for any number of agents — run
     /// `f` with a reader of [`Self::summary`] while holding the lock every
     /// [`BroadcastMsg::Inbox`] notice is sent under. A receiver `f` opens on

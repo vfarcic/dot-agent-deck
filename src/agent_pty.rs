@@ -2248,6 +2248,17 @@ fn pump_reader(
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
     {
+        #[cfg(test)]
+        {
+            let held = registry
+                .exit_cleanup_holds
+                .lock()
+                .unwrap()
+                .remove(&agent_id);
+            if let Some(held) = held {
+                let _ = held.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        }
         // PRD #1666 S5: a delegated task this agent never acknowledged is now
         // undeliverable, so the commission and idle-worker record its delegate
         // armed go with it — before the orchestrator is told, so a delegate sent
@@ -5557,6 +5568,10 @@ pub struct AgentPtyRegistry {
     /// child is terminated — see [`Self::pause_next_respawn_for_test`].
     #[cfg(test)]
     respawn_pause: RespawnPause,
+    /// PRD #1666 §2.8 test seam: generations whose exit the inbox hears of
+    /// only once the test lets it — see [`Self::hold_exit_cleanup_for_test`].
+    #[cfg(test)]
+    exit_cleanup_holds: Mutex<HashMap<String, std::sync::mpsc::Receiver<()>>>,
     /// PRD #1589 test seam: see
     /// [`Self::pause_next_role_registration_for_test`].
     #[cfg(test)]
@@ -7346,6 +7361,8 @@ impl AgentPtyRegistry {
             respawns_settled: Notify::new(),
             #[cfg(test)]
             respawn_pause: Mutex::new(None),
+            #[cfg(test)]
+            exit_cleanup_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
             role_registration_pause: Mutex::new(None),
             #[cfg(test)]
@@ -10305,6 +10322,13 @@ impl AgentPtyRegistry {
         // harmless — the monitor will re-check counters anyway.
         self.change_notify.notify_one();
         drop(inner);
+        // PRD #1666 §2.8 (auditor R9S-A01): every generation published on a
+        // pane — a first start, a respawn, a re-created pane — hands the pane's
+        // inbox over to it, before anything the spawn owes that inbox below. A
+        // registry with no inbox yet has no client to tell.
+        if let (Some(pane), Some(hub)) = (inbox_spawn.0.as_deref(), self.inbox.get()) {
+            hub.hand_over(pane, &id);
+        }
         if let (Some(pane), Some((integration, refresh))) = (inbox_spawn.0, inbox_refresh) {
             self.note_inbox_spawn(&pane, &id, integration, refresh, &inbox_spawn.2);
         }
@@ -14674,6 +14698,20 @@ impl AgentPtyRegistry {
                 return Err(RespawnsInFlight);
             }
         }
+    }
+
+    /// PRD #1666 §2.8 (auditor R9S-A01) test seam: when `agent_id`'s reader
+    /// reaches its end, it waits for the returned sender to send or drop
+    /// before it tells the inbox the generation exited, so a test can land
+    /// that cleanup after its successor's start.
+    #[cfg(test)]
+    pub(crate) fn hold_exit_cleanup_for_test(&self, agent_id: &str) -> std::sync::mpsc::Sender<()> {
+        let (release, held) = std::sync::mpsc::channel();
+        self.exit_cleanup_holds
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), held);
+        release
     }
 
     /// PRD #1487 re-check R2 test seam: the next respawn reports (on the

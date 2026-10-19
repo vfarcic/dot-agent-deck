@@ -7972,6 +7972,11 @@ async fn handle_subscribe_events(
 /// the hub-then-registry order [`crate::inbox_hub::InboxHub::set_live_agent_check`]
 /// already takes.
 ///
+/// Auditor R9S-A02: the wait for the hub's lock and the summaries built under
+/// it run on the blocking pool, with the `AppState` read guard moved there and
+/// held to the end of them, so a held hub parks no runtime worker and the
+/// nesting and the single hold above are unchanged.
+///
 /// Otherwise the listing is the [`AttachRequest::ListAgents`] reply's records,
 /// built by the same calls.
 async fn handle_subscribe_events_with_snapshot(
@@ -7980,8 +7985,10 @@ async fn handle_subscribe_events_with_snapshot(
     registry: &Arc<AgentPtyRegistry>,
     state: &SharedState,
 ) -> io::Result<()> {
-    let (rx, mut records, notices) = {
-        let guard = state.read().await;
+    let guard = Arc::clone(state).read_owned().await;
+    let registry_for_snapshot = Arc::clone(registry);
+    let (rx, mut records, notices) = tokio::task::spawn_blocking(move || {
+        let registry = registry_for_snapshot;
         let (rx, records) = registry.inbox().with_summaries(|summarize| {
             let rx = event_tx.subscribe();
             let mut records = registry.agent_records();
@@ -7991,7 +7998,9 @@ async fn handle_subscribe_events_with_snapshot(
             (rx, records)
         });
         (rx, records, guard.hook_binaries.notices())
-    };
+    })
+    .await
+    .map_err(io::Error::other)?;
     crate::agent_pty::attach_cli_names(&mut records);
     let mut resp = AttachResponse::agent_records(records);
     // Issue #1637: read under the same guard as the receiver, so a notice
@@ -9454,8 +9463,8 @@ mod tests {
         write_frame(&mut wr, KIND_REQ, &request)
             .await
             .expect("send the request");
-        // A blocking wait: the handler blocks a runtime worker on the held
-        // lock, so the runtime's timers are not this wait's clock.
+        // A wall-clock wait, so this pin does not depend on the handler
+        // leaving the runtime's workers free (that is the test below's).
         let opened_by = std::time::Instant::now() + Duration::from_secs(1);
         while event_tx.receiver_count() == receivers && std::time::Instant::now() < opened_by {
             std::thread::sleep(Duration::from_millis(10));
@@ -9506,6 +9515,100 @@ mod tests {
             (after.as_str(), crate::inbox::StateName::Queued),
             "the stream's first inbox notice is the post after the snapshot, not one the \
              snapshot already counts"
+        );
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// Auditor R9S-A02: an ordered subscription waiting for the inbox hub's
+    /// lock leaves the runtime running. On a runtime with one worker, the test
+    /// holds the hub's lock, sends the request, and then waits on that
+    /// runtime's own timer before letting the lock go: a handler that waited
+    /// for the lock on the worker would stall the timer until the holder gave
+    /// up. The subscription still opens, with its snapshot, once released.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ordered_subscription_waiting_on_the_hub_leaves_the_runtime_running() {
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(64);
+        registry.inbox().set_broadcast(event_tx.clone());
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let hub = Arc::clone(registry.inbox());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // Whether the test let the lock go, rather than the holder giving up.
+        let holder = std::thread::spawn(move || {
+            hub.with_summary("", "", |_| {
+                held_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+            })
+        });
+        held_rx.recv().expect("the hub's lock is held");
+        let (mut rd, mut wr) = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect for the ordered subscription")
+            .into_split();
+        let receivers = event_tx.receiver_count();
+        let request = serde_json::to_vec(&AttachRequest::SubscribeEventsWithSnapshot).unwrap();
+        write_frame(&mut wr, KIND_REQ, &request)
+            .await
+            .expect("send the request");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let opened_while_held = event_tx.receiver_count() != receivers;
+        let _ = release_tx.send(());
+        let released_by_the_test = tokio::task::spawn_blocking(move || holder.join().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            released_by_the_test,
+            "the runtime's timer stalled until the holder gave up: the handler waited for the \
+             hub's lock on the runtime's worker"
+        );
+        assert!(
+            !opened_while_held,
+            "the receiver opened before the hub's lock was released"
+        );
+        let (kind, payload) = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut rd))
+            .await
+            .expect("the daemon answers within 5 s")
+            .expect("the frame reads")
+            .expect("the stream is open");
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&payload).expect("a response");
+        assert!(resp.ok, "the ordered subscription opens: {:?}", resp.error);
+        assert!(
+            resp.agent_records.is_some(),
+            "the reply carries the snapshot"
         );
 
         registry.shutdown_all();

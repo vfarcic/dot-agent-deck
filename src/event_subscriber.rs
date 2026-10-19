@@ -108,6 +108,11 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
                     Ok(Some(BroadcastMsg::Inbox(notice))) => {
                         state.write().await.apply_inbox_notice(&notice);
                     }
+                    // PRD #1666 §2.8: a new generation took a pane; the card's
+                    // counts follow it from here.
+                    Ok(Some(BroadcastMsg::InboxHandover(handover))) => {
+                        state.write().await.apply_inbox_handover(&handover);
+                    }
                     // Issue #1637: the daemon's hook-binary notices changed.
                     // The whole list replaces what the dashboard footer shows.
                     Ok(Some(BroadcastMsg::HookBinaryNotice(payload))) => {
