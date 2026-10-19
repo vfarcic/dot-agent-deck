@@ -829,6 +829,15 @@ impl AttemptModel {
         self.seen_slots.contains(&slot)
     }
 
+    /// The `(A, e)` [`Self::issue`] would give `id`'s next attempt, so a
+    /// hand-out can be measured with its opener's `delivery A.e` before it is
+    /// issued under the same lock. `None` for a message the model does not
+    /// hold.
+    pub fn next_attempt(&self, id: &str) -> Option<(u32, u32)> {
+        let msg = self.messages.get(id)?;
+        Some((msg.a, msg.attempts.len() as u32 + 1))
+    }
+
     /// T1: hand `id` out to `rx`, if it is `Queued` or carries a repeat token
     /// that still holds under the lock right now.
     pub fn issue(&mut self, now: Instant, id: &str, rx: Rx) -> Result<Issued, IssueRefusal> {

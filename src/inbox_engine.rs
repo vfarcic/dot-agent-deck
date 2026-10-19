@@ -570,7 +570,7 @@ fn issue_to(
             .delivery(id)
             .is_some_and(|d| d.repeat_scheduled());
         let len = budget.map(|budget| {
-            let text = render_marked(&message, Some(budget), marked).text;
+            let text = render_marked(&message, Some(budget), marked, None).text;
             budget.measure(&text) + budget.measure(super::BLOCK_SEPARATOR)
         });
         if let (Some(budget), Some(len)) = (budget, len)
@@ -615,7 +615,7 @@ fn issue_to(
         } else {
             st.inbox.count_receipt_repeat(id, &key.0, &key.1);
         }
-        let mut delivery = render_marked(&message, budget, issued.kind.marked());
+        let mut delivery = render_marked(&message, budget, issued.kind.marked(), None);
         used += len.unwrap_or(0);
         delivery.attempt = Some(InboxDeliveryAttempt {
             a: issued.a,

@@ -8174,6 +8174,55 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Does not assert:** the daemon's reaper thread or its one-minute interval; a cursor across daemon restarts (it is not persisted).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/receipt/019 — A one-shot reads its caps by exact attempt, and fails closed.
+- **Layer:** L1 unit (src/inbox_receipt.rs), tempdir spool.
+- **Agent:** none.
+- **Asserts:** `read_caps_checked` finds each of two attempts of one message by its exact `(id, A, e)`, never the other's; a caps file holding one line, a non-hex cap, a third line, no final newline or too many bytes is `Malformed`; a directory, a FIFO or a symlink to a valid caps file is `Failed`, never followed; an attempt never written, or removed by `remove_attempt`, is `Missing`, and its sibling's caps stay.
+- **Does not assert:** a one-shot's commit acting on the lookup (part 2's H3); Windows reparse points (the FIFO and symlink cases are unix-only).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/020 — A one-shot publishes into its pinned spool on the attempt's own cap.
+- **Layer:** L1 unit (src/inbox_oneshot.rs), tempdir spool, the daemon's evidence store and scanner.
+- **Agent:** none.
+- **Asserts:** `open_pinned` opens the generation spool the daemon created; a relative or non-instance pinned path is refused with words for the degraded notice; a hook's written block publishes `committed` and a waiter's publishes `handed`, both admitted by the daemon's scan; a `committed` record carried on the hand-out cap is refused; a cap that is not a cap, or missing, publishes no file and reports degraded; no spool reports degraded; a block not handed publishes nothing.
+- **Does not assert:** a real one-shot process or the pinned environment variable (part 2's H3).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/021 — The fence refuses before the first byte, and covers one block.
+- **Layer:** L1 unit (src/inbox_oneshot.rs), tempdir spool, a scripted connection.
+- **Agent:** none.
+- **Asserts:** an attempt never asked about is not granted; the approval runs out `grant_ttl` after the questions were sent, also when the answer came late, and an answer read after that grants nothing; an EOF or a revoke line refuses, and keeps refusing; a revoke marker written after the grant refuses, and one that cannot be read refuses too; through `hand_over`, a revoke arriving between two blocks leaves block one written and no byte of block two, and a marked block never reaches the pipe.
+- **Does not assert:** a non-blocking read of a real socket (part 2's H3); the daemon writing the markers (H3).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/022 — Only a block of which no byte went is not handed.
+- **Layer:** L1 unit (src/inbox_oneshot.rs), a scripted pipe.
+- **Agent:** none.
+- **Asserts:** a pipe taking a few bytes a write gets every byte and both blocks are `Written`; nothing accepted or a zero-byte write gives `NotHanded`; a prefix then an error or a timeout gives `Possible`; a failed flush turns `Written` into `Possible`; an error after block one's whole bytes leaves block one `Possible` and block two `NotHanded`; an interrupted write is tried again; `classify_frame` gives `NotHanded` for a line whose newline was not accepted, `Possible` for a whole line with a failed flush, unknown progress or no newline, and `Written` for a whole flushed line.
+- **Does not assert:** a real descriptor, or the daemon's once-batch write using `classify_frame` (part 2's H3).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/023 — Only closed top-level blocks name an attempt.
+- **Layer:** L1 unit (src/inbox_prompt.rs).
+- **Agent:** none.
+- **Asserts:** `delivered` returns the exact `(id, A, e)` of each closed top-level block whose opener names `delivery A.e`, including one opening on the same line as Claude's rewake text; a block quoted inside another names nothing while a later genuine one counts; an unclosed opener ends the scan; malformed, out-of-range or over-long `delivery` fields give no attempt; one attempt counted twice is one tuple, two attempts of one id are two; at most `MAX_IDS`; an untrusted body's defused markers name and close nothing.
+- **Does not assert:** the prompt hook committing what it returns (part 2's H3).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/024 — A one-shot's opener names its attempt.
+- **Layer:** L1 unit (src/inbox_hub.rs), the hub's renderer and an attempt model.
+- **Agent:** none.
+- **Asserts:** with no attempt, `render_marked` writes today's opener and equals `render_within` for trusted, untrusted, prefaced and over-budget messages, first hand-out and marked repeat alike; with one, the opener reads `delivery A.e` after the id, the rest of an unbudgeted block is unchanged and a budgeted one still fits; the existing opener scan still finds the id; `next_attempt` is exactly the `(A, e)` the next `issue` assigns.
+- **Does not assert:** a hand-out measured with `next_attempt` (part 2's H3).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/025 — No cap leaves the one-shot library.
+- **Layer:** L1 unit (src/inbox_oneshot.rs).
+- **Agent:** none.
+- **Asserts:** for a batch whose caps are known, none of their hex appears in the block texts, the `may` lines, any control line (hook or waiter, every output, with or without degraded), any fence refusal's `Display` or `Debug`, a hand-over's error, the pinned-spool errors, or the batch's and the approval's `Debug`.
+- **Does not assert:** the one-shot processes' own output (the waiter's stderr, a hook's JSON, `inbox fetch --json`), which part 2's H3 and H4 add.
+- **Platform coverage:** mac+linux+windows.
+
 #### Protocol and waiter lifecycle
 
 ##### inbox/protocol/001 — Inbox verbs require an attested caller.
