@@ -1604,13 +1604,18 @@ fn cancel(op: &OpenCode, id: &str) -> Value {
     }
 }
 
-/// Scenario: The OpenCode pane is a worker taking jobs from a pool, and every receipt its watcher publishes takes three seconds. A job is offered to it, prompted, and answered, so the plugin reports it committed; while that receipt is still being written, the user cancels the job. The plugin answers the revoke `already_handed`, never `revoked_ack`, and the job ends cancelled on this worker instead of going back to its pool.
+/// Scenario: The OpenCode pane is a worker taking jobs from a pool, and its first watcher's receipt publishes are held for two minutes. A job is offered to it, prompted, and answered, so the plugin reports it committed; while that receipt is still being written, the user cancels the job. The plugin answers the revoke `already_handed`, never `revoked_ack`, and the job ends cancelled on this worker instead of going back to its pool.
 #[spec("inbox/opencode/047")]
 #[test]
 fn opencode_047_a_cancel_racing_a_commits_publication_keeps_the_offer_bound() {
+    // As in `opencode_052`: two minutes outlasts every step from the commit
+    // report to the end of the test, so the Cancel always lands while the
+    // commit is still being published. A three-second delay raced it under
+    // load. A replacement watcher, should one start, publishes at once.
     let op = OpenCode::new(
         "session",
-        json!({"offerPool":"review","publishDelayMs":"3000"}),
+        json!({"offerPool":"review","publishDelayMs":"120000",
+            "firstWatcherDelaysPublish":true}),
     );
     armed(&op.daemon, &op.pane, 1);
     let orch = op.orchestrator.as_ref().unwrap();
@@ -1627,11 +1632,25 @@ fn opencode_047_a_cancel_racing_a_commits_publication_keeps_the_offer_bound() {
     op.assistant(&last_user(&op));
     assert!(
         common::wait_until(WAIT, || op.commits(&id) >= 1),
-        "the plugin reports the commit: {:?}",
-        op.controls()
+        "the plugin reports the commit: {:?}\n{}",
+        op.controls(),
+        timeline(&op)
+    );
+    // Each step its own assertion, with the timeline, so a failure names the
+    // step that did not happen.
+    assert_ne!(
+        op.message_state(&id),
+        "acknowledged",
+        "the commit is still being published when the user cancels: {}",
+        timeline(&op)
     );
     let pressed = cancel(&op, &id);
-    assert_eq!(pressed["inbox_action"]["outcome"], "applied", "{pressed}");
+    assert_eq!(
+        pressed["inbox_action"]["outcome"],
+        "applied",
+        "{pressed}\n{}",
+        timeline(&op)
+    );
     let answered = |what: &str| {
         op.controls()
             .iter()
@@ -1642,26 +1661,30 @@ fn opencode_047_a_cancel_racing_a_commits_publication_keeps_the_offer_bound() {
     assert!(
         common::wait_until(WAIT, || answered("already_handed")
             || answered("revoked_ack")),
-        "the revoke is answered: {:?}",
-        op.controls()
+        "the revoke is answered: {:?}\n{}",
+        op.controls(),
+        timeline(&op)
     );
     assert!(
         !answered("revoked_ack"),
-        "a committed job is no not-handed witness: {:?}",
-        op.controls()
+        "a committed job is no not-handed witness: {:?}\n{}",
+        op.controls(),
+        timeline(&op)
     );
     assert!(
         common::wait_until(WAIT, || op.message_state(&id) == "undeliverable"),
-        "the job ends cancelled on this worker: {}",
-        op.message_state(&id)
+        "the job ends cancelled on this worker: {}\n{}",
+        op.message_state(&id),
+        timeline(&op)
     );
     assert!(
         !common::wait_until(Duration::from_millis(4000), || op.message_state(&id)
             != "undeliverable"),
-        "and never goes back to its pool: {}",
-        op.message_state(&id)
+        "and never goes back to its pool: {}\n{}",
+        op.message_state(&id),
+        timeline(&op)
     );
-    assert_eq!(op.prompts().len(), 1);
+    assert_eq!(op.prompts().len(), 1, "{}", timeline(&op));
 }
 
 /// Scenario: The TUI plugin is handed a deck message and prompts it; its watcher is killed and respawns, the new registration resumes the attempt, and the context answers that it retained it. The deck's answer, with the attempt's caps, reaches the new watcher's publisher two seconds late, and OpenCode answers the message inside that window, so the plugin reports it committed before the caps are there; the commit's control never reaches the deck. The new watcher waits for the caps and publishes the commit receipt, and the deck settles the message from it, with one prompt.

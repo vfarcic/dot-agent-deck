@@ -10218,9 +10218,9 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Cost:** none.
 
 ##### inbox/opencode/047 — A Cancel racing a commit's publication keeps the offer bound.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watcher with a 3 s publish delay.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watcher whose publishes are held for two minutes (`DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS`, the first watcher's alone through the fixture's `firstWatcherDelaysPublish`), far longer than the steps from the commit report to the end of the test.
 - **Agent:** generated TUI plugin in an offer-taking worker.
-- **Asserts:** a job reported committed and cancelled while its commit receipt is still being written is answered `already_handed`, never `revoked_ack`, ends undeliverable on this worker and does not go back to its pool; one prompt.
+- **Asserts:** a job reported committed, still not acknowledged when the user cancels it, is answered `already_handed`, never `revoked_ack`, ends undeliverable on this worker and does not go back to its pool; one prompt. Each step fails with a timeline of the watchers' spawns, exits, registrations and the commit reports.
 - **Does not assert:** a real OpenCode.
 - **Cost:** none.
 
@@ -10253,7 +10253,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Cost:** none.
 
 ##### inbox/opencode/052 — A cancelled task's commit survives its watcher killed mid-publish.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watchers, the first of which alone gets a two-minute `DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS` (the fixture's `firstWatcherDelaysPublish`) so the kill always lands mid-publish, an offers orchestration whose worker role keeps its agent, and the fixture logging what each watcher writes to the plugin; plus a fast JS test in `src/opencode_manage.rs`.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real watchers, the first of which alone gets a two-minute `DOT_AGENT_DECK_INBOX_TEST_PUBLISH_DELAY_MS` (the fixture's `firstWatcherDelaysPublish`): that hold keeps its commit publish in flight far longer than the steps from the commit report to the kill, while a replacement publishes at once; an offers orchestration whose worker role keeps its agent, and the fixture logging what each watcher writes to the plugin; plus a fast JS test in `src/opencode_manage.rs`.
 - **Agent:** generated TUI plugin; the unit half drives the receiver with stand-in watchers.
 - **Asserts:** a delegated task, prompted, then cancelled and answered `already_handed`, ends cancelled; OpenCode then answers it and the plugin reports the commit; the watcher is SIGKILLed while that publish is in flight; the replacement registers, its registration reaches the plugin listing the attempt as `correctable`, and the plugin sends the commit again to it (each its own assertion, failing with a timeline of the watchers' spawns, exits, registrations and the commit reports); the orchestrator receives "delivered after all, despite Cancel", the worker's card carries no `receipts_degraded`, and no line the plugin reads carries a cap. Unit: after a watcher dies holding two commits, a registration listing the first as correctable gets only that commit again (not its handed report, nothing about the second, no resume answer); a registration listing nothing gets nothing, and the report is then gone for good.
 - **Does not assert:** a real OpenCode, the evidence's return (`inbox/opencode/053`), or Pi.
