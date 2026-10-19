@@ -17628,6 +17628,63 @@ mod tests {
         replacement_handover_case(Replacement::Restart, "ho-r-orch", "ho-r-worker").await;
     }
 
+    /// PRD #1666 §2.8 (auditor R9T-A01): a generation whose start is held
+    /// between its publication and its inbox hand-over is stopped, a successor
+    /// takes the pane and hands over, and only then does the held start reach
+    /// its hand-over. An attached TUI's account stays the successor's, and the
+    /// successor's later messages still count.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delayed_handover_never_takes_the_pane_back_from_its_successor() {
+        let pane = "a01-worker";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (hub_tx, mut rx) = broadcast::channel(256);
+        registry.inbox().set_broadcast(hub_tx);
+        let mut client = AppState::default();
+        client.register_pane(pane.to_string());
+        let mut seen = Vec::new();
+
+        let (published, release) = registry.hold_next_handover_for_test(pane);
+        let starting = {
+            let registry = registry.clone();
+            std::thread::spawn(move || stand_in_in(&registry, pane, None))
+        };
+        published
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the first generation is published and held before its hand-over");
+        let old = registry
+            .pane_current_agent_id(pane)
+            .expect("the first generation holds the pane");
+        registry
+            .close_agent(&old)
+            .expect("stop the first generation");
+        let new_agent = stand_in_in(&registry, pane, None);
+        let to_new = crate::inbox::Recipient::bound(pane, &new_agent);
+        registry
+            .inbox()
+            .post_notice(to_new.clone(), "for the new agent", "x")
+            .expect("post to the new agent");
+        assert_eq!(
+            follow_inbox(&mut client, &mut rx, &mut seen, pane),
+            Some((Some(new_agent.clone()), 1)),
+            "precondition: the successor handed over and its message counts"
+        );
+
+        release.send(()).unwrap();
+        assert_eq!(starting.join().unwrap(), old, "the held start finishes");
+        registry
+            .inbox()
+            .post_notice(to_new, "another for the new agent", "x")
+            .expect("post to the new agent again");
+        assert_eq!(
+            follow_inbox(&mut client, &mut rx, &mut seen, pane),
+            Some((Some(new_agent), 2)),
+            "the replaced generation's late hand-over takes nothing back: the account stays \
+             the successor's and its later message counts"
+        );
+        registry.shutdown_all();
+    }
+
     /// PR #1735 fifth review (RB2-01): a `clear = true` dispatch whose
     /// replacement worker is gone before the post tells the orchestrator in the
     /// room it reserved for the task, so a deck that filled meanwhile cannot

@@ -2107,6 +2107,142 @@ async fn a_full_stream_queue_is_issued_nothing() {
     peer.close().await;
 }
 
+/// Read out every line the daemon has written to `peer` so far, keepalives
+/// included, until none arrives for a moment.
+async fn drain_lines(peer: &mut Peer) {
+    while let Ok(Ok(Some(_))) =
+        tokio::time::timeout(Duration::from_millis(200), peer.lines.next_line()).await
+    {}
+}
+
+/// Auditor R9T-A02 / reviewer R9T-02: with room for one more line on a
+/// receiver's queue, one pass issues a message and has not yet written its
+/// hand-out when a second pass posts, issues and writes another. The first
+/// pass's line still fits: the second message waits instead of taking its
+/// room, and both reach the receiver on their first attempts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_holds_its_room_on_the_queue_until_it_writes() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let mut peer = Peer::open_buffered(
+        &hub,
+        "p",
+        "a",
+        InboxComponent::PiExtension,
+        INTEGRATION,
+        256,
+    )
+    .await;
+    let rx = peer.next().await.registered.unwrap().rx;
+    let key = ("p".to_string(), "a".to_string());
+    let tx = hub.lock().receipts.gens[&key].links[&crate::inbox_attempts::Rx(rx)]
+        .tx
+        .clone();
+    let kept = tx.try_reserve_owned().expect("room for a line");
+    assert!(fill_the_queue(&hub, "p", "a", rx).await > 0);
+    let first = hub
+        .post_direct(Recipient::bound("p", "a"), content("first"))
+        .unwrap();
+    assert_eq!(
+        attempts_of(&hub, "p", "a", first.as_str()),
+        0,
+        "precondition: posted while the queue was full"
+    );
+    drop(kept);
+    assert_eq!(
+        queue_capacity(&hub, "p", "a", rx),
+        1,
+        "precondition: room for exactly one line"
+    );
+
+    let mut unwritten = engine::Outbox::new();
+    {
+        let mut st = hub.lock();
+        engine::dispatch(&mut st, &key, Instant::now(), &mut unwritten);
+    }
+    assert_eq!(
+        attempts_of(&hub, "p", "a", first.as_str()),
+        1,
+        "precondition: the held pass issued the first message"
+    );
+    let second = hub
+        .post_direct(Recipient::bound("p", "a"), content("second"))
+        .unwrap();
+    engine::flush(unwritten);
+
+    let mut handed: Vec<(String, u32, bool)> = Vec::new();
+    let started = Instant::now();
+    while handed.len() < 2 && started.elapsed() < Duration::from_secs(5) {
+        hub.tick();
+        if let Ok(reply) = tokio::time::timeout(Duration::from_millis(20), peer.next()).await
+            && let Some(messages) = reply.messages
+        {
+            handed.extend(messages.iter().map(|d| {
+                let at = attempt(d);
+                (d.id.clone(), at.a, at.repeat)
+            }));
+        }
+    }
+    assert_eq!(
+        handed,
+        vec![
+            (first.to_string(), 1, false),
+            (second.to_string(), 1, false)
+        ],
+        "an issued hand-out was dropped: every message must reach the receiver on its first \
+         attempt"
+    );
+    peer.close().await;
+}
+
+/// Reviewer R9T-02: a doorbell fetch by a receiver whose queue of waiting
+/// lines is full hands nothing over — the caps of whatever it issued could
+/// not reach the watcher — and the mail stays waiting. Once the receiver
+/// reads its lines again, the next fetch hands it over and its caps reach the
+/// stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doorbell_fetch_into_a_full_queue_hands_nothing_over() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let mut peer = Peer::open_buffered(
+        &hub,
+        "p",
+        "a",
+        InboxComponent::PiExtension,
+        ReceiptArm {
+            doorbell_only: true,
+            ..INTEGRATION
+        },
+        256,
+    )
+    .await;
+    let rx = peer.next().await.registered.unwrap().rx;
+    assert!(fill_the_queue(&hub, "p", "a", rx).await > 0);
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("ring"))
+        .unwrap();
+    let fetched = hub.receipt_fetch("p", "a", rx, None, None).unwrap();
+    assert!(
+        fetched.is_empty(),
+        "a fetch handed {} message(s) over while their caps could not reach the stream",
+        fetched.len()
+    );
+    assert_eq!(attempts_of(&hub, "p", "a", id.as_str()), 0);
+    assert_eq!(state_of(&hub, "p", id.as_str()), StateName::Queued);
+
+    drain_lines(&mut peer).await;
+    let fetched = hub.receipt_fetch("p", "a", rx, None, None).unwrap();
+    assert_eq!(
+        fetched.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        vec![id.as_str()]
+    );
+    let issued = peer.next().await.issued;
+    assert_eq!(
+        issued.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        vec![id.as_str()],
+        "the caps reached the stream"
+    );
+    peer.close().await;
+}
+
 /// Scenario: On an OpenCode and on a Pi receiver alike, a message is handed to a receiver whose connection stops taking lines, so its queue of waiting lines fills; Cancel's revoke finds the queue full and is dropped, while the stream stays connected. The test reads the queue out: no revoke arrives before one ack-wait has passed, and the clock's next pass after it sends the revoke again on the same stream, which answers it; the message ends cancelled and its evidence is returned.
 #[spec("inbox/boundary/039")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

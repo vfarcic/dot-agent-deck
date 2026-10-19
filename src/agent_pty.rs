@@ -5572,6 +5572,10 @@ pub struct AgentPtyRegistry {
     /// only once the test lets it — see [`Self::hold_exit_cleanup_for_test`].
     #[cfg(test)]
     exit_cleanup_holds: Mutex<HashMap<String, std::sync::mpsc::Receiver<()>>>,
+    /// PRD #1666 §2.8 test seam: panes whose next published generation waits
+    /// before handing the inbox over — see [`Self::hold_next_handover_for_test`].
+    #[cfg(test)]
+    handover_holds: Mutex<HashMap<String, StdPause>>,
     /// PRD #1589 test seam: see
     /// [`Self::pause_next_role_registration_for_test`].
     #[cfg(test)]
@@ -5591,7 +5595,11 @@ type NamedPauses = Mutex<HashMap<String, (oneshot::Sender<()>, oneshot::Receiver
 
 /// See [`AgentPtyRegistry::pause_next_publish_for_test`].
 #[cfg(test)]
-type PublishPause = Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>;
+type PublishPause = Mutex<Option<StdPause>>;
+
+/// A synchronous pause: report on the sender, then wait on the receiver.
+#[cfg(test)]
+type StdPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 /// See [`AgentPtyRegistry::pause_next_respawn_for_test`].
 #[cfg(test)]
@@ -7363,6 +7371,8 @@ impl AgentPtyRegistry {
             respawn_pause: Mutex::new(None),
             #[cfg(test)]
             exit_cleanup_holds: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            handover_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
             role_registration_pause: Mutex::new(None),
             #[cfg(test)]
@@ -10327,7 +10337,9 @@ impl AgentPtyRegistry {
         // inbox over to it, before anything the spawn owes that inbox below. A
         // registry with no inbox yet has no client to tell.
         if let (Some(pane), Some(hub)) = (inbox_spawn.0.as_deref(), self.inbox.get()) {
-            hub.hand_over(pane, &id);
+            #[cfg(test)]
+            self.hold_handover(pane);
+            hub.hand_over(pane, &id, || self.publication_owns_pane(pane, &id));
         }
         if let (Some(pane), Some((integration, refresh))) = (inbox_spawn.0, inbox_refresh) {
             self.note_inbox_spawn(&pane, &id, integration, refresh, &inbox_spawn.2);
@@ -10439,6 +10451,21 @@ impl AgentPtyRegistry {
             .iter()
             .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env) && !a.pane_handed_over)
             .map(|(id, _)| id.clone())
+    }
+
+    /// PRD #1666 §2.8 (auditor R9T-A01): whether the generation `agent_id`,
+    /// published on `pane_id_env`, still holds that pane — it is in the
+    /// registry and no successor has been published on the pane since. A
+    /// publication sets [`RunningAgent::pane_handed_over`] on every record
+    /// already on the pane and never clears it, so once a successor is
+    /// published this stays `false`; a generation that exited with nothing
+    /// published after it still holds the pane.
+    fn publication_owns_pane(&self, pane_id_env: &str, agent_id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .get(agent_id)
+            .is_some_and(|a| a.pane_id_env.as_deref() == Some(pane_id_env) && !a.pane_handed_over)
     }
 
     /// Issue #524: whether `pane_id_env`'s occupant has EXITED — the pane has a
@@ -14712,6 +14739,34 @@ impl AgentPtyRegistry {
             .unwrap()
             .insert(agent_id.to_string(), held);
         release
+    }
+
+    /// PRD #1666 §2.8 (auditor R9T-A01) test seam: the next generation
+    /// published on `pane` reports (on the returned receiver) that it is
+    /// published, then waits for the returned sender to send or drop before it
+    /// hands the pane's inbox over.
+    #[cfg(test)]
+    pub(crate) fn hold_next_handover_for_test(
+        &self,
+        pane: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.handover_holds
+            .lock()
+            .unwrap()
+            .insert(pane.to_string(), (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Where [`Self::hold_next_handover_for_test`] waits.
+    #[cfg(test)]
+    fn hold_handover(&self, pane: &str) {
+        let hold = self.handover_holds.lock().unwrap().remove(pane);
+        if let Some((reached, release)) = hold {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
     }
 
     /// PRD #1487 re-check R2 test seam: the next respawn reports (on the

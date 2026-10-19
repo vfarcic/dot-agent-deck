@@ -302,11 +302,23 @@ impl Receipts {
     }
 }
 
-/// A line to write to one receipt stream once the lock is released.
-pub(super) type Outbox = Vec<(mpsc::Sender<WaiterSignal>, InboxWaitReply)>;
+/// A line to write to one receipt stream once the lock is released, with the
+/// room in that stream's queue it was given under the lock (auditor R9T-A02):
+/// a line holding its place cannot be crowded out by another pass's lines
+/// before it is written.
+pub(super) type Outbox = Vec<(mpsc::OwnedPermit<WaiterSignal>, InboxWaitReply)>;
+
+/// Room for one line on `tx`'s queue, held until the line is written or the
+/// room given back; `None` while the queue is full or gone.
+fn room(tx: &mpsc::Sender<WaiterSignal>) -> Option<mpsc::OwnedPermit<WaiterSignal>> {
+    tx.clone().try_reserve_owned().ok()
+}
 
 fn send(out: &mut Outbox, link: &Link, reply: InboxWaitReply) {
-    out.push((link.tx.clone(), reply));
+    match room(&link.tx) {
+        Some(permit) => out.push((permit, reply)),
+        None => debug!("inbox: a receipt stream is not taking its lines"),
+    }
 }
 
 /// The generation for `key`, created with `spool` (or degraded by `spool`'s
@@ -614,24 +626,15 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
     else {
         return;
     };
-    let (rx, conn_id, budget, tx) = (
-        *rx,
-        link.conn_id,
-        link.component.inline_budget(),
-        link.tx.clone(),
-    );
-    // PR #1735 review 4307236310: nothing is issued while the stream's queue
-    // has no room for the line, counting the lines this pass already owes
-    // it, since a line that does not fit is dropped after its attempts were
+    let (rx, conn_id, budget) = (*rx, link.conn_id, link.component.inline_budget());
+    // PR #1735 review 4307236310, auditor R9T-A02: nothing is issued unless
+    // the stream's queue gives the hand-out's line its room first, under this
+    // lock, since a line that does not fit is dropped after its attempts were
     // issued. The mail stays queued for the next pass: the receiver's next
     // control (a keepalive's snapshot among them) or the clock.
-    let owed = out
-        .iter()
-        .filter(|(queued, _)| queued.same_channel(&tx))
-        .count();
-    if tx.capacity() <= owed {
+    let Some(permit) = room(&link.tx) else {
         return;
-    }
+    };
     let ids = candidates(st, key);
     if ids.is_empty() {
         return;
@@ -646,7 +649,7 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
         now,
     );
     if !batch.is_empty() {
-        out.push((tx, InboxWaitReply::messages(batch)));
+        out.push((permit, InboxWaitReply::messages(batch)));
     }
     apply(st, key, now, out);
 }
@@ -673,13 +676,20 @@ pub(super) fn doorbell_fetch(
     let Some(link) = generation.links.get(&rx) else {
         return Err("unknown_receiver");
     };
-    let (conn_id, tx) = (link.conn_id, link.tx.clone());
+    let conn_id = link.conn_id;
     let ids = candidates(st, key);
     if let Some(named) = named
         && !ids.iter().any(|id| id == named)
     {
         return Ok(Vec::new());
     }
+    // Reviewer R9T-02: as for a stream hand-out, nothing is issued unless the
+    // line carrying the attempts' caps has its room on the stream first; a
+    // fetch that finds the queue full hands nothing over and the mail stays
+    // waiting for the next.
+    let Some(permit) = room(&link.tx) else {
+        return Ok(Vec::new());
+    };
     let mut batch = issue_to(st, key, rx, &ids, budget, Consumer::Stream { conn_id }, now);
     let issued: Vec<InboxIssued> = batch
         .iter_mut()
@@ -697,7 +707,7 @@ pub(super) fn doorbell_fetch(
         .collect();
     if !issued.is_empty() {
         out.push((
-            tx,
+            permit,
             InboxWaitReply {
                 issued,
                 ..InboxWaitReply::default()
@@ -873,10 +883,8 @@ pub(super) fn explicit_commit(st: &mut HubState, key: &AgentKey, id: &str, now: 
 /// [`AttemptModel::revokes_due`]); a stream that is gone is left to its own
 /// connection task to notice.
 pub(super) fn flush(out: Outbox) {
-    for (tx, reply) in out {
-        if tx.try_send(WaiterSignal::Line(Box::new(reply))).is_err() {
-            debug!("inbox: a receipt stream is not taking its lines");
-        }
+    for (permit, reply) in out {
+        permit.send(WaiterSignal::Line(Box::new(reply)));
     }
 }
 

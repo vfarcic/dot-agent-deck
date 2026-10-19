@@ -1665,11 +1665,23 @@ impl InboxHub {
     /// [`BroadcastMsg::Inbox`] notice is sent under. The registry sends it for
     /// every generation it publishes on a pane, so a client's account follows
     /// a respawn, a restart or a re-created pane at its place in the stream.
-    pub fn hand_over(&self, pane_id: &str, agent_id: &str) {
+    ///
+    /// Auditor R9T-A01: `owns_pane` answers whether `agent_id` still holds
+    /// `pane_id` in the registry, and is asked under this hub's lock. A
+    /// successor is published before its own hand-over takes this lock, so a
+    /// hand-over delayed past its successor's finds it no longer owns the pane
+    /// and sends nothing, and the hand-overs a client reads follow the order
+    /// the generations took the pane. `owns_pane` may take the registry lock
+    /// (hub → registry, the order the hub's other readers keep) and must not
+    /// call back into this hub.
+    pub fn hand_over(&self, pane_id: &str, agent_id: &str, owns_pane: impl FnOnce() -> bool) {
         let st = self.lock();
         let Some(tx) = st.broadcast.as_ref() else {
             return;
         };
+        if !owns_pane() {
+            return;
+        }
         let _ = tx.send(BroadcastMsg::InboxHandover(crate::event::InboxHandover {
             pane_id: pane_id.to_string(),
             agent_id: agent_id.to_string(),
