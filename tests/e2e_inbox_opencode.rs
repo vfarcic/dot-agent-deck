@@ -922,10 +922,12 @@ while os.read(0,4096):pass
             let records = attach(&daemon, json!({"op":"list-agents"}));
             let record = records["agent_records"]
                 .as_array()
-                .unwrap()
+                .unwrap_or_else(|| panic!("mini repaint must list agent records: {records}"))
                 .iter()
                 .find(|r| r["id"] == pane.agent)
-                .unwrap();
+                .unwrap_or_else(|| {
+                    panic!("mini repaint must retain worker {}: {records}", pane.agent)
+                });
             assert_eq!(record["cols"], 140);
             assert_eq!(record["rows"], 40);
             // A burst while one nudge is active coalesces to one additional nudge.
@@ -1591,7 +1593,13 @@ fn cancel(op: &OpenCode, id: &str) -> Value {
     };
     let first = press(0);
     match first["inbox_action"]["outcome"].as_str() {
-        Some("stale") => press(first["inbox_action"]["revision"].as_u64().unwrap()),
+        Some("stale") => press(
+            first["inbox_action"]["revision"]
+                .as_u64()
+                .unwrap_or_else(|| {
+                    panic!("stale Cancel must name the current inbox revision: {first}")
+                }),
+        ),
         _ => first,
     }
 }
@@ -1954,7 +1962,9 @@ fn opencode_052_a_cancelled_tasks_commit_survives_its_watcher_killed_mid_publish
     let records = attach(&op.daemon, json!({"op":"list-agents"}));
     let record = records["agent_records"]
         .as_array()
-        .unwrap()
+        .unwrap_or_else(|| {
+            panic!("list-agents must return agent records after watcher replacement: {records}")
+        })
         .iter()
         .find(|r| r["id"] == op.pane.agent.as_str())
         .unwrap_or_else(|| panic!("the worker's record: {records}"));

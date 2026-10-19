@@ -1,4 +1,4 @@
-#![cfg(all(feature = "e2e", feature = "e2e-live"))]
+#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
 //! PTY-attached real-agent coverage for PRD #249's `clear = true` delegate path.
 //!

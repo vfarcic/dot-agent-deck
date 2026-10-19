@@ -991,26 +991,67 @@ fn normalize(text: &str) -> String {
 }
 
 fn work_command(path: &std::path::Path, token_suffix: Option<&str>) -> String {
-    let mut command = format!("printf '{CONTENT}' > '{}'", path.display());
+    let mut command = format!(
+        "printf '{CONTENT}' > {}",
+        shell_word(&path.to_string_lossy())
+    );
     if let Some(suffix) = token_suffix {
-        command.push_str(&format!("; printf '%s%s\\n' 'NATIVE-EXEC-' '{suffix}'"));
+        command.push_str(&format!(
+            "; printf '%s%s\\n' 'NATIVE-EXEC-' {}",
+            shell_word(suffix)
+        ));
     }
     command
 }
 
-fn sample(socket: &std::path::Path, request: &Value, budget: Duration) -> Option<Value> {
-    use std::io::{BufRead, BufReader, Write};
-    let mut stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
-    stream.set_read_timeout(Some(budget)).ok()?;
-    stream.set_write_timeout(Some(budget)).ok()?;
-    writeln!(stream, "{request}").ok()?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    serde_json::from_str(&line).ok()
+fn shell_word(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-fn join_observer(observer: std::thread::JoinHandle<()>, _budget: Duration) {
-    let _ = observer.join();
+fn sample(socket: &std::path::Path, request: &Value, budget: Duration) -> Option<Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    // One deadline covers connection, writing and reading a complete reply.
+    // A per-read timeout alone permits an indefinitely slow trickle of bytes.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?
+        .block_on(async {
+            tokio::time::timeout(budget, async {
+                const LIMIT: usize = 2 * 1024 * 1024;
+                let mut stream = tokio::net::UnixStream::connect(socket).await.ok()?;
+                stream
+                    .write_all(format!("{request}\n").as_bytes())
+                    .await
+                    .ok()?;
+                let mut line = Vec::new();
+                BufReader::new(stream.take((LIMIT + 1) as u64))
+                    .read_until(b'\n', &mut line)
+                    .await
+                    .ok()?;
+                if line.len() > LIMIT || line.last() != Some(&b'\n') {
+                    return None;
+                }
+                serde_json::from_slice(&line).ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        })
+}
+
+fn join_observer(observer: std::thread::JoinHandle<()>, budget: Duration) {
+    let deadline = std::time::Instant::now() + budget;
+    while !observer.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if observer.is_finished() {
+        let _ = observer.join();
+    } else {
+        // Diagnostics must not hold fixture teardown indefinitely, including
+        // when a filesystem operation stalls after the bounded socket sample.
+        eprintln!("OpenCode inbox observer exceeded its teardown deadline");
+    }
 }
 
 #[cfg(test)]

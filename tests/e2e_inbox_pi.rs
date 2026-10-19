@@ -92,9 +92,12 @@ fn pi(deck: &TuiDeck, node: &Path, mode: &str, extra_env: &[(&str, &str)]) -> (P
             "cwd": deck.cwd(), "rows": 40, "cols": 140, "env": env, "display_name": "pi-standin"}),
     );
     assert_eq!(reply["ok"], true, "stand-in spawn: {reply}");
-    let agent = reply["id"].as_str().unwrap().to_string();
+    let agent = reply["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("stand-in spawn must return an agent id: {reply}"))
+        .to_string();
     let token = tokio::runtime::Runtime::new()
-        .unwrap()
+        .expect("create runtime to read the stand-in hook capability")
         .block_on(common::recorded_hook_capability(deck.cwd(), &agent))
         .expect("stand-in capability");
     let boot = common::child_boot_budget();
@@ -110,7 +113,12 @@ fn pi(deck: &TuiDeck, node: &Path, mode: &str, extra_env: &[(&str, &str)]) -> (P
         id: "pi-standin".into(),
         agent,
         token,
-        pid: std::fs::read_to_string(&pid_path).unwrap().parse().unwrap(),
+        pid: std::fs::read_to_string(&pid_path)
+            .unwrap_or_else(|error| {
+                panic!("read stand-in Pi PID at {}: {error}", pid_path.display())
+            })
+            .parse()
+            .expect("stand-in Pi PID file must contain a u32"),
         capture: base.with_extension("bytes"),
         attach_socket: deck.attach_socket_path().to_path_buf(),
     };
@@ -179,9 +187,9 @@ fn pi_023_a_message_the_agent_never_starts_on_shows_on_the_card_and_retry_repeat
 }
 
 /// Scenario: A stand-in Pi starts on the deck message at once, commits it and then stays in a silent model call for more than twice the window. The card never says the message may not have reached the agent.
-#[spec("inbox/pi/023")]
+#[spec("inbox/pi/033")]
 #[test]
-fn pi_023a_a_committed_message_in_a_long_silent_turn_shows_nothing() {
+fn pi_033_a_committed_message_in_a_long_silent_turn_shows_nothing() {
     let Some(node) = node() else {
         return;
     };
@@ -193,9 +201,9 @@ fn pi_023a_a_committed_message_in_a_long_silent_turn_shows_nothing() {
 }
 
 /// Scenario: A stand-in Pi runs a long turn on one deck message while a second is handed to it as a follow-up, which stays queued without starting. Nothing shows while the turn runs, for more than twice the window; after the turn ends with the original follow-up still queued, the card says it may not have reached the agent and that message still has one delivery.
-#[spec("inbox/pi/023")]
+#[spec("inbox/pi/034")]
 #[test]
-fn pi_023b_a_follow_up_behind_a_long_turn_shows_only_after_the_turn_ends() {
+fn pi_034_a_follow_up_behind_a_long_turn_shows_only_after_the_turn_ends() {
     let Some(node) = node() else {
         return;
     };
@@ -213,14 +221,14 @@ fn pi_023b_a_follow_up_behind_a_long_turn_shows_only_after_the_turn_ends() {
     wait_log(&path, &format!("handed {second}"));
     never_shown(&deck, Duration::from_millis(2 * WINDOW_MS));
     deck.wait_for_string(LINE);
-    let messages = inbox::listing(&deck, &pane)["messages"]
+    let listing = inbox::listing(&deck, &pane);
+    let messages = listing["messages"]
         .as_array()
-        .unwrap()
-        .clone();
+        .unwrap_or_else(|| panic!("Pi inbox listing must contain a messages array: {listing}"));
     let follow_up = messages
         .iter()
         .find(|message| message["id"] == second)
-        .unwrap();
+        .unwrap_or_else(|| panic!("Pi inbox must retain queued follow-up {second}: {listing}"));
     assert_eq!(follow_up["deliveries"], 1, "{follow_up}");
     assert!(
         !log(&path)
@@ -231,9 +239,9 @@ fn pi_023b_a_follow_up_behind_a_long_turn_shows_only_after_the_turn_ends() {
 }
 
 /// Scenario: A stand-in Pi takes longer than the window to start on a deck message, as a slow preflight would. The card says the message may not have reached the agent, and the line goes once the turn starts, with no Retry.
-#[spec("inbox/pi/023")]
+#[spec("inbox/pi/035")]
 #[test]
-fn pi_023c_a_slow_start_shows_the_line_until_the_turn_starts() {
+fn pi_035_a_slow_start_shows_the_line_until_the_turn_starts() {
     let Some(node) = node() else {
         return;
     };

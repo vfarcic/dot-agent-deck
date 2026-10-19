@@ -119,6 +119,7 @@ impl Trace {
         let began = Instant::now();
         let mut out = Vec::new();
         let mut frames = Vec::new();
+        let mut retained = 0;
         let result = (|| -> std::io::Result<()> {
             let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
             stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -132,7 +133,9 @@ impl Trace {
                 let mut header = [0; 5];
                 stream.read_exact(&mut header)?;
                 let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
-                if length > LIMIT || out.len() + length > LIMIT {
+                // Charge every wire frame, including empty/RESP frames, and
+                // its metadata against one aggregate snapshot budget.
+                if length > LIMIT || retained + header.len() + length > LIMIT {
                     return Err(std::io::Error::other("snapshot frame exceeds trace bound"));
                 }
                 let mut body = vec![0; length];
@@ -143,8 +146,16 @@ impl Trace {
                         .max(Duration::from_millis(1)),
                 ))?;
                 stream.read_exact(&mut body)?;
-                frames.push(json!({"kind":header[0],"bytes":length,
-                    "response": if header[0] == KIND_RESP { serde_json::from_slice::<Value>(&body).ok() } else { None }}));
+                let frame = json!({"kind":header[0],"bytes":length,
+                    "response": if header[0] == KIND_RESP { serde_json::from_slice::<Value>(&body).ok() } else { None }});
+                let cost = header.len() + length + frame.to_string().len();
+                if retained + cost > LIMIT {
+                    return Err(std::io::Error::other(
+                        "snapshot metadata exceeds trace bound",
+                    ));
+                }
+                retained += cost;
+                frames.push(frame);
                 if header[0] == KIND_STREAM_OUT {
                     out.extend_from_slice(&body);
                 }

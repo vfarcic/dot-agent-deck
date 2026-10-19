@@ -10575,10 +10575,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/023 — A message a Pi agent never starts on shows on the attached card; Retry repeats it, Cancel ends it.
 - **Layer:** L2 PTY lane 1 (`tests/e2e_inbox_pi.rs`), the real binary with an attached TuiDeck and a stand-in Pi (`tests/fixtures/pi-inbox/fake-pi.mjs`) running the real extension and receiver under Node, with a 2-second not-started window.
 - **Agent:** none: the stand-in plays Pi 0.84.4's event contract with no model.
-- **Asserts:** a message handed over and never started shows the not-started reason on the card; the picker explains Retry's possible duplicate and `r` hands it over once more as a marked repeat, while `c` removes the line for good. Healthy negatives, each its own function: a committed message in a silent turn longer than twice the window shows nothing; a follow-up handed behind a long turn shows nothing during the turn and the line after it ends with the original follow-up still queued and one delivery; a start slower than the window shows the line until the turn starts, with no repeat.
+- **Asserts:** a message handed over and never started shows the not-started reason on the card; the picker explains Retry's possible duplicate and `r` hands it over once more as a marked repeat, while `c` removes the line for good.
 - **Does not assert:** a real Pi (inbox/pi/022, lane 2), or the desktop app.
 - **Platform coverage:** mac+linux (prints `SKIP:` without Node 23.6+).
-- **Cost:** about 30 seconds.
+- **Cost:** about 15 seconds.
 
 ##### inbox/pi/024 — A Pi /new swap releases called-uncommitted attempts lost.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
@@ -10651,6 +10651,27 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** The timing of a real Pi's awaited input pipeline (lane 2).
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.
+
+##### inbox/pi/033 — A committed message in a long silent Pi turn shows no not-started notice.
+- **Layer:** L2 PTY lane 1 (`tests/e2e_inbox_pi.rs`), attached real binary with a stand-in Pi running the real extension and receiver under Node.
+- **Agent:** none; the stand-in plays Pi's event contract without a model.
+- **Asserts:** A committed message in a silent turn longer than twice the not-started window never shows the card notice.
+- **Does not assert:** Real Pi model execution or the desktop app.
+- **Platform coverage:** mac+linux (prints `SKIP:` without Node 23.6+).
+
+##### inbox/pi/034 — A Pi follow-up behind a long turn shows the notice only after that turn ends.
+- **Layer:** L2 PTY lane 1 (`tests/e2e_inbox_pi.rs`), attached real binary with a stand-in Pi running the real extension and receiver under Node.
+- **Agent:** none; the stand-in plays Pi's event contract without a model.
+- **Asserts:** A handed follow-up shows no notice during the preceding long turn; after it ends the notice appears with the original follow-up still queued, one delivery and no repeat.
+- **Does not assert:** Real Pi model execution or the desktop app.
+- **Platform coverage:** mac+linux (prints `SKIP:` without Node 23.6+).
+
+##### inbox/pi/035 — A slow Pi start shows the notice until its turn starts.
+- **Layer:** L2 PTY lane 1 (`tests/e2e_inbox_pi.rs`), attached real binary with a stand-in Pi running the real extension and receiver under Node.
+- **Agent:** none; the stand-in plays Pi's event contract without a model.
+- **Asserts:** A start slower than the not-started window shows the card notice, then removes it when the turn starts, with one hand-over and no Retry.
+- **Does not assert:** Real Pi model execution or the desktop app.
+- **Platform coverage:** mac+linux (prints `SKIP:` without Node 23.6+).
 
 #### inbox/publish
 
