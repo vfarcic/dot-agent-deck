@@ -158,7 +158,10 @@ fn proxy_connection(
             write_wire_frame(&mut downstream, &response_frame)?;
             relay_after_first_response(downstream, upstream)
         }
-        AttachRequest::SubscribeEvents => {
+        // PRD #1666: the TUI's first subscription is the ordered
+        // `SubscribeEventsWithSnapshot` where the daemon offers it, and a
+        // plain `SubscribeEvents` otherwise.
+        AttachRequest::SubscribeEvents | AttachRequest::SubscribeEventsWithSnapshot => {
             write_wire_frame(&mut downstream, &response_frame)?;
             let _ = subscription_tx.send(());
             relay_subscription(downstream, upstream, event_tx.clone())
@@ -289,20 +292,34 @@ impl AttachRaceGate {
     }
 
     fn wait_for_surface_event(&self, attempt: usize, pane_id: &str) {
-        let payload = self
-            .event_rx
-            .recv_timeout(attach_race_wait())
-            .unwrap_or_else(|error| {
-                panic!(
-                    "attach-race attempt {attempt}: no card-surface event crossed the TUI's live \
-                     subscription before hydration was released: {error}. Proxy errors: {:#?}",
-                    self.errors.lock().expect("attach-race errors")
-                )
-            });
-        let broadcast: BroadcastMsg = serde_json::from_slice(&payload)
-            .expect("attach-race KIND_EVENT payload is a BroadcastMsg");
-        let BroadcastMsg::Event(event) = broadcast else {
-            panic!("attach-race attempt {attempt}: expected a card-surface AgentEvent");
+        // PRD #1666: a new generation on a pane announces its inbox
+        // (`inbox_handover`) ahead of the pane's surfacing start; a handover
+        // for this pane is passed over, within the same single wait.
+        let deadline = std::time::Instant::now() + attach_race_wait();
+        let broadcast = loop {
+            let payload = self
+                .event_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "attach-race attempt {attempt}: no card-surface event crossed the TUI's \
+                         live subscription before hydration was released: {error}. Proxy \
+                         errors: {:#?}",
+                        self.errors.lock().expect("attach-race errors")
+                    )
+                });
+            let broadcast: BroadcastMsg = serde_json::from_slice(&payload)
+                .expect("attach-race KIND_EVENT payload is a BroadcastMsg");
+            match broadcast {
+                BroadcastMsg::InboxHandover(handover) if handover.pane_id == pane_id => {}
+                other => break other,
+            }
+        };
+        let event = match broadcast {
+            BroadcastMsg::Event(event) => event,
+            other => panic!(
+                "attach-race attempt {attempt}: expected a card-surface AgentEvent, got {other:?}"
+            ),
         };
         assert_eq!(
             event.pane_id.as_deref(),
