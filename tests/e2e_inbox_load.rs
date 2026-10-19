@@ -336,7 +336,12 @@ fn exercise(deck: &TuiDeck, pane: &Pane, work: &Path, kind: &str, doorbell_only:
     let started = work.join("inbox-load-busy-start-49ab.txt");
     let ended = work.join("inbox-load-busy-end-49ab.txt");
     let mut input = common::AttachInput::attach(deck.attach_socket_path(), &pane.agent);
-    input.write(&format!("Use the shell tool to run exactly: printf busy > '{}'; sleep 30; printf done > '{}'. Then reply BUSY-DONE and stop.", started.display(), ended.display()));
+    let busy_prompt = format!(
+        "Use the shell tool to run exactly: printf busy > '{}'; sleep 30; printf done > '{}'. Then reply BUSY-DONE and stop.",
+        started.display(),
+        ended.display()
+    );
+    input.write(&busy_prompt);
     // Observe the human prompt arriving before submitting it under load.
     assert!(
         common::wait_until(remaining(deadline), || {
@@ -355,6 +360,35 @@ fn exercise(deck: &TuiDeck, pane: &Pane, work: &Path, kind: &str, doorbell_only:
         "busy prompt must render before its submit"
     );
     input.write("\r");
+    if kind == "codex" {
+        // A painted prompt does not end Codex's paste burst: its first Enter
+        // can insert a newline. Like questions::submit, press Enter until the
+        // agent reports this user prompt (not Idle from the preceding turn),
+        // or its tool starts. Keep the original absolute load-test deadline.
+        // Hooks truncate reported prompts, so match this turn's busy prefix.
+        let busy_prefix: String = busy_prompt.chars().take(64).collect();
+        let submitted = || {
+            started.exists()
+                || record(deck, pane)["live"]["last_user_prompt"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(&busy_prefix))
+        };
+        let mut enters = 1;
+        while !common::wait_until(remaining(deadline).min(Duration::from_secs(2)), submitted) {
+            assert!(
+                Instant::now() < deadline,
+                "busy prompt must be submitted before waiting for its tool: {}",
+                deck.snapshot_grid()
+            );
+            eprintln!(
+                "inbox load: busy prompt not yet submitted after {enters} Enter(s); pane={}",
+                inbox::screen(deck, pane)
+            );
+            input.write("\r");
+            enters += 1;
+        }
+        eprintln!("inbox load: busy prompt proven submitted after {enters} Enter(s)");
+    }
     assert!(
         common::wait_until(remaining(deadline), || started.exists()),
         "busy phase must enter its genuine sleep tool"
@@ -495,7 +529,7 @@ fn load_003_pi_acknowledges_seed_idle_and_busy_under_cpu_pressure() {
     exercise(&pi.deck, &pi.pane, &pi.work, "pi", false);
 }
 
-/// Scenario: Under three busy-loop processes per CPU, run real interactive Codex on DOT_AGENT_DECK_CODEX_TEST_MODEL through spawn seed, idle and a sleep-tool turn. Each of 20 messages must be acknowledged and acted on, and listed as acknowledged by the inbox list CLI; no deck line may remain in the composer.
+/// Scenario: Under three busy-loop processes per CPU, run real interactive Codex on DOT_AGENT_DECK_CODEX_TEST_MODEL through spawn seed, idle and a sleep-tool turn, proving the busy prompt was submitted even when Enter first inserts a newline. Each of 20 messages must be acknowledged and acted on, and listed as acknowledged by the inbox list CLI; no deck line may remain in the composer.
 #[spec("inbox/load/004")]
 #[test]
 fn load_004_codex_never_loses_seed_idle_or_busy_messages_under_cpu_pressure() {
