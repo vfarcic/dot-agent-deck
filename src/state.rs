@@ -6601,6 +6601,7 @@ impl PaneInbox {
             delivered: self.delivered,
             stalled: self.stalled,
             uncertain: count(AttentionKind::uncertain),
+            out_of_attempts: count(|kind| kind == AttentionKind::OutOfAttempts),
             not_started: count(|kind| kind == AttentionKind::NotStarted),
             held_long: count(|kind| kind == AttentionKind::HeldLong),
             integration: self.notices.integration,

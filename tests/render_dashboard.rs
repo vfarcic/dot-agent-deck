@@ -703,6 +703,36 @@ fn status_014_card_counts_several_uncertain_deliveries() {
     assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
 }
 
+/// Scenario: The daemon's snapshot lists one deck message whose delivery is uncertain and out of attempts, so its row offers Cancel alone. The card still says `delivery uncertain`, and its notice row says what running out of attempts means instead of offering Retry, in the words the desktop uses.
+#[spec("inbox/status/026")]
+#[test]
+fn status_026_card_explains_a_delivery_out_of_attempts() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "out_of_attempts")]
+    }));
+    let line = format!(
+        "{} {}",
+        words["glyph"].as_str().unwrap(),
+        words["uncertain"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+    let reason: String = words["outOfAttempts"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        rendered.contains(&reason),
+        "{reason:?} missing:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Retry"),
+        "no Retry is offered:\n{rendered}"
+    );
+}
+
 /// Scenario: A deck message has been held by the agent for an hour without a commit. The card shows the one-shot held-for-an-hour attention, not a failure.
 #[spec("inbox/status/015")]
 #[test]

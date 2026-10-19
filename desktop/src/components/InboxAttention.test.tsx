@@ -63,10 +63,21 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     })).agents[0];
     const card = tile(agent);
     expect(card.getByTestId("inbox-badge-7")).toHaveTextContent(`${words.glyph} 2 ${words.uncertainMany}`);
+    expect(card.getByTestId("inbox-notice-7")).toHaveTextContent(words.uncertainReason);
     const exhausted = card.getByTestId(`inbox-attention-${second}`);
     expect(exhausted).toHaveTextContent(words.outOfAttempts);
     expect(within(exhausted).queryByRole("button", { name: words.retry })).toBeNull();
     expect(within(exhausted).getByRole("button", { name: words.cancel })).toBeVisible();
+  });
+
+  /// Scenario: The only uncertain delivery on a card is out of attempts; the tile still says delivery uncertain, and its notice says what running out of attempts means instead of offering Retry, as the TUI's card does.
+  it("explains a delivery out of attempts without offering Retry", () => {
+    const agent = mapDesktopSnapshot(snapshot({ attention: [item(first, "out_of_attempts")] })).agents[0];
+    const card = tile(agent);
+    expect(card.getByTestId("inbox-badge-7")).toHaveTextContent(`${words.glyph} ${words.uncertain}`);
+    expect(card.getByTestId("inbox-notice-7")).toHaveTextContent(words.outOfAttempts);
+    expect(card.getByTestId("inbox-notice-7")).not.toHaveTextContent(words.retry);
+    expect(within(card.getByTestId(`inbox-attention-${first}`)).queryByRole("button", { name: words.retry })).toBeNull();
   });
 
   /// Scenario: A message held for an hour shows the attention sentence and still offers Retry and Cancel, without marking the agent failed.

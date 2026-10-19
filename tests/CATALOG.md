@@ -9009,6 +9009,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the desktop tile (its list scrolls and shows each reason whole; vitest `InboxAttention`).
 - **Platform coverage:** mac+linux+windows.
 
+##### inbox/status/026 — A delivery out of attempts is explained without offering Retry.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam; plus `CardInbox` unit tests in `src/inbox_display.rs`.
+- **Agent:** none.
+- **Asserts:** an inbox summary listing one item out of attempts renders `✉ delivery uncertain` with the out-of-attempts sentence as its notice row, in the shared words, and no Retry; the unit test keeps the uncertain reason while any plain uncertain item is listed beside it, and the journal value carries the count.
+- **Does not assert:** the desktop tile (`desktop/src/components/InboxAttention.test.tsx`).
+- **Platform coverage:** all.
+
 #### inbox/claude
 
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.

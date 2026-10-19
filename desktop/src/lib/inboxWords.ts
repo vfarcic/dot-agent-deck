@@ -51,6 +51,8 @@ const countOf = (inbox: AgentInbox, kinds: ReadonlyArray<InboxAttentionItem["kin
   (inbox.attention ?? []).filter((item) => kinds.includes(item.kind)).length;
 /** Uncertain deliveries, out of attempts included. */
 const uncertainCount = (inbox: AgentInbox) => countOf(inbox, ["uncertain", "out_of_attempts"]);
+/** PRD #1666 §7: uncertain deliveries out of attempts, whose rows offer Cancel alone. */
+const outOfAttemptsCount = (inbox: AgentInbox) => countOf(inbox, ["out_of_attempts"]);
 /** PRD #1666 G3: messages handed to an agent that has started no work since. */
 const notStartedCount = (inbox: AgentInbox) => countOf(inbox, ["not_started"]);
 const heldLongCount = (inbox: AgentInbox) => countOf(inbox, ["held_long"]);
@@ -83,9 +85,10 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
 /**
  * PRD #1666 §6.5: the card's inbox notice row, when the deck has something to
  * say beyond the badge — the first that holds of: why the integration takes
- * nothing yet, paused hand-outs, what an uncertain delivery means, what a
- * message the agent may not have received means, held_long attention, failed
- * receipt storage. The TUI's card prints the same row.
+ * nothing yet, paused hand-outs, what an uncertain delivery means (what running
+ * out of attempts means, when every uncertain one has: its row offers no
+ * Retry), what a message the agent may not have received means, held_long
+ * attention, failed receipt storage. The TUI's card prints the same row.
  */
 export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (!inbox) return undefined;
@@ -95,7 +98,8 @@ export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (inbox.integration === "refresh_failed") return INBOX_WORDS.refreshFailed;
   if (inbox.integration === "refresh_failed_pi") return INBOX_WORDS.refreshFailedPi;
   if (inbox.evidencePaused !== undefined) return INBOX_WORDS.evidencePaused.replace("{n}", String(inbox.evidencePaused));
-  if (uncertainCount(inbox) > 0) return INBOX_WORDS.uncertainReason;
+  if (uncertainCount(inbox) > outOfAttemptsCount(inbox)) return INBOX_WORDS.uncertainReason;
+  if (outOfAttemptsCount(inbox) > 0) return INBOX_WORDS.outOfAttempts;
   if (notStartedCount(inbox) > 0) return INBOX_WORDS.notStartedReason;
   if (heldLongCount(inbox) > 0) return INBOX_WORDS.heldLong;
   if (inbox.receiptsDegraded !== undefined) return `${INBOX_WORDS.receiptsDegraded} (${inbox.receiptsDegraded})`;

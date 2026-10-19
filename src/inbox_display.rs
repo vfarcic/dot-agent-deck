@@ -249,6 +249,9 @@ pub struct CardInbox {
     pub stalled: bool,
     /// PRD #1666 §6: deliveries that may or may not have reached the agent.
     pub uncertain: usize,
+    /// PRD #1666 §7: how many of `uncertain` are out of attempts, whose row
+    /// offers Cancel alone.
+    pub out_of_attempts: usize,
     /// PRD #1666 §6.3: messages held an hour without a commit.
     pub held_long: usize,
     /// PRD #1666 G3: messages handed to an agent that started no work since.
@@ -297,9 +300,11 @@ impl CardInbox {
 
     /// The card's inbox notice row, the same words in both clients, when the
     /// deck has something to say beyond the line: why the integration takes
-    /// nothing yet, paused hand-outs, what an uncertain delivery means, what
-    /// a message the agent may not have received means, held_long attention,
-    /// then failed receipt storage — the first that holds.
+    /// nothing yet, paused hand-outs, what an uncertain delivery means (what
+    /// running out of attempts means, when every uncertain one has: its row
+    /// offers no Retry), what a message the agent may not have received
+    /// means, held_long attention, then failed receipt storage — the first
+    /// that holds.
     pub fn notice_text(&self) -> Option<String> {
         if let Some(notice) = self.integration {
             return Some(notice.text().to_string());
@@ -307,8 +312,11 @@ impl CardInbox {
         if let Some(waiting) = self.evidence_paused {
             return Some(evidence_paused_text(waiting));
         }
-        if self.uncertain > 0 {
+        if self.uncertain > self.out_of_attempts {
             return Some(UNCERTAIN_REASON.to_string());
+        }
+        if self.uncertain > 0 {
+            return Some(OUT_OF_ATTEMPTS.to_string());
         }
         if self.not_started > 0 {
             return Some(NOT_STARTED_REASON.to_string());
@@ -331,7 +339,7 @@ impl CardInbox {
     /// [`CARD_INBOX_DEGRADED_METADATA_KEY`]).
     pub fn encode(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{}",
             self.pending,
             u8::from(self.delivered),
             u8::from(self.stalled),
@@ -341,12 +349,14 @@ impl CardInbox {
             self.evidence_paused
                 .map_or_else(|| "-".to_string(), |n| n.to_string()),
             self.not_started,
+            self.out_of_attempts,
         )
     }
 
-    /// Reads [`Self::encode`]'s value, and the two-, three- and seven-field
-    /// values written before the later fields existed; `None` for anything
-    /// else.
+    /// Reads [`Self::encode`]'s value, and the two-, three-, seven- and
+    /// eight-field values written before the later fields existed; `None` for
+    /// anything else, out-of-attempts counts above the uncertain one
+    /// included.
     pub fn decode(value: &str) -> Option<Self> {
         let flag = |text: &str| match text {
             "0" => Some(false),
@@ -354,7 +364,7 @@ impl CardInbox {
             _ => None,
         };
         let parts: Vec<&str> = value.split(',').collect();
-        if !matches!(parts.len(), 2 | 3 | 7 | 8) {
+        if !matches!(parts.len(), 2 | 3 | 7 | 8 | 9) {
             return None;
         }
         let mut inbox = Self {
@@ -376,6 +386,12 @@ impl CardInbox {
         }
         if let Some(text) = parts.get(7) {
             inbox.not_started = text.parse().ok()?;
+        }
+        if let Some(text) = parts.get(8) {
+            inbox.out_of_attempts = text.parse().ok()?;
+            if inbox.out_of_attempts > inbox.uncertain {
+                return None;
+            }
         }
         Some(inbox)
     }
@@ -488,6 +504,7 @@ mod tests {
             CardInbox {
                 pending: 3,
                 uncertain: 2,
+                out_of_attempts: 1,
                 held_long: 1,
                 integration: Some(IntegrationNotice::NotArmed),
                 evidence_paused: Some(4),
@@ -520,6 +537,8 @@ mod tests {
             "1,0,1,0",
             "1,0,0,0,0,6,-",
             "1,0,0,0,0,0,x",
+            "1,0,0,1,0,0,-,0,2",
+            "1,0,0,1,0,0,-,0,x",
         ] {
             assert_eq!(CardInbox::decode(bad), None, "{bad}");
         }
@@ -538,6 +557,25 @@ mod tests {
         };
         assert_eq!(base.full_text().as_deref(), Some("✉ delivery uncertain"));
         assert_eq!(base.notice_text().as_deref(), Some(UNCERTAIN_REASON));
+        // PR #1735 review 4309809292: a delivery out of attempts is still
+        // uncertain, but its row offers Cancel alone, so while no other
+        // uncertain one is listed the notice says what running out means
+        // rather than offering Retry.
+        let exhausted = CardInbox {
+            out_of_attempts: 1,
+            ..base.clone()
+        };
+        assert_eq!(
+            exhausted.full_text().as_deref(),
+            Some("✉ delivery uncertain")
+        );
+        assert_eq!(exhausted.notice_text().as_deref(), Some(OUT_OF_ATTEMPTS));
+        let mixed = CardInbox {
+            uncertain: 2,
+            out_of_attempts: 1,
+            ..base.clone()
+        };
+        assert_eq!(mixed.notice_text().as_deref(), Some(UNCERTAIN_REASON));
         let many = CardInbox {
             uncertain: 3,
             ..base.clone()
