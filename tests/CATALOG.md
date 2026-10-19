@@ -10283,6 +10283,14 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
+##### inbox/opencode/056 — An answered `already_handed` is never contradicted by `not_handed`.
+- **Layer:** Fast (`src/opencode_manage.rs`), the generated receiver under Node with a stand-in watcher.
+- **Agent:** none.
+- **Asserts:** an approved callback is inside its OpenCode call when a revoke of its attempt arrives and is answered `already_handed`; OpenCode then refuses the call before accepting it (4xx), and nothing is reported `not_handed`; a revoke sent again is answered `already_handed`, never `revoked_ack`.
+- **Does not assert:** a real watcher process, or the deck's handling of the attempt (inbox/attempts/018).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
 ##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`)
 - **Agent:** generated server plugin under mini, full-TUI, run, serve and attach argv.

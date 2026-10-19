@@ -4774,6 +4774,41 @@ check(sent().filter((c) => c.handed).map((c) => c.handed), [[ref]], "reported ha
         );
     }
 
+    /// Scenario: An approved callback is inside its OpenCode call when the deck revokes the attempt, which is answered `already_handed`. OpenCode then refuses the call before accepting it. The attempt is not reported not handed, and a revoke sent again is answered `already_handed` once more.
+    #[spec("inbox/opencode/056")]
+    #[cfg(unix)]
+    #[test]
+    fn opencode_056_an_answered_already_handed_is_never_contradicted() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        run_receiver_script(
+            r#"
+const receiver = inboxReceiver({ agent: "opencode", active: () => true, deliver: () => {} });
+receiver.start();
+feed({ registered: { rx: 4, slot: "opencode_tui", keepalive_ms: 30000 } });
+const id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+const ref = { id, a: 1, e: 1 };
+feed({ messages: [{ ...ref, subject: "s", from: "x", text: "t", d: 1 }] });
+let answer;
+const inCall = new Promise((resolve) => { answer = resolve; });
+const pending = inboxHandOver(receiver, ref, "s1", () => inCall);
+await tick();
+feed({ grant: { q: sent().find((c) => c.may).may.q, ok: true } });
+await tick();
+feed({ revoke: [ref] });
+check(sent().filter((c) => c.already_handed).map((c) => c.already_handed), [[ref]], "answered already_handed");
+answer({ error: { status: 400 }, response: { status: 400 } });
+check(await pending, false, "the call was refused");
+check(sent().filter((c) => c.not_handed).length, 0, "never reported not handed after already_handed");
+feed({ revoke: [ref] });
+check(sent().filter((c) => c.already_handed).length, 2, "a revoke sent again is answered the same");
+check(sent().filter((c) => c.revoked_ack).length, 0, "and never revoked_ack");
+"#,
+        );
+    }
+
     /// Scenario: The deck refuses a hand-over check, or never answers it. Neither reaches OpenCode, and both are reported positively not handed, so the deck may hand the message out again, unmarked.
     #[spec("inbox/opencode/032")]
     #[cfg(unix)]

@@ -254,6 +254,10 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     const handed = handedBefore(key);
     revoke(key);
     if (handed) {
+      // Said once, kept: this attempt never reports `not_handed` from here on
+      // (`rejected`, PR #1735 review 4306466350).
+      const entry = held.get(key);
+      if (entry) entry.toldHanded = true;
       inboxWrite(child, { already_handed: [ref] });
     } else {
       held.delete(key);
@@ -544,9 +548,16 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     // (`inboxRefusedBeforeAcceptance`). It was the attempt's only call
     // (`ready`), so the attempt was positively not handed: revoked locally
     // first, like `notHanded`, so no approval still outstanding for it can
-    // reach OpenCode once the deck believes it was not handed.
+    // reach OpenCode once the deck believes it was not handed. A revoke the
+    // receiver already answered `already_handed` while the call was in flight
+    // stands: the attempt stays possibly handed and nothing contradicts it.
     rejected: (ref) => {
       const key = inboxKey(ref);
+      if (held.get(key)?.toldHanded) {
+        held.delete(key);
+        snapshot();
+        return;
+      }
       revoke(key);
       called.delete(key);
       held.delete(key);
