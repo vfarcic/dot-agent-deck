@@ -22,7 +22,9 @@ on:
   # `notify-main-red` job at the bottom of this file is the missing half —
   # detection was never the gap.
   push:
-    branches: [main]
+    # `rwx`: the RWX workbench branch, which never merges. Pushes to it run
+    # this workflow and `.rwx/ci.yml` side by side, as a team using both would.
+    branches: [main, rwx]
   # Issue #1088 — the merge queue's event. A queued PR is tested on a temporary
   # `refs/heads/gh-readonly-queue/main/...` branch carrying main plus every PR
   # ahead of it in the queue: the PROJECTED main, which a PR's own `pull_request`
