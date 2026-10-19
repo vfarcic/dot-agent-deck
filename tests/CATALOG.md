@@ -3169,6 +3169,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the daemon actually applying the clamp to a real child PTY (covered by `tests/daemon_protocol.rs`'s `assert_resize_clamps`, which reads it back through `stty size`); the rendered cells of an over-cap pane (covered by `render/widget/003`); the once-per-process `warn!` either clamp now emits (observability, not behaviour); any width a real terminal reaches — both fixtures are far past any physical display, which is the point.
 - **Platform coverage:** mac+linux+windows.
 
+##### resize/layout/003 — A pane made shorter keeps its latest output on screen, and made taller again brings the older rows back from scrollback.
+- **Layer:** L1 (the production `new_pane_parser` and `set_parser_size_if_changed` resize seam; no PTY, no subprocess, no daemon). Lives in `src/embedded_pane.rs`'s own `#[cfg(test)]` module because both functions are module-private.
+- **Agent:** none.
+- **Asserts:** ten numbered lines in a 10-row pane resized to 5 rows leave the newest five visible with the cursor on the last row, and resizing back to 10 rows shows all ten again with the cursor on row 9 — vt100 0.18's scrollback-preserving `set_size`. Under vt100 0.16 the shrink kept the oldest five, so the test fails there.
+- **Does not assert:** what `TerminalWidget` draws (covered by `render/widget/*`); the daemon resizing the child PTY (covered by `resize/sigwinch/002` and `resize/layout/002`); how a real agent redraws after a resize; column changes.
+- **Platform coverage:** mac+linux+windows.
+
 #### resize/policy
 
 ##### resize/policy/001 — A smaller second client attached to the same agent shrinks that agent for every client as the focusless fallback (PRD #882).

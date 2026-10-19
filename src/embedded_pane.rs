@@ -4529,6 +4529,8 @@ impl PaneController for EmbeddedPaneController {
 
 #[cfg(test)]
 mod tests {
+    use spec::spec;
+
     /// PR #1735 review (4301453654): two presses whose answers come back out
     /// of order leave the later press's answer, and the earlier one's is
     /// dropped.
@@ -4982,13 +4984,15 @@ mod tests {
         assert!(parser.screen().contents().contains("old child"));
     }
 
-    /// vt100 0.18: a pane made shorter keeps its newest rows on screen and
-    /// moves the oldest into scrollback; made taller again, it brings them
-    /// back. Under 0.16 the shrink cut rows off the bottom, hiding the latest
-    /// output and the cursor's row. Driven through the production parser and
-    /// resize seam (`new_pane_parser`, `set_parser_size_if_changed`).
+    /// Scenario: Ten numbered lines fill a ten-row pane, which is then made
+    /// five rows tall and back to ten. The shorter pane shows the newest five
+    /// with the cursor on its last row, and the taller one shows all ten again.
+    ///
+    /// vt100 0.18 moves the oldest rows into scrollback on a shrink; 0.16 cut
+    /// rows off the bottom, hiding the latest output and the cursor's row.
+    #[spec("resize/layout/003")]
     #[test]
-    fn a_shorter_pane_keeps_its_latest_output_and_a_taller_one_restores_it() {
+    fn resize_layout_003_a_shorter_pane_keeps_its_latest_output_and_a_taller_one_restores_it() {
         let parser = Mutex::new(new_pane_parser(10, 20));
         let lines: Vec<String> = (1..=10).map(|n| format!("LINE_{n:02}")).collect();
         parser
