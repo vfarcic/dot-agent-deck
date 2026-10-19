@@ -7921,8 +7921,8 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 ##### inbox/attempts/017 — One idle grace for a once-waiter, and a hook holds by its connection.
 - **Layer:** L1 unit (src/inbox_attempts.rs).
 - **Agent:** none.
-- **Asserts:** a once-waiter's handed attempt lapses one ack-wait after the first idle report even when an error stop and an Idle are both reported; a busy, idle, busy, idle cycle restarts the grace at the last idle; a hook receiver's attempt is possessed while its fetch connection is open, a busy report does not hold it, and it lapses once the connection closes.
-- **Does not assert:** the Claude status events or hook connections that will drive these calls.
+- **Asserts:** a once-waiter's handed attempt is held by the generation's turn clock: it lapses one ack-wait after the idle edge, an Idle reported again with the same edge does not extend that grace, and a busy, idle, busy, idle cycle restarts it at the last idle edge; a hook receiver's attempt is possessed while its fetch connection is open whatever the turn clock reads, and lapses once the connection closes.
+- **Does not assert:** the Claude status events or hook connections that will drive these calls (no component maps to a one-shot slot before part 2's H3).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/attempts/018 — A refused check is no not-handed witness.
@@ -7994,6 +7994,55 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Asserts:** a turn edge kept for a reserved spawn creates a clock entry; refusing the start through a restart's reservation (the reservation's drop) or the daemon's shutdown (the locked give-up) removes it and a later edge does not restore it; a start that publishes keeps it.
 - **Does not assert:** the daemon's ingest forwarding the edge (inbox/attempts/022).
 - **Platform coverage:** mac+linux.
+
+##### inbox/attempts/028 — A once-waiter attempt is held by the generation's turn clock.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** fresh mail issued to a once-waiter of a generation idle for ten ack-waits, and of one that never reported a turn, is possessed for one ack-wait from issue and then lapses, never earlier; a busy turn holds a handed attempt for an hour; after the turn ends the grace runs from the idle edge; a repeated Idle extends nothing; a Stop re-arm (a new once-waiter) during the turn leaves the handed attempt possessed and schedules no repeat.
+- **Does not assert:** the engine feeding turn edges to the model (`engine::note_turn`), or a real Claude waiter (part 2's H3).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/029 — A crashed once-waiter lapses only once the turn clock lets it.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a once-waiter's issued attempt whose connection closes with nothing reported is fenced at once and stays possessed while the turn is busy; a spool check prepared while idle and applied after another turn started clears nothing, and nor does one applied in the same `tick_turn` that first reads the turn busy; the next check after the grace clears it, a marked repeat is issued, and the first attempt's late commit settles the message.
+- **Does not assert:** a real waiter process or its connection (part 2's H3). The pin cannot tell `tick_turn` applying the view before or after the checks, since a regained turn voids a token minted in the same locked call: that order is defensive, recorded as an equivalent mutant.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/030 — A one-shot registration resumes nothing, and a superseded waiter is fenced at once.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** a once-waiter or hook registration gets an empty resume list and no correctable hand-back; a new once-waiter fences the superseded one's issued attempt at once while the busy turn keeps it possessed, leaves its handed attempt `HandedInert`, emits `Effect::Close` for the old receiver, refuses its stage reports and approvals as `WrongReceiver`, and still applies a commit published under the attempt's cap; a hook registration retires no waiter.
+- **Does not assert:** the serve path acting on `Effect::Close` (part 2's H3).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/031 — Hook receivers coexist, and their number is bounded.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** two hook registrations are both live; closing one fences and lapses only its own attempt while the other keeps holding its own; the closed hook's receiver record is pruned; `hook_room()` turns false once `MAX_LIVE_HOOKS` hooks are live.
+- **Does not assert:** the hub refusing a hook fetch when there is no room (part 2's H4).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/032 — A hook past its hold is closed, and its late commit still counts.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** `hold_due_at()` names the hook's hold; a tick at it retires the hook with `Effect::Close`, fences its attempt and schedules a marked repeat that another hook takes; the first attempt's commit arriving afterwards settles the message; a message cancelled while its hook held it ends cancelled at the hold, and its fenced attempt is not a verify candidate before its `quiet_at`.
+- **Does not assert:** the real clock waking for the hold through `Receipts::next_deadline` (boundary/055, part 2's H3).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/033 — A hook's not-handed report requeues and counts.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** each `NotHanded` from a hook receiver returns the message to `Queued` and counts toward `max_deliver`; at the limit it is undeliverable; a later commit of one of those attempts gives `WitnessViolation` and `DeliveredAfterAll`.
+- **Does not assert:** a hook producing that report (part 2's H4). The model's rule for it is unchanged, so this pin guards H4's wiring rather than an H1 change, and no mutant is claimed for it.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/034 — An explicit commit never lands on a not-handed attempt.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** `commit_target` names the newest attempt of the current assignment that was not positively not handed, skipping a newer `NotHanded` one; an assignment whose every attempt is `NotHanded` is refused as such, and one with no attempt as none.
+- **Does not assert:** the hub's `ack` acting on the refusal (inbox/boundary/047).
+- **Platform coverage:** mac+linux+windows.
 
 #### inbox/receipt
 
@@ -8831,6 +8880,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** for each stream, a held message counts 1 delivery, and after Retry from held_long attention hands a marked repeat it counts 2 while still fetched; a message that lapses through both automatic repeats counts one per copy handed, and a Retry from uncertain counts one more.
 - **Does not assert:** offers, which count assignments rather than copies; a real Pi (inbox/pi/022, lane 2).
+- **Platform coverage:** all.
+
+##### inbox/boundary/047 — An ack of a message never handed over changes nothing.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub with a Pi receipt stream that takes mail by doorbell fetch only.
+- **Agent:** none.
+- **Asserts:** after the receiver reports the message's only attempt not handed, the agent's `ack <id>` is answered `Unknown`; no attempt is committed and no witness violation is raised; the inbox copy and the model both stay `Queued`, the ack does not fall through to the legacy acknowledgement, and once the stream takes pushed mail again the message is handed out again as usual.
+- **Does not assert:** OpenCode, which shares the path; a real Pi.
 - **Platform coverage:** all.
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.

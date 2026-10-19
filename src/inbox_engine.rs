@@ -43,8 +43,9 @@ use crate::event::{
 };
 use crate::inbox::{AckHow, AssignmentOwner, Consumer, MessageState, UndeliverableReason};
 use crate::inbox_attempts::{
-    AttemptModel, Effect, HandOverRefusal, LapseCheck, Limits, MessageState as Delivery,
-    ResumeAnswer, Rx, Slot, Stage, TurnView, UncertainReason, UndeliverableReason as Verdict,
+    AttemptModel, CommitTargetRefusal, Effect, HandOverRefusal, LapseCheck, Limits,
+    MessageState as Delivery, ResumeAnswer, Rx, Slot, Stage, TurnView, UncertainReason,
+    UndeliverableReason as Verdict,
 };
 use crate::inbox_display::{AttentionKind, IntegrationNotice};
 use crate::inbox_receipt::{EvidenceStore, GenerationSpool, RecordScanner};
@@ -271,7 +272,7 @@ impl Receipts {
         // for the next ordinary step; at most once a second while one waits.
         let checking = self.gens.values().any(|generation| {
             !generation.model.lapse_candidates(now).is_empty()
-                || !generation.model.verify_candidates().is_empty()
+                || !generation.model.verify_candidates(now).is_empty()
         });
         let check = checking.then(|| {
             self.last_check
@@ -286,6 +287,13 @@ impl Receipts {
             .filter_map(|generation| generation.model.revoke_due_at())
             .min()
             .map(|due| due.max(now));
+        // C-3: a hook receiver is closed when its hold runs out.
+        let hold = self
+            .gens
+            .values()
+            .filter_map(|generation| generation.model.hold_due_at())
+            .min()
+            .map(|due| due.max(now));
         // PRD #1666 G3: a not-started attention falls due on its own instant.
         let not_started = self
             .gens
@@ -295,10 +303,17 @@ impl Receipts {
             })
             .min()
             .map(|due| due.max(now));
-        [open.then(|| now + step), arm, check, revoke, not_started]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            open.then(|| now + step),
+            arm,
+            check,
+            revoke,
+            hold,
+            not_started,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }
 
@@ -329,6 +344,7 @@ pub(super) fn generation_mut<'a>(
     spool: Option<Result<Arc<GenerationSpool>, String>>,
 ) -> &'a mut Gen {
     let limits = st.receipts.limits;
+    let turn = st.receipts.turn_view(key);
     let missing = match &st.spool_error {
         Some(error) => format!("the receipt spool could not start: {error}"),
         None => "the deck has no receipt spool".to_string(),
@@ -348,8 +364,12 @@ pub(super) fn generation_mut<'a>(
                 None
             }
         });
+        // C-1: a once-waiter attempt's possession reads the turn clock, which
+        // may have run before the generation's first registration.
+        let mut model = AttemptModel::new(limits, 1);
+        model.turn(Instant::now(), turn);
         Gen {
-            model: AttemptModel::new(limits, 1),
+            model,
             spool,
             evidence: Arc::new(Mutex::new(Evidence {
                 store: EvidenceStore::default(),
@@ -849,25 +869,35 @@ pub(super) fn control(
     dispatch(st, key, now, out);
 }
 
+/// What [`explicit_commit`] did with an agent's `ack <id>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExplicitCommit {
+    /// An attempt of the current assignment was committed.
+    Committed,
+    /// Every attempt of the current assignment was positively not handed,
+    /// so the agent cannot have it: nothing changes (C-5).
+    Refused,
+    /// The model has no attempt to commit; the caller decides.
+    NoAttempt,
+}
+
 /// An explicit acknowledgement of a `Receipt`-owned message (`dot-agent-deck
 /// ack <id>`): its agent says it has the message, which settles it — rule 1
-/// needs one committed attempt of the current assignment, whichever it is.
-pub(super) fn explicit_commit(st: &mut HubState, key: &AgentKey, id: &str, now: Instant) -> bool {
+/// needs one committed attempt of the current assignment, the newest that
+/// may have reached the agent ([`AttemptModel::commit_target`]).
+pub(super) fn explicit_commit(
+    st: &mut HubState,
+    key: &AgentKey,
+    id: &str,
+    now: Instant,
+) -> ExplicitCommit {
     let Some(generation) = st.receipts.gens.get_mut(key) else {
-        return false;
+        return ExplicitCommit::NoAttempt;
     };
-    let Some(delivery) = generation.model.delivery(id) else {
-        return false;
-    };
-    let a = delivery.a;
-    let Some(e) = delivery
-        .attempts
-        .iter()
-        .filter(|at| at.a == a)
-        .map(|at| at.e)
-        .max()
-    else {
-        return false;
+    let (a, e) = match generation.model.commit_target(id) {
+        Ok(target) => target,
+        Err(CommitTargetRefusal::NotHanded) => return ExplicitCommit::Refused,
+        Err(CommitTargetRefusal::NoAttempt) => return ExplicitCommit::NoAttempt,
     };
     generation
         .model
@@ -875,7 +905,7 @@ pub(super) fn explicit_commit(st: &mut HubState, key: &AgentKey, id: &str, now: 
     let mut out = Outbox::new();
     apply(st, key, now, &mut out);
     flush(out);
-    true
+    ExplicitCommit::Committed
 }
 
 /// Write `out`'s lines, each on the room [`send`] reserved for it under the
@@ -968,7 +998,7 @@ pub(super) fn note_turn(st: &mut HubState, key: &AgentKey, seen: TurnSeen, now: 
         return false;
     }
     clock.seq = seen.seq;
-    match seen.edge {
+    let changed = match seen.edge {
         TurnEdge::Started if !clock.busy => {
             clock.busy = true;
             true
@@ -979,7 +1009,15 @@ pub(super) fn note_turn(st: &mut HubState, key: &AgentKey, seen: TurnSeen, now: 
             true
         }
         _ => false,
+    };
+    // C-1: the model reads the same clock for once-waiter possession.
+    if changed {
+        let turn = st.receipts.turn_view(key);
+        if let Some(generation) = st.receipts.gens.get_mut(key) {
+            generation.model.turn(now, turn);
+        }
     }
+    changed
 }
 
 /// One generation's spool IO for the clock (§3).
@@ -1001,7 +1039,7 @@ pub(super) fn lapse_checks(st: &HubState, now: Instant) -> Vec<Check> {
         .iter()
         .filter_map(|(key, generation)| {
             let candidates = generation.model.lapse_candidates(now);
-            let verify = generation.model.verify_candidates();
+            let verify = generation.model.verify_candidates(now);
             (!candidates.is_empty() || !verify.is_empty() || generation.model.watching_receipts())
                 .then(|| Check {
                     key: key.clone(),
@@ -1110,6 +1148,13 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
                     .forget(&id, a, e);
                 if let Some(spool) = generation.spool.clone() {
                     st.receipts.removals.push((spool, id, a, e));
+                }
+            }
+            // C-2/C-3: a superseded or expired one-shot's connection is
+            // closed; no component maps to a one-shot slot before H3.
+            Effect::Close { rx } => {
+                if let Some(generation) = st.receipts.gens.get_mut(key) {
+                    generation.links.remove(&rx);
                 }
             }
         }

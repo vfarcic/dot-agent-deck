@@ -1975,10 +1975,16 @@ impl InboxHub {
             let key = (pane_id.to_string(), agent_id.to_string());
             // PRD #1666 §13 step 4: a receipt-owned assignment is settled
             // through its attempt model, never by the legacy ack alone.
-            if st.inbox.owner_of(id, pane_id, agent_id)
-                == Some(crate::inbox::AssignmentOwner::Receipt)
-                && engine::explicit_commit(&mut st, &key, id, now)
-            {
+            let receipt_owned = st.inbox.owner_of(id, pane_id, agent_id)
+                == Some(crate::inbox::AssignmentOwner::Receipt);
+            let committed = receipt_owned.then(|| engine::explicit_commit(&mut st, &key, id, now));
+            // C-5: an ack of a message no attempt of which reached the agent
+            // changes nothing, and does not fall through to the legacy ack,
+            // which would acknowledge the inbox copy the model still queues.
+            if committed == Some(engine::ExplicitCommit::Refused) {
+                return AckOutcome::Unknown;
+            }
+            if committed == Some(engine::ExplicitCommit::Committed) {
                 drain_events(&mut st);
                 return match st.inbox.get(id, pane_id).map(|m| &m.state) {
                     Some(MessageState::Acknowledged { .. }) => AckOutcome::Acknowledged,

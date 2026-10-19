@@ -3416,3 +3416,76 @@ async fn boundary_036_a_legacy_stream_is_refused_and_an_unhanded_once_batch_requ
     );
     drop(peer_reads);
 }
+
+/// Scenario: A Pi receiver is handed a message and reports that it handed
+/// nothing over, while its stream takes mail only by doorbell fetch so
+/// nothing is pushed to it again yet. The agent then runs `ack` on the
+/// message. The ack is refused as unknown and changes nothing: no attempt
+/// is committed, the inbox copy and the model both stay queued, and once
+/// the stream takes pushed mail again the message is handed out again as
+/// usual.
+#[spec("inbox/boundary/047")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_047_an_ack_of_a_message_never_handed_over_changes_nothing() {
+    use crate::inbox_attempts::{MessageState as Model, Rx, Stage};
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::PiExtension, INTEGRATION).await;
+    let rx = Rx(peer.next().await.registered.unwrap().rx);
+    let key = ("p".to_string(), "a".to_string());
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("never handed"))
+        .unwrap();
+    let first = peer.handout().await.remove(0);
+    // A doorbell-only stream is never pushed mail, so the requeued message
+    // waits for the ack instead of going straight out again.
+    let doorbell_only = |only: bool| {
+        hub.lock()
+            .receipts
+            .gens
+            .get_mut(&key)
+            .unwrap()
+            .links
+            .get_mut(&rx)
+            .unwrap()
+            .doorbell_only = only;
+    };
+    doorbell_only(true);
+    peer.send(serde_json::json!({"not_handed": [at(&first)]}))
+        .await;
+    let model = |hub: &InboxHub| {
+        hub.lock().receipts.gens[&key]
+            .model
+            .delivery(id.as_str())
+            .map(|d| {
+                (
+                    d.state,
+                    d.attempts.iter().map(|at| at.stage).collect::<Vec<_>>(),
+                )
+            })
+            .unwrap()
+    };
+    until("the not-handed report to requeue it", || {
+        model(&hub) == (Model::Queued, vec![Stage::NotHanded])
+    })
+    .await;
+
+    assert_eq!(
+        hub.ack(id.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::Unknown
+    );
+    assert_eq!(
+        model(&hub),
+        (Model::Queued, vec![Stage::NotHanded]),
+        "nothing was committed, so no witness was contradicted"
+    );
+    assert_eq!(state_of(&hub, "p", id.as_str()), StateName::Queued);
+
+    doorbell_only(false);
+    let again = peer.handout_ticking(&hub).await;
+    assert_eq!(
+        again.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        vec![id.as_str()]
+    );
+    assert_eq!(attempts_of(&hub, "p", "a", id.as_str()), 2);
+    peer.close().await;
+}
