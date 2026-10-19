@@ -78,7 +78,7 @@ fn inner_dump(buf: &Buffer, inner: Rect) -> String {
 #[spec("render/widget/001")]
 #[test]
 fn widget_001_renders_screen_from_row_zero_no_cursor_window() {
-    let mut parser = vt100::Parser::new(8, 20, 0);
+    let mut parser = dot_agent_deck::vt_grid::parser(8, 20, 0);
     // Place a unique marker on each row via absolute (1-based) cursor moves;
     // the final write parks the cursor on the bottom row (row 7).
     parser.process(b"\x1b[1;1HTOP_ROW_0");
@@ -124,7 +124,7 @@ fn widget_001_renders_screen_from_row_zero_no_cursor_window() {
 #[spec("render/widget/002")]
 #[test]
 fn widget_002_area_larger_than_pty_falls_back_to_min_no_panic() {
-    let mut parser = vt100::Parser::new(3, 6, 0);
+    let mut parser = dot_agent_deck::vt_grid::parser(3, 6, 0);
     // 5-char markers in a 6-col screen → no autowrap, cursor parks on row 2.
     parser.process(b"\x1b[1;1HTOP00");
     parser.process(b"\x1b[2;1HMID11");
@@ -185,7 +185,7 @@ fn widget_003_over_cap_inner_area_does_not_trip_the_contract_guard() {
     // Short and very wide: the cap only bites on the column axis here, which
     // keeps the fixture's cell count (and the buffer below) small.
     const ROWS: u16 = 4;
-    let mut parser = vt100::Parser::new(ROWS, PTY_RESIZE_DIM_MAX, 0);
+    let mut parser = dot_agent_deck::vt_grid::parser(ROWS, PTY_RESIZE_DIM_MAX, 0);
     parser.process(b"\x1b[1;1HCAPPED_ROW_0");
 
     // Outer area 2 cols wider than the capped screen → inner width

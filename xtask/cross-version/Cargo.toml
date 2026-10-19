@@ -21,7 +21,7 @@ path = "src/main.rs"
 # pulls no new crate into Cargo.lock. They are the same PTY + terminal-emulator
 # pair the L2 e2e harness (`tests/common/mod.rs`) drives the real binary with.
 portable-pty = "=0.8.1"
-vt100 = "0.16"
+vt100 = "0.18"
 # Already a root dependency. `daemon status --json` and `daemon hello` are the
 # two machine-readable surfaces this harness reads.
 serde_json = "1"

@@ -219,6 +219,7 @@ fn open_span(
 /// every screen a docs image shows, and a stray block would be noise.
 pub fn render_rows(screen: &vt100::Screen, palette: &Palette) -> String {
     let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
     let mut out = String::new();
     for row in 0..rows {
         out.push_str("<div class=\"row\">");
@@ -264,6 +265,7 @@ pub fn render_rows(screen: &vt100::Screen, palette: &Palette) -> String {
 /// plus padding, so an element screenshot of it is the frame and nothing else.
 pub fn render_page(screen: &vt100::Screen, title: &str, options: &RenderOptions) -> String {
     let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
     let palette = &options.palette;
     let mut out = String::new();
     out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>");
@@ -312,7 +314,9 @@ mod tests {
     use super::*;
 
     fn screen(rows: u16, cols: u16, bytes: &[u8]) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
+        let axis =
+            |v| std::num::NonZeroU16::new(v).expect("a test screen has non-zero rows and columns");
+        let mut parser = vt100::Parser::new(axis(rows), axis(cols), 0);
         parser.process(bytes);
         parser
     }

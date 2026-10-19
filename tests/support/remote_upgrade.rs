@@ -466,7 +466,7 @@ impl Terminal {
         let mut reader = pair.master.try_clone_reader().unwrap();
         let writer = pair.master.take_writer().unwrap();
         let text = Arc::new(Mutex::new(Vec::new()));
-        let grid = Arc::new(Mutex::new(vt100::Parser::new(45, 180, 0)));
+        let grid = Arc::new(Mutex::new(dot_agent_deck::vt_grid::parser(45, 180, 0)));
         let text_thread = Arc::clone(&text);
         let grid_thread = Arc::clone(&grid);
         let drained = Arc::new(AtomicBool::new(false));

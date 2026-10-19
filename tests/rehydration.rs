@@ -2173,7 +2173,7 @@ async fn hydrate_sizes_parser_to_daemon_reported_pty_dims() {
         .expect("hydrated pane must expose its vt100 parser");
     let size = {
         let parser = screen.lock().unwrap();
-        parser.screen().size()
+        dot_agent_deck::vt_grid::size(parser.screen())
     };
     assert_eq!(
         size,

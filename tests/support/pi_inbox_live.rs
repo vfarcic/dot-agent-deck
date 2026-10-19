@@ -627,7 +627,7 @@ impl Pi {
     }
     pub fn screen(&self) -> String {
         let r = self.record();
-        let mut parser = vt100::Parser::new(
+        let mut parser = dot_agent_deck::vt_grid::parser(
             r["rows"].as_u64().unwrap_or(40) as u16,
             r["cols"].as_u64().unwrap_or(140) as u16,
             0,
