@@ -115,6 +115,14 @@ pub const LATE_ACK_MEMORY: Duration = Duration::from_secs(60 * 60);
 /// and its card says the integration is out of date.
 pub const ADAPTER_INTEGRATION: u32 = 2;
 
+/// PRD #1666 part 2 §2.7: the one-shot receipt integration every one-shot
+/// receiver of this binary declares — Claude's once-waiter and its prompt
+/// hook. Kept apart from [`ADAPTER_INTEGRATION`], so either floor moves
+/// without the other's adapters. A one-shot request without it, or below it,
+/// comes from an older dot-agent-deck named in the agent's hook settings,
+/// and is refused before anything is issued to it.
+pub const HOOK_INTEGRATION: u32 = 1;
+
 #[path = "inbox_engine.rs"]
 mod engine;
 #[cfg(test)]
@@ -256,6 +264,10 @@ pub struct InboxCardNotices {
     pub attention: Vec<InboxAttentionItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<crate::inbox_display::IntegrationNotice>,
+    /// Part 2 §2.7: the command that fixes `integration`, when the deck can
+    /// compose one (`hooks_too_old`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipts_degraded: Option<String>,
     /// Delivered messages whose evidence pauses hand-outs (§7).
@@ -279,6 +291,12 @@ pub enum WaiterSignal {
     Superseded,
     /// PRD #1666 §4: one line for a receipt stream to write as it is.
     Line(Box<InboxWaitReply>),
+    /// Part 2 §2.6: a once-waiter's batch, written with every byte the
+    /// connection accepts counted, so a line whose newline never went is
+    /// known not handed.
+    Once(Box<InboxWaitReply>),
+    /// Part 2 §2.5: close the connection, writing nothing.
+    Close,
 }
 
 /// Why a waiter could not arm.
@@ -494,6 +512,11 @@ struct HubState {
     /// client's press of the same verb at the same revision is told it came
     /// too late ([`InboxHub::inbox_action`]).
     action_presses: HashMap<(AgentKey, String), (u64, bool, String)>,
+    /// Part 2 §2.7: the command a card names when an agent's hooks run a
+    /// dot-agent-deck too old for its messages
+    /// ([`crate::hook_binary::remedy_for`]), `None` when the deck can offer
+    /// none.
+    hooks_remedy: Option<String>,
 }
 
 /// PRD #1666 long-turn delivery: who was told that a message ran out of
@@ -550,6 +573,11 @@ pub struct InboxHub {
     undelivered_after: Duration,
     /// Hardening M4: how long one write to a waiter's connection may take.
     write_deadline: Duration,
+    /// Test seam: while set, each once batch's caps-file writes tell the
+    /// first end they started and wait for the second before going on.
+    #[cfg(test)]
+    hold_caps:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl std::fmt::Debug for InboxHub {
@@ -670,6 +698,7 @@ impl InboxHub {
                 spool: None,
                 spool_error: None,
                 action_presses: HashMap::new(),
+                hooks_remedy: None,
             }),
             spill_manifest: Mutex::new(None),
             changed: Arc::new(Notify::new()),
@@ -678,6 +707,8 @@ impl InboxHub {
             pause_waiter_delivery: false,
             undelivered_after: DEFAULT_UNDELIVERED_NOTICE_AFTER,
             write_deadline: DEFAULT_WAITER_WRITE_DEADLINE,
+            #[cfg(test)]
+            hold_caps: std::sync::Mutex::new(None),
         }
     }
 
@@ -2282,6 +2313,7 @@ impl InboxHub {
             engine::dispatch(&mut st, &key, Instant::now(), &mut out);
             drop(st);
             engine::flush(out);
+            self.release_staged();
             self.changed.notify_one();
             return;
         }
@@ -2408,6 +2440,9 @@ pub struct ReceiptArm {
     pub adapter_integration: Option<u32>,
     pub doorbell_only: bool,
     pub resumed: bool,
+    /// Part 2 §2.7: the one-shot integration a once-waiter declared
+    /// ([`HOOK_INTEGRATION`]).
+    pub hook_integration: Option<u32>,
 }
 
 /// PRD #1666 §13 step 4: whether `component`'s streams are owned by the
@@ -2690,10 +2725,18 @@ impl InboxHub {
         reply
     }
 
-    /// Spool removals the engine queued, run off the executor and outside the
-    /// lock, then owed notices.
+    /// The spool work the engine queued, run off the executor and outside
+    /// the lock — once batches' caps files, revoke markers and removals —
+    /// then owed notices.
     fn after_receipts(&self) {
-        let removals = std::mem::take(&mut self.lock().receipts.removals);
+        self.release_staged();
+        let (removals, markers) = {
+            let mut st = self.lock();
+            (
+                std::mem::take(&mut st.receipts.removals),
+                std::mem::take(&mut st.receipts.markers),
+            )
+        };
         if !removals.is_empty() {
             off_the_executor(|| {
                 for (spool, id, a, e) in removals {
@@ -2703,8 +2746,101 @@ impl InboxHub {
                 }
             });
         }
+        if !markers.is_empty() {
+            // Part 2 §2.5: a marker that cannot be written leaves a one-shot
+            // fence only the revoke line to stop at, so the generation stops
+            // claiming its receipts protect it.
+            let failed: Vec<(AgentKey, String)> = off_the_executor(|| {
+                markers
+                    .into_iter()
+                    .filter_map(|(key, spool, id, a, e)| {
+                        spool
+                            .write_revoke(&id, a, e)
+                            .err()
+                            .map(|error| (key, error.to_string()))
+                    })
+                    .collect()
+            });
+            if !failed.is_empty() {
+                let mut st = self.lock();
+                let now = Instant::now();
+                for (key, error) in failed {
+                    if let Some(generation) = st.receipts.gens.get_mut(&key) {
+                        generation.degraded.get_or_insert_with(|| {
+                            format!("could not mark a revoked delivery: {error}")
+                        });
+                    }
+                    engine::broadcast_notices(&mut st, &key, now);
+                }
+            }
+        }
         self.changed.notify_one();
         self.post_owed_notices();
+    }
+
+    /// Part 2 §2.4: release the once batches [`engine::dispatch`] staged.
+    /// Each one's caps files are written off the executor and outside the
+    /// lock, so a slow spool holds up that batch and no inbox call; the batch
+    /// is then revalidated and sent under the lock ([`engine::release`]).
+    fn release_staged(&self) {
+        loop {
+            let staged = std::mem::take(&mut self.lock().receipts.staged);
+            if staged.is_empty() {
+                return;
+            }
+            for staged in staged {
+                let failed = self.write_caps_files(&staged);
+                let mut out = engine::Outbox::new();
+                {
+                    let mut st = self.lock();
+                    engine::release(&mut st, staged, &failed, Instant::now(), &mut out);
+                }
+                engine::flush(out);
+            }
+        }
+    }
+
+    /// Each staged attempt's caps file, written for the prompt hook that
+    /// commits it (part 2 §1.3): the write error of each, in batch order.
+    /// With no spool this run there is nowhere to write one, and the
+    /// generation already says its receipts are degraded.
+    fn write_caps_files(&self, staged: &engine::Staged) -> Vec<Option<String>> {
+        #[cfg(test)]
+        if let Some(hold) = self
+            .hold_caps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = hold.0.send(());
+            let _ = hold.1.recv();
+        }
+        let Some(spool) = staged.spool.as_ref() else {
+            return vec![None; staged.batch.len()];
+        };
+        off_the_executor(|| {
+            staged
+                .batch
+                .iter()
+                .map(|delivery| {
+                    use crate::inbox_receipt::{AttemptCaps, Cap};
+                    let at = delivery.attempt.as_ref()?;
+                    let caps = at.caps.as_ref().and_then(|caps| {
+                        Some(AttemptCaps {
+                            handed: Cap::from_hex(&caps.handed)?,
+                            commit: Cap::from_hex(&caps.commit)?,
+                        })
+                    });
+                    let Some(caps) = caps else {
+                        return Some("the deck minted no caps for it".to_string());
+                    };
+                    spool
+                        .write_caps(&delivery.id, at.a, at.e, &caps)
+                        .err()
+                        .map(|error| error.to_string())
+                })
+                .collect()
+        })
     }
 
     /// PRD #1666 §3, §4: the receipt engine's clock. Each generation's spool
@@ -2817,6 +2953,43 @@ impl InboxHub {
         engine::flush(out);
         self.after_receipts();
         result
+    }
+
+    /// Part 2 §2.7: the command a card names when an agent's hooks run a
+    /// dot-agent-deck too old for its messages, composed by the daemon at
+    /// start from its own install path.
+    pub fn set_hooks_remedy(&self, command: Option<String>) {
+        self.lock().hooks_remedy = command;
+    }
+
+    /// Part 2 §2.7: a one-shot receiver declared no [`HOOK_INTEGRATION`], or
+    /// a lower one. Nothing is issued; its card names the fix.
+    pub fn refuse_old_hooks(&self, pane_id: &str, agent_id: &str) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        engine::refuse_hooks(&mut st, &key);
+        engine::broadcast_notices(&mut st, &key, Instant::now());
+    }
+
+    /// Part 2 §1.3: Claude's prompt hook commits the exact attempts a
+    /// submitted prompt carried whole ([`engine::one_shot_committed`]).
+    /// Answers how many it applied.
+    pub fn one_shot_committed(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        attempts: &[crate::event::InboxAttemptRef],
+        degraded: Option<&str>,
+    ) -> usize {
+        let mut out = engine::Outbox::new();
+        let applied = {
+            let mut st = self.lock();
+            let key = (pane_id.to_string(), agent_id.to_string());
+            engine::one_shot_committed(&mut st, &key, attempts, degraded, Instant::now(), &mut out)
+        };
+        engine::flush(out);
+        self.after_receipts();
+        applied
     }
 
     /// PRD #1666 §11: a fetch or stream from a component the receipt policy
@@ -2977,7 +3150,9 @@ async fn serve_receipt<R, W, P>(
                     let _ = write_line_within(deadline, &mut writer, &InboxWaitReply::superseded()).await;
                     break;
                 }
-                None => break,
+                Some(WaiterSignal::Close) | None => break,
+                // Only a once-waiter is sent its batch this way.
+                Some(WaiterSignal::Once(_)) => {}
             },
             line = lines.recv() => match line {
                 Some(line) => match serde_json::from_str::<InboxStreamControl>(&line) {
@@ -3008,6 +3183,411 @@ async fn serve_receipt<R, W, P>(
     read_task.abort();
     hub.receipt_closed(&key, rx, conn_id);
     let _ = tokio::time::timeout(deadline, writer.shutdown()).await;
+}
+
+/// Part 2 §2.4: serve Claude's once-waiter, which declared the one-shot
+/// integration, until it ends: register it (superseding the generation's
+/// previous once-waiter), push it exactly one batch once that batch's caps
+/// files are written, and apply each control it sends — its `may`, then its
+/// `handed` and `not_handed` reports. A batch line whose newline the
+/// connection never accepted reaches no waiter (it reads through
+/// [`crate::inbox_oneshot::read_frame`]), so it is not handed.
+async fn serve_once<R, W>(
+    hub: Arc<InboxHub>,
+    pane_id: String,
+    agent_id: String,
+    component: InboxComponent,
+    instance: Option<u32>,
+    reader: R,
+    mut writer: W,
+) where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+{
+    let deadline = hub.write_deadline();
+    let key = (pane_id.clone(), agent_id.clone());
+    let Ok(_slot) = Arc::clone(&hub.waiter_slots).try_acquire_owned() else {
+        let error = ArmError::NoSlots;
+        let _ = write_line_within(
+            deadline,
+            &mut writer,
+            &InboxWaitReply::refused(error.code(), &error.message()),
+        )
+        .await;
+        return;
+    };
+    let spool = hub.generation_spool(&pane_id, &agent_id);
+    let (tx, mut signals) = mpsc::channel(engine::RECEIPT_SIGNAL_CAPACITY);
+    let registered = {
+        let mut st = hub.lock();
+        match st.admit_receiver(&key, instance) {
+            Err(error) => Err(error),
+            Ok(()) => {
+                let conn_id = st.next_conn;
+                st.next_conn += 1;
+                let now = Instant::now();
+                let first = engine::register(
+                    &mut st,
+                    &key,
+                    component,
+                    false,
+                    false,
+                    conn_id,
+                    tx.clone(),
+                    spool,
+                    now,
+                );
+                st.waiters.entry(key.clone()).or_default().push(Waiter {
+                    conn_id,
+                    mode: InboxWaitMode::Once,
+                    component,
+                    tx: tx.clone(),
+                });
+                let mut out = engine::Outbox::new();
+                engine::apply(&mut st, &key, now, &mut out);
+                Ok((conn_id, first, out))
+            }
+        }
+    };
+    drop(tx);
+    let (conn_id, first, out) = match registered {
+        Ok(registered) => registered,
+        Err(error) => {
+            let _ = write_line_within(
+                deadline,
+                &mut writer,
+                &InboxWaitReply::refused(error.code(), &error.message()),
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(first) = first else {
+        return;
+    };
+    let rx = crate::inbox_attempts::Rx(first.registered.as_ref().map_or(0, |r| r.rx));
+    engine::flush(out);
+    hub.after_receipts();
+    if write_line_within(deadline, &mut writer, &first)
+        .await
+        .is_err()
+    {
+        hub.receipt_closed(&key, rx, conn_id);
+        return;
+    }
+    hub.dispatch_agent(&pane_id, &agent_id);
+    let (line_tx, mut lines) = mpsc::channel::<String>(16);
+    let read_task = tokio::spawn(async move {
+        let mut reader = reader;
+        while let Ok(Some(line)) = crate::bounded_read::read_capped_line(
+            &mut reader,
+            crate::bounded_read::MAX_HOOK_LINE_BYTES,
+        )
+        .await
+        {
+            if line_tx.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut keepalive = tokio::time::interval(hub.keepalive());
+    keepalive.tick().await;
+    loop {
+        tokio::select! {
+            signal = signals.recv() => match signal {
+                Some(WaiterSignal::Line(reply)) => {
+                    if write_line_within(deadline, &mut writer, &*reply).await.is_err() {
+                        break;
+                    }
+                }
+                Some(WaiterSignal::Once(reply)) => {
+                    let attempts = attempts_of(&reply);
+                    match write_counted_line(deadline, &mut writer, &*reply).await {
+                        crate::inbox_oneshot::Output::Written => {
+                            info!(conn_id, count = attempts.len(), "inbox: a batch went to a once-waiter");
+                        }
+                        crate::inbox_oneshot::Output::NotHanded => {
+                            debug!(conn_id, "inbox: a once-waiter took no line of its batch");
+                            hub.receipt_control(&key, rx, &InboxStreamControl {
+                                not_handed: attempts,
+                                ..InboxStreamControl::default()
+                            });
+                            break;
+                        }
+                        crate::inbox_oneshot::Output::Possible => break,
+                    }
+                }
+                Some(WaiterSignal::Superseded) => {
+                    let _ = write_line_within(deadline, &mut writer, &InboxWaitReply::superseded()).await;
+                    break;
+                }
+                Some(WaiterSignal::Close) | None => break,
+                // Only a legacy waiter is handed a batch this way.
+                Some(WaiterSignal::Deliver(_)) => {}
+            },
+            line = lines.recv() => match line {
+                Some(line) => match serde_json::from_str::<InboxStreamControl>(&line) {
+                    Ok(control) => hub.receipt_control(&key, rx, &control),
+                    Err(_) => debug!(conn_id, "inbox: ignoring a once-waiter line that is not a control"),
+                },
+                None => break,
+            },
+            _ = keepalive.tick() => {
+                if write_line_within(deadline, &mut writer, &InboxWaitReply::keepalive()).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    read_task.abort();
+    hub.receipt_closed(&key, rx, conn_id);
+    let _ = tokio::time::timeout(deadline, writer.shutdown()).await;
+}
+
+/// What a hook receiver's own fetch asked for (part 2 §2.4).
+#[derive(Debug, Clone, Default)]
+pub struct HookFetch {
+    /// The message the doorbell named: nothing is issued unless it is still
+    /// waiting.
+    pub named: Option<String>,
+    pub budget: Option<InboxBudget>,
+    /// The one-shot integration the hook declared ([`HOOK_INTEGRATION`]).
+    pub hook_integration: Option<u32>,
+}
+
+/// Part 2 §2.4: serve one hook receiver (Claude's prompt hook) until it
+/// ends: register it beside every other receiver of the generation, issue it
+/// what its fetch asked for once, with the caps it publishes its receipts
+/// with, and apply its controls until it closes or its hold runs out. It is
+/// never pushed anything. Below the one-shot integration floor (§2.7)
+/// nothing is registered or issued, and the agent's card names the command
+/// that updates its hooks.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_hook<R, W>(
+    hub: Arc<InboxHub>,
+    pane_id: String,
+    agent_id: String,
+    component: InboxComponent,
+    fetch: HookFetch,
+    reader: R,
+    mut writer: W,
+) where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+{
+    let deadline = hub.write_deadline();
+    let key = (pane_id.clone(), agent_id.clone());
+    if fetch
+        .hook_integration
+        .is_none_or(|declared| declared < HOOK_INTEGRATION)
+    {
+        hub.refuse_old_hooks(&pane_id, &agent_id);
+        warn!(
+            pane_id = %pane_id,
+            ?component,
+            declared = ?fetch.hook_integration,
+            "inbox: refused a hook fetch from an older dot-agent-deck"
+        );
+        let _ = write_line_within(
+            deadline,
+            &mut writer,
+            &InboxWaitReply::refused("hooks_too_old", crate::inbox_display::HOOKS_TOO_OLD),
+        )
+        .await;
+        return;
+    }
+    let Ok(_slot) = Arc::clone(&hub.waiter_slots).try_acquire_owned() else {
+        let error = ArmError::NoSlots;
+        let _ = write_line_within(
+            deadline,
+            &mut writer,
+            &InboxWaitReply::refused(error.code(), &error.message()),
+        )
+        .await;
+        return;
+    };
+    let spool = hub.generation_spool(&pane_id, &agent_id);
+    let (tx, mut signals) = mpsc::channel(engine::RECEIPT_SIGNAL_CAPACITY);
+    let registered = {
+        let mut st = hub.lock();
+        let room = st
+            .receipts
+            .gens
+            .get(&key)
+            .is_none_or(|generation| generation.model.hook_room());
+        if room {
+            let conn_id = st.next_conn;
+            st.next_conn += 1;
+            let now = Instant::now();
+            let mut out = engine::Outbox::new();
+            let first = engine::register(
+                &mut st,
+                &key,
+                component,
+                false,
+                false,
+                conn_id,
+                tx.clone(),
+                spool,
+                now,
+            );
+            let rx = crate::inbox_attempts::Rx(
+                first
+                    .as_ref()
+                    .and_then(|first| first.registered.as_ref())
+                    .map_or(0, |r| r.rx),
+            );
+            let batch = engine::hook_fetch(
+                &mut st,
+                &key,
+                rx,
+                fetch.named.as_deref(),
+                fetch.budget,
+                now,
+                &mut out,
+            );
+            Some((conn_id, rx, first, batch, out))
+        } else {
+            None
+        }
+    };
+    drop(tx);
+    let Some((conn_id, rx, first, batch, out)) = registered else {
+        let _ = write_line_within(
+            deadline,
+            &mut writer,
+            &InboxWaitReply::refused(
+                "too_many_hooks",
+                "too many of this agent's hooks are taking its messages at once",
+            ),
+        )
+        .await;
+        return;
+    };
+    engine::flush(out);
+    hub.after_receipts();
+    let Some(mut reply) = first else {
+        return;
+    };
+    let empty = batch.is_empty();
+    let attempts: Vec<crate::event::InboxAttemptRef> = batch
+        .iter()
+        .filter_map(|delivery| {
+            let at = delivery.attempt.as_ref()?;
+            Some(crate::event::InboxAttemptRef {
+                id: delivery.id.clone(),
+                a: at.a,
+                e: at.e,
+            })
+        })
+        .collect();
+    reply.messages = Some(batch);
+    let ended = match write_counted_line(deadline, &mut writer, &reply).await {
+        crate::inbox_oneshot::Output::Written => empty,
+        crate::inbox_oneshot::Output::NotHanded => {
+            hub.receipt_control(
+                &key,
+                rx,
+                &InboxStreamControl {
+                    not_handed: attempts,
+                    ..InboxStreamControl::default()
+                },
+            );
+            true
+        }
+        crate::inbox_oneshot::Output::Possible => true,
+    };
+    if !ended {
+        let (line_tx, mut lines) = mpsc::channel::<String>(16);
+        let read_task = tokio::spawn(async move {
+            let mut reader = reader;
+            while let Ok(Some(line)) = crate::bounded_read::read_capped_line(
+                &mut reader,
+                crate::bounded_read::MAX_HOOK_LINE_BYTES,
+            )
+            .await
+            {
+                if line_tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
+        loop {
+            tokio::select! {
+                signal = signals.recv() => match signal {
+                    Some(WaiterSignal::Line(reply)) => {
+                        if write_line_within(deadline, &mut writer, &*reply).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(WaiterSignal::Superseded | WaiterSignal::Close) | None => break,
+                    Some(WaiterSignal::Once(_) | WaiterSignal::Deliver(_)) => {}
+                },
+                line = lines.recv() => match line {
+                    Some(line) => match serde_json::from_str::<InboxStreamControl>(&line) {
+                        Ok(control) => hub.receipt_control(&key, rx, &control),
+                        Err(_) => debug!(conn_id, "inbox: ignoring a hook line that is not a control"),
+                    },
+                    None => break,
+                },
+            }
+        }
+        read_task.abort();
+    }
+    hub.receipt_closed(&key, rx, conn_id);
+    let _ = tokio::time::timeout(deadline, writer.shutdown()).await;
+}
+
+/// The attempts a hand-out line carries.
+fn attempts_of(reply: &InboxWaitReply) -> Vec<crate::event::InboxAttemptRef> {
+    reply
+        .messages
+        .iter()
+        .flatten()
+        .filter_map(|delivery| {
+            let at = delivery.attempt.as_ref()?;
+            Some(crate::event::InboxAttemptRef {
+                id: delivery.id.clone(),
+                a: at.a,
+                e: at.e,
+            })
+        })
+        .collect()
+}
+
+/// Part 2 §2.6: write `value` as one line within `deadline`, counting every
+/// byte the connection accepts, and say what that means for a one-shot that
+/// reads through [`crate::inbox_oneshot::read_frame`]: a line whose newline
+/// was never accepted is not handed, a whole line with a failed or late flush
+/// is possibly handed.
+async fn write_counted_line<W, T>(
+    deadline: Duration,
+    writer: &mut W,
+    value: &T,
+) -> crate::inbox_oneshot::Output
+where
+    W: AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
+    let Ok(mut line) = serde_json::to_string(value) else {
+        return crate::inbox_oneshot::Output::NotHanded;
+    };
+    line.push('\n');
+    let bytes = line.as_bytes();
+    let mut accepted = 0usize;
+    let wrote = tokio::time::timeout(deadline, async {
+        while accepted < bytes.len() {
+            match writer.write(&bytes[accepted..]).await {
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                Ok(n) => accepted += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        writer.flush().await
+    })
+    .await;
+    crate::inbox_oneshot::classify_frame(bytes, Some(accepted), matches!(wrote, Ok(Ok(()))))
 }
 
 impl InboxHub {
@@ -4325,6 +4905,43 @@ pub async fn serve_waiter<R, W, P>(
     P: Fn(&str),
 {
     let deadline = hub.write_deadline();
+    // Part 2 §2.4, §2.7: Claude's once-waiter is served by the receipt
+    // engine at the one-shot integration floor; below it nothing registers or
+    // is issued, and its card names the command that updates the hooks. A
+    // one-shot component never streams.
+    if engine::one_shot_component(component) {
+        if mode == InboxWaitMode::Once && component == InboxComponent::ClaudeWaiter {
+            if arm
+                .hook_integration
+                .is_some_and(|declared| declared >= HOOK_INTEGRATION)
+            {
+                serve_once(hub, pane_id, agent_id, component, instance, reader, writer).await;
+                return;
+            }
+            hub.refuse_old_hooks(&pane_id, &agent_id);
+            warn!(
+                pane_id = %pane_id,
+                ?component,
+                declared = ?arm.hook_integration,
+                "inbox: refused a waiter whose hooks run an older dot-agent-deck"
+            );
+            let _ = write_line_within(
+                deadline,
+                &mut writer,
+                &InboxWaitReply::refused("hooks_too_old", crate::inbox_display::HOOKS_TOO_OLD),
+            )
+            .await;
+            return;
+        }
+        warn!(pane_id = %pane_id, ?component, ?mode, "inbox: refused a wait a one-shot component cannot make");
+        let _ = write_line_within(
+            deadline,
+            &mut writer,
+            &InboxWaitReply::refused("unsupported", crate::inbox_display::STREAM_UNSUPPORTED),
+        )
+        .await;
+        return;
+    }
     // PRD #1666 §13 step 4, §11: a component the receipt policy covers is
     // served by the receipt engine, at the floor or above; below it nothing
     // registers and its card says the integration is out of date.
@@ -4428,9 +5045,9 @@ pub async fn serve_waiter<R, W, P>(
                     let _ = write_line_within(deadline, &mut writer, &InboxWaitReply::superseded()).await;
                     break;
                 }
-                // Only a receipt stream is sent single lines.
-                Some(WaiterSignal::Line(_)) => {}
-                None => break,
+                // Only a receipt receiver is sent these.
+                Some(WaiterSignal::Line(_) | WaiterSignal::Once(_)) => {}
+                Some(WaiterSignal::Close) | None => break,
             },
             line = lines.recv() => match line {
                 // A once waiter has nothing to say after its request.
@@ -5395,7 +6012,10 @@ mod tests {
             InboxWaitMode::Once,
             InboxComponent::ClaudeWaiter,
             None,
-            ReceiptArm::default(),
+            ReceiptArm {
+                hook_integration: Some(HOOK_INTEGRATION),
+                ..ReceiptArm::default()
+            },
             tokio::io::BufReader::new(read),
             write,
             |_: &str| {},
@@ -6184,7 +6804,8 @@ mod tests {
     #[tokio::test]
     async fn a_waiter_that_stops_reading_is_disarmed_and_its_message_requeued() {
         let hub = Arc::new(hub().with_write_deadline(Duration::from_millis(300)));
-        let (peer_reads, daemon_writes) = tokio::io::duplex(64);
+        // Room for the registration, not for the batch.
+        let (peer_reads, daemon_writes) = tokio::io::duplex(512);
         let (_peer_writes, daemon_reads) = tokio::io::duplex(64);
         let serve = tokio::spawn(serve_waiter(
             Arc::clone(&hub),
@@ -6193,7 +6814,10 @@ mod tests {
             InboxWaitMode::Once,
             InboxComponent::ClaudeWaiter,
             Some(4242),
-            ReceiptArm::default(),
+            ReceiptArm {
+                hook_integration: Some(HOOK_INTEGRATION),
+                ..ReceiptArm::default()
+            },
             tokio::io::BufReader::new(daemon_reads),
             daemon_writes,
             |_: &str| {},

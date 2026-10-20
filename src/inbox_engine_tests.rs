@@ -40,6 +40,7 @@ const INTEGRATION: ReceiptArm = ReceiptArm {
     adapter_integration: Some(ADAPTER_INTEGRATION),
     doorbell_only: false,
     resumed: false,
+    hook_integration: None,
 };
 
 /// The component's end of one receipt stream.
@@ -3330,7 +3331,7 @@ async fn boundary_046_deliveries_counts_every_receipt_hand_out() {
 /// Scenario: Each component the receipt policy does not cover opens a stream for an agent with a task queued, then a Claude waiter waits once on a connection that never reads its hand-over. Every stream is refused `unsupported`, arms nothing and leaves the task queued; the once-waiter's batch, which never reached its peer, goes back to the queue.
 #[spec("inbox/boundary/036")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn boundary_036_a_legacy_stream_is_refused_and_an_unhanded_once_batch_requeues() {
+async fn boundary_036_a_stream_from_a_component_that_cannot_stream_is_refused() {
     use tokio::io::AsyncReadExt;
     let hub = Arc::new(
         InboxHub::new(deck(), InboxLimits::default(), Duration::from_secs(30))
@@ -3383,38 +3384,6 @@ async fn boundary_036_a_legacy_stream_is_refused_and_an_unhanded_once_batch_requ
             "{component:?}"
         );
     }
-    // A once-waiter whose peer never reads: the hand-over cannot finish, so
-    // the batch was never the peer's and goes back to the queue.
-    let (peer_reads, daemon_writes) = tokio::io::duplex(64);
-    let (_peer_writes, daemon_reads) = tokio::io::duplex(64);
-    let serve = tokio::spawn(serve_waiter(
-        Arc::clone(&hub),
-        "p".to_string(),
-        "a".to_string(),
-        InboxWaitMode::Once,
-        InboxComponent::ClaudeWaiter,
-        Some(4242),
-        ReceiptArm::default(),
-        BufReader::new(daemon_reads),
-        daemon_writes,
-        |_: &str| {},
-    ));
-    tokio::time::timeout(Duration::from_secs(5), serve)
-        .await
-        .expect("the hand-over's write deadline ends the waiter")
-        .unwrap();
-    assert_eq!(hub.armed("p", "a"), 0);
-    assert_eq!(
-        hub.lock().inbox.get(id.as_str(), "p").unwrap().deliveries,
-        1,
-        "the once-waiter took the batch"
-    );
-    assert_eq!(
-        state_of(&hub, "p", id.as_str()),
-        StateName::Queued,
-        "an unhanded once batch goes back to the queue"
-    );
-    drop(peer_reads);
 }
 
 /// Scenario: A Pi receiver is handed a message and reports that it handed
@@ -3523,6 +3492,7 @@ fn once_waiter_fenced(
                 tx,
                 component: InboxComponent::ClaudeWaiter,
                 doorbell_only: true,
+                kind: engine::LinkKind::Once { spent: true },
             },
         );
         rx
@@ -3699,4 +3669,496 @@ async fn boundary_056_a_fenced_waiters_commit_authority_lasts_while_the_turn_clo
             assert!(!corrected(&hub, &task), "{what}: no correction");
         }
     }
+}
+
+/// Claude's once-waiter's end of one connection to `p`/`a`, declaring
+/// `declared` as its one-shot integration.
+fn open_once(hub: &Arc<InboxHub>, declared: Option<u32>) -> Peer {
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (read, write) = tokio::io::split(server);
+    let serve = tokio::spawn(serve_waiter(
+        Arc::clone(hub),
+        "p".to_string(),
+        "a".to_string(),
+        InboxWaitMode::Once,
+        InboxComponent::ClaudeWaiter,
+        Some(4242),
+        ReceiptArm {
+            hook_integration: declared,
+            ..ReceiptArm::default()
+        },
+        BufReader::new(read),
+        write,
+        |_: &str| {},
+    ));
+    let (from, to) = tokio::io::split(client);
+    Peer {
+        lines: BufReader::new(from).lines(),
+        to,
+        serve,
+    }
+}
+
+/// Claude's prompt hook's end of one connection to `p`/`a`: its fetch, for
+/// the doorbell that named `named`, declaring `declared`.
+fn open_hook(hub: &Arc<InboxHub>, named: Option<&str>, declared: Option<u32>) -> Peer {
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (read, write) = tokio::io::split(server);
+    let serve = tokio::spawn(serve_hook(
+        Arc::clone(hub),
+        "p".to_string(),
+        "a".to_string(),
+        InboxComponent::ClaudeHooks,
+        HookFetch {
+            named: named.map(str::to_string),
+            budget: Some(InboxComponent::ClaudeHooks.inline_budget()),
+            hook_integration: declared,
+        },
+        BufReader::new(read),
+        write,
+    ));
+    let (from, to) = tokio::io::split(client);
+    Peer {
+        lines: BufReader::new(from).lines(),
+        to,
+        serve,
+    }
+}
+
+/// The caps file of `id`'s attempt `(a, e)` in `p`/`a`'s generation spool.
+fn caps_file(hub: &InboxHub, id: &str, a: u32, e: u32) -> crate::inbox_receipt::CapsLookup {
+    let (p, ag) = spool_names("p", "a");
+    crate::inbox_receipt::GenerationSpool::open(&hub.spool_env().unwrap(), &p, &ag)
+        .unwrap()
+        .read_caps_checked(id, a, e)
+}
+
+fn integration_notice(hub: &InboxHub) -> (Option<IntegrationNotice>, Option<String>) {
+    let notices = hub.summary("p", "a").notices;
+    (notices.integration, notices.integration_command)
+}
+
+/// Scenario: A Claude once-waiter that declares no one-shot integration, and one that declares less than the deck's, are each refused as hooks too old before anything is issued: the queued task stays queued with no attempt, and the agent's card names the hooks-too-old notice with the deck's own hooks install command. A Claude prompt hook's fetch is refused the same way. A waiter at the integration registers as the once-waiter slot with its approval window, and is handed the task with its opener naming attempt 1.1, without the attempt's caps, whose caps file the deck has written for the prompt hook; the notice is gone.
+#[spec("inbox/boundary/048")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_048_the_hook_integration_floor_holds_before_anything_is_issued() {
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let fix = "/opt/deck/dot-agent-deck hooks install --agent claude-code";
+    hub.set_hooks_remedy(Some(fix.to_string()));
+    let key: AgentKey = ("p".into(), "a".into());
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("behind the floor"))
+        .unwrap();
+    let nothing_issued = |hub: &InboxHub| {
+        hub.lock()
+            .receipts
+            .gens
+            .get(&key)
+            .and_then(|generation| generation.model.delivery(id.as_str()))
+            .is_none_or(|delivery| delivery.attempts.is_empty())
+    };
+    for declared in [None, Some(HOOK_INTEGRATION - 1)] {
+        let mut peer = open_once(&hub, declared);
+        let reply = peer.next().await;
+        assert_eq!(
+            reply.refused.as_deref(),
+            Some("hooks_too_old"),
+            "{declared:?}"
+        );
+        assert!(reply.messages.is_none());
+        peer.close().await;
+        assert!(nothing_issued(&hub), "{declared:?}: nothing issued");
+        assert_eq!(state_of(&hub, "p", id.as_str()), StateName::Queued);
+        assert_eq!(hub.armed("p", "a"), 0);
+        assert_eq!(
+            integration_notice(&hub),
+            (Some(IntegrationNotice::HooksTooOld), Some(fix.to_string())),
+            "{declared:?}"
+        );
+    }
+    assert!(
+        hub.doorbell_facts("p", "a").blocked,
+        "no doorbell for stale hooks"
+    );
+    let mut hook = open_hook(&hub, Some(id.as_str()), None);
+    assert_eq!(
+        hook.next().await.refused.as_deref(),
+        Some("hooks_too_old"),
+        "a stale prompt hook is refused too"
+    );
+    hook.close().await;
+    assert!(nothing_issued(&hub));
+
+    let mut peer = open_once(&hub, Some(HOOK_INTEGRATION));
+    let registered = peer.next().await.registered.expect("registered first");
+    assert_eq!(registered.slot, "once_waiter");
+    assert_eq!(registered.grant_ttl_ms, Some(60_000));
+    let batch = peer.handout().await;
+    assert_eq!(batch.len(), 1);
+    let at = attempt(&batch[0]);
+    assert_eq!((at.a, at.e), (1, 1));
+    assert!(
+        at.caps.is_none(),
+        "the caps stay in the deck and the caps file"
+    );
+    assert!(
+        batch[0]
+            .text
+            .starts_with(&format!("[dot-agent-deck message {id} delivery 1.1 from ")),
+        "{}",
+        batch[0].text
+    );
+    assert!(matches!(
+        caps_file(&hub, id.as_str(), 1, 1),
+        crate::inbox_receipt::CapsLookup::Found(_)
+    ));
+    assert_eq!(integration_notice(&hub), (None, None));
+    peer.close().await;
+}
+
+/// A writer that takes the first line it is given whole, then of the line
+/// after it only `take` bytes before failing, and whose flush fails once it
+/// has taken that line whole when `flush_fails` is set.
+struct CutWriter {
+    lines: usize,
+    take: usize,
+    taken: usize,
+    flush_fails: bool,
+    written: Vec<u8>,
+}
+
+impl tokio::io::AsyncWrite for CutWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        if this.lines == 0 {
+            this.written.extend_from_slice(buf);
+            if buf.ends_with(b"\n") {
+                this.lines = 1;
+            }
+            return std::task::Poll::Ready(Ok(buf.len()));
+        }
+        let room = this.take.saturating_sub(this.taken).min(buf.len());
+        if room == 0 {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        this.taken += room;
+        this.written.extend_from_slice(&buf[..room]);
+        std::task::Poll::Ready(Ok(room))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let failed = self.flush_fails && self.lines > 0 && self.taken > 0;
+        std::task::Poll::Ready(if failed {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        } else {
+            Ok(())
+        })
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Scenario: The deck writes a once-waiter's batch line to a connection that takes none of it, then to one that takes part of it without its newline, then to one that takes all of it but whose flush fails. In the first two the waiter, which reads only whole lines, cannot have parsed it: the attempt is positively not handed and the task is queued again for the next receiver, not repeated. In the third the line may have reached it: the attempt is final and possibly handed, left to the lapse path, and the task is not queued again.
+#[spec("inbox/boundary/051")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_051_a_batch_line_whose_newline_never_went_is_not_handed() {
+    use crate::inbox_attempts::{MessageState as Model, Stage};
+    let key: AgentKey = ("p".into(), "a".into());
+    for (take, flush_fails, handed) in [
+        (0, false, false),
+        (40, false, false),
+        (usize::MAX, true, true),
+    ] {
+        let what = format!("take {take}, flush fails {flush_fails}");
+        let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content("a once batch"))
+            .unwrap();
+        let (_client, server) = tokio::io::duplex(1 << 16);
+        let (read, _write) = tokio::io::split(server);
+        let writer = CutWriter {
+            lines: 0,
+            take,
+            taken: 0,
+            flush_fails,
+            written: Vec::new(),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_waiter(
+                Arc::clone(&hub),
+                "p".to_string(),
+                "a".to_string(),
+                InboxWaitMode::Once,
+                InboxComponent::ClaudeWaiter,
+                Some(4242),
+                ReceiptArm {
+                    hook_integration: Some(HOOK_INTEGRATION),
+                    ..ReceiptArm::default()
+                },
+                BufReader::new(read),
+                writer,
+                |_: &str| {},
+            ),
+        )
+        .await
+        .expect("a failed hand-over ends the waiter");
+        let (state, stages) = hub.lock().receipts.gens[&key]
+            .model
+            .delivery(id.as_str())
+            .map(|d| {
+                (
+                    d.state,
+                    d.attempts.iter().map(|at| at.stage).collect::<Vec<_>>(),
+                )
+            })
+            .unwrap();
+        if handed {
+            assert_eq!(stages, vec![Stage::Fenced], "{what}: possibly handed");
+            assert_eq!(state, Model::Attempting, "{what}");
+            assert_ne!(
+                state_of(&hub, "p", id.as_str()),
+                StateName::Queued,
+                "{what}"
+            );
+        } else {
+            assert_eq!(
+                stages,
+                vec![Stage::NotHanded],
+                "{what}: positively not handed"
+            );
+            assert_eq!(state, Model::Queued, "{what}");
+            assert_eq!(
+                state_of(&hub, "p", id.as_str()),
+                StateName::Queued,
+                "{what}"
+            );
+            let mut next = open_once(&hub, Some(HOOK_INTEGRATION));
+            assert!(next.next().await.registered.is_some());
+            let again = next.handout().await;
+            assert!(
+                !again[0].text.contains("This may repeat"),
+                "{what}: not a repeat: {}",
+                again[0].text
+            );
+            next.close().await;
+        }
+    }
+}
+
+/// Scenario: Two Claude once-waiters register one after the other: the older is told it was superseded and its connection ends with nothing handed to it. The newer is handed the first task and is then spent: a second task posted after it is handed nothing on that connection, and the next waiter to register is handed it.
+#[spec("inbox/boundary/052")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_052_a_newer_waiter_supersedes_and_a_spent_one_takes_nothing() {
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let mut older = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(older.next().await.registered.is_some());
+    let mut newer = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(newer.next().await.registered.is_some());
+    assert!(
+        older.next().await.superseded,
+        "the older waiter is superseded"
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(5), older.lines.next_line())
+        .await
+        .expect("its connection ends")
+        .unwrap();
+    assert!(ended.is_none(), "nothing after the supersession: {ended:?}");
+    assert_eq!(hub.armed("p", "a"), 1);
+    let first = hub
+        .post_direct(Recipient::bound("p", "a"), content("first"))
+        .unwrap();
+    assert_eq!(newer.handout().await[0].id, first.as_str());
+    assert_eq!(hub.armed("p", "a"), 0, "a spent waiter is armed no longer");
+    let second = hub
+        .post_direct(Recipient::bound("p", "a"), content("second"))
+        .unwrap();
+    for _ in 0..10 {
+        hub.tick();
+        if let Ok(reply) = tokio::time::timeout(Duration::from_millis(30), newer.next()).await {
+            assert!(
+                reply.messages.is_none(),
+                "a spent waiter takes nothing: {reply:?}"
+            );
+        }
+    }
+    let mut next = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(next.next().await.registered.is_some());
+    assert_eq!(next.handout().await[0].id, second.as_str());
+    next.close().await;
+    newer.close().await;
+}
+
+/// Scenario: A once-waiter's batch is held while its caps file is written. Meanwhile the deck still answers a listing and takes a post on another thread. Once the write goes on, the waiter is handed the batch. With the spool's caps directory made unwritable, a batch whose caps file cannot be written is never sent: its attempt is positively not handed, the task is queued again, the agent's card says receipts are degraded, and the waiter's connection is closed with nothing on it. A Claude prompt hook that takes a task and then reports nothing is closed by the deck's own clock when its hold runs out, and its attempt is final, possibly handed.
+#[cfg(unix)]
+#[spec("inbox/boundary/055")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boundary_055_caps_files_are_written_off_the_lock_and_holds_end_on_the_clock() {
+    use crate::inbox_attempts::Stage;
+    use std::os::unix::fs::PermissionsExt;
+    let key: AgentKey = ("p".into(), "a".into());
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let mut peer = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(peer.next().await.registered.is_some());
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel();
+    *hub.hold_caps.lock().unwrap() = Some((entered_tx, go_rx));
+    let posting = {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            hub.post_direct(Recipient::bound("p", "a"), content("held"))
+                .unwrap()
+        })
+    };
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the caps write started");
+    let listed = {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            let listed = hub.list("p").len();
+            hub.post_direct(Recipient::bound("p", "a"), content("meanwhile"))
+                .unwrap();
+            listed
+        })
+    };
+    let started = Instant::now();
+    while !listed.is_finished() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deck answers while a caps file is written"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(listed.join().unwrap() >= 1);
+    go.send(()).unwrap();
+    let held = posting.join().unwrap();
+    *hub.hold_caps.lock().unwrap() = None;
+    assert_eq!(peer.handout().await[0].id, held.as_str());
+    peer.close().await;
+
+    let caps_dir = hub
+        .spool_env()
+        .unwrap()
+        .join(spool_names("p", "a").0)
+        .join(spool_names("p", "a").1)
+        .join("caps");
+    std::fs::set_permissions(&caps_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut denied = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(denied.next().await.registered.is_some());
+    let stages = |hub: &InboxHub, id: &str| {
+        hub.lock().receipts.gens[&key]
+            .model
+            .delivery(id)
+            .map(|d| d.attempts.iter().map(|at| at.stage).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let ended = tokio::time::timeout(Duration::from_secs(5), denied.lines.next_line())
+        .await
+        .expect("the connection ends")
+        .unwrap();
+    std::fs::set_permissions(&caps_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(ended.is_none(), "nothing is written for it: {ended:?}");
+    let meanwhile = hub
+        .list("p")
+        .into_iter()
+        .find(|m| m.subject == "about meanwhile")
+        .unwrap()
+        .id;
+    assert_eq!(stages(&hub, meanwhile.as_str()), vec![Stage::NotHanded]);
+    assert_eq!(state_of(&hub, "p", meanwhile.as_str()), StateName::Queued);
+    assert!(
+        hub.summary("p", "a")
+            .notices
+            .receipts_degraded
+            .is_some_and(|error| error.contains("caps file")),
+        "{:?}",
+        hub.summary("p", "a").notices
+    );
+    let _ = denied.serve.await;
+
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_millis(300));
+    let ticker = hub.spawn_ticker();
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("held by a hook"))
+        .unwrap();
+    let mut hook = open_hook(&hub, Some(id.as_str()), Some(HOOK_INTEGRATION));
+    let first = hook.next().await;
+    assert_eq!(first.messages.map(|m| m.len()), Some(1));
+    let ended = tokio::time::timeout(Duration::from_secs(5), hook.lines.next_line())
+        .await
+        .expect("the deck closes a hook whose hold ran out")
+        .unwrap();
+    assert!(ended.is_none(), "{ended:?}");
+    assert_eq!(stages(&hub, id.as_str()), vec![Stage::Fenced]);
+    ticker.abort();
+}
+
+/// Scenario: A Claude prompt hook fetches the task its doorbell named as a receiver of its own and is handed it with the caps it publishes with, its opener naming attempt 1.1; a task posted while it holds the connection is not pushed to it. A second hook registered beside it takes nothing the first holds and retires nothing. The first reports the block written: the deck commits it and the task settles; it reports nothing for the second task, which stays queued.
+#[spec("inbox/boundary/057")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_057_a_hook_receiver_takes_only_what_its_fetch_asked_for() {
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("rung"))
+        .unwrap();
+    let mut hook = open_hook(&hub, Some(id.as_str()), Some(HOOK_INTEGRATION));
+    let reply = hook.next().await;
+    assert_eq!(
+        reply.registered.as_ref().map(|r| r.slot.as_str()),
+        Some("hook")
+    );
+    let batch = reply.messages.unwrap();
+    assert_eq!(batch.len(), 1);
+    assert!(
+        attempt(&batch[0]).caps.is_some(),
+        "a hook publishes with its caps"
+    );
+    assert!(batch[0].text.contains(" delivery 1.1 from "));
+    let later = hub
+        .post_direct(Recipient::bound("p", "a"), content("later"))
+        .unwrap();
+    let mut other = open_hook(&hub, Some(id.as_str()), Some(HOOK_INTEGRATION));
+    assert_eq!(
+        other.next().await.messages.map(|m| m.len()),
+        Some(0),
+        "the named message is held by the first hook"
+    );
+    other.close().await;
+    for _ in 0..5 {
+        hub.tick();
+        if let Ok(reply) = tokio::time::timeout(Duration::from_millis(30), hook.next()).await {
+            assert!(
+                reply.messages.is_none(),
+                "nothing is pushed to a hook: {reply:?}"
+            );
+        }
+    }
+    publish_receipt(
+        &hub,
+        "p",
+        "a",
+        &batch[0],
+        crate::inbox_receipt::RecordStage::Committed,
+    );
+    hook.send(serde_json::json!({"committed": [at(&batch[0])]}))
+        .await;
+    hook.close().await;
+    until("the hook's commit to settle the task", || {
+        state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
+    })
+    .await;
+    assert_eq!(state_of(&hub, "p", later.as_str()), StateName::Queued);
 }

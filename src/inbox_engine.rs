@@ -110,14 +110,24 @@ pub(super) struct TurnClock {
     pub(super) seq: u64,
 }
 
-/// The receiver slot a component's stream registers in (§4).
+/// The receiver slot a component registers in (§4; part 2 §2.1): a stream
+/// for OpenCode and Pi, a once-waiter for Claude's `asyncRewake` waiter, a
+/// hook for Claude's prompt hook.
 pub(super) fn slot_for(component: InboxComponent) -> Option<Slot> {
     match component {
         InboxComponent::OpenCodePlugin => Some(Slot::OpencodeTui),
         InboxComponent::OpenCodeMini => Some(Slot::OpencodeServer),
         InboxComponent::PiExtension => Some(Slot::Pi),
+        InboxComponent::ClaudeWaiter => Some(Slot::OnceWaiter),
+        InboxComponent::ClaudeHooks => Some(Slot::Hook),
         _ => None,
     }
+}
+
+/// Whether `component` registers as a one-shot receiver (part 2 §2.4): one
+/// batch on one connection, then its stage reports, then it exits.
+pub(super) fn one_shot_component(component: InboxComponent) -> bool {
+    matches!(slot_for(component), Some(Slot::OnceWaiter | Slot::Hook))
 }
 
 fn slot_name(slot: Slot) -> &'static str {
@@ -141,6 +151,10 @@ pub(super) struct Floor {
     pub(super) cli_too_old: bool,
     /// A registration declared a missing or lower integration.
     pub(super) adapter_too_old: bool,
+    /// Part 2 §2.7: a one-shot receiver (a Claude hook or waiter) declared
+    /// no [`super::HOOK_INTEGRATION`], or a lower one: the agent's hooks run
+    /// an older dot-agent-deck.
+    pub(super) hooks_too_old: bool,
     /// The deck could not rewrite the generation's integration files as it
     /// started (`refresh_for_spawn`), so restarting does not update them:
     /// the notice in that integration's words.
@@ -153,6 +167,8 @@ impl Floor {
             Some(IntegrationNotice::CliTooOld)
         } else if let Some(notice) = self.refresh_failed.filter(|_| !self.registered) {
             Some(notice)
+        } else if self.hooks_too_old {
+            Some(IntegrationNotice::HooksTooOld)
         } else if self.adapter_too_old {
             Some(IntegrationNotice::AdapterTooOld)
         } else if !self.registered && self.arm_by.is_some_and(|by| now >= by) {
@@ -165,16 +181,52 @@ impl Floor {
     /// Incompatible: nothing is handed to the generation and its doorbell is
     /// silent. `not_armed` is readiness, not incompatibility.
     pub(super) fn blocks(&self) -> bool {
-        self.cli_too_old || self.adapter_too_old
+        self.cli_too_old || self.adapter_too_old || self.hooks_too_old
     }
 }
 
-/// One live receipt stream.
+/// What a receipt receiver's connection is for (part 2 §2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LinkKind {
+    /// A receipt stream: pushed every hand-out its queue has room for.
+    Stream,
+    /// Claude's once-waiter: pushed exactly one batch, then spent.
+    Once { spent: bool },
+    /// A hook: issued what its own fetch asked for, never pushed anything.
+    Hook,
+}
+
+/// One live receipt receiver's connection.
 pub(super) struct Link {
     pub(super) conn_id: u64,
     pub(super) tx: mpsc::Sender<WaiterSignal>,
     pub(super) component: InboxComponent,
     pub(super) doorbell_only: bool,
+    pub(super) kind: LinkKind,
+}
+
+impl Link {
+    /// Whether [`dispatch`] may push a hand-out to it: an unspent once-waiter,
+    /// or a stream that takes pushed mail. A hook never.
+    fn takes_pushes(&self) -> bool {
+        match self.kind {
+            LinkKind::Stream => !self.doorbell_only,
+            LinkKind::Once { spent } => !spent,
+            LinkKind::Hook => false,
+        }
+    }
+}
+
+/// Part 2 §2.4: a once-waiter's batch, issued under the lock and held there
+/// until its caps files are written off it. `permit` is the room on the
+/// waiter's queue reserved at issue.
+pub(super) struct Staged {
+    pub(super) key: AgentKey,
+    pub(super) rx: Rx,
+    pub(super) conn_id: u64,
+    pub(super) permit: mpsc::OwnedPermit<WaiterSignal>,
+    pub(super) batch: Vec<InboxDelivery>,
+    pub(super) spool: Option<Arc<GenerationSpool>>,
 }
 
 /// The evidence a generation's attempts publish into its spool.
@@ -207,6 +259,11 @@ pub(super) struct Receipts {
     pub(super) told: HashMap<AgentKey, InboxCardNotices>,
     /// Reclaimed attempts whose spool files go once the lock is released.
     pub(super) removals: Vec<(Arc<GenerationSpool>, String, u32, u32)>,
+    /// Part 2 §2.5: revoked one-shot attempts whose revoke markers are
+    /// written once the lock is released, with their generation.
+    pub(super) markers: Vec<(AgentKey, Arc<GenerationSpool>, String, u32, u32)>,
+    /// Part 2 §2.4: once batches waiting for their caps files.
+    pub(super) staged: Vec<Staged>,
     pub(super) arm_deadline: Duration,
     /// When the clock last read the spools ([`tick`]).
     pub(super) last_check: Option<Instant>,
@@ -224,6 +281,8 @@ impl Receipts {
             floors: HashMap::new(),
             told: HashMap::new(),
             removals: Vec::new(),
+            markers: Vec::new(),
+            staged: Vec::new(),
             arm_deadline,
             last_check: None,
             turns: HashMap::new(),
@@ -392,8 +451,10 @@ pub(super) fn generation_mut<'a>(
     })
 }
 
-/// T8: a receipt stream registers for `key`. The slot's previous incarnation
-/// is retired; its open attempts wait for this registration's resume answer.
+/// T8: a receipt receiver registers for `key`. For a stream, the slot's
+/// previous incarnation is retired and its open attempts wait for this
+/// registration's resume answer; a once-waiter supersedes the previous one,
+/// and a hook supersedes nothing (C-2, C-3).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn register(
     st: &mut HubState,
@@ -410,8 +471,10 @@ pub(super) fn register(
     let floor = st.receipts.floors.entry(key.clone()).or_default();
     floor.registered = true;
     floor.adapter_too_old = false;
+    floor.hooks_too_old = false;
     floor.cli_too_old = false;
     floor.refresh_failed = None;
+    let grant_ttl = st.receipts.limits.grant_ttl();
     let generation = generation_mut(st, key, spool);
     let registration = generation.model.register(now, slot, resumed);
     // r8k R8G-03: commit authority only, for the new watcher to publish a
@@ -437,6 +500,11 @@ pub(super) fn register(
             })
             .collect()
     };
+    let kind = match slot {
+        Slot::OnceWaiter => LinkKind::Once { spent: false },
+        Slot::Hook => LinkKind::Hook,
+        _ => LinkKind::Stream,
+    };
     generation.links.insert(
         registration.rx,
         Link {
@@ -444,6 +512,7 @@ pub(super) fn register(
             tx,
             component,
             doorbell_only,
+            kind,
         },
     );
     info!(
@@ -461,6 +530,7 @@ pub(super) fn register(
             keepalive_ms: (st.receipts.limits.possess_ttl
                 / crate::inbox_attempts::KEEPALIVES_PER_POSSESS_TTL)
                 .as_millis() as u64,
+            grant_ttl_ms: (kind != LinkKind::Stream).then_some(grant_ttl.as_millis() as u64),
         }),
         resume: registration
             .resume
@@ -483,6 +553,18 @@ pub(super) fn refuse_adapter(st: &mut HubState, key: &AgentKey) {
         .adapter_too_old = true;
 }
 
+/// Part 2 §2.7: a one-shot receiver declared no [`super::HOOK_INTEGRATION`],
+/// or a lower one. Nothing was registered or issued; the generation's mail
+/// waits queued, its doorbell stays silent and its card names the command
+/// that updates the hooks.
+pub(super) fn refuse_hooks(st: &mut HubState, key: &AgentKey) {
+    st.receipts
+        .floors
+        .entry(key.clone())
+        .or_default()
+        .hooks_too_old = true;
+}
+
 /// The stream `rx` of `key` ended. It decides nothing at once (§4: a stream
 /// disconnect never requeues): the incarnation stays its slot's until the
 /// next registration of that slot retires it and asks it to resume what it
@@ -491,6 +573,9 @@ pub(super) fn refuse_adapter(st: &mut HubState, key: &AgentKey) {
 /// registration in its place for a while, the model retires it and fences
 /// what it held, so a Cancel can end those attempts and a message no
 /// receiver takes is `Uncertain` rather than waiting forever.
+///
+/// A one-shot receiver's connection ending is final at once (C-2): no
+/// control can come for it any more, so its open attempts are fenced.
 pub(super) fn closed(st: &mut HubState, key: &AgentKey, rx: Rx, conn_id: u64, now: Instant) {
     let Some(generation) = st.receipts.gens.get_mut(key) else {
         return;
@@ -499,9 +584,12 @@ pub(super) fn closed(st: &mut HubState, key: &AgentKey, rx: Rx, conn_id: u64, no
         .links
         .get(&rx)
         .is_some_and(|link| link.conn_id == conn_id)
+        && let Some(link) = generation.links.remove(&rx)
     {
-        generation.links.remove(&rx);
-        generation.model.stream_closed(now, rx);
+        match link.kind {
+            LinkKind::Stream => generation.model.stream_closed(now, rx),
+            LinkKind::Once { .. } | LinkKind::Hook => generation.model.connection_closed(now, rx),
+        }
     }
 }
 
@@ -550,7 +638,10 @@ pub(super) fn candidates(st: &HubState, key: &AgentKey) -> Vec<String> {
 }
 
 /// T1 for each candidate that fits `budget`, bound to `rx`. Returns the
-/// rendered hand-outs, each with its attempt and caps.
+/// rendered hand-outs, each with its attempt and caps. A `one_shot`
+/// receiver's blocks name their attempt in the opener (`delivery A.e`,
+/// part 2 §1.1), measured with it before issue.
+#[allow(clippy::too_many_arguments)]
 fn issue_to(
     st: &mut HubState,
     key: &AgentKey,
@@ -558,6 +649,7 @@ fn issue_to(
     ids: &[String],
     budget: Option<InboxBudget>,
     consumer: Consumer,
+    one_shot: bool,
     now: Instant,
 ) -> Vec<InboxDelivery> {
     let mut out = Vec::new();
@@ -578,8 +670,11 @@ fn issue_to(
             .model
             .delivery(id)
             .is_some_and(|d| d.repeat_scheduled());
+        let next = one_shot
+            .then(|| generation.model.next_attempt(id))
+            .flatten();
         let len = budget.map(|budget| {
-            let text = render_marked(&message, Some(budget), marked, None).text;
+            let text = render_marked(&message, Some(budget), marked, next).text;
             budget.measure(&text) + budget.measure(super::BLOCK_SEPARATOR)
         });
         if let (Some(budget), Some(len)) = (budget, len)
@@ -624,7 +719,8 @@ fn issue_to(
         } else {
             st.inbox.count_receipt_repeat(id, &key.0, &key.1);
         }
-        let mut delivery = render_marked(&message, budget, issued.kind.marked(), None);
+        let attempt = one_shot.then_some((issued.a, issued.e));
+        let mut delivery = render_marked(&message, budget, issued.kind.marked(), attempt);
         used += len.unwrap_or(0);
         delivery.attempt = Some(InboxDeliveryAttempt {
             a: issued.a,
@@ -643,6 +739,11 @@ fn issue_to(
 /// A generation whose floor blocks it (§11) has no receiver to hand to: a
 /// refused component never registers, and a valid registration clears the
 /// floor's verdicts.
+///
+/// Part 2 §2.4: a once-waiter is pushed one batch and is then spent. Its
+/// batch is not sent from here: it is staged ([`Staged`]) with the room
+/// reserved for it, so its caps files are written off the lock before it is
+/// released ([`release`]).
 pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut Outbox) {
     let Some(generation) = st.receipts.gens.get(key) else {
         return;
@@ -650,12 +751,13 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
     let Some((rx, link)) = generation
         .links
         .iter()
-        .filter(|(rx, link)| !link.doorbell_only && generation.model.live(**rx))
+        .filter(|(rx, link)| link.takes_pushes() && generation.model.live(**rx))
         .max_by_key(|(_, link)| link.conn_id)
     else {
         return;
     };
     let (rx, conn_id, budget) = (*rx, link.conn_id, link.component.inline_budget());
+    let once = matches!(link.kind, LinkKind::Once { .. });
     // PR #1735 review 4307236310, auditor R9T-A02: nothing is issued unless
     // the stream's queue gives the hand-out's line its room first, under this
     // lock, since a line that does not fit is dropped after its attempts were
@@ -668,19 +770,202 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
     if ids.is_empty() {
         return;
     }
-    let batch = issue_to(
-        st,
-        key,
-        rx,
-        &ids,
-        Some(budget),
-        Consumer::Stream { conn_id },
-        now,
-    );
+    let consumer = if once {
+        Consumer::Waiter { conn_id }
+    } else {
+        Consumer::Stream { conn_id }
+    };
+    let batch = issue_to(st, key, rx, &ids, Some(budget), consumer, once, now);
     if !batch.is_empty() {
-        out.push((permit, InboxWaitReply::messages(batch)));
+        if once {
+            spend(st, key, rx, conn_id, permit, batch);
+        } else {
+            out.push((permit, InboxWaitReply::messages(batch)));
+        }
     }
     apply(st, key, now, out);
+}
+
+/// A once-waiter was issued `batch`: it is spent, so it no longer counts as
+/// armed, and the batch waits for its caps files ([`release`]).
+fn spend(
+    st: &mut HubState,
+    key: &AgentKey,
+    rx: Rx,
+    conn_id: u64,
+    permit: mpsc::OwnedPermit<WaiterSignal>,
+    batch: Vec<InboxDelivery>,
+) {
+    let Some(generation) = st.receipts.gens.get_mut(key) else {
+        return;
+    };
+    if let Some(link) = generation.links.get_mut(&rx) {
+        link.kind = LinkKind::Once { spent: true };
+    }
+    let spool = generation.spool.clone();
+    forget_waiter(st, key, conn_id);
+    st.receipts.staged.push(Staged {
+        key: key.clone(),
+        rx,
+        conn_id,
+        permit,
+        batch,
+        spool,
+    });
+}
+
+/// Drop connection `conn_id` from `key`'s armed waiters.
+fn forget_waiter(st: &mut HubState, key: &AgentKey, conn_id: u64) {
+    if let Some(list) = st.waiters.get_mut(key) {
+        list.retain(|w| w.conn_id != conn_id);
+        if list.is_empty() {
+            st.waiters.remove(key);
+        }
+    }
+}
+
+/// Part 2 §2.4: release a once batch whose caps files were written off the
+/// lock, `failed` holding each attempt's write error. Each attempt is
+/// revalidated under this lock — its link is the one it was issued on and
+/// the deck would still approve its hand-over — before it goes. One that
+/// fails either check, or whose caps file could not be written, is reported
+/// not handed by the deck itself, which is true: no byte of it left the
+/// deck. With nothing left to send, the waiter's connection is closed, so it
+/// exits with nothing and the doorbell covers the mail.
+pub(super) fn release(
+    st: &mut HubState,
+    staged: Staged,
+    failed: &[Option<String>],
+    now: Instant,
+    out: &mut Outbox,
+) {
+    let Staged {
+        key,
+        rx,
+        conn_id,
+        permit,
+        batch,
+        ..
+    } = staged;
+    let Some(generation) = st.receipts.gens.get_mut(&key) else {
+        return;
+    };
+    let linked = generation
+        .links
+        .get(&rx)
+        .is_some_and(|link| link.conn_id == conn_id);
+    let mut going = Vec::new();
+    for (mut delivery, failed) in batch.into_iter().zip(failed) {
+        let Some(attempt) = delivery.attempt.as_mut() else {
+            continue;
+        };
+        let (a, e) = (attempt.a, attempt.e);
+        if let Some(error) = failed {
+            generation
+                .degraded
+                .get_or_insert_with(|| format!("could not write a receipt caps file: {error}"));
+        }
+        let approved = linked
+            && generation
+                .model
+                .may_hand_over(&delivery.id, a, e, rx)
+                .is_ok();
+        if approved && failed.is_none() {
+            // The caps stay in the deck and the caps file: the waiter reads
+            // its own from there.
+            attempt.caps = None;
+            going.push(delivery);
+        } else {
+            generation
+                .model
+                .stage(now, &delivery.id, a, e, Stage::NotHanded, Some(rx));
+        }
+    }
+    if going.is_empty() {
+        permit.send(WaiterSignal::Close);
+    } else {
+        permit.send(WaiterSignal::Once(Box::new(InboxWaitReply::messages(
+            going,
+        ))));
+    }
+    apply(st, &key, now, out);
+}
+
+/// Part 2 §2.4: a hook receiver `rx`'s own fetch: the waiting mail that fits
+/// `budget` is issued to it, each block naming its attempt, with the caps it
+/// publishes its receipts with. With `named`, nothing is issued unless that
+/// message is still waiting, decided under the same lock.
+pub(super) fn hook_fetch(
+    st: &mut HubState,
+    key: &AgentKey,
+    rx: Rx,
+    named: Option<&str>,
+    budget: Option<InboxBudget>,
+    now: Instant,
+    out: &mut Outbox,
+) -> Vec<InboxDelivery> {
+    if !st
+        .receipts
+        .gens
+        .get(key)
+        .is_some_and(|generation| generation.model.live(rx))
+    {
+        return Vec::new();
+    }
+    let ids = candidates(st, key);
+    if let Some(named) = named
+        && !ids.iter().any(|id| id == named)
+    {
+        return Vec::new();
+    }
+    let batch = issue_to(st, key, rx, &ids, budget, Consumer::DoorbellHook, true, now);
+    apply(st, key, now, out);
+    batch
+}
+
+/// Part 2 §1.3: Claude's prompt hook commits the exact one-shot attempts a
+/// submitted prompt carried whole, after publishing their `committed`
+/// receipts, on its own admitted connection. An attempt that is not a
+/// one-shot's is left alone. `degraded` is why a receipt could not be
+/// published.
+pub(super) fn one_shot_committed(
+    st: &mut HubState,
+    key: &AgentKey,
+    attempts: &[InboxAttemptRef],
+    degraded: Option<&str>,
+    now: Instant,
+    out: &mut Outbox,
+) -> usize {
+    let Some(generation) = st.receipts.gens.get_mut(key) else {
+        return 0;
+    };
+    if let Some(error) = degraded {
+        generation
+            .degraded
+            .get_or_insert_with(|| crate::untrusted_text::display_line(error, 200));
+    }
+    let mut applied = 0;
+    for at in attempts.iter().take(crate::inbox_prompt::MAX_IDS) {
+        let one_shot = generation
+            .model
+            .delivery(&at.id)
+            .and_then(|d| d.attempt(at.a, at.e))
+            .is_some_and(|attempt| matches!(attempt.slot, Slot::OnceWaiter | Slot::Hook));
+        if one_shot
+            && matches!(
+                generation
+                    .model
+                    .stage(now, &at.id, at.a, at.e, Stage::Committed, None),
+                crate::inbox_attempts::StageOutcome::Applied
+                    | crate::inbox_attempts::StageOutcome::Recorded
+            )
+        {
+            applied += 1;
+        }
+    }
+    apply(st, key, now, out);
+    dispatch(st, key, now, out);
+    applied
 }
 
 /// A doorbell substitution by the component holding incarnation `rx` (§4):
@@ -719,7 +1004,16 @@ pub(super) fn doorbell_fetch(
     let Some(permit) = room(&link.tx) else {
         return Ok(Vec::new());
     };
-    let mut batch = issue_to(st, key, rx, &ids, budget, Consumer::Stream { conn_id }, now);
+    let mut batch = issue_to(
+        st,
+        key,
+        rx,
+        &ids,
+        budget,
+        Consumer::Stream { conn_id },
+        false,
+        now,
+    );
     let issued: Vec<InboxIssued> = batch
         .iter_mut()
         .filter_map(|delivery| {
@@ -1107,6 +1401,21 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
                 let Some(generation) = st.receipts.gens.get(key) else {
                     continue;
                 };
+                // Part 2 §2.5: a one-shot's fence also reads the attempt's
+                // revoke marker, written once the lock is released.
+                let one_shot = generation
+                    .model
+                    .delivery(&id)
+                    .and_then(|d| d.attempt(a, e))
+                    .is_some_and(|at| matches!(at.slot, Slot::OnceWaiter | Slot::Hook));
+                if one_shot && let Some(spool) = generation.spool.clone() {
+                    st.receipts
+                        .markers
+                        .push((key.clone(), spool, id.clone(), a, e));
+                }
+                let Some(generation) = st.receipts.gens.get(key) else {
+                    continue;
+                };
                 if let Some(link) = generation
                     .model
                     .attempt_rx(&id, a, e)
@@ -1159,11 +1468,23 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
                     st.receipts.removals.push((spool, id, a, e));
                 }
             }
-            // C-2/C-3: a superseded or expired one-shot's connection is
-            // closed; no component maps to a one-shot slot before H3.
+            // C-2/C-3: a superseded once-waiter is told so and its
+            // connection closed; an expired hook's is closed. Dropping the
+            // link's sender ends its connection task even when the signal
+            // finds its queue full.
             Effect::Close { rx } => {
-                if let Some(generation) = st.receipts.gens.get_mut(key) {
-                    generation.links.remove(&rx);
+                let link = st
+                    .receipts
+                    .gens
+                    .get_mut(key)
+                    .and_then(|generation| generation.links.remove(&rx));
+                if let Some(link) = link {
+                    let signal = match link.kind {
+                        LinkKind::Once { .. } => WaiterSignal::Superseded,
+                        LinkKind::Stream | LinkKind::Hook => WaiterSignal::Close,
+                    };
+                    let _ = link.tx.try_send(signal);
+                    forget_waiter(st, key, link.conn_id);
                 }
             }
         }
@@ -1340,8 +1661,14 @@ fn also_reached(st: &mut HubState, key: &AgentKey, id: &str, a: u32) {
 
 /// The card notices for `key` now (§6.5).
 pub(super) fn notices(st: &HubState, key: &AgentKey, now: Instant) -> InboxCardNotices {
+    let integration = st.receipts.floors.get(key).and_then(|f| f.notice(now));
     let mut notices = InboxCardNotices {
-        integration: st.receipts.floors.get(key).and_then(|f| f.notice(now)),
+        integration,
+        // Part 2 §2.7: composed by the deck from its own install path, never
+        // from anything a hook sent.
+        integration_command: (integration == Some(IntegrationNotice::HooksTooOld))
+            .then(|| st.hooks_remedy.clone())
+            .flatten(),
         ..InboxCardNotices::default()
     };
     let Some(generation) = st.receipts.gens.get(key) else {

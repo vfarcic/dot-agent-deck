@@ -239,6 +239,7 @@ fn hand_over_request(
         doorbell: rung.map(str::to_string),
         adapter_integration: None,
         rx: None,
+        hook_integration: None,
     }
 }
 
@@ -273,6 +274,280 @@ fn hand_over(
         context,
         fetched: messages.into_iter().map(|message| message.id).collect(),
     })
+}
+
+/// Part 2 §1.2: what Claude's prompt hook hands the model when a doorbell
+/// started the prompt, fetched on a connection of its own as a one-shot
+/// receiver ([`crate::inbox_hub::HOOK_INTEGRATION`]). Its caps never leave
+/// [`crate::inbox_oneshot::OneShotBatch`].
+#[cfg(unix)]
+pub struct OneShotInjection {
+    connection: crate::inbox_oneshot::Connection,
+    batch: crate::inbox_oneshot::OneShotBatch,
+    grant_ttl: std::time::Duration,
+    framing: String,
+    hook_event_name: String,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for OneShotInjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotInjection")
+            .field("batch", &self.batch)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How long Claude's prompt hook waits for the deck's answer to its fetch,
+/// as [`crate::hook::request_from_socket`] does.
+#[cfg(unix)]
+const HOOK_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Part 2 §1.2: fetch what is waiting for this pane's agent, for the doorbell
+/// that named `rung`, within `budget` including `framing`, as a one-shot
+/// receiver of its own. `None` outside a deck pane, without a token, when the
+/// deck refuses or does not answer, or when nothing is waiting.
+#[cfg(unix)]
+pub fn one_shot_injection(
+    budget: InboxBudget,
+    framing: &str,
+    rung: &str,
+    hook_event_name: &str,
+) -> Option<OneShotInjection> {
+    let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
+        .ok()
+        .filter(|pane| !pane.is_empty())?;
+    let token = crate::hook_provenance::token_from_env()?;
+    let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
+        .ok()
+        .filter(|agent| !agent.is_empty());
+    let mut request = hand_over_request(
+        InboxFetchConsumer::DoorbellHook,
+        budget,
+        framing,
+        Some(rung),
+        pane_id,
+        agent_id,
+        token,
+    );
+    request.hook_integration = crate::inbox_oneshot::declared_hook_integration();
+    let json = serde_json::to_string(&DaemonMessage::InboxFetch(request)).ok()?;
+    let mut connection = crate::inbox_oneshot::Connection::open(
+        &crate::endpoint_resolve::client_socket_path(),
+        &json,
+    )
+    .ok()?;
+    let deadline = std::time::Instant::now() + HOOK_FETCH_WAIT;
+    let reply = loop {
+        let reply = connection.next(Some(deadline))?;
+        if !reply.keepalive {
+            break reply;
+        }
+    };
+    let grant_ttl = reply
+        .registered
+        .as_ref()
+        .and_then(|registered| registered.grant_ttl_ms)
+        .map_or(
+            crate::inbox::DEFAULT_ACK_WAIT,
+            std::time::Duration::from_millis,
+        );
+    let batch = crate::inbox_oneshot::OneShotBatch::new(reply.messages?);
+    if batch.is_empty() {
+        return None;
+    }
+    Some(OneShotInjection {
+        connection,
+        batch,
+        grant_ttl,
+        framing: framing.to_string(),
+        hook_event_name: hook_event_name.to_string(),
+    })
+}
+
+#[cfg(unix)]
+impl OneShotInjection {
+    /// The ids of the messages it carries.
+    pub fn ids(&self) -> Vec<String> {
+        self.batch.ids()
+    }
+
+    /// Hand the batch to the model as the hook's `additionalContext`, written
+    /// straight to stdout: a block whose bytes all went and were flushed is
+    /// committed, one partly written is possibly handed, one refused at its
+    /// fence or never started is not handed (part 2 §1.2).
+    pub fn print(mut self) {
+        let Ok(mut stdout) = raw_stdout() else {
+            return;
+        };
+        let parts = hook_output_parts(&self.hook_event_name, &self.framing, &self.batch);
+        let pieces = parts.pieces();
+        let pinned = pinned_spool();
+        self.batch.run(
+            &mut self.connection,
+            &pinned,
+            self.grant_ttl,
+            &mut stdout,
+            &pieces,
+            crate::inbox_oneshot::Receiver::Hook,
+            None,
+        );
+    }
+}
+
+/// This process's stdout as the descriptor itself, with no buffer between a
+/// write and the pipe.
+#[cfg(unix)]
+fn raw_stdout() -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsFd;
+    Ok(std::fs::File::from(
+        std::io::stdout().as_fd().try_clone_to_owned()?,
+    ))
+}
+
+/// The spool the deck pinned for this pane's agent.
+fn pinned_spool() -> crate::inbox_oneshot::Pinned {
+    let pane = std::env::var(DOT_AGENT_DECK_PANE_ID).unwrap_or_default();
+    let agent = std::env::var(DOT_AGENT_DECK_AGENT_ID).unwrap_or_default();
+    crate::inbox_oneshot::Pinned::from_env(&pane, &agent)
+}
+
+/// [`hook_output`]'s bytes for `framing` and `batch`, each block's escaped
+/// text a piece of its own, so the hand-over judges each block by what of it
+/// was written.
+pub struct HookOutputParts {
+    head: String,
+    separator: String,
+    blocks: Vec<String>,
+    tail: String,
+}
+
+impl HookOutputParts {
+    pub fn pieces(&self) -> Vec<crate::inbox_oneshot::Piece<'_>> {
+        use crate::inbox_oneshot::Piece;
+        let mut pieces = vec![Piece::Frame(self.head.as_bytes())];
+        for (i, block) in self.blocks.iter().enumerate() {
+            pieces.push(Piece::Frame(self.separator.as_bytes()));
+            pieces.push(Piece::Block(i, block.as_bytes()));
+        }
+        pieces.push(Piece::Frame(self.tail.as_bytes()));
+        pieces
+    }
+}
+
+/// The parts of the hook's stdout handing `framing` and `batch`'s blocks to
+/// the model: the same JSON [`hook_output`] prints for the joined context,
+/// then its newline.
+pub fn hook_output_parts(
+    hook_event_name: &str,
+    framing: &str,
+    batch: &crate::inbox_oneshot::OneShotBatch,
+) -> HookOutputParts {
+    let escaped = |text: &str| {
+        let quoted = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+        quoted[1..quoted.len() - 1].to_string()
+    };
+    let event = serde_json::to_string(hook_event_name).unwrap_or_else(|_| "\"\"".to_string());
+    HookOutputParts {
+        head: format!(
+            "{{\"hookSpecificOutput\":{{\"additionalContext\":\"{}",
+            escaped(framing)
+        ),
+        separator: escaped(crate::inbox_hub::BLOCK_SEPARATOR),
+        blocks: (0..batch.len())
+            .map(|i| escaped(batch.text(i).unwrap_or_default()))
+            .collect(),
+        tail: format!("\",\"hookEventName\":{event}}}}}\n"),
+    }
+}
+
+/// Part 2 §1.3: commit the exact attempts whose blocks `prompt` carries whole
+/// at its top level ([`delivered`]) — Claude submitted a once-waiter's
+/// notification. Each attempt's caps are read from its own caps file; for
+/// one found, its `committed` receipt is published on its commit cap and the
+/// attempt is named in an `inbox_committed` the deck admits from this
+/// agent's process tree. One whose caps file is missing (reclaimed, or never
+/// a one-shot's) commits nothing: that is no evidence the delivery did not
+/// happen, and its own lapse decides it. A caps file that is malformed or
+/// cannot be read commits nothing either, and tells the deck its receipts are
+/// degraded. Nothing is acknowledged by id. A deck that pinned no spool has
+/// written no caps file for any attempt, so the exact attempts are named
+/// with that said, and the authenticated connection is the witness.
+pub fn commit_delivered(prompt: &str) {
+    use crate::inbox_receipt::{CapsLookup, RecordKey, RecordStage};
+    let attempts = delivered(prompt);
+    if attempts.is_empty() {
+        return;
+    }
+    let Some(pane_id) = std::env::var(DOT_AGENT_DECK_PANE_ID)
+        .ok()
+        .filter(|pane| !pane.is_empty())
+    else {
+        return;
+    };
+    let Some(token) = crate::hook_provenance::token_from_env() else {
+        return;
+    };
+    let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
+        .ok()
+        .filter(|agent| !agent.is_empty());
+    let (committed, degraded) = match pinned_spool() {
+        crate::inbox_oneshot::Pinned::Unpinned => {
+            (attempts, Some("the deck has no receipt spool".to_string()))
+        }
+        crate::inbox_oneshot::Pinned::Failed(error) => (Vec::new(), Some(error)),
+        crate::inbox_oneshot::Pinned::Open(spool) => {
+            let mut committed = Vec::new();
+            let mut degraded = None;
+            for at in attempts {
+                match spool.read_caps_checked(&at.id, at.a, at.e) {
+                    CapsLookup::Found(caps) => {
+                        let key = RecordKey {
+                            msg: at.id.clone(),
+                            a: at.a,
+                            e: at.e,
+                            stage: RecordStage::Committed,
+                        };
+                        match spool.publish(&key, &caps.commit) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                            Err(error) => {
+                                degraded.get_or_insert_with(|| {
+                                    format!("a receipt could not be published: {error}")
+                                });
+                            }
+                        }
+                        committed.push(at);
+                    }
+                    CapsLookup::Missing => {}
+                    CapsLookup::Malformed => {
+                        degraded.get_or_insert_with(|| {
+                            "a delivery's receipt caps are malformed".to_string()
+                        });
+                    }
+                    CapsLookup::Failed(error) => {
+                        degraded.get_or_insert_with(|| {
+                            format!("a delivery's receipt caps could not be read: {error}")
+                        });
+                    }
+                }
+            }
+            (committed, degraded)
+        }
+    };
+    if committed.is_empty() && degraded.is_none() {
+        return;
+    }
+    let request = DaemonMessage::InboxCommitted(crate::event::InboxCommittedRequest {
+        pane_id,
+        agent_id,
+        token: Some(token),
+        attempts: committed,
+        degraded,
+    });
+    if let Ok(json) = serde_json::to_string(&request) {
+        let _ = crate::hook::request_from_socket(&json);
+    }
 }
 
 /// The hook's stdout handing `context` to the model with the prompt or
@@ -390,6 +665,87 @@ mod tests {
             );
             assert!(!request.ack, "{consumer:?}");
         }
+    }
+
+    /// Scenario: Claude's prompt hook hands a two-message batch over as additionalContext, one block's body full of characters JSON escapes. Its pieces, joined, are exactly the JSON the hook prints for the framing and both blocks, then a newline, each block a piece of its own; none of the batch's caps is in them or in the batch's debug output. Written to an output that fails partway through the second block, the first block is possibly handed (the hook's JSON never closed) and the second possibly handed too.
+    #[spec("inbox/receipt/030")]
+    #[test]
+    fn receipt_030_the_hooks_output_is_its_json_and_carries_no_cap() {
+        use crate::event::{InboxAttemptCaps, InboxDelivery, InboxDeliveryAttempt};
+        use crate::inbox_oneshot::{OneShotBatch, Output, Piece};
+        let handed = "0123456789abcdef0123456789abcdef";
+        let commit = "fedcba9876543210fedcba9876543210";
+        let block = |id: &str, body: &str| InboxDelivery {
+            id: id.to_string(),
+            subject: "s".to_string(),
+            from: "the orchestrator".to_string(),
+            text: format!(
+                "[dot-agent-deck message {id} delivery 1.1 from the orchestrator]\n{body}\n[end of dot-agent-deck message {id}]"
+            ),
+            attempt: Some(InboxDeliveryAttempt {
+                a: 1,
+                e: 1,
+                d: 1,
+                repeat: false,
+                caps: Some(InboxAttemptCaps {
+                    handed: handed.to_string(),
+                    commit: commit.to_string(),
+                }),
+            }),
+        };
+        let messages = vec![
+            block(ID, "quote \" slash \\ tab \t é"),
+            block(OTHER, "plain"),
+        ];
+        let joined = format!(
+            "framing{}{}{}{}",
+            crate::inbox_hub::BLOCK_SEPARATOR,
+            messages[0].text,
+            crate::inbox_hub::BLOCK_SEPARATOR,
+            messages[1].text
+        );
+        let batch = OneShotBatch::new(messages);
+        let parts = hook_output_parts("UserPromptSubmit", "framing", &batch);
+        let pieces = parts.pieces();
+        let bytes: Vec<u8> = pieces
+            .iter()
+            .flat_map(|piece| match piece {
+                Piece::Frame(bytes) | Piece::Block(_, bytes) => bytes.to_vec(),
+            })
+            .collect();
+        let printed = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            printed,
+            format!("{}\n", hook_output("UserPromptSubmit", &joined))
+        );
+        assert_eq!(
+            pieces
+                .iter()
+                .filter(|piece| matches!(piece, Piece::Block(..)))
+                .count(),
+            2
+        );
+        for cap in [handed, commit] {
+            assert!(!printed.contains(cap), "no cap in the hook's output");
+            assert!(!format!("{batch:?}").contains(cap), "no cap in its Debug");
+        }
+        struct Cut(usize);
+        impl std::io::Write for Cut {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let n = buf.len().min(self.0);
+                self.0 -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let second_starts = printed.find(OTHER).unwrap() - 30;
+        let hand = batch.hand_over(&mut Cut(second_starts + 10), &pieces, |_| Ok(()));
+        assert_eq!(hand.outputs, vec![Output::Possible, Output::Possible]);
     }
 
     #[test]

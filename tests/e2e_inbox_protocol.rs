@@ -147,9 +147,13 @@ fn armed(daemon: &DaemonProc, pane: &Pane, expected: u64) {
     );
 }
 
+/// A legacy Once waiter, armed from the test process. Claude's waiter is on
+/// receipts since PRD #1666 part 2's H3 (inbox/claude/006, inbox/boundary/052);
+/// the legacy once path these tests pin stays for any other component until
+/// H5 deletes it.
 fn waiter(daemon: &DaemonProc, pane: &Pane) -> BufReader<UnixStream> {
     let mut req = request(pane, "inbox_wait");
-    req["component"] = json!("claude_waiter");
+    req["component"] = json!("other");
     req["component_version"] = json!("synthetic-s2");
     req["mode"] = json!("once");
     req["session"] = json!({"source":"startup", "session_id":"inbox-s2"});
@@ -737,16 +741,19 @@ fn inbox_protocol_015_a_process_outside_the_agent_cannot_take_its_mail() {
     state(&daemon, &pane, &id, "acknowledged");
 }
 
-/// Scenario: With the daemon binding inbox components to the pane's agent, a process outside the pane sends a raw hook event with the pane's own token that names the agent's queued task as a prompt it observed. The task must stay Queued; the real Claude hook, run inside the pane for a prompt carrying that task's block, then acknowledges it.
+/// Scenario: With the daemon binding inbox components to the pane's agent, a process outside the pane sends a raw hook event with the pane's own token that names the agent's queued task as a prompt it observed. The task must stay Queued; the real Claude waiter, run inside the pane, is then handed the task, and the real Claude hook, run inside the pane for a prompt carrying the block the waiter wrote, commits it.
 #[spec("inbox/protocol/016")]
 #[test]
 fn inbox_protocol_016_a_raw_event_from_outside_the_agent_acknowledges_nothing() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let script = daemon.home.join("hook.sh");
-    std::fs::write(&script, "#!/bin/sh\nwhile [ ! -f hook-go ]; do sleep 0.05; done\n\"$INBOX_TEST_BIN\" hook --agent claude-code < prompt.json > hook.stdout 2> hook.stderr\nprintf '%s' \"$?\" > hook.exit\nexec /bin/cat\n").unwrap();
+    std::fs::write(&script, "#!/bin/sh\nwhile [ ! -f wait-go ]; do sleep 0.05; done\n\"$INBOX_TEST_BIN\" inbox wait --agent claude-code < /dev/null > wait.stdout 2> wait.stderr\nprintf '%s' \"$?\" > wait.exit\nwhile [ ! -f hook-go ]; do sleep 0.05; done\n\"$INBOX_TEST_BIN\" hook --agent claude-code < prompt.json > hook.stdout 2> hook.stderr\nprintf '%s' \"$?\" > hook.exit\nexec /bin/cat\n").unwrap();
     // Quote only fixture-owned paths; the binary path contains no shell code.
+    // `exec` makes the script the agent's own process: a shell under the
+    // launch shell would read as a nested agent of the same kind, and the
+    // receiver check refuses the waiter it runs.
     let command = format!(
-        "INBOX_TEST_BIN='{}' /bin/sh '{}'",
+        "exec env INBOX_TEST_BIN='{}' /bin/sh '{}'",
         env!("CARGO_BIN_EXE_dot-agent-deck").replace('\'', "'\\''"),
         script.display()
     );
@@ -765,9 +772,24 @@ fn inbox_protocol_016_a_raw_event_from_outside_the_agent_acknowledges_nothing() 
     let after_event = line(&mut socket);
     assert!(after_event["messages"].is_array(), "{after_event}");
     state(&daemon, &pane, &id, "queued");
-    let prompt = format!(
-        "<task-notification>[dot-agent-deck message {id} from deck]\n{BODY}\n[end of dot-agent-deck message {id}]</task-notification>"
+    std::fs::write(daemon.home.join("wait-go"), b"go").unwrap();
+    assert!(
+        common::wait_until(WAIT, || std::fs::read_to_string(
+            daemon.home.join("wait.exit")
+        )
+        .is_ok_and(|text| !text.is_empty())),
+        "the in-pane waiter must hand the task over"
     );
+    assert_eq!(
+        std::fs::read_to_string(daemon.home.join("wait.exit")).unwrap(),
+        "2"
+    );
+    let block = std::fs::read_to_string(daemon.home.join("wait.stderr")).unwrap();
+    assert!(
+        block.contains(&format!("[dot-agent-deck message {id} delivery 1.1 from ")),
+        "{block}"
+    );
+    let prompt = format!("<task-notification>{block}</task-notification>");
     std::fs::write(
         daemon.home.join("prompt.json"),
         json!({"session_id":"in-pane", "hook_event_name":"UserPromptSubmit",
@@ -798,7 +820,7 @@ fn inbox_protocol_016_a_raw_event_from_outside_the_agent_acknowledges_nothing() 
                 .to_ascii_lowercase()
                 .contains("acknowledged")
         }),
-        "the in-pane hook must acknowledge the observed task: {}",
+        "the in-pane hook must commit the task it was handed: {}",
         latest.borrow()
     );
     state(&daemon, &pane, &id, "acknowledged");
@@ -1040,7 +1062,7 @@ fn inbox_cli_002_claude_waiter_exits_two_with_stderr() {
     let text = String::from_utf8_lossy(&result.stderr);
     assert!(
         text.contains(BODY)
-            && text.contains(&format!("[dot-agent-deck message {id} from "))
+            && text.contains(&format!("[dot-agent-deck message {id} delivery 1.1 from "))
             && text.contains(&format!("[end of dot-agent-deck message {id}]")),
         "waiter stderr: {text}"
     );
@@ -1192,9 +1214,19 @@ fn inbox_cli_005_a_doorbell_fetch_names_its_message_in_the_one_request() {
     let block = format!(
         "[dot-agent-deck message {id} from the orchestrator]\nwork\n[end of dot-agent-deck message {id}]"
     );
+    // Claude's prompt hook fetches as a one-shot receiver: its batch names
+    // each attempt and carries its caps, and its `may` is answered.
     let reply = |request: &Value| match request["message_type"].as_str() {
+        Some("inbox_fetch") if request["hook_integration"].is_u64() => Some(json!({
+            "registered":{"rx":1, "slot":"hook", "keepalive_ms":1000, "grant_ttl_ms":5000},
+            "messages":[{"id":id, "subject":"task", "from":"the orchestrator", "text":block,
+                "a":1, "e":1, "d":1, "caps":{"handed":"00000000000000000000000000000000",
+                "commit":"11111111111111111111111111111111"}}]})),
         Some("inbox_fetch") => Some(json!({"messages":[{"id":id, "subject":"task",
             "from":"the orchestrator", "text":block}]})),
+        None if request["may"].is_object() => {
+            Some(json!({"grant":{"q":request["may"]["q"], "ok":true}}))
+        }
         Some("inbox_list") => Some(json!({"messages":[{"id":id, "state":"queued",
             "subject":"task"}], "armed":0})),
         Some("ack") => Some(json!({"kind":"signal_ack", "accepted":true,
@@ -1233,6 +1265,7 @@ fn inbox_cli_005_a_doorbell_fetch_names_its_message_in_the_one_request() {
         .collect();
     assert_eq!(fetches.len(), 1, "{requests:?}");
     assert_eq!(fetches[0]["doorbell"], id, "{requests:?}");
+    assert_eq!(fetches[0]["hook_integration"], 1, "{requests:?}");
     assert!(
         !requests.iter().any(|r| r["message_type"] == "inbox_list"),
         "{requests:?}"

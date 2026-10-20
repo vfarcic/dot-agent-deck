@@ -58,13 +58,17 @@ pub const ENV_TEST_REBIND_DELAY_MS: &str = "DOT_AGENT_DECK_INBOX_TEST_REBIND_DEL
 /// report a stage to a replacement watcher before it has registered.
 pub const ENV_TEST_REGISTER_DELAY_MS: &str = "DOT_AGENT_DECK_INBOX_TEST_REGISTER_DELAY_MS";
 
-/// Every TEST knob above. A spawned agent inherits none of them from the
-/// daemon's environment (`agent_pty`); a test sets one explicitly.
-pub const TEST_KNOBS: [&str; 4] = [
+/// Every TEST knob above, and the one-shot receivers'
+/// ([`crate::inbox_oneshot::ENV_TEST_HOOK_INTEGRATION`],
+/// [`crate::inbox_oneshot::ENV_TEST_EXIT_AFTER_GRANT`]). A spawned agent
+/// inherits none of them from the daemon's environment (`agent_pty`); a test sets one explicitly.
+pub const TEST_KNOBS: [&str; 6] = [
     ENV_TEST_PUBLISH_DELAY_MS,
     ENV_TEST_DROP_COMMITTED,
     ENV_TEST_REBIND_DELAY_MS,
     ENV_TEST_REGISTER_DELAY_MS,
+    crate::inbox_oneshot::ENV_TEST_HOOK_INTEGRATION,
+    crate::inbox_oneshot::ENV_TEST_EXIT_AFTER_GRANT,
 ];
 
 #[cfg(not(unix))]
@@ -666,6 +670,7 @@ mod unix {
                     rx: 5,
                     slot: "opencode_tui".into(),
                     keepalive_ms: 30_000,
+                    grant_ttl_ms: None,
                 }),
                 correctable: vec![InboxCorrectable {
                     id: listed.id.clone(),

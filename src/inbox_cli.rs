@@ -6,7 +6,7 @@
 //! capability token the deck put in the pane's environment; the daemon acts
 //! only for the agent the token attests.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -163,6 +163,11 @@ pub fn wait(agent: &str, stream: bool, receipt: Receipt) -> ExitCode {
         adapter_integration: receipt.adapter_integration,
         doorbell_only: receipt.doorbell_only,
         resumed: receipt.resumed,
+        hook_integration: if stream {
+            None
+        } else {
+            crate::inbox_oneshot::declared_hook_integration()
+        },
     });
     let Ok(json) = serde_json::to_string(&request) else {
         return ExitCode::SUCCESS;
@@ -220,9 +225,6 @@ fn exit_when_orphaned() {
     });
 }
 
-#[cfg(not(unix))]
-fn exit_when_orphaned() {}
-
 /// The parent of process `pid`, from `/proc/<pid>/stat`; `None` once it is
 /// gone or where there is no `/proc`.
 #[cfg(target_os = "linux")]
@@ -238,52 +240,98 @@ fn parent_of(_pid: u32) -> Option<u32> {
     None
 }
 
+/// Claude's once-waiter on receipts (part 2 §1.1): register, take one
+/// batch, and hand it to Claude through stderr — asking `may` for every
+/// attempt and fencing each block right before its first byte — then publish
+/// a `handed` receipt for every block any byte of which went, on the
+/// attempt's own handed cap from its caps file, and report every attempt.
+/// The commit comes later, from the prompt hook that sees the block in
+/// Claude's notification. Exits 2 when anything reached stderr, 1 when
+/// nothing of the batch did, and 0, silent, when no batch came.
+#[cfg(unix)]
 fn wait_once(json: &str) -> ExitCode {
+    use crate::inbox_oneshot::{Connection, OneShotBatch, Piece, Pinned, Receiver};
     exit_when_orphaned();
     let path = crate::endpoint_resolve::client_socket_path();
-    let Ok(mut socket) = crate::platform::ipc::IpcClient::connect(&path) else {
+    let Ok(mut connection) = Connection::open(&path, json) else {
         return ExitCode::SUCCESS;
     };
-    if socket
-        .write_all(format!("{json}\n").as_bytes())
-        .and_then(|()| socket.flush())
-        .is_err()
-    {
-        return ExitCode::SUCCESS;
-    }
-    let mut reader = BufReader::new(socket);
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return ExitCode::SUCCESS,
-            Ok(_) => {}
-        }
-        let Ok(reply) = serde_json::from_str::<InboxWaitReply>(&line) else {
+    let mut grant_ttl = crate::inbox::DEFAULT_ACK_WAIT;
+    let messages = loop {
+        let Some(reply) = connection.next(None) else {
             return ExitCode::SUCCESS;
         };
         if reply.keepalive {
             continue;
         }
-        let Some(messages) = reply.messages.filter(|m| !m.is_empty()) else {
-            return ExitCode::SUCCESS;
-        };
-        let text = messages
-            .iter()
-            .map(|m| m.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let mut stderr = std::io::stderr().lock();
-        return if writeln!(stderr, "{text}")
-            .and_then(|()| stderr.flush())
-            .is_ok()
-        {
-            ExitCode::from(2)
-        } else {
-            // Nothing reached Claude; the deck's ack-wait hands the messages
-            // over again.
-            ExitCode::FAILURE
-        };
+        if let Some(registered) = &reply.registered {
+            if let Some(ms) = registered.grant_ttl_ms {
+                grant_ttl = Duration::from_millis(ms);
+            }
+            if reply.messages.is_none() {
+                continue;
+            }
+        }
+        if reply.messages.is_none() && !reply.revoke.is_empty() {
+            connection.hold(reply);
+            continue;
+        }
+        // A refusal, a supersession, an empty batch: nothing to wake for.
+        match reply.messages {
+            Some(messages) if !messages.is_empty() => break messages,
+            _ => return ExitCode::SUCCESS,
+        }
+    };
+    let mut batch = OneShotBatch::new(messages);
+    if batch.is_empty() {
+        return ExitCode::SUCCESS;
     }
+    let (pane, agent) = (
+        std::env::var(DOT_AGENT_DECK_PANE_ID).unwrap_or_default(),
+        std::env::var(DOT_AGENT_DECK_AGENT_ID).unwrap_or_default(),
+    );
+    let pinned = Pinned::from_env(&pane, &agent);
+    let degraded = match &pinned {
+        Pinned::Open(spool) => batch.caps_from(spool),
+        _ => None,
+    };
+    let Ok(mut stderr) = raw_stderr() else {
+        return ExitCode::FAILURE;
+    };
+    let mut pieces = batch.plain_pieces("", crate::inbox_hub::BLOCK_SEPARATOR);
+    pieces.push(Piece::Frame(b"\n"));
+    let ran = batch.run(
+        &mut connection,
+        &pinned,
+        grant_ttl,
+        &mut stderr,
+        &pieces,
+        Receiver::Waiter,
+        degraded,
+    );
+    if ran.handed_any() {
+        ExitCode::from(2)
+    } else {
+        // Nothing reached Claude, and the deck was told so.
+        ExitCode::FAILURE
+    }
+}
+
+/// This process's stderr as the descriptor itself, with no buffer between a
+/// write and the pipe, so every byte a write accepted is one Claude can read.
+#[cfg(unix)]
+fn raw_stderr() -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsFd;
+    Ok(std::fs::File::from(
+        std::io::stderr().as_fd().try_clone_to_owned()?,
+    ))
+}
+
+/// The one-shot receipt protocol runs on Unix only, as the receipt stream
+/// does: elsewhere the waiter exits quietly and the doorbell reaches Claude.
+#[cfg(not(unix))]
+fn wait_once(_json: &str) -> ExitCode {
+    ExitCode::SUCCESS
 }
 
 /// Send one inbox request and read its one-line answer.
@@ -388,6 +436,7 @@ fn fetch_with(
         doorbell: doorbell.map(str::to_string),
         adapter_integration,
         rx,
+        hook_integration: None,
     });
     let line = match send(&message) {
         Ok(line) => line,

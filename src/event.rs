@@ -1738,6 +1738,11 @@ pub enum DaemonMessage {
     /// [`InboxWaitReply`] carrying `messages`.
     #[serde(rename = "inbox_fetch")]
     InboxFetch(InboxFetchRequest),
+    /// PRD #1666 part 2 §1.3: Claude's prompt hook commits the exact
+    /// attempts whose blocks a submitted prompt carried, after publishing
+    /// each one's `committed` receipt. Answered with an [`InboxWaitReply`].
+    #[serde(rename = "inbox_committed")]
+    InboxCommitted(InboxCommittedRequest),
     /// PRD #1666: list the caller's inbox (and with `all`, an orchestrator's
     /// scope). Answered with an [`InboxListReply`].
     #[serde(rename = "inbox_list")]
@@ -1795,6 +1800,7 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(r) => &r.pane_id,
             DaemonMessage::InboxAnnounce(r) => &r.pane_id,
             DaemonMessage::InboxFetch(r) => &r.pane_id,
+            DaemonMessage::InboxCommitted(r) => &r.pane_id,
             DaemonMessage::InboxList(r) => &r.pane_id,
             DaemonMessage::InboxPublish(r) => &r.pane_id,
             DaemonMessage::InboxOffer(r) => &r.pane_id,
@@ -1818,6 +1824,7 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(r) => r.token.as_deref(),
             DaemonMessage::InboxAnnounce(r) => r.token.as_deref(),
             DaemonMessage::InboxFetch(r) => r.token.as_deref(),
+            DaemonMessage::InboxCommitted(r) => r.token.as_deref(),
             DaemonMessage::InboxList(r) => r.token.as_deref(),
             DaemonMessage::InboxPublish(r) => r.token.as_deref(),
             DaemonMessage::InboxOffer(r) => r.token.as_deref(),
@@ -1835,6 +1842,7 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxCommitted(_)
             | DaemonMessage::InboxList(_)
             | DaemonMessage::InboxPublish(_)
             | DaemonMessage::InboxOffer(_)
@@ -1859,6 +1867,7 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxAnnounce(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxFetch(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxCommitted(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxList(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxPublish(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxOffer(r) => r.agent_id.as_deref(),
@@ -1893,6 +1902,7 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(_) => "inbox_wait",
             DaemonMessage::InboxAnnounce(_) => "inbox_announce",
             DaemonMessage::InboxFetch(_) => "inbox_fetch",
+            DaemonMessage::InboxCommitted(_) => "inbox_committed",
             DaemonMessage::InboxList(_) => "inbox_list",
             DaemonMessage::InboxPublish(_) => "inbox_publish",
             DaemonMessage::InboxOffer(_) => "inbox_offer",
@@ -1956,6 +1966,7 @@ impl DaemonMessage {
             // learns nothing about what the pane holds.
             DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxCommitted(_)
             | DaemonMessage::InboxList(_) => {
                 serde_json::to_string(&InboxWaitReply::refused(reason, message))
             }
@@ -2022,6 +2033,7 @@ impl DaemonMessage {
             | DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxCommitted(_)
             | DaemonMessage::InboxList(_)
             | DaemonMessage::InboxPublish(_)
             | DaemonMessage::InboxOffer(_)
@@ -3397,6 +3409,11 @@ pub struct InboxWaitRequest {
     /// its `not_handed` resume answers are believed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resumed: bool,
+    /// PRD #1666 part 2 §2.7: the one-shot receipt integration this binary
+    /// speaks ([`crate::inbox_hub::HOOK_INTEGRATION`]). A Claude once-waiter
+    /// without it, or below it, is refused before anything is issued to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_integration: Option<u32>,
 }
 
 /// PRD #1666 §2, §4: one attempt, by its identity. Every control on the
@@ -3532,6 +3549,10 @@ pub struct InboxRegistered {
     /// its component for three of them closes the stream (§4 "Dead adapter,
     /// live watcher").
     pub keepalive_ms: u64,
+    /// PRD #1666 part 2 §2.5: for a one-shot receiver, how long a `may`
+    /// approval stays usable, counted from when it asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_ttl_ms: Option<u64>,
 }
 
 /// PRD #1666 §5: caps for attempts a doorbell fetch issued to this
@@ -3598,6 +3619,28 @@ pub struct InboxFetchRequest {
     /// possession.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rx: Option<u64>,
+    /// PRD #1666 part 2 §2.4, §2.7: the one-shot receipt integration of a
+    /// hook that fetches as a receiver of its own
+    /// ([`crate::inbox_hub::HOOK_INTEGRATION`]): the connection stays open
+    /// for its `may` and stage controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_integration: Option<u32>,
+}
+
+/// PRD #1666 part 2 §1.3: payload of [`DaemonMessage::InboxCommitted`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxCommittedRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The exact attempts a submitted prompt carried whole.
+    #[serde(default)]
+    pub attempts: Vec<InboxAttemptRef>,
+    /// Why a commit could not be recorded in the spool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
 }
 
 /// Payload of [`DaemonMessage::InboxList`].

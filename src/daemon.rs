@@ -992,6 +992,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let event_tx = daemon.event_tx;
     // PRD #1666 S3: every inbox state change reaches attached clients.
     pty_registry.inbox().set_broadcast(event_tx.clone());
+    // PRD #1666 part 2 §2.7: what a card tells the user to run when an
+    // agent's hooks run a dot-agent-deck too old for its messages, composed
+    // from this deck's own install path.
+    {
+        let deck = state.read().await.hook_binaries.deck().clone();
+        let remedy =
+            crate::hook_binary::remedy_for(&deck, false, &[crate::event::AgentType::ClaudeCode]);
+        pty_registry.inbox().set_hooks_remedy(remedy.command);
+    }
     // Issue #424: give the spawn-time delivery path a way to REPORT a failed
     // delivery as state on the pane's card instead of typing a diagnostic line
     // into the agent's input buffer. See `install_delivery_notice_sink`.
@@ -5481,6 +5490,39 @@ fn pi_generation(registry: &AgentPtyRegistry, pane_id: &str, agent_id: &str) -> 
             == Some(crate::event::InboxComponent::PiExtension)
 }
 
+/// Part 2 §2.4: whether `req` is a Claude hook's fetch — a doorbell or
+/// turn-end hand-over — which is served as a one-shot receiver of its own
+/// ([`crate::inbox_hub::serve_hook`]): one that declares the one-shot
+/// integration (only Claude's hook does, until H4), or one from a generation
+/// known to be Claude Code, by its spawn or by the Claude component it
+/// announced, so an older hook there meets the floor. A pane started from a
+/// bare command carries no spawn type, which is why the declaration and the
+/// announcement count. A CLI fetch stays on the legacy path until H4.
+fn claude_hook_fetch(
+    registry: &AgentPtyRegistry,
+    req: &crate::event::InboxFetchRequest,
+    agent_id: &str,
+) -> bool {
+    use crate::event::{InboxComponent, InboxFetchConsumer};
+    matches!(
+        req.consumer,
+        InboxFetchConsumer::DoorbellHook | InboxFetchConsumer::TurnEndHook
+    ) && req.rx.is_none()
+        && (req.hook_integration.is_some()
+            || registry.spawn_agent_type(agent_id) == Some(crate::event::AgentType::ClaudeCode)
+            || matches!(
+                registry.inbox().announced_component(&req.pane_id, agent_id),
+                Some(InboxComponent::ClaudeHooks | InboxComponent::ClaudeWaiter)
+            ))
+}
+
+/// The budget a fetch asked for: `max_bytes` when set, else `max_chars`.
+fn fetch_budget(req: &crate::event::InboxFetchRequest) -> Option<crate::event::InboxBudget> {
+    req.max_bytes
+        .map(crate::event::InboxBudget::Bytes)
+        .or(req.max_chars.map(crate::event::InboxBudget::Chars))
+}
+
 fn handle_inbox_fetch(
     registry: &AgentPtyRegistry,
     req: &crate::event::InboxFetchRequest,
@@ -5493,10 +5535,7 @@ fn handle_inbox_fetch(
         InboxFetchConsumer::TurnEndHook => (Consumer::TurnEndHook, AckHow::HookHandover),
         InboxFetchConsumer::DoorbellHook => (Consumer::DoorbellHook, AckHow::HookHandover),
     };
-    let budget = req
-        .max_bytes
-        .map(crate::event::InboxBudget::Bytes)
-        .or(req.max_chars.map(crate::event::InboxBudget::Chars));
+    let budget = fetch_budget(req);
     let doorbell = req
         .doorbell
         .as_deref()
@@ -6128,6 +6167,7 @@ async fn run_hook_loop_with_limits(
                                         adapter_integration: req.adapter_integration,
                                         doorbell_only: req.doorbell_only,
                                         resumed: req.resumed,
+                                        hook_integration: req.hook_integration,
                                     };
                                     crate::inbox_hub::serve_waiter(
                                         hub,
@@ -6215,6 +6255,56 @@ async fn run_hook_loop_with_limits(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
+                                    // Part 2 §2.4, §2.7: a Claude hook's fetch is
+                                    // a one-shot receiver of its own, held on
+                                    // this connection for its controls; below
+                                    // the integration floor nothing is issued
+                                    // ([`crate::inbox_hub::serve_hook`]).
+                                    if claude_hook_fetch(&pty_registry, &req, &agent_id) {
+                                        if !mail_taker_admitted(
+                                            &pty_registry,
+                                            peer_pid,
+                                            &agent_id,
+                                            "inbox_fetch",
+                                            &req.pane_id,
+                                        ) {
+                                            let reply = crate::event::InboxWaitReply::refused(
+                                                INBOX_NOT_AGENT_PROCESS,
+                                                INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                            );
+                                            if let Ok(json) = serde_json::to_string(&reply) {
+                                                let line = format!("{json}\n");
+                                                let _ = write_half.write_all(line.as_bytes()).await;
+                                                let _ = write_half.flush().await;
+                                            }
+                                            continue;
+                                        }
+                                        let hub = Arc::clone(pty_registry.inbox());
+                                        info!(
+                                            pane_id = %escape_id_for_log(&req.pane_id),
+                                            consumer = ?req.consumer,
+                                            "Received a hook receiver's inbox fetch"
+                                        );
+                                        drop(permit.take());
+                                        crate::inbox_hub::serve_hook(
+                                            hub,
+                                            req.pane_id.clone(),
+                                            agent_id,
+                                            crate::event::InboxComponent::ClaudeHooks,
+                                            crate::inbox_hub::HookFetch {
+                                                named: req
+                                                    .doorbell
+                                                    .clone()
+                                                    .filter(|id| crate::inbox::is_valid_message_id(id)),
+                                                budget: fetch_budget(&req),
+                                                hook_integration: req.hook_integration,
+                                            },
+                                            reader,
+                                            write_half,
+                                        )
+                                        .await;
+                                        return;
+                                    }
                                     let reply = if mail_taker_admitted(
                                         &pty_registry,
                                         peer_pid,
@@ -6223,6 +6313,46 @@ async fn run_hook_loop_with_limits(
                                         &req.pane_id,
                                     ) {
                                         handle_inbox_fetch(&pty_registry, &req, &agent_id)
+                                    } else {
+                                        crate::event::InboxWaitReply::refused(
+                                            INBOX_NOT_AGENT_PROCESS,
+                                            INBOX_NOT_AGENT_PROCESS_MESSAGE,
+                                        )
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::InboxCommitted(req) => {
+                                    let Some(agent_id) = attested_agent else {
+                                        continue;
+                                    };
+                                    // Part 2 §1.3: admitted from the agent's own
+                                    // process tree, as `ack` is, for the
+                                    // generation the token attests.
+                                    let reply = if mail_taker_admitted(
+                                        &pty_registry,
+                                        peer_pid,
+                                        &agent_id,
+                                        "inbox_committed",
+                                        &req.pane_id,
+                                    ) {
+                                        let applied = pty_registry.inbox().one_shot_committed(
+                                            &req.pane_id,
+                                            &agent_id,
+                                            &req.attempts,
+                                            req.degraded.as_deref(),
+                                        );
+                                        info!(
+                                            pane_id = %escape_id_for_log(&req.pane_id),
+                                            attempts = req.attempts.len(),
+                                            applied,
+                                            degraded = req.degraded.is_some(),
+                                            "Received a prompt's exact commits"
+                                        );
+                                        crate::event::InboxWaitReply::default()
                                     } else {
                                         crate::event::InboxWaitReply::refused(
                                             INBOX_NOT_AGENT_PROCESS,

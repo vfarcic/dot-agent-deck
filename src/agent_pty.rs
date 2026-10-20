@@ -24991,7 +24991,10 @@ mod spawn_tests {
         registry.shutdown_all();
         assert_eq!(
             text.expect("the child reported its environment").trim(),
-            "unset unset 7 unset",
+            (0..knobs.len())
+                .map(|i| if i == 2 { "7" } else { "unset" })
+                .collect::<Vec<_>>()
+                .join(" "),
             "only the knob the spawn set reaches the child"
         );
     }

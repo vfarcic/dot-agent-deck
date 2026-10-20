@@ -23,8 +23,8 @@
 //! string, an underlying writer's error — so it makes no claim about what
 //! that text holds.
 //!
-//! Inert: nothing in production calls it yet. H3 wires Claude's waiter and
-//! prompt hook to it, H4 the other hooks and `inbox fetch`.
+//! Claude Code's waiter and prompt hook run it since H3 ([`Connection`] is
+//! their side of the socket); H4 wires the other hooks and `inbox fetch`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
@@ -140,6 +140,48 @@ impl OneShotBatch {
     /// Block `i`'s text, as the daemon rendered it.
     pub fn text(&self, i: usize) -> Option<&str> {
         self.blocks.get(i).map(|block| block.text.as_str())
+    }
+
+    /// The message ids of the batch, in order.
+    pub fn ids(&self) -> Vec<String> {
+        self.blocks
+            .iter()
+            .map(|block| block.at.id.clone())
+            .collect()
+    }
+
+    /// Part 2 §1.1: a once-waiter's batch carries no caps; each attempt's
+    /// are read from its own caps file, by its exact `(id, A, e)`. Answers
+    /// the first attempt whose caps could not be read, worded for the
+    /// generation's degraded notice; that attempt publishes nothing.
+    pub fn caps_from(&mut self, spool: &GenerationSpool) -> Option<String> {
+        use crate::inbox_receipt::CapsLookup;
+        let mut first = None;
+        for block in &mut self.blocks {
+            match spool.read_caps_checked(&block.at.id, block.at.a, block.at.e) {
+                CapsLookup::Found(caps) => {
+                    block.caps = Some(InboxAttemptCaps {
+                        handed: caps.handed.hex(),
+                        commit: caps.commit.hex(),
+                    });
+                }
+                CapsLookup::Missing => {
+                    first
+                        .get_or_insert_with(|| "a delivery's receipt caps are missing".to_string());
+                }
+                CapsLookup::Malformed => {
+                    first.get_or_insert_with(|| {
+                        "a delivery's receipt caps are malformed".to_string()
+                    });
+                }
+                CapsLookup::Failed(error) => {
+                    first.get_or_insert_with(|| {
+                        format!("a delivery's receipt caps could not be read: {error}")
+                    });
+                }
+            }
+        }
+        first
     }
 
     /// The pieces of a plain-text hand-over: `head`, then each block with
@@ -458,7 +500,7 @@ impl std::fmt::Display for FenceRefusal {
 /// once seen, refuses every later block too.
 pub struct Fence<'a, I> {
     approval: &'a Approval,
-    spool: &'a GenerationSpool,
+    spool: Option<&'a GenerationSpool>,
     incoming: I,
     ended: Option<FenceRefusal>,
     revoked: BTreeSet<Key>,
@@ -468,7 +510,20 @@ impl<'a, I: Incoming> Fence<'a, I> {
     pub fn new(approval: &'a Approval, spool: &'a GenerationSpool, incoming: I) -> Self {
         Fence {
             approval,
-            spool,
+            spool: Some(spool),
+            incoming,
+            ended: None,
+            revoked: BTreeSet::new(),
+        }
+    }
+
+    /// [`Self::new`] for a one-shot of a deck that pinned no spool
+    /// ([`Pinned::Unpinned`]): there is no revoke marker to read, since that
+    /// deck writes none, so only the approval and the connection fence it.
+    pub fn unpinned(approval: &'a Approval, incoming: I) -> Self {
+        Fence {
+            approval,
+            spool: None,
             incoming,
             ended: None,
             revoked: BTreeSet::new(),
@@ -498,7 +553,10 @@ impl<'a, I: Incoming> Fence<'a, I> {
         if self.revoked.contains(&key(at)) {
             return Err(FenceRefusal::Revoked);
         }
-        match self.spool.revoke_state(&at.id, at.a, at.e) {
+        let Some(spool) = self.spool else {
+            return Ok(());
+        };
+        match spool.revoke_state(&at.id, at.a, at.e) {
             RevokeState::NotRevoked => Ok(()),
             RevokeState::Revoked => Err(FenceRefusal::RevokeMarker),
             RevokeState::Unreadable(error) => {
@@ -582,6 +640,303 @@ pub fn classify_frame(frame: &[u8], accepted: Option<usize>, flushed: bool) -> O
         Some(n) if n < frame.len() && frame.last() == Some(&b'\n') => Output::NotHanded,
         Some(n) if n >= frame.len() && flushed => Output::Written,
         _ => Output::Possible,
+    }
+}
+
+/// The generation spool the deck pinned for this process, as a one-shot
+/// finds it.
+#[derive(Debug)]
+pub enum Pinned {
+    Open(GenerationSpool),
+    /// The deck pinned no spool: it runs without one, and says so on the
+    /// agent's card.
+    Unpinned,
+    /// The pinned spool could not be opened; worded for the generation's
+    /// degraded notice.
+    Failed(String),
+}
+
+impl Pinned {
+    /// The spool [`crate::inbox_receipt::ENV_INBOX_SPOOL`] names for the
+    /// agent `agent_id` in `pane_id`.
+    pub fn from_env(pane_id: &str, agent_id: &str) -> Pinned {
+        match std::env::var_os(crate::inbox_receipt::ENV_INBOX_SPOOL) {
+            None => Pinned::Unpinned,
+            Some(path) => match open_pinned(Path::new(&path), pane_id, agent_id) {
+                Ok(spool) => Pinned::Open(spool),
+                Err(error) => Pinned::Failed(error),
+            },
+        }
+    }
+}
+
+/// What [`OneShotBatch::run`] did with a batch.
+#[derive(Debug)]
+pub struct Ran {
+    pub outputs: Vec<Output>,
+    /// The write or flush error that stopped the hand-over, if one did.
+    pub error: Option<io::Error>,
+}
+
+impl Ran {
+    /// Whether any byte of any block reached the agent.
+    pub fn handed_any(&self) -> bool {
+        self.outputs
+            .iter()
+            .any(|output| *output != Output::NotHanded)
+    }
+}
+
+#[cfg(unix)]
+impl OneShotBatch {
+    /// The whole one-shot sequence on `connection` (part 2 §1.1, §1.2): ask
+    /// `may` for every attempt and read the answers; with nothing awaited
+    /// after them, fence each block right before its first byte and write
+    /// `pieces` to `out`; publish each attempt's receipt into `pinned`; then
+    /// report every attempt on the connection, `degraded` added to the first
+    /// publish failure. A spool that is pinned but cannot be opened fails
+    /// every fence closed: the deck may have marked a block revoked, and
+    /// nothing here can read that.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run<W: Write>(
+        &self,
+        connection: &mut Connection,
+        pinned: &Pinned,
+        grant_ttl: Duration,
+        out: &mut W,
+        pieces: &[Piece<'_>],
+        receiver: Receiver,
+        degraded: Option<String>,
+    ) -> Ran {
+        let approval = connection.approve(self, grant_ttl);
+        #[cfg(feature = "e2e")]
+        if std::env::var_os(ENV_TEST_EXIT_AFTER_GRANT).is_some() {
+            std::process::exit(0);
+        }
+        let hand = match pinned {
+            Pinned::Open(spool) => {
+                let mut fence = Fence::new(&approval, spool, connection.arrivals());
+                self.hand_over(out, pieces, |at| fence.check(at, Instant::now()))
+            }
+            Pinned::Unpinned => {
+                let mut fence = Fence::unpinned(&approval, connection.arrivals());
+                self.hand_over(out, pieces, |at| fence.check(at, Instant::now()))
+            }
+            Pinned::Failed(_) => HandOver {
+                outputs: vec![Output::NotHanded; self.len()],
+                error: None,
+            },
+        };
+        let published = match pinned {
+            Pinned::Open(spool) => self.publish(Some(spool), &hand.outputs, receiver),
+            Pinned::Unpinned => self.publish(None, &hand.outputs, receiver),
+            Pinned::Failed(error) => Some(error.clone()),
+        };
+        let line = self.controls(&hand.outputs, receiver, degraded.or(published));
+        let _ = connection.send(&line);
+        connection.finish();
+        Ran {
+            outputs: hand.outputs,
+            error: hand.error,
+        }
+    }
+}
+
+/// TEST knob, read only by a build with the `e2e` feature: the one-shot
+/// integration this process declares instead of
+/// [`crate::inbox_hub::HOOK_INTEGRATION`] — a number, or `none` to declare
+/// nothing — so a test can stand in for an older dot-agent-deck named in an
+/// agent's hook settings.
+pub const ENV_TEST_HOOK_INTEGRATION: &str = "DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION";
+
+/// TEST knob, read only by a build with the `e2e` feature: the one-shot
+/// exits as soon as its `may` questions are answered, before it writes a
+/// byte, as a hook killed between its grant and its print would.
+pub const ENV_TEST_EXIT_AFTER_GRANT: &str = "DOT_AGENT_DECK_INBOX_TEST_EXIT_AFTER_GRANT";
+
+/// The one-shot integration this process declares (part 2 §2.7).
+pub fn declared_hook_integration() -> Option<u32> {
+    #[cfg(feature = "e2e")]
+    if let Ok(raw) = std::env::var(ENV_TEST_HOOK_INTEGRATION) {
+        return raw.trim().parse().ok();
+    }
+    Some(crate::inbox_hub::HOOK_INTEGRATION)
+}
+
+/// The most of one line from the daemon a one-shot reads.
+pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// A one-shot's side of its one connection to the deck (part 2 §2.5). A
+/// reader thread of its own reads every line through [`read_frame`] and
+/// hands it over parsed; an end of the connection, a line cut short by it,
+/// a line past [`MAX_LINE_BYTES`] or a read error ends the connection's use
+/// for good, and nothing after it is read. So [`Connection::arrivals`] is a
+/// non-blocking [`Incoming`] that never splits a line.
+#[cfg(unix)]
+pub struct Connection {
+    stream: std::os::unix::net::UnixStream,
+    lines: std::sync::mpsc::Receiver<Option<InboxWaitReply>>,
+    /// Lines read before the hand-over that its fence must still see.
+    held: Vec<InboxWaitReply>,
+    ended: bool,
+    next_q: u64,
+}
+
+#[cfg(unix)]
+impl Connection {
+    /// Connect to the deck at `path` and send `request`, one line.
+    pub fn open(path: &Path, request: &str) -> io::Result<Connection> {
+        let mut stream = std::os::unix::net::UnixStream::connect(path)?;
+        stream.write_all(format!("{request}\n").as_bytes())?;
+        stream.flush()?;
+        Connection::over(stream, MAX_LINE_BYTES)
+    }
+
+    /// The connection on `stream`, reading lines of at most `max` bytes.
+    fn over(stream: std::os::unix::net::UnixStream, max: usize) -> io::Result<Connection> {
+        let reading = stream.try_clone()?;
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = io::BufReader::new(reading);
+            loop {
+                match read_frame(&mut reader, max) {
+                    Frame::Line(line) => {
+                        // A line that is not a reply is skipped; it never
+                        // ends the connection.
+                        if let Ok(reply) = serde_json::from_slice::<InboxWaitReply>(&line)
+                            && tx.send(Some(reply)).is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Frame::Eof | Frame::Unterminated | Frame::TooLong | Frame::Failed(_) => {
+                        let _ = tx.send(None);
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Connection {
+            stream,
+            lines,
+            held: Vec::new(),
+            ended: false,
+            next_q: 1,
+        })
+    }
+
+    /// The next line, waiting until `deadline` (forever with `None`).
+    /// `None` once the connection has ended, or at the deadline.
+    pub fn next(&mut self, deadline: Option<Instant>) -> Option<InboxWaitReply> {
+        if self.ended {
+            return None;
+        }
+        use std::sync::mpsc::RecvTimeoutError;
+        let got = match deadline {
+            None => self.lines.recv().unwrap_or(None),
+            Some(deadline) => {
+                match self
+                    .lines
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                {
+                    Ok(got) => got,
+                    Err(RecvTimeoutError::Timeout) => return None,
+                    Err(RecvTimeoutError::Disconnected) => None,
+                }
+            }
+        };
+        if got.is_none() {
+            self.ended = true;
+        }
+        got
+    }
+
+    /// Keep `reply` for the fence: a revoke or a terminal line read before
+    /// the hand-over.
+    pub fn hold(&mut self, reply: InboxWaitReply) {
+        self.held.push(reply);
+    }
+
+    /// Whether the connection has ended.
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
+
+    /// Send one control line.
+    pub fn send(&mut self, line: &str) -> io::Result<()> {
+        self.stream.write_all(format!("{line}\n").as_bytes())?;
+        self.stream.flush()
+    }
+
+    /// Ask `may` for every attempt of `batch`, recording when first, and
+    /// read the answers until each question is answered, the approval runs
+    /// out or the connection ends. Whatever else arrives meanwhile is kept
+    /// for the fence.
+    pub fn approve(&mut self, batch: &OneShotBatch, grant_ttl: Duration) -> Approval {
+        let sent_at = Instant::now();
+        let (mut approval, lines) = batch.ask(self.next_q, sent_at, grant_ttl);
+        self.next_q += lines.len() as u64;
+        let mut unanswered = lines.len();
+        for line in &lines {
+            if self.send(line).is_err() {
+                return approval;
+            }
+        }
+        while unanswered > 0 {
+            let Some(reply) = self.next(Some(approval.valid_until())) else {
+                break;
+            };
+            if reply.keepalive {
+                continue;
+            }
+            if let Some(grant) = &reply.grant {
+                approval.answer(grant, Instant::now());
+                unanswered = unanswered.saturating_sub(1);
+            }
+            if !reply.revoke.is_empty()
+                || reply.superseded
+                || reply.not_in_deck
+                || reply.refused.is_some()
+            {
+                self.hold(reply);
+            }
+        }
+        approval
+    }
+
+    /// What has arrived and can be read without waiting, for the fence.
+    pub fn arrivals(&mut self) -> Arrivals<'_> {
+        Arrivals(self)
+    }
+
+    /// Done writing: the deck reads every line sent before this.
+    pub fn finish(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+/// See [`Connection::arrivals`].
+#[cfg(unix)]
+pub struct Arrivals<'a>(&'a mut Connection);
+
+#[cfg(unix)]
+impl Incoming for Arrivals<'_> {
+    fn arrived(&mut self) -> Arrived {
+        let connection = &mut *self.0;
+        let mut lines = std::mem::take(&mut connection.held);
+        while !connection.ended {
+            match connection.lines.try_recv() {
+                Ok(Some(reply)) => lines.push(reply),
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    connection.ended = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+        Arrived {
+            lines,
+            eof: connection.ended,
+        }
     }
 }
 
@@ -1356,6 +1711,65 @@ mod tests {
                 "{what}: no byte of either block: {written:?}"
             );
         }
+    }
+
+    /// Scenario: A one-shot's connection is handed a reply split across two writes, a line that is not a reply, a revoke, then a line longer than its bound and a reply after it. It hands the split reply over whole, skips the stray line, and gives its fence the revoke without waiting; the overlong line ends the connection's use, so the reply after it is never read, and every later look sees it ended. On another connection, a reply cut off by the end of the connection is never handed over.
+    #[cfg(unix)]
+    #[spec("inbox/receipt/029")]
+    #[test]
+    fn receipt_029_a_one_shots_connection_hands_over_whole_lines_and_ends_for_good() {
+        use std::os::unix::net::UnixStream;
+        let (ours, mut deck) = UnixStream::pair().unwrap();
+        let mut connection = Connection::over(ours, 256).unwrap();
+        deck.write_all(b"{\"keepalive\":").unwrap();
+        deck.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        deck.write_all(b"true}\nnot a reply\n").unwrap();
+        let soon = || Some(Instant::now() + Duration::from_secs(5));
+        assert!(
+            connection
+                .next(soon())
+                .expect("the split line, whole")
+                .keepalive
+        );
+        let revoke = format!("{{\"revoke\":[{{\"id\":\"{ID1}\",\"a\":1,\"e\":1}}]}}\n");
+        deck.write_all(revoke.as_bytes()).unwrap();
+        let mut arrived = Arrived::default();
+        let started = Instant::now();
+        while arrived.lines.is_empty() {
+            arrived = connection.arrivals().arrived();
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+        assert_eq!(arrived.lines[0].revoke, vec![at(ID1, 1, 1)]);
+        assert!(!arrived.eof);
+        let polled = Instant::now();
+        assert!(connection.arrivals().arrived().lines.is_empty());
+        assert!(
+            polled.elapsed() < Duration::from_millis(100),
+            "a look never waits"
+        );
+        deck.write_all(&[b'x'; 300]).unwrap();
+        deck.write_all(b"\n{\"superseded\":true}\n").unwrap();
+        assert!(
+            connection.next(soon()).is_none(),
+            "an overlong line ends it"
+        );
+        assert!(connection.ended());
+        let after = connection.arrivals().arrived();
+        assert!(
+            after.eof && after.lines.is_empty(),
+            "nothing after it is read"
+        );
+
+        let (ours, mut deck) = UnixStream::pair().unwrap();
+        let mut cut = Connection::over(ours, 256).unwrap();
+        deck.write_all(b"{\"superseded\":true}").unwrap();
+        drop(deck);
+        assert!(
+            cut.next(soon()).is_none(),
+            "a cut line is never handed over"
+        );
+        assert!(cut.ended());
     }
 
     /// Scenario: Read the deck's once line through the one-shot's reader:

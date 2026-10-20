@@ -395,12 +395,13 @@ pub fn possess_for(stream: &mut BufReader<UnixStream>, held: &Value, span: Durat
     written
 }
 
-/// A Claude Code once-waiter, armed from the test process: the native
-/// waiter that is not on receipts. Only a receipt receiver streams since
-/// PRD #1666.
+/// A Claude Code once-waiter, armed from the test process at the one-shot
+/// integration (PRD #1666 part 2 §2.7). It reads nothing; a test that needs
+/// its batch drives the real waiter instead.
 pub fn waiter(daemon: &impl Endpoint, pane: &Pane) -> BufReader<UnixStream> {
     let mut req = request(pane, "inbox_wait");
     req["component"] = json!("claude_waiter");
+    req["hook_integration"] = json!(1);
     req["component_version"] = json!("synthetic-doorbell");
     req["mode"] = json!("once");
     req["session"] = json!({"source":"startup", "session_id":"doorbell-waiter"});

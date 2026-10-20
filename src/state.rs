@@ -6338,6 +6338,10 @@ fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> 
         .metadata
         .get(crate::inbox_display::CARD_INBOX_DEGRADED_METADATA_KEY)
         .cloned();
+    inbox.integration_command = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_COMMAND_METADATA_KEY)
+        .cloned();
     Some(inbox)
 }
 
@@ -6374,6 +6378,12 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
         metadata.insert(
             crate::inbox_display::CARD_INBOX_DEGRADED_METADATA_KEY.to_string(),
             error.clone(),
+        );
+    }
+    if let Some(command) = &inbox.integration_command {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_COMMAND_METADATA_KEY.to_string(),
+            command.clone(),
         );
     }
     session.recent_events.push_back(AgentEvent {
@@ -6605,6 +6615,7 @@ impl PaneInbox {
             not_started: count(|kind| kind == AttentionKind::NotStarted),
             held_long: count(|kind| kind == AttentionKind::HeldLong),
             integration: self.notices.integration,
+            integration_command: self.notices.integration_command.clone(),
             evidence_paused: self.notices.evidence_paused,
             receipts_degraded: self.notices.receipts_degraded.clone(),
         }
@@ -19953,6 +19964,31 @@ mod tests {
             pane_card_inbox(&state, "pane-q").and_then(|inbox| inbox.integration),
             None
         );
+    }
+
+    /// Scenario: An agent's card is told its hooks run a dot-agent-deck too old for its messages, with the command the deck gives to fix them. The card's notice row names the hooks-too-old notice with that command, and still does after the card's journal has turned over.
+    #[test]
+    fn a_hooks_too_old_notice_carries_its_command_on_the_card() {
+        use crate::inbox_display::{IntegrationNotice::HooksTooOld, hooks_too_old_text};
+        let command = "/opt/deck/dot-agent-deck hooks install --agent claude-code";
+        let mut summary = held_summary(1, Some(HooksTooOld));
+        summary.notices.integration_command = Some(command.to_string());
+        let mut state = AppState::default();
+        state.apply_event(surfacing_start("pane-q", "agent-q", &summary));
+        let shown = || {
+            pane_card_inbox(&state, "pane-q")
+                .and_then(|inbox| inbox.notice_text())
+                .unwrap_or_default()
+        };
+        assert_eq!(shown(), hooks_too_old_text(Some(command)));
+        assert!(shown().contains(command), "{}", shown());
+        for secs in 0..(MAX_RECENT_EVENTS as i64 + 5) {
+            state.apply_event(quota_event(EventType::ToolStart, 10 + secs));
+        }
+        let shown = pane_card_inbox(&state, "pane-q")
+            .and_then(|inbox| inbox.notice_text())
+            .unwrap_or_default();
+        assert_eq!(shown, hooks_too_old_text(Some(command)));
     }
 
     /// PRD #1666 §2.8 (reviewer R3fix5-02): a pane id reused by a new agent

@@ -810,10 +810,14 @@ pub struct DesktopInbox {
     /// Cancel. Sender and subject are display copies.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attention: Vec<DesktopInboxAttention>,
-    /// PRD #1666 §11: `cli_too_old`, `adapter_too_old`, `not_armed` or
-    /// `refresh_failed`.
+    /// PRD #1666 §11: `cli_too_old`, `adapter_too_old`, `not_armed`,
+    /// `refresh_failed`, `refresh_failed_pi` or `hooks_too_old`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
+    /// PRD #1666 part 2 §2.7: the command that fixes `integration`, a display
+    /// copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_command: Option<String>,
     /// PRD #1666 §3: the deck's error recording receipts, a display copy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receipts_degraded: Option<String>,
@@ -2256,6 +2260,11 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             .integration
             .and_then(|notice| serde_json::to_value(notice).ok())
             .and_then(|value| value.as_str().map(str::to_string)),
+        integration_command: summary
+            .notices
+            .integration_command
+            .as_deref()
+            .map(safe_display_text),
         receipts_degraded: summary
             .notices
             .receipts_degraded

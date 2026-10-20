@@ -8248,7 +8248,21 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Layer:** L1 unit (src/inbox_oneshot.rs), in-memory readers.
 - **Agent:** none.
 - **Asserts:** `read_frame` hands back a whole line; a complete JSON reply whose newline never came before the end of the connection, in one read or two, is `Unterminated` and its bytes are not handed back, although `read_line` hands it back and it parses; an empty connection is `Eof`; a line over the bound is `TooLong`; two whole lines then a cut one read as two lines and `Unterminated`; `classify_frame` calls a write that lost that newline `NotHanded`.
-- **Does not assert:** the one-shot waiter reading its socket through `read_frame`, or the floor that keeps a legacy `read_line` waiter from being sent a once batch (part 2's H3).
+- **Does not assert:** the one-shot waiter reading its socket through `read_frame` (inbox/receipt/029), or the floor that keeps a legacy `read_line` waiter from being sent a once batch (inbox/boundary/048).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/receipt/029 — A one-shot's connection hands over whole lines and ends for good.
+- **Layer:** L1 unit (src/inbox_oneshot.rs), a Unix socket pair.
+- **Agent:** none.
+- **Asserts:** `Connection` hands over a reply written in two parts whole, skips a line that is not a reply, gives its fence an arrived revoke without waiting (a look with nothing arrived returns at once), and treats a line over its bound as the end: the reply after it is never read and every later look reports it ended; a reply cut off by the end of the connection is never handed over.
+- **Does not assert:** a read error other than a closed or overlong connection.
+- **Platform coverage:** mac+linux.
+
+##### inbox/receipt/030 — The hook's output is its JSON and carries no cap.
+- **Layer:** L1 unit (src/inbox_prompt.rs), in-memory writers.
+- **Agent:** none.
+- **Asserts:** the prompt hook's pieces for a two-block batch join to exactly `hook_output`'s JSON for the framing and both blocks plus a newline, characters JSON escapes included, with each block a piece of its own; neither of the batch's caps is in them or in the batch's `Debug`; a write that fails inside the second block leaves both possibly handed.
+- **Does not assert:** the hook process's stdout (inbox/claude/019).
 - **Platform coverage:** mac+linux+windows.
 
 #### Protocol and waiter lifecycle
@@ -8272,25 +8286,25 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/004 — Once hands a batch to the newest waiter and requires explicit ack.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated daemon and two hook-socket waiters.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), isolated daemon and two hook-socket waiters of the legacy once path (component `other`; Claude's waiter is on receipts since part 2's H3, inbox/claude/016), which stays until H5 deletes it.
 - **Agent:** none (`cat` stand-in).
 - **Asserts:** newest gets the complete rendered block, oldest remains armed, state becomes Fetched, owner ack moves it to Acknowledged, and repeated ack returns AlreadyAcknowledged.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/005 — The per-agent waiter cap supersedes the oldest.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), nine hook-socket waiters.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), nine hook-socket waiters of the legacy once path (component `other`, until H5).
 - **Agent:** none (`cat` stand-in).
 - **Asserts:** waiter nine supersedes waiter one, armed stays at eight, and the newest waiter receives the next message.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/006 — Idle waiters survive the hook read timeout.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), shortened hook-idle and inbox-keepalive environment overrides.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), shortened hook-idle and inbox-keepalive environment overrides, a legacy once waiter (component `other`, until H5).
 - **Agent:** none (`cat` stand-in).
 - **Asserts:** a waiter emits keepalives beyond several idle windows, remains armed, and receives a subsequent message.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/007 — Waiter EOF removes its armed registration.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real socket closure and InboxList observation.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real socket closure and InboxList observation, legacy once waiters (component `other`, until H5).
 - **Agent:** none (`cat` stand-in).
 - **Asserts:** armed moves two → one → zero as peers disconnect, and the next message stays Queued.
 - **Platform coverage:** mac+linux.
@@ -8302,7 +8316,7 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/009 — Waiters leave ordinary hook-ingest slots available.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), forty live waiters across five daemon-owned panes.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), forty live legacy once waiters (component `other`, until H5) across five daemon-owned panes.
 - **Agent:** none (five `cat` stand-ins).
 - **Asserts:** list and announce continue answering above the ordinary thirty-two hook-connection limit, and closing the waiters removes their armed registrations.
 - **Platform coverage:** mac+linux.
@@ -8338,9 +8352,9 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/016 — A raw event from outside the agent acknowledges nothing.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on, a raw hook event from the test process, then the real Claude hook inside the pane.
-- **Agent:** none (shell stand-in that waits for a fixture sentinel before running the hook).
-- **Asserts:** a raw event presenting the pane's token from outside the agent's process tree, naming the queued task as observed and acknowledged, leaves it Queued; the in-pane `hook --agent claude-code` for a prompt carrying the task's block then acknowledges it.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), daemon with component binding on, a raw hook event from the test process, then the real Claude waiter and hook inside the pane.
+- **Agent:** none (shell stand-in, exec'd as the pane's agent, that waits for fixture sentinels before running the waiter and then the hook).
+- **Asserts:** a raw event presenting the pane's token from outside the agent's process tree, naming the queued task as observed and acknowledged, leaves it Queued; the in-pane `inbox wait --agent claude-code` is then handed the task (exit 2, `delivery 1.1`), and the in-pane `hook --agent claude-code` for a prompt carrying that block commits it (Acknowledged).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/017 — A connection of unknown ancestry cannot take mail.
@@ -8380,7 +8394,7 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 ##### inbox/cli/002 — Claude Once waiter wakes with exit two and stderr.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real wait CLI, hook JSON stdin and a real daemon.
 - **Agent:** none (`cat` stand-in; no Claude executable or credential).
-- **Asserts:** waiter arms, receives a rendered task, exits two with the block on stderr and empty stdout, and leaves the message Fetched pending ack.
+- **Asserts:** waiter arms, receives a rendered task whose opener names `delivery 1.1`, exits two with the block on stderr and empty stdout, and leaves the message Fetched pending a commit.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/cli/003 — Waiter outside a deck or without a daemon is quiet.
@@ -8398,7 +8412,7 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 ##### inbox/cli/005 — A doorbell fetch names its message in the one request.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real `inbox fetch --json --doorbell <id>` CLI and the real `hook --agent claude-code` for a doorbell-line prompt, each against a synthetic hook endpoint that records every request and lists the message as queued.
 - **Agent:** none (`cat` stand-in supplies the pane identity).
-- **Asserts:** the CLI sends exactly one `inbox_fetch`, naming the doorbell's message and not acknowledging; the hook sends one `inbox_fetch` naming it and no `inbox_list`, and prints the fetched block.
+- **Asserts:** the CLI sends exactly one `inbox_fetch`, naming the doorbell's message and not acknowledging; the hook sends one `inbox_fetch` naming it with `hook_integration: 1` and no `inbox_list`, and prints the fetched block once its `may` is granted.
 - **Platform coverage:** mac+linux.
 #### Fixed doorbell
 
@@ -8419,7 +8433,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/003 — An armed native waiter suppresses typing and EOF restores fallback.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay; the armed waiter is a Claude once-waiter opened from the test process.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay; the armed waiter is a Claude once-waiter opened from the test process at the one-shot integration.
 - **Agent:** none (raw Python stand-in; no agent executable or credential).
 - **Asserts:** with `DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY=1` preserving registration/EOF but pausing native hand-over, the task remains Queued while armed and no bytes arrive beyond native grace; EOF drops armed to zero and the same still-Queued task rings. This isolates the armed guard from the separate Fetched guard.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
@@ -8719,10 +8733,10 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real old release.
 - **Platform coverage:** mac+linux.
 
-##### inbox/boundary/014 — An old hook command is served and an old OpenCode fetch is refused.
+##### inbox/boundary/014 — An old hook fetch is refused, for Claude and for OpenCode.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_boundary.rs`), real daemon.
 - **Agent:** python stand-ins spawned as Claude Code and as OpenCode.
-- **Asserts:** a legacy doorbell-hook fetch from the Claude pane is served and acknowledged; the same fetch from the OpenCode pane is refused `adapter_too_old`, its mail waits queued and the record says so.
+- **Asserts:** a legacy doorbell-hook fetch (no one-shot integration) from the Claude pane is refused `hooks_too_old`, its mail waits queued and the record names `hooks_too_old`; the same fetch from the OpenCode pane is refused `adapter_too_old`, its mail waits queued and the record says so.
 - **Does not assert:** a real Claude hook.
 - **Platform coverage:** mac+linux.
 
@@ -8875,10 +8889,10 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the uncertain notice a lapse can end in (inbox/boundary/021).
 - **Platform coverage:** all.
 
-##### inbox/boundary/036 — A legacy stream is refused, and an unhanded once batch still requeues.
+##### inbox/boundary/036 — A stream from a component that cannot stream is refused.
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` over in-memory duplexes.
 - **Agent:** none.
-- **Asserts:** a stream from each component the receipt policy does not cover (Claude's waiter and hooks, Codex and Devin hooks, an unknown component) is answered `refused: unsupported`, arms nothing and leaves the queued task queued; a Claude once-waiter that took the task but whose peer never read the hand-over gives it back to the queue when the write deadline ends it.
+- **Asserts:** a stream from each component that takes its mail one batch at a time (Claude's waiter and hooks, Codex and Devin hooks, an unknown component) is answered `refused: unsupported`, arms nothing and leaves the queued task queued. Its legacy once half went with Claude's waiter onto receipts (part 2's H3): inbox/boundary/051 and /052 pin a once batch that never reached its peer.
 - **Does not assert:** the refusal over the real hook socket (inbox/opencode/009).
 - **Platform coverage:** all.
 
@@ -8972,6 +8986,41 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Asserts:** a delegated task issued to a once-waiter that writes its block and dies before any control, with and without its `handed` record published, is fenced and then cancelled; while the turn stays busy, receipt checks four ack-waits in (well past `quiet_at`) keep its caps in the evidence store and its caps file in the spool, and no verify instant is scheduled; the prompt hook's exact lookup then finds the caps, publishes the commit, and the orchestrator is told the task was delivered after all. With the turn ending half an ack-wait after the fence, `next_deadline` names the end of that idle grace, not `quiet_at`; a check past `quiet_at` inside the grace keeps the caps and a commit there still corrects the sender; with no commit, the check at the grace's end returns the evidence, the caps file goes, a later notification finds nothing to commit and no correction is posted.
 - **Does not assert:** a real waiter, Claude's queueing of the notification (inbox/claude/021, lane 2) or the H3 serve path writing the caps file and routing the close.
 - **Platform coverage:** all.
+
+##### inbox/boundary/048 — The hook integration floor holds before anything is issued.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` and `serve_hook` over in-memory duplexes, a real spool.
+- **Agent:** none.
+- **Asserts:** a Claude once-waiter declaring no one-shot integration, or one below `HOOK_INTEGRATION`, and a Claude prompt hook's fetch declaring none, are each answered `refused: hooks_too_old`; nothing is issued, the task stays queued, nothing is armed, the doorbell is blocked, and the card notices carry `hooks_too_old` with the deck's own `hooks install` command. A waiter at the integration registers as `once_waiter` with its `grant_ttl_ms`, is handed the task with `delivery 1.1` in its opener and no caps, and the attempt's caps file is in the spool; the notice is gone.
+- **Does not assert:** a real waiter binary or Claude's settings (inbox/claude/020).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/051 — A batch line whose newline never went is not handed.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` writing to a scripted writer.
+- **Agent:** none.
+- **Asserts:** a once batch line of which the connection took no byte, or a prefix without its newline, makes its attempt `NotHanded` and the task queued again, handed to the next waiter unmarked; one taken whole whose flush failed leaves the attempt `Fenced` (possibly handed), the message attempting and its inbox copy not queued.
+- **Does not assert:** a real socket's partial writes.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/052 — A newer waiter supersedes, and a spent one takes nothing.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` over in-memory duplexes.
+- **Agent:** none.
+- **Asserts:** a second Claude once-waiter's registration sends the first `superseded` and ends its connection with nothing else; one waiter stays armed; the newer is handed the first task and is then armed no longer, takes nothing posted after it across clock steps, and the next waiter registered is handed the second task.
+- **Does not assert:** the real waiter process exiting (inbox/claude/006).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/055 — Caps files are written off the lock, and hook holds end on the clock.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub with a real spool, threads, and its own ticker.
+- **Agent:** none.
+- **Asserts:** while a once batch's caps-file write is held, another thread's listing and post complete; once it goes on, the waiter is handed the batch. With the spool's caps directory unwritable, the next batch is never sent: its attempt is `NotHanded`, the task queued, `receipts_degraded` names the caps file, and the waiter's connection ends with no line. A Claude prompt hook that takes a task and reports nothing is closed by the hub's own ticker when `HOOK_HOLD` runs out, its attempt `Fenced`.
+- **Does not assert:** a slow filesystem, only a held write.
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/057 — A hook receiver takes only what its fetch asked for.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_hook` over in-memory duplexes, a real spool.
+- **Agent:** none.
+- **Asserts:** a Claude prompt hook's fetch registers in the `hook` slot and is handed the named task with its caps and `delivery 1.1`; a second hook naming the same task gets an empty batch and retires nothing; nothing posted while the first holds its connection is pushed to it; its published `committed` record and control settle the task, and the later task stays queued.
+- **Does not assert:** the real hook process (inbox/claude/019).
+- **Platform coverage:** mac+linux.
 
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
@@ -9196,7 +9245,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/006 — Startup and clear waiters hand one task to the newest waiter once.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real Once CLI children of a scripted parent.
 - **Agent:** none (synthetic Claude parent; no credential).
-- **Asserts:** Three armed startup/clear waiters yield one framed stderr wake with exit 2 on the newest, two older waiters remain armed, the task is Fetched and no bytes are typed into the pane.
+- **Asserts:** Each of three startup/clear waiters supersedes the one before it, which exits 0 with nothing on stdout or stderr, so one is armed at a time; the newest yields one framed stderr wake with exit 2 whose opener names `delivery 1.1`, the task is Fetched, no waiter is armed after it, and no bytes are typed into the pane.
 - **Does not assert:** Real Claude's clear behavior or model compliance with do-not-act-twice framing.
 - **Platform coverage:** mac+linux.
 
@@ -9214,10 +9263,10 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** Codex wiring or a real model turn; the trimmed spelling pins the shared scanner requirement for S7.
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/009 — Native task notifications acknowledge the message and show its subject without polluting human prompt history.
+##### inbox/claude/009 — Native task notifications settle the message and show its subject without polluting human prompt history.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), attached real TUI, daemon and hook/wait CLI children.
 - **Agent:** none (synthetic Claude parent; no credential; no reel marker).
-- **Asserts:** Fetched waiter output wrapped as a task notification becomes Acknowledged after UserPromptSubmit; the card displays `✉ native fixture`, first_prompts and last_user_prompt retain the prior human prompt, and raw task-notification markup is absent from the grid.
+- **Asserts:** Fetched waiter output wrapped as a task notification becomes Acknowledged after UserPromptSubmit commits its exact attempt (inbox/claude/016); the card displays `✉ native fixture`, first_prompts and last_user_prompt retain the prior human prompt, and raw task-notification markup is absent from the grid.
 - **Does not assert:** Actual asyncRewake delivery by Claude, a real-model action or lane-2 coverage.
 - **Platform coverage:** mac+linux.
 
@@ -9232,6 +9281,41 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI and recording Unix socket.
 - **Agent:** none.
 - **Asserts:** With no Claude settings, and with settings whose SessionStart carries only the status handler (a Claude below the waiter gate), the hook sends its SessionStart status and no InboxAnnounce.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/016 — A notification commits its exact attempt through its caps file.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real waiter and hook CLI children of a scripted parent, real spool.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** the real waiter's stderr block opens with `delivery 1.1`, and neither cap in the attempt's caps file, nor anything cap-shaped, is in it; a submitted prompt naming attempt 1.2, or no attempt, commits nothing (the task stays Fetched); the real notification through the real prompt hook commits it (Acknowledged) and the hook prints nothing cap-shaped; a waiter re-armed at Stop is handed nothing and the task has one delivery.
+- **Does not assert:** real Claude submitting the notification (inbox/claude/011, lane 2).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/017 — A lost notification repeats marked, then turns uncertain.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real waiter CLI children, short ack-wait.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** with no prompt ever submitted and the agent idle, each re-armed waiter receives a marked repeat (attempts 1.2 and 1.3, the possible-repeat line); after the automatic repeats run out the snapshot lists the task as `uncertain`, the next waiter is handed nothing and the task has three deliveries.
+- **Does not assert:** the card's words, which both clients read from the shared fixture (inbox-display.json).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/018 — A notification queued behind a long quiet tool commits once.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real waiter and hook CLI children, short keepalive and ack-wait.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** with a turn started (UserPromptSubmit, then PreToolUse) and nothing reported for over three keepalives and two ack-waits after the waiter delivered, nothing is repeated; after Stop and a re-armed waiter, the submitted notification commits the task with one delivery and the new waiter is handed nothing.
+- **Does not assert:** how real Claude orders a rewake against a busy turn (inbox/claude/021, lane 2).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/019 — A doorbell hook commits what it printed, and a killed one repeats marked.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children, short ack-wait, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_EXIT_AFTER_GRANT` knob.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** in a pane started with no agent type (as real Claude roles are), the real prompt hook answers a doorbell with additionalContext whose block opens with `delivery 1.1`, nothing cap-shaped on stdout or stderr, and the task is Acknowledged; a hook that exits after its grant and before printing leaves the second task Fetched, and a later doorbell hands it over again with the possible-repeat line, which commits it with two deliveries.
+- **Does not assert:** a hook killed by a signal mid-write.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/020 — Hooks too old name the fix, and the fix delivers.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), a stand-in older binary (the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=none` knob) named in an isolated Claude settings file, the real `hooks install`.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** the waiter that settings name exits 0 silently; the snapshot's inbox notice is `hooks_too_old`, with the deck's `hooks install --agent claude-code` command when it composes one; nothing is armed, a queued task stays queued and no doorbell is typed; after the deck's own `hooks install --agent claude-code` the settings no longer name the old binary, the waiter they name is handed the task with exit 2, and the notice is gone.
+- **Does not assert:** a genuinely older release (`cargo xver` pairs a previous release's daemon, not its hooks), or restarting a real agent.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]
@@ -9250,10 +9334,10 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** Exact model latency.
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/013 — Waiters accumulated through real /clear hand over a task once.
+##### inbox/claude/013 — Waiters armed through real /clear hand over a task once.
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.
-- **Asserts:** Two clears arm additional waiters, but one message produces one delivery and one sentinel append.
+- **Asserts:** Each of two clears registers a new waiter that takes the place of the one before it (one stays armed); one message then produces one delivery and one sentinel append.
 - **Test:** `claude_013_live_clear_waiters_claim_once` in `tests/e2e_inbox_claude_live.rs`.
 - **Does not assert:** Waiter ordering, covered by inbox/claude/006.
 - **Platform coverage:** mac+linux.

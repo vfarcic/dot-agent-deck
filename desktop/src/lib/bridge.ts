@@ -374,6 +374,7 @@ export interface DesktopAgentDto {
     /** PRD #1666 §6.5: deck messages waiting on the user's Retry or Cancel. */
     attention?: Array<{ messageId: string; revision: number; kind: string; fromLabel: string; subject: string; taskId?: string }>;
     integration?: string;
+    integrationCommand?: string;
     receiptsDegraded?: string;
     evidencePaused?: number;
   };
@@ -2330,13 +2331,14 @@ function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox 
     ...(inbox.wakeStalled === true ? { wakeStalled: true } : {}),
     ...(attention.length > 0 ? { attention } : {}),
     ...(integration ? { integration } : {}),
+    ...(integration && typeof inbox.integrationCommand === "string" ? { integrationCommand: displayText(inbox.integrationCommand, DISPLAY_LIMITS.prompt) } : {}),
     ...(typeof inbox.receiptsDegraded === "string" ? { receiptsDegraded: displayText(inbox.receiptsDegraded, DISPLAY_LIMITS.prompt) } : {}),
     ...(typeof inbox.evidencePaused === "number" && Number.isFinite(inbox.evidencePaused) ? { evidencePaused: count(inbox.evidencePaused) } : {}),
   };
 }
 
 const ATTENTION_KINDS = new Set(["uncertain", "out_of_attempts", "held_long", "not_started"]);
-const INTEGRATION_NOTICES = new Set(["cli_too_old", "adapter_too_old", "not_armed", "refresh_failed", "refresh_failed_pi"]);
+const INTEGRATION_NOTICES = new Set(["cli_too_old", "adapter_too_old", "not_armed", "refresh_failed", "refresh_failed_pi", "hooks_too_old"]);
 
 /** PRD #1666 §6.5: the listed items the crate sent, an unknown kind dropped. */
 function attentionFromDto(items: NonNullable<NonNullable<DesktopAgentDto["inbox"]>["attention"]>): InboxAttentionItem[] {
