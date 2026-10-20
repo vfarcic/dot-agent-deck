@@ -126,7 +126,7 @@ Anything you say that is not about the question, such as "open settings", is han
 Nothing is sent, and the row says why, when:
 
 - the question was answered, for example with the keyboard, or changed before the answer went: *That question was answered or changed before I could send it — nothing was sent.*
-- you close the pane, open another agent or screen, switch the pane to another tab, switch daemons, turn voice off, a confirmation opens, or the agent in the pane is replaced, while the countdown runs or the answer is being sent;
+- you close the pane, open another agent or screen, switch the pane to another tab, switch daemons, turn voice off, a confirmation opens, the agent in the pane is replaced, or the pane stops taking input, for example because its deck stops answering, while the countdown runs. If one of these happens once the answer is already being sent, the app cancels it if it still can, and the row says whether the cancel was in time or came too late;
 - what you said does not match an option: *I couldn't match that to the options: 1 “Yes”, 3 “No”.*, listing what you can say with the numbers to say;
 - what you said fits several options: *“…” could be 1 “…” or 2 “…” — say its number or more of its words. Nothing was chosen.*
 - you said a number the question has no option for: *There is no option 4, so nothing was chosen. The options are …*

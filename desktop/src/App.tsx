@@ -1213,7 +1213,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     ? (
       <>
         {/* voice-registry-exempt: the overview's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS` */}
-        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} notice={noticeOf(selfUpgrade) !== dismissedSelfUpgrade ? <SelfUpgradeBanner check={selfUpgrade} onOpen={openSelfUpgrade} onDismiss={() => setDismissedSelfUpgrade(noticeOf(selfUpgrade))} /> : undefined} />
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} notice={noticeOf(selfUpgrade) !== dismissedSelfUpgrade ? <SelfUpgradeBanner check={selfUpgrade} onOpen={openSelfUpgrade} onDismiss={() => setDismissedSelfUpgrade(noticeOf(selfUpgrade))} /> : undefined} selfUpgrade={{ check: selfUpgrade, api: selfUpgradeApi, onClosed: recheckSelfUpgrade }} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
           there is no tile here to promote and the pane is a sibling of the
@@ -1277,7 +1277,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
         <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} update={<SelfUpgradeRailButton check={selfUpgrade} onOpen={openSelfUpgrade} />} />
         {screenNode}
-        {selfUpgradeOpen && selfUpgrade && selfUpgradeApi && <SelfUpgradeDialog check={selfUpgrade} api={selfUpgradeApi} onClose={() => { setSelfUpgradeOpen(false); recheckSelfUpgrade(); }} />}
+        {selfUpgradeOpen && selfUpgrade && selfUpgradeApi && <SelfUpgradeDialog check={selfUpgrade} api={selfUpgradeApi} copies={["app"]} onClose={() => { setSelfUpgradeOpen(false); recheckSelfUpgrade(); }} />}
         {/* The newer-release dialog asks before upgrading anything, so it counts as a confirmation for voice too (issue #1635). */}
         {/* PRD #1401: with the pull request browser open, voice is on the browser's screen. */}
         <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />

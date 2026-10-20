@@ -49,27 +49,28 @@ The desktop app has two things the TUI does not: one Dashboard over several daem
 
 ## Upgrade the app
 
-The app checks for a newer release when it starts and every 6 hours while it runs. When this machine's app or its `dot-agent-deck` CLI is behind, two things appear:
+The app checks for a newer release when it starts and every 6 hours while it runs. When the app itself is behind, two things appear:
 
 - an upgrade button, an arrow in a circle, at the bottom of the rail, on every screen. Hovering it shows, for example, `Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)`.
 - a banner with the same text at the top of the Dashboard, with an **Upgrade…** button and a dismiss button. Dismissing it hides it until a newer release appears or the app restarts; the rail button stays.
 
-Once the app has upgraded itself, it still runs the old version until it restarts, so it does not offer that upgrade again. When nothing else is behind, the banner and the rail button say `Agent Deck v<new> is installed. Relaunch to run it.`, the banner's button reads **Relaunch…**, and the dialog they open shows the upgrade's result with a **Relaunch** button.
+Once the app has upgraded itself, it still runs the old version until it restarts, so it does not offer that upgrade again. Instead, the banner and the rail button say `Agent Deck v<new> is installed. Relaunch to run it.`, the banner's button reads **Relaunch…**, and the dialog they open shows the upgrade's result with a **Relaunch** button.
 
-Nothing appears while both copies are current, or while the app cannot reach GitHub. The TUI checks on the same schedule and shows the same notice at the right end of its footer; pressing `u` there opens its own upgrade dialog, with the same plans and the same one-copy-at-a-time questions as this one ([Installation → Upgrade from the TUI](../installation.md#upgrade-from-the-tui)). `dot-agent-deck upgrade` in a terminal shows the same plan too.
+Nothing appears while the app is current, or while the app cannot reach GitHub. The banner and the rail button are about the app only. When the `dot-agent-deck` CLI on this machine is behind, which is the copy the TUI and your terminal commands run, the **Local daemon** section of the Dashboard offers **Upgrade** instead ([Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)).
+
+The TUI checks on the same schedule and shows a notice at the right end of its footer, such as `dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)`, for the CLI it runs or for this app; pressing `u` there opens its own upgrade dialog, which covers both, with the same plans and the same one-copy-at-a-time questions ([Installation → Upgrade from the TUI](../installation.md#upgrade-from-the-tui)). `dot-agent-deck upgrade` in a terminal shows the same plans too.
 
 ### The upgrade dialog
 
-The rail button and **Upgrade…** open a dialog titled **Upgrade to v<new>**. It has one section for the app and, when a `dot-agent-deck` CLI is installed on this machine, one for the CLI. Each says which version you have, how that copy was installed, and what upgrading it does, including whether the download's build provenance will be checked (it is when the [GitHub CLI](https://cli.github.com/) is installed and logged in; the checksum is always checked). [Installation → What upgrading does for each install method](../installation.md#what-upgrading-does-for-each-install-method) lists every case.
+The rail button and **Upgrade…** open a dialog titled **Upgrade to v<new>**, with the app's plan: which version you have, how the app was installed, and what upgrading it does, including whether the download's build provenance will be checked (it is when the [GitHub CLI](https://cli.github.com/) is installed and logged in; the checksum is always checked). [Installation → What upgrading does for each install method](../installation.md#what-upgrading-does-for-each-install-method) lists every case. The **Local daemon** section's **Upgrade** opens the same dialog with the CLI's plan.
 
-![The Upgrade to v0.47.0 dialog over the Dashboard, whose banner reads Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0) beside an Upgrade… button, with the upgrade button lit at the bottom of the rail: one section for the app installed from a .dmg in /Applications, saying what upgrading downloads and checks, one for the dot-agent-deck CLI installed with Homebrew, and below them the question Upgrade Agent Deck (desktop app) to v0.47.0? with Cancel and Upgrade buttons](/img/self-upgrade-desktop.png)
+![The Upgrade to v0.47.0 dialog over the Dashboard, whose banner reads Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0) beside an Upgrade… button, with the upgrade button lit at the bottom of the rail: the plan for the app installed from a .dmg in /Applications, saying what upgrading downloads and checks, and below it the question Upgrade Agent Deck (desktop app) to v0.47.0? with Cancel and Upgrade buttons](/img/self-upgrade-desktop.png)
 
-1. The dialog asks about one copy at a time, the app first, for example `Upgrade Agent Deck (desktop app) to v0.47.0?`. Press **Upgrade**, or **Cancel**. **Cancel** has the focus, as in the TUI, so `Enter` alone never upgrades anything. Nothing changes until you press **Upgrade**: **Cancel**, `Escape` or a click outside the dialog before then close it having done nothing. After one copy is upgraded, **Cancel** skips the next copy instead.
-2. While a copy upgrades, its section says **Upgrading…** and the dialog cannot be closed. The dialog keeps the plan it opened with: a check that finishes while it is open does not change it, and **Upgrade** carries out exactly the plan shown.
-3. The result appears under that copy's section, then the dialog asks about the next copy, if any.
-4. When nothing is left to ask, **Close** closes the dialog, and the app checks again.
+1. The dialog asks, for example, `Upgrade Agent Deck (desktop app) to v0.47.0?`. Press **Upgrade**, or **Cancel**. **Cancel** has the focus, as in the TUI, so `Enter` alone never upgrades anything. Nothing changes until you press **Upgrade**: **Cancel**, `Escape` or a click outside the dialog before then close it having done nothing.
+2. While it upgrades, the plan says **Upgrading…** and the dialog cannot be closed. The dialog keeps the plan it opened with: a check that finishes while it is open does not change it, and **Upgrade** carries out exactly the plan shown.
+3. The result appears under the plan, and **Close** closes the dialog; the app then checks again.
 
-A copy that cannot be upgraded from the app, such as a CLI installed with Nix or built from source, says what to do instead, and the dialog offers only **Close**. Most commands shown in the dialog have a copy button beside them.
+A copy that cannot be upgraded from the app, such as an app in a folder you cannot write, or a CLI installed with Nix or built from source, says what to do instead, and the dialog offers only **Close**. Most commands shown in the dialog have a copy button beside them.
 
 ### What you see on each outcome
 
@@ -87,7 +88,7 @@ A copy that cannot be upgraded from the app, such as a CLI installed with Nix or
 
 If **Relaunch** fails, the dialog shows why under its buttons; quit the app and open it again yourself. For any other failure, the copy's section shows the error and says whether anything changed; [Installation → When an upgrade fails](../installation.md#when-an-upgrade-fails) lists the messages and what to do.
 
-Upgrading does not stop the daemon or its agents. If the Dashboard says **Incompatible daemon** after the app restarts, see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release). A remote daemon is not upgraded from this dialog; use its **Upgrade** button ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)).
+Upgrading does not stop the daemon or its agents. When the restarted app finds the daemon on this machine running the older release, it restarts the daemon onto its own version, asking first when agents are running ([Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)). If the Dashboard says **Incompatible daemon** after the app restarts, see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release). A remote daemon is not upgraded from this dialog; use its **Upgrade** button ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)).
 
 ## Features behind the `experimental` flag
 

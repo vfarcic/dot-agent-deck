@@ -16,12 +16,13 @@ expression: text
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
   ┌ Upgrade to v0.47.0 ──────────────────────────────────────────────────────────────────────────────────────────────┐  
   │                                                                                                                  │  
-  │ dot-agent-deck: update available: v0.47.0 (current: v0.46.0)                                                     │  
+  │ dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)                                                 │  
   │ Installed with Nix (/nix/store/abc-dot-agent-deck-0.46.0/bin/dot-agent-deck), so it is not changed from here.    │  
   │ Update your flake input (for example `nix flake update`) and rebuild, or run `nix profile upgrade`.              │  
+  │ Upgrading does not restart the daemon on this machine, so its agents keep running. The next time you start the   │  
+  │ TUI, it restarts a daemon running another version onto its own, asking first when agents are running on it.      │  
   │                                                                                                                  │  
   │ > Close                                                                                                          │  
   │                                                                                                                  │  

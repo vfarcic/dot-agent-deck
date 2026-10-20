@@ -27,7 +27,7 @@ const INSTALLED: SelfUpgradeCheck = {
   ...NEWER,
   updateAvailable: false,
   notice: RELAUNCH_NOTICE,
-  installed: { copy: "app", ok: true, relaunch: true, lines: [{ text: "Replaced /Applications/Agent Deck.app with v0.47.0. Quit and reopen Agent Deck to run it.", command: null }] },
+  installed: { copy: "app", ok: true, installed: true, relaunch: true, lines: [{ text: "Replaced /Applications/Agent Deck.app with v0.47.0. Quit and reopen Agent Deck to run it.", command: null }] },
 };
 
 describe("SelfUpgradeNotice", () => {

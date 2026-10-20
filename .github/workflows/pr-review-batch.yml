@@ -150,6 +150,10 @@ jobs:
       # that it is one, which changes what it reads and what its verdict may
       # claim. Both sides read the same input rather than inferring it.
       focus_unreviewed: ${{ inputs.focus_unreviewed == true }}
+      # Issue #1754: the selector's mechanical answer to "which independent
+      # review covers this head", read from the unfiltered API. The agent's own
+      # reads are filtered and could not see the summary comment that answers it.
+      independent_review: ${{ matrix.item.independent_review }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
