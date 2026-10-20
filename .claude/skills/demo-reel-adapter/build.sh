@@ -25,14 +25,20 @@
 #       a list that reaches no provenance check never touches git.
 #
 #   reel (default) — run (a), then (b), then invoke the engine forwarding
-#       --out/--publish. Clean-skips when nothing is in scope, naming WHICH of
-#       the two causes it hit: nothing changed, or things changed but carry no
-#       ` [reel]` marker (issue #735 — the two call for opposite responses).
+#       --out/--publish. Clean-skips when nothing is in scope, naming WHICH
+#       cause it hit: nothing changed, things changed but carry no ` [reel]`
+#       marker (issue #735 — the two call for opposite responses), or marked e2e
+#       tests changed but have no recording on disk (issue #1683).
 #
 # Selection rule (file-level granularity, robustness over cleverness):
 #   A recording dir `<RECORDINGS_DIR>/<id>/` is IN SCOPE iff
 #     1. it contains a `full-stream.cast` — the e2e proxy. L1 render tests emit a
-#        `test.md` but NO cast, so they are excluded by construction; and
+#        `test.md` but NO cast, so they are excluded by construction. So is an
+#        e2e test whose cast is missing — a run without DOT_AGENT_DECK_RECORD=1
+#        clears a test's earlier artifacts and leaves only `test.md` — but that
+#        exclusion is NAMED rather than silent (issue #1683): a changed, marked
+#        test whose source is an `e2e_*.rs` file gets a stderr diagnostic and is
+#        counted in the skip, since recording it is what puts it in the reel; and
 #     2. its catalog id carries the OPT-IN `[reel]` eligibility MARKER (see below); and
 #     3. the source file named in its `test.md` `**Source:**` line was changed on
 #        this branch vs `<MAIN_REF>`. Matching is by FILE BASENAME against
@@ -138,6 +144,10 @@ MIN_COMMIT_LEN=7
 
 SKIP_MSG="skipped: no e2e tests changed on this branch"
 
+# The remedy for a changed e2e test with no usable recording, shared by the
+# unrecorded and stale-provenance wordings so the two cannot drift apart.
+RECORD_HINT="DOT_AGENT_DECK_RECORD=1 cargo test-e2e-live <filter>"
+
 # Where `select_ids` records the ids it dropped for a MISSING ` [reel]` marker —
 # the near-misses that cleared every other gate (they have a cast, and their
 # source changed on this branch), so they are exactly what a reader would
@@ -146,6 +156,20 @@ SKIP_MSG="skipped: no e2e tests changed on this branch"
 # variables never make it back. Empty (the default, and what `build.sh select`
 # uses) means "record nothing".
 INELIGIBLE_LOG=""
+# Same mechanism for the ids it dropped because the e2e test changed, is marked,
+# and has NO cast on disk (issue #1683). Recording is the one action that turns
+# these into clips, so they are kept apart from the marker near-misses.
+UNRECORDED_LOG=""
+
+# Ids `select_ids` already dropped and diagnosed, handed to `assemble` by the
+# `reel` path so that a skip AFTER assembly still counts them — without them an
+# all-stale selection would report only the stale ids and lose the rest. Empty
+# for the standalone `build.sh assemble`, whose id list is all it knows about.
+PRE_INELIGIBLE=()
+PRE_UNRECORDED=()
+# The phrase a skip uses for the list it was handed: `reel` passes ids that
+# changed on this branch, the standalone subcommand passes whatever it was given.
+ASSEMBLE_SCOPE="in the given list"
 
 die() { echo "demo-reel-adapter: $*" >&2; exit 1; }
 
@@ -160,12 +184,13 @@ die() { echo "demo-reel-adapter: $*" >&2; exit 1; }
 # Composed in ONE place, called from both paths, so the two messages cannot drift
 # back into saying the same wrong thing.
 #
-# Exclusions arrive as THREE buckets separated by literal `--`s, because a list
+# Exclusions arrive as FOUR buckets separated by literal `--`s, because a list
 # can lose ids to any of the gates and the composed reason has to survive more
 # than one firing at once (PR #778 review, extended for issue #808's provenance
-# gate). An id is never `--` itself — ids are single recording-dir names, and
-# `assemble` rejects `/` and `..` before this is ever called.
-#   usage: skip_message <scope-phrase> [cast-less...] -- [unmarked...] -- [stale...]
+# gate and issue #1683's missing recordings). An id is never `--` itself — ids
+# are single recording-dir names, and `assemble` rejects `/` and `..` before
+# this is ever called.
+#   usage: skip_message <scope-phrase> [cast-less...] -- [unmarked...] -- [stale...] -- [unrecorded...]
 skip_message() {
   local scope="$1"; shift
   # Declared one per line: macOS ships /bin/bash 3.2.57 and this file already
@@ -174,35 +199,50 @@ skip_message() {
   local cast_less=()
   local unmarked=()
   local stale=()
+  local unrecorded=()
   local bucket=0 arg
   for arg in "$@"; do
     if [[ "$arg" == "--" ]]; then bucket=$((bucket + 1)); continue; fi
     case "$bucket" in
       0) cast_less+=("$arg") ;;
       1) unmarked+=("$arg") ;;
-      *) stale+=("$arg") ;;
+      2) stale+=("$arg") ;;
+      *) unrecorded+=("$arg") ;;
     esac
   done
 
-  # Nothing reached the marker or provenance gate, so the scope gate really is
-  # the whole story. A cast-less-ONLY list lands here deliberately: "no e2e tests
-  # changed" is literally true of a list that contains no e2e test (a dir with no
-  # cast is an L1 render test, not a clip candidate), and each such id has already
-  # had its own naming diagnostic on stderr mid-loop.
-  if [[ ${#unmarked[@]} -eq 0 && ${#stale[@]} -eq 0 ]]; then
+  # Nothing reached the marker or provenance gate and no e2e test is merely
+  # unrecorded, so the scope gate really is the whole story. A cast-less-ONLY
+  # list lands here deliberately: "no e2e tests changed" is literally true of a
+  # list that contains no e2e test (the cast-less bucket holds only ids that are
+  # not e2e tests — an e2e test with no cast goes to the unrecorded bucket
+  # instead, issue #1683), and each such id has already had its own naming
+  # diagnostic on stderr mid-loop.
+  if [[ ${#unmarked[@]} -eq 0 && ${#stale[@]} -eq 0 && ${#unrecorded[@]} -eq 0 ]]; then
     printf '%s\n' "$SKIP_MSG"
     return 0
   fi
 
-  # The headline names the gate that dropped the most ids' worth of the reader's
-  # attention, and the marker wording is kept EXACTLY as issue #735 established
-  # it. A stale-only list gets its own headline rather than borrowing that one:
-  # "none is reel-eligible" would send a reader to add a marker that changes
-  # nothing, which is the same misattribution #735 was about, in a new bucket.
-  if [[ ${#unmarked[@]} -gt 0 ]]; then
+  # The headline names a gate the reader can act on before one they usually
+  # should not. Stale and unrecorded ids are both [reel]-MARKED, so while either
+  # bucket holds one, "none is reel-eligible" would be false and would bury the
+  # remedy (re-record) under a note saying the marker's absence is usually right
+  # (PR #1763 review). The marker headline therefore takes the line only when
+  # every dropped id really is unmarked, and its wording is kept EXACTLY as
+  # issue #735 established it. A stale list gets its own headline rather than
+  # borrowing that one: "none is reel-eligible" would send a reader to add a
+  # marker that changes nothing, which is the same misattribution #735 was
+  # about, in a new bucket.
+  #
+  # An unrecorded list gets its own headline for the same reason (issue #1683):
+  # it used to fall through to "no e2e tests changed", which sent a reader to
+  # debug the diff gate when the fix was to record the tests.
+  if [[ ${#stale[@]} -eq 0 && ${#unrecorded[@]} -eq 0 ]]; then
     printf '%s\n' "skipped: ${#unmarked[@]} e2e test(s) $scope, but none is reel-eligible — no [reel] marker in $CATALOG_FILE for: $(join_ids "${unmarked[@]}")"
-  else
+  elif [[ ${#stale[@]} -gt 0 ]]; then
     printf '%s\n' "skipped: ${#stale[@]} e2e test(s) $scope, but none has a recording whose provenance checks out — nothing was published"
+  else
+    printf '%s\n' "skipped: ${#unrecorded[@]} e2e test(s) $scope, but none has a recording; run them with $RECORD_HINT at this commit: $(join_ids "${unrecorded[@]}")"
   fi
   # The marker is not the whole reason when the same list ALSO lost ids before
   # they ever reached the marker gate: saying only "none is reel-eligible" would
@@ -216,7 +256,18 @@ skip_message() {
   # and a marker will not fix it either. The per-id reason is already on stderr,
   # so this names the ids and the remedy rather than repeating each verdict.
   if [[ ${#stale[@]} -gt 0 ]]; then
-    printf '%s\n' "  (${#stale[@]} id(s) were dropped by the CAST PROVENANCE gate — the recording on disk is not proven to come from a passing run of the current revision, so it may predate this branch entirely (issue #808): $(join_ids "${stale[@]}"). Each id's own verdict is on stderr above. Re-record with DOT_AGENT_DECK_RECORD=1 cargo test-e2e-live <filter> at this commit.)"
+    printf '%s\n' "  (${#stale[@]} id(s) were dropped by the CAST PROVENANCE gate — the recording on disk is not proven to come from a passing run of the current revision, so it may predate this branch entirely (issue #808): $(join_ids "${stale[@]}"). Each id's own verdict is on stderr above. Re-record with $RECORD_HINT at this commit.)"
+  fi
+  # And for the unrecorded bucket when the stale one took the headline: these ids
+  # would need a recording, not a marker.
+  if [[ ${#unrecorded[@]} -gt 0 && ${#stale[@]} -gt 0 ]]; then
+    printf '%s\n' "  (${#unrecorded[@]} further e2e test(s) have no recording at all — no full-stream.cast on disk — so they were not considered: $(join_ids "${unrecorded[@]}"). Record them with $RECORD_HINT at this commit.)"
+  fi
+  # The unmarked ids when a recording problem took the headline. Named, so the
+  # reader sees every changed test, but scoped to those ids alone: recording
+  # them would not make them clips.
+  if [[ ${#unmarked[@]} -gt 0 && ( ${#stale[@]} -gt 0 || ${#unrecorded[@]} -gt 0 ) ]]; then
+    printf '%s\n' "  (${#unmarked[@]} further e2e test(s) have no [reel] marker in $CATALOG_FILE, so they are not reel candidates whether or not they are recorded: $(join_ids "${unmarked[@]}"))"
   fi
   if [[ ${#unmarked[@]} -gt 0 ]]; then
     printf '%s\n' "  ([reel] is OPT-IN and its absence is usually the right answer: a clip exists so a human can watch REAL behavior, so only a test that genuinely spins up a real agent is marked — a stand-in (cat, scripted echo, recorder stubs, synthesized hook events) stays unmarked and never becomes a clip. See CLAUDE.md rule 4.)"
@@ -237,8 +288,8 @@ Usage:
   build.sh [reel] [--out OUT.mp4] [--publish] [--manifest PATH] [--title TITLE]
       Select in-scope e2e tests, build a manifest, and invoke the engine.
       Clean-skips (no manifest, no engine, exit 0) when no e2e tests changed —
-      or, when e2e tests DID change but none carries the [reel] marker, skips
-      just as cleanly while naming those tests instead.
+      or, when e2e tests DID change but none carries the [reel] marker or none
+      has a recording, skips just as cleanly while naming those tests instead.
       Composes a descriptive video title ('<repo> · PRD #<prd> · PR #<pr> —
       <desc>') and forwards it to the engine; --title TITLE overrides that
       composition verbatim (for manual/dogfood runs).
@@ -251,7 +302,8 @@ Usage:
   build.sh assemble [ID...] [--manifest PATH]
       Build manifest.json from the given recording-dir IDs (no network; one
       `git rev-parse HEAD` unless REEL_ADAPTER_EXPECT_COMMIT is set). Excludes
-      any ID without a full-stream.cast, any whose catalog id lacks the trailing
+      any ID without a full-stream.cast (naming an e2e test's as unrecorded),
+      any whose catalog id lacks the trailing
       [reel] eligibility marker, and any whose provenance.json is absent or
       records a different commit or a non-passing outcome (issue #808); orders by
       catalog id. Clean-skips when no ID resolves to a publishable clip, naming
@@ -321,12 +373,33 @@ html_decode() {
 }
 
 # Source-file basename from the test.md "**Source:**" line
-# (`<dir>/<file>::<fn>` inside backticks) — used by selection only.
+# (`<dir>/<file>::<fn>` inside backticks) — used by selection, and by assembly
+# to tell an unrecorded e2e test from an L1 one.
 extract_source_basename() {
   local md="$1" src
   src="$(grep -m1 '^\*\*Source:\*\*' "$md" 2>/dev/null | sed -E 's/.*`([^`]*)`.*/\1/' || true)"
   src="${src%%::*}"        # drop ::fn_name
   printf '%s' "${src##*/}"  # basename
+}
+
+# Is this source basename an e2e test file? CLAUDE.md rule 4 names L2 PTY tests
+# `e2e_*.rs`, so a cast-less dir whose test lives in one is an e2e test whose
+# recording is missing, not an L1 test that never had one (issue #1683). The
+# test.md `**Cast:**` line cannot tell them apart: the docs generator writes it
+# for every catalog layer that is not L1, fast-tier ones included.
+is_e2e_source() {
+  [[ "$1" == e2e_*.rs ]]
+}
+
+# The marker gate's per-id diagnostic, shared by selection and assembly so the
+# two print the same words wherever it fires.
+say_unmarked() {
+  echo "demo-reel-adapter: excluding '$1' (catalog id '$2' has no [reel] marker — not reel-eligible)" >&2
+}
+
+# The per-id diagnostic for a changed, marked e2e test with no cast on disk.
+say_unrecorded() {
+  echo "demo-reel-adapter: excluding '$1' (e2e test with no full-stream.cast — it has no recording; run it with $RECORD_HINT to record one)" >&2
 }
 
 # Catalog ordinal for an id: 1-based line order of its `##### <id> — …` entry in
@@ -502,13 +575,14 @@ human_time() {
 
 # --------------------------------------------------------------------------
 # Concern (b): assemble manifest.json from an explicit list of recording IDs.
-# Pure — reads test.md + CATALOG.md only. Excludes cast-less (L1) IDs. Orders by
+# Pure — reads test.md + CATALOG.md only. Excludes cast-less IDs (L1, or e2e
+# with no recording — issue #1683 — reported separately). Orders by
 # catalog id. Clean-skips (prints SKIP_MSG, writes NO manifest, exit 0) when
 # nothing is in scope.
 # --------------------------------------------------------------------------
 assemble() {
   local manifest="$1"; shift
-  local rows id md cast title catid desc ord obj title_dec desc_dec
+  local rows id md cast title catid desc ord obj title_dec desc_dec src
   # Ids dropped for a missing ` [reel]` marker, so the clean-skip below can name
   # the real reason instead of blaming the diff (issue #735) — and, separately,
   # the ids dropped for having no cast at all. BOTH buckets are tracked because a
@@ -517,8 +591,12 @@ assemble() {
   # (PR #778 review). `reel` never mixes them — `select_ids` filters cast-less
   # dirs out before `assemble` is called — but the standalone
   # `build.sh assemble <id...>` subcommand takes raw ids with no such filtering.
-  local ineligible=()
+  local ineligible=(${PRE_INELIGIBLE[@]+"${PRE_INELIGIBLE[@]}"})
   local cast_less=()
+  # Issue #1683: e2e tests with no cast on disk. Kept out of `cast_less`, whose
+  # wording ("not an e2e clip at all") is right for an L1 test and wrong for
+  # these, and whose remedy is the opposite one: these need recording.
+  local unrecorded=(${PRE_UNRECORDED[@]+"${PRE_UNRECORDED[@]}"})
   # Issue #808: ids whose recording failed the provenance gate. A third bucket
   # rather than folding them into `ineligible`, because "not reel-eligible" is a
   # statement about the TEST (its catalog marker) while this is a statement about
@@ -543,6 +621,22 @@ assemble() {
     cast="$RECORDINGS_DIR/$id/full-stream.cast"
     md="$RECORDINGS_DIR/$id/test.md"
     if [[ ! -f "$cast" ]]; then
+      src=""
+      [[ -f "$md" ]] && src="$(extract_source_basename "$md")"
+      if [[ -n "$src" ]] && is_e2e_source "$src"; then
+        # An e2e test that simply has no recording. The marker decides which
+        # bucket it lands in, so a skip never tells anyone to record a test
+        # that would not become a clip once recorded.
+        catid="$(extract_catalog_id "$(extract_title "$md")")"
+        if ! catalog_reel_eligible "$catid"; then
+          say_unmarked "$id" "$catid"
+          ineligible+=("$id")
+        else
+          say_unrecorded "$id"
+          unrecorded+=("$id")
+        fi
+        continue
+      fi
       echo "demo-reel-adapter: excluding '$id' (no full-stream.cast — not an e2e clip)" >&2
       cast_less+=("$id")
       continue
@@ -557,7 +651,7 @@ assemble() {
     # (PTY-attached) but NOT a reel clip. Excluded at assembly too, so an injected
     # id list can't smuggle an unmarked test past selection's own marker check.
     if ! catalog_reel_eligible "$catid"; then
-      echo "demo-reel-adapter: excluding '$id' (catalog id '$catid' has no [reel] marker — not reel-eligible)" >&2
+      say_unmarked "$id" "$catid"
       ineligible+=("$id")
       continue
     fi
@@ -588,9 +682,9 @@ assemble() {
 
   if [[ ! -s "$rows" ]]; then
     rm -f "$rows"
-    skip_message "in the given list" \
+    skip_message "$ASSEMBLE_SCOPE" \
       ${cast_less[@]+"${cast_less[@]}"} -- ${ineligible[@]+"${ineligible[@]}"} \
-      -- ${stale[@]+"${stale[@]}"}
+      -- ${stale[@]+"${stale[@]}"} -- ${unrecorded[@]+"${unrecorded[@]}"}
     return 0
   fi
 
@@ -600,6 +694,12 @@ assemble() {
   # visible in the same place the manifest is announced, not only mid-loop.
   if [[ ${#stale[@]} -gt 0 ]]; then
     echo "demo-reel-adapter: WARNING — ${#stale[@]} clip(s) were left OUT by the provenance gate and are NOT in this reel: $(join_ids "${stale[@]}"). Re-record them at this commit if the reel is meant to include them." >&2
+  fi
+  # The same visibility for marked e2e tests that have no recording at all
+  # (issue #1683): the reel is built without them, and saying so only mid-loop
+  # would let a partial reel pass for a complete one.
+  if [[ ${#unrecorded[@]} -gt 0 ]]; then
+    echo "demo-reel-adapter: WARNING — ${#unrecorded[@]} e2e test(s) have NO recording and are NOT in this reel: $(join_ids "${unrecorded[@]}"). Record them with $RECORD_HINT at this commit if the reel is meant to include them." >&2
   fi
 
   # Two cross-clip notes, both advisory. Neither can be a refusal without
@@ -638,7 +738,7 @@ assemble() {
 # route to a manifest runs `assemble`.
 # --------------------------------------------------------------------------
 select_ids() {
-  local changed base md id src catid
+  local changed base md id src catid has_cast
   # The default ref is `origin/main`, so refresh the remote-tracking ref first —
   # a local `main` can lag the true remote tip and over-select tests already
   # merged upstream. Best-effort: offline / no remote just falls back to whatever
@@ -657,27 +757,46 @@ select_ids() {
   changed="$(git diff --name-only "$base" -- '*.rs' 2>/dev/null | sed -E 's#.*/##' | sort -u || true)"
   [[ -d "$RECORDINGS_DIR" ]] || return 0
   # The three gates are ANDed, so evaluation ORDER cannot change WHICH ids are
-  # selected — but it does change which ones the marker gate gets to talk about,
-  # so the marker is checked LAST (issue #735). Checked first, it fires for every
-  # unmarked recording dir on disk (dozens), which is noise; checked last it
-  # fires only for a test that WOULD have been selected — cast on disk, source
-  # changed on this branch, marker absent. Those are the near-misses worth
-  # naming, and the ones `INELIGIBLE_LOG` hands to the caller so a clean skip can
-  # state its real reason instead of blaming the diff.
+  # selected — but it does change which ones the diagnostics get to talk about.
+  # The diff gate runs FIRST, so nothing is said about a test this branch did
+  # not touch, and the marker gate LAST (issue #735). Checked first, the marker
+  # fires for every unmarked recording dir on disk (dozens), which is noise;
+  # checked last it fires only for a test that WOULD have been selected. Those
+  # are the near-misses worth naming, and the ones `INELIGIBLE_LOG` hands to the
+  # caller so a clean skip can state its real reason instead of blaming the diff.
+  #
+  # The cast gate sits between them and splits two ways (issue #1683). A changed
+  # L1 test has no cast by construction and is dropped silently, as before. A
+  # changed e2e test with no cast is an unrecorded test — usually one whose last
+  # run lacked DOT_AGENT_DECK_RECORD=1 — and dropping it silently is what made
+  # the skip claim "no e2e tests changed". It still goes through the marker gate,
+  # so only a test that recording would actually put in the reel is reported as
+  # unrecorded; an unmarked one is reported as unmarked.
   for md in "$RECORDINGS_DIR"/*/test.md; do
     [[ -f "$md" ]] || continue
     id="$(basename "$(dirname "$md")")"
-    [[ -f "$RECORDINGS_DIR/$id/full-stream.cast" ]] || continue   # (1) e2e proxy
     src="$(extract_source_basename "$md")"
     [[ -n "$src" ]] || continue
     printf '%s\n' "$changed" | grep -Fxq "$src" || continue       # (3) changed vs main
+    has_cast=1
+    if [[ ! -f "$RECORDINGS_DIR/$id/full-stream.cast" ]]; then    # (1) e2e proxy
+      is_e2e_source "$src" || continue
+      has_cast=""
+    fi
     catid="$(extract_catalog_id "$(extract_title "$md")")"
     if ! catalog_reel_eligible "$catid"; then                     # (2) [reel] marker
       # Same diagnostic assemble() emits, so the marker gate explains itself
       # wherever it fires rather than only at assembly.
-      echo "demo-reel-adapter: excluding '$id' (catalog id '$catid' has no [reel] marker — not reel-eligible)" >&2
+      say_unmarked "$id" "$catid"
       if [[ -n "$INELIGIBLE_LOG" ]]; then
         printf '%s\n' "$id" >> "$INELIGIBLE_LOG"
+      fi
+      continue
+    fi
+    if [[ -z "$has_cast" ]]; then
+      say_unrecorded "$id"
+      if [[ -n "$UNRECORDED_LOG" ]]; then
+        printf '%s\n' "$id" >> "$UNRECORDED_LOG"
       fi
       continue
     fi
@@ -778,7 +897,8 @@ case "$cmd" in
     # trap: this path ends in `exec`, which replaces the process without running
     # EXIT traps, so the trap only covers a `die`/interrupt before that point.
     INELIGIBLE_LOG="$(mktemp)"
-    trap 'rm -f "${INELIGIBLE_LOG:-}"' EXIT INT TERM
+    UNRECORDED_LOG="$(mktemp)"
+    trap 'rm -f "${INELIGIBLE_LOG:-}" "${UNRECORDED_LOG:-}"' EXIT INT TERM
     # A read loop rather than `mapfile -t scope`, which is bash 4: macOS ships
     # /bin/bash 3.2.57, where `mapfile` is not a builtin at all and this died
     # with `mapfile: command not found` (exit 127) before selecting anything
@@ -793,25 +913,35 @@ case "$cmd" in
     while IFS= read -r id; do
       ineligible+=("$id")
     done < "$INELIGIBLE_LOG"
-    rm -f "$INELIGIBLE_LOG"
+    unrecorded=()
+    while IFS= read -r id; do
+      unrecorded+=("$id")
+    done < "$UNRECORDED_LOG"
+    rm -f "$INELIGIBLE_LOG" "$UNRECORDED_LOG"
     if [[ ${#scope[@]} -eq 0 ]]; then
       # Still a CLEAN skip — no manifest, no engine, exit 0. Only the wording
-      # changes: an empty `ineligible` means nothing was in scope at all, a
-      # non-empty one means tests changed but are deliberately not reel-eligible.
-      # The cast-less bucket is EMPTY here and always will be: `select_ids`'s gate
-      # (1) drops cast-less dirs itself, so this path never sees one. The STALE
-      # bucket is empty for a different reason — provenance is checked at
-      # ASSEMBLY, so a stale id is still SELECTED here and reaches `assemble`,
-      # which then clean-skips with its own three-bucket message. Both trailing
-      # `--`s still lead, so every call site passes the same shape.
-      skip_message "changed on this branch" -- ${ineligible[@]+"${ineligible[@]}"} --
+      # changes: both lists empty means nothing was in scope at all; a non-empty
+      # `ineligible` means tests changed but are deliberately not reel-eligible;
+      # a non-empty `unrecorded` means marked e2e tests changed but have no cast
+      # to publish (issue #1683). The cast-less bucket is EMPTY here and always
+      # will be: `select_ids` drops L1 dirs silently and routes cast-less e2e
+      # dirs to `unrecorded`. The STALE bucket is empty for a different reason —
+      # provenance is checked at ASSEMBLY, so a stale id is still SELECTED here
+      # and reaches `assemble`, which then clean-skips with its own message.
+      skip_message "changed on this branch" -- ${ineligible[@]+"${ineligible[@]}"} \
+        -- -- ${unrecorded[@]+"${unrecorded[@]}"}
       exit 0
     fi
     rm -f "$manifest"
+    # Hand assemble the ids selection already dropped, so a skip or a partial
+    # reel after assembly still names them rather than only the stale ones.
+    PRE_INELIGIBLE=(${ineligible[@]+"${ineligible[@]}"})
+    PRE_UNRECORDED=(${unrecorded[@]+"${unrecorded[@]}"})
+    ASSEMBLE_SCOPE="changed on this branch"
     assemble "$manifest" "${scope[@]}"
-    # assemble clean-skipped: either every selected dir turned out to be
-    # cast-less, or — since issue #808 — every one of them failed the provenance
-    # gate. `assemble` has already said which on stdout, naming the ids.
+    # assemble clean-skipped: every selected dir failed the provenance gate
+    # (issue #808). `assemble` has already said so on stdout, naming the ids
+    # along with any selection dropped for a missing marker or recording.
     [[ -f "$manifest" ]] || exit 0
     [[ -x "$ENGINE" ]] || die "engine not found or not executable: $ENGINE"
     # Compose a descriptive title unless the caller pinned one with --title, and
