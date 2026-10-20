@@ -14,6 +14,7 @@ import { UPGRADE_ALREADY_RUNNING, upgradeEndedDeckSessions, type UpgradeChoice, 
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
 import { speechAudioError } from "./speech";
+import { DEFAULT_SPEECH_LANGUAGE, SPEECH_LANGUAGE_TOKENS } from "./speechLanguages";
 import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "./voiceQuestion";
 import { pullRequestFromDto } from "./pullRequest";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
@@ -539,7 +540,7 @@ export interface DesktopSettingsDto {
 export interface VoiceSettingsDto {
   activation: string;
   intent: VoiceIntentStageDto;
-  transcription: VoiceStageDto;
+  transcription: VoiceTranscriptionStageDto;
   /**
    * Whether each command request carries the names the app observed — agents,
    * decks, directories on screen, the New agent form's chips and picker,
@@ -600,6 +601,17 @@ export interface VoiceStageDto {
  */
 export interface VoiceIntentStageDto extends VoiceStageDto {
   max_tokens: number;
+}
+
+/**
+ * The speech stage, which is one voice stage plus the language each request
+ * names (issue #1458): `auto` or one of `SPEECH_LANGUAGES`' codes, `en` by
+ * default. Only the speech stage has one — it is what the speaker speaks, not
+ * something the Commands service is told. It is not part of a backend's
+ * preset, so picking another backend keeps it.
+ */
+export interface VoiceTranscriptionStageDto extends VoiceStageDto {
+  language: string;
 }
 
 /** The `[endpoints]` section: the remote decks, and which deck is selected. */
@@ -855,7 +867,7 @@ export const LOCAL_SPEECH_IMAGE = "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu";
 export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
   activation: "toggle",
   intent: VOICE_STAGE_PRESETS.intent.openai_compatible,
-  transcription: VOICE_STAGE_PRESETS.transcription.local,
+  transcription: { ...VOICE_STAGE_PRESETS.transcription.local, language: DEFAULT_SPEECH_LANGUAGE },
   labels: "shared",
   speech: "auto",
   reading: "off",
@@ -1419,7 +1431,7 @@ function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined {
   return {
     activation,
     intent: normalizeVoiceIntentStage(record.intent),
-    transcription: normalizeVoiceStage(record.transcription, VOICE_TRANSCRIPTION_BACKENDS, DEFAULT_VOICE_SETTINGS.transcription, VOICE_STAGE_PRESETS.transcription),
+    transcription: normalizeVoiceTranscriptionStage(record.transcription),
     labels,
     speech,
     reading,
@@ -1455,6 +1467,31 @@ function normalizeVoiceStage(
     backend,
     endpoint: typeof record.endpoint === "string" && record.endpoint ? record.endpoint : preset.endpoint,
     model: typeof record.model === "string" && record.model ? record.model : preset.model,
+  };
+}
+
+/**
+ * The speech stage, which is `normalizeVoiceStage` plus the language (issue
+ * #1458). Rebuilt key by key for the parent's reason. A language this build
+ * does not offer folds to English, as Rust's `SpeechLanguage` folds it — so a
+ * document that names none, which is every one written before the setting,
+ * reads as the English pin it always had.
+ */
+function normalizeVoiceTranscriptionStage(value: unknown): VoiceTranscriptionStageDto {
+  const stage = normalizeVoiceStage(
+    value,
+    VOICE_TRANSCRIPTION_BACKENDS,
+    DEFAULT_VOICE_SETTINGS.transcription,
+    VOICE_STAGE_PRESETS.transcription,
+  );
+  const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+  const language = SPEECH_LANGUAGE_TOKENS.find((candidate) => candidate === record.language)
+    ?? DEFAULT_SPEECH_LANGUAGE;
+  return {
+    backend: stage.backend,
+    endpoint: stage.endpoint,
+    model: stage.model,
+    language,
   };
 }
 

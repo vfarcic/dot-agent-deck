@@ -215,7 +215,7 @@ fn clean_composer(deck: &TuiDeck, pane: &Pane, deadline: Instant) {
             let r = record(deck, pane);
             let rows = r["rows"].as_u64().unwrap() as u16;
             let cols = r["cols"].as_u64().unwrap() as u16;
-            let mut terminal = vt100::Parser::new(rows, cols, 0);
+            let mut terminal = dot_agent_deck::vt_grid::parser(rows, cols, 0);
             terminal.process(&common::pane_snapshot_on(
                 deck.attach_socket_path(),
                 &pane.agent,
@@ -346,7 +346,7 @@ fn exercise(deck: &TuiDeck, pane: &Pane, work: &Path, kind: &str, doorbell_only:
     assert!(
         common::wait_until(remaining(deadline), || {
             let r = record(deck, pane);
-            let mut terminal = vt100::Parser::new(
+            let mut terminal = dot_agent_deck::vt_grid::parser(
                 r["rows"].as_u64().unwrap() as u16,
                 r["cols"].as_u64().unwrap() as u16,
                 0,

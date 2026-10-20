@@ -8,7 +8,9 @@ import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentV
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
+import { LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
 import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
+import { cliBehind, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
 import { HostMetricsButton } from "./HostMetricsPanel";
 import { chooseHostDeck } from "../lib/hostMetrics";
@@ -827,7 +829,7 @@ export function stopTargetName(agent: OverviewAgent): string {
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange, notice }: {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange, notice, selfUpgrade }: {
   runtime: DeckRuntimeState;
   settings?: DesktopSettingsState;
   onNavigate: (view: DeckView) => void;
@@ -858,6 +860,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   newAgentVoice?: NewAgentVoiceChannel;
   /** Issue #1635 — the app's newer-release banner, shown at the top of the dashboard. */
   notice?: ReactNode;
+  /**
+   * Issue #1753 — the app's newer-release check and the calls that upgrade
+   * this machine's CLI, for the Local daemon section's Upgrade. `onClosed`
+   * runs when that flow ends, so the app checks again.
+   */
+  selfUpgrade?: { check?: SelfUpgradeCheck; api?: SelfUpgradeApi; onClosed?: () => void };
 }) {
   const { fleet, snapshot, mode } = runtime;
   /*
@@ -1222,6 +1230,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const [confirm, setConfirm] = useState<ConfirmState>();
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
   const [upgrade, setUpgrade] = useState<UpgradeTarget>();
+  /** Issue #1753 — Upgrade on the Local daemon section: the CLI, the daemon, or both. */
+  const [localUpgrade, setLocalUpgrade] = useState<LocalUpgradeRequest>();
+  /* The CLI's plan while it is behind and this app can upgrade it. */
+  const cliPlan = selfUpgrade?.api ? cliBehind(selfUpgrade.check) : undefined;
   /**
    * PR #1451 round 3, change 3 — the rows, numbered: every deck's, in the
    * order they render, as one sequence. Declared whenever they are on screen
@@ -1267,7 +1279,27 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   ), [numberedAgents, voiceOn]);
   /* The Upgrade dialog counts as a confirmation for voice and for the
      dashboard's own keys: it asks whether to stop agents (PRD #1487 review). */
-  const confirmationOpen = confirm !== undefined || upgrade !== undefined;
+  const confirmationOpen = confirm !== undefined || upgrade !== undefined || localUpgrade !== undefined;
+  /**
+   * What a deck's Upgrade does, and what its button says. A remote deck's
+   * covers its daemon, which runs that host's CLI. The local deck's covers the
+   * CLI on this machine and the local daemon, either of which can be behind
+   * (issue #1753), so its label and tooltip name what is.
+   */
+  const deckUpgrade = (connection: ConnectionView): { onUpgrade?: () => void; upgradeLabel?: string; upgradeTitle?: string } => {
+    const daemon: UpgradeTarget | undefined = runtime.upgradeDaemon && upgradeOffered(connection) && connection.deckId !== undefined
+      ? { deckId: connection.deckId, deckName: deckName(connection), kind: upgradeKindOf(connection), offer: connection.upgradeOffer }
+      : undefined;
+    const daemonTitle = connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined;
+    if (connection.deckKind === "remote") return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    const cli = cliPlan && selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
+    if (!cli) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    return {
+      onUpgrade: () => setLocalUpgrade({ daemon, cli }),
+      upgradeLabel: daemon ? "Upgrade the CLI and the daemon on this machine" : "Upgrade the CLI on this machine",
+      upgradeTitle: [displayText(cliPlan!.headline, DISPLAY_LIMITS.message), daemon ? daemonTitle : undefined].filter(Boolean).join(" "),
+    };
+  };
   /* Issue #1492 — the scroll keys, while the rows are on screen and focus is
      outside the dashboard's region (see `dashboardKeyScroll`). */
   useEffect(() => {
@@ -1592,14 +1624,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               overrideError={overrideError && deck.snapshot.connection.deckId === overrideError.deckId ? overrideError.message : undefined}
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? () => requestConnectAnyway(deck.snapshot.connection) : undefined}
               /*
-                PRD #1487 D8/D9: Upgrade on THIS deck's card, offered only when
-                the crate says its daemon runs an older release than the app —
-                on the local deck too since issue #1636, as a restart onto this
-                app's build.
+                PRD #1487 D8/D9: Upgrade on THIS deck's card, offered when the
+                crate says its daemon runs an older release than the app — on
+                the local deck too since issue #1636, as a restart onto this
+                app's build — and, on the local deck since issue #1753, when
+                this machine's CLI is behind, whatever the daemon runs.
               */
-              onUpgrade={runtime.upgradeDaemon && upgradeOffered(deck.snapshot.connection) && deck.snapshot.connection.deckId !== undefined
-                ? () => setUpgrade({ deckId: deck.snapshot.connection.deckId!, deckName: deckName(deck.snapshot.connection), kind: upgradeKindOf(deck.snapshot.connection), offer: deck.snapshot.connection.upgradeOffer })
-                : undefined}
+              {...deckUpgrade(deck.snapshot.connection)}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
               hostOpen={deck.snapshot.connection.deckId !== undefined && hostOpen === deck.snapshot.connection.deckId}
               onOpenHost={() => VOICE_ACTIONS.showHostMetrics.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId })}
@@ -1610,6 +1641,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       </main>
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
+      {localUpgrade && <LocalUpgradeFlow {...localUpgrade} runtime={runtime} onClose={() => { setLocalUpgrade(undefined); selfUpgrade?.onClosed?.(); }} />}
       {newAgent && newAgentRuntime && (
         <NewAgentDialog
           runtime={newAgentRuntime}
@@ -1704,7 +1736,7 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
+function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
   deck: FleetDeck;
   now: number;
   columns: OverviewColumnId[];
@@ -1721,8 +1753,12 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
   onOpenDeck?: () => void;
   onReconnect: () => void;
   onConnectAnyway?: () => void;
-  /** PRD #1487 — Upgrade this deck's daemon. Absent unless the crate offers it. */
+  /** PRD #1487 — Upgrade this deck's daemon, and on the local deck this machine's CLI (issue #1753). Absent unless something is behind. */
   onUpgrade?: () => void;
+  /** Issue #1753 — what Upgrade's button says to a screen reader, when it is not the daemon alone. */
+  upgradeLabel?: string;
+  /** What hovering Upgrade shows: what is behind. */
+  upgradeTitle?: string;
   /** Open the New agent flow with THIS deck preselected (PRD #1223 M4). Absent where the deck cannot take a spawn. */
   onNewAgent?: () => void;
   /** PR #1672 — whether THIS deck's Host popover is the open one, and the two ways to change that. */
@@ -1736,7 +1772,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
     sentence that explains it; every other state puts it on the header, so a
     card never shows two.
   */
-  const upgradeInNote = connection.status === "error" && connection.daemonDetected === true;
+  const upgradeInNote = connection.status === "error" && connection.daemonDetected === true && connection.deckKind === "remote";
   const socketPath = connection.socketPath;
   const titleId = useId();
   const daemonMessage = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
@@ -1838,7 +1874,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
           neighbours read as counted — never as a deck running nothing.
         */}
         {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title={unknownPipsTitle(connection)}>—</span>}
-        {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={`Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
+        {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={upgradeLabel ?? `Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={upgradeTitle} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
       </header>
 

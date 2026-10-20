@@ -364,15 +364,18 @@ pub(crate) fn parse_github_owner_repo(url: &str) -> Option<String> {
     Some(format!("{owner}/{name}"))
 }
 
-/// `gh pr list --head <branch> --state all --repo <owner/name> --json
-/// state,headRefName` — `--state all` because `gh pr list` defaults to
+/// The `--json` fields the PR lookup needs. `isCrossRepository` for the
+/// reason [`crate::pull_request::GH_PR_FIELDS`] carries it: `--head` matches a
+/// branch NAME, so a fork's pull request from a branch named like ours is
+/// listed too (issue #1687).
+const GH_PR_FIELDS: &str = "state,headRefName,isCrossRepository";
+
+/// `gh pr list --head <branch> --state all --repo <owner/name> --json`
+/// [`GH_PR_FIELDS`] — `--state all` because `gh pr list` defaults to
 /// `--state open`, which makes every merged PR invisible; `--repo`, derived
 /// from `origin` via [`derive_repo_slug`], because letting `gh` infer it
 /// queries the upstream repo from a fork checkout with no default set.
-///
-/// Matches results on `headRefName` exactly (mitigates "a PR is matched to
-/// the wrong branch" from the PRD's risk list) and treats zero matches as
-/// `NoPr`, more than one as `Unresolvable` (ambiguous), never guessing.
+/// [`parse_pr_state`] reads the answer.
 fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
     let repo_slug = match derive_repo_slug(repo_dir) {
         Some(slug) => slug,
@@ -389,7 +392,7 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
         .args(crate::pull_request::gh_pr_list_args(
             branch,
             &repo_slug,
-            "state,headRefName",
+            GH_PR_FIELDS,
         ))
         .output();
     let out = match out {
@@ -402,15 +405,40 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let entries: Vec<serde_json::Value> = match serde_json::from_str(&text) {
+    parse_pr_state(&String::from_utf8_lossy(&out.stdout), branch)
+}
+
+/// The PR state `gh pr list --json` output reports for exactly `branch`.
+///
+/// Matches results on `headRefName` exactly (mitigates "a PR is matched to
+/// the wrong branch" from the PRD's risk list) and from a branch of the
+/// repository itself: a fork's pull request from a branch with the same name
+/// is someone else's, and its merge says nothing about this worktree (issue
+/// #1687, the same filter [`crate::pull_request::parse_pr_list`] applies to
+/// the badge). Unlike the badge, an entry naming the branch that does not say
+/// where its branch lives is `Unresolvable` rather than read as ours, since
+/// this verdict can delete a directory. Zero matches is `NoPr`, more than one
+/// `Unresolvable` (ambiguous), never guessing.
+fn parse_pr_state(json: &str, branch: &str) -> PrState {
+    let entries: Vec<serde_json::Value> = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(e) => return PrState::Unresolvable(format!("could not parse gh output: {e}")),
     };
-    let matching: Vec<&serde_json::Value> = entries
+    let mut matching = Vec::new();
+    for entry in entries
         .iter()
         .filter(|v| v.get("headRefName").and_then(|h| h.as_str()) == Some(branch))
-        .collect();
+    {
+        match entry.get("isCrossRepository").and_then(|c| c.as_bool()) {
+            Some(true) => {}
+            Some(false) => matching.push(entry),
+            None => {
+                return PrState::Unresolvable(
+                    "PR entry has no `isCrossRepository` field".to_string(),
+                );
+            }
+        }
+    }
     match matching.as_slice() {
         [] => PrState::NoPr,
         [one] => match one.get("state").and_then(|s| s.as_str()) {
@@ -725,6 +753,49 @@ mod tests {
             Ownership::Ours,
         );
         assert!(matches!(v, Verdict::Keep(_)));
+    }
+
+    #[test]
+    fn parse_pr_state_ignores_a_fork_pull_request_from_a_same_named_branch() {
+        assert!(
+            GH_PR_FIELDS
+                .split(',')
+                .any(|field| field == "isCrossRepository"),
+            "gh must be asked where each PR's branch lives"
+        );
+        let fork = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":true}"#;
+        let own = r#"{"state":"OPEN","headRefName":"feat/x","isCrossRepository":false}"#;
+        assert_eq!(
+            parse_pr_state(&format!("[{fork}]"), "feat/x"),
+            PrState::NoPr
+        );
+        assert_eq!(
+            parse_pr_state(&format!("[{fork},{own}]"), "feat/x"),
+            PrState::Open
+        );
+    }
+
+    #[test]
+    fn parse_pr_state_without_is_cross_repository_is_unresolvable() {
+        let json = r#"[{"state":"MERGED","headRefName":"feat/x"}]"#;
+        assert!(matches!(
+            parse_pr_state(json, "feat/x"),
+            PrState::Unresolvable(_)
+        ));
+    }
+
+    #[test]
+    fn parse_pr_state_two_own_pull_requests_are_unresolvable() {
+        let one = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":false}"#;
+        let two = r#"{"state":"CLOSED","headRefName":"feat/x","isCrossRepository":false}"#;
+        assert!(matches!(
+            parse_pr_state(&format!("[{one},{two}]"), "feat/x"),
+            PrState::Unresolvable(_)
+        ));
+        assert_eq!(
+            parse_pr_state(&format!("[{one}]"), "feat/x"),
+            PrState::Merged
+        );
     }
 
     #[test]

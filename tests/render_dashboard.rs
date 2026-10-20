@@ -2318,7 +2318,7 @@ fn render_pane_border_buffer(
         height: 6,
     };
     // Inner area is 20×4; size the screen to match (no contract fallback).
-    let parser = vt100::Parser::new(4, 20, 0);
+    let parser = dot_agent_deck::vt_grid::parser(4, 20, 0);
     let parser = Arc::new(Mutex::new(parser));
     let title = match &status {
         Some(s) => format!("{s:?}"),

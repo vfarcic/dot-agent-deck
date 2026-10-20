@@ -416,22 +416,31 @@ mod logind {
     /// ours and outlives the connection that carried it, and a long-lived
     /// system-bus connection would be a socket and a reader task held by an app
     /// that otherwise speaks to no bus at all.
+    ///
+    /// zbus 6 has no blocking API, so the async calls run under
+    /// [`zbus::block_on`]. That is safe here because this runs on a
+    /// `spawn_blocking` thread, not inside a runtime's task.
     fn acquire() -> zbus::Result<OwnedFd> {
-        let bus = zbus::blocking::connection::Builder::system()?
-            .method_timeout(ANSWER_WITHIN)
-            .build()?;
-        let reply = bus.call_method(
-            Some("org.freedesktop.login1"),
-            "/org/freedesktop/login1",
-            Some("org.freedesktop.login1.Manager"),
-            "Inhibit",
-            &(WHAT, WAKE_WHO, WAKE_WHY, MODE),
-        )?;
-        // Bound rather than chained: `Body` borrows the message, and the
-        // descriptor it yields borrows the body.
-        let body = reply.body();
-        let fd: zbus::zvariant::OwnedFd = body.deserialize()?;
-        Ok(fd.into())
+        zbus::block_on(async {
+            let bus = zbus::connection::Builder::system()
+                .method_timeout(ANSWER_WITHIN)
+                .build()
+                .await?;
+            let reply = bus
+                .call_method(
+                    Some("org.freedesktop.login1"),
+                    "/org/freedesktop/login1",
+                    Some("org.freedesktop.login1.Manager"),
+                    "Inhibit",
+                    &(WHAT, WAKE_WHO, WAKE_WHY, MODE),
+                )
+                .await?;
+            // Bound rather than chained: `Body` borrows the message, and the
+            // descriptor it yields borrows the body.
+            let body = reply.body();
+            let fd: zbus::OwnedFd = body.deserialize()?;
+            Ok(fd.into())
+        })
     }
 }
 

@@ -124,6 +124,7 @@ For documentation-first PRDs:
 - [ ] Documentation complete
 - [ ] Integration points clear
 - [ ] Implementation approach decided
+- [ ] Every new desktop control has a voice path (a `commands.toml` row) or a written `no_voice` reason (CLAUDE.md rule 23)
 ```
 
 **If PRD is not ready:** Inform the user what's missing and suggest they complete PRD planning first — for an issue PRD that is `/prd-create [issue-id]` or `/prd-update-decisions`, which edit the issue body; neither needs a commit.

@@ -758,7 +758,7 @@ fn settled_side_scroll_markers(deck: &TuiDeck, what: &str) -> Vec<String> {
 /// read off a grid line is not the screen column.
 fn schedules_dialog_fully_painted(screen: &vt100::Screen) -> bool {
     const TITLE: &str = "Schedules";
-    let (rows, cols) = screen.size();
+    let (rows, cols) = dot_agent_deck::vt_grid::size(screen);
     let cell = |row: u16, col: u16| screen.cell(row, col).map_or("", |c| c.contents());
     for top in 0..rows {
         for left in 0..cols {

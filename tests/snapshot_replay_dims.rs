@@ -63,9 +63,9 @@ fn hydration_at_wide_dims_preserves_sentinel_past_col_80() {
         "PRD #104 M2 contract: hydration must propagate daemon-reported dims"
     );
 
-    let mut parser = vt100::Parser::new(rows, cols, 10_000);
+    let mut parser = dot_agent_deck::vt_grid::parser(rows, cols, 10_000);
     assert_eq!(
-        parser.screen().size(),
+        dot_agent_deck::vt_grid::size(parser.screen()),
         (40, 120),
         "parser must be constructed at the resolved dims so snapshot \
          bytes are parsed at the same geometry the daemon emitted them at"
@@ -94,7 +94,7 @@ fn parser_at_24x80_demonstrates_pre_prd_corruption() {
     // bytes that placed an intact SENTINEL at col 100 above must NOT
     // produce a recognizable SENTINEL string anywhere on this
     // parser's screen — that's the regression we just closed.
-    let mut parser = vt100::Parser::new(24, 80, 10_000);
+    let mut parser = dot_agent_deck::vt_grid::parser(24, 80, 10_000);
     parser.process(b"\x1b[10;101HSENTINEL");
 
     // Scan every cell across every row for the literal sentinel byte

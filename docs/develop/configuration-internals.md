@@ -8,7 +8,7 @@ When `XDG_RUNTIME_DIR` is unset, both endpoints (`hook.sock`, `attach.sock`) go 
 
 The directory's own name is predictable, so another uid can create it first. In that case `daemon serve` binds in a relocated sibling, `dot-agent-deck-{uid}.` plus 16 random hex digits, created at `0700`, and the connect side finds it by listing (issue #1173, `crate::endpoint_resolve::prepare_bind_endpoint`). The relocation is logged with `tracing::warn!` ("this deck's endpoints are in … instead of …"), which reaches a file only when `DOT_AGENT_DECK_LOG` is set for the daemon. `platform::paths::fallback_endpoint_dir` does not know about relocation and must not: it stays the pure answer for a host where the name is free.
 
-Since issue #1211 the daemon also binds the pre-#1121 spellings, `/tmp/dot-agent-deck-{uid}.sock` and `/tmp/dot-agent-deck-attach-{uid}.sock` (a literal `/tmp`, because that is what older builds wrote), as best-effort aliases so an older client finds a newer daemon. An alias bind is allowed to fail; the daemon unlinks only its own stale socket there, and at exit only the inode it bound. `platform::paths::legacy_socket_path` carries the full reasoning.
+The pre-#1121 spellings, `/tmp/dot-agent-deck-{uid}.sock` and `/tmp/dot-agent-deck-attach-{uid}.sock` (a literal `/tmp`, because that is what older builds wrote), are only read: a client that finds nothing at its primary endpoint looks there for a daemon from an older build. From issue #1211 until issue #1213 the daemon also bound them as best-effort aliases so an older client found a newer daemon; #1213 removed the aliases. `platform::paths::legacy_socket_path` carries the full reasoning.
 
 ## `config.toml` load and save
 

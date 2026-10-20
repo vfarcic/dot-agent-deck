@@ -24,6 +24,7 @@ pub mod daemon_attach;
 pub mod daemon_client;
 pub mod daemon_protocol;
 pub mod daemon_restart;
+pub mod daemon_service;
 // Issue #1490: why a deck is not connected, and starting its daemon.
 pub mod daemon_start;
 pub mod daemon_status;
@@ -48,9 +49,8 @@ pub mod embedded_pane;
 // PRD #1419 Decision 4: the user docs embedded at build time for `docs [topic]`.
 pub mod embedded_docs;
 // Issue #1121: the endpoint I/O that `platform::paths`' pure resolvers must not
-// do — creating the owner-only fallback directory, the connect side's
-// read-only probe of the pre-#1121 endpoint spelling, and (issue #1211) the
-// daemon's best-effort alias bind of that same spelling.
+// do — creating the owner-only fallback directory, and the connect side's
+// read-only probe of the pre-#1121 endpoint spelling.
 pub mod endpoint_resolve;
 // Issue #1516: an in-process stand-in for a few environment knobs, so a test can
 // change one while the deck's own tasks are reading it. Production never sets an
@@ -179,6 +179,8 @@ pub mod ui;
 pub mod untrusted_text;
 pub mod upgrade_dialog;
 pub mod version;
+// vt100 0.18 sizes grids in `NonZeroU16`; the deck's `u16` geometry crosses here.
+pub mod vt_grid;
 pub mod watch;
 pub mod worktree_owner;
 pub mod worktree_reclaim;

@@ -311,26 +311,26 @@ tauri = { version = "2", features = ["test"] }
 # `org.freedesktop.login1.Manager.Inhibit("idle", …, "block")` call on the
 # system bus, whose reply is the file descriptor that IS the inhibit.
 #
-# NOT A NEW DEPENDENCY in any sense that costs a build second or a lockfile
-# entry: `keyring`'s `zbus-secret-service-keyring-store` backend — the one that
-# is already selected on Linux by the `keyring = "4"` entry above — pulls
-# exactly this `zbus` in, and the lockfile carries one of it. Default features,
-# which is `async-io` + `blocking-api`, is what that backend already resolves,
-# so declaring it here adds no feature either. Declaring it at all is the
-# discipline the `tokio` and `getrandom` entries above state: a change over
-# there cannot silently take this crate's sleep inhibit out.
+# Since zbus 6 this is a SECOND copy of zbus in the Linux build: `keyring`'s
+# `zbus-secret-service-keyring-store` backend, selected on Linux by the
+# `keyring = "4"` entry above, still pulls zbus 5, so the lockfile carries both
+# until that backend moves to 6. Declaring it here at all is the discipline the
+# `tokio` and `getrandom` entries above state: a change over there cannot
+# silently take this crate's sleep inhibit out. Default features, whose
+# `default-rt` is what `zbus::block_on` needs.
 #
-# `zbus::blocking` rather than the async API because every call site is already
-# on a blocking thread — opening the audio device and asking the machine to
-# stay awake happen in the same `spawn_blocking` closure — and an async D-Bus
-# connection would need a runtime of its own driven from there anyway.
+# zbus 6 has no blocking API, so `voice/wake.rs` drives the async one under
+# `zbus::block_on`. That fits because every call site is already on a blocking
+# thread — opening the audio device and asking the machine to stay awake happen
+# in the same `spawn_blocking` closure — so the call needs no runtime task of
+# its own.
 #
 # Target-gated to Linux because that is where logind is. macOS and Windows get
 # hand-written FFI to a framework and a DLL their target already links (see
 # `voice/wake.rs`), so neither needs a crate, and this one is never compiled
 # for them.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = "5"
+zbus = "6"
 # PRD #1401: the Linux half of the PR browser's placement (`pr_browser.rs`'s
 # `overlay`). Tauri packs a window's webviews into one `GtkBox`, so the PR
 # webview is moved into a `GtkOverlay` over the main one. NOT a new dependency:

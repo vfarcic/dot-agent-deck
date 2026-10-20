@@ -114,6 +114,8 @@ The daemon outlives the TUI: detach, close the terminal or lose an ssh connectio
 
 About 30 seconds after the last client disconnects, if no agent is running and no enabled schedule is registered, the daemon exits by itself. `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` sets that window in seconds (`0` keeps the daemon up until it is stopped). See [Configuration](configuration.md) for the other settings.
 
+Nothing starts the daemon after a reboot or a crash until you open the deck again. To keep it running on its own, for schedules or for a remote host, run it as a service with `dot-agent-deck daemon install`; see [Run the Daemon as a Service](daemon-service.md).
+
 ## Next steps
 
 This page stops at one running agent. Most setups want more than that, so if the goal is larger, continue with the page for it: several agents working together (for example a coder, a reviewer and an orchestrator that hands them work) is [Orchestration](orchestration.md).

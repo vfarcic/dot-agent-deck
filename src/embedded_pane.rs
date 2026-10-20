@@ -470,16 +470,16 @@ fn set_parser_size_if_changed(parser: &Mutex<vt100::Parser>, rows: u16, cols: u1
     let Ok(mut parser) = parser.lock() else {
         return;
     };
-    if parser.screen().size() == (rows, cols) {
+    if crate::vt_grid::size(parser.screen()) == (rows, cols) {
         return;
     }
-    parser.screen_mut().set_size(rows, cols);
+    crate::vt_grid::set_size(parser.screen_mut(), rows, cols);
 }
 
 /// guarded by [`guarded_parser_feed`].
 fn new_pane_parser(rows: u16, cols: u16) -> vt100::Parser {
     let (rows, cols) = parser_init_dims(rows, cols);
-    vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES)
+    crate::vt_grid::parser(rows, cols, PANE_SCROLLBACK_LINES)
 }
 
 use crate::pane_input::{SUBMIT_DELAY, encode_pane_payload};
@@ -1143,7 +1143,7 @@ impl EmbeddedPaneController {
         // Post-guard geometry, read back off the parser itself rather than
         // re-derived: what the warning below should name, and what the rebuild
         // has to reproduce. Re-deriving it is how two copies of a rule drift.
-        let (rows, cols) = parser.screen().size();
+        let (rows, cols) = crate::vt_grid::size(parser.screen());
         if guarded_parser_feed(|| parser.process(bytes)).is_err() {
             tracing::warn!(
                 rows,
@@ -1388,7 +1388,7 @@ impl EmbeddedPaneController {
         let pane = panes.get(pane_id)?;
         let bytes_since_spawn = pane.bytes_since_spawn.load(Ordering::Relaxed);
         let mut parser = pane.screen.lock().ok()?;
-        let (rows, cols) = parser.screen().size();
+        let (rows, cols) = crate::vt_grid::size(parser.screen());
         // vt100 0.16 clamps a requested offset to the lines it actually holds,
         // so asking for an impossible one and reading it back IS the depth.
         // Deliberately not `PANE_SCROLLBACK_LINES`: that is the capacity the
@@ -3297,7 +3297,7 @@ async fn run_pane_io_task(
         let viewport = parser
             .lock()
             .ok()
-            .map(|p| p.screen().size())
+            .map(|p| crate::vt_grid::size(p.screen()))
             .filter(|(rows, cols)| *rows > 0 && *cols > 0);
         match resolve_and_reattach(&client, &pane_id, viewport).await {
             Ok((new_agent_id, new_conn)) => {
@@ -3768,6 +3768,12 @@ thread_local! {
     /// not treated like a genuine fatal panic — i.e. it does not restore/tear
     /// down the live terminal and exit the TUI.
     static IN_GUARDED_PARSER_FEED: Cell<bool> = const { Cell::new(false) };
+
+    /// Test-only: make the next [`feed_segment`] on this thread panic, so the
+    /// containment path can be exercised now that vt100 0.18 no longer panics
+    /// on the wide-character input that used to trigger it.
+    #[cfg(test)]
+    static PANIC_IN_NEXT_FEED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// True while this thread is inside a guarded vt100 feed. The `run_tui` panic
@@ -3787,9 +3793,10 @@ pub(crate) fn in_guarded_parser_feed() -> bool {
 
 /// Run `f` under [`catch_unwind`], flagging the thread for the duration so the
 /// `run_tui` panic hook treats any panic as *contained*. Used to isolate
-/// panics originating inside the `vt100` crate — notably the `col_wrap` row
-/// underflow / out-of-bounds cell `unwrap()` (grid.rs) that fires on wide
-/// characters in a very short (e.g. 1-row) pane. Callers MUST keep any held
+/// panics originating inside the `vt100` crate — the guard was written for
+/// 0.16.2's `col_wrap` row underflow / out-of-bounds cell `unwrap()` (grid.rs)
+/// on wide characters in a very short (e.g. 1-row) pane, which 0.18 fixed, and
+/// stays for whatever the parser does next. Callers MUST keep any held
 /// `MutexGuard` *outside* `f` so a caught panic does not drop a guard
 /// mid-unwind and poison the lock.
 ///
@@ -3807,9 +3814,13 @@ fn guarded_parser_feed<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
 /// the third-party parser — runs inside [`guarded_parser_feed`]'s
 /// `catch_unwind`.
 fn feed_segment(p: &mut vt100::Parser, segment: &Osc8Segment) -> (u16, Option<(u16, String)>) {
+    #[cfg(test)]
+    if PANIC_IN_NEXT_FEED.with(|flag| flag.replace(false)) {
+        panic!("injected vt100 feed panic");
+    }
     // Recomputed per segment: only a resize changes it, and no resize happens
     // within a single chunk, so this matches the previous once-per-chunk value.
-    let max_row = p.screen().size().0.saturating_sub(1);
+    let max_row = crate::vt_grid::size(p.screen()).0.saturating_sub(1);
     match segment {
         Osc8Segment::Text(bytes) => {
             let rb = p.screen().cursor_position().0;
@@ -3890,7 +3901,7 @@ fn process_agent_output_chunk(
         // rebuild it at the same geometry. Rebuilt through `new_pane_parser`
         // (issue #363), so a parser that somehow holds a degenerate geometry is
         // replaced by a valid one instead of reproducing the degenerate grid.
-        let (rows, cols) = p.screen().size();
+        let (rows, cols) = crate::vt_grid::size(p.screen());
         for segment in &segments {
             // The MutexGuard `p` is borrowed into the closure but lives in this
             // scope, so a caught panic does not poison the lock.
@@ -4518,6 +4529,8 @@ impl PaneController for EmbeddedPaneController {
 
 #[cfg(test)]
 mod tests {
+    use spec::spec;
+
     /// PR #1735 review (4301453654): two presses whose answers come back out
     /// of order leave the later press's answer, and the earlier one's is
     /// dropped.
@@ -4814,14 +4827,17 @@ mod tests {
         );
     }
 
-    /// Regression: `vt100` 0.16.2 panics (`col_wrap` row-underflow / an
-    /// out-of-bounds cell `unwrap()` in grid.rs) when a wide character wraps in
-    /// a 1-row pane — the geometry a pane collapses to when many are stacked
-    /// into one column (the crash observed over `connect`). Feeding that chunk
-    /// must be contained by `process_agent_output_chunk` so a single malformed
-    /// chunk from any agent can never crash the whole TUI: the call returns
-    /// normally, the guard flag clears, the parser mutex is not poisoned, and a
-    /// later chunk still processes.
+    /// Regression: `vt100` 0.16.2 panicked (`col_wrap` row-underflow / an
+    /// out-of-bounds cell `unwrap()` in grid.rs) when a wide character wrapped
+    /// in a 1-row pane — the geometry a pane collapses to when many are stacked
+    /// into one column (the crash observed over `connect`). vt100 0.18 no
+    /// longer panics on that input, so the panic is now injected
+    /// ([`PANIC_IN_NEXT_FEED`]) and the wide-character chunk is checked
+    /// separately to still feed cleanly. A panicking chunk must be contained by
+    /// `process_agent_output_chunk` so a single malformed chunk from any agent
+    /// can never crash the whole TUI: the call returns normally, the guard flag
+    /// clears, the parser mutex is not poisoned, and a later chunk still
+    /// processes.
     #[test]
     fn wide_char_in_one_row_pane_does_not_crash_the_tui() {
         // Suppress the *contained* panic's default report so test output stays
@@ -4842,19 +4858,18 @@ mod tests {
         let crasher_owned = crasher_unit.repeat(8);
         let crasher = crasher_owned.as_bytes();
 
-        // Guard against bit-rot: prove the raw crate still panics on this input,
-        // so a future vt100 fix/upgrade doesn't turn this into a silent no-op.
+        // The crate itself now handles this input; a panic here would be a
+        // vt100 regression, which the guarded path below still contains.
         let unguarded = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut p = vt100::Parser::new(1, 10, 1000);
+            let mut p = crate::vt_grid::parser(1, 10, 1000);
             p.process(crasher);
         }));
         assert!(
-            unguarded.is_err(),
-            "precondition: raw vt100 must still panic on this input; if the crate \
-             was fixed/upgraded, retarget or retire this regression test"
+            unguarded.is_ok(),
+            "vt100 0.18 feeds a wide character wrapping in a 1-row grid without panicking"
         );
 
-        let parser = Mutex::new(vt100::Parser::new(1, 10, 1000));
+        let parser = Mutex::new(crate::vt_grid::parser(1, 10, 1000));
         let mut osc8 = Osc8Filter::new();
         let mouse = AtomicBool::new(false);
         let mut mouse_scan = MouseModeScanner::default();
@@ -4862,6 +4877,7 @@ mod tests {
         let bytes_since_spawn = AtomicU64::new(0);
 
         // The real path must NOT panic on the crashing chunk.
+        PANIC_IN_NEXT_FEED.with(|flag| flag.set(true));
         process_agent_output_chunk(
             crasher,
             &mut osc8,
@@ -4881,10 +4897,12 @@ mod tests {
             "parser mutex must not be poisoned by a contained panic"
         );
 
-        // A subsequent chunk still flows through the same parser. Deliberately
-        // short enough not to wrap in this 1x10 pane: a longer one panics on the
-        // same vt100 edge case and would rebuild the parser again, so "a later
-        // chunk still processes" would be asserting nothing.
+        assert!(
+            !PANIC_IN_NEXT_FEED.with(Cell::get),
+            "the injected panic must have fired inside the guarded feed"
+        );
+
+        // A subsequent chunk still flows through the same parser.
         process_agent_output_chunk(
             b"ok\r\n",
             &mut osc8,
@@ -4955,7 +4973,7 @@ mod tests {
     /// whatever its predecessor asked for, and keeps what is on screen.
     #[test]
     fn a_replaced_childs_application_cursor_mode_is_forgotten() {
-        let parser = Mutex::new(vt100::Parser::new(4, 20, 0));
+        let parser = Mutex::new(crate::vt_grid::parser(4, 20, 0));
         parser.lock().unwrap().process(b"old child\x1b[?1h");
         assert!(parser.lock().unwrap().screen().application_cursor());
 
@@ -4964,6 +4982,40 @@ mod tests {
         let parser = parser.lock().unwrap();
         assert!(!parser.screen().application_cursor());
         assert!(parser.screen().contents().contains("old child"));
+    }
+
+    /// Scenario: Ten numbered lines fill a ten-row pane, which is then made
+    /// five rows tall and back to ten. The shorter pane shows the newest five
+    /// with the cursor on its last row, and the taller one shows all ten again.
+    ///
+    /// vt100 0.18 moves the oldest rows into scrollback on a shrink; 0.16 cut
+    /// rows off the bottom, hiding the latest output and the cursor's row.
+    #[spec("resize/layout/003")]
+    #[test]
+    fn resize_layout_003_a_shorter_pane_keeps_its_latest_output_and_a_taller_one_restores_it() {
+        let parser = Mutex::new(new_pane_parser(10, 20));
+        let lines: Vec<String> = (1..=10).map(|n| format!("LINE_{n:02}")).collect();
+        parser
+            .lock()
+            .unwrap()
+            .process(lines.join("\r\n").as_bytes());
+
+        set_parser_size_if_changed(&parser, 5, 20);
+        {
+            let p = parser.lock().unwrap();
+            let visible: Vec<String> = p.screen().rows(0, 20).collect();
+            assert_eq!(visible, lines[5..], "the newest five lines stay visible");
+            assert_eq!(p.screen().cursor_position(), (4, 7));
+        }
+
+        set_parser_size_if_changed(&parser, 10, 20);
+        let p = parser.lock().unwrap();
+        let visible: Vec<String> = p.screen().rows(0, 20).collect();
+        assert_eq!(
+            visible, lines,
+            "growing back pulls the rows out of scrollback"
+        );
+        assert_eq!(p.screen().cursor_position(), (9, 7));
     }
 
     // PRD #104 M2: hydration sizes the local vt100 parser from the
@@ -5059,7 +5111,7 @@ mod tests {
             let screen = controller
                 .get_screen(&pane_id)
                 .expect("wire_stream_pane must have registered the pane");
-            let size = screen.lock().unwrap().screen().size();
+            let size = crate::vt_grid::size(screen.lock().unwrap().screen());
             assert_eq!(
                 size,
                 (24, 80),
@@ -5092,7 +5144,7 @@ mod tests {
         );
 
         let screen = controller.get_screen("1").expect("pane registered");
-        let size = screen.lock().unwrap().screen().size();
+        let size = crate::vt_grid::size(screen.lock().unwrap().screen());
         assert_eq!(size, (21, 38), "usable dims must pass through unchanged");
     }
 
@@ -5100,15 +5152,27 @@ mod tests {
     /// "valid parser geometry", applied in one place. Pin both halves.
     #[test]
     fn new_pane_parser_clamps_and_passes_through() {
-        assert_eq!(new_pane_parser(0, 0).screen().size(), (24, 80));
-        assert_eq!(new_pane_parser(0, 80).screen().size(), (24, 80));
-        assert_eq!(new_pane_parser(24, 0).screen().size(), (24, 80));
         assert_eq!(
-            new_pane_parser(u16::MAX, u16::MAX).screen().size(),
+            crate::vt_grid::size(new_pane_parser(0, 0).screen()),
             (24, 80)
         );
-        assert_eq!(new_pane_parser(21, 38).screen().size(), (21, 38));
-        assert_eq!(new_pane_parser(1, 1).screen().size(), (1, 1));
+        assert_eq!(
+            crate::vt_grid::size(new_pane_parser(0, 80).screen()),
+            (24, 80)
+        );
+        assert_eq!(
+            crate::vt_grid::size(new_pane_parser(24, 0).screen()),
+            (24, 80)
+        );
+        assert_eq!(
+            crate::vt_grid::size(new_pane_parser(u16::MAX, u16::MAX).screen()),
+            (24, 80)
+        );
+        assert_eq!(
+            crate::vt_grid::size(new_pane_parser(21, 38).screen()),
+            (21, 38)
+        );
+        assert_eq!(crate::vt_grid::size(new_pane_parser(1, 1).screen()), (1, 1));
     }
 
     /// The failure mode issue #363 warns about is a *fourth* call site added
@@ -5116,7 +5180,8 @@ mod tests {
     /// bug, and the same class as any rule kept in two hand-maintained copies.
     ///
     /// So pin the structural invariant rather than only the behaviour: in this
-    /// file's non-test code there is exactly ONE `vt100::Parser::new`, and it is
+    /// file's non-test code there is exactly ONE parser construction (a
+    /// `vt100::Parser::new`, or the `vt_grid::parser` that wraps it), and it is
     /// inside `new_pane_parser`. `include_str!` is compile-time, so this reads
     /// no file at runtime and stays inside the fast tier's budget.
     #[test]
@@ -5136,8 +5201,13 @@ mod tests {
             .split_once("\n#[cfg(test)]\nmod tests {")
             .expect("test module marker moved; update this guard");
 
-        let needle = "vt100::Parser::new(";
-        let hits: Vec<usize> = prod.match_indices(needle).map(|(i, _)| i).collect();
+        // Both spellings construct a parser: the raw vt100 call, and the
+        // `vt_grid` wrapper that takes the deck's `u16` geometry.
+        let mut hits: Vec<usize> = ["vt100::Parser::new(", "vt_grid::parser("]
+            .iter()
+            .flat_map(|needle| prod.match_indices(needle).map(|(i, _)| i))
+            .collect();
+        hits.sort_unstable();
         assert_eq!(
             hits.len(),
             1,
@@ -5156,7 +5226,7 @@ mod tests {
             .expect("`new_pane_parser` must end at a top-level brace");
         assert!(
             (helper_start..helper_end).contains(&hits[0]),
-            "the one raw `vt100::Parser::new` must live inside `new_pane_parser`"
+            "the one parser construction must live inside `new_pane_parser`"
         );
     }
 
@@ -5430,7 +5500,7 @@ mod tests {
         /// What the authority says about a stream: a protocol in force, encoded
         /// the one way `forward_mouse_scroll` can speak.
         fn vt100_would_understand_an_sgr_report(stream: &[u8]) -> bool {
-            let mut parser = vt100::Parser::new(24, 80, 100);
+            let mut parser = crate::vt_grid::parser(24, 80, 100);
             parser.process(stream);
             parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
                 && parser.screen().mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr
@@ -5669,7 +5739,7 @@ mod tests {
     /// derive the same flag from the same bytes — including across a boundary.
     #[test]
     fn scan_mouse_mode_is_wired_through_the_shared_chunk_path() {
-        let parser = Mutex::new(vt100::Parser::new(24, 80, 100));
+        let parser = Mutex::new(crate::vt_grid::parser(24, 80, 100));
         let mut osc8 = Osc8Filter::new();
         let mouse = AtomicBool::new(false);
         let mut mouse_scan = MouseModeScanner::default();

@@ -30,7 +30,7 @@ path = "src/main.rs"
 # Parses `cargo metadata`, which is how the binary learns cargo's effective
 # target directory rather than guessing it.
 serde_json = "1"
-vt100 = "0.16"
+vt100 = "0.18"
 
 [dev-dependencies]
 tempfile = "3"

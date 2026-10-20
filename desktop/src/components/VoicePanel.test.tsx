@@ -70,7 +70,7 @@ const BOTH_KEYED = {
   voice: {
     activation: "toggle",
     intent: VOICE_STAGE_PRESETS.intent.anthropic,
-    transcription: VOICE_STAGE_PRESETS.transcription.remote,
+    transcription: { ...VOICE_STAGE_PRESETS.transcription.remote, language: "en" },
     labels: "shared",
     speech: "auto",
     reading: "off",
@@ -166,7 +166,7 @@ describe("VoicePanel", () => {
     renderPanel({
       voice: {
         ...DEFAULT_VOICE_SETTINGS,
-        transcription: { backend: "local", endpoint: "http://127.0.0.1:9123/v1/audio/transcriptions", model: "Systran/faster-whisper-tiny.en" },
+        transcription: { backend: "local", endpoint: "http://127.0.0.1:9123/v1/audio/transcriptions", model: "Systran/faster-whisper-tiny.en", language: "en" },
       },
     });
     expect(screen.getByTestId("voice-speech-local")).toHaveTextContent("-p 9123:8000");
@@ -184,7 +184,7 @@ describe("VoicePanel", () => {
     expect(onSave).toHaveBeenCalledWith({
       ...DEFAULT_DESKTOP_SETTINGS,
       appearance: { mode: "dark" },
-      voice: { ...DEFAULT_VOICE_SETTINGS, transcription: VOICE_STAGE_PRESETS.transcription.remote },
+      voice: { ...DEFAULT_VOICE_SETTINGS, transcription: { ...VOICE_STAGE_PRESETS.transcription.remote, language: "en" } },
     });
   });
 
@@ -196,7 +196,7 @@ describe("VoicePanel", () => {
         voice: {
           activation: "toggle",
           intent: VOICE_STAGE_PRESETS.intent.openai_compatible,
-          transcription: VOICE_STAGE_PRESETS.transcription.remote,
+          transcription: { ...VOICE_STAGE_PRESETS.transcription.remote, language: "en" },
           labels: "shared",
           speech: "auto",
           reading: "off",
@@ -302,7 +302,68 @@ describe("VoicePanel", () => {
       backend: "remote",
       endpoint: "https://api.openai.com/v1/audio/transcriptions",
       model: "whisper-1",
+      language: "en",
     });
+  });
+
+  /**
+   * Issue #1458: the Language row saves the chosen code into the speech
+   * stage and nothing else, offers Auto-detect, and starts on English.
+   */
+  it("saves the speech language the user picks, English by default", () => {
+    const { onSave } = renderPanel();
+    const select = screen.getByLabelText("Language");
+    expect(select).toHaveValue("en");
+    expect(within(select).getByRole("option", { name: "Auto-detect" })).toHaveValue("auto");
+    expect(within(select).getByRole("option", { name: "Serbian" })).toHaveValue("sr");
+    // English is the default and costs nothing, so it says nothing.
+    expect(screen.queryByTestId("voice-language-hint")).not.toBeInTheDocument();
+
+    fireEvent.change(select, { target: { value: "sr" } });
+    expect(onSave.mock.calls[0][0].voice.transcription).toEqual({
+      ...VOICE_STAGE_PRESETS.transcription.local,
+      language: "sr",
+    });
+    expect(onSave.mock.calls[0][0].voice.intent).toEqual(DEFAULT_VOICE_SETTINGS.intent);
+  });
+
+  /**
+   * The language is the speaker's, not the service's, so switching the Speech
+   * backend brings the backend's endpoint and model and keeps the language.
+   */
+  it("keeps the speech language when the backend changes", () => {
+    const { onSave } = renderPanel({
+      voice: { ...DEFAULT_VOICE_SETTINGS, transcription: { ...VOICE_STAGE_PRESETS.transcription.local, language: "de" } },
+    });
+    fireEvent.change(screen.getByLabelText("Speech"), { target: { value: "remote" } });
+    expect(onSave.mock.calls[0][0].voice.transcription).toEqual({
+      ...VOICE_STAGE_PRESETS.transcription.remote,
+      language: "de",
+    });
+  });
+
+  /**
+   * Another language than English costs commands, which are English, and the
+   * local default model is an English-only `.en` build, which cannot do what
+   * was chosen — the row says both, and drops the model half for a
+   * multilingual model.
+   */
+  it("says what another language costs, and when the model is English-only", () => {
+    renderPanel({
+      voice: { ...DEFAULT_VOICE_SETTINGS, transcription: { ...VOICE_STAGE_PRESETS.transcription.local, language: "sr" } },
+    });
+    const hint = screen.getByTestId("voice-language-hint");
+    expect(hint).toHaveTextContent("Commands are English, so with Serbian they may be misheard.");
+    expect(hint).toHaveTextContent("The model Systran/faster-whisper-tiny.en understands English only");
+  });
+
+  it("says what Auto-detect costs, without the model warning for a multilingual model", () => {
+    renderPanel({
+      voice: { ...DEFAULT_VOICE_SETTINGS, transcription: { ...VOICE_STAGE_PRESETS.transcription.remote, language: "auto" } },
+    });
+    const hint = screen.getByTestId("voice-language-hint");
+    expect(hint).toHaveTextContent("The language is detected for each thing you say");
+    expect(hint).not.toHaveTextContent("English only");
   });
 
   /**
@@ -322,6 +383,7 @@ describe("VoicePanel", () => {
       backend: "local",
       endpoint: "http://127.0.0.1:9000/v1/audio/transcriptions",
       model: "Systran/faster-whisper-tiny.en",
+      language: "en",
     });
   });
 
@@ -385,7 +447,7 @@ describe("VoicePanel", () => {
 
     // The keyed backend reaches another host by design, so it keeps the
     // general rule.
-    renderPanel({ voice: { ...DEFAULT_VOICE_SETTINGS, transcription: VOICE_STAGE_PRESETS.transcription.remote } });
+    renderPanel({ voice: { ...DEFAULT_VOICE_SETTINGS, transcription: { ...VOICE_STAGE_PRESETS.transcription.remote, language: "en" } } });
     expect(screen.getAllByTestId("voice-transcription-endpoint-hint")[1]).toHaveTextContent(
       /https to another machine/i,
     );
@@ -431,7 +493,7 @@ describe("VoicePanel", () => {
     renderPanel({
       voice: {
         ...DEFAULT_VOICE_SETTINGS,
-        transcription: VOICE_STAGE_PRESETS.transcription.remote,
+        transcription: { ...VOICE_STAGE_PRESETS.transcription.remote, language: "en" },
       },
     });
     expect(screen.getByLabelText(DEFAULT_COMMANDS_KEY)).toBeVisible();
