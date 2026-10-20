@@ -293,11 +293,24 @@ impl Fixture {
         path
     }
 
-    /// Canned `gh pr list --head <branch>` reply.
+    /// Canned `gh pr list --head <branch>` reply: one pull request from a
+    /// branch of the repository itself.
     fn set_pr_state(&self, branch: &str, state: &str) {
+        self.set_pr_entries(
+            branch,
+            &format!(r#"{{"state":"{state}","headRefName":"{branch}","isCrossRepository":false}}"#),
+        );
+    }
+
+    /// Canned `gh pr list --head <branch>` reply holding exactly `entries`, a
+    /// comma-separated list of JSON objects.
+    fn set_pr_entries(&self, branch: &str, entries: &str) {
         let key = branch.replace('/', "_");
-        let body = format!(r#"[{{"state":"{state}","headRefName":"{branch}"}}]"#);
-        std::fs::write(self.ghstub.join(format!("pr-{key}.json")), body).expect("write pr fixture");
+        std::fs::write(
+            self.ghstub.join(format!("pr-{key}.json")),
+            format!("[{entries}]"),
+        )
+        .expect("write pr fixture");
     }
 
     /// Give a linked worktree its OWN `origin` remote via
@@ -1200,9 +1213,81 @@ fn worktree_reclaim_011_a_zero_byte_marker_is_not_proof_of_ownership() {
     );
 }
 
+/// Scenario: A deck-owned, clean worktree's branch has no pull request of its
+/// own, but a contributor's fork has a MERGED pull request from a branch with
+/// the same name, which `gh pr list --head` lists too. `worktree list` must
+/// not read the fork's merge as this branch's (`no_pr`, `keep`), and
+/// `worktree reclaim --yes` must leave the directory on disk.
+#[spec("worktree/reclaim/012")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_012_a_merged_fork_pr_with_the_same_branch_name_is_not_this_branchs() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-fork-namesake", "feat/namesake");
+    fx.mark_owned(&wt); // clean by construction, owned: only PR state decides the verdict
+    fx.set_pr_entries(
+        "feat/namesake",
+        r#"{"state":"MERGED","headRefName":"feat/namesake","isCrossRepository":true}"#,
+    );
+
+    let entry = verdict_entry(&fx, "wt-fork-namesake");
+    assert_eq!(
+        (
+            entry.get("owned").and_then(|o| o.as_bool()),
+            entry.get("clean").and_then(|c| c.as_bool()),
+        ),
+        (Some(true), Some(true)),
+        "fixture precondition: the worktree must be owned and clean, so that PR state is the \
+         only gate deciding its verdict; got entry:\n{entry}"
+    );
+    assert_eq!(
+        (
+            entry.get("pr_state").and_then(|p| p.as_str()),
+            entry.get("verdict").and_then(|v| v.as_str()),
+        ),
+        (Some("no_pr"), Some("keep")),
+        "a fork's merged pull request from a same-named branch is someone else's, so this \
+         branch has no pull request and its worktree is kept; got entry:\n{entry}"
+    );
+
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim --yes` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        wt.is_dir(),
+        "a worktree whose only merged pull request is a fork's must survive `reclaim --yes` — \
+         {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+
+    // Control: the same worktree with its own merged pull request listed beside
+    // the fork's is reclaimable, so the `keep` above is the fork filter's doing
+    // and not some other gate's.
+    fx.set_pr_entries(
+        "feat/namesake",
+        r#"{"state":"MERGED","headRefName":"feat/namesake","isCrossRepository":true},
+           {"state":"MERGED","headRefName":"feat/namesake","isCrossRepository":false}"#,
+    );
+    let control = verdict_entry(&fx, "wt-fork-namesake");
+    assert_eq!(
+        (
+            control.get("pr_state").and_then(|p| p.as_str()),
+            control.get("verdict").and_then(|v| v.as_str()),
+        ),
+        (Some("merged"), Some("remove")),
+        "control: with the branch's own merged pull request listed too, the worktree is \
+         reclaimable; got entry:\n{control}"
+    );
+}
+
 /// The `worktree list --json` entry whose `path` contains `needle`, panicking
 /// with the whole document when it is absent — used by `011` to take the same
-/// measurement twice, before and after the marker is truncated.
+/// measurement twice, before and after the marker is truncated, and by `012`.
 #[cfg(unix)]
 fn verdict_entry(fx: &Fixture, needle: &str) -> serde_json::Value {
     let out = fx.run(&["worktree", "list", "--json"]);
