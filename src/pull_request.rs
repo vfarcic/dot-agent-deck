@@ -19,7 +19,8 @@
 //! (repository, branch), so sessions sharing a worktree share one call, and at
 //! most one `gh` runs per key at a time. An open or draft PR is re-read on a
 //! slow poll ([`DOT_AGENT_DECK_PR_REFRESH_SECS_ENV`]); a merged or closed one is
-//! not read again until the branch changes; a turn ending or an agent stopping
+//! not read again until the branch changes, unless its CI checks were still
+//! pending, which keep it on that poll until they finish; a turn ending or an agent stopping
 //! asks for an early, debounced re-read ([`fetch_due`]).
 //!
 //! No `gh`, no login, no network, a non-GitHub `origin`, the default branch, a
@@ -467,7 +468,9 @@ pub(crate) struct KeyEntry {
 ///
 /// * never two at once, and a key never looked up is due at once;
 /// * after a failure, only once [`FAILURE_BACKOFF_FACTOR`] intervals passed;
-/// * a merged or closed PR, never (a new branch is a new key);
+/// * a merged or closed PR, never (a new branch is a new key) — unless its
+///   CI checks are still pending, which are then re-read as an open PR's
+///   are, so the badge does not keep a pending mark for good (issue #1781);
 /// * an open or draft PR, every `interval`, or after a turn end once the
 ///   debounce passed;
 /// * no PR, every `interval` too — a PR the user opens while the agent is
@@ -491,7 +494,9 @@ pub(crate) fn fetch_due(entry: &KeyEntry, now: Instant, interval: Duration) -> b
             if matches!(
                 pr.state,
                 PullRequestState::Merged | PullRequestState::Closed
-            ) =>
+            ) && !pr
+                .checks
+                .is_some_and(|checks| checks.state == PullRequestChecksState::Pending) =>
         {
             false
         }
@@ -1105,6 +1110,38 @@ mod tests {
             ..KeyEntry::default()
         };
         assert!(!fetch_due(&in_flight, now, interval));
+    }
+
+    /// Issue #1781 (PR #1783 review): a PR merged or closed while its checks
+    /// still run keeps being re-read until they finish, then stops, so its
+    /// CI mark does not stay pending for good.
+    #[test]
+    fn a_merged_or_closed_pr_with_pending_checks_is_polled_until_they_finish() {
+        let at = Instant::now();
+        let interval = Duration::from_secs(60);
+        let with_checks = |state, checks_state| {
+            let mut value = pr_in(state);
+            value.as_mut().unwrap().as_mut().unwrap().checks = Some(PullRequestChecks {
+                state: checks_state,
+                passing: 1,
+                failing: 0,
+                pending: 1,
+                skipped: 0,
+            });
+            fetched(value, false, at)
+        };
+        for state in [PullRequestState::Merged, PullRequestState::Closed] {
+            let pending = with_checks(state, PullRequestChecksState::Pending);
+            assert!(!fetch_due(&pending, at + Duration::from_secs(59), interval));
+            assert!(fetch_due(&pending, at + interval, interval), "{state:?}");
+            for finished in [
+                PullRequestChecksState::Passing,
+                PullRequestChecksState::Failing,
+            ] {
+                let done = with_checks(state, finished);
+                assert!(!fetch_due(&done, at + interval * 10, interval), "{state:?}");
+            }
+        }
     }
 
     #[test]
