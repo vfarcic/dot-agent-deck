@@ -142,6 +142,14 @@ struct MeaningAction {
 /// 46 misses in 65 such sentences, 23 when told where the user is. It is
 /// built from the declared screen and from whether each of the dialog's
 /// declarations is present, never from what they hold ([`Place::of`]).
+///
+/// **The dialog is named first when it is open**, as what the user is looking
+/// at, with the screen it covers after it. Told "the agent dashboard" first and
+/// the dialog second, the classifier read the words as being about the
+/// dashboard: "clear filter" over a directory listing listed only the
+/// dashboard's filter in 7 votes of 8, and "use the build box deck" over the
+/// open dialog only the Daemon selector in 5 of 8, where told the dialog first
+/// it was 0 of 8 for both (2026-10-20, `gpt-5-mini`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Place {
     screen: Screen,
@@ -159,15 +167,18 @@ enum Dialog {
 
 impl Place {
     /// The place `screen` and the dialog's declarations describe — read for
-    /// whether each declaration is there, and for nothing in it.
+    /// whether each declaration is there, and for nothing in it. A directory
+    /// listing is the dialog's own browser, so one declared is the dialog
+    /// showing it, whether or not the rest of the dialog was declared beside
+    /// it.
     pub fn of(
         screen: Screen,
         directories: Option<&VoiceDirectories>,
         new_agent: Option<&VoiceNewAgent>,
     ) -> Self {
         let dialog = match (new_agent, directories) {
-            (None, _) => Dialog::Closed,
-            (Some(_), Some(_)) => Dialog::Listing,
+            (_, Some(_)) => Dialog::Listing,
+            (None, None) => Dialog::Closed,
             (Some(dialog), None) if dialog.form.is_some() => Dialog::Form,
             (Some(_), None) => Dialog::Open,
         };
@@ -182,13 +193,15 @@ impl Place {
             Screen::Agent => "an agent's pane",
             Screen::PullRequest => "a pull request page",
         };
-        let dialog = match self.dialog {
-            Dialog::Closed => "The New agent dialog is closed.",
-            Dialog::Open => "The New agent dialog is open.",
-            Dialog::Listing => "The New agent dialog is open, showing a directory listing.",
-            Dialog::Form => "The New agent dialog is open, showing its form.",
+        let looking_at = match self.dialog {
+            Dialog::Closed => format!("{view}. The New agent dialog is closed."),
+            Dialog::Open => format!("the New agent dialog, open over {view}."),
+            Dialog::Listing => {
+                format!("the New agent dialog, open over {view} and showing a directory listing.")
+            }
+            Dialog::Form => format!("the New agent dialog, open over {view} and showing its form."),
         };
-        format!("The user is looking at {view}. {dialog}\n{PLACE_INSTRUCTIONS}")
+        format!("The user is looking at {looking_at}\n{PLACE_INSTRUCTIONS}")
     }
 }
 
@@ -451,7 +464,9 @@ called \"billing run\", an agent \"tester\" or \"Close\"), and judge the request
 the sentence calls a thing says what kind of thing it is: something it calls an agent is one \
 agent, even when its name is also an orchestration's, a run's or a mode's. Opening, showing or \
 going to something the sentence names asks for that thing; it asks to start or create something \
-only when it asks for a new one or for a start.\n\
+only when it asks for a new one or for a start. When the sentence does not say what kind of thing \
+a name is, it could be any kind — an agent (by its name, role or mode), a daemon, a directory — so \
+list every action that opens, shows, selects or goes to a thing of a kind it could be.\n\
 \n\
 Each action below has an id and what it does, in the app's own words. The phrasings an action's \
 text lists are examples of the request, never the only words for it: any sentence that means the \
@@ -462,7 +477,9 @@ List an action in `yes` when a person hearing the sentence would take it as aski
 that action — in any words at all: synonyms, paraphrases, slang, indirect phrasing (\"get rid of \
 it\", \"can you…\", \"I want…\"). Do not list it when its words only appear in passing or as the \
 subject of something else, when the sentence asks for a different action, or when it is not a \
-request to the app. An action marked (write) types words into an agent's prompt: list it only \
+request to the app. A question asking where or how to do something in the app is a request to be \
+taken there: list the action that opens the place where it is done — never an action that would \
+do it. An action marked (write) types words into an agent's prompt: list it only \
 when the sentence opens by asking for that — to type, write, dictate, say, tell or ask the agent \
 something — and the rest of it is what to write; never when the sentence opens by asking for \
 anything else (sending, submitting, stopping, opening, closing, showing), even when it mentions a \
@@ -868,7 +885,9 @@ mod tests {
 
     /// Scenario: where the user is goes after the actions, so everything
     /// before it is the same text on every screen; it says the screen and the
-    /// New agent dialog's state, read from whether each declaration is there.
+    /// New agent dialog's state — the dialog first while it is open — read
+    /// from whether each declaration is there, a listing declared alone
+    /// included.
     #[test]
     fn meaning_request_says_where_the_user_is_after_the_actions() {
         let transcript = Transcript::new("Start agent");
@@ -878,6 +897,16 @@ mod tests {
             &every_action(table()),
         ));
         let dialog = VoiceNewAgent { form: None };
+        let form_dialog = VoiceNewAgent {
+            form: Some(crate::voice::VoiceNewAgentForm {
+                deck_id: "deck-local".into(),
+                path: "/work".into(),
+                modes: Vec::new(),
+                agent_types: Vec::new(),
+                withheld_modes: Vec::new(),
+                mode_paging: None,
+            }),
+        };
         let listing = VoiceDirectories {
             deck_id: "deck-local".into(),
             path: "/work".into(),
@@ -892,11 +921,22 @@ mod tests {
             ),
             (
                 Place::of(Screen::Overview, None, Some(&dialog)),
-                "The user is looking at the agent dashboard. The New agent dialog is open.",
+                "The user is looking at the New agent dialog, open over the agent dashboard.\n",
+            ),
+            (
+                Place::of(Screen::Overview, None, Some(&form_dialog)),
+                "The user is looking at the New agent dialog, open over the agent dashboard and \
+                 showing its form.",
             ),
             (
                 Place::of(Screen::Overview, Some(&listing), Some(&dialog)),
-                "The New agent dialog is open, showing a directory listing.",
+                "The user is looking at the New agent dialog, open over the agent dashboard and \
+                 showing a directory listing.",
+            ),
+            (
+                Place::of(Screen::Overview, Some(&listing), None),
+                "The user is looking at the New agent dialog, open over the agent dashboard and \
+                 showing a directory listing.",
             ),
             (
                 Place::of(Screen::Agent, None, None),

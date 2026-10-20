@@ -1845,7 +1845,7 @@ report      = "Daemon: {deck}."
 # runs each (2026-10-20): it is not shown the dialog, and none of those says
 # "new agent". Leading with what the user asks for, and saying where the app
 # puts it, follows `open_new_agent`'s measured wording.
-asks_to     = "choose which daemon to use (the app sets it in the New agent dialog)"
+asks_to     = "switch daemon in the New agent dialog, choosing which daemon the new agent uses"
 try_saying  = "daemon {deck}"
 action_words = ["daemon", "deck", "demon"]
 
