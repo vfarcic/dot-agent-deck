@@ -1499,7 +1499,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 ##### daemon/service/001 — `dot-agent-deck daemon install` writes a unit that runs the installed deck with the idle shutdown off and the shell's endpoint overrides, and enables a running service without stopping or restarting it.
 - **Layer:** fast synthetic real-binary-subprocess integration (the REAL CLI as a subprocess in an isolated `HOME`/`XDG_CONFIG_HOME`, with stand-in `systemctl` and `loginctl` on `PATH` that record their calls; no daemon, no PTY, no LLM, no `e2e` feature gate).
 - **Agent:** none.
-- **Asserts:** the unit lands at `$XDG_CONFIG_HOME/systemd/user/dot-agent-deck.service`; its one `ExecStart` names the `~/.local/bin` install rather than the cargo artifact it links to; its `Environment` lines are exactly the idle-shutdown `0` and the three endpoint overrides set in the shell; `Restart=on-failure` and `WantedBy=default.target`; `systemctl` is asked to `daemon-reload` and `enable` and never to stop, restart, kill or `--now` anything when the service is already active; the lingering advice is printed when `loginctl` reports `no`.
+- **Asserts:** the unit lands at `$XDG_CONFIG_HOME/systemd/user/dot-agent-deck.service`; its one `ExecStart` names the `~/.local/bin` install rather than the cargo artifact it links to; its `Environment` lines are exactly the idle-shutdown `0` and the four endpoint and directory overrides set in the shell (`DOT_AGENT_DECK_SOCKET`, `DOT_AGENT_DECK_ATTACH_SOCKET`, `DOT_AGENT_DECK_STATE_DIR`, `XDG_CONFIG_HOME`); `Restart=on-failure` and `WantedBy=default.target`; `systemctl` is asked to `daemon-reload` and `enable` and never to stop, restart, kill or `--now` anything when the service is already active; the lingering advice is printed when `loginctl` reports `no`.
 - **Does not assert:** that systemd accepts the unit or runs it (the PRD's recorded real-systemd verification); the start path (`daemon/service/004`); launchd.
 - **Platform coverage:** linux.
 
@@ -1515,6 +1515,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Agent:** none.
 - **Asserts:** a relative `DOT_AGENT_DECK_STATE_DIR` fails the command with an error naming the variable and not clap's usage banner, no unit is written, and `systemctl` is never called.
 - **Does not assert:** the other override variables (unit-tested in `daemon_service::tests`).
+- **Platform coverage:** linux.
+
+##### daemon/service/005 — `dot-agent-deck daemon install` refuses, before enabling anything, when systemd loads the unit from a file other than the one it wrote.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `/001`, with the stand-in reporting a different `FragmentPath`).
+- **Agent:** none.
+- **Asserts:** the command fails naming both the file it wrote and the file systemd reports, and `systemctl` is never asked to `enable`. This is the case of a shell whose `XDG_CONFIG_HOME` the systemd user manager does not share, or an older unit earlier in systemd's search path.
+- **Does not assert:** which directories a real systemd searches.
 - **Platform coverage:** linux.
 
 ##### daemon/service/004 — `dot-agent-deck daemon install` reports success only once the started daemon answers, and a second install beside it starts nothing.

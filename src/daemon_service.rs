@@ -46,12 +46,15 @@ pub const LAUNCHD_LABEL: &str = "ai.devopstoolkit.dot-agent-deck";
 pub const IDLE_SHUTDOWN_ENV: (&str, &str) = ("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0");
 
 /// The installing shell's variables a service needs to reach the same daemon
-/// endpoint and state directory as that shell's clients. Credentials are
-/// deliberately not here: the deck never writes them into a file.
+/// endpoint, configuration (the schedules file among it) and state as that
+/// shell's clients. Credentials are deliberately not here: the deck never
+/// writes them into a file.
 pub const CARRIED_ENV: &[&str] = &[
     "DOT_AGENT_DECK_SOCKET",
     "DOT_AGENT_DECK_ATTACH_SOCKET",
     "DOT_AGENT_DECK_STATE_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
 ];
 
 /// The service manager `daemon install` targets.
@@ -93,12 +96,13 @@ impl ServiceManager {
     }
 
     /// The variables carried from the installing shell, beyond
-    /// [`CARRIED_ENV`]. macOS sets no `XDG_RUNTIME_DIR`, so the sockets fall
-    /// back to `$TMPDIR`, which a LaunchAgent is not guaranteed to inherit.
+    /// [`CARRIED_ENV`]. systemd sets the service's own `XDG_RUNTIME_DIR`, and
+    /// a value from the shell could only be staler than it. launchd sets
+    /// neither that nor, reliably, `TMPDIR`, which the sockets fall back to.
     fn extra_carried_env(self) -> &'static [&'static str] {
         match self {
             Self::Systemd => &[],
-            Self::Launchd => &["TMPDIR"],
+            Self::Launchd => &["XDG_RUNTIME_DIR", "TMPDIR"],
         }
     }
 }
@@ -283,10 +287,10 @@ pub fn launchd_log_path(home: &Path) -> PathBuf {
 /// What `install` found before deciding what to start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallObservation {
-    /// The service is already running (systemd: the unit is active; launchd:
-    /// the job is loaded).
+    /// The service manager has the daemon running (systemd: the unit is
+    /// active; launchd: the job has a process).
     pub service_running: bool,
-    /// A daemon answers at this shell's endpoint.
+    /// Something holds this shell's endpoint ([`endpoint_occupied`]).
     pub daemon_live: bool,
 }
 
@@ -312,11 +316,11 @@ pub fn plan_install(observed: InstallObservation) -> InstallPlan {
     }
 }
 
-/// What `uninstall` does with a loaded launchd job. (systemd needs no
-/// decision: `disable` without `--now` never stops the unit.)
+/// What `uninstall` does with the launchd job. (systemd needs no decision:
+/// `disable` without `--now` never stops the unit.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UninstallPlan {
-    /// Unload the job: nothing it started is running.
+    /// Unload the job: it has no process, so unloading stops nothing.
     Unload,
     /// Leave the job loaded, because unloading a launchd job stops its
     /// daemon. It is gone at the next login, and `daemon stop` ends it for
@@ -326,17 +330,32 @@ pub enum UninstallPlan {
     NothingLoaded,
 }
 
-pub fn plan_uninstall(job_loaded: bool, daemon_live: bool) -> UninstallPlan {
-    match (job_loaded, daemon_live) {
+/// Decided from launchd's own record of the job rather than from a probe at
+/// this shell's endpoint: a shell with different socket settings would find
+/// nothing there while the job's daemon runs.
+pub fn plan_uninstall(job_loaded: bool, job_running: bool) -> UninstallPlan {
+    match (job_loaded, job_running) {
         (false, _) => UninstallPlan::NothingLoaded,
         (true, true) => UninstallPlan::LeaveLoaded,
         (true, false) => UninstallPlan::Unload,
     }
 }
 
+/// The process id `launchctl print gui/<uid>/<label>` reports for a loaded
+/// job, if it has one: a `pid = <n>` line. A loaded job whose daemon exited
+/// cleanly stays loaded with no such line.
+pub fn launchd_job_pid(print_stdout: &str) -> Option<u32> {
+    print_stdout.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("pid = ")
+            .and_then(|pid| pid.trim().parse().ok())
+    })
+}
+
 /// Write `content` to `path`, creating its directory, through a temporary
-/// file renamed into place so a reader never sees half a unit. Returns whether
-/// the file changed.
+/// file renamed into place so a reader never sees half a unit. The temporary
+/// name carries this process's id, so two installs at once cannot write into
+/// each other's. Returns whether the file changed.
 pub fn write_service_file(path: &Path, content: &str) -> std::io::Result<bool> {
     if std::fs::read_to_string(path).is_ok_and(|existing| existing == content) {
         return Ok(false);
@@ -346,10 +365,12 @@ pub fn write_service_file(path: &Path, content: &str) -> std::io::Result<bool> {
         .ok_or_else(|| std::io::Error::other("service file has no parent directory"))?;
     std::fs::create_dir_all(dir)?;
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".tmp.{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
     Ok(true)
 }
 
@@ -359,6 +380,26 @@ pub fn write_service_file(path: &Path, content: &str) -> std::io::Result<bool> {
 pub fn linger_is_off(loginctl_stdout: &str) -> bool {
     loginctl_stdout.trim() == "no"
 }
+
+/// Whether systemd loads the unit from `written`, given the `FragmentPath`
+/// it reports. A different path means systemd reads another copy (an older
+/// unit earlier in its search path), or does not search the directory this
+/// shell's `XDG_CONFIG_HOME` named at all.
+pub fn systemd_loads(fragment_path: &str, written: &Path) -> bool {
+    let fragment = Path::new(fragment_path.trim());
+    if fragment.as_os_str().is_empty() {
+        return false;
+    }
+    fragment == written
+        || matches!(
+            (std::fs::canonicalize(fragment), std::fs::canonicalize(written)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+// `install` and `uninstall` are one-shot CLI processes: the runtime they run
+// on exists for the endpoint probe and runs nothing else, so the blocking
+// calls below hold up no other work.
 
 /// Run a service-manager tool, naming it when it cannot be started at all.
 fn run_tool(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -383,25 +424,30 @@ fn run_tool_ok(program: &str, args: &[&str]) -> Result<std::process::Output, Str
     ))
 }
 
-/// Whether a daemon answers at this shell's attach endpoint. Anything other
-/// than a clean "nothing is listening" counts as live: something holds the
-/// endpoint, and a service started beside it could not bind.
-async fn daemon_answers() -> bool {
+/// One bounded `Hello` probe at this shell's attach endpoint.
+async fn probe_endpoint() -> Result<
+    Result<Option<crate::daemon_protocol::AttachResponse>, crate::daemon_client::ClientError>,
+    tokio::time::error::Elapsed,
+> {
     let client = crate::daemon_client::DaemonClient::new(
         crate::endpoint_resolve::client_attach_socket_path(),
     );
-    !matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(3), client.probe_running()).await,
-        Ok(Ok(None))
-    )
+    tokio::time::timeout(std::time::Duration::from_secs(3), client.probe_running()).await
 }
 
-/// Poll until a daemon answers at this shell's endpoint, for as long as a
-/// lazy-spawned daemon is given to bind.
+/// Whether something holds this shell's endpoint. Anything other than a clean
+/// "nothing is listening" counts: a service started beside it could not bind.
+async fn endpoint_occupied() -> bool {
+    !matches!(probe_endpoint().await, Ok(Ok(None)))
+}
+
+/// Poll until a daemon completes a `Hello` at this shell's endpoint, for as
+/// long as a lazy-spawned daemon is given to bind. Unlike
+/// [`endpoint_occupied`], only a real reply counts.
 async fn wait_for_daemon() -> bool {
     let deadline = tokio::time::Instant::now() + crate::daemon_attach::daemon_start_poll_timeout();
     loop {
-        if daemon_answers().await {
+        if matches!(probe_endpoint().await, Ok(Ok(Some(_)))) {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -436,6 +482,32 @@ fn launchd_target() -> String {
     format!("{}/{LAUNCHD_LABEL}", launchd_domain())
 }
 
+/// `launchctl print` of the job: `None` when it is not loaded, else its pid
+/// if it has a process.
+fn launchd_job(target: &str) -> Result<Option<Option<u32>>, String> {
+    let output = run_tool("launchctl", &["print", target])?;
+    Ok(output
+        .status
+        .success()
+        .then(|| launchd_job_pid(&String::from_utf8_lossy(&output.stdout))))
+}
+
+/// The unit file systemd reports loading `SYSTEMD_UNIT` from, or empty.
+fn systemd_fragment_path() -> Result<String, String> {
+    let output = run_tool(
+        "systemctl",
+        &[
+            "--user",
+            "show",
+            "-p",
+            "FragmentPath",
+            "--value",
+            SYSTEMD_UNIT,
+        ],
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// `dot-agent-deck daemon install`. Prints what it did on stdout; an `Err`
 /// is the message the caller prints before exiting non-zero.
 pub async fn run_install() -> Result<(), String> {
@@ -462,21 +534,35 @@ pub async fn run_install() -> Result<(), String> {
     );
 
     match manager {
-        ServiceManager::Systemd => install_systemd(changed).await?,
+        ServiceManager::Systemd => install_systemd(&file, changed).await?,
         ServiceManager::Launchd => install_launchd(&file, changed).await?,
     }
     Ok(())
 }
 
-async fn install_systemd(changed: bool) -> Result<(), String> {
+async fn install_systemd(file: &Path, changed: bool) -> Result<(), String> {
     run_tool_ok("systemctl", &["--user", "daemon-reload"])?;
+    let fragment = systemd_fragment_path()?;
+    if !systemd_loads(&fragment, file) {
+        return Err(format!(
+            "wrote {}, but systemd loads {SYSTEMD_UNIT} from {}. Remove that copy, or, \
+             if this shell's XDG_CONFIG_HOME differs from the systemd user manager's, run \
+             `daemon install` with the same value the manager has",
+            file.display(),
+            if fragment.is_empty() {
+                "nowhere: it does not read that directory"
+            } else {
+                &fragment
+            }
+        ));
+    }
     let service_running = run_tool(
         "systemctl",
         &["--user", "is-active", "--quiet", SYSTEMD_UNIT],
     )?
     .status
     .success();
-    let daemon_live = daemon_answers().await;
+    let daemon_live = endpoint_occupied().await;
     match plan_install(InstallObservation {
         service_running,
         daemon_live,
@@ -532,39 +618,53 @@ async fn install_systemd(changed: bool) -> Result<(), String> {
 async fn install_launchd(file: &Path, changed: bool) -> Result<(), String> {
     let file = file.to_string_lossy();
     let target = launchd_target();
-    let service_running = run_tool("launchctl", &["print", &target])?.status.success();
-    let daemon_live = daemon_answers().await;
+    let job = launchd_job(&target)?;
+    let loaded = job.is_some();
+    let daemon_live = endpoint_occupied().await;
     match plan_install(InstallObservation {
-        service_running,
+        service_running: job.flatten().is_some(),
         daemon_live,
     }) {
         InstallPlan::EnableAndStart => {
-            run_tool_ok("launchctl", &["bootstrap", &launchd_domain(), &file])?;
+            // A loaded job whose daemon was stopped stays loaded, and
+            // `bootstrap` refuses a loaded job; `kickstart` starts it.
+            if loaded {
+                run_tool_ok("launchctl", &["kickstart", &target])?;
+            } else {
+                run_tool_ok("launchctl", &["bootstrap", &launchd_domain(), &file])?;
+            }
             if !wait_for_daemon().await {
                 return Err(format!(
-                    "the LaunchAgent was loaded, but no daemon answered at {} in time. \
+                    "the LaunchAgent was started, but no daemon answered at {} in time. \
                      Check `launchctl print {target}` and ~/Library/Logs/dot-agent-deck.log",
                     crate::endpoint_resolve::client_attach_socket_path().display()
                 ));
             }
             println!("the daemon is running as LaunchAgent {LAUNCHD_LABEL}");
+            if loaded && changed {
+                println!("the new plist applies from your next login");
+            }
         }
         InstallPlan::EnableKeepRunning => {
             if changed {
                 println!(
-                    "LaunchAgent {LAUNCHD_LABEL} is already loaded and was left running; \
+                    "LaunchAgent {LAUNCHD_LABEL} is already running and was left running; \
                      the new plist applies from your next login"
                 );
             } else {
-                println!("LaunchAgent {LAUNCHD_LABEL} is already loaded");
+                println!("LaunchAgent {LAUNCHD_LABEL} is already running");
             }
         }
         InstallPlan::EnableOnly => {
+            let start = if loaded {
+                format!("launchctl kickstart {target}")
+            } else {
+                format!("launchctl bootstrap {} {file}", launchd_domain())
+            };
             println!(
                 "a daemon not started by launchd is running, so the LaunchAgent was not \
-                 loaded; it loads at your next login. To switch now: \
-                 `dot-agent-deck daemon stop`, then `launchctl bootstrap {} {file}`",
-                launchd_domain()
+                 started; it starts at your next login. To switch now: \
+                 `dot-agent-deck daemon stop`, then `{start}`"
             );
         }
     }
@@ -579,6 +679,13 @@ pub async fn run_uninstall() -> Result<(), String> {
     let file = manager.service_file(&home, crate::platform::paths::xdg_config_home().as_deref());
     let still_running = match manager {
         ServiceManager::Systemd => {
+            let fragment = systemd_fragment_path()?;
+            if !fragment.is_empty() && !systemd_loads(&fragment, &file) {
+                println!(
+                    "note: systemd loads {SYSTEMD_UNIT} from {fragment}, which this command \
+                     does not remove"
+                );
+            }
             // `disable` without `--now` never stops the unit. A unit that was
             // never installed fails here, which is not an error to report.
             let _ = run_tool("systemctl", &["--user", "disable", SYSTEMD_UNIT])?;
@@ -593,8 +700,8 @@ pub async fn run_uninstall() -> Result<(), String> {
         }
         ServiceManager::Launchd => {
             let target = launchd_target();
-            let loaded = run_tool("launchctl", &["print", &target])?.status.success();
-            let plan = plan_uninstall(loaded, loaded && daemon_answers().await);
+            let job = launchd_job(&target)?;
+            let plan = plan_uninstall(job.is_some(), job.flatten().is_some());
             if plan == UninstallPlan::Unload {
                 run_tool_ok("launchctl", &["bootout", &target])?;
             }
@@ -604,8 +711,9 @@ pub async fn run_uninstall() -> Result<(), String> {
     };
     if still_running {
         println!(
-            "the daemon the service started is still running, with its agents; it will not \
-             start again at login. `dot-agent-deck daemon stop` stops it"
+            "the daemon the service started is still running, with its agents, and will not \
+             start again at login. Until it stops, the service manager still restarts it if it \
+             crashes; `dot-agent-deck daemon stop` stops it for good"
         );
     }
     Ok(())
@@ -767,21 +875,51 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_never_unloads_a_job_whose_daemon_is_running() {
+    fn uninstall_never_unloads_a_job_with_a_process() {
         assert_eq!(plan_uninstall(true, true), UninstallPlan::LeaveLoaded);
         assert_eq!(plan_uninstall(true, false), UninstallPlan::Unload);
-        assert_eq!(plan_uninstall(false, true), UninstallPlan::NothingLoaded);
+        assert_eq!(plan_uninstall(false, false), UninstallPlan::NothingLoaded);
+    }
+
+    #[test]
+    fn launchd_job_pid_reads_only_a_pid_line() {
+        let running = "gui/501/ai.devopstoolkit.dot-agent-deck = {\n\tactive count = 1\n\tstate = running\n\tpid = 4242\n\tlast exit code = 75\n}";
+        assert_eq!(launchd_job_pid(running), Some(4242));
+        let stopped = "gui/501/ai.devopstoolkit.dot-agent-deck = {\n\tstate = not running\n\tlast exit code = 0\n}";
+        assert_eq!(launchd_job_pid(stopped), None);
+        assert_eq!(launchd_job_pid(""), None);
+    }
+
+    #[test]
+    fn systemd_loads_only_the_written_file() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let written = dir.path().join("dot-agent-deck.service");
+        std::fs::write(&written, "x").unwrap();
+        assert!(systemd_loads(&format!("{}\n", written.display()), &written));
+        let link = dir.path().join("link.service");
+        std::os::unix::fs::symlink(&written, &link).unwrap();
+        assert!(systemd_loads(&link.to_string_lossy(), &written));
+        assert!(!systemd_loads(
+            "/etc/systemd/user/dot-agent-deck.service",
+            &written
+        ));
+        assert!(!systemd_loads("", &written));
     }
 
     #[test]
     fn write_service_file_creates_the_directory_and_reports_change() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_temp::tempdir().unwrap();
         let path = dir.path().join("a/b/unit.service");
         assert!(write_service_file(&path, "one").unwrap());
         assert!(!write_service_file(&path, "one").unwrap());
         assert!(write_service_file(&path, "two").unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
-        assert!(!path.with_extension("service.tmp").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| name != "unit.service")
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
     }
 
     #[test]

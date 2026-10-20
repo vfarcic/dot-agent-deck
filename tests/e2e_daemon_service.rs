@@ -28,6 +28,7 @@ const SYSTEMCTL_STUB: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$STUB_DIR/systemctl.log"
 case "$*" in
   *is-active*) exit 3 ;;
+  *FragmentPath*) printf '%s\n' "$XDG_CONFIG_HOME/systemd/user/dot-agent-deck.service" ;;
   *"enable --now"*)
     unit="$XDG_CONFIG_HOME/systemd/user/dot-agent-deck.service"
     bin=$(sed -n 's/^ExecStart="\(.*\)" daemon serve$/\1/p' "$unit")

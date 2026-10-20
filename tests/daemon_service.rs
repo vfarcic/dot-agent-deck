@@ -12,6 +12,11 @@
 //! recorded verification.
 #![cfg(target_os = "linux")]
 
+// Issue #322: fast-tier and does not link `tests/common/mod.rs`, so the
+// crate's temp-root resolver is `#[path]`-included instead.
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Output;
@@ -22,6 +27,8 @@ const SYSTEMCTL_STUB: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$STUB_LOG"
 case "$*" in
   *is-active*) exit "${STUB_ACTIVE:-3}" ;;
+  *FragmentPath*)
+    printf '%s\n' "${STUB_FRAGMENT-$XDG_CONFIG_HOME/systemd/user/dot-agent-deck.service}" ;;
 esac
 exit 0
 "#;
@@ -37,7 +44,7 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = test_temp::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
         let bin = root.join("home/.local/bin");
         std::fs::create_dir_all(&bin).expect("create ~/.local/bin");
@@ -169,6 +176,10 @@ fn daemon_service_001_install_writes_the_unit_and_leaves_a_running_service_runni
             "Environment=\"DOT_AGENT_DECK_STATE_DIR={}\"",
             sandbox.root.join("state").display()
         ),
+        format!(
+            "Environment=\"XDG_CONFIG_HOME={}\"",
+            sandbox.root.join("config").display()
+        ),
     ] {
         assert!(
             env.contains(&expected.as_str()),
@@ -177,8 +188,8 @@ fn daemon_service_001_install_writes_the_unit_and_leaves_a_running_service_runni
     }
     assert_eq!(
         env.len(),
-        4,
-        "only the idle setting and the endpoint overrides are carried: {env:?}"
+        5,
+        "only the idle setting and the shell's endpoint and directory overrides are carried: {env:?}"
     );
     assert_eq!(unit_line(&unit, "Restart="), vec!["Restart=on-failure"]);
     assert_eq!(
@@ -255,5 +266,35 @@ fn daemon_service_003_install_refuses_a_relative_override_before_touching_anythi
         sandbox.calls().is_empty(),
         "systemctl was called: {:?}",
         sandbox.calls()
+    );
+}
+
+/// Scenario: Run `dot-agent-deck daemon install` with a stand-in `systemctl` that reports loading `dot-agent-deck.service` from `/etc/systemd/user/` rather than from the file the command just wrote. It fails, naming both paths, before enabling or starting anything, instead of starting a unit other than the one it wrote.
+#[spec("daemon/service/005")]
+#[test]
+fn daemon_service_005_install_refuses_when_systemd_loads_another_unit_file() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(
+        "install",
+        false,
+        &[("STUB_FRAGMENT", "/etc/systemd/user/dot-agent-deck.service")],
+    );
+    let stderr = text(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "install accepted a unit systemd does not load"
+    );
+    assert!(
+        stderr.contains("/etc/systemd/user/dot-agent-deck.service"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&sandbox.unit().display().to_string()),
+        "{stderr}"
+    );
+    let calls = sandbox.calls();
+    assert!(
+        !calls.iter().any(|c| c.contains("enable")),
+        "systemctl was asked to enable after the mismatch: {calls:?}"
     );
 }
