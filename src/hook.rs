@@ -264,11 +264,11 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         Some(announce) => send_lines_and_drain(&format!("{announce}\n{json}")),
         None => send_to_socket(&json),
     };
-    // PRD #1666 part 2: a daemon that did not confirm it serves receipts was
-    // handed nothing, and the hook said so on stderr. Claude Code shows the
-    // stderr of a hook that exits non-zero (other than 2) and goes on with the
-    // prompt.
-    if crate::inbox_oneshot::reported_unsupported() {
+    // PRD #1666 part 2: a daemon that did not confirm it serves receipts, or
+    // a socket this user may not use, was handed nothing, and the hook said
+    // so on stderr. Claude Code shows the stderr of a hook that exits
+    // non-zero (other than 2) and goes on with the prompt.
+    if crate::inbox_oneshot::reported_refusal() {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -621,11 +621,21 @@ pub fn deck_prompt_submit(
     }
     let budget = component.inline_budget();
     if component == crate::event::InboxComponent::ClaudeHooks {
-        crate::inbox_prompt::commit_delivered(prompt);
+        // One budget for all of this prompt's receipt work, the commit's and
+        // the doorbell fetch's: the hook blocks the user's prompt while it
+        // runs.
+        let receipts_by = std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait();
+        crate::inbox_prompt::commit_delivered(prompt, receipts_by);
         #[cfg(unix)]
         {
             let injection = ids.rung.first().and_then(|rung| {
-                crate::inbox_prompt::one_shot_injection(budget, framing, rung, "UserPromptSubmit")
+                crate::inbox_prompt::one_shot_injection(
+                    budget,
+                    framing,
+                    rung,
+                    "UserPromptSubmit",
+                    receipts_by,
+                )
             });
             let fetched = injection
                 .as_ref()

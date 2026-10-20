@@ -9555,8 +9555,43 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/038 — A prompt's commit exchange is bounded.
 - **Layer:** Fast (`src/inbox_prompt.rs`), `commit_attempts` against stand-in sockets that answer the question.
 - **Agent:** none.
-- **Asserts:** against a deck that then reads nothing, a 2 MB commit gives up as `Nothing` within two waits plus 2 s; against one that reads the commit and never replies, it is `Sent` within the same bound.
-- **Does not assert:** the daemon applying the commit (inbox/claude/016, /023).
+- **Asserts:** against a deck that then reads nothing, a 2 MB commit gives up as `Nothing` within its one wait plus 2 s; against one that reads the commit and never replies, it is `Sent` within the same bound.
+- **Does not assert:** the daemon applying the commit (inbox/claude/016, /023), or a spool stalled between the answer and the commit line, whose IO the deadline does not interrupt.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/039 — A line received after the deadline is not returned for it.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::next_by` over a socket pair with a scripted clock read once before the receive and once after.
+- **Agent:** none.
+- **Asserts:** with the deadline passed between the two readings, a line received is not returned and the fence still sees it; in time the next line is returned; a line held back is first for a later read without a deadline.
+- **Does not assert:** the OS scheduling the hook at any exact instant.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/040 — A prompt's receipt work shares one deadline.
+- **Layer:** Fast (`src/inbox_prompt.rs`), `commit_attempts_by` and `fetch_with_receipts` with one deadline against stand-in sockets that serve receipts.
+- **Agent:** none.
+- **Asserts:** against a prompt deck both phases complete, each asking `inbox_receipts` first on its own connection; against one that waits 1.3 s before each answer, the commit and the fetch together are done within the shared 1.5 s plus 2 s (four budgets in turn would take over 5 s), the commit `Sent` and the fetch, with the budget spent, taking nothing.
+- **Does not assert:** the hook's status send or its own grant, output and spool work, which the budget does not cover.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/041 — A socket of another user is refused before the question.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::open_receipts_within` against a socket whose mode lets no one connect.
+- **Agent:** none.
+- **Asserts:** the gate is `Foreign` (not `Unreachable` or `Unsupported`) and the listener accepts no connection, so the token-bearing question is never sent.
+- **Does not assert:** a listener running as another uid (the same `PermissionDenied` refusal, from the IPC client's peer-uid check); skipped under root.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/042 — Hooks say so when the deck socket belongs to another user.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real waiter and prompt-hook CLI children against a socket whose mode lets no one connect, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob.
+- **Agent:** none (no credential).
+- **Asserts:** the waiter, a doorbell's prompt hook and a committing prompt hook each exit 1 with `RECEIPTS_FOREIGN_SOCKET` on stderr and not the socket's path, and none connects.
+- **Does not assert:** a listener running as another uid; skipped under root.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/043 — A prompt's receipt work at a slow deck shares one budget.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real prompt-hook CLI child against a stand-in hook endpoint that serves receipts and waits 1.3 s before each answer, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob at 1500.
+- **Agent:** none (no credential).
+- **Asserts:** a prompt carrying a whole block and a doorbell finishes within the 1.5 s budget plus 2 s (a budget per question and exchange would take over 5 s), exits 0, and sends `inbox_receipts` then `inbox_committed` and no fetch.
+- **Does not assert:** a stalled spool or a stalled status send, which the budget does not cover.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]

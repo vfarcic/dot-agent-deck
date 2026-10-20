@@ -767,14 +767,16 @@ pub fn declared_hook_integration() -> Option<u32> {
     Some(crate::inbox_hub::HOOK_INTEGRATION)
 }
 
-/// The budget of a one-shot's receipts question, the whole of it: connecting
-/// to the deck, writing the question and reading the answer
-/// ([`Connection::open_receipts_within`]). A deck that has not answered by
-/// then is taken for one that does not serve receipts. An older daemon
+/// The socket-wait budget of a one-shot's receipts question: the connect's
+/// wait for the deck to accept, writing the question and waiting for the
+/// answer ([`Connection::open_receipts_within`]). A deck that has not answered
+/// by then is taken for one that does not serve receipts. An older daemon
 /// answers nothing at all (it cannot decode the question), so this is what
-/// that pairing costs each question. It is a budget per question, not per
-/// hook: Claude's prompt hook can ask twice, and how long the whole hook can
-/// take is [`crate::inbox_prompt::commit_attempts`]'s to say.
+/// that pairing costs each question. It is a cooperative budget, checked
+/// around each socket wait, not a ceiling on the call: resolving the socket's
+/// path inside `connect(2)` is not pre-empted by it. The waiter asks once
+/// within it; Claude's prompt hook shares one such budget between all its
+/// receipt work ([`crate::inbox_prompt::prompt_receipts_wait`]).
 pub const RECEIPTS_ANSWER_WAIT: Duration = Duration::from_secs(5);
 
 /// TEST knob, read only by a build with the `e2e` feature:
@@ -817,6 +819,30 @@ pub fn reported_unsupported() -> bool {
     REPORTED_UNSUPPORTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// What a one-shot says when the deck socket it connects to is one this user
+/// may not use ([`Opened::Foreign`]): it asked nothing there, and how to point
+/// it at the user's own deck. Fixed text: the socket's path and the uids are
+/// not in it.
+pub const RECEIPTS_FOREIGN_SOCKET: &str = "dot-agent-deck: the deck socket this hook connects to belongs to another user, so the hook asked it nothing and no message was taken. If you set DOT_AGENT_DECK_SOCKET or DOT_AGENT_DECK_ATTACH_SOCKET, point them at paths under a directory only you can write, or unset them to use your own deck daemon; then restart the agent.";
+
+static REPORTED_FOREIGN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Say [`RECEIPTS_FOREIGN_SOCKET`] on stderr, once per process, and remember
+/// it, so the hook exits with the status that shows its stderr to the user
+/// ([`reported_refusal`]).
+pub fn report_foreign_socket() {
+    if !REPORTED_FOREIGN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("{RECEIPTS_FOREIGN_SOCKET}");
+    }
+}
+
+/// Whether this process said [`RECEIPTS_UNSUPPORTED`] or
+/// [`RECEIPTS_FOREIGN_SOCKET`]: a one-shot that did either took nothing, and
+/// a later phase of the same hook asks nothing more.
+pub fn reported_refusal() -> bool {
+    reported_unsupported() || REPORTED_FOREIGN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Whether `reply`, the deck's answer to an `inbox_receipts` question, says
 /// it serves the one-shot receipts this binary speaks.
 pub fn serves_receipts(reply: &InboxWaitReply) -> bool {
@@ -853,8 +879,12 @@ pub enum Opened {
     /// [`crate::inbox_hub::ONE_SHOT_RECEIPTS`]. Nothing that could take mail
     /// or commit it was sent.
     Unsupported,
-    /// The connect failed for a reason other than running out of time: no
-    /// socket, nothing listening on it, or a listener this user may not use.
+    /// The socket is one this user may not use: its listener runs as another
+    /// user, or connecting to it was denied. Refused before the question,
+    /// which carries the token, was written.
+    Foreign,
+    /// The connect failed for another reason than running out of time or
+    /// [`Opened::Foreign`]: no socket, or nothing listening on it.
     Unreachable,
 }
 
@@ -863,18 +893,20 @@ pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 /// The most lines a connection's reader thread queues that the one-shot has
 /// not yet taken, each of at most [`MAX_LINE_BYTES`]. With the queue full the
-/// thread stops reading, so the deck's further lines wait in the socket and
-/// then in the deck rather than in this process.
+/// thread holds one more, parsed, while it waits for room, and stops reading,
+/// so the deck's further lines wait in the socket and then in the deck rather
+/// than in this process.
 pub const MAX_QUEUED_LINES: usize = 8;
 
 /// A one-shot's side of its one connection to the deck (part 2 §2.5). A
 /// reader thread of its own reads every line through [`read_frame`] and
-/// hands it over parsed, holding at most [`MAX_QUEUED_LINES`]; an end of the
+/// hands it over parsed, queueing at most [`MAX_QUEUED_LINES`] (and holding a
+/// further one while it waits for room); an end of the
 /// connection, a line cut short by it, a line past [`MAX_LINE_BYTES`] or a
 /// read error ends the connection's use for good, and nothing after it is
 /// read. So [`Connection::arrivals`] is a non-blocking [`Incoming`] that
-/// never splits a line. A write through [`Connection::send`] is bounded by
-/// its deadline.
+/// never splits a line. A write through [`Connection::send`] is given the
+/// time left before its deadline.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct Connection {
@@ -882,6 +914,9 @@ pub struct Connection {
     lines: std::sync::mpsc::Receiver<Option<InboxWaitReply>>,
     /// Lines read before the hand-over that its fence must still see.
     held: Vec<InboxWaitReply>,
+    /// A line received past the deadline it was waited for: not returned
+    /// then, and first in line for whatever reads next.
+    unread: Option<Box<InboxWaitReply>>,
     ended: bool,
     next_q: u64,
 }
@@ -902,7 +937,7 @@ impl Connection {
 
     /// PRD #1666 part 2 (wire audit W03–W05): connect to the deck at `path`,
     /// ask `question` (an `inbox_receipts` line, [`receipts_question`]) and
-    /// read the answer, the three of them within one
+    /// read the answer, the three of them within one socket-wait budget of
     /// [`RECEIPTS_ANSWER_WAIT`]. Every one-shot that could take mail or
     /// commit it asks first, on the connection that then carries its
     /// request, and decides from this answer alone, never from an earlier
@@ -913,16 +948,32 @@ impl Connection {
         Connection::open_receipts_within(path, question, receipts_answer_wait())
     }
 
-    /// [`Connection::open_receipts`] within `wait`. The deadline is set
-    /// before the connect and checked on every line: a connect parked on a
-    /// full accept queue, a question the deck does not read, and an answer
-    /// that arrives after it, even queued behind keepalives that came in
-    /// time, are all [`Opened::Unsupported`].
+    /// [`Connection::open_receipts`] within `wait`, from now.
     pub fn open_receipts_within(path: &Path, question: &str, wait: Duration) -> Opened {
-        let deadline = Instant::now() + wait;
+        Connection::open_receipts_by(path, question, Instant::now() + wait)
+    }
+
+    /// [`Connection::open_receipts`] by `deadline`, a socket-wait budget
+    /// checked around each wait: a connect parked on a full accept queue, a
+    /// question the deck does not read, and an answer received after it,
+    /// even queued behind keepalives that came in time, are all
+    /// [`Opened::Unsupported`]. It cannot pre-empt `connect(2)` resolving the
+    /// socket's path (a stalled filesystem); once that returns, a deadline
+    /// already past sends nothing.
+    pub fn open_receipts_by(path: &Path, question: &str, deadline: Instant) -> Opened {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return Opened::Unsupported;
+        }
         let stream = match crate::platform::ipc::IpcClient::connect_timeout(path, wait) {
             Ok(client) => client.into_std(),
             Err(error) if error.kind() == io::ErrorKind::TimedOut => return Opened::Unsupported,
+            // A listener running as another user, or a socket this user may
+            // not connect to: refused before the question, which carries the
+            // token, is written.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Opened::Foreign;
+            }
             Err(_) => return Opened::Unreachable,
         };
         let Ok(mut connection) = Connection::over(stream, MAX_LINE_BYTES) else {
@@ -976,24 +1027,44 @@ impl Connection {
             stream,
             lines,
             held: Vec::new(),
+            unread: None,
             ended: false,
             next_q: 1,
         })
     }
 
     /// The next line, waiting until `deadline` (forever with `None`).
-    /// `None` once the connection has ended, or from the deadline on, even
-    /// with lines already waiting: a deck that keeps lines coming cannot
-    /// stretch it.
+    /// `None` once the connection has ended, or once the deadline has passed,
+    /// even with lines already waiting: a deck that keeps lines coming cannot
+    /// stretch it. The clock is read again after a line is received, so one
+    /// that came in, or was taken, after the deadline is not returned for it
+    /// (R3AR-R01); it stays first in line for the fence or a later read.
     pub fn next(&mut self, deadline: Option<Instant>) -> Option<InboxWaitReply> {
+        self.next_by(deadline, &mut Instant::now)
+    }
+
+    /// [`Connection::next`] reading the clock from `now`.
+    fn next_by(
+        &mut self,
+        deadline: Option<Instant>,
+        now: &mut dyn FnMut() -> Instant,
+    ) -> Option<InboxWaitReply> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let expired = |now: &mut dyn FnMut() -> Instant| deadline.is_some_and(|d| now() >= d);
+        if let Some(reply) = self.unread.take() {
+            if expired(now) {
+                self.unread = Some(reply);
+                return None;
+            }
+            return Some(*reply);
+        }
         if self.ended {
             return None;
         }
-        use std::sync::mpsc::RecvTimeoutError;
         let got = match deadline {
             None => self.lines.recv().unwrap_or(None),
             Some(deadline) => {
-                let left = deadline.saturating_duration_since(Instant::now());
+                let left = deadline.saturating_duration_since(now());
                 if left.is_zero() {
                     return None;
                 }
@@ -1004,10 +1075,15 @@ impl Connection {
                 }
             }
         };
-        if got.is_none() {
+        let Some(reply) = got else {
             self.ended = true;
+            return None;
+        };
+        if expired(now) {
+            self.unread = Some(Box::new(reply));
+            return None;
         }
-        got
+        Some(reply)
     }
 
     /// Keep `reply` for the fence: a revoke or a terminal line read before
@@ -1021,10 +1097,11 @@ impl Connection {
         self.ended
     }
 
-    /// Send one line, all of it by `deadline`, or fail with
-    /// [`io::ErrorKind::TimedOut`] (a deck that does not read). No write
-    /// starts from the deadline on, and a line given up on is not continued
-    /// later.
+    /// Send one line within the time left before `deadline`, or fail with
+    /// [`io::ErrorKind::TimedOut`] (a deck that does not read).
+    /// The clock is checked before each piece is written, and each write is
+    /// given the time that is left as its timeout; a line given up on is not
+    /// continued later.
     pub fn send(&mut self, line: &str, deadline: Instant) -> io::Result<()> {
         let line = format!("{line}\n");
         let mut rest = line.as_bytes();
@@ -1123,6 +1200,7 @@ impl Incoming for Arrivals<'_> {
     fn arrived(&mut self) -> Arrived {
         let connection = &mut *self.0;
         let mut lines = std::mem::take(&mut connection.held);
+        lines.extend(connection.unread.take().map(|reply| *reply));
         while !connection.ended {
             match connection.lines.try_recv() {
                 Ok(Some(reply)) => lines.push(reply),
@@ -2137,6 +2215,7 @@ pub(crate) mod tests {
                 Opened::Ready(_) => "ready",
                 Opened::Refused(_) => "refused",
                 Opened::Unsupported => "unsupported",
+                Opened::Foreign => "foreign",
                 Opened::Unreachable => "unreachable",
             });
         }
@@ -2410,5 +2489,95 @@ pub(crate) mod tests {
         assert!(matches!(opened, Opened::Unsupported), "{opened:?}");
         drop(opened);
         deck.join().unwrap();
+    }
+
+    /// Scenario: A line is on its way when a one-shot reads its connection
+    /// with a deadline, and the clock, read once before the receive and once
+    /// after it, has passed the deadline by the second reading, as when the
+    /// thread is descheduled between its check and the receive. The read
+    /// returns nothing, and the line is still there for the fence; with the
+    /// clock not past the deadline the same read returns the next line; and
+    /// a line held back this way is first for a later read without a deadline.
+    #[cfg(unix)]
+    #[spec("inbox/claude/039")]
+    #[test]
+    fn claude_039_a_line_received_after_the_deadline_is_not_returned_for_it() {
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut connection = Connection::over(ours, MAX_LINE_BYTES).unwrap();
+        let base = Instant::now();
+        // Far enough off that only the scripted clock can pass it.
+        let deadline = base + Duration::from_secs(3600);
+        let late = deadline + Duration::from_secs(1);
+        // The clock read before the receive and after it.
+        let script = |readings: [Instant; 2]| {
+            let mut readings = readings.into_iter();
+            move || readings.next().expect("the clock is read twice")
+        };
+
+        writeln!(theirs, r#"{{"one_shot_receipts":1}}"#).unwrap();
+        assert!(
+            connection
+                .next_by(Some(deadline), &mut script([base, late]))
+                .is_none(),
+            "a line received after the deadline is not returned for it"
+        );
+        let arrived = connection.arrivals().arrived();
+        assert_eq!(arrived.lines.len(), 1, "the fence still sees it");
+        assert_eq!(arrived.lines[0].one_shot_receipts, Some(1));
+
+        writeln!(theirs, r#"{{"one_shot_receipts":2}}"#).unwrap();
+        let got = connection.next_by(Some(deadline), &mut script([base, base]));
+        assert_eq!(
+            got.and_then(|reply| reply.one_shot_receipts),
+            Some(2),
+            "in time, the line is returned"
+        );
+
+        writeln!(theirs, r#"{{"one_shot_receipts":3}}"#).unwrap();
+        assert!(
+            connection
+                .next_by(Some(deadline), &mut script([base, late]))
+                .is_none()
+        );
+        assert_eq!(
+            connection
+                .next(None)
+                .and_then(|reply| reply.one_shot_receipts),
+            Some(3),
+            "the line held back is first for the next read"
+        );
+    }
+
+    /// Scenario: Point a one-shot's receipts question at a socket this user
+    /// may not connect to, its mode letting no one write it, as another
+    /// user's private socket does. The gate is `Foreign`, neither
+    /// `Unreachable` nor `Unsupported`, and the listener accepts no
+    /// connection, so the question, which carries the token, is never
+    /// written. The diagnostic said for it is fixed text naming the remedy.
+    #[cfg(unix)]
+    #[spec("inbox/claude/041")]
+    #[test]
+    fn claude_041_a_socket_of_another_user_is_refused_before_the_question() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::platform::paths::current_uid() == 0 {
+            eprintln!("SKIP: root connects whatever a socket's mode says");
+            return;
+        }
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("foreign.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let question = receipts_question(PANE, Some(AGENT), "token-1").unwrap();
+        let opened = Connection::open_receipts_within(&path, &question, Duration::from_millis(300));
+        assert!(matches!(opened, Opened::Foreign), "{opened:?}");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "no connection was made, so no question was sent"
+        );
+        assert!(
+            RECEIPTS_FOREIGN_SOCKET.contains("belongs to another user")
+                && RECEIPTS_FOREIGN_SOCKET.contains("DOT_AGENT_DECK_SOCKET")
+        );
     }
 }

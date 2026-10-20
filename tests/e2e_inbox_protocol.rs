@@ -1441,3 +1441,167 @@ fn claude_037_a_prompt_asks_an_older_daemon_once() {
         assert!(!MAIL_VERBS.contains(&verb), "sent {verb}: {requests:?}");
     }
 }
+
+/// Scenario: Point Claude Code's waiter, its prompt hook answering a doorbell, and its prompt hook submitting a waiter's whole block at a hook socket whose mode lets this user connect to none of it, as another user's private socket does. Each exits 1 and says on stderr, in fixed text without the socket's path, that the socket belongs to another user and how to point the hook at the user's own deck; the socket never accepts a connection, so no receipts question, which carries the token, is sent.
+#[spec("inbox/claude/042")]
+#[test]
+fn claude_042_hooks_say_so_when_the_deck_socket_belongs_to_another_user() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: getuid(2) has no failure mode and touches no memory.
+    if unsafe { libc::getuid() } == 0 {
+        eprintln!("SKIP: root connects whatever a socket's mode says");
+        return;
+    }
+    let daemon = daemon();
+    let pane = pane(&daemon, "foreign-socket", "exec /bin/cat");
+    let (id, rung) = ("m-k3xzq2ab-0f3c9a71d2e4b850", "m-k3xzq2ab-1a2b3c4d5e6f7081");
+    let refused = |what: &str, name: &str, args: &[&str], stdin: String| {
+        let path = daemon.home.join(name);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let output = BoundedChild::start(
+            cli(&daemon, Some(&pane), args)
+                .env("DOT_AGENT_DECK_SOCKET", &path)
+                .env("DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS", "300"),
+            stdin.as_bytes(),
+        )
+        .output();
+        assert_eq!(output.status.code(), Some(1), "{what}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(dot_agent_deck::inbox_oneshot::RECEIPTS_FOREIGN_SOCKET),
+            "{what} says the socket is another user's, and the remedy: {stderr}"
+        );
+        assert!(
+            !stderr.contains(&*path.to_string_lossy()),
+            "{what} names no path: {stderr}"
+        );
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "{what} made no connection"
+        );
+    };
+    refused(
+        "the waiter",
+        "foreign-wait.sock",
+        &["inbox", "wait", "--agent", "claude-code"],
+        json!({"hook_event_name":"SessionStart", "session_id":"foreign-socket",
+            "source":"startup"})
+        .to_string(),
+    );
+    refused(
+        "the doorbell hook",
+        "foreign-doorbell.sock",
+        &["hook", "--agent", "claude-code"],
+        json!({"session_id":"foreign-socket", "hook_event_name":"UserPromptSubmit",
+            "prompt":format!(" dot-agent-deck: message {rung} waiting, run: dot-agent-deck inbox fetch"),
+            "cwd":daemon.home})
+        .to_string(),
+    );
+    refused(
+        "the committing prompt hook",
+        "foreign-commit.sock",
+        &["hook", "--agent", "claude-code"],
+        json!({"session_id":"foreign-socket", "hook_event_name":"UserPromptSubmit",
+            "prompt":format!("[dot-agent-deck message {id} delivery 1.1 from the orchestrator]\nbody\n[end of dot-agent-deck message {id}]"),
+            "cwd":daemon.home})
+        .to_string(),
+    );
+}
+
+/// Scenario: Submit one prompt to Claude Code's prompt hook that carries both a waiter's whole block and a doorbell for a second message, against a stand-in hook endpoint that serves receipts but waits 1.3 s before each answer, with the receipts budget set to 1.5 s. The hook is done within that one budget plus two seconds rather than spending a budget on each question and exchange: its commit asks first and is written in time, the doorbell's fetch, reached with the budget spent, asks nothing, and the hook exits 0.
+#[spec("inbox/claude/043")]
+#[test]
+fn claude_043_a_prompts_receipt_work_at_a_slow_deck_shares_one_budget() {
+    use std::sync::{Arc, Condvar, Mutex};
+    let daemon = daemon();
+    let pane = pane(&daemon, "slow-deck", "exec /bin/cat");
+    let (id, rung) = ("m-k3xzq2ab-0f3c9a71d2e4b850", "m-k3xzq2ab-1a2b3c4d5e6f7081");
+    let (budget, delay) = (Duration::from_millis(1500), Duration::from_millis(1300));
+    let path = daemon.home.join("slow-deck.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    // Set once the hook has exited: it ends the deck's held answers and,
+    // with one last connect, its accept loop.
+    let stop = Arc::new((Mutex::new(false), Condvar::new()));
+    // Every connection served on a thread of its own, each answer held back
+    // for `delay` (a slow deck); a line that is not a receipt verb (the
+    // status event) is only recorded.
+    let deck = {
+        let (requests, stop) = (Arc::clone(&requests), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut connections = Vec::new();
+            for socket in listener.incoming() {
+                if *stop.0.lock().unwrap() {
+                    break;
+                }
+                let Ok(socket) = socket else { continue };
+                let (requests, stop) = (Arc::clone(&requests), Arc::clone(&stop));
+                connections.push(std::thread::spawn(move || {
+                    let mut writer = socket.try_clone().unwrap();
+                    for text in BufReader::new(socket).lines().map_while(Result::ok) {
+                        let request: Value = serde_json::from_str(&text).unwrap_or_default();
+                        let answer = match request["message_type"].as_str() {
+                            Some("inbox_receipts") => Some(json!({"one_shot_receipts":1})),
+                            Some("inbox_committed") => Some(json!({})),
+                            Some("inbox_receipt_fetch") => Some(json!({"messages":[]})),
+                            _ => None,
+                        };
+                        requests.lock().unwrap().push(request);
+                        let Some(answer) = answer else { continue };
+                        let (stopped, _) = stop
+                            .1
+                            .wait_timeout_while(stop.0.lock().unwrap(), delay, |stopped| !*stopped)
+                            .unwrap();
+                        if *stopped || writeln!(writer, "{answer}").is_err() {
+                            break;
+                        }
+                    }
+                }));
+            }
+            for connection in connections {
+                let _ = connection.join();
+            }
+        })
+    };
+    let prompt = json!({"session_id":"slow-deck", "hook_event_name":"UserPromptSubmit",
+        "prompt":format!("[dot-agent-deck message {id} delivery 1.1 from the orchestrator]\nbody\n[end of dot-agent-deck message {id}]\n dot-agent-deck: message {rung} waiting, run: dot-agent-deck inbox fetch"),
+        "cwd":daemon.home})
+    .to_string();
+    let started = Instant::now();
+    let child = BoundedChild::start(
+        cli(&daemon, Some(&pane), &["hook", "--agent", "claude-code"])
+            .env("DOT_AGENT_DECK_SOCKET", &path)
+            .env(
+                "DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS",
+                budget.as_millis().to_string(),
+            ),
+        prompt.as_bytes(),
+    );
+    assert!(common::wait_until(WAIT, || child.finished()));
+    let took = started.elapsed();
+    let output = child.output();
+    *stop.0.lock().unwrap() = true;
+    stop.1.notify_all();
+    let _ = UnixStream::connect(&path);
+    deck.join().unwrap();
+    // The slack for a loaded box to start the hook and schedule it late.
+    let tolerance = Duration::from_secs(2);
+    assert!(
+        took < budget + tolerance,
+        "the prompt hook took {took:?}, past one shared {budget:?}: {output:?}"
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let requests = requests.lock().unwrap();
+    let verbs: Vec<&str> = requests
+        .iter()
+        .filter_map(|r| r["message_type"].as_str())
+        .filter(|verb| verb.starts_with("inbox_"))
+        .collect();
+    assert_eq!(
+        verbs,
+        ["inbox_receipts", "inbox_committed"],
+        "the commit asks first and is written; the fetch asks nothing: {requests:?}"
+    );
+}

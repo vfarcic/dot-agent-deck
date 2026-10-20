@@ -276,7 +276,9 @@ fn parent_of(_pid: u32) -> Option<u32> {
 /// With `question`, it first asks the deck whether it serves receipts, and
 /// sends `json` only on a deck that says so; one that does not is sent
 /// nothing that could take mail, and the waiter says so and exits 1
-/// ([`crate::inbox_oneshot::Connection::open_receipts`]). Without it, it is
+/// ([`crate::inbox_oneshot::Connection::open_receipts`]). A socket this user
+/// may not use is asked nothing, and the waiter says that and exits 1
+/// ([`crate::inbox_oneshot::RECEIPTS_FOREIGN_SOCKET`]). Without it, it is
 /// a stand-in for an older waiter and sends `json` unasked.
 #[cfg(unix)]
 fn wait_once(json: &str, question: Option<&str>) -> ExitCode {
@@ -296,6 +298,10 @@ fn wait_once(json: &str, question: Option<&str>) -> ExitCode {
             }
             Opened::Unsupported => {
                 crate::inbox_oneshot::report_unsupported();
+                return ExitCode::FAILURE;
+            }
+            Opened::Foreign => {
+                crate::inbox_oneshot::report_foreign_socket();
                 return ExitCode::FAILURE;
             }
             Opened::Refused(_) | Opened::Unreachable => return ExitCode::SUCCESS,

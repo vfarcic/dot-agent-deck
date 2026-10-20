@@ -304,11 +304,35 @@ impl std::fmt::Debug for OneShotInjection {
     }
 }
 
-/// The budget of Claude's prompt hook's fetch once the deck has said it
-/// serves receipts: writing the fetch and reading its answer, as
-/// [`crate::hook::request_from_socket`] waits.
+/// The budget of a legacy prompt hook's fetch, one that declares no
+/// integration ([`crate::inbox_oneshot::declared_hook_integration`]): writing
+/// the fetch and reading its answer, as [`crate::hook::request_from_socket`]
+/// waits. A hook on receipts fetches within [`prompt_receipts_wait`] instead.
 #[cfg(unix)]
 const HOOK_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// R3a-fix2 (A03): the one socket-wait budget Claude's prompt hook shares
+/// between all its receipt work — the commit's question and exchange
+/// ([`commit_attempts_by`]) and the doorbell fetch's question and reply
+/// ([`one_shot_injection`]) — counted from one absolute deadline set when the
+/// prompt arrives. It is one [`crate::inbox_oneshot::RECEIPTS_ANSWER_WAIT`]
+/// (5 s), the same as one question's budget: an older daemon, which answers
+/// nothing, already costs a prompt that one budget (its commit's question,
+/// after which the fetch asks nothing), so a slow daemon that does serve
+/// receipts now costs a prompt about what an older one does, instead of four
+/// budgets one after another (about 20 s), while a deck that answers at all
+/// promptly needs a small part of it. Each phase still asks on its own
+/// connection and goes on only on that connection's answer; a phase reached
+/// with the budget spent asks nothing, and its mail stays queued for the next
+/// receiver. The `UserPromptSubmit` hook blocks the user's prompt for as long
+/// as it runs, which is why this is shared rather than per phase. The
+/// waiter's wait for a batch after it registers is not part of it. Like the
+/// question's budget, it bounds socket waits cooperatively, not the hook:
+/// path resolution inside `connect(2)`, the commit's spool IO and the hook's
+/// own work and status event are outside it.
+pub fn prompt_receipts_wait() -> std::time::Duration {
+    crate::inbox_oneshot::receipts_answer_wait()
+}
 
 /// Part 2 §1.2: fetch what is waiting for this pane's agent, for the doorbell
 /// that named `rung`, within `budget` including `framing`, as a one-shot
@@ -316,19 +340,19 @@ const HOOK_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// deck refuses or does not answer, or when nothing is waiting.
 ///
 /// It asks first whether the deck serves receipts, and fetches only from one
-/// that says so, on that same connection; one that does not is sent nothing
-/// that could take mail, and the hook says so
-/// ([`crate::inbox_oneshot::report_unsupported`]). A hook whose commit
-/// already found the deck not saying so does not ask again: the answer that
-/// keeps mail back is shared within the hook, the one that lets it through
-/// never is. A hook that declares no integration stands in for an older one
-/// and fetches unasked, on the legacy verb.
+/// that says so, on that same connection, all by `receipts_by`
+/// ([`fetch_with_receipts`]). A hook whose commit already found the deck not
+/// saying so, or its socket one this user may not use, does not ask again:
+/// the answer that keeps mail back is shared within the hook, the one that
+/// lets it through never is. A hook that declares no integration stands in
+/// for an older one and fetches unasked, on the legacy verb.
 #[cfg(unix)]
 pub fn one_shot_injection(
     budget: InboxBudget,
     framing: &str,
     rung: &str,
     hook_event_name: &str,
+    receipts_by: std::time::Instant,
 ) -> Option<OneShotInjection> {
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID)
         .ok()
@@ -348,39 +372,16 @@ pub fn one_shot_injection(
     );
     request.hook_integration = crate::inbox_oneshot::declared_hook_integration();
     let path = crate::endpoint_resolve::client_socket_path();
-    let (mut connection, deadline) = if request.hook_integration.is_some() {
-        use crate::inbox_oneshot::{Connection, Opened};
-        if crate::inbox_oneshot::reported_unsupported() {
+    let (connection, reply) = if request.hook_integration.is_some() {
+        if crate::inbox_oneshot::reported_refusal() {
             return None;
         }
-        let question = crate::inbox_oneshot::receipts_question(
-            &request.pane_id,
-            request.agent_id.as_deref(),
-            request.token.as_deref().unwrap_or_default(),
-        )?;
-        let json = serde_json::to_string(&DaemonMessage::InboxReceiptFetch(request)).ok()?;
-        match Connection::open_receipts(&path, &question) {
-            Opened::Ready(mut connection) => {
-                let deadline = std::time::Instant::now() + HOOK_FETCH_WAIT;
-                connection.send(&json, deadline).ok()?;
-                (connection, deadline)
-            }
-            Opened::Unsupported => {
-                crate::inbox_oneshot::report_unsupported();
-                return None;
-            }
-            Opened::Refused(_) | Opened::Unreachable => return None,
-        }
+        fetch_with_receipts(&path, request, receipts_by)?
     } else {
         let json = serde_json::to_string(&DaemonMessage::InboxFetch(request)).ok()?;
-        let connection = crate::inbox_oneshot::Connection::open(&path, &json).ok()?;
-        (connection, std::time::Instant::now() + HOOK_FETCH_WAIT)
-    };
-    let reply = loop {
-        let reply = connection.next(Some(deadline))?;
-        if !reply.keepalive {
-            break reply;
-        }
+        let mut connection = crate::inbox_oneshot::Connection::open(&path, &json).ok()?;
+        let reply = first_reply(&mut connection, std::time::Instant::now() + HOOK_FETCH_WAIT)?;
+        (connection, reply)
     };
     let grant_ttl = reply
         .registered
@@ -401,6 +402,62 @@ pub fn one_shot_injection(
         framing: framing.to_string(),
         hook_event_name: hook_event_name.to_string(),
     })
+}
+
+/// The doorbell fetch `request` on the receipt verb at the deck at `path`:
+/// ask whether it serves receipts, and only on that connection's own yes send
+/// the fetch on it and wait for its reply, every socket wait of the three by
+/// `receipts_by` ([`prompt_receipts_wait`]). The connection and the reply, or
+/// `None`. Reached with the budget spent it asks nothing. A deck that does not
+/// confirm is sent nothing that could take mail, and the hook says so
+/// ([`crate::inbox_oneshot::report_unsupported`]); a socket this user may not
+/// use is asked nothing, and the hook says that
+/// ([`crate::inbox_oneshot::report_foreign_socket`]).
+#[cfg(unix)]
+pub fn fetch_with_receipts(
+    path: &std::path::Path,
+    request: InboxFetchRequest,
+    receipts_by: std::time::Instant,
+) -> Option<(crate::inbox_oneshot::Connection, InboxWaitReply)> {
+    use crate::inbox_oneshot::{Connection, Opened};
+    if receipts_by <= std::time::Instant::now() {
+        return None;
+    }
+    let question = crate::inbox_oneshot::receipts_question(
+        &request.pane_id,
+        request.agent_id.as_deref(),
+        request.token.as_deref().unwrap_or_default(),
+    )?;
+    let json = serde_json::to_string(&DaemonMessage::InboxReceiptFetch(request)).ok()?;
+    let mut connection = match Connection::open_receipts_by(path, &question, receipts_by) {
+        Opened::Ready(connection) => connection,
+        Opened::Unsupported => {
+            crate::inbox_oneshot::report_unsupported();
+            return None;
+        }
+        Opened::Foreign => {
+            crate::inbox_oneshot::report_foreign_socket();
+            return None;
+        }
+        Opened::Refused(_) | Opened::Unreachable => return None,
+    };
+    connection.send(&json, receipts_by).ok()?;
+    let reply = first_reply(&mut connection, receipts_by)?;
+    Some((connection, reply))
+}
+
+/// The first reply on `connection` that is not a keepalive, by `deadline`.
+#[cfg(unix)]
+fn first_reply(
+    connection: &mut crate::inbox_oneshot::Connection,
+    deadline: std::time::Instant,
+) -> Option<InboxWaitReply> {
+    loop {
+        let reply = connection.next(Some(deadline))?;
+        if !reply.keepalive {
+            return Some(reply);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -501,9 +558,10 @@ pub fn hook_output_parts(
 
 /// Part 2 §1.3: commit the exact attempts whose blocks `prompt` carries whole
 /// at its top level ([`delivered`]) — Claude submitted a once-waiter's
-/// notification — for this pane's agent ([`commit_attempts`]). Outside a deck
-/// pane or without a token nothing is sent.
-pub fn commit_delivered(prompt: &str) {
+/// notification — for this pane's agent ([`commit_attempts_by`]), within the
+/// prompt's shared receipts budget, `receipts_by` ([`prompt_receipts_wait`]).
+/// Outside a deck pane or without a token nothing is sent.
+pub fn commit_delivered(prompt: &str, receipts_by: std::time::Instant) {
     let attempts = delivered(prompt);
     if attempts.is_empty() {
         return;
@@ -521,7 +579,7 @@ pub fn commit_delivered(prompt: &str) {
         .ok()
         .filter(|agent| !agent.is_empty());
     #[cfg(unix)]
-    if commit_attempts(
+    match commit_attempts_by(
         &crate::endpoint_resolve::client_socket_path(),
         CommitFor {
             pane_id: &pane_id,
@@ -530,15 +588,16 @@ pub fn commit_delivered(prompt: &str) {
         },
         attempts,
         &pinned_spool(),
-        crate::inbox_oneshot::receipts_answer_wait(),
-    ) == Committed::Withheld
-    {
-        crate::inbox_oneshot::report_unsupported();
+        receipts_by,
+    ) {
+        Committed::Withheld => crate::inbox_oneshot::report_unsupported(),
+        Committed::Foreign => crate::inbox_oneshot::report_foreign_socket(),
+        Committed::Nothing | Committed::Refused | Committed::Sent => {}
     }
     // The one-shot receipt protocol is Unix only: no one-shot there wrote
     // a block for a prompt to carry.
     #[cfg(not(unix))]
-    let _ = (pane_id, agent_id, token);
+    let _ = (pane_id, agent_id, token, receipts_by);
 }
 
 /// Whom [`commit_attempts`] commits for.
@@ -559,6 +618,10 @@ pub enum Committed {
     Withheld,
     /// The deck refused the question, or there was none to ask.
     Refused,
+    /// The deck's socket is one this user may not use
+    /// ([`crate::inbox_oneshot::Opened::Foreign`]): nothing was asked, no
+    /// receipt published and no `inbox_committed` sent.
+    Foreign,
     /// The commits were sent.
     Sent,
 }
@@ -577,17 +640,7 @@ pub enum Committed {
 /// written no caps file for any attempt, so the exact attempts are named with
 /// that said, and the authenticated connection is the witness.
 ///
-/// It takes two budgets of `wait`, one after the other: the question (connect,
-/// write, answer; [`crate::inbox_oneshot::Connection::open_receipts_within`]),
-/// and from its answer the commit (the receipts, the `inbox_committed` line
-/// and the deck's reply). No `inbox_committed` is written once the second has
-/// run out. So the prompt hook spends at most `wait` against a deck that
-/// does not answer and two against a slow one that does; with a doorbell in
-/// the same prompt its fetch adds a question and
-/// [`HOOK_FETCH_WAIT`] against a deck that serves receipts, and nothing
-/// against one this found not to ([`one_shot_injection`]). At the production
-/// five seconds each, that is at most about 5 s against an older daemon and
-/// 20 s against a slow newer one, before the hook's own work and status event.
+/// [`commit_attempts_by`] with a budget of `wait` from now.
 #[cfg(unix)]
 pub fn commit_attempts(
     socket: &std::path::Path,
@@ -595,6 +648,33 @@ pub fn commit_attempts(
     attempts: Vec<crate::event::InboxAttemptRef>,
     pinned: &crate::inbox_oneshot::Pinned,
     wait: std::time::Duration,
+) -> Committed {
+    commit_attempts_by(
+        socket,
+        who,
+        attempts,
+        pinned,
+        std::time::Instant::now() + wait,
+    )
+}
+
+/// [`commit_attempts`]'s socket waits — the question (connect, write, answer;
+/// [`crate::inbox_oneshot::Connection::open_receipts_by`]), the
+/// `inbox_committed` write and the wait for the deck's reply — all share the
+/// one `deadline`, which for the prompt hook is the prompt's shared receipts
+/// budget ([`prompt_receipts_wait`]). No `inbox_committed` is written once it
+/// has passed. The spool work between the answer and that write (reading caps
+/// files, publishing receipts) is synchronous file IO the deadline does not
+/// interrupt: a stalled spool can run past it and publish its receipts late,
+/// which is valid evidence, and the line that would tell the deck is then not
+/// sent.
+#[cfg(unix)]
+pub fn commit_attempts_by(
+    socket: &std::path::Path,
+    who: CommitFor<'_>,
+    attempts: Vec<crate::event::InboxAttemptRef>,
+    pinned: &crate::inbox_oneshot::Pinned,
+    deadline: std::time::Instant,
 ) -> Committed {
     use crate::inbox_oneshot::{Connection, Opened, Pinned};
     use crate::inbox_receipt::{CapsLookup, RecordKey, RecordStage};
@@ -606,12 +686,12 @@ pub fn commit_attempts(
     else {
         return Committed::Refused;
     };
-    let mut connection = match Connection::open_receipts_within(socket, &question, wait) {
+    let mut connection = match Connection::open_receipts_by(socket, &question, deadline) {
         Opened::Ready(connection) => connection,
         Opened::Unsupported => return Committed::Withheld,
+        Opened::Foreign => return Committed::Foreign,
         Opened::Refused(_) | Opened::Unreachable => return Committed::Refused,
     };
-    let deadline = std::time::Instant::now() + wait;
     let (committed, degraded) = match pinned {
         Pinned::Unpinned => (attempts, Some("the deck has no receipt spool".to_string())),
         Pinned::Failed(error) => (Vec::new(), Some(error.clone())),
@@ -1241,7 +1321,7 @@ mod tests {
 
     /// Scenario: A stand-in deck answers a prompt's receipts question that it
     /// serves receipts, then reads nothing, and the commit is too large for the
-    /// socket to buffer: the commit is given up within two waits plus two
+    /// socket to buffer: the commit is given up within its one wait plus two
     /// seconds. Another reads the commit and never replies: the commit counts
     /// as sent within the same bound.
     #[cfg(unix)]
@@ -1297,7 +1377,7 @@ mod tests {
             commit_attempts(&path, who, many, &Pinned::Unpinned, wait)
         })
         .expect("the commit is still blocked writing");
-        assert!(took < 2 * wait + TOLERANCE, "the commit took {took:?}");
+        assert!(took < wait + TOLERANCE, "the commit took {took:?}");
         assert_eq!(committed, Committed::Nothing);
         let (got, _, _) = deaf.join().unwrap();
         assert_eq!(got.len(), 1, "only the question was read: {got:?}");
@@ -1312,10 +1392,144 @@ mod tests {
             commit_attempts(&path, who, vec![attempt], &Pinned::Unpinned, wait)
         })
         .expect("the commit is still waiting for a reply");
-        assert!(took < 2 * wait + TOLERANCE, "the commit took {took:?}");
+        assert!(took < wait + TOLERANCE, "the commit took {took:?}");
         assert_eq!(committed, Committed::Sent);
         let (got, _, _) = silent.join().unwrap();
         let sent: serde_json::Value = serde_json::from_str(&got[1]).unwrap();
         assert_eq!(sent["message_type"], "inbox_committed");
+    }
+
+    /// Scenario: One prompt both commits a waiter's block and fetches for a
+    /// doorbell, sharing one receipts deadline, at a stand-in deck that
+    /// serves receipts and waits `delay` before each of its answers. A prompt
+    /// deck answering at once gets both done, each on its own connection that
+    /// is asked first; a slow one, whose every answer comes just inside a
+    /// budget, has the whole phase done within the one shared wait plus two
+    /// seconds, where four budgets one after another would take four delays.
+    #[cfg(unix)]
+    #[spec("inbox/claude/040")]
+    #[test]
+    fn claude_040_a_prompts_receipt_work_shares_one_deadline() {
+        use std::io::{BufRead, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        use crate::inbox_oneshot::Pinned;
+        use crate::inbox_oneshot::tests::{TOLERANCE, timed};
+        let who = CommitFor {
+            pane_id: "2",
+            agent_id: Some("agent-a"),
+            token: "token-1",
+        };
+        let fetch = || {
+            hand_over_request(
+                InboxFetchConsumer::DoorbellHook,
+                crate::event::InboxComponent::ClaudeHooks.inline_budget(),
+                "framing",
+                Some(ID),
+                "2".to_string(),
+                Some("agent-a".to_string()),
+                "token-1".to_string(),
+            )
+        };
+        // A deck serving every connection until stopped: it waits `delay`,
+        // says it serves receipts, reads the request, waits `delay` and
+        // answers it. Joined, it gives each connection's lines in order.
+        let deck = |name: &str, delay: Duration| {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let path = dir.path().join(name);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = Arc::clone(&stop);
+            let serve = std::thread::spawn(move || {
+                let mut connections = Vec::new();
+                while !stopped.load(Ordering::SeqCst) {
+                    let Ok((socket, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    socket.set_nonblocking(false).unwrap();
+                    connections.push(std::thread::spawn(move || {
+                        let mut writer = socket.try_clone().unwrap();
+                        let mut lines = std::io::BufReader::new(socket).lines();
+                        let mut got = Vec::new();
+                        for answer in [r#"{"one_shot_receipts":1}"#, r#"{"messages":[]}"#] {
+                            let Some(Ok(line)) = lines.next() else { break };
+                            got.push(line);
+                            std::thread::sleep(delay);
+                            if writeln!(writer, "{answer}").is_err() {
+                                break;
+                            }
+                        }
+                        got
+                    }));
+                }
+                connections
+                    .into_iter()
+                    .map(|connection| connection.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            (dir, path, stop, serve)
+        };
+        let verbs = |lines: &[String]| {
+            lines
+                .iter()
+                .map(|line| {
+                    let line: serde_json::Value = serde_json::from_str(line).unwrap();
+                    line["message_type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let attempt = || crate::event::InboxAttemptRef {
+            id: ID.to_string(),
+            a: 1,
+            e: 1,
+        };
+        let wait = Duration::from_millis(1500);
+
+        let (_dir, path, stop, prompt) = deck("prompt.sock", Duration::ZERO);
+        let receipts_by = Instant::now() + wait;
+        let committed =
+            commit_attempts_by(&path, who, vec![attempt()], &Pinned::Unpinned, receipts_by);
+        let fetched = fetch_with_receipts(&path, fetch(), receipts_by);
+        assert_eq!(committed, Committed::Sent);
+        assert!(fetched.is_some(), "the fetch was answered");
+        drop(fetched);
+        stop.store(true, Ordering::SeqCst);
+        let seen = prompt.join().unwrap();
+        assert_eq!(
+            seen.iter().map(|lines| verbs(lines)).collect::<Vec<_>>(),
+            [
+                ["inbox_receipts", "inbox_committed"],
+                ["inbox_receipts", "inbox_receipt_fetch"],
+            ],
+            "each phase asks on its own connection, first"
+        );
+
+        // Each answer inside a budget of its own; two of them past the
+        // shared one.
+        let delay = Duration::from_millis(1300);
+        let (_dir, path, stop, slow) = deck("slow.sock", delay);
+        let (took, (committed, fetched)) = timed(4 * delay, move || {
+            let receipts_by = Instant::now() + wait;
+            let committed =
+                commit_attempts_by(&path, who, vec![attempt()], &Pinned::Unpinned, receipts_by);
+            let fetched = fetch_with_receipts(&path, fetch(), receipts_by).is_some();
+            (committed, fetched)
+        })
+        .expect("the prompt's receipt work is still waiting");
+        assert!(
+            took < wait + TOLERANCE,
+            "the prompt's receipt work took {took:?}, past one shared {wait:?}"
+        );
+        assert_eq!(committed, Committed::Sent, "the commit was written in time");
+        assert!(!fetched, "the fetch, with the budget spent, takes nothing");
+        stop.store(true, Ordering::SeqCst);
+        drop(slow.join());
     }
 }
