@@ -70,8 +70,11 @@ export function SelfUpgradeDialog({ check, api, copies, then, onClose, copyText 
   const shownResults = plans.flatMap((plan) => results[plan.copy] ?? []);
   const relaunch = shownResults.some((result) => result.relaunch);
   const anyRun = shownResults.length > 0;
-  /* Closed once something ran, or with nothing left to ask; before that, a close changes nothing. */
-  const close = () => onClose(anyRun || phase === "done" ? { installed: shownResults.some((result) => result.installed) } : undefined);
+  /* Closed once something ran, or with Close at the end; before anything
+     ran, Cancel, Escape and a click outside close it having changed nothing —
+     also over a plan that offers only Close (Qodo, PR #1769). */
+  const finished = (): SelfUpgradeClosed => ({ installed: shownResults.some((result) => result.installed) });
+  const close = () => onClose(finished());
   /* Fence the rest of the window while it is open (Greptile, PR #1769): a
      rail button reached with Tab would otherwise switch screens and unmount
      this dialog mid-upgrade, losing its result and any command to run. */
@@ -92,7 +95,7 @@ export function SelfUpgradeDialog({ check, api, copies, then, onClose, copyText 
      upgrade it passes on this copy and moves to the next, or to the end. */
   const cancel = (plan: SelfUpgradePlan) => (anyRun ? setDone((current) => [...current, plan.copy]) : onClose());
   const dismiss = () => {
-    if (!running) close();
+    if (!running) onClose(anyRun ? finished() : undefined);
   };
   const doRelaunch = () => {
     setRelaunchError(undefined);

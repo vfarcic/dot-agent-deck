@@ -276,6 +276,21 @@ describe("Upgrade on the Local daemon section (issue #1753)", () => {
     expect(deck.upgradeDaemon).not.toHaveBeenCalled();
   });
 
+  /** Scenario: Both are behind and the CLI cannot be upgraded from the app (Nix), so its dialog offers only Close: Escape, or a click outside, ends the whole Upgrade rather than going on to the daemon's question. */
+  it("local_upgrade_007 Escape on a CLI plan with only Close ends the whole upgrade", () => {
+    const deck = runtime(olderLocal());
+    const nix: SelfUpgradePlan = { ...cliPlan, action: "notify-only", actionable: false, confirmQuestion: null, lines: [cliPlan.lines[0], { text: "Installed with Nix (/nix/store/abc/bin/dot-agent-deck), so it is not changed from here.", command: null }] };
+    render(<AgentOverview runtime={deck} onNavigate={vi.fn()} selfUpgrade={{ check: check(nix), api: selfApi() }} />);
+    fireEvent.click(within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade"));
+    fireEvent.keyDown(screen.getByTestId("self-upgrade-dialog"), { key: "Escape" });
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+
+    fireEvent.click(within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade"));
+    fireEvent.mouseDown(document.querySelector(".dialog-backdrop")!);
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+  });
+
   /** Scenario: Both are behind and the CLI's folder is not writable, so Upgrade only downloads and checks it, showing the command to install it: closing that result leads to the daemon's Upgrade asking first, never restarting the daemon on its own while the CLI is still the old one. */
   it("local_upgrade_006 asks before the daemon restart after a CLI that was only downloaded", async () => {
     const deck = runtime(olderLocal());
