@@ -415,7 +415,8 @@ impl EndpointMatrix {
     /// directions — in reverse the daemon is a branch build, in forward it is
     /// the previous release (v0.41.0 and older bind the flat pair; #1121 and
     /// #1211 landed together in #1179, first released in v0.41.1; #1213 then
-    /// removed the alias).
+    /// removed the alias, so a build containing #1213 binds the per-uid pair
+    /// alone, and the aliased candidates below are for the daemons before it).
     ///
     /// #1211's alias is best-effort per address (the releases that bind it skip
     /// a hook or attach alias they cannot clear, and both when their lock is

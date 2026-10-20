@@ -249,7 +249,7 @@ DOT_AGENT_DECK_LOG=1 dot-agent-deck           # the new TUI starts a new daemon 
 
 `<temp dir>` is `$TMPDIR` when set, else `/tmp`; on macOS `$TMPDIR` is normally a per-user directory under `/var/folders`. The deck creates `dot-agent-deck-<uid>` with mode `0700`. If another user already owns a directory of that name, the daemon uses a sibling named `dot-agent-deck-<uid>.` followed by 16 random hex digits instead, and clients find it without configuration. On Windows the endpoints are the named pipes `\\.\pipe\dot-agent-deck-<user>-hook` and `\\.\pipe\dot-agent-deck-<user>-attach`.
 
-To see where the running daemon is listening, run `dot-agent-deck daemon endpoint`; it prints the attach endpoint only when a live daemon answered there. When you set either socket variable, set it to the same value for every process that should reach the same daemon, and pick a directory only you can write to.
+To see where the running daemon is listening, run `dot-agent-deck daemon endpoint`; it prints the attach endpoint only when a live daemon answered there. When you set either socket variable, set it to the same value for every process that should reach the same daemon, and pick a directory only you can write to. Without them, every such process also needs the same `XDG_RUNTIME_DIR` and `TMPDIR`: a process with a different value looks for a different socket and does not find the running daemon, and a TUI started that way starts a daemon of its own.
 
 ### Logging
 
