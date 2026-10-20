@@ -72,7 +72,8 @@ use crate::settings::{
 
 use super::Transcript;
 use super::capture::{MIN_SPEECH, Pcm16, SPEECH_WINDOW, SpeechMeasure};
-use super::human_voice::{self, MIN_VOICE, VoiceMeasure};
+use super::evidence::{self, Timed, Timing};
+use super::human_voice::{self, MIN_VOICE, VoiceMeasure, VoiceTimeline};
 
 /// How long the request gets before the attempt is abandoned.
 ///
@@ -157,7 +158,7 @@ fn not_enough_speech(measure: SpeechMeasure) -> (String, String) {
 
 /// The detail for a segment that rose out of the room but held no voice
 /// ([`human_voice`]): a breath, a cough, a knock, a beep — issue #1450.
-fn no_voice(measure: VoiceMeasure) -> String {
+fn no_voice(measure: &VoiceMeasure) -> String {
     format!(
         "no voice — {} ms of the segment scored as voice, where {} ms is needed (the highest \
          score was {:.2})",
@@ -167,25 +168,27 @@ fn no_voice(measure: VoiceMeasure) -> String {
     )
 }
 
-/// Whether `audio` is worth sending to any backend, and if not, the detail and
-/// the sentence its refusal carries.
+/// Whether `audio` is worth sending to any backend: where its voice is when it
+/// is, and the detail and the sentence its refusal carries when it is not.
 ///
 /// Two questions, cheapest first: did enough of it rise out of the room to be
 /// a word ([`MIN_SPEECH`]), and is what rose a human voice ([`human_voice`]).
+/// The voice's [`VoiceTimeline`] is what the backend's answer is held against
+/// afterwards ([`super::evidence`]).
 ///
 /// CPU-bound — the voice check runs a model over every 16 ms of the segment,
 /// up to [`super::capture::MAX_UTTERANCE`] of it — so [`handle_audio`] runs it
 /// on a blocking worker rather than on the async runtime (Qodo on PR #1550).
-fn ineligible(audio: &Pcm16) -> Option<(String, String)> {
+fn eligibility(audio: &Pcm16) -> Result<VoiceTimeline, (String, String)> {
     let measure = audio.measure_speech();
     if measure.voiced < MIN_SPEECH {
-        return Some(not_enough_speech(measure));
+        return Err(not_enough_speech(measure));
     }
     let voice = human_voice::measure(audio);
     if !voice.heard() {
-        return Some((no_voice(voice), NOTHING_HEARD.into()));
+        return Err((no_voice(&voice), NOTHING_HEARD.into()));
     }
-    None
+    Ok(voice.timeline)
 }
 
 /// `Heard “<transcript>”.` — with no full stop of its own after a transcript
@@ -240,7 +243,34 @@ impl std::error::Error for TranscriptionError {}
 /// from settings at runtime, so the trait has to be object-safe, and an
 /// `async fn` in a trait is not.
 pub type TranscribeFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Transcript, TranscriptionError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Transcription, TranscriptionError>> + Send + 'a>>;
+
+/// What a backend answered: the text, and when in the audio it says the text
+/// was spoken, as far as it said ([`Timing`]) — which [`handle_audio`] holds
+/// against the segment's voice before the text is accepted
+/// ([`super::evidence`], issue #1450).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transcription {
+    pub transcript: Transcript,
+    pub timing: Timing,
+}
+
+impl Transcription {
+    /// The text, verbatim.
+    pub fn text(&self) -> &str {
+        self.transcript.text()
+    }
+}
+
+impl From<Transcript> for Transcription {
+    /// Text with no timing, the way a backend that reports none answers.
+    fn from(transcript: Transcript) -> Self {
+        Self {
+            transcript,
+            timing: Timing::default(),
+        }
+    }
+}
 
 /// A backend that turns audio into text.
 pub trait Transcriber: Send + Sync {
@@ -392,7 +422,7 @@ impl HttpTranscriber {
         }
     }
 
-    async fn run(&self, audio: &Pcm16) -> Result<Transcript, TranscriptionError> {
+    async fn run(&self, audio: &Pcm16) -> Result<Transcription, TranscriptionError> {
         // A buffer with nothing said in it cannot produce words, and sending one
         // costs a round trip, a fraction of a cent, and — with a whisper-family
         // model — a training artefact presented to the user as a sentence they
@@ -406,11 +436,12 @@ impl HttpTranscriber {
         // setup is fine, which is a different thing to do next.
         //
         // **The cheap half only.** [`handle_audio`]'s second question, whether
-        // the audio holds a voice ([`ineligible`]), runs a model over the
+        // the audio holds a voice ([`eligibility`]), runs a model over the
         // whole segment; asking it again here would score every utterance the
         // app sends twice (Qodo on PR #1550). [`handle_audio`] is the one
         // entry point this app transcribes through, so the voice check is
-        // there and only there.
+        // there and only there — and so is the check of the answer against
+        // that voice ([`super::evidence`]), which needs its measurement.
         let measure = audio.measure_speech();
         if measure.voiced < MIN_SPEECH {
             return Err(TranscriptionError::Backend(not_enough_speech(measure).0));
@@ -586,8 +617,9 @@ pub fn content_type(boundary: &str) -> String {
 /// rather than a setting for now; making it one is issue #1458.
 pub const TRANSCRIPTION_LANGUAGE: &str = "en";
 
-/// The whole request body: the WAV, the model, the response format and the
-/// language, and nothing else.
+/// The whole request body: the WAV, the model, the response format, the
+/// language and — where the format carries timing — which timing to send back,
+/// and nothing else.
 ///
 /// **Assembled by hand rather than through `reqwest`'s `multipart` feature**,
 /// and that is a dependency decision rather than a preference. Turning the
@@ -620,6 +652,22 @@ pub fn multipart_body(audio: &Pcm16, model: &str, boundary: &str) -> Vec<u8> {
     part(response_format_for(model));
     part("\r\n");
 
+    // When each word and each segment was spoken, which [`super::evidence`]
+    // holds against the voice in the audio (issue #1450). Both are named, so
+    // a server that returns only the timing it is asked for still sends the
+    // segments the per-segment no-speech guard reads. Only with
+    // `verbose_json`: no other format carries timing, and OpenAI's API
+    // reference requires it for the field. Measured 2026-10-20 on the local
+    // container: the word timing cost 3-10% of a request's time.
+    if response_format_for(model) == "verbose_json" {
+        for granularity in TIMESTAMP_GRANULARITIES {
+            part(&format!("--{boundary}\r\n"));
+            part("content-disposition: form-data; name=\"timestamp_granularities[]\"\r\n\r\n");
+            part(granularity);
+            part("\r\n");
+        }
+    }
+
     // Named rather than detected: with no `language`, Whisper-family models
     // guess it per utterance, and a short command in an accent is what they
     // guess wrong — "Select the directory …" spoken with a Serbian accent came
@@ -644,6 +692,10 @@ pub fn multipart_body(audio: &Pcm16, model: &str, boundary: &str) -> Vec<u8> {
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     body
 }
+
+/// The timing a `verbose_json` request asks for, in OpenAI's
+/// `timestamp_granularities[]` vocabulary, which the local container shares.
+pub const TIMESTAMP_GRANULARITIES: [&str; 2] = ["word", "segment"];
 
 /// The `response_format` a request asks `model` for.
 ///
@@ -725,21 +777,34 @@ pub const LOW_CONFIDENCE: f64 = -1.0;
 /// every non-speech reply with a confident-looking `avg_logprob` (0.918).
 pub const CERTAIN_NO_SPEECH: f64 = 0.85;
 
-/// The transcript, out of the reply.
+/// The transcript, out of the reply, with the timing the reply gave for it.
 ///
 /// A whisper-family `verbose_json` reply also carries `segments`, each with
 /// the model's `no_speech_prob` and `avg_logprob`. Segments [`NO_SPEECH_LIMIT`]
 /// marks as no-speech are dropped; when none is, `text` is taken verbatim, so speech reaches the
 /// pipeline exactly as before. A reply with no `segments` — plain `json`, or a
 /// server that ignored the format — is read from `text` alone.
-pub fn parse_response(payload: &Value) -> Result<Transcript, TranscriptionError> {
+///
+/// The [`Timing`] is the kept segments' `start` and `end`, and the `words`
+/// list [`multipart_body`] asks for — OpenAI's shape, a top-level list, or a
+/// list inside each segment — minus the words timed inside a dropped segment.
+/// A segment or word without both times is left out of it rather than
+/// guessed at; what a reply does not time, [`super::evidence`] holds to the
+/// segment's voice as a whole.
+pub fn parse_response(payload: &Value) -> Result<Transcription, TranscriptionError> {
     let Some(text) = payload["text"].as_str() else {
         return Err(TranscriptionError::Backend(
             "the transcription backend answered without a transcript".into(),
         ));
     };
     let Some(segments) = payload["segments"].as_array() else {
-        return Ok(Transcript::new(text.trim()));
+        return Ok(Transcription {
+            transcript: Transcript::new(text.trim()),
+            timing: Timing {
+                segments: Vec::new(),
+                words: timed_words(&payload["words"]),
+            },
+        });
     };
     let no_speech = |segment: &Value| {
         let probability = segment["no_speech_prob"].as_f64().unwrap_or(0.0);
@@ -749,21 +814,76 @@ pub fn parse_response(payload: &Value) -> Result<Transcript, TranscriptionError>
         probability > CERTAIN_NO_SPEECH
             || (probability > NO_SPEECH_LIMIT && confidence < LOW_CONFIDENCE)
     };
-    if !segments.iter().any(no_speech) {
-        return Ok(Transcript::new(text.trim()));
+    let (kept, dropped): (Vec<&Value>, Vec<&Value>) =
+        segments.iter().partition(|segment| !no_speech(segment));
+    let spans = |segments: &[&Value]| -> Vec<Timed> {
+        segments
+            .iter()
+            .filter_map(|segment| {
+                timed(
+                    segment,
+                    evidence::word_count(segment["text"].as_str().unwrap_or("")),
+                )
+            })
+            .collect()
+    };
+    let (kept_spans, dropped_spans) = (spans(&kept), spans(&dropped));
+    let mut words = timed_words(&payload["words"]);
+    if words.is_empty() {
+        words = kept
+            .iter()
+            .flat_map(|segment| timed_words(&segment["words"]))
+            .collect();
     }
-    let mut kept = String::new();
-    for piece in segments
-        .iter()
-        .filter(|segment| !no_speech(segment))
-        .filter_map(|segment| segment["text"].as_str())
-    {
-        if needs_separator(&kept, piece) {
-            kept.push(' ');
+    let within =
+        |spans: &[Timed], at: f64| spans.iter().any(|span| span.start <= at && at <= span.end);
+    words.retain(|word| {
+        let middle = (word.start + word.end) / 2.0;
+        within(&kept_spans, middle) || !within(&dropped_spans, middle)
+    });
+    let timing = Timing {
+        segments: kept_spans,
+        words,
+    };
+    if dropped.is_empty() {
+        return Ok(Transcription {
+            transcript: Transcript::new(text.trim()),
+            timing,
+        });
+    }
+    let mut joined = String::new();
+    for piece in kept.iter().filter_map(|segment| segment["text"].as_str()) {
+        if needs_separator(&joined, piece) {
+            joined.push(' ');
         }
-        kept.push_str(piece);
+        joined.push_str(piece);
     }
-    Ok(Transcript::new(kept.trim()))
+    Ok(Transcription {
+        transcript: Transcript::new(joined.trim()),
+        timing,
+    })
+}
+
+/// `item`'s `start` and `end` as a [`Timed`] of `words` words, or `None` when
+/// either time is missing.
+fn timed(item: &Value, words: usize) -> Option<Timed> {
+    Some(Timed {
+        start: item["start"].as_f64()?,
+        end: item["end"].as_f64()?,
+        words,
+    })
+}
+
+/// The timed words in a reply's `words` list, one [`Timed`] each. An entry
+/// that is only punctuation — whisper times a lone `.` as a word — is not a
+/// word anybody said, and is left out.
+fn timed_words(list: &Value) -> Vec<Timed> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|word| evidence::word_count(word["word"].as_str().unwrap_or("")) > 0)
+        .filter_map(|word| timed(word, 1))
+        .collect()
 }
 
 /// Whether two retained segments need a space between them once a dropped
@@ -828,13 +948,13 @@ fn transport_detail(error: &reqwest::Error) -> String {
 /// layer, the state machine and the rendered sentences are all asserted with no
 /// model, no credential, no microphone and no network hop.
 pub struct StubTranscriber {
-    answer: Result<Transcript, TranscriptionError>,
+    answer: Result<Transcription, TranscriptionError>,
 }
 
 impl StubTranscriber {
     pub fn hearing(text: impl Into<String>) -> Self {
         Self {
-            answer: Ok(Transcript::new(text)),
+            answer: Ok(Transcript::new(text).into()),
         }
     }
 
@@ -930,7 +1050,9 @@ pub enum TranscriptionOutcome {
     NotConfigured { detail: String, sentence: String },
     /// The segment held no speech: the audio gate refused it and no backend
     /// was called, or the backend's answer held no words once the segments
-    /// the model itself marked as no-speech were dropped ([`NO_SPEECH_LIMIT`]).
+    /// the model itself marked as no-speech were dropped ([`NO_SPEECH_LIMIT`]),
+    /// or its words were not in the audio — more than the segment's voice
+    /// could hold, or timed where there was none ([`super::evidence`]).
     ///
     /// **Not a failure either, and the distinction is the whole of the fix PRD
     /// #802's product owner asked for.** A noise ends a segment
@@ -1003,12 +1125,12 @@ pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> Voice
     // wrong on others, so the audio is judged before any of them is called.
     //
     // On a blocking worker, because the voice check is CPU work over the whole
-    // segment ([`ineligible`]). The copy is at most
+    // segment ([`eligibility`]). The copy is at most
     // [`super::capture::MAX_UTTERANCE`] of 16-bit audio, under a megabyte. A
     // worker that panics refuses the segment as a failure, never as silence:
     // "could not check" is not "nothing was said".
     let checked = audio.clone();
-    let verdict = match tokio::task::spawn_blocking(move || ineligible(&checked)).await {
+    let verdict = match tokio::task::spawn_blocking(move || eligibility(&checked)).await {
         Ok(verdict) => verdict,
         Err(error) => {
             // Logged the way this crate logs a blocking task that did not
@@ -1032,14 +1154,17 @@ pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> Voice
             };
         }
     };
-    if let Some((detail, sentence)) = verdict {
-        return VoiceTranscription {
-            outcome: TranscriptionOutcome::Silent { detail, sentence },
-            transcribe_ms: None,
-            backend,
-            audio_ms,
-        };
-    }
+    let voice = match verdict {
+        Ok(voice) => voice,
+        Err((detail, sentence)) => {
+            return VoiceTranscription {
+                outcome: TranscriptionOutcome::Silent { detail, sentence },
+                transcribe_ms: None,
+                backend,
+                audio_ms,
+            };
+        }
+    };
 
     let started = std::time::Instant::now();
     let answered = transcriber.transcribe(audio).await;
@@ -1051,14 +1176,28 @@ pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> Voice
         // ([`NO_SPEECH_LIMIT`]). That is the same situation as audio the gate
         // refused — nobody said anything — so it is the same outcome, and
         // nothing downstream sees it.
-        Ok(transcript) if !transcript.has_words() => TranscriptionOutcome::Silent {
+        Ok(answer) if !answer.transcript.has_words() => TranscriptionOutcome::Silent {
             detail: "the transcription held no words".into(),
             sentence: NOTHING_HEARD.into(),
         },
-        Ok(transcript) => TranscriptionOutcome::Heard {
-            sentence: heard_sentence(transcript.text()),
-            transcript,
-        },
+        // Words the audio cannot hold, or timed where there was no voice
+        // ([`super::evidence`], issue #1450): the backend invented them. The
+        // same outcome as a segment with nobody speaking in it, because that
+        // is what it was, and the text goes nowhere — not typed, not resolved
+        // into a command, not quoted in the detail.
+        Ok(answer) => {
+            match evidence::unsupported(evidence::word_count(answer.text()), &answer.timing, &voice)
+            {
+                Some(why) => TranscriptionOutcome::Silent {
+                    detail: format!("the transcription was not in the audio — {why}"),
+                    sentence: NOTHING_HEARD.into(),
+                },
+                None => TranscriptionOutcome::Heard {
+                    sentence: heard_sentence(answer.text()),
+                    transcript: answer.transcript,
+                },
+            }
+        }
         Err(TranscriptionError::NotConfigured(detail)) => {
             let detail = crate::dto::safe_message(detail);
             TranscriptionOutcome::NotConfigured {
@@ -1507,6 +1646,28 @@ mod tests {
         );
     }
 
+    /// Issue #1450: a `verbose_json` request asks for word and segment timing,
+    /// which the answer is held to; a `gpt-*` request, whose plain `json`
+    /// carries no timing, does not.
+    #[test]
+    fn voice_transcribe_request_asks_for_timing_only_where_the_format_carries_it() {
+        let rendered = text_of(&body(&audio(8)));
+        for granularity in ["word", "segment"] {
+            assert!(
+                rendered.contains(&format!(
+                    "name=\"timestamp_granularities[]\"\r\n\r\n{granularity}\r\n"
+                )),
+                "{rendered}"
+            );
+        }
+        let gpt = text_of(&multipart_body(
+            &audio(8),
+            "gpt-4o-transcribe",
+            "TESTBOUNDARY",
+        ));
+        assert!(!gpt.contains("timestamp_granularities"), "{gpt}");
+    }
+
     /// Reported 2026-10-01 while testing PR #1451: "Select the directory
     /// dot-agent-deck", spoken with a Serbian accent, came back as
     /// "Selectajte directory dot-agent-deck" — a Serbian imperative ending
@@ -1548,10 +1709,11 @@ mod tests {
         let rendered = text_of(&raw);
         assert!(rendered.starts_with("--TESTBOUNDARY\r\n"), "{rendered}");
         assert!(rendered.ends_with("\r\n--TESTBOUNDARY--\r\n"), "{rendered}");
-        // Four parts: model, response_format, language, file.
+        // Six parts: model, response_format, the two timestamp
+        // granularities, language, file.
         assert_eq!(
             rendered.matches("content-disposition: form-data").count(),
-            4
+            6
         );
 
         // CRLF everywhere — a bare LF is the mistake a hand-written encoder
@@ -1720,21 +1882,29 @@ mod tests {
     /// same sentence at a peak of 400 and of 250 against a room at 64 —
     /// scored a no-speech probability of 0.089 and 0.202 on whisper-1 and up
     /// to 0.377 on the local container's `faster-whisper-tiny.en`. All of it
-    /// is still heard, word for word.
+    /// is still heard, word for word. The audio is a dictated sentence, the
+    /// same words the reply carries, since issue #1450 holds a reply's words
+    /// to the voice in the segment.
     #[tokio::test]
     async fn voice_transcribe_quiet_real_speech_is_still_heard() {
+        let dictated = spoken(
+            include_bytes!("fixtures/speech/dictation-joe.pcm"),
+            800.0,
+            80.0,
+            3,
+        );
         for no_speech in [0.089, 0.202, 0.377] {
             let result = handle_audio(
                 &StubTranscriber::replying(&verbose(&[
-                    (" Please list the files in this directory.", no_speech, -0.4),
-                    (" Yes.", no_speech, -0.4),
+                    (" Please add a unit test", no_speech, -0.4),
+                    (" for the parser.", no_speech, -0.4),
                 ])),
-                &audio(16_000),
+                &dictated,
             )
             .await;
             assert_eq!(
                 result.transcript().map(Transcript::text),
-                Some("Please list the files in this directory. Yes."),
+                Some("Please add a unit test for the parser."),
                 "no_speech_prob {no_speech}: {:?}",
                 result.outcome
             );
@@ -1763,13 +1933,17 @@ mod tests {
     fn voice_transcribe_drops_an_unsure_no_speech_segment_under_the_certain_limit() {
         // The reply was a one-word exclamation; the numbers are the measured ones.
         let beep = parse_response(&verbose(&[(" Oh!", 0.818, -1.228)])).expect("parses");
-        assert!(!beep.has_words(), "{:?}", beep.text());
+        assert!(!beep.transcript.has_words(), "{:?}", beep.text());
         let unreported = parse_response(&json!({
             "text": "Thank you.",
             "segments": [{ "text": " Thank you.", "no_speech_prob": 0.7 }],
         }))
         .expect("parses");
-        assert!(!unreported.has_words(), "{:?}", unreported.text());
+        assert!(
+            !unreported.transcript.has_words(),
+            "{:?}",
+            unreported.text()
+        );
     }
 
     /// Scenario: a no-speech segment is removed from a verbose reply between
@@ -1844,7 +2018,7 @@ mod tests {
         // transcription failure — the sentences are different and only the
         // pipeline can phrase the first one.
         let transcript = parse_response(&json!({"text": ""})).expect("parses");
-        assert!(transcript.is_empty());
+        assert!(transcript.transcript.is_empty());
     }
 
     #[test]
@@ -2460,6 +2634,263 @@ mod tests {
                 result.outcome
             );
         }
+    }
+
+    /// The sentence the maintainer found typed into an agent's prompt in
+    /// typing mode on 2026-10-20, having said nothing, after PR #1550's voice
+    /// check had shipped (issue #1450).
+    const INVENTED_AFTER_THE_VOICE_CHECK: &str = "Then, thank you very much for having me.";
+
+    /// The ways a backend can hand back a sentence the audio does not hold,
+    /// with nothing in the reply that marks it: plain text with no segments
+    /// (OpenAI's `gpt-*` models, or a server that ignores `verbose_json`), and
+    /// a whisper reply whose segment calls the sentence speech.
+    fn invented_replies(sentence: &str) -> Vec<(&'static str, Value)> {
+        vec![
+            ("a reply with no segments", json!({ "text": sentence })),
+            (
+                "a whisper reply that calls it speech",
+                verbose(&[(&format!(" {sentence}"), 0.2, -0.3)]),
+            ),
+        ]
+    }
+
+    /// Scenario: issue #1450 after PR #1550 — a sound with a fraction of a
+    /// second of voice in it clears both checks in front of the backend (here
+    /// a real one-word "Stop." at one and a half times speed), and the backend
+    /// answers with a fluent eight-word sentence: "Then, thank you very much
+    /// for having me." Eight words do not fit in that much voice, so the
+    /// sentence was invented: nothing is heard, nothing is typed in typing
+    /// mode and nothing reaches the Commands model.
+    #[tokio::test]
+    async fn voice_transcribe_an_invented_sentence_from_a_moment_of_voice_is_never_heard() {
+        let audio = spoken(
+            include_bytes!("fixtures/speech/stop-kristin.pcm"),
+            3_000.0,
+            120.0,
+            5,
+        );
+        let voice = human_voice::measure(&audio);
+        assert!(
+            eligibility(&audio).is_ok() && voice.voice < Duration::from_millis(500),
+            "the premise: under half a second of voice that clears both checks ({voice:?})"
+        );
+        for sentence in [INVENTED_AFTER_THE_VOICE_CHECK, REPORTED_ARTEFACT] {
+            for (shape, reply) in invented_replies(sentence) {
+                let result = handle_audio(&StubTranscriber::replying(&reply), &audio).await;
+                assert!(
+                    !result.outcome.is_heard(),
+                    "{sentence:?}, {shape}: {:?}",
+                    result.outcome
+                );
+                assert!(
+                    !result.sentence().contains("thank you")
+                        && !result.sentence().contains("signing off"),
+                    "{shape}: {}",
+                    result.sentence()
+                );
+            }
+        }
+    }
+
+    /// A `verbose_json` reply with timing, the shape the local container
+    /// answered with on 2026-10-20 when asked for word and segment timestamps:
+    /// one segment per `(text, start, end)` with a confident no-speech verdict,
+    /// and a top-level `words` list of `(word, start, end)`.
+    fn timed_reply(segments: &[(&str, f64, f64)], words: &[(&str, f64, f64)]) -> Value {
+        let text: String = segments.iter().map(|(text, ..)| *text).collect();
+        json!({
+            "text": text.trim(),
+            "segments": segments
+                .iter()
+                .map(|(text, start, end)| json!({
+                    "text": text,
+                    "start": start,
+                    "end": end,
+                    "no_speech_prob": 0.05,
+                    "avg_logprob": -0.2,
+                }))
+                .collect::<Vec<_>>(),
+            "words": words
+                .iter()
+                .map(|(word, start, end)| json!({ "word": word, "start": start, "end": end }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Scenario: the user dictates "Please add a unit test for the parser."
+    /// and the local container answers with its own word timing — measured
+    /// 2026-10-20 for this fixture, "Please" starting 0.36 s before the voice
+    /// does. Every word is timed on the voice and eight words fit in it, so
+    /// the sentence is heard word for word.
+    #[tokio::test]
+    async fn voice_transcribe_real_dictation_with_the_local_models_timing_is_heard() {
+        let audio = spoken(COMMANDS[14].1, 3_000.0, 120.0, 4);
+        let reply = timed_reply(
+            &[(" Please add a unit test for the parser.", 0.24, 2.54)],
+            &[
+                (" Please", 0.24, 0.94),
+                (" add", 0.94, 1.16),
+                (" a", 1.16, 1.52),
+                (" unit", 1.52, 1.6),
+                (" test", 1.6, 1.88),
+                (" for", 1.88, 2.06),
+                (" the", 2.06, 2.3),
+                (" parser.", 2.3, 2.54),
+            ],
+        );
+        let result = handle_audio(&StubTranscriber::replying(&reply), &audio).await;
+        assert_eq!(
+            result.transcript().map(Transcript::text),
+            Some("Please add a unit test for the parser."),
+            "{:?}",
+            result.outcome
+        );
+    }
+
+    /// Scenario: the user says "Stop." and the backend adds "Thank you." after
+    /// it, timed over the quiet room that follows the word. Three words would
+    /// fit in the voice, so only the timing gives the addition away: a word
+    /// timed where there was no voice was not said, and nothing is heard.
+    #[tokio::test]
+    async fn voice_transcribe_words_timed_after_the_voice_are_never_heard() {
+        let audio = spoken(
+            include_bytes!("fixtures/speech/stop-john.pcm"),
+            3_000.0,
+            120.0,
+            6,
+        );
+        let timed_on_the_voice =
+            |words: &[(&str, f64, f64)]| timed_reply(&[(" Stop. Thank you.", 0.6, 2.0)], words);
+        let invented = timed_on_the_voice(&[
+            (" Stop.", 0.6, 1.0),
+            (" Thank", 1.7, 1.85),
+            (" you.", 1.85, 2.0),
+        ]);
+        let result = handle_audio(&StubTranscriber::replying(&invented), &audio).await;
+        assert!(!result.outcome.is_heard(), "{:?}", result.outcome);
+        let TranscriptionOutcome::Silent { detail, sentence } = &result.outcome else {
+            panic!("{:?}", result.outcome);
+        };
+        assert_eq!(sentence, NOTHING_HEARD);
+        assert!(detail.contains("where no voice was detected"), "{detail}");
+        assert!(
+            !detail.contains("Thank"),
+            "the detail quotes no text: {detail}"
+        );
+
+        // The control: the same reply with "Stop." alone is heard.
+        let said = timed_reply(&[(" Stop.", 0.6, 1.0)], &[(" Stop.", 0.6, 1.0)]);
+        let result = handle_audio(&StubTranscriber::replying(&said), &audio).await;
+        assert_eq!(
+            result.transcript().map(Transcript::text),
+            Some("Stop."),
+            "{:?}",
+            result.outcome
+        );
+    }
+
+    /// Scenario: the user dictates a sentence and stops talking, and the
+    /// backend appends a second segment — "Thank you for watching." — timed
+    /// over the quiet after it, with nothing marking it as no-speech and no
+    /// word timing. The whole reply fits in the sentence's voice, but the
+    /// second segment's words do not fit in the voice inside its own time, so
+    /// nothing is heard.
+    #[tokio::test]
+    async fn voice_transcribe_a_segment_timed_over_quiet_is_never_heard() {
+        let mut samples = room_tone(6.0, 120.0, 8);
+        let dictated = spoken(COMMANDS[14].1, 3_000.0, 0.0, 8);
+        add(
+            &mut samples,
+            &dictated
+                .samples()
+                .iter()
+                .map(|&sample| f64::from(sample))
+                .collect::<Vec<_>>(),
+            0.0,
+        );
+        let audio = pcm(samples);
+        let segments_only = |segments: &[(&str, f64, f64)]| timed_reply(segments, &[]);
+        let invented = segments_only(&[
+            (" Please add a unit test for the parser.", 0.3, 2.6),
+            (" Thank you for watching.", 4.0, 5.5),
+        ]);
+        let result = handle_audio(&StubTranscriber::replying(&invented), &audio).await;
+        assert!(!result.outcome.is_heard(), "{:?}", result.outcome);
+
+        let said = segments_only(&[(" Please add a unit test for the parser.", 0.3, 2.6)]);
+        let result = handle_audio(&StubTranscriber::replying(&said), &audio).await;
+        assert!(result.outcome.is_heard(), "{:?}", result.outcome);
+    }
+
+    /// The timing a reply gives is read from where each backend puts it:
+    /// OpenAI's and the local container's top-level `words`, or a list inside
+    /// each segment. A word inside a segment the no-speech guard dropped is
+    /// not held against the voice, a lone punctuation mark is not a word, and
+    /// an entry missing a time is left out rather than guessed at.
+    #[test]
+    fn voice_transcribe_reads_the_timing_a_reply_gives() {
+        let top_level = parse_response(&json!({
+            "text": "Send it.",
+            "segments": [
+                { "text": " Send it.", "start": 0.33, "end": 2.09,
+                  "no_speech_prob": 0.28, "avg_logprob": -0.331 },
+                { "text": " Thank you.", "start": 3.0, "end": 4.0,
+                  "no_speech_prob": 0.95, "avg_logprob": -0.3 },
+            ],
+            "words": [
+                { "word": " Send", "start": 0.33, "end": 1.01 },
+                { "word": " it.", "start": 1.01, "end": 2.09 },
+                { "word": " .", "start": 2.09, "end": 2.09 },
+                { "word": " Thank", "start": 3.0, "end": 3.5 },
+                { "word": " you.", "start": 3.5 },
+            ],
+        }))
+        .expect("parses");
+        assert_eq!(top_level.text(), "Send it.");
+        assert_eq!(
+            top_level.timing,
+            Timing {
+                segments: vec![Timed {
+                    start: 0.33,
+                    end: 2.09,
+                    words: 2
+                }],
+                words: vec![
+                    Timed {
+                        start: 0.33,
+                        end: 1.01,
+                        words: 1
+                    },
+                    Timed {
+                        start: 1.01,
+                        end: 2.09,
+                        words: 1
+                    },
+                ],
+            }
+        );
+
+        let nested = parse_response(&json!({
+            "text": "Yes.",
+            "segments": [{
+                "text": " Yes.", "start": 0.5, "end": 0.9,
+                "no_speech_prob": 0.1, "avg_logprob": -0.2,
+                "words": [{ "word": " Yes.", "start": 0.5, "end": 0.9 }],
+            }],
+        }))
+        .expect("parses");
+        assert_eq!(
+            nested.timing.words,
+            vec![Timed {
+                start: 0.5,
+                end: 0.9,
+                words: 1
+            }]
+        );
+
+        let untimed = parse_response(&json!({ "text": "Yes." })).expect("parses");
+        assert_eq!(untimed.timing, Timing::default());
     }
 
     #[test]

@@ -62,7 +62,8 @@
 //! A sound that IS voice-like: another person talking, a television, singing,
 //! a laugh, a squeaking chair with a steady pitch (a synthetic one scored like
 //! speech). Those reach the backend as before, where the per-segment guard
-//! still applies.
+//! still applies, and what comes back is then held to the voice this measured
+//! ([`super::evidence`]): a sentence the voice could not hold is dropped.
 
 use std::time::Duration;
 
@@ -120,13 +121,15 @@ const LEVEL_FRAME: usize = TARGET_SAMPLE_RATE as usize / 50;
 const MAX_GAIN: f64 = 64.0;
 
 /// What [`measure`] found.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VoiceMeasure {
     /// How much of the segment scored as voice, in whole [`VOICE_FRAME`]s.
     pub voice: Duration,
     /// The highest score any frame reached, `0.0..=1.0` — for the refusal's
     /// detail, so a maintainer can see how close a refused segment came.
     pub peak_score: f32,
+    /// Where in the segment the voice was.
+    pub timeline: VoiceTimeline,
 }
 
 impl VoiceMeasure {
@@ -134,6 +137,58 @@ impl VoiceMeasure {
     pub fn heard(&self) -> bool {
         self.voice >= MIN_VOICE
     }
+}
+
+/// Which of a segment's [`VOICE_FRAME`]s scored as voice, in order — what a
+/// transcript is later held against ([`super::evidence`], issue #1450): the
+/// words a backend returns have to fit in the voice, and where it says when
+/// each was spoken, that has to be where the voice was.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VoiceTimeline {
+    voiced: Vec<bool>,
+}
+
+impl VoiceTimeline {
+    /// A timeline of one entry per [`VOICE_FRAME`], `true` where the frame
+    /// scored as voice.
+    pub fn from_frames(voiced: Vec<bool>) -> Self {
+        Self { voiced }
+    }
+
+    /// How much voice the whole segment holds.
+    pub fn voice(&self) -> Duration {
+        frames_to_duration(self.voiced.iter().filter(|&&voiced| voiced).count())
+    }
+
+    /// How much voice lies between `start` and `end`, in seconds from the
+    /// segment's start. A frame counts when any part of it is in the window,
+    /// so a window that ends inside a voiced frame counts that frame whole.
+    pub fn voice_between(&self, start: f64, end: f64) -> Duration {
+        let Some(range) = self.frames_between(start, end) else {
+            return Duration::ZERO;
+        };
+        frames_to_duration(self.voiced[range].iter().filter(|&&voiced| voiced).count())
+    }
+
+    /// The frames any part of `start..=end` touches, clipped to the segment,
+    /// or `None` when the window lies wholly outside it or is not a window.
+    fn frames_between(&self, start: f64, end: f64) -> Option<std::ops::RangeInclusive<usize>> {
+        if !(start.is_finite() && end.is_finite()) || end < start || self.voiced.is_empty() {
+            return None;
+        }
+        let frame = VOICE_FRAME as f64 / f64::from(TARGET_SAMPLE_RATE);
+        let last = self.voiced.len() - 1;
+        if end < 0.0 || start > frame * self.voiced.len() as f64 {
+            return None;
+        }
+        let first = ((start.max(0.0) / frame).floor() as usize).min(last);
+        let until = ((end / frame).floor() as usize).min(last);
+        Some(first..=until)
+    }
+}
+
+fn frames_to_duration(frames: usize) -> Duration {
+    Duration::from_secs_f64((frames * VOICE_FRAME) as f64 / f64::from(TARGET_SAMPLE_RATE))
 }
 
 /// The gain each 20 ms frame of `audio` is scored at.
@@ -197,7 +252,7 @@ pub fn measure(audio: &Pcm16) -> VoiceMeasure {
 
     let mut detector = earshot::Detector::default();
     let mut frame = [0i16; VOICE_FRAME];
-    let mut voiced = 0usize;
+    let mut voiced = Vec::with_capacity(samples.len() / VOICE_FRAME);
     let mut peak_score = 0.0f32;
     for (index, chunk) in samples.as_chunks::<VOICE_FRAME>().0.iter().enumerate() {
         let start = index * VOICE_FRAME;
@@ -208,15 +263,13 @@ pub fn measure(audio: &Pcm16) -> VoiceMeasure {
         }
         let score = detector.predict_i16(&frame);
         peak_score = peak_score.max(score);
-        if score >= VOICE_SCORE {
-            voiced += 1;
-        }
+        voiced.push(score >= VOICE_SCORE);
     }
+    let timeline = VoiceTimeline::from_frames(voiced);
     VoiceMeasure {
-        voice: Duration::from_secs_f64(
-            (voiced * VOICE_FRAME) as f64 / f64::from(TARGET_SAMPLE_RATE),
-        ),
+        voice: timeline.voice(),
         peak_score,
+        timeline,
     }
 }
 
@@ -236,6 +289,32 @@ mod tests {
         // Five 16 ms frames, so `heard` flips exactly on the fifth.
         let frames = MIN_VOICE.as_secs_f64() * f64::from(TARGET_SAMPLE_RATE) / VOICE_FRAME as f64;
         assert_eq!(frames, 5.0);
+    }
+
+    /// The timeline answers "how much voice between these two times" in
+    /// whole 16 ms frames, counting a frame the window only touches, and
+    /// answers zero for a window outside the segment or one that is not a
+    /// window at all.
+    #[test]
+    fn voice_human_voice_timeline_counts_voice_inside_a_window() {
+        // Ten frames, 0.16 s; voice in frames 2..=4 (0.032 s to 0.080 s).
+        let timeline =
+            VoiceTimeline::from_frames((0..10).map(|frame| (2..=4).contains(&frame)).collect());
+        let frames = |count: u64| Duration::from_millis(count * 16);
+        assert_eq!(timeline.voice(), frames(3));
+        assert_eq!(timeline.voice_between(0.0, 0.16), frames(3));
+        assert_eq!(timeline.voice_between(0.034, 0.046), frames(1));
+        assert_eq!(timeline.voice_between(0.0, 0.031), Duration::ZERO);
+        assert_eq!(timeline.voice_between(-1.0, 0.033), frames(1));
+        assert_eq!(timeline.voice_between(0.079, 9.0), frames(1));
+        assert_eq!(timeline.voice_between(0.2, 0.3), Duration::ZERO);
+        assert_eq!(timeline.voice_between(-0.3, -0.1), Duration::ZERO);
+        assert_eq!(timeline.voice_between(0.05, 0.04), Duration::ZERO);
+        assert_eq!(timeline.voice_between(f64::NAN, 0.1), Duration::ZERO);
+        assert_eq!(
+            VoiceTimeline::default().voice_between(0.0, 1.0),
+            Duration::ZERO
+        );
     }
 
     #[test]
