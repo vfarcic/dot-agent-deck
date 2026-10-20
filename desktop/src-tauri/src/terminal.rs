@@ -1206,16 +1206,22 @@ pub(crate) async fn attach(
         }
 
         let state = app_for_stream.state::<DesktopState>();
-        if let Ok(mut sessions) = state.sessions()
-            && sessions
-                .get(&session_for_stream)
-                .is_some_and(|session| session.generation == generation)
-        {
-            sessions.remove(&session_for_stream);
-        }
+        terminal_stream_ended(&state, &session_for_stream, generation).await;
     });
 
     Ok(result)
+}
+
+/// Shared lifecycle seam so socket tests run the reader's actual end cleanup,
+/// including any future trust invalidation, without requiring a webview.
+async fn terminal_stream_ended(state: &DesktopState, session_id: &str, generation: u64) {
+    if let Ok(mut sessions) = state.sessions()
+        && sessions
+            .get(session_id)
+            .is_some_and(|session| session.generation == generation)
+    {
+        sessions.remove(session_id);
+    }
 }
 
 /// A best-effort DETACH over a session that was built and then **not**
@@ -2308,6 +2314,122 @@ mod tests {
     #[cfg(unix)]
     fn fixture_channel() -> Channel<Response> {
         Channel::new(|_body: tauri::ipc::InvokeResponseBody| Ok(()))
+    }
+
+    /// Scenario: A terminal reaches EOF, then its daemon socket is replaced before the independent event watcher invalidates cached trust. Reopening must refuse a different protocol with zero attach requests; the same-protocol control must really reopen a terminal stream.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_reopen_after_eof_rechecks_protocol_before_cached_trust() {
+        use dot_agent_deck::daemon_protocol::{
+            AttachResponse, KIND_REQ, KIND_RESP, PROTOCOL_VERSION,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for protocol in [PROTOCOL_VERSION, PROTOCOL_VERSION + 1] {
+            let (_dir, socket) = scratch_socket("dad-eof-skew");
+            let (listener, _local_deck) = bind_local_deck(&socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            let original = tokio::spawn(async move {
+                let _hello = answer_one(&listener, matching_hello(), None, None).await;
+                let (_, writer) = answer_one(&listener, AttachResponse::ok(), None, None).await;
+                // Returning drops the listener; the test chooses when this
+                // terminal's final writer closes, independent of any watcher.
+                writer
+            });
+            let channel = fixture_channel();
+            let mut first = tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(&state, None, "planner".into(), &channel, None),
+            )
+            .await
+            .expect("bounded initial attach")
+            .expect("initial compatible terminal");
+            let old_writer = original.await.expect("original scripted daemon");
+            drop(old_writer);
+            let eof = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_frame(
+                    first
+                        .stream
+                        .as_mut()
+                        .expect("actual initial terminal stream"),
+                ),
+            )
+            .await
+            .expect("terminal must reach EOF")
+            .expect("read EOF");
+            assert!(eof.is_none(), "old terminal genuinely reached EOF");
+            // Run the reader's real cleanup. No independent watcher runs;
+            // a fix at this EOF boundary or at reopen can satisfy the pin.
+            terminal_stream_ended(&state, &first.result.session_id, first.result.generation).await;
+            std::fs::remove_file(&socket).unwrap();
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let admissions = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&admissions);
+            let replacement = tokio::spawn(async move {
+                let mut streams = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (reader, writer) = stream.into_split();
+                    let mut reader =
+                        dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
+                    let mut writer = TransportWriteHalf::new(writer);
+                    let Some((KIND_REQ, payload)) = read_frame(&mut reader).await.unwrap() else {
+                        continue;
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    let reply = match request["op"].as_str().unwrap() {
+                        "hello" => {
+                            let mut hello = matching_hello();
+                            hello.server_version = Some(protocol);
+                            hello
+                        }
+                        "attach-stream" => {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            AttachResponse::ok()
+                        }
+                        _ => AttachResponse::ok(),
+                    };
+                    write_frame(&mut writer, KIND_RESP, &serde_json::to_vec(&reply).unwrap())
+                        .await
+                        .unwrap();
+                    streams.push(writer);
+                }
+            });
+            let reopened = tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(&state, None, "planner".into(), &channel, None),
+            )
+            .await
+            .expect("bounded terminal reopen");
+            replacement.abort();
+            if protocol == PROTOCOL_VERSION {
+                let attached = reopened.expect("same-version terminal must reopen");
+                assert!(
+                    attached.stream.is_some(),
+                    "control must open an actual terminal stream"
+                );
+                assert_eq!(admissions.load(Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(
+                    admissions.load(Ordering::SeqCst),
+                    0,
+                    "desktop terminal reopened against incompatible daemon using cached trust before watcher invalidation"
+                );
+                let Err(refusal) = reopened else {
+                    panic!("incompatible terminal must refuse");
+                };
+                assert!(
+                    refusal.contains(&protocol.to_string())
+                        && refusal.contains(&PROTOCOL_VERSION.to_string()),
+                    "refusal must name both versions: {refusal}"
+                );
+            }
+        }
     }
 
     /// A `Hello` reply this build classifies as `Connected`, so

@@ -480,7 +480,7 @@ fn handshake_010_protocol_skew_with_matching_build_restarts_silently() {
     );
 }
 
-/// Scenario: Keep a TUI open while its fixture-owned daemon is stopped and replaced at the same socket. A same-protocol replacement must reconnect and show its new agent, while an N+1 replacement must show a refusal naming both protocol numbers and must not show that daemon's agent.
+/// Scenario: Replace the daemon under an open TUI at the same socket. A compatible replacement must display a terminal-only sentinel; an incompatible replacement must admit zero terminal/event streams throughout the attempt and show a persistent refusal associating the daemon and client versions.
 #[spec("lifecycle/handshake/011")]
 #[test]
 fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
@@ -519,6 +519,10 @@ fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
             &[
                 ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
                 (
+                    "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR",
+                    "reconnect-observations",
+                ),
+                (
                     "DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE",
                     &protocol.to_string(),
                 ),
@@ -533,10 +537,11 @@ fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
             ],
         );
         let name = if protocol == own {
-            "same-version-returned"
+            "replacement-peer-a"
         } else {
-            "incompatible-returned"
+            "replacement-peer-b"
         };
+        let sentinel = format!("PTY-ONLY-REPLACEMENT-9f71-{protocol}");
         // Recreate the pane the user already had open. The stand-in paints
         // its label periodically, so reattachment is visible from live output
         // as well as a replayed snapshot, including when daemon ids restart at 1.
@@ -544,28 +549,53 @@ fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
             &replacement,
             &old.id,
             serde_json::json!({
-                "display_name":name, "env":[["DOORBELL_STANDIN_LABEL", name]]
+                "display_name":name, "env":[["DOORBELL_STANDIN_LABEL", sentinel]]
             }),
         );
         status(&replacement, &new, "idle", "claude_code");
         if protocol == own {
-            deck.wait_for_string(name);
+            deck.wait_for_string(&sentinel);
             continue;
         }
-        let refused = deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| {
+        let observations = replacement.home.join("reconnect-observations/observations");
+        let admission_count = || {
+            std::fs::read_to_string(&observations)
+                .unwrap_or_default()
+                .lines()
+                .filter(|s| s.starts_with("attach-stream ") || s.starts_with("subscribe-events"))
+                .count()
+        };
+        let refusal_visible = |grid: &str| {
             let low = grid.to_lowercase();
+            let associated = (low.contains(&format!("daemon v{protocol}"))
+                && low.contains(&format!("client v{own}")))
+                || (low.contains(&format!("daemon speaks attach protocol v{protocol}"))
+                    && low.contains(&format!("binary speaks v{own}")));
             low.contains("protocol")
-                && low.contains(&own.to_string())
-                && low.contains(&protocol.to_string())
-                && ["refus", "incompatib", "cannot"]
+                && associated
+                && ["refus", "incompatib", "cannot", "not attaching"]
                     .iter()
                     .any(|word| low.contains(word))
-        });
+        };
+        let refused = deck.wait_for_grid_predicate_within(Duration::from_secs(10), refusal_visible);
         let grid = deck.snapshot_grid();
+        assert_eq!(
+            admission_count(),
+            0,
+            "incompatible reconnect admitted terminal/event streams before refusal: {}; refusal_visible={refused}; grid={grid}",
+            std::fs::read_to_string(&observations).unwrap_or_default()
+        );
         assert!(
-            refused && !grid.contains(name),
+            refused && !grid.contains(&sentinel),
             "protocol-skew reconnect must refuse daemon v{protocol}, name client v{own}, and never reattach; replacement_visible={}; grid=\n{grid}",
-            grid.contains(name)
+            grid.contains(&sentinel)
+        );
+        assert!(
+            !common::wait_until(Duration::from_secs(2), || {
+                let grid = deck.snapshot_grid();
+                admission_count() != 0 || grid.contains(&sentinel) || !refusal_visible(&grid)
+            }),
+            "refusal must stay visible without any incompatible attach admission across retry window"
         );
     }
 }

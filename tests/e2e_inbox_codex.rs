@@ -96,6 +96,9 @@ while True:
             # Codex 0.160 hides its shortcuts hint while the composer holds text.
             if strand and draft: shown = shown.replace('? for shortcuts', ' ' * 15)
             with open(base + '.screen', 'w') as f: f.write(shown)
+    elif os.path.exists(base + '.drain'):
+        os.remove(base + '.drain')
+        open(base + '.drained', 'w').close()
 "#).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:/usr/bin:/bin", bin.path().display());
@@ -291,6 +294,56 @@ fn codex_005_recognised_composer_rings_before_first_hook() {
         "composer must ring before the first own hook: {:?}",
         bytes(&codex.pane)
     );
+}
+
+/// Scenario: Strand a fixed line in Codex's recognized composer and pause its CR-only retry before admission. Fetch that selected task while another stays queued; releasing the attempt must send no CR and must not submit the settled task.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_codex_flush_only_rechecks_selected_message() {
+    let codex = Codex::new_with(
+        COMPOSER,
+        &[
+            ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
+            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "codex-inbox"),
+            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
+        ],
+    );
+    let root = codex.daemon.home.join("ring-barriers");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("before-pre-cr.armed"), "").unwrap();
+    let base = codex.pane.capture.with_extension("strand");
+    std::fs::write(base.with_extension("empty"), COMPOSER).unwrap();
+    std::fs::write(&base, "").unwrap();
+    let id = codex.queued(BODY);
+    assert!(
+        common::wait_until(WAIT, || root.join("before-pre-cr.reached").exists()),
+        "recognized Codex CR-only retry must reach its fence"
+    );
+    let first = format!("{}\r", fixed_line(&id));
+    assert_eq!(bytes(&codex.pane), first.as_bytes());
+    fetch(&codex.daemon, &codex.pane, true);
+    state(&codex.daemon, &codex.pane, &id, "acknowledged");
+    let other = codex.queued("CODEX-SECOND-QUEUED");
+    state(&codex.daemon, &codex.pane, &other, "queued");
+    std::fs::write(root.join("completed.armed"), "").unwrap();
+    std::fs::write(root.join("before-pre-cr.release"), "").unwrap();
+    assert!(
+        common::wait_until(WAIT, || root.join("completed.reached").exists()),
+        "CR-only attempt must complete"
+    );
+    drained(&codex.pane);
+    assert_eq!(
+        bytes(&codex.pane),
+        first.as_bytes(),
+        "Codex CR-only retry must not submit the settled selected ID while another message remains queued"
+    );
+    assert!(
+        std::fs::read_to_string(base.with_extension("submitted"))
+            .unwrap_or_default()
+            .is_empty(),
+        "settled stranded Codex line was submitted"
+    );
+    std::fs::write(root.join("completed.release"), "").unwrap();
 }
 
 /// Scenario: Type into synthetic Codex and press Enter during its paste burst, which leaves the draft visible. A queued message must send zero bytes while that text remains, even after a native hook; clearing the composer must let the fixed doorbell ring separately, including when the screen poll starts after the placeholder has been replaced by the doorbell.

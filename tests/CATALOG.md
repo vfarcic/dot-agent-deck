@@ -3152,8 +3152,8 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 ##### lifecycle/handshake/011 — Reconnect rechecks the replacement daemon's protocol before reattaching.
 - **Layer:** L2 lane 1 (`tests/e2e_handshake.rs`), real TUI in a PTY and isolated daemon processes replaced at the same socket.
 - **Agent:** none (raw Python stand-ins; no agent executable or credential).
-- **Asserts:** the same-protocol replacement reconnects and its new agent appears; an N+1 replacement shows a refusal naming both protocol numbers and its agent does not appear. The skew uses the existing e2e-only protocol override.
-- **Does not assert:** compatibility with a real previous-release binary, or desktop rendering; the desktop's link invalidation and handshake classifier have their own Rust tests.
+- **Asserts:** the same-protocol replacement displays a unique terminal-only sentinel, distinct from its display name. An N+1 replacement records zero terminal/event stream requests from startup through the refusal and a two-second stability window; the visible refusal associates the daemon and client version numbers. The skew uses the existing e2e-only protocol override. The desktop Rust regression `terminal_reopen_after_eof_rechecks_protocol_before_cached_trust` independently drives EOF, socket replacement and terminal establishment with watcher invalidation withheld, including a same-version stream control.
+- **Does not assert:** compatibility with a real previous-release binary, desktop webview rendering, or behavior after the bounded refusal observation window.
 - **Platform coverage:** mac+linux.
 
 #### lifecycle/login-path
@@ -8533,10 +8533,10 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
-##### inbox/doorbell/008 — A replacement agent waits for its own readiness and never receives its predecessor's doorbell.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
+##### inbox/doorbell/008 — Replacement and placeholder readiness during bounded startup windows.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), subprocess and in-process daemons with real PTYs, byte capture and vt100 replay; `inbox/route/001` covers genuine clear=true delegation.
 - **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** A draft holds an old task while its agent is stopped and the same pane identity is respawned; a ShellIdle carrier using the old session id and new agent id cannot establish readiness. A separate in-process daemon case seeds a bare hydrated placeholder and requires zero automatic bytes. After the replacement's own Idle hook, its newly bound task rings and can be fetched, while the old task never rings in the replacement.
+- **Asserts:** A draft holds an old task while its agent is stopped and the same pane identity is respawned; a predecessor-session ShellIdle carrier must leave the replacement's byte history empty for 6.5 seconds. A separate in-process daemon case seeds a bare hydrated placeholder and requires the same zero-byte interval. Own Idle then permits the newly bound task's fixed line and fetch. The clear=true route control holds readiness before and after SessionStart, ages hook history with shell samples, and requires a prompt fixed line after own Idle. The 6.5-second windows reject unconditional two- or five-second boot sleeps; they do not establish an unlimited observation horizon.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
@@ -8706,11 +8706,11 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
-##### inbox/doorbell/031 — Acknowledgement fences an already-decided retry at each admission boundary.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY with exact input capture and vt100 replay.
+##### inbox/doorbell/031 — Selected-message and human-input fences at forced retry interleaves.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`, `tests/e2e_inbox_codex.rs`), real binary and daemon-owned PTY with exact input capture and vt100 replay.
 - **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** with Idle unchanged, acknowledging after the retry decision suppresses the stale line and second submission; acknowledging after the pre-CR suppresses the payload. Each phase first exercises a still-queued control that really submits the retry. Exact byte assertions allow the pre-CR already written and one owed cleanup CR.
-- **Does not assert:** a real editor's startup buffering, or acknowledgement atomic with an already-enqueued PTY-thread write. E2E-only barriers target one pane's retry at decision and after-pre-CR phases without holding state or inbox locks.
+- **Asserts:** with Idle unchanged and a second message still queued, settling the selected ID after decision, after pre-CR, after the inter-step delay or before final submit withholds the remaining bytes. Decision also covers Fetched without acknowledgement. Still-queued controls complete the real retry, parked at completion so later retries cannot race exact capture comparisons. A human input frame arriving between steps must prevent automatic payload/submission; a recognized stranded Codex composer independently covers its CR-only retry. Cleanup CR accounting remains in 007.
+- **Does not assert:** a real editor's startup buffering, or settlement atomic with an already-enqueued PTY-thread write. E2E-only filesystem barriers are confined to the isolated daemon HOME, are inert when unarmed, and time out after ten seconds with a diagnostic marker. Between-step barriers temporarily retain the pane writer; completion barriers do not retain it. Processes with access to the private fixture root can control its files; these are not process-local barriers.
 - **Platform coverage:** mac+linux.
 
 #### inbox/boundary
@@ -10360,8 +10360,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/route/001 — Delegate with clear enabled to a live stand-in. The old process is replaced before posting; exactly one task is bound to the new agent and only that generation can fetch it.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Delegate with clear enabled to a live stand-in. The old process is replaced before posting; exactly one task is bound to the new agent and only that generation can fetch it.
-- **Test:** `route_001_clear_posts_after_respawn_to_new_agent` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Asserts:** Clear delegation replaces the predecessor and binds one task to its successor. In separate pre-SessionStart and post-SessionStart cases, 128 predecessor-session ShellIdle samples and 6.5 seconds without readiness must leave its input empty; own Idle must submit the fixed line within one second, followed by a successful fetch.
+- **Test:** `route_001_clear_posts_after_respawn_to_new_agent` and `route_001_clear_session_start_is_not_ready` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 

@@ -423,23 +423,66 @@ fn status_explains_waiting(status: Option<&crate::state::SessionStatus>) -> bool
 
 type AgentKey = (String, String);
 
-/// E2E interleave fixture: park one re-ring phase for one named pane. The
-/// caller holds neither the app-state nor inbox-hub lock while parked.
+/// E2E interleave fixture, armed through files below the isolated daemon HOME.
+/// The caller holds neither the app-state nor inbox-hub lock while parked.
 #[cfg(feature = "e2e")]
 pub(crate) async fn pause_rering_for_test(pane: &str, phase: &str) {
     if std::env::var("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE").as_deref() != Ok(pane) {
         return;
     }
-    let Some(root) = std::env::var_os("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR") else {
+    let Some(root) = test_control_root() else {
         return;
     };
-    let root = std::path::PathBuf::from(root);
     if std::fs::remove_file(root.join(format!("{phase}.armed"))).is_err() {
         return;
     }
     std::fs::write(root.join(format!("{phase}.reached")), b"").expect("report ring barrier");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !root.join(format!("{phase}.release")).exists() {
+        if tokio::time::Instant::now() >= deadline {
+            std::fs::write(root.join(format!("{phase}.timed-out")), b"barrier timeout")
+                .expect("report barrier timeout");
+            panic!("doorbell test barrier {phase} timed out after 10s for pane {pane}");
+        }
         tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(feature = "e2e")]
+fn test_control_root() -> Option<std::path::PathBuf> {
+    let root = std::env::var_os("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR")?;
+    let root = std::path::PathBuf::from(root);
+    // A relative single directory under this subprocess's private HOME is the
+    // entire control surface. Do not accept arbitrary external marker paths.
+    if root.components().count() != 1
+        || !matches!(
+            root.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return None;
+    }
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("fixture HOME"));
+    let root = home.join(root);
+    std::fs::create_dir_all(&root).ok()?;
+    let canonical = root.canonicalize().ok()?;
+    if !canonical.starts_with(home.canonicalize().expect("fixture HOME exists")) {
+        return None;
+    }
+    Some(root)
+}
+
+/// Append-only observations, enabled only inside an e2e fixture HOME.
+#[cfg(feature = "e2e")]
+pub(crate) fn record_for_test(event: &str) {
+    use std::io::Write;
+    if let Some(root) = test_control_root() {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("observations"))
+            .expect("open test observations");
+        writeln!(file, "{event}").expect("record test observation");
     }
 }
 
@@ -593,6 +636,10 @@ async fn run_tick(
                     still_admitted,
                 )
                 .await;
+            // The writer has been dropped; busy remains set so a completed
+            // attempt can be inspected without a later retry changing bytes.
+            #[cfg(feature = "e2e")]
+            pause_rering_for_test(&pane, "completed").await;
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
             let Some(slot) = slots.get_mut(&(pane.clone(), agent.clone())) else {
                 return;

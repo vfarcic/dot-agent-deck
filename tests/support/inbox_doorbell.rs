@@ -141,8 +141,11 @@ label = os.environ.get('DOORBELL_STANDIN_LABEL', '')
 os.write(1, ('DOORBELL-STANDIN-READY' + label + '\r\n').encode())
 line = bytearray()
 while True:
-    if label and not select.select([0], [], [], 0.2)[0]:
-        os.write(1, ('\r\n' + label + '\r\n').encode())
+    if not select.select([0], [], [], 0.025)[0]:
+        if os.path.exists(base + '.drain'):
+            os.remove(base + '.drain')
+            open(base + '.drained', 'w').close()
+        if label: os.write(1, ('\r\n' + label + '\r\n').encode())
         continue
     chunk = os.read(0, 4096)
     if not chunk: break
@@ -429,6 +432,17 @@ pub fn fixed_line(id: &str) -> String {
 
 pub fn bytes(pane: &Pane) -> Vec<u8> {
     std::fs::read(&pane.capture).unwrap_or_default()
+}
+
+/// Acknowledge an empty input queue after the daemon's completed write.
+pub fn drained(pane: &Pane) {
+    let marker = pane.capture.with_extension("drained");
+    let _ = std::fs::remove_file(&marker);
+    std::fs::write(pane.capture.with_extension("drain"), "").unwrap();
+    assert!(
+        common::wait_until(WAIT, || marker.exists()),
+        "recorder must drain completed attempt"
+    );
 }
 
 pub fn turns(pane: &Pane) -> Vec<Value> {

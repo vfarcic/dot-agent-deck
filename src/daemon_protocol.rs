@@ -6395,6 +6395,8 @@ async fn handle_connection(
             geometry_updates,
             client_id,
         } => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test(&format!("attach-stream {id}"));
             // PRD #882: both axes or neither. A half-declared viewport is a
             // client bug, and guessing the missing axis would register a
             // constraint the client never asked for — which under a
@@ -6521,9 +6523,13 @@ async fn handle_connection(
             write_resp(&mut stream, &resp).await?
         }
         AttachRequest::SubscribeEvents => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test("subscribe-events");
             handle_subscribe_events(stream, event_tx).await?;
         }
         AttachRequest::SubscribeEventsWithSnapshot => {
+            #[cfg(feature = "e2e")]
+            crate::doorbell::record_for_test("subscribe-events-with-snapshot");
             handle_subscribe_events_with_snapshot(stream, event_tx, &registry, &state).await?;
         }
         AttachRequest::SubscribeTurnReplies { id } => {
@@ -8511,6 +8517,8 @@ async fn handle_attach_stream(
                     enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
+                #[cfg(feature = "e2e")]
+                crate::doorbell::record_for_test(&format!("human-arrived {pane_id}"));
                 let w = writer.lock().await;
                 // PRD #20 R20-006 (finding #7): RE-VALIDATE under the held writer,
                 // immediately before writing. A close/respawn (registry removal),

@@ -314,16 +314,20 @@ fn doorbell_008_respawn_never_rings_old_agents_message() {
     socket.shutdown(std::net::Shutdown::Write).unwrap();
     std::io::Read::read_to_end(&mut socket, &mut Vec::new()).unwrap();
     assert!(
-        !common::wait_until(Duration::from_millis(1200), || !bytes(&new).is_empty()),
+        !common::wait_until(Duration::from_millis(6500), || !bytes(&new).is_empty()),
         "replacement received automatic input before current-generation readiness: {:?}; grid={}",
         String::from_utf8_lossy(&bytes(&new)),
         screen(&daemon, &new)
     );
     state(&daemon, &new, &id, "queued");
     status(&daemon, &new, "idle", "claude_code");
+    assert!(
+        common::wait_until(Duration::from_secs(1), || !rings(&new).is_empty()),
+        "own ready must promptly submit replacement's fixed line"
+    );
     ring(&daemon, &new, &id);
     assert!(
-        !screen(&daemon, &new).contains(&old_id),
+        !String::from_utf8_lossy(&bytes(&new)).contains(&old_id),
         "old message rang in replacement"
     );
     let fetched = fetch(&daemon, &new, true).to_string();
@@ -369,51 +373,88 @@ fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
     });
     let id = enqueue(&fixture, &pane, BODY);
     assert!(
-        !common::wait_until(Duration::from_millis(1200), || !bytes(&pane).is_empty()),
+        !common::wait_until(Duration::from_millis(6500), || !bytes(&pane).is_empty()),
         "bare placeholder received automatic input before current-generation readiness: {:?}; grid={}",
         String::from_utf8_lossy(&bytes(&pane)),
         screen(&fixture, &pane)
     );
     state(&fixture, &pane, &id, "queued");
     status(&fixture, &pane, "idle", "claude_code");
+    assert!(
+        common::wait_until(Duration::from_secs(1), || !rings(&pane).is_empty()),
+        "own ready must promptly submit placeholder's fixed line"
+    );
     ring(&fixture, &pane, &id);
     let fetched = fetch(&fixture, &pane, true).to_string();
     assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
 }
 
-/// Scenario: Leave a task queued after its first submitted doorbell, pause the next attempt before admission, and acknowledge it while the agent remains Idle. Releasing the attempt must add no stale line or second task submission; a queued control still rings and the owed cleanup CR is allowed.
+/// Scenario: Pause an outstanding task's retry after decision and acknowledge that task while the agent remains Idle and another message stays queued. Releasing the attempt must add no further bytes; an unchanged selected-message control still submits its retry.
 #[spec("inbox/doorbell/031")]
 #[test]
 fn doorbell_031_ack_after_decision_cancels_stale_rering() {
-    assert_ack_fences_rering("decided");
+    assert_ack_fences_rering("decided", true, false);
 }
 
-/// Scenario: Pause a retry after its pre-ring CR, then acknowledge the task without changing Idle and release the writer. The already-written CR and owed cleanup CR are allowed, but the retry payload and its submission must be absent; the same pause with queued work still submits the line.
+/// Scenario: Fetch the selected message without acknowledging it while its retry is paused after decision, then queue another task. The fetched ID must receive no further input while the queued control can progress.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_fetch_after_decision_cancels_stale_rering() {
+    assert_ack_fences_rering("decided", false, false);
+}
+
+/// Scenario: Pause a retry after its pre-ring CR, then acknowledge its selected task and leave another message queued without changing Idle. The already-written CR is allowed, but the retry payload and submission must be absent; an unchanged selected-message control still submits its line.
 #[spec("inbox/doorbell/031")]
 #[test]
 fn doorbell_031_ack_after_pre_cr_cancels_stale_payload() {
-    assert_ack_fences_rering("after-pre-cr");
+    assert_ack_fences_rering("after-pre-cr", true, false);
 }
 
-fn assert_ack_fences_rering(phase: &str) {
+/// Scenario: Settle the selected message while another remains queued after the inter-step delay. The paused retry must emit no further byte, while an unchanged selected message still completes its retry.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_ack_after_delay_cancels_remaining_bytes() {
+    assert_ack_fences_rering("after-delay", true, false);
+}
+
+/// Scenario: Settle the selected message while another remains queued just before the retry's final submit. The payload already written is allowed but the final CR must be withheld; the unchanged-message control still submits.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_ack_before_submit_cancels_final_cr() {
+    assert_ack_fences_rering("before-submit", true, false);
+}
+
+/// Scenario: Type a human draft while the retry is paused between its pre-ring CR and payload. Releasing the retry must not append automatic text or submit the draft.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_human_draft_between_steps_withholds_remaining_input() {
+    assert_ack_fences_rering("after-delay", true, true);
+}
+
+/// Scenario: A human input frame arrives while a retry is paused after decision, before writer admission. The queued task must remain deferred with the draft unsent; the unchanged-message control still completes its retry.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_human_draft_after_decision_withholds_retry() {
+    assert_ack_fences_rering("decided", true, true);
+}
+
+fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
     // Run the queued control FIRST, so a RED below still proves the barrier
     // releases a real re-ring with the ordinary payload and submission.
     for acknowledge in [false, true] {
-        let scratch = common::harness_tempdir().unwrap();
-        let root = scratch.path();
-        let log = root.join("doorbell.log");
-        std::fs::write(root.join(format!("{phase}.armed")), "").unwrap();
         let daemon = daemon_unbound(&[
             ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
             ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "fenced"),
-            (
-                "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR",
-                root.to_str().unwrap(),
-            ),
-            ("DOT_AGENT_DECK_LOG", log.to_str().unwrap()),
+            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
             ("RUST_LOG", "dot_agent_deck::doorbell=debug"),
         ]);
+        let root = daemon.home.join("ring-barriers");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(format!("{phase}.armed")), "").unwrap();
         let pane = pane(&daemon, "fenced");
+        // Attach before the writer is parked. The observation seam proves the
+        // human frame arrived while its PTY write waits behind that writer.
+        let mut user = common::AttachInput::attach(&daemon.attach_socket, &pane.agent);
         status(&daemon, &pane, "idle", "claude_code");
         let id = enqueue(&daemon, &pane, BODY);
         ring(&daemon, &pane, &id);
@@ -422,24 +463,47 @@ fn assert_ack_fences_rering(phase: &str) {
             common::wait_until(WAIT, || root.join(format!("{phase}.reached")).exists()),
             "re-ring must reach {phase} barrier"
         );
-        let parked = if phase == "after-pre-cr" {
-            format!("{first}\r")
-        } else {
-            first.clone()
+        let parked = match phase {
+            "decided" => first.clone(),
+            "before-submit" => format!("{first}\r{}", fixed_line(&id)),
+            _ => format!("{first}\r"),
         };
         assert!(
             common::wait_until(WAIT, || bytes(&pane) == parked.as_bytes()),
             "{phase}: barrier must precede payload: {:?}",
             bytes(&pane)
         );
-        if acknowledge {
-            let fetched = fetch(&daemon, &pane, true).to_string();
+        if acknowledge && !draft {
+            let fetched = fetch(&daemon, &pane, ack).to_string();
             assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
-            state(&daemon, &pane, &id, "acknowledged");
+            state(
+                &daemon,
+                &pane,
+                &id,
+                if ack { "acknowledged" } else { "fetched" },
+            );
         } else {
             state(&daemon, &pane, &id, "queued");
         }
+        let other = enqueue(&daemon, &pane, "SECOND-QUEUED-MESSAGE");
+        state(&daemon, &pane, &other, "queued");
+        if acknowledge && draft {
+            user.write(DRAFT);
+            assert!(
+                common::wait_until(WAIT, || std::fs::read_to_string(root.join("observations"))
+                    .unwrap_or_default()
+                    .contains("human-arrived fenced")),
+                "human frame must arrive before releasing the writer"
+            );
+        }
+        std::fs::write(root.join("completed.armed"), "").unwrap();
         std::fs::write(root.join(format!("{phase}.release")), "").unwrap();
+        assert!(
+            common::wait_until(WAIT, || root.join("completed.reached").exists()),
+            "{phase}: attempt must complete within the bounded seam; timeout={}",
+            root.join(format!("{phase}.timed-out")).exists()
+        );
+        drained(&pane);
         if !acknowledge {
             assert!(
                 common::wait_until(WAIT, || rings(&pane).len() >= 2),
@@ -449,26 +513,34 @@ fn assert_ack_fences_rering(phase: &str) {
                 bytes(&pane),
                 format!("{first}\r{}\r", fixed_line(&id)).as_bytes()
             );
+            fetch(&daemon, &pane, true);
+            std::fs::write(root.join("completed.release"), "").unwrap();
             continue;
         }
-        // Acknowledging an outstanding ring owes exactly one cleanup CR.
-        // Wait for that completed cleanup rather than asserting silence at
-        // an arbitrary point in the writer's 150ms multi-step sequence.
-        assert!(
-            common::wait_until(WAIT, || std::fs::read_to_string(&log)
-                .unwrap_or_default()
-                .contains("doorbell sent its cleanup CR")),
-            "{phase}: outstanding ring must receive its cleanup CR"
-        );
-        let expected = format!("{parked}\r");
-        assert!(common::wait_until(WAIT, || bytes(&pane).len() >= expected.len()));
+        let expected = if draft {
+            format!("{parked}{DRAFT}")
+        } else {
+            parked
+        };
+        if draft {
+            assert!(
+                common::wait_until(WAIT, || bytes(&pane).ends_with(DRAFT.as_bytes())),
+                "human input must resume after writer release"
+            );
+        }
         assert_eq!(
             String::from_utf8_lossy(&bytes(&pane)),
             expected,
-            "{phase}: acknowledged message must add only the owed cleanup CR, no stale doorbell payload or second submission"
+            "{phase}: settled selected ID with another message queued (or intervening human draft) must emit no remaining payload or submit"
         );
         assert_eq!(rings(&pane).len(), 1, "ack must stop second submission");
-        unchanged(&pane, Duration::from_millis(600));
+        std::fs::write(root.join("completed.release"), "").unwrap();
+        if draft {
+            unchanged(&pane, Duration::from_millis(600));
+        } else {
+            ring(&daemon, &pane, &other);
+            fetch(&daemon, &pane, true);
+        }
     }
 }
 

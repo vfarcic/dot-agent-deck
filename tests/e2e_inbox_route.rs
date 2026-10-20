@@ -183,12 +183,24 @@ fn route_008_refused_post_releases_the_commission_for_a_fresh_delegate() {
     );
 }
 
-/// Scenario: Delegate with clear enabled to a live stand-in. The old process is replaced before posting; exactly one task is bound to the new agent and only that generation can fetch it.
+/// Scenario: Delegate with clear enabled after a predecessor's Idle hook. Keep the successor unready through predecessor ShellIdle samples for over five seconds; zero automatic input is allowed until its own Idle, which must promptly submit the newly bound task.
 #[spec("inbox/route/001")]
 #[test]
 fn route_001_clear_posts_after_respawn_to_new_agent() {
+    assert_clear_waits_for_ready(false);
+}
+
+/// Scenario: Delegate with clear enabled, report the successor's SessionStart, and age the hook history with predecessor-session shell samples. For 6.5 seconds its input must stay empty until its own Idle promptly submits the new task.
+#[spec("inbox/route/001")]
+#[test]
+fn route_001_clear_session_start_is_not_ready() {
+    assert_clear_waits_for_ready(true);
+}
+
+fn assert_clear_waits_for_ready(session_start: bool) {
     let daemon = daemon_unbound(&[]);
     let (orch, old) = route::team(&daemon, true);
+    status(&daemon, &old, "idle", "claude_code");
     let id = route::delegate(&daemon, &orch, route::TASK, false);
     let successor = std::cell::RefCell::new(None);
     assert!(
@@ -205,6 +217,37 @@ fn route_001_clear_posts_after_respawn_to_new_agent() {
     let new = route::observe(&daemon, &successor.into_inner().unwrap());
     assert_ne!(new.agent, old.agent);
     assert_eq!(route::count(&daemon, &new, 1)[0]["id"], id);
+    {
+        if session_start {
+            status(&daemon, &new, "session_start", "claude_code");
+        }
+        // Age the bounded hook history past the predecessor's native hook.
+        // Shell observations remain samples, not successor readiness.
+        let samples: Vec<_> = (0..128)
+            .map(|_| {
+                json!({"session_id":format!("doorbell-{}", old.agent),
+                "pane_id":new.id,"agent_id":new.agent,"token":new.token,
+                "agent_type":"none","event_type":"shell_idle",
+                "timestamp":chrono::Utc::now(),"metadata":{}})
+            })
+            .collect();
+        for event in samples {
+            let mut socket = connect(&daemon, &event).into_inner();
+            socket.shutdown(std::net::Shutdown::Write).unwrap();
+            std::io::Read::read_to_end(&mut socket, &mut Vec::new()).unwrap();
+        }
+        assert!(
+            !common::wait_until(Duration::from_millis(6500), || !bytes(&new).is_empty()),
+            "clear=true successor received automatic input before own ready (SessionStart={session_start}): {:?}",
+            String::from_utf8_lossy(&bytes(&new))
+        );
+        state(&daemon, &new, &id, "queued");
+    }
+    status(&daemon, &new, "idle", "claude_code");
+    assert!(
+        common::wait_until(Duration::from_secs(1), || bytes(&new).ends_with(b"\r")),
+        "own ready must promptly deliver clear=true task, rather than a boot timer"
+    );
     route::fetched(&daemon, &new, &id, route::TASK, "the orchestrator");
     assert!(!String::from_utf8_lossy(&bytes(&old)).contains(route::TASK));
     // Never stop a successor through an old pane's Drop: StopAgent uses id.

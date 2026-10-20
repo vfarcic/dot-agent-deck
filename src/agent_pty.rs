@@ -10692,6 +10692,15 @@ impl AgentPtyRegistry {
             if n > 0 {
                 tokio::time::sleep(SUBMIT_DELAY).await;
             }
+            #[cfg(feature = "e2e")]
+            if pre_cr && line.is_some() {
+                let phase = match n {
+                    0 => "before-pre-cr",
+                    1 => "after-delay",
+                    _ => "before-submit",
+                };
+                crate::doorbell::pause_rering_for_test(pane_id, phase).await;
+            }
             // PRD #1666 hardening H3: the admission the doorbell decided on
             // is asked for again under the writer before EVERY byte — the
             // pre-ring CR, the line, its submit and a cleanup CR — so a dialog
