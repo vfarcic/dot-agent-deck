@@ -3872,8 +3872,9 @@ pub struct InboxWaitReply {
     pub correctable: Vec<InboxCorrectable>,
     /// PRD #1666 part 2: the answer to [`DaemonMessage::InboxReceipts`], the
     /// one-shot receipt support this daemon serves
-    /// ([`crate::inbox_hub::ONE_SHOT_RECEIPTS`]). Additive and optional; a
-    /// line without it is not a daemon that serves them.
+    /// ([`crate::inbox_hub::ONE_SHOT_RECEIPTS`]). Additive and optional. Its
+    /// absence from the answer to that question does not establish support;
+    /// other lines (refusals, keepalives, batches) omit it from any daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub one_shot_receipts: Option<u32>,
 }

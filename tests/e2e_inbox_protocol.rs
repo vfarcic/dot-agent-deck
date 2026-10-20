@@ -1402,3 +1402,42 @@ fn claude_028_newer_hooks_take_nothing_from_an_older_daemon() {
         "and prints it: {output:?}"
     );
 }
+
+/// Scenario: Submit one prompt to Claude Code's prompt hook that carries both a waiter's whole block and a doorbell for a second message, against a stand-in for a 0.47.0 daemon that answers nothing it cannot decode. The hook asks whether the deck serves receipts once, not once for the commit and again for the doorbell's fetch, sends nothing that could take or commit mail, and exits 1 saying why.
+#[spec("inbox/claude/037")]
+#[test]
+fn claude_037_a_prompt_asks_an_older_daemon_once() {
+    let daemon = daemon();
+    let pane = pane(&daemon, "asks-once", "exec /bin/cat");
+    let (id, rung) = ("m-k3xzq2ab-0f3c9a71d2e4b850", "m-k3xzq2ab-1a2b3c4d5e6f7081");
+    let older = |request: &Value| match request["message_type"].as_str() {
+        Some("inbox_wait" | "inbox_fetch") => Some(json!({"messages":[]})),
+        _ => None,
+    };
+    let prompt = json!({"session_id":"asks-once", "hook_event_name":"UserPromptSubmit",
+        "prompt":format!("[dot-agent-deck message {id} delivery 1.1 from the orchestrator]\nbody\n[end of dot-agent-deck message {id}]\n dot-agent-deck: message {rung} waiting, run: dot-agent-deck inbox fetch"),
+        "cwd":daemon.home})
+    .to_string();
+    let (output, requests) = record_requests(
+        cli(&daemon, Some(&pane), &["hook", "--agent", "claude-code"])
+            .envs([("DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS", "300")]),
+        prompt.as_bytes(),
+        &daemon.home.join("asks-once.sock"),
+        older,
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("did not confirm that it serves message receipts"),
+        "{output:?}"
+    );
+    let questions = requests
+        .iter()
+        .filter(|r| r["message_type"] == "inbox_receipts")
+        .count();
+    assert_eq!(questions, 1, "{requests:?}");
+    for request in &requests {
+        let verb = request["message_type"].as_str().unwrap_or_default();
+        assert!(!MAIL_VERBS.contains(&verb), "sent {verb}: {requests:?}");
+    }
+}

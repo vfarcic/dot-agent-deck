@@ -285,8 +285,11 @@ fn wait_once(json: &str, question: Option<&str>) -> ExitCode {
     let path = crate::endpoint_resolve::client_socket_path();
     let mut connection = match question {
         Some(question) => match Connection::open_receipts(&path, question) {
+            // The request is written within a budget of its own from the
+            // answer; only the wait for a batch after it is unbounded.
             Opened::Ready(mut connection) => {
-                if connection.send(json).is_err() {
+                let by = std::time::Instant::now() + crate::inbox_oneshot::receipts_answer_wait();
+                if connection.send(json, by).is_err() {
                     return ExitCode::SUCCESS;
                 }
                 connection

@@ -125,7 +125,8 @@ pub const HOOK_INTEGRATION: u32 = 1;
 
 /// PRD #1666 part 2 (wire audit W03–W05): the one-shot receipt support this
 /// daemon serves — `inbox_receipt_wait`, `inbox_receipt_fetch` and
-/// `inbox_committed` — answered to every `inbox_receipts` question. It is the
+/// `inbox_committed` — answered to every admitted `inbox_receipts` question
+/// (one the token, pane and agent checks refuse gets the refusal). It is the
 /// daemon's side of [`HOOK_INTEGRATION`]: that floor refuses an older hook
 /// before this daemon issues it anything, and this one lets a newer hook
 /// refuse an older daemon before it sends anything that could take mail or

@@ -733,7 +733,7 @@ impl OneShotBatch {
             Pinned::Failed(error) => Some(error.clone()),
         };
         let line = self.controls(&hand.outputs, receiver, degraded.or(published));
-        let _ = connection.send(&line);
+        let _ = connection.send(&line, Instant::now() + RECEIPTS_ANSWER_WAIT);
         connection.finish();
         Ran {
             outputs: hand.outputs,
@@ -767,10 +767,14 @@ pub fn declared_hook_integration() -> Option<u32> {
     Some(crate::inbox_hub::HOOK_INTEGRATION)
 }
 
-/// How long a one-shot waits for the deck's answer to its `inbox_receipts`
-/// question before it takes the deck for one that does not serve receipts.
-/// An older daemon answers nothing at all (it cannot decode the question),
-/// so this is what that pairing costs each one-shot.
+/// The budget of a one-shot's receipts question, the whole of it: connecting
+/// to the deck, writing the question and reading the answer
+/// ([`Connection::open_receipts_within`]). A deck that has not answered by
+/// then is taken for one that does not serve receipts. An older daemon
+/// answers nothing at all (it cannot decode the question), so this is what
+/// that pairing costs each question. It is a budget per question, not per
+/// hook: Claude's prompt hook can ask twice, and how long the whole hook can
+/// take is [`crate::inbox_prompt::commit_attempts`]'s to say.
 pub const RECEIPTS_ANSWER_WAIT: Duration = Duration::from_secs(5);
 
 /// TEST knob, read only by a build with the `e2e` feature:
@@ -843,23 +847,34 @@ pub enum Opened {
     /// It answered with a refusal (of the token, the pane or the agent): a
     /// deck that serves receipts, and not to this caller.
     Refused(Box<InboxWaitReply>),
-    /// It did not say it serves them: no answer in time, the connection
-    /// ended, or an answer without [`crate::inbox_hub::ONE_SHOT_RECEIPTS`].
-    /// Nothing that could take mail or commit it was sent.
+    /// It did not say it serves them within the budget: the connect or the
+    /// question's write did not finish (a full accept queue, a deck that does
+    /// not read), no answer came, the connection ended, or the answer had no
+    /// [`crate::inbox_hub::ONE_SHOT_RECEIPTS`]. Nothing that could take mail
+    /// or commit it was sent.
     Unsupported,
-    /// There is no deck to connect to.
+    /// The connect failed for a reason other than running out of time: no
+    /// socket, nothing listening on it, or a listener this user may not use.
     Unreachable,
 }
 
 /// The most of one line from the daemon a one-shot reads.
 pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
+/// The most lines a connection's reader thread queues that the one-shot has
+/// not yet taken, each of at most [`MAX_LINE_BYTES`]. With the queue full the
+/// thread stops reading, so the deck's further lines wait in the socket and
+/// then in the deck rather than in this process.
+pub const MAX_QUEUED_LINES: usize = 8;
+
 /// A one-shot's side of its one connection to the deck (part 2 §2.5). A
 /// reader thread of its own reads every line through [`read_frame`] and
-/// hands it over parsed; an end of the connection, a line cut short by it,
-/// a line past [`MAX_LINE_BYTES`] or a read error ends the connection's use
-/// for good, and nothing after it is read. So [`Connection::arrivals`] is a
-/// non-blocking [`Incoming`] that never splits a line.
+/// hands it over parsed, holding at most [`MAX_QUEUED_LINES`]; an end of the
+/// connection, a line cut short by it, a line past [`MAX_LINE_BYTES`] or a
+/// read error ends the connection's use for good, and nothing after it is
+/// read. So [`Connection::arrivals`] is a non-blocking [`Incoming`] that
+/// never splits a line. A write through [`Connection::send`] is bounded by
+/// its deadline.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct Connection {
@@ -873,7 +888,11 @@ pub struct Connection {
 
 #[cfg(unix)]
 impl Connection {
-    /// Connect to the deck at `path` and send `request`, one line.
+    /// Connect to the deck at `path` and send `request`, one line, with no
+    /// bound on the connect or the write, as an older dot-agent-deck does.
+    /// Only a process standing in for one ([`declared_hook_integration`]
+    /// `None`) opens a connection this way; every other one-shot asks first
+    /// ([`Connection::open_receipts`]).
     pub fn open(path: &Path, request: &str) -> io::Result<Connection> {
         let mut stream = std::os::unix::net::UnixStream::connect(path)?;
         stream.write_all(format!("{request}\n").as_bytes())?;
@@ -883,22 +902,35 @@ impl Connection {
 
     /// PRD #1666 part 2 (wire audit W03–W05): connect to the deck at `path`,
     /// ask `question` (an `inbox_receipts` line, [`receipts_question`]) and
-    /// read the answer, within [`RECEIPTS_ANSWER_WAIT`]. Every one-shot that
-    /// could take mail or commit it asks first, on the connection that then
-    /// carries its request, and decides from this answer alone, never from
-    /// an earlier one: the deck that answers is the one the request reaches.
-    /// An older daemon cannot decode the question and answers nothing, so it
-    /// is never sent the request.
+    /// read the answer, the three of them within one
+    /// [`RECEIPTS_ANSWER_WAIT`]. Every one-shot that could take mail or
+    /// commit it asks first, on the connection that then carries its
+    /// request, and decides from this answer alone, never from an earlier
+    /// one: the deck that answers is the one the request reaches. An older
+    /// daemon cannot decode the question and answers nothing, so it is never
+    /// sent the request.
     pub fn open_receipts(path: &Path, question: &str) -> Opened {
         Connection::open_receipts_within(path, question, receipts_answer_wait())
     }
 
-    /// [`Connection::open_receipts`], waiting `wait` for the answer.
+    /// [`Connection::open_receipts`] within `wait`. The deadline is set
+    /// before the connect and checked on every line: a connect parked on a
+    /// full accept queue, a question the deck does not read, and an answer
+    /// that arrives after it, even queued behind keepalives that came in
+    /// time, are all [`Opened::Unsupported`].
     pub fn open_receipts_within(path: &Path, question: &str, wait: Duration) -> Opened {
-        let Ok(mut connection) = Connection::open(path, question) else {
+        let deadline = Instant::now() + wait;
+        let stream = match crate::platform::ipc::IpcClient::connect_timeout(path, wait) {
+            Ok(client) => client.into_std(),
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => return Opened::Unsupported,
+            Err(_) => return Opened::Unreachable,
+        };
+        let Ok(mut connection) = Connection::over(stream, MAX_LINE_BYTES) else {
             return Opened::Unreachable;
         };
-        let deadline = Instant::now() + wait;
+        if connection.send(question, deadline).is_err() {
+            return Opened::Unsupported;
+        }
         loop {
             let Some(reply) = connection.next(Some(deadline)) else {
                 return Opened::Unsupported;
@@ -919,7 +951,7 @@ impl Connection {
     /// The connection on `stream`, reading lines of at most `max` bytes.
     fn over(stream: std::os::unix::net::UnixStream, max: usize) -> io::Result<Connection> {
         let reading = stream.try_clone()?;
-        let (tx, lines) = std::sync::mpsc::channel();
+        let (tx, lines) = std::sync::mpsc::sync_channel(MAX_QUEUED_LINES);
         std::thread::spawn(move || {
             let mut reader = io::BufReader::new(reading);
             loop {
@@ -950,7 +982,9 @@ impl Connection {
     }
 
     /// The next line, waiting until `deadline` (forever with `None`).
-    /// `None` once the connection has ended, or at the deadline.
+    /// `None` once the connection has ended, or from the deadline on, even
+    /// with lines already waiting: a deck that keeps lines coming cannot
+    /// stretch it.
     pub fn next(&mut self, deadline: Option<Instant>) -> Option<InboxWaitReply> {
         if self.ended {
             return None;
@@ -959,10 +993,11 @@ impl Connection {
         let got = match deadline {
             None => self.lines.recv().unwrap_or(None),
             Some(deadline) => {
-                match self
-                    .lines
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                match self.lines.recv_timeout(left) {
                     Ok(got) => got,
                     Err(RecvTimeoutError::Timeout) => return None,
                     Err(RecvTimeoutError::Disconnected) => None,
@@ -986,10 +1021,41 @@ impl Connection {
         self.ended
     }
 
-    /// Send one control line.
-    pub fn send(&mut self, line: &str) -> io::Result<()> {
-        self.stream.write_all(format!("{line}\n").as_bytes())?;
-        self.stream.flush()
+    /// Send one line, all of it by `deadline`, or fail with
+    /// [`io::ErrorKind::TimedOut`] (a deck that does not read). No write
+    /// starts from the deadline on, and a line given up on is not continued
+    /// later.
+    pub fn send(&mut self, line: &str, deadline: Instant) -> io::Result<()> {
+        let line = format!("{line}\n");
+        let mut rest = line.as_bytes();
+        let sent = loop {
+            if rest.is_empty() {
+                break Ok(());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            if let Err(error) = self.stream.set_write_timeout(Some(left)) {
+                break Err(error);
+            }
+            match self.stream.write(rest) {
+                Ok(0) => break Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(n) => rest = &rest[n..],
+                // The write timed out, or was interrupted: the deadline
+                // decides whether to try again.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = self.stream.set_write_timeout(None);
+        sent
     }
 
     /// Ask `may` for every attempt of `batch`, recording when first, and
@@ -1002,7 +1068,7 @@ impl Connection {
         self.next_q += lines.len() as u64;
         let mut unanswered = lines.len();
         for line in &lines {
-            if self.send(line).is_err() {
+            if self.send(line, approval.valid_until()).is_err() {
                 return approval;
             }
         }
@@ -2101,5 +2167,248 @@ pub(crate) mod tests {
             Connection::open_receipts_within(&dir.path().join("absent.sock"), "{}", wait),
             Opened::Unreachable
         ));
+    }
+
+    /// The slack a bounded wait in these pins may run past its budget, for a
+    /// loaded box that schedules a thread late.
+    #[cfg(unix)]
+    pub(crate) const TOLERANCE: Duration = Duration::from_secs(2);
+
+    /// Run `f` on a thread of its own and say how long it took, or `None` if
+    /// it has not come back ten seconds past `budget`. What these pins catch
+    /// is a call that blocks for good, which run inline would hang the test
+    /// instead of failing it.
+    #[cfg(unix)]
+    pub(crate) fn timed<T: Send + 'static>(
+        budget: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<(Duration, T)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let got = f();
+            let _ = tx.send((started.elapsed(), got));
+        });
+        rx.recv_timeout(budget + Duration::from_secs(10)).ok()
+    }
+
+    /// Scenario: Point a one-shot's receipts question at a socket whose accept
+    /// queue is full and that never accepts, as a saturated deck's is. The gate
+    /// comes back within its wait plus two seconds without opening it:
+    /// `Unsupported` where a full queue parks the connect (Linux),
+    /// `Unreachable` where the platform refuses it outright.
+    #[cfg(unix)]
+    #[spec("inbox/claude/033")]
+    #[test]
+    fn claude_033_the_receipts_gate_gives_up_on_a_deck_that_never_accepts() {
+        use crate::platform::ipc::{QueueFull, SaturatedListener};
+        let listener = SaturatedListener::new();
+        let path = listener.path.clone();
+        let wait = Duration::from_millis(300);
+        let (took, opened) = timed(wait, move || {
+            Connection::open_receipts_within(&path, "{}", wait)
+        })
+        .expect("the gate is still parked in connect(2)");
+        assert!(took < wait + TOLERANCE, "the gate took {took:?}");
+        match listener.behaviour {
+            QueueFull::Parks => assert!(matches!(opened, Opened::Unsupported), "{opened:?}"),
+            QueueFull::Refuses => assert!(matches!(opened, Opened::Unreachable), "{opened:?}"),
+        }
+    }
+
+    /// Scenario: A stand-in deck accepts a one-shot's connection and reads
+    /// nothing, and the question is larger than the socket can buffer, as any
+    /// question is once the deck's side has filled up. The gate gives up as
+    /// `Unsupported` within its wait plus two seconds instead of blocking in
+    /// the write. A batch of fifty thousand attempts run on a connection the
+    /// deck stops reading gives up its `may` questions when the approval runs
+    /// out and its report after `RECEIPTS_ANSWER_WAIT`, within both plus two
+    /// seconds.
+    #[cfg(unix)]
+    #[spec("inbox/claude/034")]
+    #[test]
+    fn claude_034_the_receipts_gate_gives_up_on_a_deck_that_does_not_read() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("deaf.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // The accepted socket stays open, unread, until the deck is joined.
+        let deck = std::thread::spawn(move || listener.accept().map(|(socket, _)| socket));
+        let question = format!("{{\"pad\":\"{}\"}}", "x".repeat(16 << 20));
+        let wait = Duration::from_millis(300);
+        let (took, opened) = timed(wait, move || {
+            Connection::open_receipts_within(&path, &question, wait)
+        })
+        .expect("the gate is still blocked writing its question");
+        assert!(took < wait + TOLERANCE, "the gate took {took:?}");
+        assert!(matches!(opened, Opened::Unsupported), "{opened:?}");
+        drop(deck.join());
+
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let batch = OneShotBatch::new((1..=50_000).map(|a| handout(ID1, a, 1, None)).collect());
+        let (took, ran) = timed(wait + RECEIPTS_ANSWER_WAIT, move || {
+            let mut connection = Connection::over(ours, MAX_LINE_BYTES).unwrap();
+            batch.run(
+                &mut connection,
+                &Pinned::Unpinned,
+                wait,
+                &mut Vec::new(),
+                &[],
+                Receiver::Hook,
+                None,
+            )
+        })
+        .expect("the batch is still blocked writing");
+        assert!(
+            took < wait + RECEIPTS_ANSWER_WAIT + TOLERANCE,
+            "the batch took {took:?}"
+        );
+        assert!(
+            ran.outputs
+                .iter()
+                .all(|output| *output == Output::NotHanded)
+        );
+        drop(theirs);
+    }
+
+    /// Scenario: A keepalive and an answer that the deck serves receipts are
+    /// already waiting on a one-shot's connection when its deadline passes:
+    /// reading with that deadline returns neither. Then a stand-in deck sends
+    /// a keepalive every two milliseconds until past the wait and only then
+    /// the answer; a prompt's commit against it is withheld within the wait
+    /// plus two seconds, and the question is the only line the deck reads.
+    #[cfg(unix)]
+    #[spec("inbox/claude/035")]
+    #[test]
+    fn claude_035_an_answer_after_the_deadline_is_not_taken_behind_keepalives() {
+        use std::io::BufRead;
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut connection = Connection::over(ours, MAX_LINE_BYTES).unwrap();
+        writeln!(theirs, r#"{{"keepalive":true}}"#).unwrap();
+        writeln!(theirs, r#"{{"one_shot_receipts":1}}"#).unwrap();
+        let deadline = Instant::now();
+        // Long enough for the reader thread to have queued both lines.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            connection.next(Some(deadline)).is_none(),
+            "a line waiting past the deadline is not taken"
+        );
+        assert!(
+            connection.next(None).is_some_and(|reply| reply.keepalive),
+            "the lines were there"
+        );
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("chatty.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let wait = Duration::from_millis(300);
+        let deck = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut writer = socket.try_clone().unwrap();
+            let mut lines = io::BufReader::new(socket).lines();
+            let mut got = vec![lines.next().unwrap().unwrap()];
+            let until = Instant::now() + wait + Duration::from_millis(500);
+            while Instant::now() < until {
+                if writeln!(writer, r#"{{"keepalive":true}}"#).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = writeln!(writer, r#"{{"one_shot_receipts":1}}"#);
+            got.extend(lines.map_while(Result::ok));
+            got
+        });
+        let attempt = crate::event::InboxAttemptRef {
+            id: ID1.to_string(),
+            a: 1,
+            e: 1,
+        };
+        let (took, committed) = timed(wait, move || {
+            crate::inbox_prompt::commit_attempts(
+                &path,
+                crate::inbox_prompt::CommitFor {
+                    pane_id: PANE,
+                    agent_id: Some(AGENT),
+                    token: "token-1",
+                },
+                vec![attempt],
+                &Pinned::Unpinned,
+                wait,
+            )
+        })
+        .expect("the commit is still waiting");
+        assert!(took < wait + TOLERANCE, "the commit took {took:?}");
+        assert_eq!(committed, crate::inbox_prompt::Committed::Withheld);
+        let seen = deck.join().unwrap();
+        assert_eq!(seen.len(), 1, "only the question: {seen:?}");
+        let question: serde_json::Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(question["message_type"], "inbox_receipts");
+    }
+
+    /// Scenario: A stand-in deck floods a one-shot's connection with 64 KiB
+    /// keepalive lines that the one-shot does not read. The deck soon cannot
+    /// write more, having pushed no more than the connection's queue of lines
+    /// and the socket's buffers rather than everything it had; and against a
+    /// deck that floods keepalives and never answers, the gate is
+    /// `Unsupported` within its wait plus two seconds.
+    #[cfg(unix)]
+    #[spec("inbox/claude/036")]
+    #[test]
+    fn claude_036_a_reply_flood_stays_bounded() {
+        use std::io::BufRead;
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _connection = Connection::over(ours, MAX_LINE_BYTES).unwrap();
+        let line = format!(
+            "{{\"keepalive\":true,\"pad\":\"{}\"}}\n",
+            "x".repeat(64 * 1024)
+        );
+        // What the one-shot may hold, with room for the socket's own buffers;
+        // a queue without a bound takes in all of `flood`.
+        let bound = (MAX_QUEUED_LINES + 2) * line.len() + (16 << 20);
+        let flood = 64 << 20;
+        theirs.set_nonblocking(true).unwrap();
+        let (mut pushed, mut at) = (0usize, 0usize);
+        let mut stalled: Option<Instant> = None;
+        while pushed <= flood {
+            match (&theirs).write(&line.as_bytes()[at..]) {
+                Ok(n) => {
+                    pushed += n;
+                    at = (at + n) % line.len();
+                    stalled = None;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if stalled.get_or_insert_with(Instant::now).elapsed()
+                        > Duration::from_millis(500)
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("the flood failed: {error}"),
+            }
+        }
+        assert!(
+            pushed <= bound,
+            "the one-shot took in {pushed} bytes it never read (bound {bound})"
+        );
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("flood.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let deck = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut writer = socket.try_clone().unwrap();
+            let mut lines = io::BufReader::new(socket).lines();
+            let _question = lines.next();
+            while writeln!(writer, r#"{{"keepalive":true}}"#).is_ok() {}
+        });
+        let wait = Duration::from_millis(300);
+        let (took, opened) = timed(wait, move || {
+            Connection::open_receipts_within(&path, "{}", wait)
+        })
+        .expect("the gate is still reading keepalives");
+        assert!(took < wait + TOLERANCE, "the gate took {took:?}");
+        assert!(matches!(opened, Opened::Unsupported), "{opened:?}");
+        drop(opened);
+        deck.join().unwrap();
     }
 }

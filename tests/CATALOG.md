@@ -9517,6 +9517,48 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the desktop's `classify_handshake` (same exact-equality rule, pinned in `desktop/src-tauri`), or a real 0.47.0 binary.
 - **Platform coverage:** mac+linux.
 
+##### inbox/claude/033 — The receipts gate gives up on a deck that never accepts.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::open_receipts_within` against a listener whose accept queue is full (`platform::ipc::SaturatedListener`).
+- **Agent:** none.
+- **Asserts:** the gate returns within its wait plus 2 s, `Unsupported` where a full queue parks the connect (Linux) and `Unreachable` where it is refused (the BSDs); it is never `Ready`.
+- **Does not assert:** a real daemon under load.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/034 — A one-shot's writes give up on a deck that does not read.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), a stand-in socket that accepts and never reads, and a socket pair whose far end never reads.
+- **Agent:** none.
+- **Asserts:** a question larger than the socket buffers is `Unsupported` within the wait plus 2 s; a batch of 50 000 attempts gives up its `may` lines when the approval runs out and its report after `RECEIPTS_ANSWER_WAIT`, within both plus 2 s, with every block not handed.
+- **Does not assert:** the deck's side of a stalled connection.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/035 — An answer after the deadline is not taken behind keepalives.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::next` over a socket pair, and `inbox_prompt::commit_attempts` against a stand-in socket.
+- **Agent:** none.
+- **Asserts:** a keepalive and a support answer already queued when the deadline passes are not returned for it; against a deck that sends keepalives every 2 ms past the wait and then the answer, the commit is `Withheld` within the wait plus 2 s and the question is the only line the deck reads.
+- **Does not assert:** a real daemon's keepalive cadence.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/036 — A reply flood stays bounded.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), a connection over a socket pair and the gate against a stand-in socket.
+- **Agent:** none.
+- **Asserts:** a deck flooding 64 KiB keepalive lines the one-shot does not read is held back after `MAX_QUEUED_LINES` lines plus the socket buffers (under 16 MiB slack) rather than taking in 64 MiB; against a deck that floods keepalives and never answers the gate is `Unsupported` within the wait plus 2 s.
+- **Does not assert:** the process's resident memory directly.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/037 — A prompt asks an older daemon once.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real prompt-hook CLI child against a stand-in 0.47.0 hook endpoint, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob.
+- **Agent:** none (no credential).
+- **Asserts:** a prompt carrying a waiter's whole block and a doorbell sends exactly one `inbox_receipts`, nothing that could take or commit mail, and exits 1 naming the refusal.
+- **Does not assert:** a supporting daemon, where each of the commit and the fetch asks on its own connection (inbox/claude/030, /031).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/038 — A prompt's commit exchange is bounded.
+- **Layer:** Fast (`src/inbox_prompt.rs`), `commit_attempts` against stand-in sockets that answer the question.
+- **Agent:** none.
+- **Asserts:** against a deck that then reads nothing, a 2 MB commit gives up as `Nothing` within two waits plus 2 s; against one that reads the commit and never replies, it is `Sent` within the same bound.
+- **Does not assert:** the daemon applying the commit (inbox/claude/016, /023).
+- **Platform coverage:** mac+linux.
+
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.

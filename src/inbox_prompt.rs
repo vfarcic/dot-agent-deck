@@ -304,8 +304,9 @@ impl std::fmt::Debug for OneShotInjection {
     }
 }
 
-/// How long Claude's prompt hook waits for the deck's answer to its fetch,
-/// as [`crate::hook::request_from_socket`] does.
+/// The budget of Claude's prompt hook's fetch once the deck has said it
+/// serves receipts: writing the fetch and reading its answer, as
+/// [`crate::hook::request_from_socket`] waits.
 #[cfg(unix)]
 const HOOK_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -317,9 +318,11 @@ const HOOK_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// It asks first whether the deck serves receipts, and fetches only from one
 /// that says so, on that same connection; one that does not is sent nothing
 /// that could take mail, and the hook says so
-/// ([`crate::inbox_oneshot::report_unsupported`]). A hook that declares no
-/// integration stands in for an older one and fetches unasked, on the legacy
-/// verb.
+/// ([`crate::inbox_oneshot::report_unsupported`]). A hook whose commit
+/// already found the deck not saying so does not ask again: the answer that
+/// keeps mail back is shared within the hook, the one that lets it through
+/// never is. A hook that declares no integration stands in for an older one
+/// and fetches unasked, on the legacy verb.
 #[cfg(unix)]
 pub fn one_shot_injection(
     budget: InboxBudget,
@@ -345,8 +348,11 @@ pub fn one_shot_injection(
     );
     request.hook_integration = crate::inbox_oneshot::declared_hook_integration();
     let path = crate::endpoint_resolve::client_socket_path();
-    let mut connection = if request.hook_integration.is_some() {
+    let (mut connection, deadline) = if request.hook_integration.is_some() {
         use crate::inbox_oneshot::{Connection, Opened};
+        if crate::inbox_oneshot::reported_unsupported() {
+            return None;
+        }
         let question = crate::inbox_oneshot::receipts_question(
             &request.pane_id,
             request.agent_id.as_deref(),
@@ -355,8 +361,9 @@ pub fn one_shot_injection(
         let json = serde_json::to_string(&DaemonMessage::InboxReceiptFetch(request)).ok()?;
         match Connection::open_receipts(&path, &question) {
             Opened::Ready(mut connection) => {
-                connection.send(&json).ok()?;
-                connection
+                let deadline = std::time::Instant::now() + HOOK_FETCH_WAIT;
+                connection.send(&json, deadline).ok()?;
+                (connection, deadline)
             }
             Opened::Unsupported => {
                 crate::inbox_oneshot::report_unsupported();
@@ -366,9 +373,9 @@ pub fn one_shot_injection(
         }
     } else {
         let json = serde_json::to_string(&DaemonMessage::InboxFetch(request)).ok()?;
-        crate::inbox_oneshot::Connection::open(&path, &json).ok()?
+        let connection = crate::inbox_oneshot::Connection::open(&path, &json).ok()?;
+        (connection, std::time::Instant::now() + HOOK_FETCH_WAIT)
     };
-    let deadline = std::time::Instant::now() + HOOK_FETCH_WAIT;
     let reply = loop {
         let reply = connection.next(Some(deadline))?;
         if !reply.keepalive {
@@ -562,14 +569,25 @@ pub enum Committed {
 /// read from its own caps file; for one found, its `committed` receipt is
 /// published on its commit cap and the attempt is named in an
 /// `inbox_committed` the deck admits from this agent's process tree, sent on
-/// the connection that asked, which waits `wait` for the answer to its
-/// question. One whose caps file is missing (reclaimed, or
+/// the connection that asked. One whose caps file is missing (reclaimed, or
 /// never a one-shot's) commits nothing: that is no evidence the delivery did
 /// not happen, and its own lapse decides it. A caps file that is malformed or
 /// cannot be read commits nothing either, and tells the deck its receipts are
 /// degraded. Nothing is acknowledged by id. A deck that pinned no spool has
 /// written no caps file for any attempt, so the exact attempts are named with
 /// that said, and the authenticated connection is the witness.
+///
+/// It takes two budgets of `wait`, one after the other: the question (connect,
+/// write, answer; [`crate::inbox_oneshot::Connection::open_receipts_within`]),
+/// and from its answer the commit (the receipts, the `inbox_committed` line
+/// and the deck's reply). No `inbox_committed` is written once the second has
+/// run out. So the prompt hook spends at most `wait` against a deck that
+/// does not answer and two against a slow one that does; with a doorbell in
+/// the same prompt its fetch adds a question and
+/// [`HOOK_FETCH_WAIT`] against a deck that serves receipts, and nothing
+/// against one this found not to ([`one_shot_injection`]). At the production
+/// five seconds each, that is at most about 5 s against an older daemon and
+/// 20 s against a slow newer one, before the hook's own work and status event.
 #[cfg(unix)]
 pub fn commit_attempts(
     socket: &std::path::Path,
@@ -593,6 +611,7 @@ pub fn commit_attempts(
         Opened::Unsupported => return Committed::Withheld,
         Opened::Refused(_) | Opened::Unreachable => return Committed::Refused,
     };
+    let deadline = std::time::Instant::now() + wait;
     let (committed, degraded) = match pinned {
         Pinned::Unpinned => (attempts, Some("the deck has no receipt spool".to_string())),
         Pinned::Failed(error) => (Vec::new(), Some(error.clone())),
@@ -649,14 +668,12 @@ pub fn commit_attempts(
     let Ok(json) = serde_json::to_string(&request) else {
         return Committed::Nothing;
     };
-    if connection.send(&json).is_err() {
+    if connection.send(&json, deadline).is_err() {
         return Committed::Nothing;
     }
     connection.finish();
     // The deck's answer, so it has read the line before the hook goes.
-    let _ = connection.next(Some(
-        std::time::Instant::now() + crate::inbox_oneshot::RECEIPTS_ANSWER_WAIT,
-    ));
+    let _ = connection.next(Some(deadline));
     Committed::Sent
 }
 
@@ -1220,5 +1237,85 @@ mod tests {
     #[cfg(unix)]
     fn holds_record(rec: &std::path::Path, key: &crate::inbox_receipt::RecordKey) -> bool {
         rec.join(key.file_name()).exists()
+    }
+
+    /// Scenario: A stand-in deck answers a prompt's receipts question that it
+    /// serves receipts, then reads nothing, and the commit is too large for the
+    /// socket to buffer: the commit is given up within two waits plus two
+    /// seconds. Another reads the commit and never replies: the commit counts
+    /// as sent within the same bound.
+    #[cfg(unix)]
+    #[spec("inbox/claude/038")]
+    #[test]
+    fn claude_038_a_prompts_commit_exchange_is_bounded() {
+        use std::io::{BufRead, Write};
+        use std::time::Duration;
+
+        use crate::inbox_oneshot::Pinned;
+        use crate::inbox_oneshot::tests::{TOLERANCE, timed};
+        // Long enough that building the commit is not what runs it out.
+        let wait = Duration::from_secs(1);
+        let who = CommitFor {
+            pane_id: "2",
+            agent_id: Some("agent-a"),
+            token: "token-1",
+        };
+        // A deck that answers the question, then reads `then` more lines and
+        // holds the connection open, unread and unanswered, until joined.
+        let deck = |name: &str, then: usize| {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let path = dir.path().join(name);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let serve = std::thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                let mut writer = socket.try_clone().unwrap();
+                let mut lines = std::io::BufReader::new(socket);
+                let mut got = Vec::new();
+                for _ in 0..=then {
+                    let mut line = String::new();
+                    lines.read_line(&mut line).unwrap();
+                    got.push(line);
+                    if got.len() == 1 {
+                        writeln!(writer, r#"{{"one_shot_receipts":1}}"#).unwrap();
+                    }
+                }
+                (got, lines, writer)
+            });
+            (dir, path, serve)
+        };
+
+        // About 2 MB: far past what the socket buffers.
+        let many: Vec<_> = (0..40_000)
+            .map(|a| crate::event::InboxAttemptRef {
+                id: ID.to_string(),
+                a,
+                e: 1,
+            })
+            .collect();
+        let (_dir, path, deaf) = deck("deaf.sock", 0);
+        let (took, committed) = timed(2 * wait, move || {
+            commit_attempts(&path, who, many, &Pinned::Unpinned, wait)
+        })
+        .expect("the commit is still blocked writing");
+        assert!(took < 2 * wait + TOLERANCE, "the commit took {took:?}");
+        assert_eq!(committed, Committed::Nothing);
+        let (got, _, _) = deaf.join().unwrap();
+        assert_eq!(got.len(), 1, "only the question was read: {got:?}");
+
+        let attempt = crate::event::InboxAttemptRef {
+            id: ID.to_string(),
+            a: 1,
+            e: 1,
+        };
+        let (_dir, path, silent) = deck("silent.sock", 1);
+        let (took, committed) = timed(2 * wait, move || {
+            commit_attempts(&path, who, vec![attempt], &Pinned::Unpinned, wait)
+        })
+        .expect("the commit is still waiting for a reply");
+        assert!(took < 2 * wait + TOLERANCE, "the commit took {took:?}");
+        assert_eq!(committed, Committed::Sent);
+        let (got, _, _) = silent.join().unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&got[1]).unwrap();
+        assert_eq!(sent["message_type"], "inbox_committed");
     }
 }
