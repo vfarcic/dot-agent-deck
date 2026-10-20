@@ -55,7 +55,8 @@
 #                    period, and never the id (`table.rs` refuses an `_`). That
 #                    sentence used to quote the id — `nothing in that asks for
 #                    "open_dir"` — and the first real use of the directory
-#                    browser met it (PRD #1223). Not sent to the model.
+#                    browser met it (PRD #1223). Not sent to the command
+#                    model; the meaning check lists every row by it.
 #   try_saying       a phrasing that DOES ask for the row, offered in the same
 #                    refusal: `try "open code"`. A `{param}` placeholder names a
 #                    required param and is filled with what the model heard for
@@ -68,9 +69,10 @@
 #   the command model, and a row with no reference — `submit_prompt` presses
 #   Enter in an agent's prompt — has nothing else between a steered pick and a
 #   dispatch (PRD #1223, closing audits F1/G1). So every pick is checked by a
-#   SECOND model call that sees only the transcript and this row's own
-#   `asks_to` and `description` — never an observed name — and the row runs
-#   only on a clear "yes" (`voice::meaning`). Until PRD #1733 that check was a
+#   SECOND model call, sent beside the command call, that sees only the
+#   transcript and every row's `asks_to` and `description` — never an
+#   observed name — and the row runs only when that call lists it
+#   (`voice::meaning`). Until PRD #1733 that check was a
 #   word list per row (`heard_as`, `heard_as_whole`, `heard_as_whole_while`,
 #   `heard_as_also`), which also refused every phrasing nobody had listed; the
 #   parser now refuses those columns by name. Because the check reads the

@@ -269,10 +269,10 @@ impl RemoteResolver {
         }
     }
 
-    /// PRD #1733: the meaning check — the same transport, credential and
-    /// failure wording again, with [`super::meaning`]'s body and reader. Its
-    /// body is built from the [`super::meaning::MeaningRequest`] alone, which
-    /// holds nothing observed.
+    /// PRD #1733: one vote of the meaning check — the same transport,
+    /// credential and failure wording again, with [`super::meaning`]'s body
+    /// and reader. Its body is built from the
+    /// [`super::meaning::MeaningRequest`] alone, which holds nothing observed.
     async fn run_meaning(
         &self,
         request: super::meaning::MeaningRequest<'_>,
@@ -290,7 +290,7 @@ impl RemoteResolver {
         };
         // Read from the bytes rather than from `post`'s JSON: `serde_json`
         // keeps one occurrence of a repeated key, so an Anthropic tool call
-        // whose input wrote `q1` twice would be read as whichever came last
+        // whose input wrote `yes` twice would be read as whichever came last
         // ([`super::meaning::parse_reply`]).
         let (status, reply) = self.post_for_bytes(body).await?;
         if !status.is_success() {
@@ -1110,9 +1110,6 @@ mod tests {
     /// and never a verdict.
     #[tokio::test]
     async fn voice_remote_meaning_check_fails_closed_in_both_dialects() {
-        let stop = crate::voice::table::table()
-            .row("stop_agent")
-            .expect("a shipped row");
         let transcript = Transcript::new("destroy the tester");
         for protocol in [
             Protocol::Anthropic,
@@ -1131,10 +1128,11 @@ mod tests {
                     ModelId::parse(HOSTED_COMMAND_MODEL).expect("valid"),
                     TokenCeiling::default(),
                 );
+                let table = crate::voice::table::table();
                 let request = crate::voice::meaning::MeaningRequest::new(
                     &transcript,
-                    crate::voice::table::table(),
-                    &[(stop, crate::voice::meaning::Strictness::Asks)],
+                    table,
+                    &crate::voice::meaning::every_action(table),
                 );
                 let error = resolver
                     .judge_meaning(request)

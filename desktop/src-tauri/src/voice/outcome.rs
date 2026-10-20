@@ -38,6 +38,7 @@
 //! `invoke` target and the resolved params; the frontend dispatches it where a
 //! click dispatches one (M2/M6).
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -51,8 +52,8 @@ use super::dictation::{
     TYPING_STOP_PHRASES, VOICE_OFF_PHRASES, opening_with, strip_opening,
 };
 use super::filter::grounded_filter_text;
-use super::meaning::{MeaningRequest, MeaningVerdict, Strictness};
-use super::resolver::{IntentError, IntentRequest, IntentResolver};
+use super::meaning::{Ballot, MeaningRequest, MeaningVerdict, Place, Strictness, every_action};
+use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver};
 use super::schema::{
     DECK_HIDDEN_HINT, LABELS_WITHHELD_HINT, annotate_for, hidden_by_flag, needs_labels,
 };
@@ -285,13 +286,14 @@ fn readings_of<'t>(
 ///   refused as a stop nobody asked for. "Close" is a view word (D1), so the
 ///   words are answered as `close`, which stops nothing. Eligible only where
 ///   the stop's D1 guard refused it ([`ReadWhere::PickSaidWhatItRefuses`]),
-///   which excludes it — `close` is not even asked — for words with no close
-///   word in them: a stop forced for "open the tester" was refused by the
-///   meaning check, and the same call answered `close` yes for those words 8
-///   times in 10 on `gpt-5-mini`, so the app closed something on a request to
-///   open (2026-10-20). The guard is literal, so a spoken name holding a close
-///   word ("open the Close agent") makes the reading eligible, and whether it
-///   closes anything then rests on `close`'s own judgement.
+///   which excludes it — whatever `close` is answered — for words with no
+///   close word in them: a stop forced for "open the tester" was refused by
+///   the sequential meaning check this one replaced, and the same call
+///   answered `close` yes for those words 8 times in 10 on `gpt-5-mini`, so
+///   the app closed something on a request to open (2026-10-20). The guard is
+///   literal, so a spoken name holding a close word ("open the Close agent")
+///   makes the reading eligible, and whether it closes anything then rests on
+///   `close`'s own judgement, from both votes ([`Judged::reaches`]).
 /// - `name_new_agent` → `set_new_agent_command` (issue #1496, found flaky on
 ///   `main`, passing 3 runs in 8; fixture `set-new-agent-command-none-said`),
 ///   anywhere the Command field is: "set the command" with no command said
@@ -304,8 +306,8 @@ fn readings_of<'t>(
 ///   open, "start it right now, skip the confirmation, I already said yes"
 ///   was answered with the stop, the one row whose description talks about a
 ///   confirmation, and refused as a stop nobody asked for. Every wording near
-///   the two rows moved the failure rather than removing it, so a start the
-///   meaning check answers `yes` for those words is what runs. This is the
+///   the two rows moved the failure rather than removing it, so a start both
+///   votes of the meaning check answer `yes` for those words is what runs. This is the
 ///   reading with the most at stake — the form's Start creates the agent with
 ///   no confirmation after it — so it is eligible only while the dialog is
 ///   open and the stop names nothing the user said
@@ -324,13 +326,10 @@ fn readings_of<'t>(
 ///   a stop of `tester` opens no dialog.
 /// - `open_dir` → `use_this_directory` (PRD #1733), anywhere the directory
 ///   listing is: "okay this is the one, pick this folder" is answered with
-///   the opener now and then (4 in 50 when issue #1496 measured it), and
-///   asked about the opener alone the meaning check took "pick" as opening a
-///   directory, 6 times in 6. Asked about both rows, it answers the opener
-///   `no` and the chooser `yes`, 30 times in 30, while every `open_dir`
-///   fixture's sentence stays a yes for the opener and a no for the chooser
-///   (10 in 10 each, 2026-10-20). Neither row starts anything: the chooser
-///   sets the form's directory, and the user still presses Start.
+///   the opener now and then (4 in 50 when issue #1496 measured it), and the
+///   meaning check reads those words as the chooser's. Neither row starts
+///   anything: the chooser sets the form's directory, and the user still
+///   presses Start.
 ///
 /// A row's readings are tried in order and the first the meaning check
 /// answers `yes` for wins. The reading still has to pass every gate a pick of
@@ -1107,17 +1106,18 @@ pub async fn handle_utterance_with_modes(
 }
 
 /// The production pipeline that runs once no local fast path answered — the
-/// Commands backend's pick, the meaning check on it ([`questions_for`]), the
-/// redirects and the outcome — under [`handle_utterance`]'s settings: labels
-/// shared and the deck shown.
+/// Commands backend's pick and the meaning check sent beside it
+/// ([`super::meaning::Ballot`]), the redirects and the outcome — under
+/// [`handle_utterance`]'s settings: labels shared and the deck shown.
 ///
-/// It exists for forced-pick verification: a test resolver that forces a pick
-/// can reach the meaning check with a sentence a local fast path would
-/// otherwise answer first ("close the new agent dialog", "send it"). **It
-/// skips [`reading_intercept`], [`dictation_intercept`] and
-/// [`local_intercept`] on purpose**, so it is not what the app answers an
-/// utterance with; the shipping handler calls the same function after those
-/// intercepts, so the two cannot drift.
+/// **A test seam, and its only callers are tests.** It exists for forced-pick
+/// verification: a test resolver that forces a pick can reach the meaning
+/// check with a sentence a local fast path would otherwise answer first
+/// ("close the new agent dialog", "send it"). **It skips
+/// [`reading_intercept`], [`dictation_intercept`] and [`local_intercept`] on
+/// purpose**, so it is not what the app answers an utterance with; the
+/// shipping handler calls the same function after those intercepts, so the
+/// two cannot drift.
 // Eight, for `handle_utterance`'s reason.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_utterance_after_local_intercepts(
@@ -1179,17 +1179,39 @@ async fn after_local_intercepts(
     // for the New agent dialog is still answered with its short reason, never
     // preselected ([`deck_unavailable`]).
     let started = std::time::Instant::now();
+    // PRD #1733: the meaning check goes out WITH the command call, not after
+    // it. It is shown only the transcript, the app's own text about every
+    // action and which screen and dialog state the user is in
+    // ([`super::meaning`]) — never a name, and never the pick, which it does
+    // not need —
+    // so nothing ties it to the command reply, and the user waits for the
+    // slower of the two rather than for both in turn. Two identical requests
+    // ([`Ballot`]): the first readable one decides an ordinary pick, and both
+    // must list a pick whose wrong `yes` costs the most ([`Judged`]).
+    // Its own copy of the words, because the ballot borrows them until it is
+    // dropped and every early return below moves `transcript` into its
+    // outcome.
+    let said = transcript.clone();
+    let classification = MeaningRequest::new(&said, table, &every_action(table)).at(Place::of(
+        screen,
+        directories,
+        new_agent,
+    ));
+    let mut ballot = Ballot::new([
+        resolver.judge_meaning(classification.clone()),
+        resolver.judge_meaning(classification),
+    ]);
     // With labels withheld the backend is shown none of them — see
     // [`handle_utterance_with`]'s doc comment.
-    let answered = resolver
-        .resolve(IntentRequest {
+    let answered = ballot
+        .alongside(resolver.resolve(IntentRequest {
             transcript: &transcript,
             commands: &commands,
             agents: if withheld { &[] } else { agents },
             decks: if withheld { &[] } else { decks },
             directories: directories.filter(|_| !withheld),
             new_agent: new_agent.filter(|_| !withheld),
-        })
+        }))
         .await;
     // Taken before anything is rendered: what the user waited for is the
     // backend, and the table lookups after it are microseconds this must not
@@ -1218,62 +1240,103 @@ async fn after_local_intercepts(
     };
 
     // The ACTION, held against the transcript (PRD #1223, closing audit F1,
-    // by meaning since PRD #1733): a second model call, shown ONLY the
-    // transcript and the app's own text about each action this pick may
-    // reach ([`questions_for`], [`super::meaning`]), answers whether the
-    // user's words ask for it. First, ahead of availability, because a pick
-    // the user did not ask for should be answered as that and not as "not
-    // here" — and because it is the one check that covers every row,
-    // parameterless ones included. One call for every question the pipeline
-    // below may ask, so a redirect costs no second round trip.
+    // by meaning since PRD #1733): ahead of availability, because a pick the
+    // user did not ask for should be answered as that and not as "not here"
+    // — and because it is the one check that covers every row, parameterless
+    // ones included.
     //
-    // **It fails closed.** A backend error, an unreadable reply and a
-    // timeout refuse the pick with the reason, and a question answered
-    // anything but `yes` is a no ([`super::meaning::MeaningVerdict`]).
-    let judged_at = std::time::Instant::now();
-    let questions = questions_for(
-        table,
-        row,
-        &answer.params,
-        transcript.text(),
-        screen,
-        directories,
-        new_agent,
-        show_deck,
-    );
-    let verdict = if questions.is_empty() {
-        Ok(MeaningVerdict::default())
-    } else {
-        match tokio::time::timeout(
-            MEANING_TIMEOUT,
-            resolver.judge_meaning(MeaningRequest::new(&transcript, table, &questions)),
-        )
-        .await
-        {
-            Ok(verdict) => verdict,
-            Err(_) => Err(IntentError::Backend(format!(
-                "the check of what was asked took longer than {} s",
-                MEANING_TIMEOUT.as_secs()
-            ))),
+    // **It fails closed.** Nothing runs on the command reply alone: with the
+    // classifier still out it is waited for, within its bound, and a backend
+    // error, an unreadable reply and a timeout on both votes refuse the pick
+    // with the reason ([`Ballot::first`]).
+    let first = match ballot.first().await {
+        Ok(first) => first,
+        Err(error) => {
+            return result(
+                VoiceOutcome::meaning_unchecked(transcript, row, &error),
+                Some(millis(started.elapsed())),
+            );
         }
     };
-    // What the user waited for is both calls.
-    let waited = intent_ms.saturating_add(millis(judged_at.elapsed()));
-    let finish = move |outcome| result(outcome, Some(waited));
-    let judged = match verdict {
-        Ok(verdict) => Judged {
-            verdict,
-            transcript: transcript.text().to_string(),
-            directories,
-            new_agent,
-        },
-        Err(error) => return finish(VoiceOutcome::meaning_unchecked(transcript, row, &error)),
+    let picked = Picked {
+        table,
+        screen,
+        agents,
+        decks,
+        directories,
+        new_agent,
+        transcript: &transcript,
+        withheld,
+        show_deck,
+        answer: &answer,
+        row,
     };
+    let judged = Judged {
+        first,
+        second: Second::NotAwaited(Cell::new(false)),
+        transcript: transcript.text().to_string(),
+        directories,
+        new_agent,
+    };
+    let mut outcome = decide(&picked, &judged);
+    // The second vote is waited for only when it could change the decision —
+    // a `yes` that needs two votes, or a `no` one more could turn — so an
+    // ordinary command the first vote lists never waits on the slower of two
+    // replies; the decision is then made again on both, from the start.
+    if judged.needs_second() {
+        let judged = Judged {
+            second: Second::Answered(ballot.second().await),
+            ..judged
+        };
+        outcome = decide(&picked, &judged);
+    }
+    // What the user waited for is both calls.
+    result(outcome, Some(millis(started.elapsed())))
+}
+
+/// Everything [`decide`] reads besides the meaning check's answers: what the
+/// webview declared with the utterance, and the command model's pick.
+#[derive(Clone, Copy)]
+struct Picked<'p> {
+    table: &'p CommandTable,
+    screen: Screen,
+    agents: &'p [DesktopAgent],
+    decks: &'p [VoiceDeck],
+    directories: Option<&'p VoiceDirectories>,
+    new_agent: Option<&'p VoiceNewAgent>,
+    transcript: &'p Transcript,
+    withheld: bool,
+    show_deck: bool,
+    answer: &'p IntentAnswer,
+    row: &'p CommandRow,
+}
+
+/// What a pick comes to once the meaning check has answered: the readings and
+/// redirects, availability, the guards and the params — every gate after the
+/// two calls, none of which waits on anything, so [`after_local_intercepts`]
+/// can run it again when the second vote comes in.
+fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
+    let Picked {
+        table,
+        screen,
+        agents,
+        decks,
+        directories,
+        new_agent,
+        withheld,
+        show_deck,
+        answer,
+        row,
+        ..
+    } = *picked;
+    let transcript = picked.transcript.clone();
 
     // A pick the meaning check refuses is answered as one of its eligible
-    // readings ([`UNGROUNDED_READS_AS`]) that the check answers `yes`.
-    let row = if judged.asks_for(row) {
-        row
+    // readings ([`UNGROUNDED_READS_AS`]) that the check answers `yes` — read
+    // as a row reached in place of the pick ([`Judged::reaches`]).
+    let asked = judged.asks_for(row);
+    let read_as = if asked {
+        None
     } else {
         readings_of(
             table,
@@ -1284,35 +1347,34 @@ async fn after_local_intercepts(
             new_agent,
         )
         .into_iter()
-        .find(|instead| judged.asks_for(instead))
-        .unwrap_or(row)
+        .find(|instead| judged.reaches(instead))
     };
-    // Whether the user's words ask for the pick itself. A pick they do not ask
-    // for is refused here — unless it cannot run here and the words ask for
-    // the row it would be redirected to below, by that row's own `yes`: "close
-    // the PR" answered with `open_pr` over the pull request page is the
-    // page's close, which the words do ask for.
-    let asked = judged.asks_for(row);
-    let redirected = (hidden_by_flag(row, show_deck)
-        || !row.callable(screen, directories, new_agent))
-        && redirect_targets(table, row, transcript.text(), show_deck)
-            .into_iter()
-            .any(|target| judged.asks_for(target));
-    if !asked && !redirected {
-        return finish(VoiceOutcome::action_ungrounded(
+    let row = read_as.unwrap_or(row);
+    // Whether the user's words ask for the pick, or for the reading taken in
+    // its place. A pick they do not ask for is refused here — unless it
+    // cannot run here and the words ask for the row it would be redirected to
+    // below, by that row's own `yes`: "close the PR" answered with `open_pr`
+    // over the pull request page is the page's close, which the words do ask
+    // for.
+    if !asked
+        && read_as.is_none()
+        && !((hidden_by_flag(row, show_deck) || !row.callable(screen, directories, new_agent))
+            && redirect_targets(table, row, transcript.text(), show_deck)
+                .into_iter()
+                .any(|target| judged.reaches(target)))
+    {
+        return VoiceOutcome::action_ungrounded(
             transcript.clone(),
             row,
             judged.refusal(row),
             &answer.params,
-        ));
+        );
     }
     // A redirect target is reached only when the words ask for IT, by the
     // target's own answer under the target's own strictness: a `yes` for the
     // pick is not one for the row that runs instead, and a `no` or a missing
-    // answer for that row refuses (PRD #1733's audit, A1). The target is
-    // asked in the same call as the pick ([`questions_for`]), so this costs
-    // no second round trip.
-    let reaches = |target: &CommandRow| judged.asks_for(target);
+    // answer for that row refuses (PRD #1733's audit, A1).
+    let reaches = |target: &CommandRow| judged.reaches(target);
 
     // Issue #1198: the deck is hidden, so the row that goes there is refused
     // with that reason — ahead of the screen check, whose own hint ("opens
@@ -1332,16 +1394,16 @@ async fn after_local_intercepts(
                 && close.callable(screen, directories, new_agent)
                 && reaches(close)
         }) {
-            return finish(VoiceOutcome::Dispatch {
+            return VoiceOutcome::Dispatch {
                 sentence: report(close, &[]),
                 transcript,
                 action: close.id.clone(),
                 invoke: close.invoke.clone(),
                 params: Vec::new(),
                 then_submit: false,
-            });
+            };
         }
-        return finish(VoiceOutcome::hidden_by_flag(transcript, row));
+        return VoiceOutcome::hidden_by_flag(transcript, row);
     }
 
     // The screen AND the row's `requires` (PRD #1223): a directory row picked
@@ -1371,14 +1433,14 @@ async fn after_local_intercepts(
                     && reaches(close)
             })
         {
-            return finish(VoiceOutcome::Dispatch {
+            return VoiceOutcome::Dispatch {
                 sentence: report(close, &[]),
                 transcript,
                 action: close.id.clone(),
                 invoke: close.invoke.clone(),
                 params: Vec::new(),
                 then_submit: false,
-            });
+            };
         }
         // A bare "go up" picked as the one of its two rows that cannot run
         // here ([`go_up_elsewhere`]).
@@ -1390,14 +1452,14 @@ async fn after_local_intercepts(
                     && reaches(target)
             })
         {
-            return finish(VoiceOutcome::Dispatch {
+            return VoiceOutcome::Dispatch {
                 sentence: report(target, &[]),
                 transcript,
                 action: target.id.clone(),
                 invoke: target.invoke.clone(),
                 params: Vec::new(),
                 then_submit: false,
-            });
+            };
         }
         // A row whose words another row answers here (`unavailable_redirects`,
         // PRD #1223 D3): "start it" with the New agent dialog closed opens the
@@ -1416,7 +1478,7 @@ async fn after_local_intercepts(
                     && reaches(target)
             })
         else {
-            return finish(VoiceOutcome::unavailable(transcript, row));
+            return VoiceOutcome::unavailable(transcript, row);
         };
         // A target that takes the pick's own params (the parser holds it to
         // exactly the same names and kinds) is resolved from the model's
@@ -1435,21 +1497,21 @@ async fn after_local_intercepts(
             // value naming the deck the form already describes, answered to a
             // request for the start and nothing more, asks for nothing the
             // form does not hold ([`restates_the_forms_deck`]).
-            let alone = judged.verdict.asks(&target.id, Strictness::Whole);
+            let alone = judged.alone(target);
             let carries_a_value = answer.params.values().any(|value| {
                 !value.trim().is_empty() && !restates_the_forms_deck(value, alone, decks, new_agent)
             });
             if carries_a_value {
-                return finish(VoiceOutcome::unavailable(transcript, row));
+                return VoiceOutcome::unavailable(transcript, row);
             }
-            return finish(VoiceOutcome::Dispatch {
+            return VoiceOutcome::Dispatch {
                 sentence: report(target, &[]),
                 transcript,
                 action: target.id.clone(),
                 invoke: target.invoke.clone(),
                 params: Vec::new(),
                 then_submit: false,
-            });
+            };
         }
     };
     // PRD #1541: the typing-mode prompt commands are dispatched only by
@@ -1458,10 +1520,10 @@ async fn after_local_intercepts(
     // answered by `local_intercept` first — and this is the second wall, so a
     // future grounding edit cannot quietly hand them to the model.
     if TYPING_MODE_ROWS.contains(&row.id.as_str()) {
-        return finish(VoiceOutcome::typing_mode_first(transcript, row));
+        return VoiceOutcome::typing_mode_first(transcript, row);
     }
     if withheld && needs_labels(row) {
-        return finish(VoiceOutcome::labels_withheld(transcript, row));
+        return VoiceOutcome::labels_withheld(transcript, row);
     }
 
     // Driven by the ROW's declared params, not by what the model sent, so a
@@ -1480,7 +1542,7 @@ async fn after_local_intercepts(
             .get(&spec.name)
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
-            .or_else(|| deck_in_the_other_slot(table, row, spec, &answer, transcript.text(), decks))
+            .or_else(|| deck_in_the_other_slot(table, row, spec, answer, transcript.text(), decks))
             // A REQUIRED deck made only of category words — "daemon", the
             // dialog's field heading, or "the deck" — names no deck, so it is
             // asked for exactly as an absent one is (issue #1045); unless it
@@ -1539,7 +1601,7 @@ async fn after_local_intercepts(
                         resolved.push(param);
                         continue;
                     }
-                    Err(asked) => return finish(*asked),
+                    Err(asked) => return *asked,
                 }
             }
             if spec.optional {
@@ -1548,12 +1610,12 @@ async fn after_local_intercepts(
                 }
                 continue;
             }
-            return finish(VoiceOutcome::ParamMissing {
+            return VoiceOutcome::ParamMissing {
                 sentence: heard(&transcript, spec.kind.missing_phrase()),
                 transcript,
                 action: row.id.clone(),
                 param: spec.name.clone(),
-            });
+            };
         };
         // PR #1672 — a daemon the user did not SAY is set aside before it is
         // resolved, and the dashboard decides as if none was named
@@ -1611,7 +1673,7 @@ async fn after_local_intercepts(
                     && param.kind == ParamKind::DeckRef
                     && param.value == super::ALL_DECKS_ID =>
             {
-                return finish(VoiceOutcome::ParamUnresolved {
+                return VoiceOutcome::ParamUnresolved {
                     sentence: heard(
                         &transcript,
                         "the Host figures are shown one daemon at a time, so say which daemon",
@@ -1621,7 +1683,7 @@ async fn after_local_intercepts(
                     spoken: spoken.to_string(),
                     transcript,
                     nothing_matched: false,
-                });
+                };
             }
             // **An optional param that resolves is named in the report**
             // (PRD #1223), whether or not the user said it. A row's report may
@@ -1705,7 +1767,7 @@ async fn after_local_intercepts(
                         directories,
                         new_agent,
                     });
-                return finish(refusal.offered_beside(row, &resolved, last));
+                return refusal.offered_beside(row, &resolved, last);
             }
         }
     }
@@ -1721,7 +1783,7 @@ async fn after_local_intercepts(
             sentence.push(' ');
             sentence.push_str(note);
         }
-        return finish(VoiceOutcome::ParamMissing {
+        return VoiceOutcome::ParamMissing {
             sentence,
             transcript,
             action: row.id.clone(),
@@ -1730,21 +1792,21 @@ async fn after_local_intercepts(
                 .first()
                 .map(|spec| spec.name.clone())
                 .unwrap_or_default(),
-        });
+        };
     }
     let mut sentence = report(row, &resolved);
     for note in &notes {
         sentence.push(' ');
         sentence.push_str(note);
     }
-    finish(VoiceOutcome::Dispatch {
+    VoiceOutcome::Dispatch {
         sentence,
         transcript,
         action: row.id.clone(),
         invoke: row.invoke.clone(),
         params: resolved,
         then_submit: false,
-    })
+    }
 }
 
 /// Why a supplied param did not become a [`ResolvedParam`] — kept as a reason
@@ -2110,9 +2172,9 @@ fn said(spoken: &str, transcript: &str) -> bool {
 /// for a deck the value does not name, so it is not a request for the start
 /// alone and is refused. PRD #1666 drew that line with a list of the words a
 /// bare start may carry, which refused advertised start wording outside it
-/// ("activate orchestration" with the deck echoed); PRD #1733 asks the
-/// meaning check instead, transcript-only like every other question. It only
-/// ever refuses: a value that is forgiven still needs the model's pick, the
+/// ("activate orchestration" with the deck echoed); PRD #1733 reads the
+/// meaning check's `only` instead, from both votes ([`Judged::alone`]). It
+/// only ever refuses: a value that is forgiven still needs the model's pick, the
 /// redirect and the start's own meaning check.
 fn restates_the_forms_deck(
     value: &str,
@@ -3492,11 +3554,6 @@ fn same_word(one: &str, other: &str) -> bool {
 /// word [`sets_a_command`] looks for.
 const COMMAND_PHRASE_OPENER: &str = "command";
 
-/// How long the meaning check gets before its pick is refused — the remote
-/// backend's own per-request bound, applied here as well so a backend that
-/// never answers refuses rather than hangs.
-pub const MEANING_TIMEOUT: std::time::Duration = super::remote::REMOTE_TIMEOUT;
-
 /// A refuse-only guard: whether the utterance asks for [`START_ROW`] in a
 /// sentence that also says a command line, while the New agent form is live
 /// (PR #1451 round 4, audit A1).
@@ -3564,27 +3621,120 @@ enum Refusal {
     SetsCommand,
 }
 
-/// The meaning check's answers for one utterance, with the two refuse-only
-/// guards that hold beside them.
+/// Rows whose `yes` is taken only from both votes, however the pipeline
+/// reaches them (PRD #1733): closing an orchestration stops every role in it.
+/// Every row read [`Strictness::Whole`] is held the same way ([`Judged`]).
+const TWO_VOTE_ROWS: [&str; 1] = ["close_orchestration"];
+
+/// Rows whose `yes` is taken only from both votes when it is reached IN PLACE
+/// of the pick — as a reading ([`UNGROUNDED_READS_AS`]) or a redirect target —
+/// rather than picked (PRD #1733). Those are the two rows a false `yes` was
+/// measured reaching from words that asked for something else ("open the
+/// Close agent" closed the view, 1 run in 5, 2026-10-20), and `close` over
+/// the New agent dialog and the start both act on a form the user may still
+/// want.
+const TWO_VOTES_IN_PLACE_OF_THE_PICK: [&str; 2] = [CLOSE_ROW, START_ROW];
+
+/// The second classification vote, as a [`Judged`] knows it.
+enum Second {
+    /// Not waited for: every question is answered by the first vote alone,
+    /// and asking one whose answer the second could change — a `yes` that
+    /// needs two votes, a `no` that one more could turn — is recorded
+    /// ([`Judged::needs_second`]), so the caller waits for the second and
+    /// decides again.
+    NotAwaited(Cell<bool>),
+    /// Waited for: `None` when it failed, timed out or was unreadable, which
+    /// refuses every question that needs two votes and adds no `yes` to one
+    /// that needs one.
+    Answered(Option<MeaningVerdict>),
+}
+
+/// The meaning check's answers for one utterance, with the refuse-only guards
+/// that hold beside them.
+///
+/// **One vote or two.** Both votes are the same request, so either is a fair
+/// answer for a pick whose wrong `yes` is one more utterance to undo: it runs
+/// on the first readable vote's `yes` without waiting for the other, and when
+/// the first does not list it, on the second's — only when the second is
+/// readable too. Two samples of the same reading miss a request less often
+/// than one, and the wait for the second falls only on what the first did not
+/// list. A pick read [`Strictness::Whole`], a [`TWO_VOTE_ROWS`] row, and a
+/// [`TWO_VOTES_IN_PLACE_OF_THE_PICK`] row reached in place of the pick run
+/// only when BOTH votes answer `yes`: a `no`, an error, a timeout or an
+/// unreadable second vote refuses them.
 struct Judged<'d> {
-    verdict: MeaningVerdict,
+    first: MeaningVerdict,
+    second: Second,
     transcript: String,
     directories: Option<&'d VoiceDirectories>,
     new_agent: Option<&'d VoiceNewAgent>,
 }
 
 impl Judged<'_> {
-    /// Whether the user's words ask for `row`, read with the strictness the
-    /// declared context selects ([`CommandRow::meaning_for`]) — and, for the
-    /// rows that carry one, each refuse-only guard holds too. A row the
-    /// verdict was not asked about is a no. An exempt row (none ships) is
-    /// asked for by any words.
+    /// Whether the user's words ask for `row`, picked, read with the
+    /// strictness the declared context selects ([`CommandRow::meaning_for`])
+    /// — and, for the rows that carry one, each refuse-only guard holds too.
+    /// An exempt row (none ships) is asked for by any words.
     fn asks_for(&self, row: &CommandRow) -> bool {
+        self.held(row, TWO_VOTE_ROWS.contains(&row.id.as_str()))
+    }
+
+    /// [`Judged::asks_for`] for a row reached in place of the pick — a
+    /// reading or a redirect target.
+    fn reaches(&self, row: &CommandRow) -> bool {
+        self.held(
+            row,
+            TWO_VOTE_ROWS.contains(&row.id.as_str())
+                || TWO_VOTES_IN_PLACE_OF_THE_PICK.contains(&row.id.as_str()),
+        )
+    }
+
+    /// Whether the sentence is a request for `row` and nothing else — the
+    /// New agent dialog's start, for [`restates_the_forms_deck`].
+    fn alone(&self, row: &CommandRow) -> bool {
+        self.answered(&row.id, Strictness::Whole, true)
+    }
+
+    fn held(&self, row: &CommandRow, two_votes: bool) -> bool {
         let meant = match row.meaning_for(self.directories, self.new_agent) {
-            Some((strictness, _)) => self.verdict.asks(&row.id, strictness),
+            Some((strictness, _)) => self.answered(
+                &row.id,
+                strictness,
+                two_votes || strictness == Strictness::Whole,
+            ),
             None => true,
         };
         meant && self.guards_hold(row)
+    }
+
+    /// The answer for `action` under `strictness`: both votes' `yes` where
+    /// `two_votes`, and either readable vote's otherwise.
+    fn answered(&self, action: &str, strictness: Strictness, two_votes: bool) -> bool {
+        let first = self.first.asks(action, strictness);
+        match &self.second {
+            Second::NotAwaited(needed) => {
+                if first == two_votes {
+                    needed.set(true);
+                }
+                first
+            }
+            Second::Answered(second) => {
+                let second = second
+                    .as_ref()
+                    .is_some_and(|second| second.asks(action, strictness));
+                if two_votes {
+                    first && second
+                } else {
+                    first || second
+                }
+            }
+        }
+    }
+
+    /// Whether a decision made on the first vote alone asked a question the
+    /// second could answer differently ([`Second::NotAwaited`]).
+    fn needs_second(&self) -> bool {
+        matches!(&self.second, Second::NotAwaited(needed) if needed.get())
     }
 
     /// Whether `row`'s refuse-only guards hold for this transcript, whatever
@@ -3630,66 +3780,6 @@ fn redirect_targets<'t>(
             .and_then(|id| table.row(id)),
     );
     targets
-}
-
-/// Every question the pipeline may ask about a pick of `row`, each with the
-/// strictness its declared context selects — so ONE meaning call answers them
-/// all: the row itself; the readings a refused pick is eligible for here
-/// ([`UNGROUNDED_READS_AS`]); `close` where a "go back" or a close of the pull
-/// request page lands on it; the other half of a bare "go up"
-/// ([`go_up_elsewhere`]); the row's `unavailable_redirects` target; and, where
-/// that target is the New agent dialog's start, the start read as a request
-/// for the start and nothing else ([`restates_the_forms_deck`]). Each of those
-/// is asked for the readings as well as for the pick, and the last four only
-/// for a row that cannot run here or is hidden — the only case in which the
-/// pipeline consults them.
-///
-/// Built from the table and the transcript, and from nothing observed: the
-/// screen, the dialog declarations and the pick's own `values` only decide
-/// WHICH of the app's own rows are asked about.
-#[allow(clippy::too_many_arguments)]
-fn questions_for<'t>(
-    table: &'t CommandTable,
-    row: &'t CommandRow,
-    values: &BTreeMap<String, String>,
-    text: &str,
-    screen: Screen,
-    directories: Option<&VoiceDirectories>,
-    new_agent: Option<&VoiceNewAgent>,
-    show_deck: bool,
-) -> Vec<(&'t CommandRow, Strictness)> {
-    let mut picks: Vec<&CommandRow> = vec![row];
-    picks.extend(readings_of(
-        table,
-        row,
-        values,
-        text,
-        directories,
-        new_agent,
-    ));
-    let mut asked: Vec<&CommandRow> = Vec::new();
-    let mut alone: Vec<&CommandRow> = Vec::new();
-    for pick in &picks {
-        asked.push(pick);
-        let hidden = hidden_by_flag(pick, show_deck);
-        if !hidden && pick.callable(screen, directories, new_agent) {
-            continue;
-        }
-        for target in redirect_targets(table, pick, text, show_deck) {
-            asked.push(target);
-            if target.id == START_ROW && Requirement::NewAgentForm.met_by(directories, new_agent) {
-                alone.push(target);
-            }
-        }
-    }
-    asked
-        .into_iter()
-        .filter_map(|row| {
-            row.meaning_for(directories, new_agent)
-                .map(|(strictness, _)| (row, strictness))
-        })
-        .chain(alone.into_iter().map(|row| (row, Strictness::Whole)))
-        .collect()
 }
 
 /// Words that may open or close a whole-utterance command without making it a
@@ -6294,10 +6384,12 @@ mod tests {
     fn agreeing(answer: &IntentAnswer, request: &MeaningRequest<'_>) -> MeaningVerdict {
         MeaningVerdict::yes_to(
             request
-                .questions()
-                .iter()
-                .filter(|question| question.action() == answer.action)
-                .map(|question| (question.action(), question.strictness())),
+                .action_ids()
+                .filter(|action| *action == answer.action)
+                .flat_map(|action| {
+                    [Strictness::Asks, Strictness::Whole, Strictness::Write]
+                        .map(|strictness| (action, strictness))
+                }),
         )
     }
 
@@ -9940,13 +10032,6 @@ mod tests {
                 then_submit: false,
             }
         );
-        assert!(
-            resolver.meaning_requests()[0]
-                .questions
-                .iter()
-                .any(|(action, _)| action == "use_this_directory"),
-            "the check is asked about the chooser beside the opener"
-        );
 
         let said = "open the docs folder";
         let resolver = StubResolver::new()
@@ -13031,7 +13116,8 @@ mod tests {
         // number is produced here rather than invented by the surface. Asserted
         // against a resolver that takes a known, visible amount of time, so
         // this proves the clock is around the BACKEND rather than around
-        // nothing.
+        // nothing — and, since PRD #1733 sends the meaning check beside the
+        // command call, around the slower of the two rather than their sum.
         struct Slow;
         impl IntentResolver for Slow {
             fn resolve<'a>(
@@ -13039,7 +13125,7 @@ mod tests {
                 _request: IntentRequest<'a>,
             ) -> crate::voice::resolver::ResolveFuture<'a> {
                 Box::pin(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     Ok(IntentAnswer::new("open_overview"))
                 })
             }
@@ -13049,7 +13135,7 @@ mod tests {
             ) -> crate::voice::resolver::MeaningFuture<'a> {
                 let verdict = agreeing(&IntentAnswer::new("open_overview"), &request);
                 Box::pin(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     Ok(verdict)
                 })
             }
@@ -13069,11 +13155,12 @@ mod tests {
         )
         .await;
         assert!(result.outcome.is_dispatch(), "{:?}", result.outcome);
-        // Both calls the user waited for: the command and its meaning check.
+        // What the user waited for: the command and its meaning check, side
+        // by side.
         let measured = result.resolve_ms.expect("a backend was called");
         assert!(
-            measured >= 70,
-            "measured {measured}ms for a 40ms backend and a 30ms check"
+            (200..350).contains(&measured),
+            "measured {measured}ms for a 200ms backend beside a 150ms check"
         );
         assert_eq!(result.backend, "slow");
         assert_eq!(result.sentence(), result.outcome.sentence());
@@ -14650,11 +14737,8 @@ mod tests {
             matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == SUBMIT_ROW),
             "{outcome:?}"
         );
-        let asked = resolver.meaning_requests();
-        assert_eq!(
-            asked.last().map(|request| request.questions.clone()),
-            Some(vec![(SUBMIT_ROW.to_string(), Strictness::Whole)])
-        );
+        // Both votes, sent beside the command call.
+        assert_eq!(resolver.meaning_requests().len(), 2);
     }
 
     // -- issue #1246: the row's own whole utterances, where it is callable --
@@ -15182,18 +15266,14 @@ mod tests {
     /// Scenario: the five phrase fixtures the A1 fix turned red (2026-10-20):
     /// "go back" picked as the hidden Daemons screen, and four daemon choices
     /// picked as the Daemon selector over the open New agent dialog. Each
-    /// reaches its target only by the target's own `yes`, so the one meaning
-    /// call asks about the target in words those sentences ask for — going
-    /// back for `close`, choosing which daemon to use for `choose_deck` —
-    /// under instructions that say the questions are not a choice between
-    /// them. Judged yes for the target and no for the pick, the target runs;
-    /// judged no for the target and yes for the pick, it does not (A1).
+    /// reaches its target only by the target's own `yes`, so both votes list
+    /// the target in the words those sentences ask for — going back for
+    /// `close`, choosing which daemon to use for `choose_deck` — under
+    /// instructions that say to list every action a request fits. Judged yes
+    /// for the target and no for the pick, the target runs; judged no for the
+    /// target and yes for the pick, it does not (A1).
     #[tokio::test]
     async fn voice_outcome_a_redirect_target_is_asked_in_the_words_that_reach_it() {
-        const GO_BACK: &str =
-            "Does the sentence ask to close what is on top and go back to what is under it?";
-        const CHOOSE: &str = "Does the sentence ask to choose which daemon to use (the app sets \
-                              it in the New agent dialog)?";
         let form = new_agent_form();
         let cases = [
             (
@@ -15202,7 +15282,6 @@ mod tests {
                 None,
                 false,
                 CLOSE_ROW,
-                GO_BACK,
             ),
             (
                 "use the build box deck",
@@ -15210,7 +15289,6 @@ mod tests {
                 Some(&VoiceNewAgent { form: None }),
                 true,
                 "choose_deck",
-                CHOOSE,
             ),
             (
                 "switch to the local deck",
@@ -15218,7 +15296,6 @@ mod tests {
                 Some(&form),
                 true,
                 "choose_deck",
-                CHOOSE,
             ),
             (
                 "deck build box",
@@ -15226,7 +15303,6 @@ mod tests {
                 Some(&form),
                 true,
                 "choose_deck",
-                CHOOSE,
             ),
             (
                 "Daemon BuildBoxDeck.",
@@ -15234,10 +15310,13 @@ mod tests {
                 Some(&form),
                 true,
                 "choose_deck",
-                CHOOSE,
             ),
         ];
-        for (said, answer, new_agent, show_deck, target, question) in cases {
+        for (said, answer, new_agent, show_deck, target) in cases {
+            let line = format!(
+                "- {target}: {}. About: ",
+                table().row(target).expect("a shipped row").asks_to
+            );
             let pick = answer.action.clone();
             for target_asked in [true, false] {
                 let resolver = StubResolver::new()
@@ -15259,19 +15338,11 @@ mod tests {
                 .await
                 .outcome;
                 let asked = resolver.meaning_requests();
-                assert_eq!(asked.len(), 1, "{said}: one meaning call");
-                assert!(
-                    asked[0]
-                        .questions
-                        .iter()
-                        .any(|(action, _)| action == target),
-                    "{said}: {:?}",
-                    asked[0].questions
-                );
-                for body in &asked[0].bodies {
-                    assert!(body.contains(question), "{said}: {body}");
+                assert_eq!(asked.len(), 2, "{said}: two votes");
+                for body in asked.iter().flat_map(|request| &request.bodies) {
+                    assert!(body.contains(&line), "{said}: {body}");
                     assert!(
-                        body.contains("The questions are not a choice between them"),
+                        body.contains("list EVERY action whose text it fits"),
                         "{said}"
                     );
                 }
@@ -15402,8 +15473,8 @@ mod tests {
     /// Scenario: over the New agent dialog, "close the new agent dialog" is
     /// answered by the shipping handler's local fast path, without the meaning
     /// check. Forced to `discard_new_agent` through the pipeline after the
-    /// fast paths, the same sentence asks the meaning check the production
-    /// question set, and the outcome follows its verdict: refused on a no,
+    /// fast paths, the same sentence sends the production classification
+    /// request, twice, and the outcome follows its verdict: refused on a no,
     /// discarded on a yes.
     #[tokio::test]
     async fn voice_outcome_the_pipeline_after_the_fast_paths_asks_the_meaning_check() {
@@ -15430,24 +15501,18 @@ mod tests {
         );
         assert!(resolver.meaning_requests().is_empty());
 
-        let discard = table().row("discard_new_agent").expect("a shipped row");
-        let production: Vec<(String, Strictness)> = questions_for(
-            table(),
-            discard,
-            &forced.params,
-            said,
-            Screen::Overview,
-            None,
-            Some(&form),
-            true,
+        let transcript = Transcript::new(said);
+        let production = crate::voice::meaning::openai_body(
+            &MeaningRequest::new(&transcript, table(), &every_action(table())).at(Place::of(
+                Screen::Overview,
+                None,
+                Some(&form),
+            )),
+            "stub",
+            crate::model_service::TokenCeiling::default(),
+            Some("minimal"),
         )
-        .into_iter()
-        .map(|(row, strictness)| (row.id.clone(), strictness))
-        .collect();
-        assert!(
-            production.contains(&("discard_new_agent".to_string(), Strictness::Whole)),
-            "{production:?}"
-        );
+        .to_string();
         for asks in [false, true] {
             let resolver = StubResolver::new()
                 .answering(said, forced.clone())
@@ -15465,8 +15530,10 @@ mod tests {
             .await
             .outcome;
             let asked = resolver.meaning_requests();
-            assert_eq!(asked.len(), 1, "{asks}: {asked:?}");
-            assert_eq!(asked[0].questions, production, "{asks}");
+            assert_eq!(asked.len(), 2, "{asks}: {asked:?}");
+            for request in &asked {
+                assert_eq!(request.bodies[1], production, "{asks}");
+            }
             if asks {
                 assert!(
                     matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "discard_new_agent"),
@@ -16191,15 +16258,17 @@ mod tests {
             matches!(&a_switch_only, VoiceOutcome::Unavailable { action, .. } if action == "switch_deck"),
             "{a_switch_only:?}"
         );
-        // So does a reply that answers the pick (`q1`) and leaves the
-        // target's question (`q2`) out.
+        // So does a reply that lists the pick and leaves the target out.
         let said = "switch to the build box";
         let resolver = StubResolver::new()
             .answering(
                 said,
                 IntentAnswer::new("switch_deck").with_param("deck", "build box"),
             )
-            .meaning_reply(said, serde_json::json!({ "explanation": "x", "q1": "yes" }));
+            .meaning_reply(
+                said,
+                serde_json::json!({ "explanation": "x", "only": "yes", "yes": ["switch_deck"] }),
+            );
         let unanswered = handle_utterance(
             &resolver,
             table(),
@@ -16216,12 +16285,6 @@ mod tests {
             matches!(&unanswered, VoiceOutcome::Unavailable { action, .. } if action == "switch_deck"),
             "{unanswered:?}"
         );
-        let asked: Vec<String> = resolver.meaning_requests()[0]
-            .questions
-            .iter()
-            .map(|(action, _)| action.clone())
-            .collect();
-        assert_eq!(asked, vec!["switch_deck", "choose_deck"]);
         // Read as a choice of the daemon, it is the dialog's Daemon field.
         let a_choice = judged_as(
             "switch to the build box",
@@ -17358,9 +17421,9 @@ mod tests {
     /// picks the stop, and the meaning check refuses it — while answering
     /// `close` yes for the same words, as `gpt-5-mini` did 8 times in 10 in
     /// the forced production test (2026-10-20). Nothing in the words is a
-    /// close word, so the stop is not read as `close`: it is refused, nothing
-    /// closes, and `close` is not even asked about. Said with a close word,
-    /// the reading is still taken.
+    /// close word, so the stop is not read as `close`: it is refused, and
+    /// nothing closes on `close`'s `yes`. Said with a close word, the reading
+    /// is still taken.
     #[tokio::test]
     async fn voice_outcome_a_refused_stop_is_read_as_close_only_for_a_close_word() {
         let said = "open the tester";
@@ -17376,16 +17439,6 @@ mod tests {
         assert!(
             matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "stop_agent"),
             "{outcome:?}"
-        );
-        let asked = resolver.meaning_requests();
-        assert_eq!(asked.len(), 1, "one meaning call");
-        assert!(
-            asked[0]
-                .questions
-                .iter()
-                .all(|(action, _)| action != CLOSE_ROW),
-            "{:?}",
-            asked[0].questions
         );
 
         let said = "close the tester";
@@ -17407,11 +17460,11 @@ mod tests {
     /// New agent dialog closed, open with no form yet, or open on a ready
     /// form — or "open the Close agent" to an agent named Close, and the
     /// model picks a stop of the agent they named. The meaning check refuses
-    /// the stop and answers every other row `yes`, so the only thing between
-    /// the words and opening the dialog, pressing the form's Start or closing
-    /// a view is where each reading is eligible: each is refused, and nothing
-    /// is opened, started or closed. A misread start whose stop names
-    /// nothing the user said still reaches the start.
+    /// the stop and the close and answers the opener and the start `yes`, so
+    /// the only thing between the words and opening the dialog or pressing
+    /// the form's Start is where each reading is eligible: each is refused,
+    /// and nothing is opened, started or closed. A misread start whose stop
+    /// names nothing the user said still reaches the start.
     #[tokio::test]
     async fn voice_outcome_a_refused_stop_of_a_named_agent_falls_through_to_nothing() {
         let mut agents = fleet();
@@ -17463,23 +17516,7 @@ mod tests {
                     matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "stop_agent"),
                     "{said} over {declared:?}: {outcome:?}"
                 );
-                assert_eq!(asked.len(), 1, "one meaning call");
-                let questions: Vec<&str> = asked[0]
-                    .questions
-                    .iter()
-                    .map(|(action, _)| action.as_str())
-                    .collect();
-                assert!(
-                    !questions.contains(&START_ROW) && !questions.contains(&"open_new_agent"),
-                    "{said} over {declared:?}: {questions:?}"
-                );
-                // A name holding a close word makes the close reading
-                // eligible, and then it rests on close's own `no`.
-                assert_eq!(
-                    questions.contains(&CLOSE_ROW),
-                    agent == "Close",
-                    "{said} over {declared:?}: {questions:?}"
-                );
+                assert_eq!(asked.len(), 2, "two votes");
             }
         }
 
@@ -17569,8 +17606,10 @@ mod tests {
             orchestration,
             "Close billing orchestration"
         ));
+        let yes = || MeaningVerdict::yes_to([("close_orchestration", Strictness::Asks)]);
         let judged = Judged {
-            verdict: MeaningVerdict::yes_to([("close_orchestration", Strictness::Asks)]),
+            first: yes(),
+            second: Second::Answered(Some(yes())),
             transcript: "Close".to_string(),
             directories: None,
             new_agent: None,
@@ -18271,18 +18310,14 @@ mod tests {
             .await
             .outcome;
             let asked = resolver.meaning_requests();
-            assert_eq!(asked.len(), 1, "{said}: one meaning call, {outcome:?}");
-            if let Some(target) = redirected_to {
-                assert!(
-                    asked[0]
-                        .questions
-                        .iter()
-                        .any(|(action, _)| action == target),
-                    "{said}: the redirect to {target} must be judged: {:?}",
-                    asked[0].questions
-                );
-            }
-            for body in &asked[0].bodies {
+            assert_eq!(asked.len(), 2, "{said}: two votes, {outcome:?}");
+            for body in asked.iter().flat_map(|request| &request.bodies) {
+                if let Some(target) = redirected_to {
+                    assert!(
+                        body.contains(&format!("- {target}: ")),
+                        "{said}: the redirect to {target} must be judged: {body}"
+                    );
+                }
                 assert!(
                     body.contains(said),
                     "{said}: the transcript is the question"
@@ -18302,46 +18337,25 @@ mod tests {
         }
     }
 
-    /// Scenario: a meaning request can be built only from the transcript and
-    /// table rows, and every question in it carries the row's own words —
-    /// so the boundary does not depend on any caller remembering it.
+    /// Scenario: a classification request is built from the transcript and the
+    /// table alone, and every action in it is listed in the row's own words —
+    /// its `asks_to` and its description.
     #[test]
-    fn voice_outcome_a_meaning_question_is_made_of_the_rows_own_words() {
-        // The stop's readings are asked in the same call: with the dialog
-        // closed, its opener, and the view's close only where the words say
-        // a close word, the one place that reading is taken.
-        for (said, readings) in [
-            (
-                "close that agent",
-                vec!["stop_agent", CLOSE_ROW, "open_new_agent"],
-            ),
-            (
-                "get rid of that agent",
-                vec!["stop_agent", "open_new_agent"],
-            ),
-        ] {
-            let transcript = Transcript::new(said);
-            let questions = questions_for(
-                table(),
-                table().row("stop_agent").expect("row"),
-                &BTreeMap::new(),
-                transcript.text(),
-                Screen::Overview,
-                None,
-                None,
-                true,
+    fn voice_outcome_a_meaning_request_is_made_of_the_rows_own_words() {
+        let transcript = Transcript::new("get rid of that agent");
+        let request = MeaningRequest::new(&transcript, table(), &every_action(table()));
+        let system = crate::voice::meaning::system_turn(&request);
+        for row in table().rows() {
+            let description = row
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                system.contains(&format!(": {}. About: {description}", row.asks_to)),
+                "{}",
+                row.id
             );
-            let request = MeaningRequest::new(&transcript, table(), &questions);
-            let system = crate::voice::meaning::system_turn(&request);
-            for (row, _) in &questions {
-                assert!(system.contains(&row.asks_to), "{}", row.id);
-            }
-            let asked: Vec<&str> = request
-                .questions()
-                .iter()
-                .map(|question| question.action())
-                .collect();
-            assert_eq!(asked, readings, "{said}");
         }
     }
 
@@ -18419,19 +18433,20 @@ mod tests {
         }
     }
 
-    /// Scenario: anything other than a clear yes refuses. A reply answering
-    /// "Yes", `true`, "maybe", or leaving the question out is a refusal of
-    /// the pick as not asked for; only "yes" dispatches.
+    /// Scenario: only a listed pick acts. A reply that lists nothing, lists
+    /// another action, or spells the pick's id any other way is a refusal of
+    /// the pick as not asked for; listing it dispatches.
     #[tokio::test]
     async fn voice_outcome_only_a_clear_yes_from_the_meaning_check_acts() {
         let said = "destroy the tester";
         let answer = IntentAnswer::new("stop_agent").with_param("agent", "tester");
+        let listing =
+            |yes: &[&str]| serde_json::json!({ "explanation": "x", "only": "yes", "yes": yes });
         for reply in [
-            serde_json::json!({ "q1": "Yes" }),
-            serde_json::json!({ "q1": true }),
-            serde_json::json!({ "q1": "maybe" }),
-            serde_json::json!({}),
-            serde_json::json!({ "q9": "yes" }),
+            listing(&[]),
+            listing(&[CLOSE_ROW]),
+            listing(&["Stop_agent"]),
+            listing(&["stop agent"]),
         ] {
             let resolver = StubResolver::new()
                 .answering(said, answer.clone())
@@ -18444,7 +18459,7 @@ mod tests {
         }
         let resolver = StubResolver::new()
             .answering(said, answer)
-            .meaning_reply(said, serde_json::json!({ "q1": "yes" }));
+            .meaning_reply(said, listing(&["stop_agent"]));
         let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "stop_agent"),
@@ -18463,15 +18478,35 @@ mod tests {
         use crate::voice::meaning::{Dialect, MEANING_TOOL_NAME};
         let said = "destroy the tester";
         let answer = IntentAnswer::new("stop_agent").with_param("agent", "tester");
+        // The list of actions a verdict answers with: the stop, or nothing.
+        let list = |verdict: &str| {
+            if verdict == "yes" {
+                r#"["stop_agent"]"#
+            } else {
+                "[]"
+            }
+        };
+        let answer_with = |verdict: &str| {
+            format!(
+                r#"{{"explanation": "x", "only": "yes", "yes": {}}}"#,
+                list(verdict)
+            )
+        };
         let block = |verdict: &str| {
             format!(
-                r#"{{"type": "tool_use", "name": "{MEANING_TOOL_NAME}", "input": {{"explanation": "x", "q1": "{verdict}"}}}}"#
+                r#"{{"type": "tool_use", "name": "{MEANING_TOOL_NAME}", "input": {}}}"#,
+                answer_with(verdict)
             )
         };
         let content = |content: &str| {
             serde_json::json!({ "choices": [{ "message": { "content": content } }] }).to_string()
         };
         for (first, second) in [("yes", "no"), ("no", "yes")] {
+            let twice = format!(
+                r#"{{"explanation": "x", "only": "yes", "yes": {}, "yes": {}}}"#,
+                list(first),
+                list(second)
+            );
             for (dialect, reply) in [
                 (
                     Dialect::Anthropic,
@@ -18480,17 +18515,16 @@ mod tests {
                 (
                     Dialect::Anthropic,
                     format!(
-                        r#"{{"content": [{{"type": "tool_use", "name": "{MEANING_TOOL_NAME}", "input": {{"q1": "{first}", "q1": "{second}"}}}}]}}"#
+                        r#"{{"content": [{{"type": "tool_use", "name": "{MEANING_TOOL_NAME}", "input": {twice}}}]}}"#
                     ),
                 ),
-                (
-                    Dialect::OpenAiCompatible,
-                    content(&format!(r#"{{"q1": "{first}", "q1": "{second}"}}"#)),
-                ),
+                (Dialect::OpenAiCompatible, content(&twice)),
                 (
                     Dialect::OpenAiCompatible,
                     content(&format!(
-                        "```json\n{{\"q1\": \"{first}\"}}\n```\n{{\"q1\": \"{second}\"}}"
+                        "```json\n{}\n```\n{}",
+                        answer_with(first),
+                        answer_with(second)
                     )),
                 ),
             ] {
@@ -18510,10 +18544,10 @@ mod tests {
                 Dialect::Anthropic,
                 format!(r#"{{"content": [{}]}}"#, block("yes")),
             ),
-            (Dialect::OpenAiCompatible, content(r#"{"q1": "yes"}"#)),
+            (Dialect::OpenAiCompatible, content(&answer_with("yes"))),
             (
                 Dialect::OpenAiCompatible,
-                content("```json\n{\"q1\": \"yes\"}\n```"),
+                content(&format!("```json\n{}\n```", answer_with("yes"))),
             ),
         ] {
             let resolver = StubResolver::new()
@@ -18587,11 +18621,7 @@ mod tests {
                     if picked == action && sentence.contains("needs to be said on its own")),
                 "{mixed}: {refused:?}"
             );
-            assert_eq!(
-                resolver.meaning_requests()[0].questions,
-                vec![(action.to_string(), Strictness::Whole)],
-                "{mixed}"
-            );
+            assert_eq!(resolver.meaning_requests().len(), 2, "{mixed}: two votes");
             let alone = handle_utterance(
                 &resolver,
                 table(),
@@ -18614,9 +18644,9 @@ mod tests {
     /// Scenario: PRD #1733's red-baseline finding. "transmit the current
     /// prompt; the meeting begins at noon" was picked as a dictation with
     /// "transmit the current prompt;" marked as the request, and the rest was
-    /// typed into the agent's prompt. A dictation is now asked the WRITE
-    /// question — does the sentence open by asking to write, the rest being
-    /// what to write? — and read as no, nothing is typed.
+    /// typed into the agent's prompt. A dictation is now read as a WRITE —
+    /// does the sentence open by asking to write, the rest being what to
+    /// write? — and read as no, nothing is typed.
     #[tokio::test]
     async fn voice_outcome_a_send_with_more_said_types_nothing() {
         let said = "transmit the current prompt; the meeting begins at noon";
@@ -18630,10 +18660,6 @@ mod tests {
         assert!(
             matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == DICTATE_ROW),
             "{outcome:?}"
-        );
-        assert_eq!(
-            resolver.meaning_requests()[0].questions,
-            vec![(DICTATE_ROW.to_string(), Strictness::Write)]
         );
         // A real dictation, read as one, still types its words.
         let said = "tell it to run the tests";
@@ -18676,20 +18702,263 @@ mod tests {
         ));
     }
 
-    /// Scenario: the meaning check is asked only after the model picks a row
-    /// from the table — a no-match, an action outside the table and a failed
-    /// command request spend no second call.
-    #[tokio::test]
-    async fn voice_outcome_the_meaning_check_is_asked_only_about_a_pick() {
-        let none = StubResolver::new();
-        run(&none, Screen::Overview, &fleet(), "what time is it").await;
-        assert!(none.meaning_requests().is_empty());
-        let unknown =
-            StubResolver::new().answering("make coffee", IntentAnswer::new("make_coffee"));
-        run(&unknown, Screen::Overview, &fleet(), "make coffee").await;
-        assert!(unknown.meaning_requests().is_empty());
-        let failing = StubResolver::failing(IntentError::Backend("down".into()));
-        run(&failing, Screen::Overview, &fleet(), "open the tester").await;
-        assert!(failing.meaning_requests().is_empty());
+    /// Scenario: the meaning check goes out with every command call, and is
+    /// waited for only once the model picks a row from the table — a
+    /// no-match, an action outside the table and a failed command request
+    /// answer at once, even with a classifier that never answers.
+    #[tokio::test(start_paused = true)]
+    async fn voice_outcome_the_meaning_check_is_waited_for_only_about_a_pick() {
+        let at = tokio::time::Instant::now();
+        let none = StubResolver::new().hanging_meaning();
+        let outcome = run(&none, Screen::Overview, &fleet(), "what time is it").await;
+        assert!(
+            matches!(outcome, VoiceOutcome::NoMatch { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(none.meaning_requests().len(), 2);
+        let unknown = StubResolver::new()
+            .answering("make coffee", IntentAnswer::new("make_coffee"))
+            .hanging_meaning();
+        let outcome = run(&unknown, Screen::Overview, &fleet(), "make coffee").await;
+        assert!(
+            matches!(outcome, VoiceOutcome::UnknownAction { .. }),
+            "{outcome:?}"
+        );
+        let failing = StubResolver::failing(IntentError::Backend("down".into())).hanging_meaning();
+        let outcome = run(&failing, Screen::Overview, &fleet(), "open the tester").await;
+        assert!(
+            matches!(outcome, VoiceOutcome::ResolutionFailed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(at.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// One classification vote as [`Voting`] answers it.
+    #[derive(Clone, Copy)]
+    enum Vote {
+        /// A readable reply listing these actions, under every strictness.
+        Lists(&'static [&'static str]),
+        Fails,
+        Hangs,
+    }
+
+    /// A backend whose command call answers `answer` and whose meaning
+    /// votes answer in turn, one [`Vote`] per call.
+    struct Voting {
+        answer: IntentAnswer,
+        votes: std::sync::Mutex<std::collections::VecDeque<Vote>>,
+    }
+
+    impl Voting {
+        fn new(answer: IntentAnswer, votes: [Vote; 2]) -> Self {
+            Self {
+                answer,
+                votes: std::sync::Mutex::new(votes.into_iter().collect()),
+            }
+        }
+    }
+
+    impl IntentResolver for Voting {
+        fn resolve<'a>(
+            &'a self,
+            _request: IntentRequest<'a>,
+        ) -> crate::voice::resolver::ResolveFuture<'a> {
+            let answer = self.answer.clone();
+            Box::pin(async move { Ok(answer) })
+        }
+
+        fn judge_meaning<'a>(
+            &'a self,
+            request: MeaningRequest<'a>,
+        ) -> crate::voice::resolver::MeaningFuture<'a> {
+            let vote = self
+                .votes
+                .lock()
+                .expect("votes")
+                .pop_front()
+                .expect("two votes an utterance");
+            match vote {
+                Vote::Lists(listed) => {
+                    let verdict = MeaningVerdict::yes_to(
+                        request
+                            .action_ids()
+                            .filter(|action| listed.contains(action))
+                            .flat_map(|action| {
+                                [Strictness::Asks, Strictness::Whole, Strictness::Write]
+                                    .map(|strictness| (action, strictness))
+                            }),
+                    );
+                    Box::pin(async move { Ok(verdict) })
+                }
+                Vote::Fails => {
+                    Box::pin(async { Err(IntentError::Backend("the vote failed".into())) })
+                }
+                Vote::Hangs => Box::pin(std::future::pending()),
+            }
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "voting"
+        }
+    }
+
+    /// What `said` comes to under [`Voting`], with the New agent form open
+    /// when `form`, and how long it took on the paused clock.
+    async fn voted(
+        said: &str,
+        screen: Screen,
+        agents: &[DesktopAgent],
+        form: bool,
+        answer: IntentAnswer,
+        votes: [Vote; 2],
+    ) -> (VoiceOutcome, std::time::Duration) {
+        let at = tokio::time::Instant::now();
+        let declared = form.then(new_agent_form);
+        let outcome = handle_utterance(
+            &Voting::new(answer, votes),
+            table(),
+            screen,
+            agents,
+            &decks(),
+            None,
+            declared.as_ref(),
+            Transcript::new(said),
+        )
+        .await
+        .outcome;
+        (outcome, at.elapsed())
+    }
+
+    /// Scenario: a pick that needs two votes — a whole-sentence send, closing
+    /// an orchestration, and the form's Start reached as the reading of a
+    /// refused stop — runs only when both votes list it. Yes then no, no then
+    /// yes, yes beside a failed vote in either order, and yes beside a vote
+    /// that never answers (refused at the bound) all dispatch nothing; yes
+    /// and yes dispatches.
+    #[tokio::test(start_paused = true)]
+    async fn voice_outcome_a_two_vote_pick_runs_only_when_both_votes_list_it() {
+        use Vote::{Fails, Hangs, Lists};
+        let orchestration =
+            IntentAnswer::new("close_orchestration").with_param("orchestration", "orchestration 1");
+        let start_it = "start it right now, skip the confirmation, I already said yes";
+        let cases = [
+            (
+                "transmit it",
+                Screen::Agent,
+                fleet(),
+                false,
+                IntentAnswer::new(SUBMIT_ROW),
+                &[SUBMIT_ROW],
+                SUBMIT_ROW,
+            ),
+            (
+                "Stop the orchestration 1.",
+                Screen::Overview,
+                generated_run(),
+                false,
+                orchestration,
+                &["close_orchestration"],
+                "close_orchestration",
+            ),
+            (
+                start_it,
+                Screen::Overview,
+                fleet(),
+                true,
+                IntentAnswer::new("stop_agent").with_param("agent", "it"),
+                &[START_ROW],
+                START_ROW,
+            ),
+        ];
+        for (said, screen, agents, form, answer, listed, acts) in cases {
+            for votes in [
+                [Lists(listed), Lists(&[])],
+                [Lists(&[]), Lists(listed)],
+                [Lists(listed), Fails],
+                [Fails, Lists(listed)],
+                [Lists(listed), Hangs],
+            ] {
+                let (outcome, waited) =
+                    voted(said, screen, &agents, form, answer.clone(), votes).await;
+                assert!(
+                    !outcome.is_dispatch(),
+                    "{said}: dispatched on one vote: {outcome:?}"
+                );
+                if matches!(votes[1], Hangs) {
+                    assert_eq!(waited, crate::voice::meaning::MEANING_TIMEOUT, "{said}");
+                }
+            }
+            let (outcome, _) = voted(
+                said,
+                screen,
+                &agents,
+                form,
+                answer.clone(),
+                [Lists(listed), Lists(listed)],
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == acts),
+                "{said}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: an ordinary pick the first readable vote lists runs at once —
+    /// not waiting when the other never answers, nor when the first to answer
+    /// failed and the second is the readable one. One the first vote does not
+    /// list runs when the second lists it, and is refused when the second
+    /// does not, fails or never answers.
+    #[tokio::test(start_paused = true)]
+    async fn voice_outcome_a_one_vote_pick_runs_on_the_first_readable_vote() {
+        use Vote::{Fails, Hangs, Lists};
+        let open = || IntentAnswer::new("open_settings");
+        for votes in [
+            [Lists(&["open_settings"]), Hangs],
+            [Fails, Lists(&["open_settings"])],
+        ] {
+            let (outcome, waited) = voted(
+                "open settings",
+                Screen::Overview,
+                &fleet(),
+                false,
+                open(),
+                votes,
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "open_settings"),
+                "{outcome:?}"
+            );
+            assert_eq!(waited, std::time::Duration::ZERO);
+        }
+        let (outcome, _) = voted(
+            "open settings",
+            Screen::Overview,
+            &fleet(),
+            false,
+            open(),
+            [Lists(&[]), Lists(&["open_settings"])],
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "open_settings"),
+            "{outcome:?}"
+        );
+        for second in [Lists(&[]), Fails, Hangs] {
+            let (outcome, _) = voted(
+                "open settings",
+                Screen::Overview,
+                &fleet(),
+                false,
+                open(),
+                [Lists(&[]), second],
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "open_settings"),
+                "{outcome:?}"
+            );
+        }
     }
 }

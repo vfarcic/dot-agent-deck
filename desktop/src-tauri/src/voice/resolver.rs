@@ -195,10 +195,11 @@ pub trait IntentResolver: Send + Sync {
         })
     }
 
-    /// PRD #1733: the meaning check — whether the transcript asks for the
-    /// actions in `request` ([`super::meaning`]). Its request holds the
-    /// transcript and the app's own text about each action, and nothing
-    /// observed.
+    /// PRD #1733: one vote of the meaning check — which of the table's
+    /// actions the transcript asks for ([`super::meaning`]). Its request
+    /// holds the transcript and the app's own text about each action, and
+    /// nothing observed. The pipeline sends two of these beside the command
+    /// call ([`super::meaning::Ballot`]).
     ///
     /// **The default refuses**: a backend that cannot ask the question answers
     /// [`IntentError::NotConfigured`], and the caller acts on nothing it did
@@ -289,12 +290,13 @@ pub struct StubResolver {
     question_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     failure: Option<IntentError>,
     /// PRD #1733: scripted meaning verdicts, keyed by utterance, action and —
-    /// when only one reading is scripted — strictness. An unscripted question
-    /// is answered `yes` for the action this stub's `answers` picked for the
-    /// utterance and `no` for every other: the stub models a judge that agrees
-    /// with the command model and with nothing else.
+    /// when only one reading is scripted — strictness. An unscripted action
+    /// is answered `yes` under every strictness for the action this stub's
+    /// `answers` picked for the utterance and `no` for every other: the stub
+    /// models a classifier that agrees with the command model and with
+    /// nothing else. Both votes of an utterance are answered alike.
     meaning: BTreeMap<(String, String, Option<Strictness>), bool>,
-    /// PRD #1733: what an unscripted question is answered when set, in place
+    /// PRD #1733: what an unscripted action is answered when set, in place
     /// of agreeing with the pick alone.
     meaning_default: Option<bool>,
     /// PRD #1733: a raw reply for an utterance, read by the production reader
@@ -308,17 +310,17 @@ pub struct StubResolver {
     meaning_failure: Option<IntentError>,
     /// PRD #1733: the meaning call never answers, for the timeout's test.
     meaning_hangs: bool,
-    /// PRD #1733: every meaning request this stub was handed, as the wire
-    /// bodies both dialects would send — what the boundary tests read.
+    /// PRD #1733: every meaning request this stub was handed — one per vote —
+    /// as the wire bodies both dialects would send, which the boundary test
+    /// reads.
     meaning_log: std::sync::Arc<std::sync::Mutex<Vec<RecordedMeaning>>>,
 }
 
 /// One meaning request a [`StubResolver`] was handed (PRD #1733): the
-/// questions it asked, and the request body each dialect would have sent for
-/// it, serialized — the exact bytes that would leave the machine.
+/// request body each dialect would have sent for it, serialized — the exact
+/// bytes that would leave the machine.
 #[derive(Debug, Clone)]
 pub struct RecordedMeaning {
-    pub questions: Vec<(String, Strictness)>,
     pub bodies: Vec<String>,
 }
 
@@ -365,7 +367,7 @@ impl StubResolver {
         self
     }
 
-    /// PRD #1733: answer every question no script answers with `asks` —
+    /// PRD #1733: answer every action no script answers with `asks` —
     /// `true` models a sentence that asks for every row the pipeline may
     /// consult on the pick's behalf (its redirects and readings included).
     pub fn judging_everything(mut self, asks: bool) -> Self {
@@ -388,14 +390,14 @@ impl StubResolver {
         self
     }
 
-    /// PRD #1733: answer the meaning call for `utterance` with `reply`, read
+    /// PRD #1733: answer each meaning call for `utterance` with `reply`, read
     /// as a backend's reply would be.
     pub fn meaning_reply(mut self, utterance: &str, reply: serde_json::Value) -> Self {
         self.meaning_replies.insert(normalize(utterance), reply);
         self
     }
 
-    /// PRD #1733: answer the meaning call for `utterance` with `reply`, the
+    /// PRD #1733: answer each meaning call for `utterance` with `reply`, the
     /// bytes of a whole `dialect` reply, read as the remote resolver reads one.
     pub fn meaning_wire_reply(
         mut self,
@@ -420,7 +422,7 @@ impl StubResolver {
         self
     }
 
-    /// PRD #1733: the meaning requests made so far.
+    /// PRD #1733: the meaning requests made so far, one per vote.
     pub fn meaning_requests(&self) -> Vec<RecordedMeaning> {
         self.meaning_log
             .lock()
@@ -462,11 +464,6 @@ impl IntentResolver for StubResolver {
     fn judge_meaning<'a>(&'a self, request: MeaningRequest<'a>) -> MeaningFuture<'a> {
         let ceiling = crate::model_service::TokenCeiling::default();
         let recorded = RecordedMeaning {
-            questions: request
-                .questions()
-                .iter()
-                .map(|question| (question.action().to_string(), question.strictness()))
-                .collect(),
             bodies: vec![
                 super::meaning::anthropic_body(&request, "stub", ceiling).to_string(),
                 super::meaning::openai_body(&request, "stub", ceiling, Some("minimal")).to_string(),
@@ -489,18 +486,19 @@ impl IntentResolver for StubResolver {
             let picked = self.answers.get(&said).map(|answer| answer.action.as_str());
             Ok(MeaningVerdict::yes_to(
                 request
-                    .questions()
-                    .iter()
-                    .filter(|question| {
-                        let action = question.action().to_string();
+                    .action_ids()
+                    .flat_map(|action| {
+                        [Strictness::Asks, Strictness::Whole, Strictness::Write]
+                            .map(|strictness| (action, strictness))
+                    })
+                    .filter(|(action, strictness)| {
                         self.meaning
-                            .get(&(said.clone(), action.clone(), Some(question.strictness())))
-                            .or_else(|| self.meaning.get(&(said.clone(), action, None)))
+                            .get(&(said.clone(), action.to_string(), Some(*strictness)))
+                            .or_else(|| self.meaning.get(&(said.clone(), action.to_string(), None)))
                             .copied()
                             .or(self.meaning_default)
-                            .unwrap_or(picked == Some(question.action()))
-                    })
-                    .map(|question| (question.action(), question.strictness())),
+                            .unwrap_or(picked == Some(*action))
+                    }),
             ))
         };
         Box::pin(async move { outcome })

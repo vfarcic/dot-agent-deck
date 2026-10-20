@@ -59,9 +59,11 @@
 //!   be left out of `required` the way the tool-use schema leaves it. Each param
 //!   is a `["string", "null"]` union instead — the documented way to express an
 //!   optional field under strict mode — and [`super::IntentAnswer`]'s own
-//!   deserializer drops the nulls, so a param the chosen action does not take
+//!   deserializer drops the nulls, so a param the user did not refer to
 //!   arrives downstream as absent and becomes
-//!   [`super::VoiceOutcome::ParamMissing`] exactly as before.
+//!   [`super::VoiceOutcome::ParamMissing`] exactly as before. Each action
+//!   carries only its OWN params ([`response_schema`]), so the nulls the model
+//!   has to write are the chosen action's, not the whole table's.
 //! - **The answer is text.** A `tool_use` block is a JSON value; a chat
 //!   completion's `content` is a string that has to be parsed. It is read
 //!   through [`super::prompt::extract_answer`], whose tolerance is what keeps a
@@ -72,40 +74,70 @@ use serde_json::{Value, json};
 
 use crate::model_service::TokenCeiling;
 
-use super::prompt::{action_enum, commands_state, data_turn, param_names};
+use super::prompt::{commands_state, data_turn};
 use super::remote::truncated_at;
 use super::resolver::{IntentAnswer, IntentError, IntentRequest};
 use super::schema::{AnnotatedCommand, TOOL_INSTRUCTIONS, TOOL_NAME};
+use super::table::NO_MATCH_ACTION;
 
-/// The `json_schema` the reply is constrained to.
+/// What each action's `params` is described as to the model.
+const PARAMS_DESCRIPTION: &str = "The params the chosen action declares, as the user referred to \
+    them — or the agent's `label`, for a reference the user made by state; `null` for one the user \
+    did not refer to. The app resolves each one against live state.";
+
+/// The `json_schema` the reply is constrained to: `{"command": {"action": …,
+/// "params": {…}}}`, one branch per action of the annotated command list the
+/// backend was handed, and `none`.
 ///
 /// See the module docs for why every property is `required` and why each param
-/// is nullable. The shape is otherwise [`super::remote::tool_definition`]'s
-/// `input_schema`: the action enum comes from the annotated command list the
-/// backend was handed, and the params are enumerated from the table, so a row
-/// that adds a param adds a property without anyone editing this file.
+/// is nullable. **Each branch lists only its own action's params** (PRD #1733),
+/// where one `params` object used to list every param the table declares: the
+/// model wrote all of them, `null` but for one or two, on every answer — 75
+/// output tokens a reply, measured on `gpt-5-mini` (2026-10-20), where this
+/// shape writes 30, and a reply's length is most of its latency: the median
+/// call went from 1.53 s to 1.15 s and its p95 from 2.13 s to 1.63 s over the
+/// same 67 captured requests, sent twice each, interleaved. `anyOf` cannot be
+/// the schema's root under strict mode, which is why the answer is nested in
+/// `command`; [`super::prompt::extract_answer`] reads the first object in the
+/// reply that is a whole answer, which is that one. The params are still
+/// enumerated from the table, so a row that adds a param adds a property
+/// without anyone editing this file.
 pub fn response_schema(commands: &[AnnotatedCommand]) -> Value {
-    let names = param_names(commands);
-    let properties: serde_json::Map<String, Value> = names
+    let branches: Vec<Value> = commands
         .iter()
-        .map(|name| (name.clone(), json!({ "type": ["string", "null"] })))
+        .map(|command| {
+            let names: Vec<&str> = command
+                .params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect();
+            branch(&command.id, &names)
+        })
+        .chain(std::iter::once(branch(NO_MATCH_ACTION, &[])))
+        .collect();
+    json!({
+        "type": "object",
+        "properties": { "command": { "anyOf": branches } },
+        "required": ["command"],
+        "additionalProperties": false,
+    })
+}
+
+/// One action's branch of [`response_schema`]: its id, and its own params.
+fn branch(action: &str, params: &[&str]) -> Value {
+    let properties: serde_json::Map<String, Value> = params
+        .iter()
+        .map(|name| (name.to_string(), json!({ "type": ["string", "null"] })))
         .collect();
     json!({
         "type": "object",
         "properties": {
-            "action": {
-                "type": "string",
-                "description": "The id of the action to run, or `none` when nothing listed matches.",
-                "enum": action_enum(commands),
-            },
+            "action": { "type": "string", "enum": [action] },
             "params": {
                 "type": "object",
-                "description": "The params the chosen action declares, as the user referred to them \
-    — or the agent's `label`, for a reference the user made by state. Every param is listed; send \
-    `null` for the ones the chosen action does not take. The app resolves each one against live \
-    state.",
+                "description": PARAMS_DESCRIPTION,
                 "properties": properties,
-                "required": names,
+                "required": params,
                 "additionalProperties": false,
             },
         },
@@ -290,11 +322,15 @@ mod tests {
     #[test]
     fn voice_openai_request_constrains_the_action_to_the_table_plus_the_escape() {
         let schema = &body("show me the tester")["response_format"]["json_schema"]["schema"];
-        let actions: Vec<&str> = schema["properties"]["action"]["enum"]
-            .as_array()
-            .expect("an array")
+        let actions: Vec<&str> = branches(schema)
             .iter()
-            .map(|value| value.as_str().expect("a string"))
+            .map(|branch| {
+                let only = branch["properties"]["action"]["enum"]
+                    .as_array()
+                    .expect("an array");
+                assert_eq!(only.len(), 1, "{branch}");
+                only[0].as_str().expect("a string")
+            })
             .collect();
         assert_eq!(
             actions,
@@ -385,55 +421,74 @@ mod tests {
                     walk(child, &format!("{path}.{key}"));
                 }
             }
+            for (at, child) in value.as_array().into_iter().flatten().enumerate() {
+                walk(child, &format!("{path}[{at}]"));
+            }
         }
         walk(&schema, "schema");
     }
 
+    /// The `anyOf` branches of a reply schema, one per action.
+    fn branches(schema: &Value) -> &Vec<Value> {
+        schema["properties"]["command"]["anyOf"]
+            .as_array()
+            .expect("one branch per action")
+    }
+
+    /// The `params` schema of `action`'s branch.
+    fn params_of<'s>(schema: &'s Value, action: &str) -> &'s Value {
+        &branches(schema)
+            .iter()
+            .find(|branch| branch["properties"]["action"]["enum"][0] == action)
+            .expect("a branch for the action")["properties"]["params"]
+    }
+
+    /// Scenario: each action's branch lists exactly the params that action
+    /// declares, every one required and nullable — `null` is how strict mode
+    /// spells a param the user did not refer to — and a paramless action, and
+    /// `none`, list none.
     #[test]
-    fn voice_openai_request_makes_every_param_nullable() {
-        // The consequence of requiring every property: a paramless action has
-        // to be able to say so, and `null` is how strict mode spells optional.
+    fn voice_openai_request_lists_each_actions_own_params_as_nullable() {
         let schema = &body("show me the tester")["response_format"]["json_schema"]["schema"];
-        assert_eq!(
-            schema["properties"]["params"]["properties"]["agent"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            schema["properties"]["params"]["properties"]["prefix"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            schema["properties"]["params"]["properties"]["deck"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            schema["properties"]["params"]["properties"]["dir"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            schema["properties"]["params"]["properties"]["text"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            schema["properties"]["params"]["required"],
-            // `deck` ahead of `prefix` since PRD #1195's `switch_deck` row,
-            // which sits above the dictation pair in the table.
-            // The dashboard filter's facets (issue #1496) after `agent`.
-            json!([
-                "agent",
-                "kind",
-                "status",
-                "agent_type",
-                "daemon",
-                "text",
-                "deck",
-                "prefix",
-                "dir",
-                "mode",
-                "command",
-                "orchestration"
-            ])
-        );
+        for (action, params) in [
+            ("open_agent", vec!["agent"]),
+            ("dictate_to_agent", vec!["prefix"]),
+            ("switch_deck", vec!["deck"]),
+            ("open_dir", vec!["dir"]),
+            ("filter_directories", vec!["text"]),
+            ("open_settings", vec![]),
+            ("none", vec![]),
+        ] {
+            let schema = params_of(schema, action);
+            assert_eq!(schema["required"], json!(params), "{action}");
+            let declared: Vec<&String> = schema["properties"]
+                .as_object()
+                .expect("properties")
+                .keys()
+                .collect();
+            assert_eq!(declared.len(), params.len(), "{action}");
+            for param in params {
+                assert_eq!(
+                    schema["properties"][param]["type"],
+                    json!(["string", "null"]),
+                    "{action}.{param}"
+                );
+            }
+        }
+        for branch in branches(schema) {
+            let action = branch["properties"]["action"]["enum"][0]
+                .as_str()
+                .expect("an id");
+            let declared: Vec<String> = table()
+                .row(action)
+                .map(|row| row.params.iter().map(|param| param.name.clone()).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                branch["properties"]["params"]["required"],
+                json!(declared),
+                "{action}"
+            );
+        }
     }
 
     #[test]
