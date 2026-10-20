@@ -23,10 +23,10 @@ Everything dot-agent-deck-specific (which tests, where their title/description l
 
 | Command | What it does |
 | --- | --- |
-| `build.sh [reel] [--out OUT.mp4] [--publish] [--manifest PATH] [--title TITLE]` | Full pipeline: **select** → **assemble** → invoke the engine, forwarding `--out`/`--publish` plus a composed `--title`. Clean-skips (no manifest, no engine, exit 0) when no e2e tests changed — and just as cleanly, but with a **different message naming the tests**, when e2e tests *did* change and none is `[reel]`-marked (see **Which clean skip you got**). `--manifest` sets where `manifest.json` is written (default `manifest.json` in CWD). `--title` overrides the composed title verbatim (see **Title composition**). |
+| `build.sh [reel] [--out OUT.mp4] [--publish] [--manifest PATH] [--title TITLE]` | Full pipeline: **select** → **assemble** → invoke the engine, forwarding `--out`/`--publish` plus a composed `--title`. Clean-skips (no manifest, no engine, exit 0) when no e2e tests changed — and just as cleanly, but with a **different message naming the tests**, when e2e tests *did* change and none is `[reel]`-marked or none has a recording (see **Which clean skip you got**). `--manifest` sets where `manifest.json` is written (default `manifest.json` in CWD). `--title` overrides the composed title verbatim (see **Title composition**). |
 | `build.sh title [--title TITLE]` | Print the title the `reel` pipeline would pass to the engine on the current branch — the composed title, or `--title` verbatim. Dry-run: no selection, no manifest, no engine, no upload. |
 | `build.sh select` | Print the in-scope recording-dir IDs, one per line (the git-diff half — concern **a**). |
-| `build.sh assemble [ID...] [--manifest PATH]` | Build `manifest.json` from an explicit list of recording-dir IDs (concern **b**; no network, and one `git rev-parse HEAD` unless `REEL_ADAPTER_EXPECT_COMMIT` is set). Excludes cast-less IDs, IDs whose catalog entry lacks the ` [reel]` marker, **and** IDs whose recording fails the [cast-provenance gate](#cast-provenance-issue-808), orders by catalog id, clean-skips a list where nothing survives — naming what each gate dropped, separately. |
+| `build.sh assemble [ID...] [--manifest PATH]` | Build `manifest.json` from an explicit list of recording-dir IDs (concern **b**; no network, and one `git rev-parse HEAD` unless `REEL_ADAPTER_EXPECT_COMMIT` is set). Excludes cast-less IDs (naming an e2e test's as **unrecorded** rather than as an L1 test), IDs whose catalog entry lacks the ` [reel]` marker, **and** IDs whose recording fails the [cast-provenance gate](#cast-provenance-issue-808), orders by catalog id, clean-skips a list where nothing survives — naming what each gate dropped, separately. |
 
 Run the full `reel` pipeline from the repo root so the default relative paths (`.dot-agent-deck/recordings`, `tests/CATALOG.md`) resolve. The engine resolves `clip` paths relative to its own CWD, so it is invoked from the same directory.
 
@@ -53,7 +53,7 @@ Composition degrades gracefully — a missing repo/PRD/PR drops only its own seg
 
 `select` lists the recording dirs under `.dot-agent-deck/recordings/<id>/` that are **in scope** for this branch's reel. File-level granularity; robustness over cleverness. A dir is in scope **iff all three** hold:
 
-1. **It contains a `full-stream.cast`** — the e2e proxy. The `cargo xtask docs` generator writes a `test.md` for *every* `#[spec]` test but emits a cast only for **L2** tests; **L1** render tests have a `test.md` and **no** cast, so they are excluded by construction (which is also exactly the right "user-journey" subset). Casts are local-only (PRD #77) and only written on failure or under `DOT_AGENT_DECK_RECORD=1`, so the reel step runs the relevant e2e tests with that flag first; without casts, every dir fails this check and the step clean-skips. That run is LOCAL and is not discharged by CI — CI's lane 1 (CLAUDE.md rule 5) sets no such flag and uploads no casts, and every reel-eligible test is a **lane-2** test that CI does not run at all — and since issue #502 removed the pre-PR full-tier obligation there is no longer an unfiltered run to piggyback on, so record the tests the branch adds or changes by filter with `DOT_AGENT_DECK_RECORD=1 cargo test-e2e-live <filter>`.
+1. **It contains a `full-stream.cast`** — the e2e proxy. The `cargo xtask docs` generator writes a `test.md` for *every* `#[spec]` test but emits a cast only for **L2** tests; **L1** render tests have a `test.md` and **no** cast, so they are excluded by construction (which is also exactly the right "user-journey" subset). Casts are local-only (PRD #77) and only written on failure or under `DOT_AGENT_DECK_RECORD=1`, so the reel step runs the relevant e2e tests with that flag first; without casts, every dir fails this check and the step clean-skips. That run is LOCAL and is not discharged by CI — CI's lane 1 (CLAUDE.md rule 5) sets no such flag and uploads no casts, and every reel-eligible test is a **lane-2** test that CI does not run at all — and since issue #502 removed the pre-PR full-tier obligation there is no longer an unfiltered run to piggyback on, so record the tests the branch adds or changes by filter with `DOT_AGENT_DECK_RECORD=1 cargo test-e2e-live <filter>`. A run **without** that flag clears a test's earlier artifacts and leaves only `test.md`, so an e2e test can lose its cast this way too. Such a test is still excluded, but not silently (issue #1683): a changed, `[reel]`-marked test whose source is an `e2e_*.rs` file gets a per-id stderr diagnostic and is counted in the skip as **unrecorded**, with the command that records it. A changed L1 test stays silent, since it never has a cast. The `test.md` `**Cast:**` line cannot tell the two apart, because the docs generator writes it for every catalog layer other than L1; the `e2e_*.rs` file name (CLAUDE.md rule 4) can.
 
 **A reel-eligible cast comes from a run that held a real agent credential, and this skill publishes it.** Eligibility requires a real agent spinning up, which is exactly the `e2e-live` boundary, so every cast that reaches `--publish` was recorded by a process holding your credentials — and the URL goes into the PR body *and* the changelog fragment, which flows into the public release notes. Two things stand between a key and a public URL, and it is worth being precise about which does what.
 
@@ -135,12 +135,15 @@ Pick the grid for what the scenario needs to show, then keep the ratio near 4:1.
 - **clip** ← `<recordings>/<id>/full-stream.cast`.
 - Any ID lacking a `full-stream.cast` is **excluded** (the same L1 guard as
   selection, applied at assembly so an injected list can't smuggle an L1 test in).
+  One whose source is an `e2e_*.rs` file is reported as an **unrecorded** e2e
+  test (or as unmarked, when its catalog entry has no ` [reel]` marker), not as
+  an L1 test (issue #1683).
 - Any ID whose catalog entry lacks the ` [reel]` marker is **excluded** (the same
   eligibility guard as selection, applied at assembly so an injected list can't
   smuggle an unmarked test in).
 - Entries are **ordered by catalog id's line position in `CATALOG.md`** (the
   authoritative order); an id absent from the catalog sorts last.
-- **Clean skip:** if no ID resolves to a reel-eligible e2e clip it writes **no** manifest and exits 0, printing either the plain `skipped: no e2e tests changed on this branch` or, when an ID was dropped for a missing marker, the eligibility message that names it (see **Which clean skip you got**).
+- **Clean skip:** if no ID resolves to a reel-eligible e2e clip it writes **no** manifest and exits 0, printing either the plain `skipped: no e2e tests changed on this branch` or, when an ID was dropped by the marker, provenance or recording check, a message that names it (see **Which clean skip you got**). When a manifest **is** written but a changed, marked e2e test had no recording, a stderr warning names it, so a partial reel cannot pass for a complete one.
 
 Splitting selection (a) from assembly (b) is deliberate: (b) is deterministic and fixture-testable, and it has exactly one impure edge — resolving the commit the provenance gate checks against, which `REEL_ADAPTER_EXPECT_COMMIT` overrides and which is resolved *lazily*, so a list that reaches no provenance check touches no git at all. That is what most of the acceptance test below exercises.
 
@@ -195,11 +198,12 @@ Both skips are identical in behaviour — no manifest, no engine, **exit 0** —
 | --- | --- | --- |
 | `skipped: no e2e tests changed on this branch` | Nothing was in scope at all — no changed e2e test with a cast. | Nothing. A reel was never possible on this branch. (If you expected one, check that the e2e suite ran with `DOT_AGENT_DECK_RECORD=1` so the casts exist.) |
 | `skipped: N e2e test(s) …, but none is reel-eligible — no [reel] marker in tests/CATALOG.md for: <ids>` | e2e tests **did** change and have casts; they were dropped by the opt-in marker gate alone. | Read the named ids. Usually **nothing** — an unmarked test is unmarked on purpose. Add the marker only if that test genuinely spins up a **real agent** and shows the feature as a user runs it; a stand-in stays unmarked. |
+| `skipped: N e2e test(s) …, but none has a recording; run them with DOT_AGENT_DECK_RECORD=1 cargo test-e2e-live <filter> at this commit: <ids>` | The tests changed and **are** marked, but their recording dirs hold no `full-stream.cast` — typically only `test.md`, left by a run without `DOT_AGENT_DECK_RECORD=1` (issue #1683). Each id also gets an `excluding '<id>' (e2e test with no full-stream.cast …)` line on stderr. | **Record** them at this commit with the printed command. Neither the diff nor a marker is the problem. |
 | `skipped: N e2e test(s) …, but none has a recording whose provenance checks out` | The tests changed and **are** marked, but every one of their recordings failed the [cast-provenance gate](#cast-provenance-issue-808) — most often a cast an earlier revision left on disk that no filtered run since has overwritten. | **Re-record** at this commit: `DOT_AGENT_DECK_RECORD=1 cargo test-e2e-live <filter>`. Each id's own verdict — absent sidecar, wrong commit, non-passing run — is on stderr above the skip. A ` [reel]` marker will not fix it, and neither will the diff. |
 
-The three wordings are deliberately distinct because the three causes call for opposite responses, and the provenance one is a third unrelated reason rather than a variant of the marker: blaming the marker for a stale cast would send a reader to add a tag that changes nothing, which is the same misattribution issue #735 was about.
+The wordings are deliberately distinct because the causes call for opposite responses, and the provenance one is a third unrelated reason rather than a variant of the marker: blaming the marker for a stale cast would send a reader to add a tag that changes nothing, which is the same misattribution issue #735 was about.
 
-A hand-written id list can trip **more than one** gate at once — one id with no cast, another with a cast but no marker — and then the second message carries an extra parenthetical naming the cast-less ids separately, because "none is reel-eligible" is not the reason those were dropped and adding a marker to them would change nothing. Only the standalone `build.sh assemble <id...>` reaches this: the `reel` pipeline's `select` half drops cast-less dirs before `assemble` ever sees them, so its skips always have a single cause.
+A hand-written id list can trip **more than one** gate at once — one id with no cast, another with a cast but no marker — and then the second message carries an extra parenthetical naming the cast-less ids separately, because "none is reel-eligible" is not the reason those were dropped and adding a marker to them would change nothing. The `reel` pipeline can carry more than one cause as well: its `select` half drops L1 dirs before `assemble` sees them, but it reports a changed e2e test with no recording, or with no marker, alongside whatever `assemble` then refuses for provenance — so whichever cause takes the headline, the others follow it as parentheticals.
 
 The second message names the ids because that is what makes it actionable, and because the older generic wording pointed at the wrong gate: a reader who saw "no e2e tests changed" on a branch that *had* changed e2e tests would go debugging the git-diff selection, which was working correctly. The inverse hazard is worth naming too — a message claiming nothing changed invites someone to reach for a ` [reel]` marker to make a reel appear, when the absent marker was the deliberate, correct answer.
 
@@ -219,7 +223,7 @@ All paths default to this repo's layout and are overridable (the test uses this 
 
 ## Acceptance test
 
-A **re-runnable, pure-shell** test (no `agg`/`ffmpeg`, no git, no network — so it **may** run in CI, unlike the engine smoke and the reel step itself) drives the deterministic `assemble` path against a tiny fixture (`tests/fixtures/recordings/` with two `[reel]`-marked e2e dirs that have casts, one L1 dir with no cast, and one cast-bearing dir that is **not** marked, plus a `CATALOG.md` fixture). It asserts:
+A **re-runnable, pure-shell** test (no `agg`/`ffmpeg`, no git, no network — so it **may** run in CI, unlike the engine smoke and the reel step itself) drives the deterministic `assemble` path against a tiny fixture (`tests/fixtures/recordings/` with two `[reel]`-marked e2e dirs that have casts, one L1 dir with no cast, one cast-bearing dir that is **not** marked, and two e2e dirs holding only `test.md` — one marked, one not — plus a `CATALOG.md` fixture). It asserts:
 
 1. given `alpha beta gamma delta`, the manifest has the right
    titles/descriptions/clip paths **in catalog order** (`beta`=001 before
@@ -229,12 +233,19 @@ A **re-runnable, pure-shell** test (no `agg`/`ffmpeg`, no git, no network — so
    the `no e2e tests changed` message, while an **unmarked-cast-only** list
    clean-skips with the **eligibility** message naming `delta`, so the two
    wordings cannot drift back into one — and a **mixed** `gamma delta` list names
-   **both** reasons rather than attributing the whole skip to the marker;
+   **both** reasons rather than attributing the whole skip to the marker; a
+   marked e2e test with no cast is reported as **unrecorded** with the
+   `DOT_AGENT_DECK_RECORD=1` remedy, and an unmarked one as unmarked;
 3. on the **`reel`** path, a branch that changed only the *unmarked* test's
    source skips with that eligibility message (never `no e2e tests changed` —
    the issue #735 defect) and still writes no manifest and invokes no engine,
    while a branch that changed a **marked** test's source selects, assembles and
-   invokes the engine (a stub) with no near-miss reported;
+   invokes the engine (a stub) with no near-miss reported; a branch whose
+   changed marked e2e test has **no recording** skips with the unrecorded
+   message and its per-id diagnostic (issue #1683), an L1-only change still says
+   `no e2e tests changed`, a reel built from the other changed tests warns that
+   the unrecorded one is missing, and a skip after the provenance gate still
+   counts it;
 4. the **cast-provenance** gate refuses a clip whose sidecar is absent, corrupt,
    of an unknown schema, missing a required field, recorded at a different
    commit, or recorded from a non-passing run — while a valid sidecar publishes,

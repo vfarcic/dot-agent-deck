@@ -19,11 +19,20 @@
 #   (ii-d) a MIXED list — one id dropped for having no cast, one for having no
 #         marker — names BOTH reasons rather than attributing the whole skip to
 #         the marker (PR #778 review; reachable only via standalone `assemble`);
+#   (ii-e) a marked e2e test with NO cast is reported as UNRECORDED, with the
+#         DOT_AGENT_DECK_RECORD=1 remedy, while an unmarked one is reported as
+#         unmarked — never "no e2e tests changed" (issue #1683);
 #   (iii) the `reel` path on a branch that DID change an e2e test whose catalog
 #         entry is unmarked skips with that eligibility message too — never the
 #         "no e2e tests changed" one, which is the issue #735 defect;
 #   (iv)  the `reel` path on a branch that changed a MARKED test still selects,
 #         assembles and invokes the engine (a stub), and reports no near-miss;
+#   (vi)  the `reel` path on a branch whose changed e2e tests have NO recording
+#         says so, counts them, names the remedy and prints the per-id
+#         diagnostic (issue #1683's repro); a branch that changed only an L1
+#         test still says "no e2e tests changed"; a reel built from the other
+#         changed tests warns that the unrecorded one is missing; and a skip
+#         after assembly still counts the unrecorded one;
 #   (v)   the CAST PROVENANCE gate (issue #808) refuses a clip whose sidecar is
 #         absent, corrupt, of an unknown schema, missing a required field,
 #         recorded at a different commit, or recorded from a non-passing run —
@@ -46,11 +55,13 @@
 # provenance.json, so the diff between "publishes" and "refused" is visible in
 # the test body. Still pure shell — a copy and a `jq`, no git and no network.
 #
-# The fixture under tests/fixtures/recordings/ has FOUR dirs:
+# The fixture under tests/fixtures/recordings/ has SIX dirs:
 #   * alpha, beta — e2e dirs WITH a cast whose catalog entry carries ` [reel]`;
 #   * gamma       — an L1 dir (test.md but NO cast), so excluded by construction;
 #   * delta       — an e2e dir WITH a cast but whose catalog entry is UNMARKED,
-#                   so excluded by the opt-in reel-eligibility marker.
+#                   so excluded by the opt-in reel-eligibility marker;
+#   * epsilon     — a MARKED e2e dir holding only test.md: an unrecorded test;
+#   * zeta        — an UNMARKED e2e dir holding only test.md.
 # Each cast-bearing dir also carries a `provenance.json` recording a synthetic
 # commit, which `REEL_ADAPTER_EXPECT_COMMIT` below pins — so every section stays
 # independent of the real checkout's HEAD and needs no git to accept a clip.
@@ -110,6 +121,7 @@ prov_set() {
 # issue #735 regression, so every skip assertion below checks both directions.
 NOTHING_CHANGED="skipped: no e2e tests changed on this branch"
 NOT_ELIGIBLE="but none is reel-eligible"
+NOT_RECORDED="but none has a recording"
 
 # --- (i) assemble alpha beta gamma delta -> [beta(001), alpha(002)];
 #         gamma excluded (no cast), delta excluded (cast but NOT [reel]-marked) --
@@ -206,6 +218,38 @@ if says "$NOTHING_CHANGED" "$out5"; then
   fail "(ii-d) a marker-rejected id is present, so this must not fall back to the generic message; got: '$out5'"
 fi
 echo "PASS (ii-d): mixed cast-less + unmarked list names BOTH reasons (gamma and delta)"
+
+# --- (ii-e) e2e tests with NO cast -> unrecorded vs unmarked (issue #1683) ------
+# epsilon and zeta are e2e tests (their source is an `e2e_*.rs` file) whose dirs
+# hold only test.md. Before #1683 both fell into the L1 bucket and the skip said
+# "no e2e tests changed". epsilon is marked, so recording it is the remedy;
+# zeta is not, so recording it would change nothing and it is reported as
+# unmarked instead.
+MAN_E="$TMP/skip-unrecorded.json"
+ERR_E="$TMP/skip-unrecorded.err"
+outE="$("$BUILD" assemble --manifest "$MAN_E" epsilon 2>"$ERR_E")"
+[[ ! -e "$MAN_E" ]] || fail "(ii-e) manifest must NOT be written when the only id has no recording"
+says "skipped: 1 e2e test(s) in the given list, $NOT_RECORDED" "$outE" \
+  || fail "(ii-e) skip must count the unrecorded e2e test; got: '$outE'"
+says "DOT_AGENT_DECK_RECORD=1" "$outE" || fail "(ii-e) skip must name the recording remedy; got: '$outE'"
+says "epsilon" "$outE" || fail "(ii-e) skip must NAME the unrecorded id; got: '$outE'"
+if says "$NOTHING_CHANGED" "$outE"; then
+  fail "(ii-e) epsilon is an e2e test — 'no e2e tests changed' is the issue #1683 defect; got: '$outE'"
+fi
+says "excluding 'epsilon' (e2e test with no full-stream.cast" "$(cat "$ERR_E")" \
+  || fail "(ii-e) the per-id diagnostic must call epsilon an unrecorded e2e test; stderr: $(cat "$ERR_E")"
+if says "not an e2e clip" "$(cat "$ERR_E")"; then
+  fail "(ii-e) epsilon IS an e2e test, so the L1 wording must not appear; stderr: $(cat "$ERR_E")"
+fi
+
+outZ="$("$BUILD" assemble --manifest "$MAN_E" zeta 2>/dev/null)"
+[[ ! -e "$MAN_E" ]] || fail "(ii-e) manifest must NOT be written for an unmarked unrecorded id"
+says "$NOT_ELIGIBLE" "$outZ" || fail "(ii-e) an unmarked unrecorded test must be reported as unmarked; got: '$outZ'"
+says "zeta" "$outZ" || fail "(ii-e) skip must NAME zeta; got: '$outZ'"
+if says "DOT_AGENT_DECK_RECORD=1" "$outZ"; then
+  fail "(ii-e) recording zeta would not make it a clip, so the skip must not suggest it; got: '$outZ'"
+fi
+echo "PASS (ii-e): a marked e2e test with no cast is reported as unrecorded (with the remedy), an unmarked one as unmarked"
 
 # --- (v) CAST PROVENANCE (issue #808) ------------------------------------------
 # Selection is a `test -f` plus two STATIC facts about the test, so a cast an
@@ -422,6 +466,8 @@ git -C "$REPO" config commit.gpgsign false
 # The two source files the fixture recordings name in their **Source:** lines.
 echo "// base" > "$REPO/tests/e2e_mouse_button.rs"   # alpha + beta (both [reel]-marked)
 echo "// base" > "$REPO/tests/e2e_mouse_delta.rs"    # delta (cast, but NOT marked)
+echo "// base" > "$REPO/tests/e2e_mouse_epsilon.rs"  # epsilon (marked, NO cast)
+echo "// base" > "$REPO/tests/render_mouse_button.rs" # gamma (L1, no cast)
 git -C "$REPO" add -A
 git -C "$REPO" commit -qm "base"
 git -C "$REPO" branch -q mainline
@@ -485,5 +531,71 @@ if says "$NOT_ELIGIBLE" "$out6"; then
   fail "(iv) delta's source did not change, so it is out of scope — not a near-miss to report; got: '$out6'"
 fi
 echo "PASS (iv): reel path selects the marked tests, writes the manifest, and invokes the engine"
+
+# --- (vi) changed e2e tests with NO recording (issue #1683) ---------------------
+# The issue's repro: the branch changes an e2e test whose recording dir holds
+# only test.md. The skip stays clean, but must say the test has no recording,
+# count it, name the remedy and print the per-id diagnostic — not claim that no
+# e2e tests changed.
+git -C "$REPO" checkout -q -b feature-unrecorded mainline
+echo "// changed" >> "$REPO/tests/e2e_mouse_epsilon.rs"
+git -C "$REPO" commit -qam "touch the unrecorded test"
+
+rm -f "$ENGINE_LOG"
+MAN7="$TMP/reel-unrecorded.json"
+ERR7="$TMP/reel-unrecorded.err"
+rc=0
+out7="$(cd "$REPO" && "$BUILD" reel --manifest "$MAN7" 2>"$ERR7")" || rc=$?
+[[ "$rc" -eq 0 ]] || fail "(vi) the skip must stay CLEAN (exit 0), got exit $rc; stderr: $(cat "$ERR7")"
+[[ ! -e "$MAN7" ]] || fail "(vi) manifest must NOT be written on a clean skip"
+[[ ! -e "$ENGINE_LOG" ]] || fail "(vi) engine must NOT be invoked on a clean skip"
+says "skipped: 1 e2e test(s) changed on this branch, $NOT_RECORDED" "$out7" \
+  || fail "(vi) skip must count the changed tests that have no recording; got: '$out7'"
+says "DOT_AGENT_DECK_RECORD=1" "$out7" || fail "(vi) skip must say how to record them; got: '$out7'"
+says "epsilon" "$out7" || fail "(vi) skip must NAME the unrecorded test; got: '$out7'"
+if says "$NOTHING_CHANGED" "$out7"; then
+  fail "(vi) e2e tests DID change — claiming otherwise is the issue #1683 defect; got: '$out7'"
+fi
+says "excluding 'epsilon' (e2e test with no full-stream.cast" "$(cat "$ERR7")" \
+  || fail "(vi) selection must print the per-id diagnostic; stderr: $(cat "$ERR7")"
+
+# An L1-only change still reads "no e2e tests changed": gamma has no cast by
+# construction, and that claim is true of it.
+git -C "$REPO" checkout -q -b feature-l1 mainline
+echo "// changed" >> "$REPO/tests/render_mouse_button.rs"
+git -C "$REPO" commit -qam "touch the L1 test"
+out8="$(cd "$REPO" && "$BUILD" reel --manifest "$TMP/reel-l1.json" 2>"$TMP/reel-l1.err")"
+says "$NOTHING_CHANGED" "$out8" || fail "(vi) an L1-only change must still say no e2e tests changed; got: '$out8'"
+if says "gamma" "$(cat "$TMP/reel-l1.err")"; then
+  fail "(vi) an L1 test with no cast is not a near-miss and must stay silent; stderr: $(cat "$TMP/reel-l1.err")"
+fi
+
+# A reel built from the OTHER changed tests still says the unrecorded one is
+# missing from it, so a partial reel cannot pass for a complete one.
+git -C "$REPO" checkout -q -b feature-partial mainline
+echo "// changed" >> "$REPO/tests/e2e_mouse_button.rs"
+echo "// changed" >> "$REPO/tests/e2e_mouse_epsilon.rs"
+git -C "$REPO" commit -qam "touch a recorded and an unrecorded test"
+rm -f "$ENGINE_LOG"
+MAN9="$TMP/reel-partial.json"
+ERR9="$TMP/reel-partial.err"
+(cd "$REPO" && "$BUILD" reel --manifest "$MAN9" --title "stub title" >/dev/null 2>"$ERR9")
+[[ "$(jq 'length' "$MAN9")" -eq 2 ]] || fail "(vi) the recorded tests must still be published; got: $(cat "$MAN9")"
+[[ -s "$ENGINE_LOG" ]] || fail "(vi) engine must be invoked when a reel is built"
+says "have NO recording and are NOT in this reel: epsilon" "$(cat "$ERR9")" \
+  || fail "(vi) a partial reel must warn about the unrecorded test; stderr: $(cat "$ERR9")"
+
+# And when the recorded ones then fail provenance, the skip after assembly still
+# counts the unrecorded one rather than reporting only the stale ids.
+rm -f "$ENGINE_LOG"
+MAN10="$TMP/reel-stale-unrecorded.json"
+out10="$(cd "$REPO" && REEL_ADAPTER_EXPECT_COMMIT="ddddddd" "$BUILD" reel --manifest "$MAN10" 2>/dev/null)"
+[[ ! -e "$MAN10" ]] || fail "(vi) no clip passes provenance, so no manifest may be written"
+says "none has a recording whose provenance checks out" "$out10" \
+  || fail "(vi) the stale clips must still headline the skip; got: '$out10'"
+says "further e2e test(s) have no recording at all" "$out10" \
+  || fail "(vi) the skip must still count the unrecorded test; got: '$out10'"
+says "epsilon" "$out10" || fail "(vi) the skip must name the unrecorded test; got: '$out10'"
+echo "PASS (vi): changed e2e tests with no recording are counted, named and given the DOT_AGENT_DECK_RECORD=1 remedy"
 
 echo "ADAPTER TEST PASS"
