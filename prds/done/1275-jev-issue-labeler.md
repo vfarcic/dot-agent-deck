@@ -1,13 +1,15 @@
 # PRD #1275: Jev as the issue and PR labeler's classifier
 
-**Status**: Draft — **blocked on Jev access.** No TypeSafe account is available yet, so no milestone can start. M1 is a go/no-go measurement, and nothing after it is built unless M1 passes.
+**Status**: No Longer Needed — closed 2026-10-20 without starting any milestone. It was blocked on Jev access throughout (no TypeSafe account was available), and the maintainer decided not to pursue it.
+**Last Updated**: 2026-10-20
+**Closed**: 2026-10-20
 **Priority**: Low
 **Created**: 2026-09-24
-**Related**: [PRD #1273](done/1273-jev-voice-command-backend.md) (Jev as a voice command model — same model, independent decision), [PRD #421](421-issue-triage-labels-and-dispatch-claims.md) (the other classification mechanism; the interlock below still holds)
+**Related**: [PRD #1273](1273-jev-voice-command-backend.md) (Jev as a voice command model — same model, independent decision), [PRD #421](../421-issue-triage-labels-and-dispatch-claims.md) (the other classification mechanism; the interlock below still holds)
 
 ## Problem Statement
 
-The adaptive labeler ([`docs/develop/issue-labeling.md`](../docs/develop/issue-labeling.md)) classifies new issues and same-repository pull requests into a **closed taxonomy** of 21 labels across six axes (type, area, component, priority, size, triage). It does that by running a full Codex agent (`gpt-5-mini`) inside a GitHub Agentic Workflow, with read tools, a threat-detection pass and correction memory.
+The adaptive labeler ([`docs/develop/issue-labeling.md`](../../docs/develop/issue-labeling.md)) classifies new issues and same-repository pull requests into a **closed taxonomy** of 21 labels across six axes (type, area, component, priority, size, triage). It does that by running a full Codex agent (`gpt-5-mini`) inside a GitHub Agentic Workflow, with read tools, a threat-detection pass and correction memory.
 
 The work itself is not agent-shaped. The safe-output allowlist already restricts the model to choosing from the taxonomy, and a validator rejects anything else — the output *is* a set of choices. Paying for an agent to make them shows in the one trial on record (2026-08-20): **0.736 AI credits for classification plus 0.454 for threat detection, and 27.5 s of model time**, for a single synthetic issue. An earlier configuration spent 5.680 credits and abstained.
 
@@ -126,3 +128,7 @@ The workflow would hold a TypeSafe key as a repository secret instead of `OPENAI
 ### 2026-09-24 — Created
 
 Split out from the discussion that produced PRD #1273. Found while writing it: the labeler has never been enabled and has no memory branch, so the "feedback store as a ready test set" idea was withdrawn in favour of the labels already on the repository's issues.
+
+### 2026-10-20 — Closed: no longer needed
+
+Closed by the maintainer without starting any milestone. The PRD was blocked on Jev access from the day it was written, and M1's go/no-go measurement never ran. The adaptive labeler stays on its current Codex classifier, as described in `docs/develop/issue-labeling.md`. Nothing in this PRD shipped.
