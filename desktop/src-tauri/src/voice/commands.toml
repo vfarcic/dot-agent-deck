@@ -1102,11 +1102,22 @@ meaning     = "whole"
 # this row; it passed 8 of 8 on `origin/main`, which has no such row. Called
 # `hush_reading` it passed 8 of 8 (2026-10-08). Do not rename it to a synonym
 # of mute or silence without rerunning that fixture.
+#
+# **"Or the same request in other words" made "mute" one of them (PRD #1733).**
+# The description used to say "Use ONLY when the WHOLE utterance is exactly"
+# one of its phrasings; once they became examples, the command model answered
+# "mute" with this row in 28 of 100 replays of `voice-off-mute` (0 of 100 with
+# the old wording), and the meaning check read "mute" as this row 20 of 20.
+# Saying here, as `voice_off` already does, that a bare "mute" is `voice_off`:
+# 100 of 100 `voice_off`, the check 0 of 20, and "quiet", "be quiet, please",
+# "mic off", "stop voice" and "disable audio input" unchanged (2026-10-20).
+# The same wording without that sentence made it worse, 71 of 100.
 [[commands]]
 id          = "hush_reading"
 description = """Stop what the app is reading aloud in reading mode (an agent's turn summary,
-permission prompt or error). Use when the user asks for this and nothing else: "quiet", "be
-quiet", "silence", "hush", "shush", or the same request in other words."""
+permission prompt or error). Use only when the WHOLE utterance asks for this, as "quiet", "be
+quiet", "silence", "hush", "shush" or the same request in other words do. A bare "mute" is
+`voice_off`, never this."""
 invoke      = "quietSpeech"
 unavailable_hint = "silencing the app's speech works anywhere"
 report      = "Quiet."
