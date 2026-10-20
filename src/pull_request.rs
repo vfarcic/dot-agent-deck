@@ -246,8 +246,10 @@ struct GhPr {
 }
 
 /// One entry of `statusCheckRollup`: a check run (`status` and, once it has
-/// finished, `conclusion`) or a commit status (`state`).
+/// finished, `conclusion`) or a commit status (`state`). The names and the
+/// start time only tell repeated runs of one check apart ([`latest_runs`]).
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GhCheck {
     #[serde(default)]
     status: Option<String>,
@@ -255,6 +257,16 @@ struct GhCheck {
     conclusion: Option<String>,
     #[serde(default)]
     state: Option<String>,
+    /// A check run's name.
+    #[serde(default)]
+    name: Option<String>,
+    /// A commit status's name.
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    #[serde(default)]
+    started_at: Option<String>,
 }
 
 /// Where one check counts on the badge.
@@ -288,9 +300,41 @@ impl GhCheck {
             "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => {
                 Some(CheckBucket::Failing)
             }
+            // A run GitHub marked stale never finished, so it is not a pass;
+            // `gh pr checks` lists it as pending too.
+            "STALE" => Some(CheckBucket::Pending),
             _ => None,
         }
     }
+}
+
+/// What tells one check from another: its workflow, its name, and a commit
+/// status's context.
+type CheckKey<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>);
+
+/// The newest run of each check in `rollup`. The rollup lists every run of a
+/// check, so one that failed and then passed on a re-run appears twice; like
+/// `gh pr checks`, only the newest counts, one per workflow and check name (or
+/// per commit status context). A run with no start time is queued and so the
+/// newest; GitHub's timestamps are all UTC `…Z`, so they order as text.
+fn latest_runs(rollup: &[GhCheck]) -> Vec<&GhCheck> {
+    let mut latest: HashMap<CheckKey<'_>, &GhCheck> = HashMap::new();
+    for check in rollup {
+        let key = (
+            check.workflow_name.as_deref(),
+            check.name.as_deref(),
+            check.context.as_deref(),
+        );
+        // `None` sorts below `Some`, so flip it: no start time is newest.
+        let newness = |c: &GhCheck| (c.started_at.is_none(), c.started_at.clone());
+        match latest.get(&key) {
+            Some(kept) if newness(kept) >= newness(check) => {}
+            _ => {
+                latest.insert(key, check);
+            }
+        }
+    }
+    latest.into_values().collect()
 }
 
 /// Issue #1781: the badge's CI summary of `rollup`, or `None` when it holds no
@@ -304,7 +348,7 @@ fn summarize_checks(rollup: &[GhCheck]) -> Option<PullRequestChecks> {
         pending: 0,
         skipped: 0,
     };
-    for bucket in rollup.iter().filter_map(GhCheck::bucket) {
+    for bucket in latest_runs(rollup).into_iter().filter_map(GhCheck::bucket) {
         let count = match bucket {
             CheckBucket::Passing => &mut checks.passing,
             CheckBucket::Failing => &mut checks.failing,
@@ -1158,17 +1202,40 @@ mod tests {
         );
     }
 
+    /// A check run with a name of its own, so no two count as one check.
     fn check_run(status: &str, conclusion: &str) -> serde_json::Value {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        named_run(
+            &format!("job-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            status,
+            conclusion,
+            None,
+        )
+    }
+
+    fn named_run(
+        name: &str,
+        status: &str,
+        conclusion: &str,
+        started_at: Option<&str>,
+    ) -> serde_json::Value {
         serde_json::json!({
             "__typename": "CheckRun",
-            "name": "build",
+            "name": name,
+            "workflowName": "CI",
             "status": status,
             "conclusion": conclusion,
+            "startedAt": started_at,
         })
     }
 
     fn status_context(state: &str) -> serde_json::Value {
-        serde_json::json!({ "__typename": "StatusContext", "context": "ci/x", "state": state })
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        serde_json::json!({
+            "__typename": "StatusContext",
+            "context": format!("ci/{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            "state": state,
+        })
     }
 
     fn checks_of(rollup: serde_json::Value) -> Option<PullRequestChecks> {
@@ -1232,6 +1299,72 @@ mod tests {
         assert_eq!(
             (passing.state, passing.passing, passing.skipped),
             (PullRequestChecksState::Passing, 2, 1)
+        );
+    }
+
+    /// Issue #1781 (PR #1783 review): a check that failed and then passed on
+    /// a re-run counts once, as its newest run, and a re-run still queued is
+    /// newer than any finished run of the same check.
+    #[test]
+    fn only_the_newest_run_of_a_check_counts() {
+        use serde_json::json;
+        let rerun_passed = checks_of(json!([
+            named_run("test", "COMPLETED", "FAILURE", Some("2026-10-20T10:00:00Z")),
+            named_run("test", "COMPLETED", "SUCCESS", Some("2026-10-20T11:00:00Z")),
+            named_run(
+                "build",
+                "COMPLETED",
+                "SUCCESS",
+                Some("2026-10-20T10:00:00Z")
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (
+                rerun_passed.state,
+                rerun_passed.passing,
+                rerun_passed.failing
+            ),
+            (PullRequestChecksState::Passing, 2, 0)
+        );
+        let requeued = checks_of(json!([
+            named_run("test", "COMPLETED", "SUCCESS", Some("2026-10-20T11:00:00Z")),
+            named_run("test", "QUEUED", "", None),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (requeued.state, requeued.passing, requeued.pending),
+            (PullRequestChecksState::Pending, 0, 1)
+        );
+        // The same job name in two workflows is two checks.
+        let mut other = named_run("test", "COMPLETED", "FAILURE", Some("2026-10-20T09:00:00Z"));
+        other["workflowName"] = json!("Docs");
+        let two = checks_of(json!([
+            named_run("test", "COMPLETED", "SUCCESS", Some("2026-10-20T11:00:00Z")),
+            other,
+        ]))
+        .unwrap();
+        assert_eq!((two.passing, two.failing), (1, 1));
+    }
+
+    /// Issue #1781 (PR #1783 review): a stale run never finished, so it is
+    /// pending, alone or beside passing checks.
+    #[test]
+    fn a_stale_check_is_pending() {
+        use serde_json::json;
+        let alone = checks_of(json!([check_run("COMPLETED", "STALE")])).unwrap();
+        assert_eq!(
+            (alone.state, alone.pending),
+            (PullRequestChecksState::Pending, 1)
+        );
+        let beside = checks_of(json!([
+            check_run("COMPLETED", "SUCCESS"),
+            check_run("COMPLETED", "STALE"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (beside.state, beside.passing, beside.pending),
+            (PullRequestChecksState::Pending, 1, 1)
         );
     }
 

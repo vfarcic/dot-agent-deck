@@ -218,15 +218,17 @@ fn pr_json(number: u64, branch: &str, state: &str, draft: bool, review: Value) -
 }
 
 /// `pr` with a CI rollup of `passing` successful check runs, `failing` failed
-/// ones and one commit status in `status_state`, as `gh` reports them.
+/// ones and one commit status in `status_state`, as `gh` reports them. Each run
+/// has a name of its own, since repeated runs of one check count once.
 fn with_checks(mut pr: Value, passing: usize, failing: usize, status_state: &str) -> Value {
-    let run = |conclusion: &str| {
-        json!({"__typename": "CheckRun", "name": "build", "status": "COMPLETED",
-            "conclusion": conclusion, "workflowName": "CI"})
-    };
-    let mut rollup: Vec<Value> = std::iter::repeat_with(|| run("SUCCESS"))
-        .take(passing)
-        .chain(std::iter::repeat_with(|| run("FAILURE")).take(failing))
+    let conclusions =
+        std::iter::repeat_n("SUCCESS", passing).chain(std::iter::repeat_n("FAILURE", failing));
+    let mut rollup: Vec<Value> = conclusions
+        .enumerate()
+        .map(|(i, conclusion)| {
+            json!({"__typename": "CheckRun", "name": format!("job-{i}"), "status": "COMPLETED",
+                "conclusion": conclusion, "workflowName": "CI"})
+        })
         .collect();
     rollup.push(
         json!({"__typename": "StatusContext", "context": "ci/legacy", "state": status_state}),
