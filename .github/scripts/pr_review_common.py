@@ -486,7 +486,27 @@ INDEPENDENT_REVIEWERS = ("qodo-code-review[bot]", "greptile-apps[bot]")
 
 
 def independent_review_at(sha, comments, review_comments, reviews):
-    """Did an independent reviewer look at THIS head? (issue #1270)
+    """Did an independent reviewer look at THIS head? The reviewer's login, or None.
+
+    The vote job's question, answered by `independent_review_evidence`, which
+    also says where the evidence is.
+    """
+    evidence = independent_review_evidence(sha, comments, review_comments, reviews)
+    return evidence["login"] if evidence else None
+
+
+def independent_review_evidence(sha, comments, review_comments, reviews):
+    """Did an independent reviewer look at THIS head, and through what? (issue #1270)
+
+    Returns `{"login", "artefact", "url"}` or None. `artefact` names the shape
+    that matched -- "submitted review", "inline review comment" or "summary
+    comment" -- and `url` is its `html_url` when the caller fetched one.
+
+    Issue #1754 is why the artefact is returned rather than only the login: the
+    selector hands this to the agent, which had been re-deriving coverage and
+    getting it wrong. On #1751 it read Qodo's one submitted review, anchored at
+    the first commit, as Qodo's entire coverage, twice, while Qodo's summary
+    comment named the head. Naming the artefact tells it where to look.
 
     Three shapes count, because the two products express it differently:
 
@@ -505,12 +525,16 @@ def independent_review_at(sha, comments, review_comments, reviews):
         its body cited the head SHA, so `created_at` is not the freshness
         signal and a timestamp comparison would read as stale.
 
-    Returns the reviewer's login, or None. Absence is not a defect — it means
-    nobody independent has read this head yet, which is a reason to withhold an
-    approval rather than to refuse the pull request.
+    Absence is not a defect — it means nobody independent has read this head
+    yet, which is a reason to withhold an approval rather than to refuse the
+    pull request.
     """
     if not sha:
         return None
+
+    def found(login, artefact, item):
+        return {"login": login, "artefact": artefact, "url": item.get("html_url") or ""}
+
     for review in reviews or ():
         login = ((review.get("user") or {}).get("login")) or ""
         # A PENDING review is a draft its author has not submitted. `pr_reviews`
@@ -519,19 +543,71 @@ def independent_review_at(sha, comments, review_comments, reviews):
         if review.get("state") == "PENDING":
             continue
         if login in INDEPENDENT_REVIEWERS and review.get("commit_id") == sha:
-            return login
+            return found(login, "submitted review", review)
     for comment in review_comments or ():
         login = ((comment.get("user") or {}).get("login")) or ""
         # `original_commit_id` is where the comment was WRITTEN; `commit_id`
         # follows the head. See the docstring -- reading the latter makes this
         # gate vacuous on any pull request that ever received an inline finding.
         if login in INDEPENDENT_REVIEWERS and comment.get("original_commit_id") == sha:
-            return login
+            return found(login, "inline review comment", comment)
     for comment in comments or ():
         login = ((comment.get("user") or {}).get("login")) or ""
         if login in INDEPENDENT_REVIEWERS and sha in (comment.get("body") or ""):
-            return login
+            return found(login, "summary comment", comment)
     return None
+
+
+def describe_independent_review(evidence):
+    """The one line the agent is handed about independent coverage (issue #1754).
+
+    Written for the agent's prompt, so it states the finding and where it came
+    from, and says outright when there is none -- an empty string would read as
+    "nobody computed this", which is a different statement.
+    """
+    if not evidence:
+        return (
+            "none: no submitted review, inline review comment or summary comment by "
+            f"{' or '.join(INDEPENDENT_REVIEWERS)} covers this head SHA"
+        )
+    where = f" ({evidence['url']})" if evidence.get("url") else ""
+    return f"{evidence['login']}, through its {evidence['artefact']}{where}"
+
+
+# Issue #1629: how many automatic re-reviews one head may get after an
+# INSUFFICIENT. One, so a coin-flip abstention stops costing a manual review
+# while a head that keeps abstaining costs at most two model calls, not one per
+# sweep. A focused pass (#1266) remains the manual remedy beyond that.
+INSUFFICIENT_RETRIES_PER_HEAD = 1
+
+
+def insufficient_retry_due(verdicts_at_head, evidence):
+    """Should the sweep review a head again although it already has a verdict?
+
+    The selector's idempotence skips any head with a verdict, which is right
+    for every verdict but an abstention: an INSUFFICIENT on a trivial pull
+    request then sat until a person approved it or a push minted a new head
+    (#1605, #1608 and #1609 waited two days). So a head gets another ordinary
+    pass when, and only when, all of these hold:
+
+      * every trusted verdict at this head is INSUFFICIENT -- a REQUEST_CHANGES
+        or an APPROVE is an answer, and re-asking would buy a second opinion
+        nobody wanted;
+      * it has had at most INSUFFICIENT_RETRIES_PER_HEAD retries, counted as the
+        verdicts beyond the first, so the bound holds across sweeps without any
+        state of its own -- the verdict comments are the state;
+      * an independent review covers the head now (`evidence`), because the
+        abstention the rubric REQUIRES is "nothing independent has read this
+        head", and re-running into that answer would spend a call to repeat it.
+
+    `verdicts_at_head` must already be filtered to trusted verdicts at this
+    head, which is what `trusted_verdicts_at` returns.
+    """
+    if not verdicts_at_head or not evidence:
+        return False
+    if any(v.get("verdict") != "INSUFFICIENT" for v in verdicts_at_head):
+        return False
+    return len(verdicts_at_head) <= INSUFFICIENT_RETRIES_PER_HEAD
 
 
 def coverage_gap(verdicts, changed_paths):
@@ -743,6 +819,38 @@ def bot_rejection_is_stale(reviews, sha):
     return all(r.get("commit_id") != sha for r in rejections)
 
 
+def stale_own_rejections(reviews, sha, app_login):
+    """The ids of `app_login`'s live CHANGES_REQUESTED reviews on an older head.
+
+    Issue #1754. A new review from the same account supersedes its earlier one,
+    so a fresh vote releases a stale rejection by itself -- but only when a vote
+    is CAST. The no-vote outcomes (INSUFFICIENT, no independent review, armed
+    auto-merge on a sensitive path) cast nothing, so the old CHANGES_REQUESTED
+    went on holding `reviewDecision` although the reviewer's current verdict
+    no longer rejected anything. On #1751 the rejection from `c1d3c1da`, both
+    of whose points had been fixed, outlived an INSUFFICIENT at `c99a7f00`,
+    blocked the maintainer's approval, and the pull request merged with
+    `--admin`. The vote job dismisses what this returns.
+
+    Keyed on the App's own login, never on bot-ness: dismissing anyone else's
+    rejection would be this job overruling a reviewer. An empty `app_login`
+    returns nothing -- fail CLOSED here, unlike `already_reviewed_at`, because
+    the failure mode of guessing is dismissing a review that is not ours. A
+    review already DISMISSED is not live and is left alone; one on this very
+    head is the current rejection, not a stale one.
+    """
+    if not app_login:
+        return []
+    return [
+        r.get("id")
+        for r in reviews or ()
+        if (r.get("user") or {}).get("login") == app_login
+        and r.get("state") == "CHANGES_REQUESTED"
+        and r.get("commit_id") != sha
+        and r.get("id") is not None
+    ]
+
+
 def pr_reviews(repo, pr_number):
     """Every review on a pull request, paginated.
 
@@ -755,7 +863,9 @@ def pr_reviews(repo, pr_number):
     """
     return gh_json_paginated(
         "api", f"repos/{repo}/pulls/{pr_number}/reviews", "--paginate",
-        "--jq", "[.[] | {commit_id, state, user: {login: .user.login, type: .user.type}}]",
+        # `id` is what a dismissal addresses (`stale_own_rejections`, #1754) and
+        # `html_url` is what the agent is pointed at (`independent_review_evidence`).
+        "--jq", "[.[] | {id, html_url, commit_id, state, user: {login: .user.login, type: .user.type}}]",
     )
 
 
@@ -763,7 +873,7 @@ def pr_comments(repo, pr_number):
     """Every issue comment on a pull request, paginated. Same paging reason."""
     return gh_json_paginated(
         "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
-        "--jq", "[.[] | {body, user: {login: .user.login}}]",
+        "--jq", "[.[] | {body, html_url, user: {login: .user.login}}]",
     )
 
 
@@ -780,7 +890,7 @@ def pr_review_comments(repo, pr_number):
     """
     return gh_json_paginated(
         "api", f"repos/{repo}/pulls/{pr_number}/comments", "--paginate",
-        "--jq", "[.[] | {commit_id, original_commit_id, body, user: {login: .user.login}}]",
+        "--jq", "[.[] | {commit_id, original_commit_id, body, html_url, user: {login: .user.login}}]",
     )
 
 

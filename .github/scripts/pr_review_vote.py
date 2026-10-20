@@ -64,6 +64,7 @@ from pr_review_common import (  # noqa: E402
     trusted_verdicts_at,
     pr_comments,
     pr_reviews,
+    stale_own_rejections,
 )
 
 ATTENTION_LABEL = "needs-human-eye"
@@ -201,6 +202,26 @@ def comment(repo, pr_number, body):
     gh_ok("pr", "comment", pr_number, "--repo", repo, "--body", body)
 
 
+def withdraw_stale_rejections(repo, pr_number, sha, app_login, decision):
+    """Dismiss my own CHANGES_REQUESTED reviews of older heads (issue #1754).
+
+    Best-effort, like the label: a failed dismissal must not lose the vote that
+    may follow it, and it is retried by the next sweep that reaches this head.
+    """
+    for review_id in stale_own_rejections(pr_reviews(repo, pr_number), sha, app_login):
+        dismissed = gh_ok(
+            "api", "-X", "PUT",
+            f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}/dismissals",
+            "-f", f"message=Superseded: my verdict for `{sha[:8]}` is `{decision}`, "
+                  "so this rejection of an earlier head no longer stands.",
+            "-f", "event=DISMISS",
+        )
+        print(
+            f"#{pr_number}: {'dismissed' if dismissed else 'could NOT dismiss'} my stale "
+            f"rejection {review_id}; my verdict for {sha[:8]} is {decision}"
+        )
+
+
 def main():
     repo = os.environ["REPO"]
     pr_number = os.environ["PR_NUMBER"]
@@ -310,6 +331,15 @@ def main():
 
     decision = verdict["verdict"]
     reasons = "\n".join(f"- {r}" for r in verdict.get("reasons", [])) or "- (none given)"
+
+    # Issue #1754: a verdict that no longer rejects withdraws my own rejection of
+    # an older head. A vote cast below would supersede it anyway, but several
+    # branches below cast nothing, and on #1751 an INSUFFICIENT left a fixed
+    # rejection blocking the maintainer's approval. Done before those branches so
+    # every one of them inherits it; a REQUEST_CHANGES keeps the old one, which
+    # its own new rejection supersedes.
+    if decision != "REQUEST_CHANGES":
+        withdraw_stale_rejections(repo, pr_number, expected_sha, app_login, decision)
 
     # Issue #1266: an APPROVE may now rest on coverage accumulated across
     # SEVERAL focused passes, so verify the union here rather than trusting the

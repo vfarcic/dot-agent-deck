@@ -68,7 +68,9 @@ fn run_py(body: &str) -> Output {
         \x20    focus_pass_requested, coverage_gap,\n\
         \x20    NO_INDEPENDENT_REVIEW_MARKER, INSUFFICIENT_MARKER,\n\
         \x20    AUTO_MERGE_ARMED_MARKER,\n\
-        \x20    independent_review_at)\n\
+        \x20    independent_review_at, independent_review_evidence,\n\
+        \x20    describe_independent_review, insufficient_retry_due,\n\
+        \x20    INSUFFICIENT_RETRIES_PER_HEAD, stale_own_rejections)\n\
          REQ = ('build', 'build-macos', 'build-windows', 'security', 'e2e-deterministic')\n\
          def crun(name, conclusion='success', status='completed', started_at=None, run_id=None):\n\
         \x20   return {{'name': name, 'status': status, 'conclusion': conclusion,\n\
@@ -1134,4 +1136,208 @@ fn nobody_else_can_satisfy_the_independence_requirement() {
 fn no_evidence_reads_as_no_independent_review() {
     assert_py_ok("assert independent_review_at(SHA, [], [], []) is None");
     assert_py_ok("assert independent_review_at('', [], [], []) is None");
+}
+
+// ---------------------------------------------------------------------------
+// Issues #1754 and #1629: the agent abstained on heads an independent review
+// covered. The cause was not the model's judgement but what it could see:
+// gh-aw's integrity filter answers the issue-comments read with an EMPTY list
+// on a pull request whose author has no write access (every Renovate pull
+// request), and Qodo's summary comment -- the artefact that names the head --
+// lives there. Measured in run 37691901791 (#1608, #1609) and run 39310350765
+// (#1751). So the selector now hands the agent the mechanical answer, gives an
+// abstention one bounded retry, and the vote job withdraws its own stale
+// rejection when its current verdict no longer rejects.
+// ---------------------------------------------------------------------------
+
+/// The #1751 shape: Qodo's only SUBMITTED review sits on the first commit, and
+/// its summary comment, edited in place, names the head. The evidence must name
+/// the summary comment, since that is the artefact the agent kept missing.
+#[test]
+fn the_summary_comment_is_named_as_the_artefact_that_covers_the_head() {
+    assert_py_ok(
+        r#"old = '8' * 40
+summary = {'user': {'login': 'qodo-code-review[bot]'},
+           'body': '<!-- https://github.com/o/r/commit/' + SHA + ' -->',
+           'html_url': 'https://github.com/o/r/pull/1#issuecomment-6'}
+first = review('qodo-code-review[bot]', old, 'COMMENTED')
+ev = independent_review_evidence(SHA, [summary], [], [first])
+assert ev == {'login': 'qodo-code-review[bot]', 'artefact': 'summary comment',
+              'url': 'https://github.com/o/r/pull/1#issuecomment-6'}, ev
+line = describe_independent_review(ev)
+assert 'qodo-code-review[bot]' in line and 'summary comment' in line, line
+assert 'issuecomment-6' in line, line
+assert independent_review_at(SHA, [summary], [], [first]) == 'qodo-code-review[bot]'
+"#,
+    );
+}
+
+/// Each shape reports itself, so the line tells the agent where to look.
+#[test]
+fn each_coverage_shape_names_its_own_artefact() {
+    assert_py_ok(
+        r#"r = review('greptile-apps[bot]', SHA, 'COMMENTED')
+assert independent_review_evidence(SHA, [], [], [r])['artefact'] == 'submitted review'
+c = {'user': {'login': 'qodo-code-review[bot]'}, 'original_commit_id': SHA, 'commit_id': SHA}
+assert independent_review_evidence(SHA, [], [c], [])['artefact'] == 'inline review comment'
+assert independent_review_evidence(SHA, [], [c], [])['url'] == ''
+"#,
+    );
+}
+
+/// "None" is said in words. An empty input means the caller did not compute
+/// it, and the prompt tells the agent to establish coverage itself in that
+/// case, so the two must never look alike.
+#[test]
+fn no_coverage_is_stated_rather_than_left_empty() {
+    assert_py_ok(
+        r#"line = describe_independent_review(None)
+assert line.startswith('none'), line
+assert 'qodo-code-review[bot]' in line and 'greptile-apps[bot]' in line, line
+"#,
+    );
+}
+
+/// The bounded retry of #1629: one more ordinary pass for a head whose only
+/// verdict is INSUFFICIENT, once something independent covers it.
+#[test]
+fn an_abstention_gets_one_retry_once_coverage_exists() {
+    assert_py_ok(
+        r#"ins = {'verdict': 'INSUFFICIENT', 'head_sha': SHA}
+ev = {'login': 'qodo-code-review[bot]', 'artefact': 'summary comment', 'url': ''}
+assert INSUFFICIENT_RETRIES_PER_HEAD == 1
+assert insufficient_retry_due([ins], ev)
+assert not insufficient_retry_due([ins], None), 'a retry into the required abstention'
+assert not insufficient_retry_due([ins, dict(ins)], ev), 'the bound did not hold'
+assert not insufficient_retry_due([], ev), 'no verdict is the ordinary review, not a retry'
+"#,
+    );
+}
+
+/// An answer is not re-asked. A REQUEST_CHANGES or an APPROVE anywhere at the
+/// head means the reviewer did not abstain, whatever came after it.
+#[test]
+fn a_head_with_an_answer_is_not_retried() {
+    for other in ["APPROVE", "REQUEST_CHANGES"] {
+        assert_py_ok(&format!(
+            r#"ev = {{'login': 'qodo-code-review[bot]', 'artefact': 'summary comment', 'url': ''}}
+assert not insufficient_retry_due([{{'verdict': {other:?}}}], ev)
+assert not insufficient_retry_due([{{'verdict': 'INSUFFICIENT'}}, {{'verdict': {other:?}}}], ev)
+"#
+        ));
+    }
+}
+
+/// Only my own live rejection of an OLDER head is withdrawn: not one on this
+/// head, not a human's, not one already dismissed, and nothing at all when the
+/// job cannot tell which account is its own.
+#[test]
+fn only_my_own_rejection_of_an_older_head_is_withdrawn() {
+    assert_py_ok(
+        r#"old = '8' * 40
+def rej(login, sha, rid, state='CHANGES_REQUESTED'):
+    r = review(login, sha, state); r['id'] = rid; return r
+mine_old = rej(APP, old, 11)
+assert stale_own_rejections([mine_old], SHA, APP) == [11]
+assert stale_own_rejections([rej(APP, SHA, 12)], SHA, APP) == []
+assert stale_own_rejections([rej('vfarcic', old, 13)], SHA, APP) == []
+assert stale_own_rejections([rej(APP, old, 14, 'DISMISSED')], SHA, APP) == []
+assert stale_own_rejections([rej(APP, old, 15, 'APPROVED')], SHA, APP) == []
+assert stale_own_rejections([mine_old], SHA, '') == [], 'guessed whose review it was'
+"#,
+    );
+}
+
+/// Wiring, not just predicates: the selector's `main` re-selects an
+/// INSUFFICIENT head once, hands the agent the coverage line, and goes back to
+/// skipping it after the retry. `gh` is stubbed; the real predicates run.
+#[test]
+fn the_selector_retries_an_abstention_once_and_hands_over_the_coverage() {
+    assert_py_ok(
+        r#"import os, tempfile, json
+import pr_review_select as sel
+ins = {'verdict': 'INSUFFICIENT', 'head_sha': SHA, 'pr': 7}
+summary = {'user': {'login': 'qodo-code-review[bot]'}, 'body': 'reviewed ' + SHA,
+           'html_url': 'https://github.com/o/r/pull/7#issuecomment-1'}
+sel.gh_json = lambda *a: [{'number': 7, 'author': {'login': 'app/renovate'}, 'isDraft': False,
+    'headRefOid': SHA, 'headRepositoryOwner': {'login': 'o'}, 'reviewDecision': ''}]
+sel.check_status = lambda repo, sha: (True, 'green', [])
+sel.unresolved_threads = lambda repo, n: 0
+sel.latest_verdict = lambda repo, n: ins
+sel.pr_comments = lambda repo, n: [summary]
+sel.pr_review_comments = lambda repo, n: []
+sel.pr_reviews = lambda repo, n: []
+sel.touches_denied = lambda repo, n: []
+def run(verdicts):
+    sel.trusted_verdicts_at = lambda repo, n, sha: verdicts
+    out = tempfile.NamedTemporaryFile('r', delete=False)
+    os.environ.update({'REPO': 'o/r', 'SELECT_MODE': 'review', 'REVIEW_AUTHORS': 'app/renovate',
+                       'VOTE_AUTHORS': 'app/renovate', 'GITHUB_OUTPUT': out.name})
+    sel.main()
+    line = [l for l in open(out.name) if l.startswith('items=')][0]
+    return json.loads(line[len('items='):])
+items = run([ins])
+assert [i['number'] for i in items] == [7], items
+assert 'summary comment' in items[0]['independent_review'], items
+items = run([ins, dict(ins)])
+assert items == [], 'the retry was not bounded: ' + repr(items)
+"#,
+    );
+}
+
+/// Wiring for the vote job: an INSUFFICIENT on a head my own older rejection
+/// still holds dismisses that rejection, so it no longer blocks the merge
+/// (#1751). It still casts no review. `gh` is stubbed.
+#[test]
+fn an_insufficient_verdict_withdraws_my_stale_rejection() {
+    assert_py_ok(
+        r#"import os
+import pr_review_vote as vote
+old = '8' * 40
+mine = review(APP, old, 'CHANGES_REQUESTED'); mine['id'] = 42
+calls = []
+vote.gh_json = lambda *a: {'headRefOid': SHA, 'isDraft': False, 'reviewDecision': 'CHANGES_REQUESTED'}
+vote.pr_reviews = lambda repo, n: [mine]
+vote.checks_green = lambda repo, sha: (True, 'green')
+vote.latest_verdict = lambda repo, n: {'verdict': 'INSUFFICIENT', 'head_sha': SHA, 'pr': 7}
+vote.pr_comments = lambda repo, n: []
+vote.gh_ok = lambda *a: calls.append(a) or True
+def no_review(*a):
+    raise AssertionError('cast a review on an INSUFFICIENT verdict: ' + repr(a))
+vote.gh = no_review
+os.environ.update({'REPO': 'o/r', 'PR_NUMBER': '7', 'EXPECTED_SHA': SHA, 'APP_LOGIN': APP,
+                   'VOTE_ALLOWED': 'true', 'DENIED_PATHS': '[]'})
+vote.main()
+puts = [c for c in calls if 'repos/o/r/pulls/7/reviews/42/dismissals' in c]
+assert len(puts) == 1, calls
+assert any(str(x).startswith('message=') and SHA[:8] in str(x) for x in puts[0]), puts
+"#,
+    );
+}
+
+/// A new rejection is the one case that keeps the old: it supersedes it by
+/// itself, and dismissing first would leave a gap where nothing rejects.
+#[test]
+fn a_new_rejection_does_not_dismiss_the_old_one() {
+    assert_py_ok(
+        r#"import os
+import pr_review_vote as vote
+old = '8' * 40
+mine = review(APP, old, 'CHANGES_REQUESTED'); mine['id'] = 42
+calls, cast = [], []
+vote.gh_json = lambda *a: {'headRefOid': SHA, 'isDraft': False, 'reviewDecision': 'CHANGES_REQUESTED'}
+vote.pr_reviews = lambda repo, n: [mine]
+vote.checks_green = lambda repo, sha: (True, 'green')
+vote.latest_verdict = lambda repo, n: {'verdict': 'REQUEST_CHANGES', 'head_sha': SHA, 'pr': 7,
+                                       'reasons': ['x']}
+vote.pr_comments = lambda repo, n: []
+vote.gh_ok = lambda *a: calls.append(a) or True
+vote.gh = lambda *a: cast.append(a) or ''
+os.environ.update({'REPO': 'o/r', 'PR_NUMBER': '7', 'EXPECTED_SHA': SHA, 'APP_LOGIN': APP,
+                   'VOTE_ALLOWED': 'true', 'DENIED_PATHS': '[]'})
+vote.main()
+assert not [c for c in calls if any('dismissals' in str(x) for x in c)], calls
+assert cast and '--request-changes' in cast[0], cast
+"#,
+    );
 }

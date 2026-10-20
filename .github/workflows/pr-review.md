@@ -22,6 +22,16 @@ on:
         required: false
         default: false
         type: boolean
+      # Issue #1754. The selector's mechanical answer to "has an independent
+      # reviewer read this head?" -- the same predicate the vote job enforces
+      # -- so the agent adjudicates that evidence instead of re-deriving it.
+      # Re-deriving it is what failed: #1751 got INSUFFICIENT twice while
+      # Qodo's summary comment named the head.
+      independent_review:
+        description: Which independent reviewer covers this head and through which artefact, or why none does; empty when the caller did not compute it
+        required: false
+        default: ""
+        type: string
     secrets:
       ANTHROPIC_API_KEY:
         description: Anthropic API key used by the Claude engine
@@ -167,6 +177,12 @@ Two of its rules matter more than the rest:
 
 Post exactly one comment on #${{ inputs.pr_number }}: your summary, then a single fenced `json` block in the `pr-review/v1` schema. `head_sha` must be exactly `${{ inputs.head_sha }}` — a mismatched verdict is discarded and fails the run.
 
+## Independent coverage, established before you ran
+
+Which independent review covers this head: **${{ inputs.independent_review }}**
+
+That line is the result of `independent_review_at`, the predicate the vote job enforces, computed by the selector from the unfiltered GitHub API. Take it as given and do not re-derive it — the rubric's priority 1 says why, and what to do when the artefact it names is one you cannot read. If the line is empty, nobody computed it: establish coverage yourself as priority 1 describes.
+
 ## Your budget, and what running out costs
 
 You have **10000 AI credits** for this run, and a 45-minute wall clock. Both are hard: the API proxy returns `403 Maximum AI credits exceeded` on the request that crosses the line, and everything after it fails.
@@ -177,7 +193,7 @@ You have **10000 AI credits** for this run, and a 45-minute wall clock. Both are
 
 That leaves one honest strategy: **bound the work, then emit once.** You cannot see your own credit meter, so budget the work instead, which you can count:
 
-1. **Establish the evidence first**, in this order: the changed-file list (paths, not contents), **every** independent review at this head and which head each covers — both products, not the newest one, because a later clean review from one does not answer an earlier finding from the other (Qodo on PR #1271) — then each of their findings and the reply under it, and the pull request body's own claims about the obligations it owes.
+1. **Establish the evidence first**, in this order: the changed-file list (paths, not contents), the independent coverage you were handed below, **every** independent review at this head and which head each covers — both products, not the newest one, because a later clean review from one does not answer an earlier finding from the other (Qodo on PR #1271) — then each of their findings and the reply under it, and the pull request body's own claims about the obligations it owes.
 2. **Read code where judging that evidence requires it** — a finding whose answer you cannot evaluate without seeing the hunk, or a contract question the body does not settle — **and on the one class the rubric says to read regardless**: the hunks that touch a secret, a token, a permission block, an action pin, or a path or command built from input. An independent review establishes that somebody read this head, not that anybody looked for those. Bounded and targeted either way. You are not the first reader of this diff and must not spend the run becoming one (issue #1270); the rubric's priority list is the whole of your job.
 3. **Emit the verdict as your final action, and make it the only pass.** There is no second, deeper sweep — if you find yourself planning one, you have already spent what it would have cost.
 
