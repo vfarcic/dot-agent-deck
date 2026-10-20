@@ -208,7 +208,7 @@ fn skipped() -> Provenance {
     }
 }
 
-/// Scenario: Open the upgrade dialog on two plans the core made — this TUI's CLI, downloaded into a folder the user can write, and the desktop app installed from its `.deb` — and draw it. The dialog must show both plans in the core's own words, ask about the CLI first, and have Cancel selected so that Enter alone changes nothing.
+/// Scenario: Open the upgrade dialog on two plans the core made — this TUI's CLI, downloaded into a folder the user can write, and the desktop app installed from its `.deb` — and draw it. The dialog must show both plans in the core's own words, with the CLI's saying that upgrading leaves the running daemon alone, ask about the CLI first, and have Cancel selected so that Enter alone changes nothing.
 #[spec("upgrade/upgrade-dialog/001")]
 #[test]
 fn upgrade_dialog_001_in_place_plan_with_other_copy_defaults_to_cancel() {
@@ -239,6 +239,14 @@ fn upgrade_dialog_001_in_place_plan_with_other_copy_defaults_to_cancel() {
             );
         }
     }
+    // Issue #1753: the CLI is the daemon's binary, so its section also says
+    // what upgrading it does to the running daemon; the app's does not.
+    let daemon = cli.daemon_line().expect("the CLI is behind");
+    assert!(
+        flat.contains(daemon.render().trim()),
+        "missing the daemon line\n{text}"
+    );
+    assert_eq!(desktop.daemon_line(), None);
     assert!(
         flat.contains("Build provenance will NOT be checked"),
         "the plan must say before confirming that provenance is not checked\n{text}"
@@ -246,7 +254,10 @@ fn upgrade_dialog_001_in_place_plan_with_other_copy_defaults_to_cancel() {
     let question = cli
         .confirm_question()
         .expect("an in-place plan is actionable");
-    assert_eq!(question, format!("Upgrade dot-agent-deck to v{LATEST}?"));
+    assert_eq!(
+        question,
+        format!("Upgrade dot-agent-deck CLI to v{LATEST}?")
+    );
     assert!(flat.contains(&question), "{text}");
     assert!(
         text.contains("> Cancel"),
@@ -284,7 +295,7 @@ fn upgrade_dialog_002_notify_only_nix_offers_only_close() {
         !flat.contains("Cancel"),
         "a notify-only plan offers only Close\n{text}"
     );
-    assert!(!flat.contains("Upgrade dot-agent-deck to"), "{text}");
+    assert!(!flat.contains("Upgrade dot-agent-deck CLI to"), "{text}");
 
     assert_eq!(dialog.handle_key(key(KeyCode::Char('y'))), Effect::None);
     assert_eq!(
@@ -496,7 +507,7 @@ fn upgrade_dialog_006_badge_names_a_rebindable_key_and_rechecks_like_the_desktop
     assert_eq!(notice, writable_cli().headline());
     assert_eq!(
         notice,
-        format!("dot-agent-deck: update available: v{LATEST} (current: v{CURRENT})")
+        format!("dot-agent-deck CLI: update available: v{LATEST} (current: v{CURRENT})")
     );
 
     // This TUI is current but the desktop app is behind: the badge names it.
@@ -625,7 +636,7 @@ fn upgrade_dialog_008_upgrade_waits_until_the_whole_plan_was_on_screen() {
     let first = render_at(&mut dialog, W, H);
     let rows = dialog_rows(&first);
     assert!(
-        rows[1].starts_with("dot-agent-deck: update available"),
+        rows[1].starts_with("dot-agent-deck CLI: update available"),
         "the view starts at this TUI's plan\n{first}"
     );
     assert!(
@@ -727,7 +738,7 @@ fn upgrade_dialog_009_an_installed_copy_is_not_offered_again_until_restart() {
         "{text}"
     );
     assert!(
-        !flat_text.contains(&format!("Upgrade dot-agent-deck to v{LATEST}?")),
+        !flat_text.contains(&format!("Upgrade dot-agent-deck CLI to v{LATEST}?")),
         "{text}"
     );
     assert!(
@@ -817,7 +828,7 @@ fn upgrade_dialog_010_escapes_in_a_version_never_reach_the_terminal() {
     assert!(!screen.chars().any(|c| c != '\n' && bad(c)), "{screen:?}");
     let flat_text = flat(&screen);
     assert!(
-        flat_text.contains("Upgrade dot-agent-deck to v0.47.0]0;owned?"),
+        flat_text.contains("Upgrade dot-agent-deck CLI to v0.47.0]0;owned?"),
         "{screen}"
     );
     assert!(flat_text.contains("Upgrade to v0.47.0]0;owned"), "{screen}");

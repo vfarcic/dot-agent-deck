@@ -40407,7 +40407,7 @@ mod upgrade_dialog_tests {
         let cli = cli_plan("0.47.0");
         let offer = crate::upgrade_dialog::badge_text(&cli.headline(), "u");
         let mut covered_dim = false;
-        for width in [90u16, 110, 130, 150, 170] {
+        for width in [100u16, 110, 130, 150, 170] {
             let mut bare = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
             let under = draw_bar(&mut bare, width);
             let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());

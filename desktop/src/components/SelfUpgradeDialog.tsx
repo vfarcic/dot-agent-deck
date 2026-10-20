@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { CircleArrowUp, Copy, LoaderCircle, RotateCcw } from "lucide-react";
 
+import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 import { writeClipboardText } from "../lib/clipboard";
 import { DISPLAY_LIMITS, displayText, sanitizeText } from "../lib/displayText";
 import {
@@ -14,12 +15,20 @@ import {
   type SelfUpgradeResult,
 } from "../lib/selfUpgrade";
 
+/** How a {@link SelfUpgradeDialog} closed: `undefined` when it closed before anything ran, having changed nothing. */
+export interface SelfUpgradeClosed {
+  /** Whether a copy is now installed: not a download whose install command the user has still to run (`SelfUpgradeResult.installed`). */
+  installed: boolean;
+}
+
 /**
  * Issue #1635 — upgrading this machine's copies of Agent Deck: the app, and the
- * `dot-agent-deck` CLI when one is installed beside it.
+ * `dot-agent-deck` CLI when one is installed beside it. Since issue #1753 each
+ * place that opens it names the copies it covers: the banner and the rail
+ * button the app, and the Dashboard's Local daemon section the CLI.
  *
- * It shows each copy's plan in the crate's own words, then offers the copies
- * that can be upgraded from here one at a time, the app first, each behind its
+ * It shows each covered copy's plan in the crate's own words, then offers the
+ * ones that can be upgraded from here one at a time, the app first, each behind its
  * own Upgrade. Nothing is upgraded until Upgrade is pressed: Cancel, Escape
  * and a click outside before then change nothing. Each question opens with
  * Cancel focused, as the TUI's does, so Enter alone never upgrades. A copy that cannot be
@@ -37,30 +46,45 @@ import {
  * bridge sends its result as `installed`, which the dialog shows in place of
  * an offer, with Relaunch at the end.
  */
-export function SelfUpgradeDialog({ check, api, onClose, copyText = writeClipboardText }: {
+export function SelfUpgradeDialog({ check, api, copies, then, onClose, copyText = writeClipboardText }: {
   check: SelfUpgradeCheck;
   api: SelfUpgradeApi;
-  onClose: () => void;
+  /** The copies this dialog shows and offers. */
+  copies: readonly SelfCopy[];
+  /** What happens after this dialog, said under the plans before anything is asked. */
+  then?: string;
+  onClose: (closed?: SelfUpgradeClosed) => void;
   /** Where Copy writes; the system clipboard in the app. */
   copyText?: (text: string) => Promise<void>;
 }) {
   /* The check this dialog shows, for as long as it is open. */
   const [shown] = useState(check);
+  const plans = plansOf(shown, copies);
   const [done, setDone] = useState<SelfCopy[]>(shown.installed ? ["app"] : []);
   const [results, setResults] = useState<Partial<Record<SelfCopy, SelfUpgradeResult>>>(shown.installed ? { app: shown.installed } : {});
   const [running, setRunning] = useState<SelfCopy>();
   const [relaunchError, setRelaunchError] = useState<string>();
 
-  const offer = running ? undefined : nextOffer(shown, done);
+  const offer = running ? undefined : nextOffer(shown, done, copies);
   const phase = running ? "running" : offer ? "confirm" : "done";
-  const relaunch = Object.values(results).some((result) => result?.relaunch);
-  const anyRun = Object.keys(results).length > 0;
+  const shownResults = plans.flatMap((plan) => results[plan.copy] ?? []);
+  const relaunch = shownResults.some((result) => result.relaunch);
+  const anyRun = shownResults.length > 0;
+  /* Closed once something ran, or with Close at the end; before anything
+     ran, Cancel, Escape and a click outside close it having changed nothing —
+     also over a plan that offers only Close (Qodo, PR #1769). */
+  const finished = (): SelfUpgradeClosed => ({ installed: shownResults.some((result) => result.installed) });
+  const close = () => onClose(finished());
+  /* Fence the rest of the window while it is open (Greptile, PR #1769): a
+     rail button reached with Tab would otherwise switch screens and unmount
+     this dialog mid-upgrade, losing its result and any command to run. */
+  const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog);
 
   const upgrade = (plan: SelfUpgradePlan) => {
     setRunning(plan.copy);
     api.run(plan.copy, shown.checkId).then(
       (result) => setResults((current) => ({ ...current, [plan.copy]: result })),
-      (cause: unknown) => setResults((current) => ({ ...current, [plan.copy]: { copy: plan.copy, ok: false, relaunch: false, lines: [{ text: String(cause instanceof Error ? cause.message : cause), command: null }] } })),
+      (cause: unknown) => setResults((current) => ({ ...current, [plan.copy]: { copy: plan.copy, ok: false, installed: false, relaunch: false, lines: [{ text: String(cause instanceof Error ? cause.message : cause), command: null }] } })),
     ).finally(() => {
       setDone((current) => [...current, plan.copy]);
       setRunning(undefined);
@@ -71,7 +95,7 @@ export function SelfUpgradeDialog({ check, api, onClose, copyText = writeClipboa
      upgrade it passes on this copy and moves to the next, or to the end. */
   const cancel = (plan: SelfUpgradePlan) => (anyRun ? setDone((current) => [...current, plan.copy]) : onClose());
   const dismiss = () => {
-    if (!running) onClose();
+    if (!running) onClose(anyRun ? finished() : undefined);
   };
   const doRelaunch = () => {
     setRelaunchError(undefined);
@@ -81,6 +105,8 @@ export function SelfUpgradeDialog({ check, api, onClose, copyText = writeClipboa
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={dismiss}>
       <section
+        ref={ref}
+        tabIndex={-1}
         className="confirm-dialog upgrade-dialog self-upgrade-dialog"
         role="alertdialog"
         aria-modal="true"
@@ -96,10 +122,11 @@ export function SelfUpgradeDialog({ check, api, onClose, copyText = writeClipboa
         }}
       >
         <div className="upgrade-icon"><CircleArrowUp size={20} /></div>
-        <h2 id="self-upgrade-title">Upgrade to v{displayText(shown.latest, DISPLAY_LIMITS.name)}</h2>
-        {plansOf(shown).map((plan) => (
+        <h2 id="self-upgrade-title">Upgrade to v{displayText(plans[0]?.latest ?? shown.latest, DISPLAY_LIMITS.name)}</h2>
+        {plans.map((plan) => (
           <PlanSection key={plan.copy} plan={plan} result={results[plan.copy]} running={running === plan.copy} copyText={copyText} />
         ))}
+        {then && <p className="self-upgrade-then" data-testid="self-upgrade-then">{displayText(then, DISPLAY_LIMITS.message)}</p>}
         {phase === "confirm" && offer && (
           /* Keyed by copy so each question mounts afresh and focuses Cancel
              again: Enter alone never upgrades, as in the TUI. */
@@ -118,7 +145,7 @@ export function SelfUpgradeDialog({ check, api, onClose, copyText = writeClipboa
           <div className="self-upgrade-actions" data-testid="self-upgrade-done">
             {relaunchError && <p role="alert" data-testid="self-upgrade-relaunch-error">{displayText(relaunchError, DISPLAY_LIMITS.detail)}</p>}
             <div>
-              <button className={relaunch ? "button secondary" : "button primary"} data-testid="self-upgrade-close" autoFocus={!relaunch} onClick={onClose}>Close</button>
+              <button className={relaunch ? "button secondary" : "button primary"} data-testid="self-upgrade-close" autoFocus={!relaunch} onClick={close}>Close</button>
               {relaunch && <button className="button primary" data-testid="self-upgrade-relaunch" autoFocus onClick={doRelaunch}><RotateCcw size={14} /><span>Relaunch</span></button>}
             </div>
           </div>

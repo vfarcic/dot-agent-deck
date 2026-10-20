@@ -7,15 +7,17 @@ import type { SelfUpgradeCheck } from "../lib/selfUpgrade";
  * Issue #1635 — the app's equivalent of the TUI's `Update available: vX
  * (current: vY)` badge, in the crate's own words (`UpgradePlan::headline`).
  *
- * Two places, both opening the same dialog. The rail button is the app's
- * chrome, on every screen, for as long as a copy is behind. The banner is at
- * the top of the dashboard, where the text can be read without hovering, and
- * can be dismissed; the rail button stays.
+ * Two places, both opening the same dialog, about the app alone (issue
+ * #1753): a CLI that is behind is offered on the Dashboard's Local daemon
+ * section instead, so this notice never reads as one about the daemon. The
+ * rail button is the app's chrome, on every screen, for as long as the app is
+ * behind. The banner is at the top of the dashboard, where the text can be
+ * read without hovering, and can be dismissed; the rail button stays.
  *
- * Neither renders unless a newer release exists for one of the copies, or the
- * app itself was upgraded and still runs the old build: then the notice is the
- * relaunch prompt, and the dialog it opens offers Relaunch, until the app
- * restarts. The TUI's badge turns into its restart line the same way.
+ * Neither renders unless a newer release exists for the app, or the app was
+ * upgraded and still runs the old build: then the notice is the relaunch
+ * prompt, and the dialog it opens offers Relaunch, until the app restarts.
+ * The TUI's badge turns into its restart line the same way.
  */
 export function noticeOf(check: SelfUpgradeCheck | undefined): string | undefined {
   return (check?.updateAvailable || check?.installed) && check.notice ? check.notice : undefined;
