@@ -18,9 +18,12 @@
 //! - on a question that takes several options, **several of those joined by
 //!   "and"**: "one and three", "small and large".
 //!
-//! A word may differ from the label's by a plural "s", or, in words of five
-//! letters or more, by one letter — the slips speech-to-text makes. Nothing
-//! looser: this is meant to be predictable, and anything it does not take
+//! On an ordinary choice a word may differ from the label's by a plural "s",
+//! or, in words of five letters or more, by one letter — the slips
+//! speech-to-text makes. On a permission prompt it may not (issue #1725): a
+//! slip there can start a countdown to an approval nobody asked for — "alloy"
+//! is not "Allow once" — so only the label's own words count. Nothing looser
+//! anywhere: this is meant to be predictable, and anything it does not take
 //! goes to the Commands model ([`super::question`]), which knows synonyms.
 //!
 //! # Which question
@@ -138,6 +141,24 @@ const LITTLE_WORDS: &[&str] = &[
 /// The words that join several options of a multi-select answer.
 const JOINERS: &[&str] = &["and", "plus"];
 
+/// How closely a word said must match a label's ([`same_word`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    /// Word for word: a permission prompt's.
+    Exact,
+    /// Allowing a plural "s" or a one-letter slip: every other question's.
+    Slips,
+}
+
+/// The [`Spelling`] `question`'s options are matched with.
+fn spelling(question: &DesktopPendingQuestion) -> Spelling {
+    if question.kind == "permission" {
+        Spelling::Exact
+    } else {
+        Spelling::Slips
+    }
+}
+
 /// Match `text` against `question`'s options, with `form` the answer so far.
 pub fn match_options(
     question: &DesktopPendingQuestion,
@@ -149,6 +170,7 @@ pub fn match_options(
     if said.is_empty() {
         return OptionMatch::Unmatched;
     }
+    let spelling = spelling(question);
     let current = current_question(question, form);
     let others = || {
         question
@@ -164,7 +186,7 @@ pub fn match_options(
             .iter()
             .filter(|option| {
                 let label = spoken_words(&option.label);
-                same_words(&label, &said) || same_words(&label, &as_said)
+                same_words(&label, &said, spelling) || same_words(&label, &as_said, spelling)
             })
             .map(|option| option.index)
             .collect()
@@ -201,7 +223,7 @@ pub fn match_options(
     let part = |q: &DesktopQuestion| -> Vec<u32> {
         q.options
             .iter()
-            .filter(|option| has_part(&spoken_words(&option.label), &said))
+            .filter(|option| has_part(&spoken_words(&option.label), &said, spelling))
             .map(|option| option.index)
             .collect()
     };
@@ -277,7 +299,7 @@ fn decide_part(
         && one_question
         && all
             .iter()
-            .all(|(_, option)| leads(&spoken_words(&option.label), said))
+            .all(|(_, option)| leads(&spoken_words(&option.label), said, spelling(question)))
     {
         let allow_once: Vec<&(usize, &DesktopQuestionOption)> = all
             .iter()
@@ -296,8 +318,8 @@ fn decide_part(
 }
 
 /// Whether `said` is how `label` begins, word for word, allowing each
-/// [`same_word`] slip, with a leading article dropped.
-fn leads(label: &[String], said: &[String]) -> bool {
+/// [`same_word`] slip `spelling` does, with a leading article dropped.
+fn leads(label: &[String], said: &[String], spelling: Spelling) -> bool {
     let said = match said {
         [article, rest @ ..]
             if !rest.is_empty() && matches!(article.as_str(), "the" | "a" | "an") =>
@@ -308,7 +330,10 @@ fn leads(label: &[String], said: &[String]) -> bool {
     };
     !said.is_empty()
         && label.len() >= said.len()
-        && label.iter().zip(said).all(|(l, s)| same_word(l, s))
+        && label
+            .iter()
+            .zip(said)
+            .all(|(l, s)| same_word(l, s, spelling))
 }
 
 /// The refusal for a number said on question `at` that the agent may draw
@@ -423,12 +448,13 @@ fn several(question: &DesktopPendingQuestion, at: usize, text: &str) -> OptionMa
         return OptionMatch::Unmatched;
     }
     let q = &question.questions[at];
+    let spelling = spelling(question);
     let mut chosen: Vec<i64> = Vec::new();
     for part in &parts {
         let mut named: Vec<u32> = q
             .options
             .iter()
-            .filter(|option| same_words(&spoken_words(&option.label), part))
+            .filter(|option| same_words(&spoken_words(&option.label), part, spelling))
             .map(|option| option.index)
             .collect();
         if named.is_empty()
@@ -446,7 +472,7 @@ fn several(question: &DesktopPendingQuestion, at: usize, text: &str) -> OptionMa
             named = q
                 .options
                 .iter()
-                .filter(|option| has_part(&spoken_words(&option.label), part))
+                .filter(|option| has_part(&spoken_words(&option.label), part, spelling))
                 .map(|option| option.index)
                 .collect();
         }
@@ -494,17 +520,21 @@ fn without_filler(words: &[String]) -> Vec<String> {
 }
 
 /// Whether two runs of words are the same, word for word, allowing each
-/// [`same_word`] slip.
-fn same_words(label: &[String], said: &[String]) -> bool {
+/// [`same_word`] slip `spelling` does.
+fn same_words(label: &[String], said: &[String], spelling: Spelling) -> bool {
     !label.is_empty()
         && label.len() == said.len()
-        && label.iter().zip(said).all(|(l, s)| same_word(l, s))
+        && label
+            .iter()
+            .zip(said)
+            .all(|(l, s)| same_word(l, s, spelling))
 }
 
 /// Whether `said` is part of `label`: every word of it in the label, in the
 /// label's order, with a leading article dropped, and at least one word that
-/// is not one of [`LITTLE_WORDS`].
-fn has_part(label: &[String], said: &[String]) -> bool {
+/// is not one of [`LITTLE_WORDS`], each allowing the [`same_word`] slips
+/// `spelling` does.
+fn has_part(label: &[String], said: &[String], spelling: Spelling) -> bool {
     let said = match said {
         [article, rest @ ..]
             if !rest.is_empty() && matches!(article.as_str(), "the" | "a" | "an") =>
@@ -521,14 +551,18 @@ fn has_part(label: &[String], said: &[String]) -> bool {
     }
     let mut label = label.iter();
     said.iter()
-        .all(|word| label.by_ref().any(|l| same_word(l, word)))
+        .all(|word| label.by_ref().any(|l| same_word(l, word, spelling)))
 }
 
-/// One word of a label and one said: the same, or the same but for a plural
-/// "s", or — both five letters or more — one letter apart.
-fn same_word(label: &str, said: &str) -> bool {
+/// One word of a label and one said: the same, or, where `spelling` allows
+/// slips, the same but for a plural "s", or — both five letters or more —
+/// one letter apart.
+fn same_word(label: &str, said: &str, spelling: Spelling) -> bool {
     if label == said {
         return true;
+    }
+    if spelling == Spelling::Exact {
+        return false;
     }
     let stem = |word: &str| word.strip_suffix('s').unwrap_or(word).to_string();
     if label.len() > 3 && said.len() > 3 && stem(label) == stem(said) {
@@ -671,26 +705,40 @@ mod tests {
 
     #[test]
     fn a_word_may_slip_by_a_plural_or_one_letter_in_a_long_word() {
-        assert!(same_word("sizes", "size"));
-        assert!(same_word("switch", "swich"));
-        assert!(same_word("large", "larges"));
-        assert!(!same_word("yes", "ye"));
-        assert!(!same_word("deny", "dent"), "short words must match exactly");
-        assert!(!same_word("allow", "below"));
+        let slips = Spelling::Slips;
+        assert!(same_word("sizes", "size", slips));
+        assert!(same_word("switch", "swich", slips));
+        assert!(same_word("large", "larges", slips));
+        assert!(!same_word("yes", "ye", slips));
+        assert!(
+            !same_word("deny", "dent", slips),
+            "short words must match exactly"
+        );
+        assert!(!same_word("allow", "below", slips));
+    }
+
+    #[test]
+    fn a_permission_prompt_s_words_must_be_said_exactly() {
+        let exact = Spelling::Exact;
+        assert!(same_word("allow", "allow", exact));
+        assert!(!same_word("allow", "alloy", exact), "issue #1725");
+        assert!(!same_word("switch", "swich", exact));
+        assert!(!same_word("sizes", "size", exact));
+        assert!(!leads(&words("Allow once"), &words("alloy"), exact));
+        assert!(!has_part(&words("Allow always"), &words("alloy"), exact));
+        assert!(has_part(&words("Allow always"), &words("always"), exact));
     }
 
     #[test]
     fn a_part_is_the_label_s_words_in_its_order_with_something_more_than_little_words() {
         let label = words("Yes, and switch to auto mode");
-        assert!(has_part(&label, &words("auto mode")));
-        assert!(has_part(&label, &words("switch to auto mode")));
-        assert!(has_part(&label, &words("yes switch to auto mode")));
-        assert!(has_part(&label, &words("the auto mode")));
-        assert!(!has_part(&label, &words("mode auto")), "order matters");
-        assert!(
-            !has_part(&label, &words("and")),
-            "a little word alone chooses nothing"
-        );
-        assert!(!has_part(&label, &words("auto mode please now")));
+        let part = |said: &str| has_part(&label, &words(said), Spelling::Slips);
+        assert!(part("auto mode"));
+        assert!(part("switch to auto mode"));
+        assert!(part("yes switch to auto mode"));
+        assert!(part("the auto mode"));
+        assert!(!part("mode auto"), "order matters");
+        assert!(!part("and"), "a little word alone chooses nothing");
+        assert!(!part("auto mode please now"));
     }
 }
