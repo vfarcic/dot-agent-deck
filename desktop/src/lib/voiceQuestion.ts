@@ -141,11 +141,11 @@ export function questionCalledOff(why: string): string {
   return `Nothing was sent — ${why}.`;
 }
 
-/** The pane on screen, as far as a question countdown needs it. `terminalHidden`: another tab of the pane is showing, so the agent's prompt is not on screen. */
-export type QuestionPane = { deckId: string; agentId: string; spawnedAtMs?: number; terminalHidden?: boolean; question?: PendingQuestionDto };
+/** The pane on screen, as far as a question countdown needs it. `terminalHidden`: another tab of the pane is showing, so the agent's prompt is not on screen. `inputBlocked`: why the pane takes no input, its deck not answering among them. */
+export type QuestionPane = { deckId: string; agentId: string; spawnedAtMs?: number; inputBlocked?: string; terminalHidden?: boolean; question?: PendingQuestionDto };
 
 /** Why {@link questionLost} called a countdown off: a code, and the reason in words. */
-export type QuestionLost = { code: "question" | "pane" | "replaced" | "hidden" | "confirmation" | "deck"; why: string };
+export type QuestionLost = { code: "question" | "pane" | "replaced" | "blocked" | "hidden" | "confirmation" | "deck"; why: string };
 
 /**
  * PRD #1631 — the gate a running answer countdown is held to, on every
@@ -153,17 +153,25 @@ export type QuestionLost = { code: "question" | "pane" | "replaced" | "hidden" |
  * `undefined` while the answer still holds, or why not: the question waiting
  * is no longer the one answered (`question`), the pane on screen shows another
  * agent or none (`pane`), the agent was replaced under the same id
- * (`replaced`), the pane shows another tab so the prompt being answered is not
- * on screen (`hidden`, audit A7), a confirmation is open (`confirmation`), or
- * the selected deck changed (`deck`).
+ * (`replaced`), the pane stopped taking input — its deck stopped answering,
+ * say — since the answer was begun (`blocked`, issue #1726), the pane shows
+ * another tab so the prompt being answered is not on screen (`hidden`, audit
+ * A7), a confirmation is open (`confirmation`), or the selected deck changed
+ * (`deck`).
+ *
+ * `blocked` is change-only, as it is in the panel's `contextLost`: an answer
+ * begun on a pane that already took no input is sent, and the row reports
+ * what the deck made of it — the deck can answer a held question without the
+ * terminal.
  */
 export function questionLost(
-  aim: { deckId: string; agentId: string; questionId: string; revision?: number; spawnedAtMs?: number; deck?: string },
+  aim: { deckId: string; agentId: string; questionId: string; revision?: number; spawnedAtMs?: number; inputBlocked?: string; deck?: string },
   now: { pane?: QuestionPane; confirmation: boolean; deck?: string },
 ): QuestionLost | undefined {
   const pane = now.pane;
   if (!pane || pane.deckId !== aim.deckId || pane.agentId !== aim.agentId) return { code: "pane", why: pane ? "the pane on screen changed" : "the pane closed" };
   if (aim.spawnedAtMs !== undefined && pane.spawnedAtMs !== undefined && aim.spawnedAtMs !== pane.spawnedAtMs) return { code: "replaced", why: "the agent in the pane was replaced" };
+  if (pane.inputBlocked !== undefined && aim.inputBlocked === undefined) return { code: "blocked", why: `the pane stopped taking input: ${pane.inputBlocked.replace(/\.$/, "")}` };
   if (pane.terminalHidden) return { code: "hidden", why: "its terminal is not shown" };
   if (pane.question?.id !== aim.questionId) return { code: "question", why: "the question changed" };
   if (aim.revision !== undefined && pane.question.revision !== aim.revision) return { code: "question", why: "the question changed" };

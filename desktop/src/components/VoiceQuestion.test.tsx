@@ -301,6 +301,11 @@ describe("answering an agent's question by voice", () => {
     expect(questionLost(aim, { ...now, pane: { ...pane(), spawnedAtMs: 2 } })?.code).toBe("replaced");
     expect(questionLost(aim, { ...now, confirmation: true })?.code).toBe("confirmation");
     expect(questionLost(aim, { ...now, deck: "remote" })?.code).toBe("deck");
+    /* Issue #1726: the pane stopping taking input calls it off; one that
+       already did when the answer was begun is the deck's to take or refuse. */
+    const blocked = { ...pane(), inputBlocked: "its deck is not answering." };
+    expect(questionLost(aim, { ...now, pane: blocked })?.code).toBe("blocked");
+    expect(questionLost({ ...aim, inputBlocked: "its deck is not answering." }, { ...now, pane: blocked })).toBeUndefined();
     /* The same id registered again is another question (audit A4). */
     const revised = { ...aim, revision: 7 };
     expect(questionLost(revised, { ...now, pane: pane({ ...PERMISSION, revision: 7 }) })).toBeUndefined();
@@ -491,6 +496,29 @@ describe("answering an agent's question by voice", () => {
       view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
       await flush();
     }
+  });
+
+  /**
+   * Scenario (question/desktop/033, issue #1726): the user says "yes" and the
+   * countdown starts; two seconds in, the pane's deck stops answering, so the
+   * pane stops taking input. The countdown is called off at once, the row
+   * says why, and nothing is sent when its five seconds would have ended.
+   */
+  it("question/desktop/033: a countdown is called off when its deck stops answering", async () => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer } = runtime(voice, () => SENT);
+    const blocked = { ...pane(), inputBlocked: "its deck is not answering." };
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "yes");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("sending in 5 s");
+    await waitOut(2_000);
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={blocked} selectedDeckId="local" />);
+    await flush();
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing was sent — the pane stopped taking input: its deck is not answering.");
+    await waitOut(VOICE_DICTATION_SEND_MS * 2);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
   });
 
   /**

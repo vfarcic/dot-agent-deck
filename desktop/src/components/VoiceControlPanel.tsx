@@ -926,7 +926,8 @@ type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "ans
 /**
  * PRD #1631 — the answer to the question the agent on screen is waiting on,
  * as it fills in across utterances: which question it is for (`target`, with
- * the incarnation and the deck it was begun on), the form Rust last returned,
+ * the incarnation, whether the pane took input and the deck it was begun on),
+ * the form Rust last returned,
  * the line that says it in words, and the "always allow" confirmation's state.
  * Held while the form fills in, through the confirmation, and through the
  * countdown; {@link questionLost} drops it the moment any of that stops
@@ -935,6 +936,8 @@ type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "ans
 type QuestionForm = {
   target: VoiceQuestionTarget;
   spawnedAtMs?: number;
+  /** Why the pane took no input when the answer was begun, if it did not: {@link questionLost}'s `blocked` is change-only. */
+  inputBlocked?: string;
   deck?: string;
   form: QuestionSelectionDto[];
   complete: boolean;
@@ -2103,7 +2106,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const held = questionFormRef.current;
     if (!held) return undefined;
     return questionLost(
-      { deckId: held.target.deckId, agentId: held.target.agentId, questionId: held.target.questionId, revision: held.target.revision, spawnedAtMs: held.spawnedAtMs, deck: held.deck },
+      { deckId: held.target.deckId, agentId: held.target.agentId, questionId: held.target.questionId, revision: held.target.revision, spawnedAtMs: held.spawnedAtMs, inputBlocked: held.inputBlocked, deck: held.deck },
       { pane: paneRef.current, confirmation: confirmationRef.current, deck: selectedDeckRef.current },
     );
   }, []);
@@ -2189,8 +2192,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     PRD #1631 — the staleness rule: the answer, its confirmation and its
     countdown are dropped, with nothing sent, the moment the question waiting
     is no longer the one answered, the pane changes or its agent is replaced,
-    a confirmation opens, or the selected deck changes. Each is something the
-    host already hands down, so this subscribes rather than polls.
+    the pane stops taking input — its deck stopped answering, say (issue
+    #1726) — a confirmation opens, or the selected deck changes. Each is
+    something the host already hands down, so this subscribes rather than
+    polls.
   */
   const paneQuestionId = pane?.question?.id;
   /* Audit R5: the same id at another revision is another question. */
@@ -2198,6 +2203,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const paneQuestionDeck = pane?.deckId;
   const paneQuestionAgent = pane?.agentId;
   const paneQuestionSpawned = pane?.spawnedAtMs;
+  const paneQuestionBlocked = pane?.inputBlocked;
   const paneQuestionHidden = pane?.terminalHidden;
   useEffect(() => {
     const lost = answerLost();
@@ -2211,7 +2217,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        cancel it. */
     if (!lost || (lost.code === "question" && questionFormRef.current?.sending)) return;
     dropQuestion(questionLostSentence(lost));
-  }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionDeck, paneQuestionHidden, paneQuestionId, paneQuestionRevision, paneQuestionSpawned, selectedDeckId]);
+  }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionBlocked, paneQuestionDeck, paneQuestionHidden, paneQuestionId, paneQuestionRevision, paneQuestionSpawned, selectedDeckId]);
 
   /**
    * PRD #1631 — an utterance said while the agent on screen waits on a
@@ -2272,6 +2278,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     const target: VoiceQuestionTarget = { deckId: shown.deckId, agentId: shown.agentId, agent: shown.questionLabel ?? shown.label, questionId: question.id, revision: question.revision };
     const spawnedAtMs = shown.spawnedAtMs;
+    const inputBlocked = shown.inputBlocked;
     const deck = selectedDeckRef.current;
     setPhase("resolving");
     /* In typing mode nothing said reaches the Commands service, so only an
@@ -2281,11 +2288,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const verdict = answered.verdict;
     if (verdict.kind === "not_answer") return false;
     /* The whole staleness rule, not only the question's identity: the
-       terminal hidden, the agent replaced, a confirmation opened or the deck
-       changed while the answer was worked out opens no countdown or
-       confirmation over it (PR #1698 review). */
+       terminal hidden, the agent replaced, the pane stopped taking input, a
+       confirmation opened or the deck changed while the answer was worked
+       out opens no countdown or confirmation over it (PR #1698 review). */
     const lost = questionLost(
-      { deckId: target.deckId, agentId: target.agentId, questionId: target.questionId, revision: target.revision, spawnedAtMs, deck },
+      { deckId: target.deckId, agentId: target.agentId, questionId: target.questionId, revision: target.revision, spawnedAtMs, inputBlocked, deck },
       { pane: paneRef.current, confirmation: confirmationRef.current, deck: selectedDeckRef.current },
     );
     if (lost) {
@@ -2312,6 +2319,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     setQuestionForm({
       target,
       spawnedAtMs,
+      inputBlocked,
       deck,
       form: verdict.form,
       complete: verdict.complete,
