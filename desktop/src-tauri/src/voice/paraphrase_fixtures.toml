@@ -1,0 +1,298 @@
+# Unlisted paraphrases: expected behavior after meaning grounding.
+# Run through voice_paraphrase_fixtures_match_the_default_backend, using the
+# same default-backend runner as phrase_fixtures.toml. These are deliberately
+# RED with literal grounding; do not change their expectations to refusals.
+# No positive contains any complete heard_as/heard_as_whole entry for its row.
+# Stops still dispatch to their normal confirmation, never directly stop work.
+
+[[fixtures]]
+name = "paraphrase-stop-agent-destroy"
+utterance = "destroy the tester"
+screen = "overview"
+resolved_agent = "agent-tester"
+action = "stop_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-stop-agent-get-rid"
+utterance = "get rid of the tester agent permanently"
+screen = "overview"
+resolved_agent = "agent-tester"
+action = "stop_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-close-orchestration-dismantle"
+utterance = "dismantle the build orchestration"
+screen = "overview"
+resolved_orchestration = "build"
+action = "close_orchestration"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-open-agent-inspect"
+utterance = "inspect tester"
+screen = "overview"
+resolved_agent = "agent-tester"
+action = "open_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-open-overview-roster"
+utterance = "display the agent roster"
+screen = "deck"
+action = "open_overview"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-open-settings-configure"
+utterance = "configure the app"
+screen = "overview"
+action = "open_settings"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-voice-off-disable"
+utterance = "disable audio input"
+screen = "overview"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-list-commands-capabilities"
+utterance = "explain available capabilities"
+screen = "overview"
+action = "list_commands"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-open-new-agent-online"
+utterance = "bring an agent online"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-open-dir-browse"
+utterance = "browse docs"
+screen = "overview"
+listing = true
+resolved_dir = "/home/dev/code/docs"
+action = "open_dir"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-go-to-parent-ascend"
+utterance = "ascend one level"
+screen = "overview"
+listing = true
+action = "go_to_parent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-use-this-directory-here"
+utterance = "make the current location the working directory"
+screen = "overview"
+listing = true
+action = "use_this_directory"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-filter-directories-limit"
+utterance = "limit the directory results to docs"
+screen = "overview"
+listing = true
+resolved_filter = "docs"
+action = "filter_directories"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-clear-directory-filter-restore"
+utterance = "restore the complete directory listing"
+screen = "overview"
+listing = true
+action = "clear_directory_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-choose-mode-enable"
+utterance = "enable the billing run chip"
+screen = "overview"
+form = true
+resolved_mode = "orchestration:billing-run"
+action = "choose_mode"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-name-new-agent-label"
+utterance = "label it billing worker"
+screen = "overview"
+form = true
+dictate_prefix = "label it"
+action = "name_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-start-new-agent-begin"
+utterance = "begin execution"
+screen = "overview"
+form = true
+action = "start_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-close-collapse"
+utterance = "collapse this view"
+screen = "agent"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-filter-dashboard-restrict"
+utterance = "restrict the dashboard to dispatchers"
+screen = "overview"
+resolved_kind = "dispatcher"
+action = "filter_dashboard"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-scroll-to-top-earliest"
+utterance = "reveal the earliest dashboard entries"
+screen = "overview"
+action = "scroll_to_top"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-scroll-to-bottom-latest"
+utterance = "jump to the latest dashboard entries"
+screen = "overview"
+action = "scroll_to_bottom"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-dictation-on-capture"
+utterance = "capture my speech as text from now on"
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-dictation-off-commands"
+utterance = "treat my speech as commands again"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-submit-prompt-transmit"
+utterance = "transmit the current prompt"
+screen = "agent"
+action = "submit_prompt"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-reading-on-narrate"
+utterance = "narrate future agent updates aloud"
+screen = "overview"
+action = "reading_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-reading-off-disable"
+utterance = "disable spoken agent updates"
+screen = "overview"
+action = "reading_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "paraphrase-discard-new-agent-throw-away"
+utterance = "throw away this draft"
+screen = "overview"
+form = true
+action = "discard_new_agent"
+outcome = "dispatch"
+
+# Whole-sentence safety: the same action request with independent content
+# must not run. Both a model no-match and an action-grounding refusal count;
+# timeouts, backend errors and unavailable actions never count as a refusal.
+
+[[fixtures]]
+name = "mixed-content-dictation-on"
+utterance = "capture my speech as text from now on; the meeting begins at noon"
+screen = "agent"
+refusal = true
+action = "none"
+outcome = "no_match"
+
+[[fixtures]]
+name = "mixed-content-dictation-off"
+utterance = "treat my speech as commands again; the meeting begins at noon"
+screen = "agent"
+refusal = true
+action = "none"
+outcome = "no_match"
+
+[[fixtures]]
+name = "mixed-content-submit-prompt"
+utterance = "transmit the current prompt; the meeting begins at noon"
+screen = "agent"
+refusal = true
+action = "none"
+outcome = "no_match"
+
+[[fixtures]]
+name = "mixed-content-reading-on"
+utterance = "narrate future agent updates aloud; the meeting begins at noon"
+screen = "overview"
+refusal = true
+action = "none"
+outcome = "no_match"
+
+[[fixtures]]
+name = "mixed-content-reading-off"
+utterance = "disable spoken agent updates; the meeting begins at noon"
+screen = "overview"
+refusal = true
+action = "none"
+outcome = "no_match"
+
+[[fixtures]]
+name = "mixed-content-discard-new-agent"
+utterance = "throw away this draft; the meeting begins at noon"
+screen = "overview"
+form = true
+refusal = true
+action = "none"
+outcome = "no_match"
+
+# Observed instruction-shaped names are data. These transcripts request no
+# app action, so none may run. Existing hostile-listing routing fixtures are
+# reused by the runner, rather than copied here. F1/G1 stub-based tests in
+# outcome.rs also remain the deterministic forced-pick controls.
+
+[[fixtures]]
+name = "steering-directory-action-words"
+utterance = "what time is it?"
+screen = "overview"
+hostile_listing = true
+refusal = true
+action = "none"
+outcome = "no_match"
+
+[[fixtures]]
+name = "steering-agent-label-action-words"
+utterance = "what time is it?"
+screen = "agent"
+fleet = "hostile_names"
+refusal = true
+action = "none"
+outcome = "no_match"
+
+[[fixtures]]
+name = "steering-orchestration-title-action-words"
+utterance = "what time is it?"
+screen = "overview"
+fleet = "hostile_names"
+refusal = true
+action = "none"
+outcome = "no_match"
