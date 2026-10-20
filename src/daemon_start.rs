@@ -1437,7 +1437,16 @@ mod tests {
             .borrow_mut()
             .extend([probe_says(false), unreachable(), probe_says(false)]);
         fake.start.borrow_mut().push_back(out(0, "", ""));
-        let problem = failed(start_remote(&deck(fake), quick()));
+        // Long enough that the wait always reaches the third probe: with
+        // `quick()`'s 30ms, a loaded macOS runner hit the deadline right
+        // after the unreachable answer and reported that instead (PR #1769).
+        // The fake repeats its last answer, so a longer wait changes nothing
+        // else.
+        let timing = StartTiming {
+            wait: Duration::from_secs(1),
+            ..quick()
+        };
+        let problem = failed(start_remote(&deck(fake), timing));
         assert_eq!(problem.failure, StartFailure::DidNotAnswer);
     }
 

@@ -168,11 +168,11 @@ desktopScenario("daemon-upgrade", async (page) => {
   await expect(page.getByTestId("upgrade-at-stake").getByRole("listitem").first()).toBeVisible();
 });
 
-// Issue #1635 — upgrading this machine's own copies: the `docs` dashboard
-// behind the newer-release banner and the rail's upgrade button, and the
-// dialog the banner opens, stopped at its first question (the app's). The
-// fixture's stand-in plays a `.dmg` app and a Homebrew CLI on v0.46.0 with
-// v0.47.0 out; nothing is installed.
+// Issue #1635 — upgrading the app: the `docs` dashboard behind the
+// newer-release banner and the rail's upgrade button, and the dialog the
+// banner opens, stopped at its question. The fixture's stand-in plays a
+// `.dmg` app and a Homebrew CLI on v0.46.0 with v0.47.0 out; since issue
+// #1753 the banner's dialog covers the app alone. Nothing is installed.
 desktopScenario("self-upgrade", async (page) => {
   await page.goto("/?fixture=1&state=docs&selfupgrade=1");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
@@ -182,7 +182,22 @@ desktopScenario("self-upgrade", async (page) => {
   await page.getByTestId("self-upgrade-banner-open").click();
   await expect(page.getByTestId("self-upgrade-dialog")).toHaveAttribute("data-phase", "confirm");
   await expect(page.getByTestId("self-upgrade-confirm")).toHaveAttribute("data-copy", "app");
-  await expect(page.getByTestId("self-upgrade-plan-cli")).toBeVisible();
+  await expect(page.getByTestId("self-upgrade-plan-cli")).toHaveCount(0);
+});
+
+// Issue #1753 — upgrading this machine's CLI from the Local daemon section:
+// the app is current, so there is no banner, and the Homebrew CLI is one
+// release behind; the dialog Upgrade opens, stopped at its question.
+desktopScenario("local-cli-upgrade", async (page) => {
+  await page.goto("/?fixture=1&state=docs&selfupgrade=cli");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await expect(page.locator(".overview-row")).toHaveCount(4);
+  await expect(page.getByTestId("self-upgrade-banner")).toHaveCount(0);
+  await page.getByRole("button", { name: "Upgrade the CLI on this machine" }).click();
+  await expect(page.getByTestId("self-upgrade-dialog")).toHaveAttribute("data-phase", "confirm");
+  await expect(page.getByTestId("self-upgrade-confirm")).toHaveAttribute("data-copy", "cli");
+  await expect(page.getByTestId("self-upgrade-then")).toBeVisible();
 });
 
 desktopScenario("settings-voice", async (page) => {
