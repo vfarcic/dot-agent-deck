@@ -1,0 +1,1217 @@
+# Issue #1701 — linkage-check rule 14's control-site ratchet
+# (`xtask/linkage-check/src/voice_control_sites.rs`).
+#
+# Every desktop control wired with an `onClick`-family handler in production
+# `.tsx` under `desktop/src` that is NOT a single `VOICE_ACTIONS` dispatch is
+# listed here, with a sentence saying what it is and why it is not a voice
+# capability. A new site fails the build until it goes through the registry or
+# is added here with a reason; an entry that matches no site fails it too, so
+# this list only shrinks.
+#
+# Before adding an entry, answer CLAUDE.md rule 23: a new desktop control is
+# reachable by voice through the registry, or its registry entry carries a
+# `no_voice` reason. An entry here is for what is not a capability at all — a
+# dismissal, a keystroke into a field, a control that forwards a prop the host
+# already wires through the registry — or for a control kept off voice on
+# purpose, with the purpose written down.
+#
+# `Gap:` marks a capability that has no voice path and no reason to keep it
+# off voice: the voice-reachability backlog as of when this list was written.
+# `grep -c '^reason = "Gap:' xtask/linkage-check/voice-control-sites.toml` counts it.
+#
+# Keys: `file` and `handler` name the site, `code` is the whole handler
+# expression with whitespace collapsed. Identical sites in one file are listed
+# once each. The failure message prints the stanza for
+# a new site; paste it and write the reason.
+
+# --- desktop/src/App.tsx ---
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "() => setPaletteOpen(true)"
+reason = "The deck's Command button: opens the command palette, a pointer/keyboard launcher whose entries all dispatch through VOICE_ACTIONS. Voice is its own launcher; `list_commands` shows what can be said."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = '() => void perform({ type: snapshot.paused ? "resume_run" : "pause_run" }, snapshot.paused ? "Fixture resumed." : "Fixture paused.")'
+reason = "Pause/Resume on the deterministic demo fixture; disabled in live mode, so it is not a capability a real deck offers."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "requestUpgrade"
+reason = "Deck toolbar Upgrade: opens the daemon upgrade dialog, which restarts a daemon and its agents. Kept off voice so a misheard utterance cannot start it."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "requestStop"
+reason = "Deck toolbar Close/Stop: asks to close the selected agent, or to stop the local daemon. Voice stops an agent with `stop_agent` (its own confirmation); stopping a whole daemon is kept off voice."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = '() => void perform({ type: "advance_fixture" })'
+reason = "Advance fixture on the demo-data banner: demo-fixture only. The palette's Advance fixture already goes through VOICE_ACTIONS.advanceFixture."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "requestStartDaemon"
+reason = "Connection banner Start daemon: starts the local daemon after a confirmation. Not voice-reachable: when no daemon answers, the deck shows no agents for voice to act on and this is the one-time recovery click."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "requestUpgrade"
+reason = "Connection banner Upgrade: the daemon upgrade flow, kept off voice because it restarts a daemon and its agents."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "requestRestartDaemon"
+reason = "Connection banner Replace daemon: replaces an incompatible daemon, stopping its agents; kept off voice."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "requestConnectAnyway"
+reason = "Connection banner Connect anyway: overrides a compatibility refusal. A deliberate risk the user takes by hand, not by a possibly misheard utterance."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "() => void runtime.reconnect()"
+reason = "Connection banner Reconnect: retries the daemon connection. A recovery click shown only while the deck is disconnected."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "() => onDismissWarning?.(warning.id)"
+reason = "Dismisses a cleanup-warning toast: a dismissal."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "onDismiss"
+reason = "Dismisses the status toast: a dismissal."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Events drawer close X: a dismissal (the drawer's opening half is VOICE_ACTIONS.toggleEvidenceDrawer)."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "() => onSelect(item.id)"
+reason = "Selects one transition event inside the open Events drawer: in-panel inspection of a diagnostic list, not a voice capability."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "onProfiles"
+reason = "Empty deck's Configure agents: forwards `onProfiles`, which DeckSurface wires to VOICE_ACTIONS.openAgentProfiles."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "onReconnect"
+reason = "Empty deck's Reconnect: retries the daemon connection; a recovery click shown only when the deck has no agents."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onMouseDown"
+code = "onClose"
+reason = "Command palette backdrop: a dismissal."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onChange"
+code = "(event) => setQuery(event.target.value)"
+reason = "Typing the command palette's search query: field editing, not a capability."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "() => { run(); onClose(); }"
+reason = "Runs a command palette entry; every entry's `run` dispatches through VOICE_ACTIONS (built in DeckSurface's `commands`)."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onMouseDown"
+code = "onClose"
+reason = "Keyboard shortcut sheet backdrop: a dismissal."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Keyboard shortcut sheet close: a dismissal."
+
+# --- desktop/src/components/AgentOverview.tsx ---
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "openDeck"
+reason = "Dashboard Open daemons: `openDeck` dispatches VOICE_ACTIONS.openDeck (`open_deck`); the ratchet sees only the identifier."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onChange"
+code = "setColumns"
+reason = "Passes `setColumns` to the column picker's `onChange` prop; the picker's own checkboxes are listed below."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => void runtime.reconnect()"
+reason = "Dashboard Refresh: reconnects to every daemon. A recovery click for a stale screen, not an action on an agent or a view."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => setDashboardFilter(removeDashboardFilterFacet(filter, chip.facet))"
+reason = "Removes one facet chip from the dashboard filter. Voice replaces or clears the filter with `filter_dashboard` and `clear_dashboard_filter`; removing one facet of several is click-only."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => setNewAgentNotice(undefined)"
+reason = "Dismisses the dashboard's new-agent notice: a dismissal."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onUpgrade"
+reason = "A daemon card's Upgrade: the daemon upgrade flow, kept off voice because it restarts a daemon and its agents."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onNewAgent"
+reason = "A daemon card's New agent: forwards `onNewAgent`, which the overview wires to VOICE_ACTIONS.openNewAgent (`open_new_agent`)."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onOpenDeck"
+reason = "Dashboard note's Open daemons: forwards `onOpenDeck`, which is VOICE_ACTIONS.openDeck (`open_deck`)."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onStartDaemon"
+reason = "Dashboard note's Start daemon: starts the local daemon when none answers; a one-time recovery click, the dashboard's twin of the deck banner's."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onReconnect"
+reason = "Dashboard note's Reconnect: retries a daemon connection; a recovery click."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onReconnect"
+reason = "Dashboard note's Reconnect after an unreadable agent list: retries the connection; a recovery click."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onOpenDeck"
+reason = "Dashboard note's Open daemons: forwards `onOpenDeck`, which is VOICE_ACTIONS.openDeck (`open_deck`)."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onUpgrade"
+reason = "Dashboard note's Upgrade: the daemon upgrade flow, kept off voice because it restarts a daemon and its agents."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onConnectAnyway"
+reason = "Dashboard note's Connect anyway: overrides a compatibility refusal, a risk the user takes by hand."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onReconnect"
+reason = "Dashboard note's Reconnect: retries a daemon connection; a recovery click."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onNewAgent"
+reason = "First-run note's New agent: forwards `onNewAgent`, which the overview wires to VOICE_ACTIONS.openNewAgent (`open_new_agent`)."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onOpenDeck"
+reason = "First-run note's Open daemons: forwards `onOpenDeck`, which is VOICE_ACTIONS.openDeck (`open_deck`)."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onChange"
+code = "(event) => setDashboardFilter({ ...filter, text: event.target.value })"
+reason = "Typing the dashboard filter's text; voice filters with `filter_dashboard`."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => setOpen((wasOpen) => !wasOpen)"
+reason = "Opens/closes the dashboard filter menu; voice sets the filter directly with `filter_dashboard` and needs no menu."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onChange"
+code = "() => toggle(facet, option.id as never)"
+reason = "Ticks one facet in the dashboard filter menu; voice sets the filter with `filter_dashboard`."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => setDashboardFilter(clearDashboardFilter())"
+reason = "The filter menu's Clear filter; voice does the same with `clear_dashboard_filter`."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => setOpen((wasOpen) => !wasOpen)"
+reason = "Gap: opens the dashboard's column picker. No row chooses dashboard columns."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onChange"
+code = "() => toggle(column)"
+reason = "Gap: ticks one column in the dashboard's column picker. No row chooses dashboard columns."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => onChange(orderedColumns(DEFAULT_OVERVIEW_COLUMNS))"
+reason = "Gap: the column picker's Restore defaults. No row chooses dashboard columns."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => stopControls.closeOrchestration(group)"
+reason = "An orchestration card's Close: raises the close-orchestration confirmation; voice raises the same one with `close_orchestration`."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => openAgent(agent)"
+reason = "A row's open button: `openAgent` dispatches VOICE_ACTIONS.openAgent (`open_agent`); the ratchet sees only the call."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => stopControls.stopAgent(agent)"
+reason = "A row's Close: raises the stop-agent confirmation; voice raises the same one with `stop_agent`."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "openFromRow"
+reason = "Clicking a dashboard row: `openFromRow` calls the `OpenAgentContext` value, which dispatches VOICE_ACTIONS.openAgent (`open_agent`)."
+
+# --- desktop/src/components/AgentTile.tsx ---
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
+code = '() => void act("retry")'
+reason = "Gap: Retry on an inbox message the deck could not deliver to this agent. No row addresses an inbox item yet."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
+code = '() => void act("cancel")'
+reason = "Gap: Cancel on an inbox message the deck could not deliver to this agent. No row addresses an inbox item yet."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onMouseDown"
+code = "onSelect"
+reason = "Pressing anywhere on a tile selects it: forwards `onSelect`, which DeckSurface wires to VOICE_ACTIONS.focusAgent (`no_voice`: selecting without enlarging; voice opens an agent with `open_agent`)."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onChange"
+code = "(event) => setRenameDraft(event.target.value)"
+reason = "Typing an agent's new name into the tile's rename field: field editing."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
+code = "commitRename"
+reason = "Gap: saves an agent's new display name typed in the tile's rename field. No row renames an agent."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
+code = "() => setRenameDraft(undefined)"
+reason = "Cancels the tile's rename field: a dismissal."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
+code = "() => setRenameDraft(agent.displayName)"
+reason = "Gap: the tile's pencil, which opens its rename field. No row renames an agent."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
+code = "onOpen"
+reason = "The tile's expand button: forwards `onOpen`, which DeckSurface wires to VOICE_ACTIONS.openAgent (`open_agent`)."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "The open pane's close X: forwards `onClose`, which DeckSurface wires to VOICE_ACTIONS.closeAgentView (`close`)."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
+code = "() => onTabChange(id)"
+reason = "Gap: switches the tile's tab (terminal, output, hand-offs). No row picks a tile tab."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
+code = "() => setReaderOpen(true)"
+reason = "Gap: opens the tile's large output reader. Voice reads an agent's output aloud with `reading_on`, but no row opens the reader itself."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onInput"
+code = "handleInput"
+reason = "Keystrokes typed into the agent's terminal: terminal input. Voice types into an agent with `dictate_to_agent`."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
+code = "() => onEvidenceSelect(item.id)"
+reason = "Selects a hand-off event in the tile's hand-offs tab: forwards `onEvidenceSelect`, which DeckSurface wires to VOICE_ACTIONS.toggleEvidenceDrawer."
+
+# --- desktop/src/components/AppearancePanel.tsx ---
+
+[[site]]
+file = "desktop/src/components/AppearancePanel.tsx"
+handler = "onChange"
+code = "() => onSave({ ...settings, appearance: { ...settings.appearance, mode: choice.value } })"
+reason = "Settings → Appearance light/dark/system radio; a per-field preference edit inside the Settings sheet, which voice opens (`open_settings`) — no row picks the value itself."
+
+# --- desktop/src/components/ConfigurationPanels.tsx ---
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onMouseDown"
+code = "onClose"
+reason = "Projects sheet (experimental; its opener `openProjects` is `no_voice`): backdrop, a dismissal."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Projects sheet (experimental; its opener `openProjects` is `no_voice`): close X, a dismissal."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "() => void state.refresh()"
+reason = "Projects sheet (experimental; its opener `openProjects` is `no_voice`): Refresh re-reads the daemon's projects; follows the sheet's classification."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "() => void state.select(item.path)"
+reason = "Projects sheet (experimental; its opener `openProjects` is `no_voice`): picks a project from the daemon's list; follows the sheet's classification."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onSubmit"
+code = "(event) => { event.preventDefault(); void submitPasted(); }"
+reason = "Projects sheet (experimental; its opener `openProjects` is `no_voice`): Resolve submits a typed project path; part of a typed form."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => setPasted(event.target.value)"
+reason = "Projects sheet (experimental; its opener `openProjects` is `no_voice`): typing a project path: field editing."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "() => state.clearSelection()"
+reason = "Projects sheet (experimental; its opener `openProjects` is `no_voice`): Clear selection; follows the sheet's classification."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "onConfigureOrchestration"
+reason = "Projects sheet (experimental; its opener `openProjects` is `no_voice`): Configure orchestration forwards `onConfigureOrchestration`, which App.tsx wires to VOICE_ACTIONS.openOrchestrationOrder."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onMouseDown"
+code = "onClose"
+reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): backdrop, a dismissal."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): close X, a dismissal."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "onAdd"
+reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): Add prompt; a browse-and-edit surface whose operations are typed."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "() => onSelect(item.id)"
+reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): selects a saved prompt to edit; follows the sheet's classification."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => onUpdate(prompt.id, { name: event.target.value })"
+reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): typing a prompt's name: field editing."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => onUpdate(prompt.id, { body: event.target.value })"
+reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): typing a prompt's body: field editing."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => onUpdate(prompt.id, { note: event.target.value })"
+reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): typing a prompt's note: field editing."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "() => { if (removeArmed) onRemove(prompt.id); else setRemoveArmed(true); }"
+reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): Remove / Confirm remove deletes a saved prompt; kept manual, and follows the sheet's classification."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onMouseDown"
+code = "onClose"
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): backdrop, a dismissal."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): close X, a dismissal."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "() => setSelectedId(item.id)"
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): selects a role profile to edit; follows the sheet's classification."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onSubmit"
+code = "(event) => { event.preventDefault(); onSaved(); }"
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): Confirm draft submits the profile form; part of a typed form."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => onUpdate(profile.id, { enabled: event.target.checked })"
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): Enabled in loop checkbox: a per-field profile edit."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => onUpdate(profile.id, { role: event.target.value })"
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): typing a role name: field editing."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = '(event) => { const provider = event.target.value as Provider; onUpdate(profile.id, { provider, cli: defaultCliForProvider(provider), commandMode: provider === "Custom" ? "custom" : "generated", }); }'
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): Provider select: a per-field profile edit."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => onUpdate(profile.id, { cli: event.target.value })"
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): typing a CLI: field editing."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => onUpdate(profile.id, { model: event.target.value })"
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): typing a model: field editing."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = '(event) => onUpdate(profile.id, { effort: event.target.value as AgentProfile["effort"] })'
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): Reasoning effort select: a per-field profile edit."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = '(event) => onUpdate(profile.id, { permissionMode: event.target.value as AgentProfile["permissionMode"] })'
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): Permission mode select: a per-field profile edit, and a permission change kept off a possibly misheard utterance."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = '(event) => onUpdate(profile.id, { commandMode: event.target.checked ? "custom" : "generated" })'
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): custom command override checkbox: a per-field profile edit that bypasses provider safety fields; kept manual."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => onUpdate(profile.id, { customCommand: event.target.value })"
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): typing a custom launch command: field editing."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "onReset"
+reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): Reset defaults discards profile edits; follows the sheet's classification."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onMouseDown"
+code = "onClose"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): backdrop, a dismissal."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): close X, a dismissal."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => setName(event.target.value)"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Orchestration name select: a per-field edit of the launch form."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => { runNameTouched.current = true; setRunName(event.target.value); }"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): typing the run name: field editing."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => { const prompt = prompts.find((candidate) => candidate.id === event.target.value); if (prompt) setTaskPrompt(prompt.body); }"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Insert saved prompt select copies a prompt into the task field; a per-field edit of the launch form."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "(event) => setTaskPrompt(event.target.value)"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): typing the task prompt: field editing."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "onChooseProject"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Choose one forwards `onChooseProject`, which App.tsx wires to VOICE_ACTIONS.openProjects."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onChange"
+code = "() => onToggle(profile.id)"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): a role's Enabled/Skipped checkbox: a per-field edit of the launch form."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "() => onMove(profile.id, -1)"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Move a role up: a per-field edit of the launch form."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "() => onMove(profile.id, 1)"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Move a role down: a per-field edit of the launch form."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = '() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, ...(runName !== "" ? { displayTitle: runName } : {}), taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })'
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Activate orchestration launches the configured run; follows the editor's classification."
+
+[[site]]
+file = "desktop/src/components/ConfigurationPanels.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): the fixture-mode footer's Use preview, which only closes the editor: a dismissal."
+
+# --- desktop/src/components/ConfirmDialog.tsx ---
+
+[[site]]
+file = "desktop/src/components/ConfirmDialog.tsx"
+handler = "onMouseDown"
+code = "onClose"
+reason = "Confirmation dialog backdrop: a dismissal, not a capability."
+
+[[site]]
+file = "desktop/src/components/ConfirmDialog.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Confirmation dialog Cancel: a dismissal, not a capability."
+
+[[site]]
+file = "desktop/src/components/ConfirmDialog.tsx"
+handler = "onClick"
+code = "() => { setBusy(true); void state.action().finally(onClose); }"
+reason = "Confirmation dialog Confirm button: runs the destructive action the opener staged. Kept manual by design: voice raises the same confirmation (`stop_agent`, `close_orchestration`) and the user confirms it by hand."
+
+# --- desktop/src/components/DeckSelector.tsx ---
+
+[[site]]
+file = "desktop/src/components/DeckSelector.tsx"
+handler = "onClick"
+code = "() => setOpen((wasOpen) => !wasOpen)"
+reason = "Opens/closes the daemon chooser menu; voice switches daemon directly with `switch_deck` and needs no menu."
+
+[[site]]
+file = "desktop/src/components/DeckSelector.tsx"
+handler = "onClick"
+code = "() => choose(choice.selection)"
+reason = "Picks a daemon in the chooser menu; voice reaches the same choice through `switch_deck` (VOICE_ACTIONS.switchDeck, which `choose` itself dispatches through)."
+
+# --- desktop/src/components/EndpointsPanel.tsx ---
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onClick"
+code = "addDeck"
+reason = "Settings → Daemons Add a daemon: starts a new endpoint form of host, user, port and key fields that is typed, not spoken."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onChange"
+code = "(name) => { draftNameTouched.current = true; setDraftName(name); }"
+reason = "Typing a new daemon's name in Settings → Daemons: field editing."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onChange"
+code = "(value) => { setRenameRefusal(undefined); setRenameEdit({ id: selected.id, from: storedName, value }); }"
+reason = "Typing a daemon's new name in Settings → Daemons: field editing."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onClick"
+code = "() => void rename(selected.id, renameValue)"
+reason = "Settings → Daemons Rename: commits the name typed in the field beside it; part of a typed form."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onChange"
+code = "(host) => editDeck(selected.id, { host })"
+reason = "Typing a daemon's SSH host in Settings → Daemons: field editing."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onChange"
+code = "(user) => editDeck(selected.id, { user: user || undefined })"
+reason = "Typing a daemon's SSH user in Settings → Daemons: field editing."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onChange"
+code = "(event) => editDeck(selected.id, { port: Number(event.target.value) })"
+reason = "Typing a daemon's SSH port in Settings → Daemons: field editing."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onChange"
+code = "(identity) => editDeck(selected.id, { identity: identity || undefined })"
+reason = "Typing a daemon's SSH identity file in Settings → Daemons: field editing."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onChange"
+code = "(jump) => editDeck(selected.id, { jump: jump || undefined })"
+reason = "Typing a daemon's SSH jump host in Settings → Daemons: field editing."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onChange"
+code = "(socket) => editDeck(selected.id, { socket: socket || undefined })"
+reason = "Typing a daemon's socket path in Settings → Daemons: field editing."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onClick"
+code = "() => void confirmDraft()"
+reason = "Settings → Daemons Add this daemon: saves the endpoint typed into the form; part of a typed form."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onClick"
+code = "() => void runTest(shown)"
+reason = "Settings → Daemons Test connection: probes the endpoint being edited in the form; part of the typed form."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onChange"
+code = "onSelect"
+reason = "Settings → Daemons radio choosing the selected endpoint for editing. Switching which daemon the screens show is voice-reachable through `switch_deck`; this radio only picks the form's row."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onClick"
+code = "onRemove"
+reason = "Settings → Daemons Remove: deletes a saved endpoint; kept off voice so a misheard utterance cannot delete configuration."
+
+[[site]]
+file = "desktop/src/components/EndpointsPanel.tsx"
+handler = "onChange"
+code = "(event) => onChange(event.target.value)"
+reason = "`TextRow` forwards a text input's edits to its `onChange` prop: field editing."
+
+# --- desktop/src/components/GitHubPanel.tsx ---
+
+[[site]]
+file = "desktop/src/components/GitHubPanel.tsx"
+handler = "onClick"
+code = "run"
+reason = "Settings → GitHub Sign out. Not voice-reachable: signing out is a rare, account-level action a misheard utterance should not trigger."
+
+# --- desktop/src/components/HookBinaryNotice.tsx ---
+
+[[site]]
+file = "desktop/src/components/HookBinaryNotice.tsx"
+handler = "onClick"
+code = "copy"
+reason = "Copies the hook-binary fix command to the clipboard. A clipboard copy of text the user then pastes into a terminal; not a spoken capability."
+
+# --- desktop/src/components/HostMetricsPanel.tsx ---
+
+[[site]]
+file = "desktop/src/components/HostMetricsPanel.tsx"
+handler = "onClick"
+code = "() => (open ? onClose() : onOpen())"
+reason = "The Host button beside a daemon's name. Voice-reachable: `show_host_metrics` opens the same popover (PR #1672) and `close` closes it; the click calls the overview's open/close callbacks rather than the entry."
+
+[[site]]
+file = "desktop/src/components/HostMetricsPanel.tsx"
+handler = "onClick"
+code = "() => { onClose(); button.current?.focus(); }"
+reason = "The Host popover's close X: a dismissal; voice closes it with `close` (closeTopmost → closeHostMetrics)."
+
+# --- desktop/src/components/NavigationRail.tsx ---
+
+[[site]]
+file = "desktop/src/components/NavigationRail.tsx"
+handler = "onClick"
+code = "toDeck"
+reason = "The rail's Daemons button. `toDeck` dispatches VOICE_ACTIONS.openDeck / showRuns itself; the ratchet sees only the identifier."
+
+[[site]]
+file = "desktop/src/components/NavigationRail.tsx"
+handler = "onClick"
+code = "onShowShortcuts"
+reason = "The rail's Keyboard shortcuts button: opens the shortcut sheet, which lists keyboard shortcuts — meaningless to a voice user, who has `list_commands` for the spoken ones."
+
+[[site]]
+file = "desktop/src/components/NavigationRail.tsx"
+handler = "onClick"
+code = "onClick"
+reason = "`RailButton` forwards its `onClick` prop; every rail call site passes a VOICE_ACTIONS dispatch (or `toDeck`, listed above)."
+
+# --- desktop/src/components/NewAgentDialog.tsx ---
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onClick"
+code = "() => chooseDeck(choice)"
+reason = "New agent: picks the daemon; voice picks it with `choose_deck`."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onChange"
+code = "(event) => changeFilter(event.target.value)"
+reason = "New agent: typing the directory filter; voice filters with `filter_directories`."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onChange"
+code = "(event) => toggleHidden(event.target.checked)"
+reason = "Gap: New agent's Show hidden checkbox in the directory browser. No row toggles hidden directories."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onClick"
+code = '() => { if (busy) return; setCursor(index); if (row.kind === "up") goUp(); else if (deck) void loadListing(deck.deckId, row.entry.path); }'
+reason = "New agent: opens a directory row or goes up; voice does the same with `open_dir` and `go_to_parent`."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onClick"
+code = "confirmCurrent"
+reason = "New agent: Use this directory; voice does the same with `use_this_directory`."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onSubmit"
+code = "(event) => { event.preventDefault(); void submit(); }"
+reason = "New agent form submit (Start); voice starts the agent with `start_new_agent`."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onClick"
+code = "() => selectMode(candidate.id)"
+reason = "New agent: picks the mode; voice picks it with `choose_mode`."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onChange"
+code = "(event) => { nameTouched.current = true; setName(event.target.value); }"
+reason = "New agent: typing the name; voice names the agent with `name_new_agent`."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onChange"
+code = "(event) => { commandTouched.current = true; setCommand(event.target.value); }"
+reason = "New agent: typing the command; voice sets it with `set_new_agent_command`."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onMouseDown"
+code = "requestClose"
+reason = "New agent dialog backdrop: a dismissal; voice closes it with `close`."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onClick"
+code = "requestClose"
+reason = "New agent dialog close X: a dismissal; voice closes it with `close`."
+
+[[site]]
+file = "desktop/src/components/NewAgentDialog.tsx"
+handler = "onClick"
+code = "requestDiscard"
+reason = "New agent Discard; voice does the same with `discard_new_agent`."
+
+# --- desktop/src/components/OutputReader.tsx ---
+
+[[site]]
+file = "desktop/src/components/OutputReader.tsx"
+handler = "onMouseDown"
+code = "(event) => { if (event.target === event.currentTarget) onClose(); }"
+reason = "Output reader backdrop click: a dismissal, not a capability."
+
+[[site]]
+file = "desktop/src/components/OutputReader.tsx"
+handler = "onClick"
+code = "copyAll"
+reason = "Output reader Copy all: copies an agent's output to the clipboard; reading it aloud is `reading_on`, a clipboard copy is not a spoken capability."
+
+[[site]]
+file = "desktop/src/components/OutputReader.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Output reader close X: a dismissal."
+
+[[site]]
+file = "desktop/src/components/OutputReader.tsx"
+handler = "onClick"
+code = "jumpToLatest"
+reason = "Gap: the output reader's Jump to latest, which re-pins the scroll to the live tail. The reader has no voice screen of its own, and the dashboard scroll rows do not drive it."
+
+# --- desktop/src/components/PullRequestBadge.tsx ---
+
+[[site]]
+file = "desktop/src/components/PullRequestBadge.tsx"
+handler = "onClick"
+code = "onOpen"
+reason = "A PR badge: forwards `onOpen`, which the tile and the dashboard row build from the `OpenPullRequest` context, App.tsx's VOICE_ACTIONS.openPullRequest dispatch (`open_pr`)."
+
+# --- desktop/src/components/PullRequestBrowser.tsx ---
+
+[[site]]
+file = "desktop/src/components/PullRequestBrowser.tsx"
+handler = "onClick"
+code = "onBack"
+reason = "PR browser Back: forwards `onBack`, which App.tsx wires to VOICE_ACTIONS.pullRequestBack."
+
+[[site]]
+file = "desktop/src/components/PullRequestBrowser.tsx"
+handler = "onClick"
+code = "onOpenExternal"
+reason = "PR browser Open in browser: forwards `onOpenExternal`, which App.tsx wires to VOICE_ACTIONS.openPullRequestInBrowser (`open_pr_in_browser`)."
+
+[[site]]
+file = "desktop/src/components/PullRequestBrowser.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "PR browser close X: forwards `onClose`, which App.tsx wires to VOICE_ACTIONS.closePullRequest (`close`)."
+
+# --- desktop/src/components/SelfUpgradeDialog.tsx ---
+
+[[site]]
+file = "desktop/src/components/SelfUpgradeDialog.tsx"
+handler = "onMouseDown"
+code = "dismiss"
+reason = "Self-upgrade dialog backdrop: a dismissal."
+
+[[site]]
+file = "desktop/src/components/SelfUpgradeDialog.tsx"
+handler = "onClick"
+code = "() => cancel(offer)"
+reason = "Self-upgrade dialog Cancel: a dismissal."
+
+[[site]]
+file = "desktop/src/components/SelfUpgradeDialog.tsx"
+handler = "onClick"
+code = "() => upgrade(offer)"
+reason = "Self-upgrade dialog Upgrade: replaces the running app. Kept off voice on purpose — a misheard utterance must not replace and relaunch the app."
+
+[[site]]
+file = "desktop/src/components/SelfUpgradeDialog.tsx"
+handler = "onClick"
+code = "close"
+reason = "Self-upgrade dialog Close: a dismissal that hands the finished result back to its caller (the Local daemon upgrade then offers its restart)."
+
+[[site]]
+file = "desktop/src/components/SelfUpgradeDialog.tsx"
+handler = "onClick"
+code = "doRelaunch"
+reason = "Self-upgrade dialog Relaunch: restarts the app, which would also end the voice session that asked; kept off voice."
+
+[[site]]
+file = "desktop/src/components/SelfUpgradeDialog.tsx"
+handler = "onClick"
+code = "() => void copyText(command).catch(() => undefined)"
+reason = "Copies the manual upgrade command to the clipboard for a terminal; not a spoken capability."
+
+# --- desktop/src/components/SelfUpgradeNotice.tsx ---
+
+[[site]]
+file = "desktop/src/components/SelfUpgradeNotice.tsx"
+handler = "onClick"
+code = "onOpen"
+reason = "The rail's app-update button: opens the self-upgrade dialog. Not voice-reachable: replacing and relaunching the app is a deliberate action a misheard utterance should not start."
+
+[[site]]
+file = "desktop/src/components/SelfUpgradeNotice.tsx"
+handler = "onClick"
+code = "onOpen"
+reason = "The update banner's Upgrade…/Relaunch… button: same as the rail's update button — the self-upgrade is kept off voice."
+
+[[site]]
+file = "desktop/src/components/SelfUpgradeNotice.tsx"
+handler = "onClick"
+code = "onDismiss"
+reason = "The update banner's dismiss X: a dismissal."
+
+# --- desktop/src/components/SettingsSheet.tsx ---
+
+[[site]]
+file = "desktop/src/components/SettingsSheet.tsx"
+handler = "onMouseDown"
+code = "onClose"
+reason = "Settings sheet backdrop: a dismissal; voice closes the sheet with `close`."
+
+[[site]]
+file = "desktop/src/components/SettingsSheet.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Settings sheet close X: a dismissal; voice closes the sheet with `close`."
+
+[[site]]
+file = "desktop/src/components/SettingsSheet.tsx"
+handler = "onClick"
+code = "() => setActiveId(section.id)"
+reason = "Settings section tab (Appearance, Voice, GitHub…): in-sheet navigation once `open_settings` has opened it; no row selects a section."
+
+# --- desktop/src/components/UpgradeDialog.tsx ---
+
+[[site]]
+file = "desktop/src/components/UpgradeDialog.tsx"
+handler = "onMouseDown"
+code = "dismiss"
+reason = "Daemon upgrade dialog backdrop: a dismissal."
+
+[[site]]
+file = "desktop/src/components/UpgradeDialog.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Daemon upgrade dialog Close (after an error): a dismissal."
+
+[[site]]
+file = "desktop/src/components/UpgradeDialog.tsx"
+handler = "onClick"
+code = "onCancel"
+reason = "Daemon upgrade confirmation Cancel: a dismissal."
+
+[[site]]
+file = "desktop/src/components/UpgradeDialog.tsx"
+handler = "onClick"
+code = "onStart"
+reason = "Daemon upgrade confirmation Upgrade/Replace daemon: restarts a daemon and the agents under it. Kept off voice — a misheard utterance must not stop running agents."
+
+[[site]]
+file = "desktop/src/components/UpgradeDialog.tsx"
+handler = "onClick"
+code = '() => onDecide("keep-current")'
+reason = "Daemon upgrade: Keep current daemon — the safe answer to the restart question; part of a click-only upgrade flow (see Restart now)."
+
+[[site]]
+file = "desktop/src/components/UpgradeDialog.tsx"
+handler = "onClick"
+code = '() => onDecide("restart-now")'
+reason = "Daemon upgrade: Restart now — stops every agent under the daemon. Kept off voice for the same reason as the upgrade itself."
+
+[[site]]
+file = "desktop/src/components/UpgradeDialog.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Daemon upgrade outcome Close: a dismissal."
+
+# --- desktop/src/components/VoiceControlPanel.tsx ---
+
+[[site]]
+file = "desktop/src/components/VoiceControlPanel.tsx"
+handler = "onClick"
+code = "() => { undo.run(); setUndo(undefined); }"
+reason = "Undo, offered on screen for 10 s after a voice command ran, reversing that command. A click-only escape hatch for a misheard command; no row undoes a command (`scratch_that` is dictation's)."
+
+[[site]]
+file = "desktop/src/components/VoiceControlPanel.tsx"
+handler = "onClick"
+code = '() => { if (phaseRef.current === "stopping") return; /* `unreleased` routes to the release rather than to the start, and not only where `on` happens to be true: the device is open, so the press that looks like *turn it on* has to be the retry that closes it. `voiceStart` would be refused by `accepts_start` anyway, which is the fall-through this replaces. */ /* Through the registry entry rather than straight to `turnOff`, the way `DeckShell` routes its own Close through `closeAgentView`: the `voice_off` row names `stopVoice`, and a button that reached the same behaviour by a second route would be exactly the residual PRD #802 D10 recorded for the unspoken capabilities, which PRD #1195 M1 then closed. */ if (onRef.current || phaseRef.current === "unreleased") VOICE_ACTIONS.stopVoice.run({ stopVoice }); else void turnOn(); }'
+reason = "The Voice button. Its turn-off half dispatches VOICE_ACTIONS.stopVoice (`voice_off`); its turn-on half starts the microphone, which no spoken command can do while the microphone is off."
+
+[[site]]
+file = "desktop/src/components/VoiceControlPanel.tsx"
+handler = "onClick"
+code = "() => { endDictation(); }"
+reason = "Voice panel Stop typing: leaves typing mode; voice does the same with `dictation_off`."
+
+[[site]]
+file = "desktop/src/components/VoiceControlPanel.tsx"
+handler = "onClick"
+code = "() => dropQuestion(QUESTION_ANSWER_CANCELLED)"
+reason = "Cancels the countdown before a spoken answer is sent to an agent's question; the click is the way to stop a send that voice itself started, so it must not depend on being heard."
+
+[[site]]
+file = "desktop/src/components/VoiceControlPanel.tsx"
+handler = "onClick"
+code = "closeVocabulary"
+reason = "What-you-can-say list backdrop: a dismissal; voice closes it with `close`."
+
+[[site]]
+file = "desktop/src/components/VoiceControlPanel.tsx"
+handler = "onClick"
+code = "closeVocabulary"
+reason = "What-you-can-say list Close: a dismissal; voice closes it with `close`."
+
+[[site]]
+file = "desktop/src/components/VoiceControlPanel.tsx"
+handler = "onMouseDown"
+code = "onCancel"
+reason = "Voice choice dialog backdrop: cancels the choice, a dismissal."
+
+[[site]]
+file = "desktop/src/components/VoiceControlPanel.tsx"
+handler = "onClick"
+code = "() => onPick(candidate)"
+reason = "Voice choice dialog entry: picks one of the candidates a voice command offered; voice picks the same entry by saying its number."
+
+[[site]]
+file = "desktop/src/components/VoiceControlPanel.tsx"
+handler = "onClick"
+code = "onCancel"
+reason = "Voice choice dialog Cancel: a dismissal; voice closes it with `close`."
+
+# --- desktop/src/components/VoicePanel.tsx ---
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onChange"
+code = '(event) => chooseBackend("transcription", event.target.value)'
+reason = "Settings → Voice transcription backend select; a preference edit inside the Settings sheet (opened by `open_settings`). Changing the backend voice is running on by voice could cut the user off."
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onChange"
+code = '(event) => chooseBackend("intent", event.target.value)'
+reason = "Settings → Voice intent backend select; a preference edit inside the Settings sheet, kept off voice for the same reason as the transcription backend."
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onChange"
+code = "() => saveVoice({ ...voice, labels: token })"
+reason = "Settings → Voice label-sharing consent radio: a privacy consent the user gives by hand, not by a possibly misheard utterance."
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onChange"
+code = "() => saveVoice({ ...voice, reading: token })"
+reason = "Settings → Voice reading consent radio: a privacy consent the user gives by hand, not by a possibly misheard utterance."
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onChange"
+code = "() => saveVoice({ ...voice, speech: token })"
+reason = "Settings → Voice speech-source radio; a preference edit inside the Settings sheet, opened by `open_settings`."
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onChange"
+code = "(event) => setDraft(event.target.value)"
+reason = "Typing into a Settings → Voice text field (model name and the like); field editing, committed on blur/Enter — not a capability."
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onChange"
+code = "(event) => setDraft(event.target.value)"
+reason = "Typing into a Settings → Voice numeric field; field editing, committed on blur/Enter — not a capability."
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onChange"
+code = "(event) => setTyped(event.target.value)"
+reason = "Typing an API key into Settings → Voice; a secret is never dictated."
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onClick"
+code = "() => void run(() => bridge.storeSecret(id, typed))"
+reason = "Settings → Voice API key Save/Replace: stores a secret the user pasted; a secret is never dictated."
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onClick"
+code = "() => void run(() => bridge.forgetSecret(id))"
+reason = "Settings → Voice API key Forget: deletes a stored secret; kept off voice so a misheard utterance cannot delete a key."
+
+# --- desktop/src/components/ZoomPanel.tsx ---
+
+[[site]]
+file = "desktop/src/components/ZoomPanel.tsx"
+handler = "onChange"
+code = "(event) => onSave({ ...settings, zoom: { level: clampZoom(Number(event.target.value)) } })"
+reason = "Settings → Zoom level select; a preference edit inside the Settings sheet (opened by `open_settings`) — no row sets the zoom."
