@@ -64,19 +64,21 @@ pub struct IntentRequest<'a> {
 ///
 /// # A `null` param is an ABSENT param, and that is forced rather than lenient
 ///
-/// OpenAI's strict structured outputs refuse a schema where a declared property
-/// is not in `required`, so [`super::openai::response_schema`] cannot leave a
-/// param optional the way a tool-use schema can: it enumerates every param the
-/// table declares, requires all of them, and types each as `["string", "null"]`
-/// — the documented way to spell *optional* under strict mode. The model is
-/// therefore obliged to name a param the chosen action does not take, and the
-/// only thing it can honestly say about it is `null`.
+/// A params object may carry a `null` for a param the user did not refer to —
+/// how a strict schema that lists every param spells *optional*, and what a
+/// server that enforces nothing may still send. Dropping those here is what
+/// keeps that a detail of one envelope. A `null` arriving as an empty string
+/// would resolve against nothing and render `no agent here matches ""`;
+/// arriving as absent, it is [`super::VoiceOutcome::ParamMissing`], which is
+/// the same sentence the other protocol produces for the same situation.
 ///
-/// Dropping those here is what keeps that a detail of one envelope. A `null`
-/// arriving as an empty string would resolve against nothing and render
-/// `no agent here matches ""`; arriving as absent, it is
-/// [`super::VoiceOutcome::ParamMissing`], which is the same sentence the other
-/// protocol produces for the same situation.
+/// # The params may also arrive as a list
+///
+/// [`super::openai::response_schema`] asks for `params` as a list of `{"name",
+/// "value"}` pairs, one per param the user referred to, which is the shortest
+/// reply strict mode can express (see its doc comment). The list is read into
+/// the same map, and a list that names one param twice is refused: two values
+/// for one param, reduced to one by position, would be an answer nobody gave.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IntentAnswer {
     pub action: String,
@@ -84,7 +86,8 @@ pub struct IntentAnswer {
     pub params: BTreeMap<String, String>,
 }
 
-/// [`IntentAnswer::params`], with the `null`s a strict schema forces removed.
+/// [`IntentAnswer::params`] as either shape arrives — an object, with its
+/// `null`s removed, or a list of named values, each name once.
 ///
 /// A non-string, non-null value is still an error — `{"agent": 7}` is a backend
 /// that did not honour the schema, and reading it as absent would turn a
@@ -92,12 +95,37 @@ pub struct IntentAnswer {
 fn params_without_nulls<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, String>, D::Error> {
-    Ok(
-        BTreeMap::<String, Option<String>>::deserialize(deserializer)?
+    match AnsweredParams::deserialize(deserializer)? {
+        AnsweredParams::Named(params) => Ok(params
             .into_iter()
             .filter_map(|(name, value)| value.map(|value| (name, value)))
-            .collect(),
-    )
+            .collect()),
+        AnsweredParams::Listed(params) => {
+            let mut named = BTreeMap::new();
+            for ListedParam { name, value } in params {
+                if named.insert(name, value).is_some() {
+                    return Err(serde::de::Error::custom("a param named twice"));
+                }
+            }
+            Ok(named)
+        }
+    }
+}
+
+/// The two shapes [`params_without_nulls`] reads.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AnsweredParams {
+    Named(BTreeMap<String, Option<String>>),
+    Listed(Vec<ListedParam>),
+}
+
+/// One entry of a listed `params`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListedParam {
+    name: String,
+    value: String,
 }
 
 impl IntentAnswer {
@@ -731,8 +759,8 @@ mod tests {
 
     #[test]
     fn voice_resolver_answer_reads_a_null_param_as_absent() {
-        // Forced by `openai`'s strict schema, which has to declare and require
-        // every param name. See `IntentAnswer`'s own docs.
+        // How a strict schema that lists every param spells one the user did
+        // not refer to. See `IntentAnswer`'s own docs.
         let answer: IntentAnswer =
             serde_json::from_str(r#"{"action":"open_deck","params":{"agent":null}}"#)
                 .expect("parses");
@@ -752,6 +780,40 @@ mod tests {
             serde_json::from_str::<IntentAnswer>(r#"{"action":"open_agent","params":{"agent":7}}"#)
                 .is_err()
         );
+    }
+
+    /// Scenario: params answered as a list of named values — the shape
+    /// `openai`'s schema asks for — read into the same map as an object, an
+    /// empty list is no params, and a list that names one param twice, or an
+    /// entry with anything but a name and a string value, is malformed.
+    #[test]
+    fn voice_resolver_answer_reads_listed_params_each_name_once() {
+        let answer: IntentAnswer = serde_json::from_str(
+            r#"{"action":"filter_dashboard","params":[{"name":"kind","value":"orchestration"},{"name":"status","value":"working"}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            answer.params.get("kind"),
+            Some(&"orchestration".to_string())
+        );
+        assert_eq!(answer.params.get("status"), Some(&"working".to_string()));
+        assert_eq!(answer.params.len(), 2);
+
+        let answer: IntentAnswer =
+            serde_json::from_str(r#"{"action":"open_settings","params":[]}"#).expect("parses");
+        assert!(answer.params.is_empty());
+
+        for malformed in [
+            r#"{"action":"open_agent","params":[{"name":"agent","value":"tester"},{"name":"agent","value":"coder"}]}"#,
+            r#"{"action":"open_agent","params":[{"name":"agent","value":7}]}"#,
+            r#"{"action":"open_agent","params":[{"name":"agent","value":"tester","also":"x"}]}"#,
+            r#"{"action":"open_agent","params":[{"name":"agent"}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<IntentAnswer>(malformed).is_err(),
+                "{malformed}"
+            );
+        }
     }
 
     #[test]
