@@ -396,9 +396,10 @@ pub use meaning::{MeaningRequest, MeaningVerdict, Strictness};
 pub use outcome::{
     ChoiceMatch, DeckRefMatch, DirRefMatch, FILTER_DASHBOARD_ROW, ResolvedParam,
     SHOW_HOST_METRICS_ROW, SWITCH_DECK_ROW, VoiceDeckIdentity, VoiceDeckSelection, VoiceOutcome,
-    VoiceResult, address_deck_switch, handle_utterance, handle_utterance_with,
-    handle_utterance_with_dictation, handle_utterance_with_modes, refuse_switch_beyond_selector,
-    resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
+    VoiceResult, address_deck_switch, handle_utterance, handle_utterance_after_local_intercepts,
+    handle_utterance_with, handle_utterance_with_dictation, handle_utterance_with_modes,
+    refuse_switch_beyond_selector, resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref,
+    resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{

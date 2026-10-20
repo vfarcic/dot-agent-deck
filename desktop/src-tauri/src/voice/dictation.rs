@@ -59,15 +59,20 @@
 //! reading phrases. They are not a check on a model's pick: no model is asked
 //! at all.
 //!
-//! **An observed name does not reach them.** Each is compared
-//! with the WHOLE utterance — the transcript's words, an edge politeness word
-//! aside (`outcome::whole_utterance`) — for equality with a fixed list written
-//! here, or, for [`DICTATION_OPENERS`], it slices the user's own transcript.
-//! None of them compares the utterance with a name from what the model is
-//! shown — an agent's label, a deck, a directory: the screen and whether the
-//! New agent dialog is open decide only where a list is answered. A
-//! whole-utterance list does not fire on a sentence that merely contains one
-//! of its phrases.
+//! **An observed name does not reach them.** Most are compared with the
+//! WHOLE utterance — the transcript's words, an edge politeness word aside
+//! (`outcome::whole_utterance`) — for equality with a fixed list written here.
+//! Two are not: a [`DICTATION_OPENERS`] opener slices the user's own
+//! transcript, and in the typing mode [`TRAILING_SEND_PHRASES`] is compared
+//! with the utterance's separate FINAL sentence, so "What's the weather over
+//! there? Send it." types the question and then sends it
+//! (`outcome::trailing_send`, read by `outcome::dictation_intercept`, which
+//! sets `then_submit`). None of them compares the utterance with a name from what
+//! the model is shown — an agent's label, a deck, a directory: the screen and
+//! whether the New agent dialog is open decide only where a list is answered.
+//! A whole-utterance list does not fire on a sentence that merely contains one
+//! of its phrases; the trailing-send rule fires on a final sentence that is
+//! one, whatever was said before it.
 //!
 //! **They exist for latency** (issue #1246): a bare "send it" presses Enter
 //! without the round trip, and routing it through the command model and then

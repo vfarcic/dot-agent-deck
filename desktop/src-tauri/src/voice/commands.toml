@@ -1540,8 +1540,10 @@ try_saying  = "scroll to the bottom"
 # `show`, `look`), because the command model sometimes puts the request
 # itself into the optional `agent` ("show the pull request"): a value made of
 # nothing but these words and filler names no agent, and is read as no name
-# (`outcome.rs`'s `names_an_agent_beyond_the_ask`). Like every `action_words`
-# entry, never read to decide whether the action was asked for.
+# (`outcome.rs`'s `names_an_agent_beyond_the_ask`) — unless it is an agent's
+# shown name said whole ("open the PR for Show" opens Show's), and the app asks
+# which agent when one could still be meant (`could_name_an_agent`). Like every
+# `action_words` entry, never read to decide whether the action was asked for.
 [[commands]]
 id          = "open_pr"
 description = """Open one agent's pull request: GitHub's page for it, inside the app, over the current

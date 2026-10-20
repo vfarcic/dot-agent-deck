@@ -541,7 +541,7 @@ pub fn parse_anthropic(
 
 /// The verdict out of a chat completion's content, fenced or not — the one
 /// choice's, and only when that content writes each key once
-/// ([`keys_written_once`]).
+/// ([`keys_written_once`]) and a fence wraps all of it ([`fenced_body`]).
 pub fn parse_openai(
     request: &MeaningRequest<'_>,
     payload: &Value,
@@ -569,18 +569,30 @@ pub fn parse_openai(
         .as_str()
         .ok_or_else(unreadable)?;
     let trimmed = content.trim();
-    let body = trimmed
-        .strip_prefix("```")
-        .and_then(|rest| rest.split_once('\n'))
-        .and_then(|(_, rest)| rest.rsplit_once("```"))
-        .map(|(inner, _)| inner)
-        .unwrap_or(trimmed)
-        .trim();
+    let body = match trimmed.strip_prefix("```") {
+        Some(fenced) => fenced_body(fenced).ok_or_else(unreadable)?,
+        None => trimmed,
+    }
+    .trim();
     if !keys_written_once(body.as_bytes()) {
         return Err(unreadable());
     }
     let answers: Value = serde_json::from_str(body).map_err(|_| unreadable())?;
     MeaningVerdict::read(request, &answers)
+}
+
+/// What a code fence encloses — `rest` being the content after its opening
+/// backticks — or `None` when the fence does not wrap the whole content: an
+/// opening line carrying more than a language word, or anything but
+/// whitespace after the closing fence (already trimmed off by the caller).
+/// Either would let a second verdict sit outside the one that is read, so the
+/// reply is unreadable instead (PRD #1733's audit, A4).
+fn fenced_body(rest: &str) -> Option<&str> {
+    let (language, rest) = rest.split_once('\n')?;
+    if !language.trim().chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    rest.strip_suffix("```")
 }
 
 #[cfg(test)]
@@ -790,9 +802,10 @@ mod tests {
     }
 
     /// Scenario: a reply that answers the same question twice — two verdict
-    /// tool calls, a key written twice, or two choices — is unreadable in
-    /// either order, so the yes is never read by its position; one answer
-    /// each is still read.
+    /// tool calls, a key written twice, two choices, or a second verdict
+    /// before or after a code fence — is unreadable in either order, so the
+    /// yes is never read by its position; one answer each, fenced or not, is
+    /// still read.
     #[test]
     fn meaning_replies_that_answer_twice_are_errors_in_either_order() {
         let transcript = Transcript::new("destroy the tester");
@@ -836,6 +849,29 @@ mod tests {
                 )
                 .is_err(),
                 "fenced {twice}"
+            );
+        }
+        for (first, second) in [("yes", "no"), ("no", "yes")] {
+            for outside in [
+                format!("```json\n{{\"q1\": \"{first}\"}}\n```\n{{\"q1\": \"{second}\"}}"),
+                format!("{{\"q1\": \"{first}\"}}\n```json\n{{\"q1\": \"{second}\"}}\n```"),
+                format!("```{{\"q1\": \"{first}\"}}\n{{\"q1\": \"{second}\"}}\n```"),
+            ] {
+                assert!(
+                    parse_openai(&request, &content(&outside), ceiling()).is_err(),
+                    "{outside}"
+                );
+            }
+        }
+        for fenced in [
+            "```json\n{\"q1\": \"yes\"}\n```",
+            "  ```\n{\"q1\": \"yes\"}```\n\n",
+        ] {
+            assert!(
+                parse_openai(&request, &content(fenced), ceiling())
+                    .expect("one fenced answer")
+                    .asks("stop_agent", Strictness::Asks),
+                "{fenced}"
             );
         }
         let two_choices = json!({ "choices": [

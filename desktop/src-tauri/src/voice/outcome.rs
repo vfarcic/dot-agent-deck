@@ -926,14 +926,12 @@ pub async fn handle_utterance_with_modes(
     labels: LabelSharing,
     show_deck: bool,
 ) -> VoiceResult {
-    let withheld = labels == LabelSharing::Withheld;
     let backend = resolver.backend_name();
-    let result = |outcome, resolve_ms| VoiceResult {
+    let finish = |outcome, resolve_ms| VoiceResult {
         outcome,
         resolve_ms,
         backend,
     };
-    let finish = result;
 
     // Silence is a no-match without a backend call. Every backend is now an
     // HTTP request costing a round trip and, off loopback, money per utterance,
@@ -965,6 +963,85 @@ pub async fn handle_utterance_with_modes(
         return finish(outcome, None);
     }
 
+    after_local_intercepts(
+        resolver,
+        table,
+        screen,
+        agents,
+        decks,
+        directories,
+        new_agent,
+        transcript,
+        labels,
+        show_deck,
+    )
+    .await
+}
+
+/// The production pipeline that runs once no local fast path answered — the
+/// Commands backend's pick, the meaning check on it ([`questions_for`]), the
+/// redirects and the outcome — under [`handle_utterance`]'s settings: labels
+/// shared and the deck shown.
+///
+/// It exists for forced-pick verification: a test resolver that forces a pick
+/// can reach the meaning check with a sentence a local fast path would
+/// otherwise answer first ("close the new agent dialog", "send it"). **It
+/// skips [`reading_intercept`], [`dictation_intercept`] and
+/// [`local_intercept`] on purpose**, so it is not what the app answers an
+/// utterance with; the shipping handler calls the same function after those
+/// intercepts, so the two cannot drift.
+// Eight, for `handle_utterance`'s reason.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_utterance_after_local_intercepts(
+    resolver: &dyn IntentResolver,
+    table: &CommandTable,
+    screen: Screen,
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
+    transcript: Transcript,
+) -> VoiceResult {
+    after_local_intercepts(
+        resolver,
+        table,
+        screen,
+        agents,
+        decks,
+        directories,
+        new_agent,
+        transcript,
+        LabelSharing::Shared,
+        true,
+    )
+    .await
+}
+
+/// Everything [`handle_utterance_with_modes`] does once no intercept answered
+/// the utterance; [`handle_utterance_after_local_intercepts`] is its door for
+/// tests.
+// Ten: `handle_utterance_with`'s reason.
+#[allow(clippy::too_many_arguments)]
+async fn after_local_intercepts(
+    resolver: &dyn IntentResolver,
+    table: &CommandTable,
+    screen: Screen,
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
+    transcript: Transcript,
+    labels: LabelSharing,
+    show_deck: bool,
+) -> VoiceResult {
+    let withheld = labels == LabelSharing::Withheld;
+    let backend = resolver.backend_name();
+    let result = |outcome, resolve_ms| VoiceResult {
+        outcome,
+        resolve_ms,
+        backend,
+    };
+
     let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
     // Every deck, including the ones a new agent cannot start on (issue
     // #1491): the Daemon selector switches to any of them, so the model has
@@ -974,8 +1051,8 @@ pub async fn handle_utterance_with_modes(
     // for the New agent dialog is still answered with its short reason, never
     // preselected ([`deck_unavailable`]).
     let started = std::time::Instant::now();
-    // With labels withheld the backend is shown none of them — see this
-    // function's doc comment.
+    // With labels withheld the backend is shown none of them — see
+    // [`handle_utterance_with`]'s doc comment.
     let answered = resolver
         .resolve(IntentRequest {
             transcript: &transcript,
@@ -1290,8 +1367,14 @@ pub async fn handle_utterance_with_modes(
             // `open_pr`'s agent made only of the words that asked for the row
             // — "show the pull request", which the command model was measured
             // answering for "show the pull request" 4 times in 12 — names no
-            // agent, and is read exactly as an agent left out.
-            .filter(|value| row.id != OPEN_PR_ROW || names_an_agent_beyond_the_ask(value, row))
+            // agent, and is read exactly as an agent left out. Unless it is an
+            // agent's shown name, said whole: "open the PR for Show" opens
+            // Show's, never the open pane's (PRD #1733's review, finding 2).
+            .filter(|value| {
+                row.id != OPEN_PR_ROW
+                    || names_an_agent_beyond_the_ask(value, row)
+                    || !agents_called(value, agents).is_empty()
+            })
         else {
             // An optional param the model left out is simply not dispatched
             // (PRD #1223's "new agent" with no deck named), and says nothing:
@@ -1308,7 +1391,18 @@ pub async fn handle_utterance_with_modes(
             // a dropped one, whose note it answers ([`Unmet::dropped_note`]).
             // Several eligible decks never reach here with one: the dialog
             // then preselects nothing unless told.
-            if row.id == OPEN_PR_ROW && screen != Screen::Agent {
+            //
+            // `open_pr` off the agent screen asks which agent; and so does a
+            // value of request words that could still be an agent's name — an
+            // agent called Show beside "show the PR" — on either screen,
+            // rather than reading it as the open pane's pull request.
+            if row.id == OPEN_PR_ROW
+                && (screen != Screen::Agent
+                    || answer
+                        .params
+                        .get(&spec.name)
+                        .is_some_and(|value| could_name_an_agent(value, agents)))
+            {
                 match unnamed_pr_agent(spec, &transcript, row, agents) {
                     Ok(param) => {
                         notes.push(facet_note(&param));
@@ -1969,8 +2063,10 @@ fn said_beyond_the_ask(
 /// It reads only the model's value, never the transcript, and only to treat
 /// a value as absent. A value with a verb the row does not list ("display the
 /// pull request") keeps that verb and is refused as naming nobody, which is
-/// the side to err on. A name the user said reads as absent only when each
-/// of its words is one of those words or filler — an agent called "Show".
+/// the side to err on. An agent called "Show" is `false` too, which is why
+/// its caller reads an agent's whole shown name first ([`agents_called`]) and
+/// asks which agent when the value could still be one
+/// ([`could_name_an_agent`]).
 fn names_an_agent_beyond_the_ask(value: &str, row: &CommandRow) -> bool {
     let vocabulary: BTreeSet<String> = row
         .action_words
@@ -1983,6 +2079,36 @@ fn names_an_agent_beyond_the_ask(value: &str, row: &CommandRow) -> bool {
         .collect();
     let (_, content) = reference_words(&rest.join(" "));
     !content.is_empty()
+}
+
+/// The agents one of whose shown names ([`spoken_names`]) `spoken` is, said
+/// whole — [`resolve_agent_ref_on`]'s first pass.
+fn agents_called<'a>(spoken: &str, agents: &'a [DesktopAgent]) -> Vec<&'a DesktopAgent> {
+    let reference = normalize(spoken);
+    if reference.is_empty() {
+        return Vec::new();
+    }
+    agents
+        .iter()
+        .filter(|agent| {
+            spoken_names(agent)
+                .iter()
+                .any(|name| normalize(name) == reference)
+        })
+        .collect()
+}
+
+/// Whether some agent here has a shown name ([`spoken_names`]) whose words,
+/// filler aside, `value` holds every one of — an agent called Show for "show
+/// the PR". Read only for a value that [`names_an_agent_beyond_the_ask`]
+/// found to be request words, to keep such a value from being read as no
+/// agent at all.
+fn could_name_an_agent(value: &str, agents: &[DesktopAgent]) -> bool {
+    let said: BTreeSet<String> = word_sequence(value).into_iter().collect();
+    agents.iter().flat_map(spoken_names).any(|name| {
+        let (_, content) = reference_words(&name);
+        !content.is_empty() && content.is_subset(&said)
+    })
 }
 
 /// `transcript`'s words ([`spoken_words`]) less one occurrence of each of
@@ -3943,11 +4069,7 @@ fn resolve_agent_ref_reading(
     if reference.is_empty() {
         return (AgentRefMatch::None, false);
     }
-    let named_exactly = |names: Vec<String>| names.iter().any(|name| normalize(name) == reference);
-    let shown: Vec<&DesktopAgent> = agents
-        .iter()
-        .filter(|agent| named_exactly(spoken_names(agent)))
-        .collect();
+    let shown = agents_called(spoken, agents);
     if !shown.is_empty() {
         return (agent_ref_match(&shown, agents), false);
     }
@@ -10878,6 +11000,62 @@ mod tests {
         }
     }
 
+    /// Scenario: Mercury's pane is open and another agent is called Show.
+    /// "open the PR for Show", answered with `agent = "Show"`, opens Show's
+    /// pull request on the agent screen and on the dashboard — never
+    /// Mercury's, though "show" is one of the row's request words. Agents
+    /// called Open, Look and PR are read the same way. With Show there, a
+    /// value of request words that could still name it ("show the pull
+    /// request") asks which agent instead of opening the pane's; without
+    /// such an agent the same value still opens the pane's pull request.
+    #[tokio::test]
+    async fn voice_outcome_open_pr_reads_an_agent_called_by_a_request_word() {
+        let mercury = agent("agent-mercury", Some("Mercury"), "claude");
+        for name in ["Show", "Open", "Look", "PR"] {
+            let agents = vec![mercury.clone(), agent("agent-named", Some(name), "codex")];
+            let said = format!("open the PR for {name}");
+            let resolver = StubResolver::new().answering(
+                &said,
+                IntentAnswer::new("open_pr").with_param("agent", name),
+            );
+            for screen in [Screen::Agent, Screen::Overview] {
+                let opened = run_agents(&resolver, screen, &agents, &said).await;
+                assert!(
+                    matches!(&opened, VoiceOutcome::Dispatch { action, params, .. }
+                        if action == "open_pr"
+                        && params.len() == 1
+                        && params[0].value == "agent-named"),
+                    "{said} on {screen}: {opened:?}"
+                );
+            }
+        }
+
+        let said = "show the pull request";
+        let resolver = StubResolver::new()
+            .answering(said, IntentAnswer::new("open_pr").with_param("agent", said));
+        let beside_show = vec![mercury.clone(), agent("agent-show", Some("Show"), "codex")];
+        for screen in [Screen::Agent, Screen::Overview] {
+            let which = run_agents(&resolver, screen, &beside_show, said).await;
+            assert!(
+                matches!(&which, VoiceOutcome::ParamAmbiguous { action, matches, .. }
+                    if action == "open_pr" && matches.len() == 2),
+                "{said} beside Show on {screen}: {which:?}"
+            );
+        }
+        let alone = vec![mercury, agent("agent-vega", Some("Vega"), "codex")];
+        let pane = run_agents(&resolver, Screen::Agent, &alone, said).await;
+        assert!(
+            matches!(&pane, VoiceOutcome::Dispatch { params, sentence, .. }
+                if params.is_empty() && sentence == "Opening the pull request."),
+            "{pane:?}"
+        );
+        let dashboard = run_agents(&resolver, Screen::Overview, &alone, said).await;
+        assert!(
+            matches!(&dashboard, VoiceOutcome::ParamAmbiguous { action, .. } if action == "open_pr"),
+            "{dashboard:?}"
+        );
+    }
+
     /// Scenario: "inspect Mercury" with Mercury and Vega on the dashboard
     /// opens Mercury. Beside an agent called Inspect, the same sentence and
     /// the same answer are refused as naming nobody: "inspect" is not one of
@@ -14979,6 +15157,87 @@ mod tests {
         .outcome
     }
 
+    /// Scenario: over the New agent dialog, "close the new agent dialog" is
+    /// answered by the shipping handler's local fast path, without the meaning
+    /// check. Forced to `discard_new_agent` through the pipeline after the
+    /// fast paths, the same sentence asks the meaning check the production
+    /// question set, and the outcome follows its verdict: refused on a no,
+    /// discarded on a yes.
+    #[tokio::test]
+    async fn voice_outcome_the_pipeline_after_the_fast_paths_asks_the_meaning_check() {
+        let said = "close the new agent dialog";
+        let form = new_agent_form();
+        let forced = IntentAnswer::new("discard_new_agent");
+
+        let resolver = StubResolver::new().answering(said, forced.clone());
+        let shipped = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &decks(),
+            None,
+            Some(&form),
+            Transcript::new(said),
+        )
+        .await
+        .outcome;
+        assert!(
+            matches!(&shipped, VoiceOutcome::Dispatch { action, .. } if action == CLOSE_ROW),
+            "{shipped:?}"
+        );
+        assert!(resolver.meaning_requests().is_empty());
+
+        let discard = table().row("discard_new_agent").expect("a shipped row");
+        let production: Vec<(String, Strictness)> = questions_for(
+            table(),
+            discard,
+            said,
+            Screen::Overview,
+            None,
+            Some(&form),
+            true,
+        )
+        .into_iter()
+        .map(|(row, strictness)| (row.id.clone(), strictness))
+        .collect();
+        assert!(
+            production.contains(&("discard_new_agent".to_string(), Strictness::Whole)),
+            "{production:?}"
+        );
+        for asks in [false, true] {
+            let resolver = StubResolver::new()
+                .answering(said, forced.clone())
+                .judging_everything(asks);
+            let outcome = handle_utterance_after_local_intercepts(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks(),
+                None,
+                Some(&form),
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
+            let asked = resolver.meaning_requests();
+            assert_eq!(asked.len(), 1, "{asks}: {asked:?}");
+            assert_eq!(asked[0].questions, production, "{asks}");
+            if asks {
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "discard_new_agent"),
+                    "{outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "discard_new_agent"),
+                    "{outcome:?}"
+                );
+            }
+        }
+    }
+
     /// [`heard_as_user_said`] with the meaning check's answer for each of
     /// `verdicts`' rows given, and every other question answered `yes`.
     async fn judged_as(
@@ -17791,8 +18050,9 @@ mod tests {
     }
 
     /// Scenario: the backend's reply to the meaning check answers the same
-    /// question twice — two verdict tool calls, or one key written twice —
-    /// with a yes and a no in either order. Read by the remote resolver's own
+    /// question twice — two verdict tool calls, one key written twice, or a
+    /// fenced verdict followed by another — with a yes and a no in either
+    /// order. Read by the remote resolver's own
     /// reader, the pick is refused as unchecked whichever answer came first;
     /// a reply that answers once still dispatches.
     #[tokio::test]
@@ -17824,6 +18084,12 @@ mod tests {
                     Dialect::OpenAiCompatible,
                     content(&format!(r#"{{"q1": "{first}", "q1": "{second}"}}"#)),
                 ),
+                (
+                    Dialect::OpenAiCompatible,
+                    content(&format!(
+                        "```json\n{{\"q1\": \"{first}\"}}\n```\n{{\"q1\": \"{second}\"}}"
+                    )),
+                ),
             ] {
                 let resolver = StubResolver::new()
                     .answering(said, answer.clone())
@@ -17842,6 +18108,10 @@ mod tests {
                 format!(r#"{{"content": [{}]}}"#, block("yes")),
             ),
             (Dialect::OpenAiCompatible, content(r#"{"q1": "yes"}"#)),
+            (
+                Dialect::OpenAiCompatible,
+                content("```json\n{\"q1\": \"yes\"}\n```"),
+            ),
         ] {
             let resolver = StubResolver::new()
                 .answering(said, answer.clone())
