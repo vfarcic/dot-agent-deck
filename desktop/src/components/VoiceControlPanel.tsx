@@ -2055,6 +2055,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   }, []);
   /** Bumped by every stop of the countdown, so a tick or a send that outlived it acts on nothing. */
   const answerEpoch = useRef(0);
+  /** Bumped by every drop of the answer, so words worked out across one do not bring it back (PR #1764 review). */
+  const answerDrops = useRef(0);
   const stopAnswerCountdown = useCallback(() => {
     answerEpoch.current += 1;
     if (answerTimer.current !== undefined) window.clearInterval(answerTimer.current);
@@ -2070,6 +2072,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * "Too late to cancel"), which the send then reports.
    */
   const dropQuestion = useCallback((why?: string) => {
+    answerDrops.current += 1;
     stopAnswerCountdown();
     const held = questionFormRef.current;
     if (held?.sending) {
@@ -2280,6 +2283,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const spawnedAtMs = shown.spawnedAtMs;
     const inputBlocked = shown.inputBlocked;
     const deck = selectedDeckRef.current;
+    const drops = answerDrops.current;
     setPhase("resolving");
     /* In typing mode nothing said reaches the Commands service, so only an
        option matched on this machine answers (PR #1698). */
@@ -2287,6 +2291,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (!ours()) return true;
     const verdict = answered.verdict;
     if (verdict.kind === "not_answer") return false;
+    /* The answer was called off while these words were worked out, and the
+       row said why: what changed may have changed back since, so the check
+       below cannot see it, but the answer stays off (PR #1764 review). */
+    if (answerDrops.current !== drops) return true;
     /* The whole staleness rule, not only the question's identity: the
        terminal hidden, the agent replaced, the pane stopped taking input, a
        confirmation opened or the deck changed while the answer was worked

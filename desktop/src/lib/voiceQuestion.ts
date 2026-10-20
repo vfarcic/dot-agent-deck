@@ -171,10 +171,13 @@ export function questionLost(
   const pane = now.pane;
   if (!pane || pane.deckId !== aim.deckId || pane.agentId !== aim.agentId) return { code: "pane", why: pane ? "the pane on screen changed" : "the pane closed" };
   if (aim.spawnedAtMs !== undefined && pane.spawnedAtMs !== undefined && aim.spawnedAtMs !== pane.spawnedAtMs) return { code: "replaced", why: "the agent in the pane was replaced" };
-  if (pane.inputBlocked !== undefined && aim.inputBlocked === undefined) return { code: "blocked", why: `the pane stopped taking input: ${pane.inputBlocked.replace(/\.$/, "")}` };
   if (pane.terminalHidden) return { code: "hidden", why: "its terminal is not shown" };
   if (pane.question?.id !== aim.questionId) return { code: "question", why: "the question changed" };
   if (aim.revision !== undefined && pane.question.revision !== aim.revision) return { code: "question", why: "the question changed" };
+  /* After the question's own checks (PR #1764 review): an answer whose
+     delivery cleared the question as the pane stopped taking input is the
+     question's case, which leaves an answer on its way alone. */
+  if (pane.inputBlocked !== undefined && aim.inputBlocked === undefined) return { code: "blocked", why: `the pane stopped taking input: ${pane.inputBlocked.replace(/\.$/, "")}` };
   if (now.confirmation) return { code: "confirmation", why: "a confirmation is open" };
   if (now.deck !== aim.deck) return { code: "deck", why: "the deck changed" };
   return undefined;
