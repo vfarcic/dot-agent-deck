@@ -20,7 +20,8 @@
 //! most one `gh` runs per key at a time. An open or draft PR is re-read on a
 //! slow poll ([`DOT_AGENT_DECK_PR_REFRESH_SECS_ENV`]); a merged or closed one is
 //! not read again until the branch changes, unless its CI checks were still
-//! pending, which keep it on that poll until they finish; a turn ending or an agent stopping
+//! pending, which keep it on that poll until they finish or
+//! [`TERMINAL_PENDING_CHECKS_WINDOW`] has passed since it closed; a turn ending or an agent stopping
 //! asks for an early, debounced re-read ([`fetch_due`]).
 //!
 //! No `gh`, no login, no network, a non-GitHub `origin`, the default branch, a
@@ -129,6 +130,13 @@ pub const DEFAULT_REFRESH: Duration = Duration::from_secs(60);
 /// A failed lookup is retried this many intervals later, whatever happens in
 /// between.
 const FAILURE_BACKOFF_FACTOR: u32 = 5;
+
+/// How long a merged or closed PR is still re-read while its CI checks are
+/// pending (issue #1781). A check GitHub marked stale, or a commit status
+/// nobody ever reports, stays pending for good, so the re-reads stop after
+/// this and the badge keeps the last answer. Two hours outlasts this
+/// repository's own longest CI job (one hour) with room for a queue.
+const TERMINAL_PENDING_CHECKS_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// The longest gap a turn-end re-read waits for after the previous lookup.
 const MAX_KICK_DEBOUNCE: Duration = Duration::from_secs(10);
@@ -462,6 +470,29 @@ pub(crate) struct KeyEntry {
     pub kicked: bool,
     /// The current run of failures has been logged.
     pub failure_logged: bool,
+    /// When a lookup first answered with this key's PR merged or closed;
+    /// `None` while it is open, or there is none.
+    pub terminal_since: Option<Instant>,
+}
+
+impl KeyEntry {
+    /// Store a successful lookup's `value`, answered at `now`.
+    pub(crate) fn record(&mut self, value: Option<PullRequestInfo>, now: Instant) {
+        let terminal = value.as_ref().is_some_and(|pr| {
+            matches!(
+                pr.state,
+                PullRequestState::Merged | PullRequestState::Closed
+            )
+        });
+        self.terminal_since = if terminal {
+            Some(self.terminal_since.unwrap_or(now))
+        } else {
+            None
+        };
+        self.value = Some(value);
+        self.failed = false;
+        self.failure_logged = false;
+    }
 }
 
 /// Whether `entry` needs a lookup at `now`. The refresh policy, pure:
@@ -470,7 +501,9 @@ pub(crate) struct KeyEntry {
 /// * after a failure, only once [`FAILURE_BACKOFF_FACTOR`] intervals passed;
 /// * a merged or closed PR, never (a new branch is a new key) — unless its
 ///   CI checks are still pending, which are then re-read as an open PR's
-///   are, so the badge does not keep a pending mark for good (issue #1781);
+///   are for [`TERMINAL_PENDING_CHECKS_WINDOW`] after it closed, so the badge
+///   does not keep a pending mark for good, nor poll for good on a check that
+///   never finishes (issue #1781);
 /// * an open or draft PR, every `interval`, or after a turn end once the
 ///   debounce passed;
 /// * no PR, every `interval` too — a PR the user opens while the agent is
@@ -494,9 +527,12 @@ pub(crate) fn fetch_due(entry: &KeyEntry, now: Instant, interval: Duration) -> b
             if matches!(
                 pr.state,
                 PullRequestState::Merged | PullRequestState::Closed
-            ) && !pr
+            ) && !(pr
                 .checks
-                .is_some_and(|checks| checks.state == PullRequestChecksState::Pending) =>
+                .is_some_and(|checks| checks.state == PullRequestChecksState::Pending)
+                && entry.terminal_since.is_some_and(|since| {
+                    now.saturating_duration_since(since) < TERMINAL_PENDING_CHECKS_WINDOW
+                })) =>
         {
             false
         }
@@ -745,11 +781,7 @@ pub async fn run_pull_request_monitor(
                 entry.in_flight = false;
                 entry.fetched_at = Some(Instant::now());
                 match result {
-                    Ok(value) => {
-                        entry.value = Some(value);
-                        entry.failed = false;
-                        entry.failure_logged = false;
-                    }
+                    Ok(value) => entry.record(value, Instant::now()),
                     Err(error) => {
                         entry.failed = true;
                         if !entry.failure_logged {
@@ -1128,7 +1160,10 @@ mod tests {
                 pending: 1,
                 skipped: 0,
             });
-            fetched(value, false, at)
+            let mut entry = KeyEntry::default();
+            entry.record(value.unwrap(), at);
+            entry.fetched_at = Some(at);
+            entry
         };
         for state in [PullRequestState::Merged, PullRequestState::Closed] {
             let pending = with_checks(state, PullRequestChecksState::Pending);
@@ -1142,6 +1177,44 @@ mod tests {
                 assert!(!fetch_due(&done, at + interval * 10, interval), "{state:?}");
             }
         }
+    }
+
+    /// Issue #1781 (PR #1783 review): a check that never finishes, such as a
+    /// stale run, stops the re-reads of a merged or closed PR once the window
+    /// passed, counted from when it first closed, not from the last re-read.
+    #[test]
+    fn a_closed_pr_whose_checks_never_finish_stops_being_polled() {
+        let at = Instant::now();
+        let interval = Duration::from_secs(60);
+        let pending = PullRequestChecks {
+            state: PullRequestChecksState::Pending,
+            passing: 0,
+            failing: 0,
+            pending: 1,
+            skipped: 0,
+        };
+        let mut closed = pr_in(PullRequestState::Closed).unwrap().unwrap();
+        closed.checks = Some(pending);
+        let mut entry = KeyEntry::default();
+        entry.record(Some(closed.clone()), at);
+        // Every later re-read keeps the first close time.
+        let later = at + TERMINAL_PENDING_CHECKS_WINDOW - interval * 2;
+        entry.record(Some(closed.clone()), later);
+        assert_eq!(entry.terminal_since, Some(at));
+        entry.fetched_at = Some(later);
+        // Inside the window it is still re-read every interval…
+        assert!(fetch_due(&entry, later + interval, interval));
+        // …and once the window has passed, never again.
+        assert!(!fetch_due(
+            &entry,
+            at + TERMINAL_PENDING_CHECKS_WINDOW + interval,
+            interval
+        ));
+        // Reopened, the PR is open again and the clock starts over.
+        let mut open = closed;
+        open.state = PullRequestState::Open;
+        entry.record(Some(open), later);
+        assert_eq!(entry.terminal_since, None);
     }
 
     #[test]
