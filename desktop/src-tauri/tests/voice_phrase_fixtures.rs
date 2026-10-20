@@ -582,7 +582,7 @@ async fn voice_parameterless_steering_is_refused_by_the_production_pipeline() {
 
 /// Scenario: Force contextual close, destructive and mixed-content picks
 /// through the shipping pipeline with its real meaning backend; refusals must dispatch nothing while standalone controls still work.
-/// Opening an existing tester must neither open the New agent dialog nor start its ready form, and opening an agent named Close must close nothing.
+/// Opening an existing agent must neither open the New agent dialog nor start its ready form, even with a pointing-word name, missing value or unspoken observed name forced into the stop pick; opening an agent named Close must close nothing.
 #[tokio::test]
 async fn voice_contextual_and_whole_controls_are_refused_by_the_production_pipeline() {
     let mut cases = contextual_judge_fixtures();
@@ -604,8 +604,42 @@ async fn voice_contextual_and_whole_controls_are_refused_by_the_production_pipel
             false,
             false,
         )
-        .with_agent_label("Close"),
+        .with_agent_label("Close")
+        .with_agent_param(Some("Close")),
     );
+    for (surface, ready_form) in [("dialog-closed", false), ("ready-form", true)] {
+        for (group, said, label, agent_param) in [
+            (
+                "destructive-pointing-name",
+                "open the it agent",
+                Some("it"),
+                Some("it"),
+            ),
+            ("destructive-missing-value", "open the tester", None, None),
+            (
+                "destructive-unspoken-name",
+                "open the tester",
+                Some("reviewer"),
+                Some("reviewer"),
+            ),
+        ] {
+            let mut case = JudgeFixture::new(
+                &format!("{group}-{surface}"),
+                "stop_agent",
+                said,
+                false,
+                false,
+            )
+            .with_agent_param(agent_param);
+            if let Some(label) = label {
+                case = case.with_agent_label(label);
+            }
+            if ready_form {
+                case = case.with_ready_form();
+            }
+            cases.push(case);
+        }
+    }
     run_judge_fixtures(cases, JudgePipeline::Production).await;
 }
 
@@ -623,6 +657,7 @@ struct JudgeFixture {
     dialog: bool,
     ready_form: bool,
     agent_label: Option<&'static str>,
+    agent_param: Option<&'static str>,
 }
 
 impl JudgeFixture {
@@ -635,6 +670,7 @@ impl JudgeFixture {
             dialog,
             ready_form: false,
             agent_label: None,
+            agent_param: Some("tester"),
         }
     }
 
@@ -646,6 +682,11 @@ impl JudgeFixture {
 
     fn with_agent_label(mut self, label: &'static str) -> Self {
         self.agent_label = Some(label);
+        self
+    }
+
+    fn with_agent_param(mut self, value: Option<&'static str>) -> Self {
+        self.agent_param = value;
         self
     }
 }
@@ -782,7 +823,11 @@ async fn run_production_judge_fixture(
     const REPETITIONS: usize = 5;
     let mut answer = IntentAnswer::new(case.action);
     match case.action {
-        "stop_agent" => answer = answer.with_param("agent", case.agent_label.unwrap_or("tester")),
+        "stop_agent" => {
+            if let Some(agent) = case.agent_param {
+                answer = answer.with_param("agent", agent);
+            }
+        }
         "close_orchestration" => answer = answer.with_param("orchestration", "build"),
         _ => {}
     }
