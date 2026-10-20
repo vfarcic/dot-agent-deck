@@ -243,7 +243,7 @@ Roles are yours to define; the deck imposes no fixed set. When it [generates a c
 | `release` | Runs the project's release/PR/merge workflow; never modifies code | `false` |
 | `researcher` | Investigates the codebase or external sources to gather context | `true` |
 
-Each suggested `prompt_template` also tells the worker how to share a checkout with the rest of the team. A worker reports back to the orchestrator rather than stopping to ask you something or handing work to another role, and opens that report with its outcome: done, blocked, or needs a decision. Every role except `researcher` checks it is on the branch or commit the task names and stops rather than switching if it is not. Roles that change files leave other agents' changes alone and stage only the files they changed.
+Each suggested `prompt_template` also tells the worker how to share a checkout with the rest of the team. A worker reports back to the orchestrator rather than stopping to ask you something or handing work to another role, and opens that report with its outcome: done, blocked, or needs a decision. Every role except `researcher` checks it is on the branch or commit the task tells it to work from, and stops rather than switching if it is not. Roles that change files leave other agents' changes alone, stage the files they changed by name rather than everything in the checkout, and check what is staged before committing.
 
 A `release` role uses `clear = false` because a release spans several tasks (open the PR, wait for CI, merge), and a restarted agent would forget the branch and PR it was working on.
 

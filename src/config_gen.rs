@@ -236,9 +236,12 @@ mod tests {
                 .find(|r| r.name == name)
                 .unwrap_or_else(|| panic!("role `{name}` present"));
             for clause in [
+                "if the task names the branch or commit to work from",
+                "confirm you are on it before",
                 "report that and stop rather than switching, stashing or resetting",
                 "Never discard changes you did not make",
                 "stage the files you changed by name",
+                "check what is staged before you commit",
             ] {
                 assert!(
                     role.prompt_template.contains(clause),
@@ -252,11 +255,16 @@ mod tests {
                 .iter()
                 .find(|r| r.name == name)
                 .unwrap_or_else(|| panic!("role `{name}` present"));
-            assert!(
-                role.prompt_template
-                    .contains("report that and stop rather than switching"),
-                "role `{name}` must stop on a branch mismatch rather than switching"
-            );
+            for clause in [
+                "if the task names the branch or commit to work from",
+                "confirm you are on it before",
+                "report that and stop rather than switching",
+            ] {
+                assert!(
+                    role.prompt_template.contains(clause),
+                    "role `{name}` is missing the branch-check clause {clause:?}"
+                );
+            }
         }
     }
 
