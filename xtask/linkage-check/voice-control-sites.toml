@@ -2,7 +2,7 @@
 # (`xtask/linkage-check/src/voice_control_sites.rs`).
 #
 # Every desktop control wired with an `onClick`-family handler in production
-# `.tsx` under `desktop/src` that does NOT dispatch through `VOICE_ACTIONS` is
+# `.tsx` under `desktop/src` that is NOT a single `VOICE_ACTIONS` dispatch is
 # listed here, with a sentence saying what it is and why it is not a voice
 # capability. A new site fails the build until it goes through the registry or
 # is added here with a reason; an entry that matches no site fails it too, so
@@ -19,9 +19,9 @@
 # off voice: the voice-reachability backlog as of when this list was written.
 # `grep -c '^reason = "Gap:' xtask/linkage-check/voice-control-sites.toml` counts it.
 #
-# Keys: `file` and `handler` name the site, `code` is the handler expression
-# with whitespace collapsed (cut at 120 characters with `…`). Identical sites
-# in one file are listed once each. The failure message prints the stanza for
+# Keys: `file` and `handler` name the site, `code` is the whole handler
+# expression with whitespace collapsed. Identical sites in one file are listed
+# once each. The failure message prints the stanza for
 # a new site; paste it and write the reason.
 
 # --- desktop/src/App.tsx ---
@@ -35,7 +35,7 @@ reason = "The deck's Command button: opens the command palette, a pointer/keyboa
 [[site]]
 file = "desktop/src/App.tsx"
 handler = "onClick"
-code = '() => void perform({ type: snapshot.paused ? "resume_run" : "pause_run" }, snapshot.paused ? "Fixture resumed." : "Fixtu…'
+code = '() => void perform({ type: snapshot.paused ? "resume_run" : "pause_run" }, snapshot.paused ? "Fixture resumed." : "Fixture paused.")'
 reason = "Pause/Resume on the deterministic demo fixture; disabled in live mode, so it is not a capability a real deck offers."
 
 [[site]]
@@ -547,7 +547,7 @@ reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is 
 [[site]]
 file = "desktop/src/components/ConfigurationPanels.tsx"
 handler = "onChange"
-code = "(event) => { const provider = event.target.value as Provider; onUpdate(profile.id, { provider, cli: defaultCliForProvide…"
+code = '(event) => { const provider = event.target.value as Provider; onUpdate(profile.id, { provider, cli: defaultCliForProvider(provider), commandMode: provider === "Custom" ? "custom" : "generated", }); }'
 reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): Provider select: a per-field profile edit."
 
 [[site]]
@@ -619,7 +619,7 @@ reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder
 [[site]]
 file = "desktop/src/components/ConfigurationPanels.tsx"
 handler = "onChange"
-code = "(event) => { const prompt = prompts.find((candidate) => candidate.id === event.target.value); if (prompt) setTaskPrompt(…"
+code = "(event) => { const prompt = prompts.find((candidate) => candidate.id === event.target.value); if (prompt) setTaskPrompt(prompt.body); }"
 reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Insert saved prompt select copies a prompt into the task field; a per-field edit of the launch form."
 
 [[site]]
@@ -655,7 +655,7 @@ reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder
 [[site]]
 file = "desktop/src/components/ConfigurationPanels.tsx"
 handler = "onClick"
-code = '() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, ...(runName !== ""…'
+code = '() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, ...(runName !== "" ? { displayTitle: runName } : {}), taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })'
 reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Activate orchestration launches the configured run; follows the editor's classification."
 
 [[site]]
@@ -863,7 +863,7 @@ reason = "Gap: New agent's Show hidden checkbox in the directory browser. No row
 [[site]]
 file = "desktop/src/components/NewAgentDialog.tsx"
 handler = "onClick"
-code = '() => { if (busy) return; setCursor(index); if (row.kind === "up") goUp(); else if (deck) void loadListing(deck.deckId, …'
+code = '() => { if (busy) return; setCursor(index); if (row.kind === "up") goUp(); else if (deck) void loadListing(deck.deckId, row.entry.path); }'
 reason = "New agent: opens a directory row or goes up; voice does the same with `open_dir` and `go_to_parent`."
 
 [[site]]
@@ -1097,6 +1097,12 @@ file = "desktop/src/components/VoiceControlPanel.tsx"
 handler = "onClick"
 code = "() => { undo.run(); setUndo(undefined); }"
 reason = "Undo, offered on screen for 10 s after a voice command ran, reversing that command. A click-only escape hatch for a misheard command; no row undoes a command (`scratch_that` is dictation's)."
+
+[[site]]
+file = "desktop/src/components/VoiceControlPanel.tsx"
+handler = "onClick"
+code = '() => { if (phaseRef.current === "stopping") return; /* `unreleased` routes to the release rather than to the start, and not only where `on` happens to be true: the device is open, so the press that looks like *turn it on* has to be the retry that closes it. `voiceStart` would be refused by `accepts_start` anyway, which is the fall-through this replaces. */ /* Through the registry entry rather than straight to `turnOff`, the way `DeckShell` routes its own Close through `closeAgentView`: the `voice_off` row names `stopVoice`, and a button that reached the same behaviour by a second route would be exactly the residual PRD #802 D10 recorded for the unspoken capabilities, which PRD #1195 M1 then closed. */ if (onRef.current || phaseRef.current === "unreleased") VOICE_ACTIONS.stopVoice.run({ stopVoice }); else void turnOn(); }'
+reason = "The Voice button. Its turn-off half dispatches VOICE_ACTIONS.stopVoice (`voice_off`); its turn-on half starts the microphone, which no spoken command can do while the microphone is off."
 
 [[site]]
 file = "desktop/src/components/VoiceControlPanel.tsx"

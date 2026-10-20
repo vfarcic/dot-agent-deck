@@ -284,8 +284,8 @@ mod voice_capability_state;
 /// planted-bad-input tests.
 mod voice_command_registry;
 /// Issue #1701: rule 14's control-site ratchet. An `onClick`-family handler
-/// in production `.tsx` under `desktop/src` names `VOICE_ACTIONS`, only stops
-/// its event, or is listed, with a reason, in `voice-control-sites.toml`,
+/// in production `.tsx` under `desktop/src` is one `VOICE_ACTIONS` dispatch,
+/// only stops its event, or is listed, with a reason, in `voice-control-sites.toml`,
 /// which only shrinks. Run from [`voice_command_registry::run`], with its own
 /// planted-bad-input tests.
 mod voice_control_sites;
@@ -1021,7 +1021,7 @@ const RULES: &[Rule] = &[
                   `ParamKind`, every registry entry is classified by a row or a written \
                   `no_voice` reason, and the registry literal stays statically readable. Its \
                   control-site ratchet (issue #1701) fails on an `onClick`-family handler in \
-                  `desktop/src` `.tsx` that does not name `VOICE_ACTIONS` unless it only stops its \
+                  `desktop/src` `.tsx` that is not one `VOICE_ACTIONS` dispatch unless it only stops its \
                   event or appears, with a reason, in `xtask/linkage-check/voice-control-sites.toml`, \
                   which only shrinks. Neither \
                   half proves every capability is voice-reachable; see `voice_command_registry` \

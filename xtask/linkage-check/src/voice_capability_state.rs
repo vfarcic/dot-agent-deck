@@ -794,6 +794,11 @@ fn joined(values: &BTreeSet<String>) -> String {
 pub(crate) struct Lexed {
     pub(crate) masked: String,
     pub(crate) problem: Option<String>,
+    /// The byte ranges of the comments, delimiters included. Rule 14's
+    /// control-site ratchet uses them to tell text the lexer blanked as a
+    /// comment from text it blanked as a string — the second can be JSX text
+    /// two apostrophes paired up, which hides code.
+    pub(crate) comments: Vec<Range<usize>>,
 }
 
 /// Blank everything in `text` that is not code.
@@ -828,6 +833,8 @@ pub(crate) fn mask_tsx(text: &str) -> Lexed {
     };
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
+    let mut comments: Vec<Range<usize>> = Vec::new();
+    let mut comment_start = 0usize;
     let mut state = State::Code;
     // One entry per open `${`: how many `{` deep the expression is.
     let mut templates: Vec<usize> = Vec::new();
@@ -843,12 +850,14 @@ pub(crate) fn mask_tsx(text: &str) -> Lexed {
             State::Code => {
                 if character == '/' && next == Some('*') {
                     state = State::Block;
+                    comment_start = out.len();
                     out.push_str("  ");
                     at += 2;
                     continue;
                 }
                 if character == '/' && next == Some('/') {
                     state = State::Line;
+                    comment_start = out.len();
                     out.push_str("  ");
                     at += 2;
                     continue;
@@ -896,6 +905,7 @@ pub(crate) fn mask_tsx(text: &str) -> Lexed {
             State::Line => {
                 if character == '\n' {
                     state = State::Code;
+                    comments.push(comment_start..out.len());
                 }
                 blank(&mut out, character);
             }
@@ -903,6 +913,7 @@ pub(crate) fn mask_tsx(text: &str) -> Lexed {
                 if character == '*' && next == Some('/') {
                     state = State::Code;
                     out.push_str("  ");
+                    comments.push(comment_start..out.len());
                     at += 2;
                     continue;
                 }
@@ -984,9 +995,13 @@ pub(crate) fn mask_tsx(text: &str) -> Lexed {
                 )
             })
     };
+    if matches!(state, State::Line | State::Block) {
+        comments.push(comment_start..out.len());
+    }
     Lexed {
         masked: out,
         problem,
+        comments,
     }
 }
 

@@ -94,8 +94,8 @@ import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "
  * PRD #802's own named risk.
  *
  * Issue #1701 narrowed that gap without closing it: rule 14's control-site
- * ratchet lists each `onClick`-family handler that does not name
- * `VOICE_ACTIONS` (and does more than stop its event) in
+ * ratchet lists each `onClick`-family handler that is not a single
+ * `VOICE_ACTIONS` dispatch (and does more than stop its event) in
  * `xtask/linkage-check/voice-control-sites.toml`, with a reason, and fails the
  * build on a new one. So a NEW control either goes
  * through an entry here or somebody writes down why it does not.
