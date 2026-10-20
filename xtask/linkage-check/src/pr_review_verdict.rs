@@ -1341,3 +1341,98 @@ assert cast and '--request-changes' in cast[0], cast
 "#,
     );
 }
+
+/// Qodo on PR #1765: an APPROVE this job refuses -- a focused pass whose
+/// coverage union leaves a changed file unread -- must leave my old rejection
+/// standing. Dismissing it first would release the pull request on a verdict
+/// the job itself just rejected.
+#[test]
+fn a_refused_approval_leaves_my_stale_rejection_standing() {
+    assert_py_ok(
+        r#"import os
+import pr_review_vote as vote
+old = '8' * 40
+mine = review(APP, old, 'CHANGES_REQUESTED'); mine['id'] = 42
+calls = []
+approve = {'verdict': 'APPROVE', 'head_sha': SHA, 'pr': 7, 'covered_paths': ['a.rs']}
+vote.gh_json = lambda *a: {'headRefOid': SHA, 'isDraft': False, 'reviewDecision': 'CHANGES_REQUESTED'}
+vote.pr_reviews = lambda repo, n: [mine]
+vote.checks_green = lambda repo, sha: (True, 'green')
+vote.latest_verdict = lambda repo, n: approve
+vote.pr_comments = lambda repo, n: [comment('qodo-code-review[bot]', 'reviewed ' + SHA)]
+vote.pr_review_comments = lambda repo, n: []
+vote.trusted_verdicts_at = lambda repo, n, sha: [approve]
+vote.pr_changed_paths = lambda repo, n: ['a.rs', 'b.rs']
+vote.gh_ok = lambda *a: calls.append(a) or True
+vote.gh = lambda *a: calls.append(a) or ''
+os.environ.update({'REPO': 'o/r', 'PR_NUMBER': '7', 'EXPECTED_SHA': SHA, 'APP_LOGIN': APP,
+                   'VOTE_ALLOWED': 'true', 'DENIED_PATHS': '[]'})
+try:
+    vote.main()
+    raise AssertionError('a coverage gap did not fail the job')
+except SystemExit:
+    pass
+assert not [c for c in calls if any('dismissals' in str(x) for x in c)], calls
+"#,
+    );
+}
+
+/// The no-independent-review branch returns before the shared call site, so
+/// it withdraws the stale rejection itself: it casts nothing either.
+#[test]
+fn an_approval_withheld_for_coverage_still_withdraws_my_stale_rejection() {
+    assert_py_ok(
+        r#"import os
+import pr_review_vote as vote
+old = '8' * 40
+mine = review(APP, old, 'CHANGES_REQUESTED'); mine['id'] = 42
+calls = []
+vote.gh_json = lambda *a: {'headRefOid': SHA, 'isDraft': False, 'reviewDecision': 'CHANGES_REQUESTED'}
+vote.pr_reviews = lambda repo, n: [mine]
+vote.checks_green = lambda repo, sha: (True, 'green')
+vote.latest_verdict = lambda repo, n: {'verdict': 'APPROVE', 'head_sha': SHA, 'pr': 7}
+vote.pr_comments = lambda repo, n: []
+vote.pr_review_comments = lambda repo, n: []
+vote.gh_ok = lambda *a: calls.append(a) or True
+def no_review(*a):
+    raise AssertionError('voted without independent coverage: ' + repr(a))
+vote.gh = no_review
+os.environ.update({'REPO': 'o/r', 'PR_NUMBER': '7', 'EXPECTED_SHA': SHA, 'APP_LOGIN': APP,
+                   'VOTE_ALLOWED': 'true', 'DENIED_PATHS': '[]'})
+vote.main()
+assert [c for c in calls if 'repos/o/r/pulls/7/reviews/42/dismissals' in c], calls
+"#,
+    );
+}
+
+/// Qodo and Greptile on PR #1765: a head that cannot be retried -- a settled
+/// verdict, or an abstention whose retry is spent -- is skipped on the one read
+/// of its verdicts, without the three evidence reads.
+#[test]
+fn a_head_with_no_retry_left_skips_the_evidence_reads() {
+    for verdicts in [
+        "[{'verdict': 'APPROVE', 'head_sha': SHA}]",
+        "[{'verdict': 'INSUFFICIENT', 'head_sha': SHA}, {'verdict': 'INSUFFICIENT', 'head_sha': SHA}]",
+    ] {
+        assert_py_ok(&format!(
+            r#"import os, tempfile
+import pr_review_select as sel
+vs = {verdicts}
+sel.gh_json = lambda *a: [{{'number': 7, 'author': {{'login': 'vfarcic'}}, 'isDraft': False,
+    'headRefOid': SHA, 'headRepositoryOwner': {{'login': 'o'}}, 'reviewDecision': ''}}]
+sel.check_status = lambda repo, sha: (True, 'green', [])
+sel.unresolved_threads = lambda repo, n: 0
+sel.latest_verdict = lambda repo, n: vs[-1]
+sel.trusted_verdicts_at = lambda repo, n, sha: vs
+def fetched(*a):
+    raise AssertionError('fetched evidence for a head that cannot use it')
+sel.pr_comments = sel.pr_review_comments = sel.pr_reviews = fetched
+out = tempfile.NamedTemporaryFile('r', delete=False)
+os.environ.update({{'REPO': 'o/r', 'SELECT_MODE': 'review', 'REVIEW_AUTHORS': 'vfarcic',
+                   'VOTE_AUTHORS': 'vfarcic', 'GITHUB_OUTPUT': out.name}})
+sel.main()
+assert 'items=[]' in open(out.name).read()
+"#
+        ));
+    }
+}

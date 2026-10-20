@@ -27,6 +27,7 @@ from pr_review_common import (  # noqa: E402
     pr_comments,
     pr_review_comments,
     pr_reviews,
+    retry_budget_left,
     trusted_verdicts_at,
     unresolved_threads,
 )
@@ -203,6 +204,20 @@ def main():
         existing = latest_verdict(repo, number)
         has_current_verdict = bool(existing and existing.get("head_sha") == sha)
 
+        # Issue #1629: an abstention gets ONE more ordinary pass once an
+        # independent review covers the head; `insufficient_retry_due` has the
+        # bound and why it is safe to count from the comments alone. The budget
+        # is checked first because it is one read, and a head with no retry
+        # left -- or a settled verdict -- needs none of the three reads below
+        # (Qodo and Greptile on PR #1765).
+        verdicts_at_head = None
+        if mode == "review" and has_current_verdict and not focus_unreviewed:
+            verdicts_at_head = trusted_verdicts_at(repo, number, sha)
+            if not retry_budget_left(verdicts_at_head):
+                # Idempotence: nothing to add for a head that already has a verdict.
+                skipped.append((number, f"already has a verdict for {sha[:8]}"))
+                continue
+
         # Issue #1754: the review pass computes independent coverage HERE, from
         # the unfiltered API, and hands it to the agent. The agent's own reads go
         # through gh-aw's integrity filter, which on a pull request whose author
@@ -218,19 +233,18 @@ def main():
                 pr_reviews(repo, number),
             )
 
-        if mode == "review" and has_current_verdict and not focus_unreviewed:
-            # Issue #1629: an abstention gets ONE more ordinary pass once an
-            # independent review covers the head; insufficient_retry_due has
-            # the bound and why it is safe to count from the comments alone.
-            if insufficient_retry_due(trusted_verdicts_at(repo, number, sha), evidence):
-                print(
-                    f"note #{number}: re-reviewing {sha[:8]} once; its only verdict is "
-                    f"INSUFFICIENT and {evidence['login']} now covers it"
-                )
-            else:
-                # Idempotence: nothing to add for a head that already has a verdict.
-                skipped.append((number, f"already has a verdict for {sha[:8]}"))
+        if verdicts_at_head is not None:
+            if not insufficient_retry_due(verdicts_at_head, evidence):
+                skipped.append((
+                    number,
+                    f"already has a verdict for {sha[:8]}; its INSUFFICIENT is retried "
+                    "once an independent review covers it",
+                ))
                 continue
+            print(
+                f"note #{number}: re-reviewing {sha[:8]} once; its only verdict is "
+                f"INSUFFICIENT and {evidence['login']} now covers it"
+            )
         if mode == "review" and has_current_verdict and focus_unreviewed:
             # Said out loud because the run costs credits and the operator asked
             # for it: a focused pass is the ONE case where paying twice for a

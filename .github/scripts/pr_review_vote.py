@@ -332,15 +332,6 @@ def main():
     decision = verdict["verdict"]
     reasons = "\n".join(f"- {r}" for r in verdict.get("reasons", [])) or "- (none given)"
 
-    # Issue #1754: a verdict that no longer rejects withdraws my own rejection of
-    # an older head. A vote cast below would supersede it anyway, but several
-    # branches below cast nothing, and on #1751 an INSUFFICIENT left a fixed
-    # rejection blocking the maintainer's approval. Done before those branches so
-    # every one of them inherits it; a REQUEST_CHANGES keeps the old one, which
-    # its own new rejection supersedes.
-    if decision != "REQUEST_CHANGES":
-        withdraw_stale_rejections(repo, pr_number, expected_sha, app_login, decision)
-
     # Issue #1266: an APPROVE may now rest on coverage accumulated across
     # SEVERAL focused passes, so verify the union here rather than trusting the
     # agent to have added it up. Before focused passes this check would have
@@ -373,6 +364,9 @@ def main():
             pr_reviews(repo, pr_number),
         )
         if reviewer is None:
+            # A no-vote outcome, so it withdraws my stale rejection (#1754) --
+            # before the repeat check, since that check returns early.
+            withdraw_stale_rejections(repo, pr_number, expected_sha, app_login, decision)
             if already_noticed_at(
                 pr_comments(repo, pr_number),
                 expected_sha,
@@ -418,6 +412,17 @@ def main():
                     f"Refusing to vote -- a coverage claim must rest on files something read."
                 )
                 return
+
+    # Issue #1754: a verdict that no longer rejects withdraws my own rejection of
+    # an older head. A vote cast below would supersede it anyway, but several
+    # branches below cast nothing, and on #1751 an INSUFFICIENT left a fixed
+    # rejection blocking the maintainer's approval. Placed AFTER the APPROVE
+    # checks, so an approval this job refuses -- a coverage gap fails above --
+    # leaves the old rejection standing (Qodo on PR #1765); the no-independent-
+    # review branch, which returns above, withdraws it itself. A REQUEST_CHANGES
+    # keeps the old one, which its own new rejection supersedes.
+    if decision != "REQUEST_CHANGES":
+        withdraw_stale_rejections(repo, pr_number, expected_sha, app_login, decision)
 
     if decision == "INSUFFICIENT":
         # Say it once per head. The verdict is fixed for this SHA, so a re-post

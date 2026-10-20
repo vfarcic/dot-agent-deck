@@ -576,8 +576,14 @@ def describe_independent_review(evidence):
 
 # Issue #1629: how many automatic re-reviews one head may get after an
 # INSUFFICIENT. One, so a coin-flip abstention stops costing a manual review
-# while a head that keeps abstaining costs at most two model calls, not one per
-# sweep. A focused pass (#1266) remains the manual remedy beyond that.
+# while a head that keeps abstaining stops being re-reviewed after its second
+# verdict. A focused pass (#1266) remains the manual remedy beyond that.
+#
+# The bound counts VERDICTS, not attempts (Qodo on PR #1765): a retry run that
+# dies before emitting -- the credit cap, the wall clock -- leaves the count
+# where it was, so the next sweep tries again. That is the same bargain a first
+# review already strikes, since a head with no verdict is re-selected by every
+# sweep, and it is bounded the same way: by the two scheduled sweeps a day.
 INSUFFICIENT_RETRIES_PER_HEAD = 1
 
 
@@ -603,7 +609,16 @@ def insufficient_retry_due(verdicts_at_head, evidence):
     `verdicts_at_head` must already be filtered to trusted verdicts at this
     head, which is what `trusted_verdicts_at` returns.
     """
-    if not verdicts_at_head or not evidence:
+    return bool(evidence) and retry_budget_left(verdicts_at_head)
+
+
+def retry_budget_left(verdicts_at_head):
+    """The half of `insufficient_retry_due` that needs no coverage evidence.
+
+    Split out so the selector can rule a head out on the one read of its
+    verdicts before paying three more for the evidence.
+    """
+    if not verdicts_at_head:
         return False
     if any(v.get("verdict") != "INSUFFICIENT" for v in verdicts_at_head):
         return False
