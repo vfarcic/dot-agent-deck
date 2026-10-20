@@ -235,7 +235,7 @@ dot-agent-deck daemon stop                    # refuses while agents are running
 DOT_AGENT_DECK_LOG=1 dot-agent-deck           # the new TUI starts a new daemon with it
 ```
 
-`daemon stop` refuses while the daemon manages running agents; `--force` stops it anyway and ends those agents. `dot-agent-deck daemon status` lists what it manages. For the desktop app, set the variable in the environment you launch the app from.
+`daemon stop` refuses while the daemon manages running agents; `--force` stops it anyway and ends those agents. `dot-agent-deck daemon status` lists what it manages. For the desktop app, set the variable in the environment you launch the app from. For a daemon that runs as a service, set it in the service and restart the service ([Run the Daemon as a Service](daemon-service.md#credentials-and-other-environment)).
 
 ### Paths and endpoints
 

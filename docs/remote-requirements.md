@@ -31,7 +31,7 @@ Everything under [Required](#required) must hold before `remote add` succeeds an
 To identify the host, `remote add` reads only `uname -s -m`; it does not check the distribution. Two things do vary:
 
 - **glibc.** The Linux release binaries are glibc builds; there is no musl build. On a musl distribution such as Alpine, install the deck on the host from source or with [Nix](installation.md#nix), put the binary (or a symlink to it) at `~/.local/bin/dot-agent-deck`, and register with `--no-install --version <the version it reports>`.
-- **systemd.** Only needed for the optional [systemd user service](#keep-the-daemon-running). Without systemd, and without `XDG_RUNTIME_DIR` set, the daemon's sockets go in the temp directory ([Where the deck puts its files](#where-the-deck-puts-its-files)).
+- **systemd.** Only needed to [run the daemon as a service](daemon-service.md). Without systemd, and without `XDG_RUNTIME_DIR` set, the daemon's sockets go in the temp directory ([Where the deck puts its files](#where-the-deck-puts-its-files)).
 
 ### ssh access
 
@@ -100,34 +100,18 @@ To see which attach socket a running daemon is using, run `dot-agent-deck daemon
 
 **Across disconnects.** The daemon that `connect` starts runs in its own session, detached from your ssh session, so it keeps running after you disconnect, as long as it has agents. That holds on a host with systemd-logind's default settings. If the host's `/etc/systemd/logind.conf` sets `KillUserProcesses=yes`, logind kills everything started from your ssh session when it ends, the daemon included; run the daemon as a systemd user service instead (below).
 
-**With no agents.** A daemon exits about 30 seconds after its last client disconnects when it has no agents and no enabled schedules. That is fine for `connect`, which starts one when needed. The desktop app does not start one, so for it, and for schedules you want to fire while nobody is connected, run a daemon with the idle shutdown off (`DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`).
+**With no agents.** A daemon exits about 30 seconds after its last client disconnects when it has no agents and no enabled schedules. That is fine for `connect`, which starts one when needed. The desktop app does not start one, so for it, and for schedules you want to fire while nobody is connected, run a daemon with the idle shutdown off (`DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`). The service below runs it that way.
 
-**Across reboots.** Agents do not survive a host reboot, and the deck installs no service that restarts the daemon. On Linux with systemd, this user unit is a starting point; the project has not validated it end to end. Save it as `~/.config/systemd/user/dot-agent-deck.service`:
-
-```ini
-[Unit]
-Description=dot-agent-deck daemon
-
-[Service]
-ExecStart=%h/.local/bin/dot-agent-deck daemon serve
-Environment=DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-Then enable it, and enable lingering so the user's services start at boot without a login:
+**Across reboots.** Agents do not survive a host reboot, and nothing starts the daemon again until the next `connect`. To have the host start it at boot and after a crash, run it as a service, on the host:
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable --now dot-agent-deck.service
+~/.local/bin/dot-agent-deck daemon install
 sudo loginctl enable-linger "$USER"
 ```
 
-Check it: `systemctl --user status dot-agent-deck.service` shows `active (running)`, and `~/.local/bin/dot-agent-deck daemon endpoint` prints a socket path. For `connect` to find this daemon, your ssh session must see the same `XDG_RUNTIME_DIR` as the service, which is normally the case on a systemd host, where `pam_systemd` sets it for ssh logins; check with `ssh <target> 'echo $XDG_RUNTIME_DIR'`. After `remote upgrade`, or the desktop app's **Upgrade**, there is nothing to do: the restart ends the service's daemon and systemd starts the service again on the new release. Keep `Restart=on-failure` (or `Restart=always`) in the unit, because that is what starts it again. The journal records the old daemon's exit as `status=75/TEMPFAIL` followed by `Scheduled restart job`; that is the upgrade's restart, not an error. A service starts with a minimal environment, and the daemon takes only `PATH` from your login shell, so put agent credentials in the unit (`Environment=`, or an `EnvironmentFile=` with mode `0600`).
+The first line writes and starts a systemd user service, `dot-agent-deck.service`; the second lets it start at boot without a login. [Run the Daemon as a Service](daemon-service.md) has what the service changes, how to give it agent credentials, and how to remove it. For `connect` to find this daemon, your ssh session must see the same `XDG_RUNTIME_DIR` as the service, which is normally the case on a systemd host, where `pam_systemd` sets it for ssh logins; check with `ssh <target> 'echo $XDG_RUNTIME_DIR'`. After `remote upgrade`, or the desktop app's **Upgrade**, there is nothing to do: the restart ends the service's daemon and systemd starts it again on the new release. The journal records the old daemon's exit as `status=75/TEMPFAIL` followed by `Scheduled restart job`; that is the upgrade's restart, not an error.
 
-On macOS, see [macOS as a remote host](#macos-as-a-remote-host) for the launchd equivalent.
+On macOS, see [macOS as a remote host](#macos-as-a-remote-host).
 
 ### Non-root user account
 
@@ -183,44 +167,12 @@ sudo pmset -a disksleep 0
 
 **Sockets are in the temp directory.** macOS does not set `XDG_RUNTIME_DIR`, so the sockets use the temp-directory fallback in [Where the deck puts its files](#where-the-deck-puts-its-files) unless you set `DOT_AGENT_DECK_SOCKET` and `DOT_AGENT_DECK_ATTACH_SOCKET`. Those overrides have not been exercised on macOS.
 
-**Restarting after a reboot** needs a LaunchAgent, which the deck does not install. This is a starting point that has not been tested across a reboot. Save it as `~/Library/LaunchAgents/ai.devopstoolkit.dot-agent-deck.plist`, replacing `YOU` (launchd does not expand `~`):
+**Restarting after a reboot** needs a LaunchAgent. `~/.local/bin/dot-agent-deck daemon install`, run on the Mac, writes and loads one; this has not been tested on a Mac yet. Two constraints apply to any LaunchAgent:
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>ai.devopstoolkit.dot-agent-deck</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Users/YOU/.local/bin/dot-agent-deck</string>
-    <string>daemon</string>
-    <string>serve</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS</key>
-    <string>0</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/Users/YOU/Library/Logs/dot-agent-deck.log</string>
-  <key>StandardErrorPath</key>
-  <string>/Users/YOU/Library/Logs/dot-agent-deck.log</string>
-</dict>
-</plist>
-```
+- **It starts at GUI login, not at boot.** An unattended Mac needs automatic login to come back after a reboot, and FileVault asks for a password at startup before any automatic login. Decide that trade-off deliberately.
+- **It does not read your shell profile** except for the `PATH` the daemon captures itself. Anything else the agents need, such as an `ANTHROPIC_API_KEY`, goes in the LaunchAgent's `EnvironmentVariables`.
 
-Load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.devopstoolkit.dot-agent-deck.plist`. Keep `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`: without it, a daemon with no agents can exit on its idle timer and `KeepAlive` starts it again, over and over. `KeepAlive` is also what starts the daemon again on the new release after `remote upgrade` or the desktop app's **Upgrade**; that has not been tested on a Mac. Three constraints:
-
-- **A LaunchAgent, not a LaunchDaemon.** A LaunchDaemon runs outside your user session, without your environment or the `~/.claude/.credentials.json` that `/login` writes.
-- **A LaunchAgent starts at GUI login, not at boot.** An unattended Mac needs automatic login to come back after a reboot, and FileVault asks for a password at startup before any automatic login. Decide that trade-off deliberately.
-- **launchd does not read your shell profile** except for the `PATH` the daemon captures itself. Put anything else the agents need, such as an `ANTHROPIC_API_KEY`, in the plist's `EnvironmentVariables`.
+[Run the Daemon as a Service](daemon-service.md#macos) has the details.
 
 ## What is not required
 

@@ -1494,6 +1494,36 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the exact exit code or the rest of the message wording; the connect-failure path (`daemon/status/003`); the live-agent paths (`daemon/status/001`/`002`/`005`); that the CLI closes its own connection on the way out.
 - **Platform coverage:** mac+linux.
 
+#### daemon/service
+
+##### daemon/service/001 — `dot-agent-deck daemon install` writes a unit that runs the installed deck with the idle shutdown off and the shell's endpoint overrides, and enables a running service without stopping or restarting it.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL CLI as a subprocess in an isolated `HOME`/`XDG_CONFIG_HOME`, with stand-in `systemctl` and `loginctl` on `PATH` that record their calls; no daemon, no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none.
+- **Asserts:** the unit lands at `$XDG_CONFIG_HOME/systemd/user/dot-agent-deck.service`; its one `ExecStart` names the `~/.local/bin` install rather than the cargo artifact it links to; its `Environment` lines are exactly the idle-shutdown `0` and the three endpoint overrides set in the shell; `Restart=on-failure` and `WantedBy=default.target`; `systemctl` is asked to `daemon-reload` and `enable` and never to stop, restart, kill or `--now` anything when the service is already active; the lingering advice is printed when `loginctl` reports `no`.
+- **Does not assert:** that systemd accepts the unit or runs it (the PRD's recorded real-systemd verification); the start path (`daemon/service/004`); launchd.
+- **Platform coverage:** linux.
+
+##### daemon/service/002 — `dot-agent-deck daemon uninstall` removes the unit and disables the service without stopping the daemon, and is a successful no-op when nothing is installed.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `/001`).
+- **Agent:** none.
+- **Asserts:** the unit file is gone; `systemctl` got `disable` and never a stop, restart, kill or `--now`; with the service still active the output says the daemon is still running and names `daemon stop`; a second uninstall succeeds and says nothing is installed.
+- **Does not assert:** launchd's unload decision (unit-tested in `daemon_service::tests`).
+- **Platform coverage:** linux.
+
+##### daemon/service/003 — `dot-agent-deck daemon install` refuses a relative endpoint override before writing anything.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `/001`).
+- **Agent:** none.
+- **Asserts:** a relative `DOT_AGENT_DECK_STATE_DIR` fails the command with an error naming the variable and not clap's usage banner, no unit is written, and `systemctl` is never called.
+- **Does not assert:** the other override variables (unit-tested in `daemon_service::tests`).
+- **Platform coverage:** linux.
+
+##### daemon/service/004 — `dot-agent-deck daemon install` reports success only once the started daemon answers, and a second install beside it starts nothing.
+- **Layer:** L2 headless, lane 1 (deterministic): the REAL CLI as a subprocess, with a stand-in `systemctl` whose `enable --now` starts the `daemon serve` the generated unit describes (its `ExecStart`, `Environment` and `WorkingDirectory`); no PTY, no LLM.
+- **Agent:** none.
+- **Asserts:** the first install exits 0 saying the daemon runs as `dot-agent-deck.service`, and `daemon probe` then reports it running at the sandbox endpoint; a second install exits 0, says the service was not started, calls `enable` without `--now`, and the stand-in was asked to start exactly once.
+- **Does not assert:** boot or login start (systemd's own behaviour, not run here); restart after a crash or an upgrade (the PRD's recorded real-systemd verification); launchd.
+- **Platform coverage:** linux.
+
 #### daemon/endpoint
 
 ##### daemon/endpoint/001 — `dot-agent-deck daemon endpoint` refuses a stale inode no daemon is listening on, and leaves it alone.

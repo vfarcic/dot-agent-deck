@@ -525,7 +525,7 @@ dot-agent-deck daemon stop
 dot-agent-deck daemon stop --force   # stops managed agents and strands live orchestrations
 ```
 
-`dot-agent-deck daemon restart` (also `--force`) runs `daemon stop`. The next `dot-agent-deck` starts a fresh daemon. Both commands act only on this machine's daemon; remotes are covered in [Remote Environments](remote-environments.md).
+`dot-agent-deck daemon restart` (also `--force`) runs `daemon stop`. The next `dot-agent-deck` starts a fresh daemon. A daemon that runs as a service stays stopped until the service starts it again ([Run the Daemon as a Service](daemon-service.md#what-the-service-changes)). Both commands act only on this machine's daemon; remotes are covered in [Remote Environments](remote-environments.md).
 
 ## Uninstall
 
