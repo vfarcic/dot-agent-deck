@@ -203,7 +203,7 @@ Both skips are identical in behaviour — no manifest, no engine, **exit 0** —
 
 The wordings are deliberately distinct because the causes call for opposite responses, and the provenance one is a third unrelated reason rather than a variant of the marker: blaming the marker for a stale cast would send a reader to add a tag that changes nothing, which is the same misattribution issue #735 was about.
 
-A hand-written id list can trip **more than one** gate at once — one id with no cast, another with a cast but no marker — and then the second message carries an extra parenthetical naming the cast-less ids separately, because "none is reel-eligible" is not the reason those were dropped and adding a marker to them would change nothing. The `reel` pipeline can carry more than one cause as well: its `select` half drops L1 dirs before `assemble` sees them, but it reports a changed e2e test with no recording, or with no marker, alongside whatever `assemble` then refuses for provenance — so whichever cause takes the headline, the others follow it as parentheticals.
+A hand-written id list can trip **more than one** gate at once — one id with no cast, another with a cast but no marker — and then the second message carries an extra parenthetical naming the cast-less ids separately, because "none is reel-eligible" is not the reason those were dropped and adding a marker to them would change nothing. The `reel` pipeline can carry more than one cause as well: its `select` half drops L1 dirs before `assemble` sees them, but it reports a changed e2e test with no recording, or with no marker, alongside whatever `assemble` then refuses for provenance — so whichever cause takes the headline, the others follow it as parentheticals. A recording problem takes the headline over a missing marker: stale and unrecorded ids are marked, so "none is reel-eligible" would be false while either is present, and the unmarked ids are named in a parenthetical instead.
 
 The second message names the ids because that is what makes it actionable, and because the older generic wording pointed at the wrong gate: a reader who saw "no e2e tests changed" on a branch that *had* changed e2e tests would go debugging the git-diff selection, which was working correctly. The inverse hazard is worth naming too — a message claiming nothing changed invites someone to reach for a ` [reel]` marker to make a reel appear, when the absent marker was the deliberate, correct answer.
 
@@ -235,7 +235,8 @@ A **re-runnable, pure-shell** test (no `agg`/`ffmpeg`, no git, no network — so
    wordings cannot drift back into one — and a **mixed** `gamma delta` list names
    **both** reasons rather than attributing the whole skip to the marker; a
    marked e2e test with no cast is reported as **unrecorded** with the
-   `DOT_AGENT_DECK_RECORD=1` remedy, and an unmarked one as unmarked;
+   `DOT_AGENT_DECK_RECORD=1` remedy, an unmarked one as unmarked, and a list
+   holding both headlines the unrecorded one;
 3. on the **`reel`** path, a branch that changed only the *unmarked* test's
    source skips with that eligibility message (never `no e2e tests changed` —
    the issue #735 defect) and still writes no manifest and invokes no engine,

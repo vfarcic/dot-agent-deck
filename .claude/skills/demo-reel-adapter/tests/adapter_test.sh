@@ -21,7 +21,8 @@
 #         the marker (PR #778 review; reachable only via standalone `assemble`);
 #   (ii-e) a marked e2e test with NO cast is reported as UNRECORDED, with the
 #         DOT_AGENT_DECK_RECORD=1 remedy, while an unmarked one is reported as
-#         unmarked — never "no e2e tests changed" (issue #1683);
+#         unmarked — never "no e2e tests changed" (issue #1683) — and a list
+#         holding both headlines the unrecorded one;
 #   (iii) the `reel` path on a branch that DID change an e2e test whose catalog
 #         entry is unmarked skips with that eligibility message too — never the
 #         "no e2e tests changed" one, which is the issue #735 defect;
@@ -249,7 +250,18 @@ says "zeta" "$outZ" || fail "(ii-e) skip must NAME zeta; got: '$outZ'"
 if says "DOT_AGENT_DECK_RECORD=1" "$outZ"; then
   fail "(ii-e) recording zeta would not make it a clip, so the skip must not suggest it; got: '$outZ'"
 fi
-echo "PASS (ii-e): a marked e2e test with no cast is reported as unrecorded (with the remedy), an unmarked one as unmarked"
+
+# A list holding BOTH must headline the unrecorded one: it is marked, so "none is
+# reel-eligible" would be false and would hide the remedy (PR #1763 review).
+outEZ="$("$BUILD" assemble --manifest "$MAN_E" epsilon zeta 2>/dev/null)"
+says "skipped: 1 e2e test(s) in the given list, $NOT_RECORDED" "$outEZ" \
+  || fail "(ii-e) a marked unrecorded test must take the headline over an unmarked one; got: '$outEZ'"
+if says "$NOT_ELIGIBLE" "$outEZ"; then
+  fail "(ii-e) epsilon IS reel-eligible, so 'none is reel-eligible' must not appear; got: '$outEZ'"
+fi
+says "have no [reel] marker in" "$outEZ" || fail "(ii-e) the unmarked id must still be named separately; got: '$outEZ'"
+says "zeta" "$outEZ" || fail "(ii-e) skip must NAME zeta in its parenthetical; got: '$outEZ'"
+echo "PASS (ii-e): a marked e2e test with no cast is reported as unrecorded (with the remedy), an unmarked one as unmarked, and a mix headlines the unrecorded one"
 
 # --- (v) CAST PROVENANCE (issue #808) ------------------------------------------
 # Selection is a `test -f` plus two STATIC facts about the test, so a cast an

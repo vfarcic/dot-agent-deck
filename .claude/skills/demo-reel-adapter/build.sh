@@ -223,16 +223,21 @@ skip_message() {
     return 0
   fi
 
-  # The headline names the gate that dropped the most ids' worth of the reader's
-  # attention, and the marker wording is kept EXACTLY as issue #735 established
-  # it. A stale-only list gets its own headline rather than borrowing that one:
-  # "none is reel-eligible" would send a reader to add a marker that changes
-  # nothing, which is the same misattribution #735 was about, in a new bucket.
+  # The headline names a gate the reader can act on before one they usually
+  # should not. Stale and unrecorded ids are both [reel]-MARKED, so while either
+  # bucket holds one, "none is reel-eligible" would be false and would bury the
+  # remedy (re-record) under a note saying the marker's absence is usually right
+  # (PR #1763 review). The marker headline therefore takes the line only when
+  # every dropped id really is unmarked, and its wording is kept EXACTLY as
+  # issue #735 established it. A stale list gets its own headline rather than
+  # borrowing that one: "none is reel-eligible" would send a reader to add a
+  # marker that changes nothing, which is the same misattribution #735 was
+  # about, in a new bucket.
   #
-  # An unrecorded-only list gets its own headline for the same reason (issue
-  # #1683): it used to fall through to "no e2e tests changed", which sent a
-  # reader to debug the diff gate when the fix was to record the tests.
-  if [[ ${#unmarked[@]} -gt 0 ]]; then
+  # An unrecorded list gets its own headline for the same reason (issue #1683):
+  # it used to fall through to "no e2e tests changed", which sent a reader to
+  # debug the diff gate when the fix was to record the tests.
+  if [[ ${#stale[@]} -eq 0 && ${#unrecorded[@]} -eq 0 ]]; then
     printf '%s\n' "skipped: ${#unmarked[@]} e2e test(s) $scope, but none is reel-eligible — no [reel] marker in $CATALOG_FILE for: $(join_ids "${unmarked[@]}")"
   elif [[ ${#stale[@]} -gt 0 ]]; then
     printf '%s\n' "skipped: ${#stale[@]} e2e test(s) $scope, but none has a recording whose provenance checks out — nothing was published"
@@ -253,10 +258,16 @@ skip_message() {
   if [[ ${#stale[@]} -gt 0 ]]; then
     printf '%s\n' "  (${#stale[@]} id(s) were dropped by the CAST PROVENANCE gate — the recording on disk is not proven to come from a passing run of the current revision, so it may predate this branch entirely (issue #808): $(join_ids "${stale[@]}"). Each id's own verdict is on stderr above. Re-record with $RECORD_HINT at this commit.)"
   fi
-  # And for the unrecorded bucket when another gate took the headline: these ids
+  # And for the unrecorded bucket when the stale one took the headline: these ids
   # would need a recording, not a marker.
-  if [[ ${#unrecorded[@]} -gt 0 && ( ${#unmarked[@]} -gt 0 || ${#stale[@]} -gt 0 ) ]]; then
+  if [[ ${#unrecorded[@]} -gt 0 && ${#stale[@]} -gt 0 ]]; then
     printf '%s\n' "  (${#unrecorded[@]} further e2e test(s) have no recording at all — no full-stream.cast on disk — so they were not considered: $(join_ids "${unrecorded[@]}"). Record them with $RECORD_HINT at this commit.)"
+  fi
+  # The unmarked ids when a recording problem took the headline. Named, so the
+  # reader sees every changed test, but scoped to those ids alone: recording
+  # them would not make them clips.
+  if [[ ${#unmarked[@]} -gt 0 && ( ${#stale[@]} -gt 0 || ${#unrecorded[@]} -gt 0 ) ]]; then
+    printf '%s\n' "  (${#unmarked[@]} further e2e test(s) have no [reel] marker in $CATALOG_FILE, so they are not reel candidates whether or not they are recorded: $(join_ids "${unmarked[@]}"))"
   fi
   if [[ ${#unmarked[@]} -gt 0 ]]; then
     printf '%s\n' "  ([reel] is OPT-IN and its absence is usually the right answer: a clip exists so a human can watch REAL behavior, so only a test that genuinely spins up a real agent is marked — a stand-in (cat, scripted echo, recorder stubs, synthesized hook events) stays unmarked and never becomes a clip. See CLAUDE.md rule 4.)"
