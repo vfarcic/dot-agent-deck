@@ -134,7 +134,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 30] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 31] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -376,6 +376,19 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 30] = [
          its neighbours, so no text is representable",
     ),
     (
+        "SpeechLanguage",
+        FieldKind::Scalar,
+        "a newtype in desktop/src-tauri/src/settings.rs serialised as one \
+         token: `auto` or the ISO-639-1 code of a language the speech services \
+         accept — which language a transcription request names (issue #1458). \
+         The value it holds is a `&'static str` taken from \
+         SPEECH_LANGUAGE_TOKENS, never a copy of what the document said, so \
+         the set is closed exactly as an enum's is: an unlisted token folds to \
+         English through the same folding deserializer and the same \
+         MAX_VOICE_TOKEN_BYTES bound as its neighbours, and no text is \
+         representable",
+    ),
+    (
         "ReadingNotice",
         FieldKind::Scalar,
         "a closed enum serialised as one token: `pending` or `shown` — whether \
@@ -456,7 +469,7 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 30] = [
         FieldKind::Section,
         "a section struct — the speech stage — whose own fields this check \
          walks: which backend, the ServiceUrl it is reached at, the ModelId it \
-         is asked for. Nested rather than flattened into VoiceSettings because \
+         is asked for, the SpeechLanguage it is told. Nested rather than flattened into VoiceSettings because \
          this struct serialises to both TOML and JSON and every field name has \
          to stay one snake_case word on both sides; `speech_endpoint` and \
          `commands_endpoint` would be two spellings waiting to drift",
@@ -542,7 +555,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 30] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 31] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -594,7 +607,11 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 30] = [
     // about one.
     ("VoiceSettingsDto", "activation", "string"),
     ("VoiceSettingsDto", "intent", "VoiceIntentStageDto"),
-    ("VoiceSettingsDto", "transcription", "VoiceStageDto"),
+    (
+        "VoiceSettingsDto",
+        "transcription",
+        "VoiceTranscriptionStageDto",
+    ),
     // PRD #1223, audit finding A1: a closed token (`VOICE_LABEL_SHARING`) —
     // whether names are SENT, never a name.
     ("VoiceSettingsDto", "labels", "string"),
@@ -624,6 +641,12 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 30] = [
     // ceiling on the answer is not a credential in any reading: it is an
     // integer, and the Rust counterpart is a newtype bounded at 64..=32768.
     ("VoiceIntentStageDto", "max_tokens", "number"),
+    // Issue #1458. The speech stage extends the shared interface the same way,
+    // with the language each request names: `auto` or a code from the closed
+    // list in `speechLanguages.json`, whose Rust counterpart `SpeechLanguage`
+    // holds only the table's own `&'static str`. A language code is not a
+    // credential in any reading.
+    ("VoiceTranscriptionStageDto", "language", "string"),
     (
         "DesktopSettingsSnapshotDto",
         "settings",
@@ -1517,6 +1540,7 @@ pub struct VoiceSettings {
             "VoiceSettingsDto",
             "VoiceStageDto",
             "VoiceIntentStageDto",
+            "VoiceTranscriptionStageDto",
             "DesktopSettingsSnapshotDto",
         ] {
             let body = block_after(&source, &format!("export interface {interface} "))
@@ -1574,6 +1598,8 @@ pub struct VoiceSettings {
             // list is about would ride in just as easily through a nested
             // builder as through the parent.
             "function normalizeVoiceIntentStage(value: unknown): VoiceIntentStageDto ",
+            // And the speech stage's, for the same reason (issue #1458).
+            "function normalizeVoiceTranscriptionStage(value: unknown): VoiceTranscriptionStageDto ",
         ] {
             let body = block_after(&source, signature)
                 .unwrap_or_else(|| panic!("no `{signature}` in {BRIDGE_TS}"));

@@ -67,7 +67,8 @@ use serde_json::Value;
 use crate::model_service::{ModelId, ServiceUrl};
 use crate::secrets::{SecretId, SecretStore, load_off_runtime};
 use crate::settings::{
-    KEYLESS_OFF_MACHINE, LOCAL_SPEECH_IMAGE, TranscriptionBackend, TranscriptionSettings,
+    KEYLESS_OFF_MACHINE, LOCAL_SPEECH_IMAGE, SpeechLanguage, TranscriptionBackend,
+    TranscriptionSettings,
 };
 
 use super::Transcript;
@@ -312,15 +313,18 @@ pub fn transcriber_for(
 ) -> Box<dyn Transcriber> {
     let endpoint = settings.endpoint.clone();
     let model = settings.model.clone();
+    let language = settings.language;
     match settings.backend {
         // A refusal rather than a fallback, and never the keyed path: a
         // keyless backend pointed off this machine has no key to send, so
         // "try it anyway" IS the upload. See [`RefusedTranscriber`].
         TranscriptionBackend::Local => match HttpTranscriber::keyless(endpoint, model) {
-            Ok(transcriber) => Box::new(transcriber),
+            Ok(transcriber) => Box::new(transcriber.speaking(language)),
             Err(refusal) => Box::new(RefusedTranscriber::new("local", refusal)),
         },
-        TranscriptionBackend::Remote => Box::new(HttpTranscriber::keyed(secrets, endpoint, model)),
+        TranscriptionBackend::Remote => {
+            Box::new(HttpTranscriber::keyed(secrets, endpoint, model).speaking(language))
+        }
     }
 }
 
@@ -375,6 +379,8 @@ pub struct HttpTranscriber {
     client: Option<reqwest::Client>,
     endpoint: ServiceUrl,
     model: ModelId,
+    /// The language each request names — see [`Self::speaking`].
+    language: SpeechLanguage,
     /// What the surface names this — `local` or `remote`, from the settings
     /// token, so one vocabulary spans the document, the panel and the report.
     name: &'static str,
@@ -406,6 +412,21 @@ impl HttpTranscriber {
         Ok(Self::build(None, endpoint, model, "local"))
     }
 
+    /// This backend's request body for one utterance: its model and its
+    /// language, in [`multipart_body`]'s shape.
+    fn body(&self, audio: &Pcm16, boundary: &str) -> Vec<u8> {
+        multipart_body(audio, self.model.as_str(), self.language, boundary)
+    }
+
+    /// The same backend, telling the service the speech is in `language`
+    /// (issue #1458). Both constructors start from
+    /// [`SpeechLanguage::default`], English, so a caller that never says
+    /// keeps the pin PR #1451 added.
+    pub fn speaking(mut self, language: SpeechLanguage) -> Self {
+        self.language = language;
+        self
+    }
+
     fn build(
         secrets: Option<Arc<dyn SecretStore>>,
         endpoint: ServiceUrl,
@@ -432,6 +453,7 @@ impl HttpTranscriber {
             client: super::http::client(),
             endpoint,
             model,
+            language: SpeechLanguage::default(),
             name,
         }
     }
@@ -497,7 +519,7 @@ impl HttpTranscriber {
         };
 
         let boundary = boundary();
-        let body = multipart_body(audio, self.model.as_str(), &boundary);
+        let body = self.body(audio, &boundary);
         let mut request = client
             .post(self.endpoint.as_str())
             .timeout(TRANSCRIBE_TIMEOUT)
@@ -627,13 +649,9 @@ pub fn content_type(boundary: &str) -> String {
     format!("multipart/form-data; boundary={boundary}")
 }
 
-/// The ISO-639-1 language every transcription request names. A constant
-/// rather than a setting for now; making it one is issue #1458.
-pub const TRANSCRIPTION_LANGUAGE: &str = "en";
-
 /// The whole request body: the WAV, the model, the response format, the
-/// language and — where the format carries timing — which timing to send back,
-/// and nothing else.
+/// language unless it is [`SpeechLanguage::AUTO`], and — where the format
+/// carries timing — which timing to send back, and nothing else.
 ///
 /// **Assembled by hand rather than through `reqwest`'s `multipart` feature**,
 /// and that is a dependency decision rather than a preference. Turning the
@@ -641,12 +659,17 @@ pub const TRANSCRIPTION_LANGUAGE: &str = "en";
 /// whose reqwest spec is copied verbatim from the root package's — so cargo
 /// would resolve one feature-unified build for both, and the root crate's
 /// `src/version.rs` would start carrying a multipart encoder it has no use for.
-/// What it would buy is the lines below, for a body with four parts, no
+/// What it would buy is the lines below, for a body with a handful of parts, no
 /// nested multipart and no filename this build does not choose itself.
 ///
 /// `\r\n` throughout, and not `\n`: RFC 2046 says CRLF, and a server that
 /// tolerates bare LF is not one this can rely on.
-pub fn multipart_body(audio: &Pcm16, model: &str, boundary: &str) -> Vec<u8> {
+pub fn multipart_body(
+    audio: &Pcm16,
+    model: &str,
+    language: SpeechLanguage,
+    boundary: &str,
+) -> Vec<u8> {
     let wav = audio.to_wav();
     let mut body = Vec::with_capacity(wav.len() + 512);
     let mut part = |header: &str| body.extend_from_slice(header.as_bytes());
@@ -682,16 +705,18 @@ pub fn multipart_body(audio: &Pcm16, model: &str, boundary: &str) -> Vec<u8> {
         }
     }
 
-    // Named rather than detected: with no `language`, Whisper-family models
-    // guess it per utterance, and a short command in an accent is what they
-    // guess wrong — "Select the directory …" spoken with a Serbian accent came
-    // back as "Selectajte directory …", which action grounding then refused.
-    // Every command this app recognises is English, so English is the right
-    // pin until the language is a setting.
-    part(&format!("--{boundary}\r\n"));
-    part("content-disposition: form-data; name=\"language\"\r\n\r\n");
-    part(TRANSCRIPTION_LANGUAGE);
-    part("\r\n");
+    // Named rather than detected unless the user chose Auto: with no
+    // `language`, Whisper-family models guess it per utterance, and a short
+    // command in an accent is what they guess wrong — "Select the directory …"
+    // spoken with a Serbian accent came back as "Selectajte directory …",
+    // which action grounding then refused. Hence English by default; see
+    // [`SpeechLanguage`].
+    if let Some(code) = language.code() {
+        part(&format!("--{boundary}\r\n"));
+        part("content-disposition: form-data; name=\"language\"\r\n\r\n");
+        part(code);
+        part("\r\n");
+    }
 
     // The filename is what tells the service the container, and `.wav` is what
     // `Pcm16::to_wav` produced. It names no user, no path and no session — it
@@ -1419,6 +1444,7 @@ mod tests {
             endpoint: ServiceUrl::parse("https://api.openai.com/v1/audio/transcriptions")
                 .expect("valid"),
             model: ModelId::parse(HOSTED_SPEECH_MODEL).expect("valid"),
+            language: SpeechLanguage::default(),
         };
         let transcriber = transcriber_for(&settings, Arc::clone(&recorder) as Arc<dyn SecretStore>);
         // Still `local` to the surface: the vocabulary is the settings token,
@@ -1668,7 +1694,12 @@ mod tests {
     // -- the request shape -------------------------------------------------
 
     fn body(audio: &Pcm16) -> Vec<u8> {
-        multipart_body(audio, HOSTED_SPEECH_MODEL, "TESTBOUNDARY")
+        multipart_body(
+            audio,
+            HOSTED_SPEECH_MODEL,
+            SpeechLanguage::default(),
+            "TESTBOUNDARY",
+        )
     }
 
     fn text_of(body: &[u8]) -> String {
@@ -1705,6 +1736,7 @@ mod tests {
         let gpt = text_of(&multipart_body(
             &audio(8),
             "gpt-4o-transcribe",
+            SpeechLanguage::default(),
             "TESTBOUNDARY",
         ));
         assert!(!gpt.contains("timestamp_granularities"), "{gpt}");
@@ -1717,6 +1749,8 @@ mod tests {
     /// leaves Whisper-family models to guess it per utterance, and a short
     /// accented command is exactly what they guess wrong. Action grounding
     /// then refused it, correctly, since no word of it asks for anything.
+    /// English is still what a request names when nobody chose otherwise
+    /// (issue #1458).
     #[test]
     fn voice_transcribe_request_pins_the_language_to_english() {
         let rendered = text_of(&body(&audio(8)));
@@ -1724,6 +1758,55 @@ mod tests {
             rendered.contains("name=\"language\"\r\n\r\nen\r\n"),
             "{rendered}"
         );
+        // And a backend built without being told a language is the same.
+        let rendered = text_of(&keyed(store()).body(&audio(8), "b"));
+        assert!(
+            rendered.contains("name=\"language\"\r\n\r\nen\r\n"),
+            "{rendered}"
+        );
+    }
+
+    /// Issue #1458: the language chosen in Settings → Voice is the one the
+    /// request names, from the stored token through the backend to the body.
+    #[test]
+    fn voice_transcribe_request_names_the_chosen_language() {
+        let settings: TranscriptionSettings =
+            serde_json::from_value(serde_json::json!({ "backend": "remote", "language": "sr" }))
+                .expect("parses");
+        let rendered = text_of(
+            &keyed(store())
+                .speaking(settings.language)
+                .body(&audio(8), "b"),
+        );
+        assert!(
+            rendered.contains("name=\"language\"\r\n\r\nsr\r\n"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("name=\"language\"").count(),
+            1,
+            "{rendered}"
+        );
+    }
+
+    /// Issue #1458: Auto-detect sends no `language` part at all, which is how
+    /// the speech services are asked to detect it; every other part is still
+    /// there.
+    #[test]
+    fn voice_transcribe_auto_detect_sends_no_language() {
+        let rendered = text_of(&multipart_body(
+            &audio(8),
+            HOSTED_SPEECH_MODEL,
+            SpeechLanguage::AUTO,
+            "TESTBOUNDARY",
+        ));
+        assert!(!rendered.contains("name=\"language\""), "{rendered}");
+        // model, response_format, the two timestamp granularities, file.
+        assert_eq!(
+            rendered.matches("content-disposition: form-data").count(),
+            5
+        );
+        assert!(rendered.ends_with("\r\n--TESTBOUNDARY--\r\n"), "{rendered}");
     }
 
     #[test]
@@ -2037,7 +2120,12 @@ mod tests {
             ("gpt-4o-transcribe", "json"),
             ("gpt-4o-mini-transcribe", "json"),
         ] {
-            let rendered = text_of(&multipart_body(&audio(8), model, boundary));
+            let rendered = text_of(&multipart_body(
+                &audio(8),
+                model,
+                SpeechLanguage::default(),
+                boundary,
+            ));
             assert!(
                 rendered.contains(&format!("name=\"response_format\"\r\n\r\n{format}\r\n")),
                 "{model}: {rendered}"

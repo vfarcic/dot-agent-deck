@@ -1157,6 +1157,12 @@ reason = "Settings → Voice transcription backend select; a preference edit ins
 [[site]]
 file = "desktop/src/components/VoicePanel.tsx"
 handler = "onChange"
+code = '(event) => saveStage("transcription", { language: event.target.value })'
+reason = "Settings → Voice speech language select (issue #1458); a preference edit inside the Settings sheet, kept off voice for the transcription backend's reason: the language decides how the next utterance is transcribed, so a misheard spoken change could leave the user unable to say the command that changes it back."
+
+[[site]]
+file = "desktop/src/components/VoicePanel.tsx"
+handler = "onChange"
 code = '(event) => chooseBackend("intent", event.target.value)'
 reason = "Settings → Voice intent backend select; a preference edit inside the Settings sheet, kept off voice for the same reason as the transcription backend."
 
