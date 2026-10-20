@@ -991,8 +991,8 @@ reason = "Self-upgrade dialog Upgrade: replaces the running app. Kept off voice 
 [[site]]
 file = "desktop/src/components/SelfUpgradeDialog.tsx"
 handler = "onClick"
-code = "onClose"
-reason = "Self-upgrade dialog Close: a dismissal."
+code = "close"
+reason = "Self-upgrade dialog Close: a dismissal that hands the finished result back to its caller (the Local daemon upgrade then offers its restart)."
 
 [[site]]
 file = "desktop/src/components/SelfUpgradeDialog.tsx"
