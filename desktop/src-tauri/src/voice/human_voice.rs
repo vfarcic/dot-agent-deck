@@ -162,7 +162,8 @@ impl VoiceTimeline {
 
     /// How much voice lies between `start` and `end`, in seconds from the
     /// segment's start. A frame counts when any part of it is in the window,
-    /// so a window that ends inside a voiced frame counts that frame whole.
+    /// so a window that ends inside a voiced frame counts that frame whole,
+    /// and one that ends exactly where a frame starts does not count it.
     pub fn voice_between(&self, start: f64, end: f64) -> Duration {
         let Some(range) = self.frames_between(start, end) else {
             return Duration::ZERO;
@@ -182,8 +183,19 @@ impl VoiceTimeline {
             return None;
         }
         let first = ((start.max(0.0) / frame).floor() as usize).min(last);
-        let until = ((end / frame).floor() as usize).min(last);
-        Some(first..=until)
+        // A window with length ends where the frame it ends in starts does
+        // not reach into that frame; a zero-length one (a word whisper timed
+        // at an instant) counts the frame it falls in.
+        let until = if end > start {
+            match (end / frame).ceil() as usize {
+                0 => return None,
+                frames => frames - 1,
+            }
+        } else {
+            (end / frame).floor() as usize
+        }
+        .min(last);
+        (first <= until).then_some(first..=until)
     }
 }
 
@@ -305,6 +317,11 @@ mod tests {
         assert_eq!(timeline.voice_between(0.0, 0.16), frames(3));
         assert_eq!(timeline.voice_between(0.034, 0.046), frames(1));
         assert_eq!(timeline.voice_between(0.0, 0.031), Duration::ZERO);
+        // Ending exactly where the first voiced frame starts reaches no voice
+        // (Qodo on PR #1766); one frame-width later it reaches that frame.
+        assert_eq!(timeline.voice_between(0.0, 0.032), Duration::ZERO);
+        assert_eq!(timeline.voice_between(0.0, 0.048), frames(1));
+        assert_eq!(timeline.voice_between(0.032, 0.032), frames(1));
         assert_eq!(timeline.voice_between(-1.0, 0.033), frames(1));
         assert_eq!(timeline.voice_between(0.079, 9.0), frames(1));
         assert_eq!(timeline.voice_between(0.2, 0.3), Duration::ZERO);

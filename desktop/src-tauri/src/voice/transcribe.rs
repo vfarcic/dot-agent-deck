@@ -253,12 +253,25 @@ pub type TranscribeFuture<'a> =
 pub struct Transcription {
     pub transcript: Transcript,
     pub timing: Timing,
+    /// Each of [`Timing::segments`]' text as the backend wrote it, in the same
+    /// order, so the transcript can be rebuilt from the segments the audio
+    /// holds ([`evidence::Support::Segments`]).
+    pub pieces: Vec<Transcript>,
 }
 
 impl Transcription {
     /// The text, verbatim.
     pub fn text(&self) -> &str {
         self.transcript.text()
+    }
+
+    /// The transcript made of only the segments at `kept`.
+    fn only(&self, kept: &[usize]) -> Transcript {
+        Transcript::new(join_pieces(
+            kept.iter()
+                .filter_map(|&index| self.pieces.get(index))
+                .map(Transcript::text),
+        ))
     }
 }
 
@@ -268,6 +281,7 @@ impl From<Transcript> for Transcription {
         Self {
             transcript,
             timing: Timing::default(),
+            pieces: Vec::new(),
         }
     }
 }
@@ -804,6 +818,7 @@ pub fn parse_response(payload: &Value) -> Result<Transcription, TranscriptionErr
                 segments: Vec::new(),
                 words: timed_words(&payload["words"]),
             },
+            pieces: Vec::new(),
         });
     };
     let no_speech = |segment: &Value| {
@@ -841,27 +856,43 @@ pub fn parse_response(payload: &Value) -> Result<Transcription, TranscriptionErr
         let middle = (word.start + word.end) / 2.0;
         within(&kept_spans, middle) || !within(&dropped_spans, middle)
     });
-    let timing = Timing {
-        segments: kept_spans,
-        words,
+    // Segment timing is all or nothing: a kept segment with no time would
+    // have no place in a transcript rebuilt from the timed ones, so a reply
+    // with one is judged whole, by its words and their timing.
+    let (segments, pieces) = if kept_spans.len() == kept.len() {
+        let pieces = kept
+            .iter()
+            .map(|segment| Transcript::new(segment["text"].as_str().unwrap_or("")))
+            .collect();
+        (kept_spans, pieces)
+    } else {
+        (Vec::new(), Vec::new())
     };
-    if dropped.is_empty() {
-        return Ok(Transcription {
-            transcript: Transcript::new(text.trim()),
-            timing,
-        });
-    }
+    let transcript = if dropped.is_empty() {
+        Transcript::new(text.trim())
+    } else {
+        Transcript::new(join_pieces(
+            kept.iter().filter_map(|segment| segment["text"].as_str()),
+        ))
+    };
+    Ok(Transcription {
+        transcript,
+        timing: Timing { segments, words },
+        pieces,
+    })
+}
+
+/// Segments' text joined into one transcript, with a space only where two
+/// segments would otherwise run together ([`needs_separator`]).
+fn join_pieces<'a>(pieces: impl Iterator<Item = &'a str>) -> String {
     let mut joined = String::new();
-    for piece in kept.iter().filter_map(|segment| segment["text"].as_str()) {
+    for piece in pieces {
         if needs_separator(&joined, piece) {
             joined.push(' ');
         }
         joined.push_str(piece);
     }
-    Ok(Transcription {
-        transcript: Transcript::new(joined.trim()),
-        timing,
-    })
+    joined.trim().to_string()
 }
 
 /// `item`'s `start` and `end` as a [`Timed`] of `words` words, or `None` when
@@ -1181,20 +1212,31 @@ pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> Voice
             sentence: NOTHING_HEARD.into(),
         },
         // Words the audio cannot hold, or timed where there was no voice
-        // ([`super::evidence`], issue #1450): the backend invented them. The
-        // same outcome as a segment with nobody speaking in it, because that
-        // is what it was, and the text goes nowhere — not typed, not resolved
-        // into a command, not quoted in the detail.
+        // ([`super::evidence`], issue #1450): the backend invented them. A
+        // segment the audio does not hold is dropped and the ones it holds are
+        // kept, the way the no-speech guard drops a segment; when none is
+        // left, it is the same outcome as a segment with nobody speaking in
+        // it, because that is what it was, and the text goes nowhere — not
+        // typed, not resolved into a command, not quoted in the detail.
         Ok(answer) => {
-            match evidence::unsupported(evidence::word_count(answer.text()), &answer.timing, &voice)
-            {
-                Some(why) => TranscriptionOutcome::Silent {
-                    detail: format!("the transcription was not in the audio — {why}"),
+            let words = evidence::word_count(answer.text());
+            let transcript = match evidence::support(words, &answer.timing, &voice) {
+                evidence::Support::All => Ok(answer.transcript),
+                evidence::Support::Segments(kept) => Ok(answer.only(&kept)),
+                evidence::Support::Nothing(why) => Err(why),
+            };
+            match transcript {
+                Ok(transcript) if transcript.has_words() => TranscriptionOutcome::Heard {
+                    sentence: heard_sentence(transcript.text()),
+                    transcript,
+                },
+                Ok(_) => TranscriptionOutcome::Silent {
+                    detail: "the transcription held no words the audio holds".into(),
                     sentence: NOTHING_HEARD.into(),
                 },
-                None => TranscriptionOutcome::Heard {
-                    sentence: heard_sentence(answer.text()),
-                    transcript: answer.transcript,
+                Err(why) => TranscriptionOutcome::Silent {
+                    detail: format!("the transcription was not in the audio — {why}"),
+                    sentence: NOTHING_HEARD.into(),
                 },
             }
         }
@@ -2795,9 +2837,10 @@ mod tests {
     /// over the quiet after it, with nothing marking it as no-speech and no
     /// word timing. The whole reply fits in the sentence's voice, but the
     /// second segment's words do not fit in the voice inside its own time, so
-    /// nothing is heard.
+    /// that segment is dropped and the dictated sentence alone is heard; a
+    /// reply of only the appended segment is not heard at all.
     #[tokio::test]
-    async fn voice_transcribe_a_segment_timed_over_quiet_is_never_heard() {
+    async fn voice_transcribe_a_segment_timed_over_quiet_is_dropped_and_the_speech_kept() {
         let mut samples = room_tone(6.0, 120.0, 8);
         let dictated = spoken(COMMANDS[14].1, 3_000.0, 0.0, 8);
         add(
@@ -2816,11 +2859,16 @@ mod tests {
             (" Thank you for watching.", 4.0, 5.5),
         ]);
         let result = handle_audio(&StubTranscriber::replying(&invented), &audio).await;
-        assert!(!result.outcome.is_heard(), "{:?}", result.outcome);
+        assert_eq!(
+            result.transcript().map(Transcript::text),
+            Some("Please add a unit test for the parser."),
+            "{:?}",
+            result.outcome
+        );
 
-        let said = segments_only(&[(" Please add a unit test for the parser.", 0.3, 2.6)]);
-        let result = handle_audio(&StubTranscriber::replying(&said), &audio).await;
-        assert!(result.outcome.is_heard(), "{:?}", result.outcome);
+        let only_invented = segments_only(&[(" Thank you for watching.", 4.0, 5.5)]);
+        let result = handle_audio(&StubTranscriber::replying(&only_invented), &audio).await;
+        assert!(!result.outcome.is_heard(), "{:?}", result.outcome);
     }
 
     /// The timing a reply gives is read from where each backend puts it:

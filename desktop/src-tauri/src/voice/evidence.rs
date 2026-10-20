@@ -98,7 +98,8 @@ pub struct Timed {
 /// Empty for a backend that returns no timing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Timing {
-    /// The segments the transcript was built from.
+    /// The segments the transcript was built from, in order — all of them or
+    /// none: a reply with a segment that is not timed is judged whole.
     pub segments: Vec<Timed>,
     /// One entry per word, where the backend timed each word.
     pub words: Vec<Timed>,
@@ -117,18 +118,29 @@ pub fn fits(words: usize, voice: Duration) -> bool {
     words as f64 <= SPARE_WORDS + MAX_WORDS_PER_SECOND * voice.as_secs_f64()
 }
 
-/// Why the audio does not hold a transcript of `words` words with `timing`,
-/// or `None` when it does. The reason states counts and times and never the
-/// text.
-pub fn unsupported(words: usize, timing: &Timing, voice: &VoiceTimeline) -> Option<String> {
-    let total = voice.voice();
-    if !fits(words, total) {
-        return Some(format!(
-            "{words} words in {} ms of voice, where at most {} fit",
-            total.as_millis(),
-            allowed(total)
-        ));
-    }
+/// How much of a reply the audio holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Support {
+    /// All of it.
+    All,
+    /// Only these of [`Timing::segments`], by index, in order: the others
+    /// were not in the audio — a phrase appended over the quiet after real
+    /// speech is the case — and are dropped the way the per-segment no-speech
+    /// guard drops a segment, keeping the speech around them.
+    Segments(Vec<usize>),
+    /// None of it, and why. The reason states counts and times and never the
+    /// text.
+    Nothing(String),
+}
+
+/// How much of a reply of `words` words with `timing` the audio holds.
+///
+/// With segment timing, each segment is judged on its own — its words fit
+/// the voice inside its own time, and each of its timed words is on voice —
+/// and what is left is then held to the whole segment's voice. Without it,
+/// the reply is judged whole: its words fit the voice, and each timed word is
+/// on voice. A time that is not a time refuses the reply whole.
+pub fn support(words: usize, timing: &Timing, voice: &VoiceTimeline) -> Support {
     // A time that is not a time — missing a number, or ending before it
     // starts — is no evidence of where anything was said.
     if let Some(item) =
@@ -136,16 +148,68 @@ pub fn unsupported(words: usize, timing: &Timing, voice: &VoiceTimeline) -> Opti
             !(item.start.is_finite() && item.end.is_finite() && item.start <= item.end)
         })
     {
-        return Some(format!(
+        return Support::Nothing(format!(
             "the backend timed text {:.2}–{:.2} s, which is not a stretch of the audio",
             item.start, item.end
         ));
     }
     let tolerance = TIMING_TOLERANCE.as_secs_f64();
-    for segment in &timing.segments {
-        let inside = voice.voice_between(segment.start - tolerance, segment.end + tolerance);
-        if !fits(segment.words, inside) {
-            return Some(format!(
+    let off_voice = |word: &Timed| {
+        voice
+            .voice_between(word.start - tolerance, word.end + tolerance)
+            .is_zero()
+    };
+    let word_off_voice = |word: &Timed| {
+        format!(
+            "a word timed {:.2}–{:.2} s, where no voice was detected",
+            word.start, word.end
+        )
+    };
+    let too_many = |words: usize| {
+        let total = voice.voice();
+        (!fits(words, total)).then(|| {
+            format!(
+                "{words} words in {} ms of voice, where at most {} fit",
+                total.as_millis(),
+                allowed(total)
+            )
+        })
+    };
+
+    if timing.segments.is_empty() {
+        if let Some(why) = too_many(words) {
+            return Support::Nothing(why);
+        }
+        return match timing.words.iter().find(|word| off_voice(word)) {
+            Some(word) => Support::Nothing(word_off_voice(word)),
+            None => Support::All,
+        };
+    }
+
+    // Each timed word belongs to the first segment whose time, widened by the
+    // tolerance, holds its middle. A word in no segment's time is checked on
+    // its own, and one off voice refuses the reply whole: nothing says which
+    // segment it came from.
+    let window = |segment: &Timed| (segment.start - tolerance, segment.end + tolerance);
+    let mut owned: Vec<Vec<&Timed>> = vec![Vec::new(); timing.segments.len()];
+    for word in &timing.words {
+        let middle = (word.start + word.end) / 2.0;
+        match timing.segments.iter().position(|segment| {
+            let (from, to) = window(segment);
+            from <= middle && middle <= to
+        }) {
+            Some(index) => owned[index].push(word),
+            None if off_voice(word) => return Support::Nothing(word_off_voice(word)),
+            None => {}
+        }
+    }
+    let mut kept = Vec::new();
+    let mut first_refusal = None;
+    for (index, segment) in timing.segments.iter().enumerate() {
+        let (from, to) = window(segment);
+        let inside = voice.voice_between(from, to);
+        let refusal = if !fits(segment.words, inside) {
+            Some(format!(
                 "a segment timed {:.2}–{:.2} s holds {} words in {} ms of voice, where at most \
                  {} fit",
                 segment.start,
@@ -153,21 +217,32 @@ pub fn unsupported(words: usize, timing: &Timing, voice: &VoiceTimeline) -> Opti
                 segment.words,
                 inside.as_millis(),
                 allowed(inside)
-            ));
+            ))
+        } else {
+            owned[index]
+                .iter()
+                .find(|word| off_voice(word))
+                .map(|word| word_off_voice(word))
+        };
+        match refusal {
+            None => kept.push(index),
+            Some(why) => {
+                first_refusal.get_or_insert(why);
+            }
         }
     }
-    for word in &timing.words {
-        if voice
-            .voice_between(word.start - tolerance, word.end + tolerance)
-            .is_zero()
-        {
-            return Some(format!(
-                "a word timed {:.2}–{:.2} s, where no voice was detected",
-                word.start, word.end
-            ));
-        }
+    if kept.is_empty() {
+        return Support::Nothing(first_refusal.unwrap_or_default());
     }
-    None
+    let kept_words = kept.iter().map(|&index| timing.segments[index].words).sum();
+    if let Some(why) = too_many(kept_words) {
+        return Support::Nothing(why);
+    }
+    if kept.len() == timing.segments.len() {
+        Support::All
+    } else {
+        Support::Segments(kept)
+    }
 }
 
 /// The most words `voice` holds, for a reason's wording.
@@ -217,44 +292,48 @@ mod tests {
         assert!(!fits(2, Duration::from_millis(80)));
     }
 
+    fn refused(support: Support) -> String {
+        match support {
+            Support::Nothing(why) => why,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     /// Scenario: a reply with no timing is held to the whole segment's voice
     /// alone — what a `gpt-*` model's reply gets.
     #[test]
     fn voice_evidence_without_timing_only_the_total_applies() {
         let voice = voiced(3.0, 1.0, 1.3);
-        assert_eq!(unsupported(2, &Timing::default(), &voice), None);
-        let refused = unsupported(8, &Timing::default(), &voice).expect("refused");
-        assert!(refused.starts_with("8 words in "), "{refused}");
+        assert_eq!(support(2, &Timing::default(), &voice), Support::All);
+        let why = refused(support(8, &Timing::default(), &voice));
+        assert!(why.starts_with("8 words in "), "{why}");
     }
 
     /// Scenario: the user dictates a sentence and pauses; the backend appends
-    /// a second segment, timed over the quiet after the sentence. The total
-    /// fits in the sentence's voice, and the appended segment does not fit in
-    /// the voice inside its own time, so the reply is refused.
+    /// a second segment, timed over the quiet after the sentence. The
+    /// appended segment does not fit in the voice inside its own time, so it
+    /// is dropped, and the dictated sentence is kept.
     #[test]
-    fn voice_evidence_a_segment_timed_over_quiet_is_refused() {
+    fn voice_evidence_a_segment_timed_over_quiet_is_dropped_and_the_speech_kept() {
         let voice = voiced(6.0, 0.6, 2.7);
         let timing = Timing {
             segments: vec![timed(0.5, 2.7, 8), timed(3.5, 5.5, 4)],
             words: Vec::new(),
         };
-        let refused = unsupported(12, &timing, &voice).expect("refused");
-        assert!(
-            refused.starts_with("a segment timed 3.50–5.50 s"),
-            "{refused}"
-        );
-        // The same sentence on its own is accepted.
-        let alone = Timing {
-            segments: vec![timed(0.5, 2.7, 8)],
+        assert_eq!(support(12, &timing, &voice), Support::Segments(vec![0]));
+        // With only the appended segment, nothing is left.
+        let invented = Timing {
+            segments: vec![timed(3.5, 5.5, 4)],
             words: Vec::new(),
         };
-        assert_eq!(unsupported(8, &alone, &voice), None);
+        let why = refused(support(4, &invented, &voice));
+        assert!(why.starts_with("a segment timed 3.50–5.50 s"), "{why}");
     }
 
     /// Scenario: a laugh, and the local model's "Thank you." for it, measured
     /// 2026-10-20 — "Thank" timed over the laugh and "you." at 2.57 s, 0.73 s
     /// after its voice ended. A word timed where there was no voice was not
-    /// said.
+    /// said, so its segment is dropped, and nothing is left.
     #[test]
     fn voice_evidence_a_word_timed_where_there_was_no_voice_is_refused() {
         let voice = voiced(3.0, 1.0, 1.84);
@@ -262,8 +341,46 @@ mod tests {
             segments: vec![timed(0.59, 2.57, 2)],
             words: vec![timed(0.59, 2.57, 1), timed(2.57, 2.57, 1)],
         };
-        let refused = unsupported(2, &timing, &voice).expect("refused");
-        assert!(refused.contains("2.57–2.57 s"), "{refused}");
+        let why = refused(support(2, &timing, &voice));
+        assert!(why.contains("2.57–2.57 s"), "{why}");
+        // Without segments, the same word refuses the reply too.
+        let words_only = Timing {
+            segments: Vec::new(),
+            words: timing.words.clone(),
+        };
+        let why = refused(support(2, &words_only, &voice));
+        assert!(why.contains("no voice was detected"), "{why}");
+    }
+
+    /// Scenario: two segments, each with its words timed, and the second's
+    /// words timed after the voice ended — only the first is kept.
+    #[test]
+    fn voice_evidence_a_segment_with_a_word_off_voice_is_dropped() {
+        let voice = voiced(4.0, 0.5, 1.5);
+        let timing = Timing {
+            segments: vec![timed(0.5, 1.5, 2), timed(2.5, 3.0, 2)],
+            words: vec![
+                timed(0.5, 1.0, 1),
+                timed(1.0, 1.5, 1),
+                timed(2.5, 2.7, 1),
+                timed(2.7, 3.0, 1),
+            ],
+        };
+        assert_eq!(support(4, &timing, &voice), Support::Segments(vec![0]));
+    }
+
+    /// Scenario: segments that each fit their own voice but together claim
+    /// more words than the whole segment's voice holds — the segments overlap
+    /// in time — are refused whole.
+    #[test]
+    fn voice_evidence_kept_segments_are_held_to_the_total_too() {
+        let voice = voiced(3.0, 1.0, 1.3);
+        let timing = Timing {
+            segments: vec![timed(1.0, 1.3, 4), timed(1.0, 1.3, 4)],
+            words: Vec::new(),
+        };
+        let why = refused(support(8, &timing, &voice));
+        assert!(why.starts_with("8 words in "), "{why}");
     }
 
     /// Scenario: the local model's word timing for real speech starts a word
@@ -281,7 +398,7 @@ mod tests {
                 timed(2.95, 2.95, 1),
             ],
         };
-        assert_eq!(unsupported(8, &timing, &voice), None);
+        assert_eq!(support(8, &timing, &voice), Support::All);
     }
 
     /// Scenario: a backend that times a word outside the segment altogether,
@@ -296,11 +413,13 @@ mod tests {
             timed(1.2, 1.1, 1),
             timed(f64::NAN, 1.2, 1),
         ] {
-            let timing = Timing {
-                segments: Vec::new(),
-                words: vec![word],
-            };
-            assert!(unsupported(1, &timing, &voice).is_some(), "{word:?}");
+            for segments in [Vec::new(), vec![timed(1.0, 1.5, 1)]] {
+                let timing = Timing {
+                    segments,
+                    words: vec![word],
+                };
+                refused(support(1, &timing, &voice));
+            }
         }
     }
 }
