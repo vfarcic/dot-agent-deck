@@ -870,13 +870,28 @@ meaning     = "write"
 #
 # No target param: the mode targets the pane on screen, and ends when that
 # pane does (the panel owns the state — `VoiceControlPanel.tsx`).
+#
+# **The descriptions say the listed phrasings are examples (PRD #1733)**, so
+# neither is a word list for either model. Their first wording for that, "Use
+# when the user asks for this and nothing else: …", moved a row they do not
+# touch: on an agent's screen the command model filled `open_pr`'s `agent` with
+# the request itself ("open the PR", "the pull request") in 52 of 400 replays
+# of fixtures `open-pr` and `open-pr-show-the-pull-request`, against 19 of 400
+# with the wording before PRD #1733; reverting only this pair accounted for
+# most of it. "Use only when the WHOLE utterance asks for this, as … or the same
+# request in other words do", with `open_pr`'s own sentence below: 19 of 400,
+# both paraphrase fixtures still 30 of 30, and the meaning check unchanged on
+# the pair's sentences ("done typing, thanks" 32 of 40 against 28; "we should
+# stop typing the logs" 4 of 40 against 4) (2026-10-20, `gpt-5-mini`). The
+# closer "Use only when the WHOLE utterance is …, or the same request in other
+# words" made the check refuse "done typing, thanks" more (17 of 40).
 [[commands]]
 id          = "dictation_on"
 description = """Start typing mode for the open agent: from now on everything the user says is
-typed into that agent's prompt until they stop it. Use when the user asks for this and nothing
-else: "type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing",
-"talking on", "start talking", "speaking on", "start speaking", "dictate on", "writing on",
-"start writing", or the same request in other words.
+typed into that agent's prompt until they stop it. Use only when the WHOLE utterance asks for this,
+as "type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing", "talking
+on", "start talking", "speaking on", "start speaking", "dictate on", "writing on", "start writing" or
+the same request in other words do.
 Nothing is sent while typing — sending is `submit_prompt`. A request to type particular words is
 `dictate_to_agent`, not this."""
 invoke      = "startDictation"
@@ -889,10 +904,10 @@ meaning     = "whole"
 
 [[commands]]
 id          = "dictation_off"
-description = """Stop typing mode, so utterances are commands again. Use when the user asks for
-this and nothing else: "type off", "typing off", "stop typing", "dictation off", "stop dictation",
-"done typing", "talking off", "stop talking", "speaking off", "stop speaking", "dictate off",
-"writing off", "stop writing", or the same request in other words. It sends nothing: whatever was typed stays in the agent's prompt."""
+description = """Stop typing mode, so utterances are commands again. Use only when the WHOLE
+utterance asks for this, as "type off", "typing off", "stop typing", "dictation off", "stop
+dictation", "done typing", "talking off", "stop talking", "speaking off", "stop speaking", "dictate
+off", "writing off", "stop writing" or the same request in other words do. It sends nothing: whatever was typed stays in the agent's prompt."""
 invoke      = "stopDictation"
 screens     = ["agent"]
 unavailable_hint = "typing mode is only on in an agent's pane"
@@ -1484,6 +1499,11 @@ try_saying  = "scroll to the bottom"
 # `action_words` holds `pr`, the id's own word: speech-to-text writes "PR" or
 # "P.R.", and a word split across adjacent words is still set aside before the
 # agent reference is read.
+#
+# The description says the words asking for the pull request name no agent:
+# with no agent named, the command model sometimes answered `agent` with the
+# request itself, which no agent matches, so the pick was refused. See the
+# dictation pair above for the measurements (PRD #1733).
 [[commands]]
 id          = "open_pr"
 description = """Open one agent's pull request: GitHub's page for it, inside the app, over the current
@@ -1491,7 +1511,8 @@ screen — the voice form of the pull request badge on an agent's dashboard row.
 show the PR, open the pull request, show the pull request, show me its pull request, look at the
 pull request, open the PR for the coder, open the coder's PR, show the pull request for the
 reviewer, or open the tester's pull request. Set `agent` the way `open_agent` does when the user
-names an agent; leave it out when they name none — on an agent's screen that means the agent whose
+names an agent, to the words that name it and no others; leave it out when they name none — the
+words asking for the pull request name no agent. On an agent's screen no agent means the agent whose
 pane is open, and on the dashboard the app asks which agent. It opens a page to read and nothing
 else: it does not merge, approve, comment on or change the pull request. An agent with no pull
 request has none to open, and the app says so."""
@@ -1569,16 +1590,18 @@ try_saying  = "open it in the browser"
 # how people name a chip, but it now says the bare word names no
 # chip and that "Activate orchestration" — the Start button's label once an
 # orchestration is chosen — is `start_new_agent`. Each chip's own label, said as
-# it reads ("No mode", "Orch billing run", "schedule", "dispatcher"), is in the
-# description too, for the label rule.
+# it reads ("No mode", "schedule", "dispatcher", and an orchestration's "Orch"
+# with its whole name), is in the description too, for the label rule.
 [[commands]]
 id          = "choose_mode"
 description = """In the New agent form, choose one of the Mode chips it offers, BY NAME: No mode (a
 plain agent), one NAMED orchestration (`Orch: <name>`), schedule, schedule: issues, or dispatcher.
 Use for mode schedule, make it a dispatcher, use the billing orchestration, orchestration build,
-orch billing, plain agent, no mode — and for a chip's label read aloud as it is written: "No mode",
-"Orch billing", "schedule", "schedule issues", "dispatcher". Set `mode` to the chip the user meant,
-exactly as listed in `new_agent_form.modes` or `new_agent_form.modes_not_offered` — when it is one
+orch release notes, plain agent, no mode — and for a chip's label read aloud as it is written: "No
+mode", "schedule", "schedule issues", "dispatcher", or an orchestration chip's "Orch" followed by
+that orchestration's whole name, however many words it has ("Orch release notes"). Set `mode` to
+the chip the user meant, exactly as listed in `new_agent_form.modes` or
+`new_agent_form.modes_not_offered` — when it is one
 the form does NOT offer, the app then says so, so never answer with the nearest offered chip
 instead. The bare word "orchestration" names NO chip: an orchestration chip is chosen
 by its name. "Activate orchestration", "activate the orchestration", "start orchestration", "start
@@ -1595,9 +1618,18 @@ report      = "Mode: {mode}."
 # and it answered "use the billing run orchestration" yes in 6 to 13 of 16
 # (fixture `choose-mode-orchestration`). Saying the chip is chosen by its name:
 # 16 in 16, the other mode fixtures' sentences 16 in 16, the Start button's
-# words still 0 (2026-10-20). "Orch billing run", the chip's label read
-# aloud, stays unreliable (5 to 12 in 16 under every wording tried): the
-# check takes "run" as a word besides the request.
+# words still 0 (2026-10-20).
+#
+# "Orch billing run", the chip's label read aloud (fixture
+# `choose-mode-orch-chip-label`), was answered yes in only 5 to 12 of 16 under
+# every `asks_to` wording tried: the description's examples were "orch billing"
+# and the label "Orch billing", so the check read "Orch billing" as the WHOLE
+# chip name and "run" as a word besides the request ("asks to choose the Mode
+# chip 'Orch billing' and also says 'run'"). The examples now name a chip whose
+# name is several words, and say an orchestration chip's label is "Orch" and
+# the whole name, however many words: 12 of 12, every other mode sentence
+# unchanged, the Start button's words and bare "orchestration" still 0 of 12
+# (2026-10-20). Neither example is a planted name.
 asks_to     = "choose a Mode chip by its name"
 try_saying  = "mode {mode}"
 
