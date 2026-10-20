@@ -35,7 +35,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, TabMembership};
-use dot_agent_deck::event::{AgentEvent, AgentType, DelegateResponse, DelegateSignal, EventType};
+use dot_agent_deck::event::{
+    AgentEvent, AgentType, DelegateResponse, DelegateSignal, EventType, WorkDoneSignal,
+};
 use spec::spec;
 
 mod common;
@@ -1867,6 +1869,9 @@ struct SupersededWorker {
     working_still_live: bool,
     /// `.dot-agent-deck/worker-task-coder.md` after the addendum.
     task_file: String,
+    /// Whether, after one `work-done`, the next plain delegate was refused
+    /// because the worker still owed one.
+    busy_after_one_work_done: bool,
 }
 
 /// Issue #1784: delegate [`ORIGINAL_TASK`] to the `coder` role, let its worker
@@ -1919,20 +1924,40 @@ async fn send_addendum_with_supersede(clear: bool) -> SupersededWorker {
         .await
         .expect("the addendum never reached the worker pane");
     let working_still_live = fx.daemon.registry.agent_is_live(&working);
-    let task_file = std::fs::read_to_string(
+    let task_file = tokio::fs::read_to_string(
         std::path::Path::new(&fx.cwd).join(".dot-agent-deck/worker-task-coder.md"),
     )
+    .await
     .unwrap_or_default();
+
+    // The worker reports once, and the orchestrator delegates its next task.
+    fx.daemon
+        .state
+        .read()
+        .await
+        .handle_work_done(
+            WorkDoneSignal {
+                pane_id: WORKER_PANE.to_string(),
+                task: "Finished the task and the addendum.".to_string(),
+                done: false,
+                timestamp: chrono::Utc::now(),
+                token: None,
+            },
+            &fx.daemon.registry,
+        )
+        .await;
+    let next = delegate_with(&fx, "The next task.", false).await;
     SupersededWorker {
         working,
         addendum_taker,
         addendum_text,
         working_still_live,
         task_file,
+        busy_after_one_work_done: next.busy.iter().any(|b| b.role == WORKER_ROLE),
     }
 }
 
-/// Scenario: Start an orchestration whose `coder` role is `clear = true`, delegate it a task and let its worker take it, so the worker owes a `work-done`. A plain delegate of an addendum is refused as busy, so send the addendum with `--supersede`, as an orchestrator has to today. The worker that was working is restarted: the addendum goes to a new agent, the old one is gone, and the task it is handed and its task file carry the addendum without the original task. The same steps on a `clear = false` worker hand the addendum to the agent that was working, which keeps running.
+/// Scenario: Delegate a task to a `clear = true` `coder` and let its worker take it, then send an addendum with `--supersede`, since a plain delegate is refused as busy. A new agent takes the addendum alone, the one that was working is gone, and after one `work-done` the worker takes the next task. On a `clear = false` worker the agent that was working takes the addendum and keeps running, but owes a `work-done` for each task.
 ///
 /// Issue #1784 reproduced: what this pins is `--supersede`'s documented meaning,
 /// which the issue keeps and the orchestrator's instructions now warn about. An
@@ -1961,6 +1986,10 @@ async fn delegate_052_a_supersede_addendum_restarts_a_clear_true_worker() {
         "the worker's task file must hold the addendum alone; file = {:?}",
         restarted.task_file
     );
+    assert!(
+        !restarted.busy_after_one_work_done,
+        "the restart retires the original task, so one work-done must leave the worker free"
+    );
 
     // CONTROL: the restart comes from `clear = true`, not from `--supersede`.
     let kept = send_addendum_with_supersede(false).await;
@@ -1976,5 +2005,12 @@ async fn delegate_052_a_supersede_addendum_restarts_a_clear_true_worker() {
         kept.addendum_text.contains(ADDENDUM),
         "control — the clear = false worker must be handed the addendum; text = {:?}",
         kept.addendum_text
+    );
+    // What the orchestrator is told: the addendum is a task of its own, so a
+    // worker that had taken the original task owes a work-done for each.
+    assert!(
+        kept.busy_after_one_work_done,
+        "a clear = false worker that took the original task and then the addendum must still \
+         owe a work-done after reporting once"
     );
 }
