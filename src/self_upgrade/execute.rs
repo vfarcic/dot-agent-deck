@@ -300,6 +300,20 @@ impl Outcome {
         !matches!(self, Self::BrewNotUpgraded { .. })
     }
 
+    /// Whether the offered release is now installed: replaced, upgraded by
+    /// Homebrew or installed behind the privilege prompt. `false` for a
+    /// staged download, whose install command the user has still to run, and
+    /// for a `brew upgrade` that did not reach the release.
+    pub fn installed(&self) -> bool {
+        matches!(
+            self,
+            Self::Replaced { .. }
+                | Self::BrewUpgraded { .. }
+                | Self::Installed { .. }
+                | Self::AppReplaced { .. }
+        )
+    }
+
     /// What the TUI adds after upgrading the copy it runs from to `version`:
     /// the running process is still the old build until it is restarted. Once
     /// the copy is staged, the user installs it first. `None` for the desktop

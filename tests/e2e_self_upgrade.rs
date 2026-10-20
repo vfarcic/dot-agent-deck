@@ -137,7 +137,7 @@ fn run_upgrade(server: &FakeReleases, exe: &Path, home: &Path, args: &[&str]) ->
     command.output().expect("run dot-agent-deck upgrade")
 }
 
-/// Scenario: Start the TUI as an old copy installed in a writable folder, with a fake release server offering a newer release. The footer badge names the release and the key; pressing `u` opens the dialog with the core's in-place plan, which says provenance will not be checked; choosing Upgrade replaces the file with the served release and the dialog shows the result and says to restart the TUI.
+/// Scenario: Start the TUI as an old copy installed in a writable folder, with a fake release server offering a newer release. The footer badge names the CLI, the release and the key; pressing `u` opens the dialog with the core's in-place plan, which says provenance will not be checked and that upgrading does not restart the running daemon; choosing Upgrade replaces the file with the served release and the dialog shows the result and says to restart the TUI.
 #[spec("upgrade/tui-upgrade/001")]
 #[test]
 fn tui_upgrade_001_badge_key_confirm_replaces_the_binary() {
@@ -150,15 +150,18 @@ fn tui_upgrade_001_badge_key_confirm_replaces_the_binary() {
 
     let deck = deck(&server, &exe, dir.path(), &[]);
     deck.wait_for_string(&format!(
-        "update available: v{version} (current: v{OLD_VERSION})"
+        "dot-agent-deck CLI: update available: v{version} (current: v{OLD_VERSION})"
     ));
     deck.wait_for_string("u to upgrade");
 
     deck.send_keys(b"u");
     deck.wait_for_string(&format!("Upgrade to v{version}"));
     deck.wait_for_string("Downloaded binary at");
+    // Issue #1753: the CLI is the daemon's binary, so the plan says what
+    // upgrading it does to the running daemon.
+    deck.wait_for_string("Upgrading does not restart the daemon on this machine");
     deck.wait_for_string("Build provenance will NOT be checked");
-    deck.wait_for_string(&format!("Upgrade dot-agent-deck to v{version}?"));
+    deck.wait_for_string(&format!("Upgrade dot-agent-deck CLI to v{version}?"));
     deck.wait_for_string("> Cancel");
     assert_eq!(
         std::fs::read(&exe).unwrap(),
@@ -199,7 +202,7 @@ fn tui_upgrade_002_nix_copy_is_notify_only() {
     deck.wait_for_string("> Close");
     let screen = deck.snapshot_grid();
     assert!(
-        !screen.contains("Upgrade dot-agent-deck to"),
+        !screen.contains("Upgrade dot-agent-deck CLI to"),
         "a Nix copy is never offered an upgrade\n{screen}"
     );
     assert!(!screen.contains("Cancel"), "{screen}");
@@ -262,7 +265,7 @@ fn cli_upgrade_001_check_prints_the_plan_and_changes_nothing() {
     );
     assert!(
         stdout.contains(&format!(
-            "dot-agent-deck: update available: v{version} (current: v{OLD_VERSION})"
+            "dot-agent-deck CLI: update available: v{version} (current: v{OLD_VERSION})"
         )),
         "{stdout}"
     );

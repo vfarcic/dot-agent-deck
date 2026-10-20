@@ -3924,11 +3924,6 @@ async fn run_daemon_serve_cli(
         }
     };
 
-    // Issue #1211: and beside it, best-effort, the pre-#1121 spelling on the
-    // fallback arm, so a client from before #1121 still finds this daemon and
-    // gets the mismatch prompt instead of silently spawning a second one. A
-    // failure to bind it is a warning, never a failure to start.
-    //
     // PRD #1487: record this daemon's own binary now, at startup, so a later
     // `restart-daemon` resolves "the build installed at my own path" from where
     // it started rather than from whatever `current_exe()` reports after an
@@ -3938,10 +3933,6 @@ async fn run_daemon_serve_cli(
     ));
     let refresh_state = state.clone();
     let daemon = Daemon::with_attach(state, attach_path.clone())
-        .with_legacy_aliases(
-            dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
-            dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
-        )
         .with_restart_control(restart_control.clone());
     // Issue #1637: re-read the agents' hook configs periodically, so a notice
     // about an older copy the hooks are still set up to call stays, and one
