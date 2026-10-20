@@ -581,11 +581,32 @@ async fn voice_parameterless_steering_is_refused_by_the_production_pipeline() {
 }
 
 /// Scenario: Force contextual close, destructive and mixed-content picks
-/// through the shipping pipeline after local intercepts with its real meaning backend and production
-/// question sets; they must refuse while standalone controls dispatch correctly.
+/// through the shipping pipeline with its real meaning backend; refusals must dispatch nothing while standalone controls still work.
+/// Opening an existing tester must neither open the New agent dialog nor start its ready form, and opening an agent named Close must close nothing.
 #[tokio::test]
 async fn voice_contextual_and_whole_controls_are_refused_by_the_production_pipeline() {
-    run_judge_fixtures(contextual_judge_fixtures(), JudgePipeline::Production).await;
+    let mut cases = contextual_judge_fixtures();
+    cases.push(
+        JudgeFixture::new(
+            "destructive-ready-form",
+            "stop_agent",
+            "open the tester",
+            false,
+            true,
+        )
+        .with_ready_form(),
+    );
+    cases.push(
+        JudgeFixture::new(
+            "destructive-spoken-name",
+            "stop_agent",
+            "open the Close agent",
+            false,
+            false,
+        )
+        .with_agent_label("Close"),
+    );
+    run_judge_fixtures(cases, JudgePipeline::Production).await;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -600,6 +621,8 @@ struct JudgeFixture {
     said: String,
     expected: bool,
     dialog: bool,
+    ready_form: bool,
+    agent_label: Option<&'static str>,
 }
 
 impl JudgeFixture {
@@ -610,7 +633,20 @@ impl JudgeFixture {
             said: said.to_string(),
             expected,
             dialog,
+            ready_form: false,
+            agent_label: None,
         }
+    }
+
+    fn with_ready_form(mut self) -> Self {
+        self.dialog = true;
+        self.ready_form = true;
+        self
+    }
+
+    fn with_agent_label(mut self, label: &'static str) -> Self {
+        self.agent_label = Some(label);
+        self
     }
 }
 
@@ -746,15 +782,32 @@ async fn run_production_judge_fixture(
     const REPETITIONS: usize = 5;
     let mut answer = IntentAnswer::new(case.action);
     match case.action {
-        "stop_agent" => answer = answer.with_param("agent", "tester"),
+        "stop_agent" => answer = answer.with_param("agent", case.agent_label.unwrap_or("tester")),
         "close_orchestration" => answer = answer.with_param("orchestration", "build"),
         _ => {}
     }
-    let agents = [in_orchestration(
+    let mut agent = in_orchestration(
         role_agent_in_state("agent-tester", "tester", "waiting_for_input"),
         "orch-build",
-    )];
-    let dialog = VoiceNewAgent { form: None };
+    );
+    agent.display_name = case.agent_label.map(str::to_string);
+    let agents = [agent];
+    let dialog = VoiceNewAgent {
+        form: case.ready_form.then(|| VoiceNewAgentForm {
+            deck_id: "deck-local".into(),
+            path: "/work".into(),
+            modes: vec![VoiceChoice {
+                id: "none".into(),
+                label: "No mode".into(),
+            }],
+            agent_types: vec![VoiceChoice {
+                id: "claude".into(),
+                label: "Claude Code".into(),
+            }],
+            withheld_modes: vec![],
+            mode_paging: None,
+        }),
+    };
     let directories = VoiceDirectories {
         deck_id: "deck-local".into(),
         path: "/work".into(),
@@ -805,12 +858,16 @@ async fn run_production_judge_fixture(
                 dispatches += usize::from(kind == OutcomeKind::Dispatch);
                 refusals += usize::from(kind == OutcomeKind::ActionUngrounded);
                 let completed = picks == 1 && checks == 1;
-                let correct = if case.expected {
-                    kind == OutcomeKind::Dispatch && action == Some(case.action)
-                } else {
+                let correct = match &result.outcome {
+                    // Check the resulting action, including readings: a
+                    // refused stop must not dispatch close, open_new_agent or
+                    // start_new_agent instead. A positive control must still
+                    // dispatch its original action.
+                    VoiceOutcome::Dispatch { action, .. } => case.expected && action == case.action,
+                    VoiceOutcome::ActionUngrounded { .. } => !case.expected,
                     // Availability, missing params and backend failure cannot
                     // disguise a yes for an unasked action as a safety pass.
-                    kind == OutcomeKind::ActionUngrounded
+                    _ => false,
                 };
                 eprintln!(
                     "forced-production: {} | run {repetition}/{REPETITIONS} | \
