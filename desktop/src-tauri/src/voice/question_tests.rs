@@ -1482,7 +1482,8 @@ async fn question_desktop_020_an_option_is_chosen_by_its_number() {
 /// OpenCode, "production" on Pi, "auto mode" on Claude Code — and that option
 /// is chosen, with the "always allow" confirmation where it grants for good.
 /// Claude's auto-mode option is keyboard-only, so naming it is refused with
-/// that reason rather than read as another option.
+/// that reason rather than read as another option; misspelt ("swich to auto
+/// mode"), it is no part of a permission prompt's label and goes to the model.
 #[tokio::test]
 async fn question_desktop_021_part_of_one_label_chooses_it() {
     assert_eq!(
@@ -1519,7 +1520,6 @@ async fn question_desktop_021_part_of_one_label_chooses_it() {
         "auto mode",
         "switch to auto mode",
         "yes, switch to auto mode",
-        "swich to auto mode",
     ] {
         assert_eq!(
             refusal(chose(&claude_auto_mode(), &[], said).await),
@@ -1527,6 +1527,13 @@ async fn question_desktop_021_part_of_one_label_chooses_it() {
             "{said:?}"
         );
     }
+    let resolver = StubResolver::new();
+    assert_eq!(
+        say(&resolver, &claude_auto_mode(), &[], "swich to auto mode").await,
+        QuestionVerdict::NotAnswer,
+        "a permission prompt takes no slips (issue #1725), so the model is asked"
+    );
+    assert_eq!(resolver.question_calls(), 1);
     // The always option still asks for its confirmation.
     let resolver = StubResolver::new();
     match say(&resolver, &opencode_permission(), &[], "allow always").await {
@@ -1994,4 +2001,47 @@ async fn question_desktop_032_a_leading_word_shared_with_allow_once_chooses_it()
         chose(&opencode_permission(), &[], "allow").await.unwrap(),
         [(0, vec![1])]
     );
+}
+
+/// Scenario (question/desktop/033, issue #1725): with OpenCode's permission row
+/// (Allow once, Allow always, Reject) waiting, the user says "alloy" — one
+/// letter from "allow". Nothing is chosen here and no countdown starts: the
+/// Commands model is asked, and its `not_answer` goes on to command handling.
+/// The same slip on an ordinary form's choice ("grean" for Green) still
+/// chooses it.
+#[tokio::test]
+async fn question_desktop_033_a_one_letter_slip_chooses_nothing_on_a_permission_prompt() {
+    for (question, said) in [
+        (opencode_permission(), "alloy"),
+        (opencode_permission(), "alloy once"),
+        (opencode_permission(), "alloy always"),
+        (codex_permission(), "proced"),
+        (devin_permission(), "denys"),
+    ] {
+        assert_eq!(question.kind, "permission");
+        let resolver = StubResolver::new();
+        assert_eq!(
+            say(&resolver, &question, &[], said).await,
+            QuestionVerdict::NotAnswer,
+            "{said:?}"
+        );
+        assert_eq!(
+            resolver.question_calls(),
+            1,
+            "{said:?}: the model was asked"
+        );
+    }
+    // Said exactly, the same words still choose.
+    assert_eq!(
+        chose(&opencode_permission(), &[], "allow").await.unwrap(),
+        [(0, vec![1])]
+    );
+    assert_eq!(
+        chose(&codex_permission(), &[], "proceed").await.unwrap(),
+        [(0, vec![1])]
+    );
+    // An ordinary choice keeps its slips.
+    let form = codex_form();
+    assert_ne!(form.kind, "permission");
+    assert_eq!(chose(&form, &[], "grean").await.unwrap(), [(0, vec![2])]);
 }

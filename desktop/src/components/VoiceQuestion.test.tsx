@@ -501,12 +501,12 @@ describe("answering an agent's question by voice", () => {
   });
 
   /**
-   * Scenario (question/desktop/033, issue #1726): the user says "yes" and the
+   * Scenario (question/desktop/034, issue #1726): the user says "yes" and the
    * countdown starts; two seconds in, the pane's deck stops answering, so the
    * pane stops taking input. The countdown is called off at once, the row
    * says why, and nothing is sent when its five seconds would have ended.
    */
-  it("question/desktop/033: a countdown is called off when its deck stops answering", async () => {
+  it("question/desktop/034: a countdown is called off when its deck stops answering", async () => {
     const voice = microphone();
     const { rt, sendVoiceAnswer } = runtime(voice, () => SENT);
     const blocked = { ...pane(), inputBlocked: "its deck is not answering." };
@@ -524,13 +524,13 @@ describe("answering an agent's question by voice", () => {
   });
 
   /**
-   * Scenario (question/desktop/033, PR #1764 review): the answer is on its way
+   * Scenario (question/desktop/034, PR #1764 review): the answer is on its way
    * and the deck delivers it, so the question leaves the pane in the same
    * snapshot that marks the pane as no longer taking input. The answer's own
    * delivery is what cleared the question, so its lease is not cancelled and
    * the row says the answer went.
    */
-  it("question/desktop/033: an answer delivered as its deck stops answering is not cancelled", async () => {
+  it("question/desktop/034: an answer delivered as its deck stops answering is not cancelled", async () => {
     const voice = microphone();
     let deliver: ((outcome: AnswerOutcomeDto) => void) | undefined;
     const { rt, sendVoiceAnswer, cancelVoiceAnswer } = runtime(voice, () => new Promise<AnswerOutcomeDto>((resolve) => { deliver = resolve; }));
@@ -550,14 +550,14 @@ describe("answering an agent's question by voice", () => {
   });
 
   /**
-   * Scenario (question/desktop/033, PR #1764 review): an answer is half given
+   * Scenario (question/desktop/034, PR #1764 review): an answer is half given
    * — the first of a form's two questions — and the next words are still
    * being worked out when the pane stops taking input and then takes it
    * again. The answer was called off while the pane took no input, and the
    * row said so; the words worked out afterwards do not bring it back, so no
    * countdown starts and nothing is sent.
    */
-  it("question/desktop/033: an answer called off while its words were worked out stays called off", async () => {
+  it("question/desktop/034: an answer called off while its words were worked out stays called off", async () => {
     const voice = microphone();
     const { rt, sendVoiceAnswer, resolveVoiceQuestion } = runtime(voice, () => SENT);
     let release: (() => void) | undefined;
