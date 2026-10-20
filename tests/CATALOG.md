@@ -3960,6 +3960,14 @@ without depending on the config struct API.
 - **Does not assert:** what the orchestrator's pane shows for the refusal; the TUI opening the successor's pane itself (the test sends the `StartAgent` a TUI would send).
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, `python3` stand-in roles).
 
+##### orchestration/delegate/052 — An addendum sent with `delegate --supersede` to a `clear = true` worker that is working on a task restarts the worker, and the new agent gets the addendum without the original task; a `clear = false` worker keeps its agent but owes a `work-done` for each task (issue #1784).
+- **Layer:** fast integration (`tests/delegate_respawn_recovery.rs`; the real `handle_delegate_with_state` against an in-process daemon whose roles were started through the real `StartAgent`, and the worker's tasks fetched and acknowledged from its inbox as an agent's component does).
+- **Agent:** none: `cat` stand-ins for both roles, because what is under test is which agent the daemon hands the addendum to, not what an agent does with it.
+- **Asserts:** for a `clear = true` `coder`: the original task is dispatched and taken, so the worker owes a `work-done`; a plain delegate of the addendum is refused with `coder` in `busy`; the `--supersede` delegate is dispatched; the addendum is taken by a different agent than the one that took the original task, that agent is no longer running, and both the delivered text and `worker-task-coder.md` carry the addendum without the original task; after one `work-done`, a plain delegate is not refused as busy. Control: the same steps on a `clear = false` `coder` hand the addendum to the agent that took the original task, which is still running, and after one `work-done` a plain delegate IS refused as busy, because the addendum is a task of its own (the orchestrator's instructions say so; PR #1785 review).
+- **Why it exists:** issue #1784. Confirmed red when written to assert what the user wanted (`left: "4"`, `right: "3"`: the agent that was working was replaced), and green with the same assertions on `clear = false`, so the restart comes from `clear = true` and not from `--supersede`. It pins `--supersede`'s meaning, which the issue keeps and the orchestrator's instructions warn about; an addendum that keeps a `clear = true` worker's agent needs its own path, which is scheduled after PRD #1666.
+- **Does not assert:** a real agent losing its conversation (a `cat` has none; the agent being replaced is what loses it); the orchestrator's instructions (`orchestrator_context` unit tests cover those); a `--supersede` before the worker took its task.
+- **Platform coverage:** mac+linux (unix-only PTYs).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).

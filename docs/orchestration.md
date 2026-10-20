@@ -452,6 +452,15 @@ When the earlier task is not coming back:
 
 If the orchestrator's own agent was replaced since it delegated, the new orchestrator is not blocked by the old one's tasks; `delegate` says which earlier task it superseded.
 
+### Adding to a task in progress
+
+When the orchestrator needs to give a worker more information about the task it is already doing (a correction, a missing detail, a forgotten constraint), whether the worker keeps its work depends on the role's `clear`:
+
+- **`clear = false`:** `delegate --supersede` reaches the running agent, which keeps its conversation and its work. The orchestrator says in the task that it adds to the current one. The deck counts the addition as a task of its own, so a worker that had already taken the original task owes a `work-done` for each, and until it sends both, a plain `delegate` to it is refused as busy.
+- **`clear = true`:** every delegate restarts the worker's agent, `--supersede` included, so the worker loses its conversation and anything it had not saved. The orchestrator waits for the `work-done` and delegates a follow-up that restates what the worker needs, or supersedes with the whole task restated and lets the worker start over.
+
+The deck marks the `clear = true` workers in the orchestrator's instructions as starting fresh for every task, and tells it the above. This is the same whether you run the orchestration in the TUI or the desktop app: the orchestrator's agent runs the same commands in either. A follow-up delegated after a `work-done` is a new task too, so a `clear = true` worker starts it without the earlier conversation. If a role's work usually continues from one task to the next, for example a coder that addresses review findings on its own change, set `clear = false` on that role.
+
 ### What `clear` does to delivery
 
 With `clear = true` (the default), the deck replaces the worker's agent in the same pane and queues the task for the replacement. Its card in the TUI or row in the desktop app keeps the same name, and its previous conversation is gone. With `clear = false`, the task goes to the running agent's inbox and the worker keeps its conversation. A `clear = true` worker whose agent has exited is started again on its next task; restart a `clear = false` worker before delegating to it again.
