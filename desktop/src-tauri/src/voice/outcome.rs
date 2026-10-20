@@ -206,12 +206,21 @@ type Reading = (&'static str, Option<Requirement>);
 ///   17 of 30 runs on `gpt-5-mini` while the instructions and the stop's own
 ///   description paired start words with the stop
 ///   ([`super::schema::TOOL_INSTRUCTIONS`]), 4 of 30 after (2026-10-15).
+/// - `open_dir` → `use_this_directory` (PRD #1733): "okay this is the one,
+///   pick this folder" is answered with the opener now and then (4 in 50 when
+///   issue #1496 measured it), and asked about the opener alone the meaning
+///   check took "pick" as opening a directory, 6 times in 6. Asked about both
+///   rows, it answers the opener `no` and the chooser `yes`, 30 times in 30,
+///   while every `open_dir` fixture's sentence stays a yes for the opener and
+///   a no for the chooser (10 in 10 each, 2026-10-20). Neither row starts
+///   anything: the chooser sets the form's directory, and the user still
+///   presses Start.
 ///
 /// A row's readings are tried in order and the first the words ask for wins,
 /// each only where its requirement, if it names one, holds. The reading still
 /// has to pass every gate a pick of it would — screen, `requires`, the flag —
 /// because it is answered exactly as one.
-const UNGROUNDED_READS_AS: [(&str, &[Reading]); 3] = [
+const UNGROUNDED_READS_AS: [(&str, &[Reading]); 4] = [
     ("clear_dashboard_filter", &[("open_overview", None)]),
     (
         "stop_agent",
@@ -222,6 +231,7 @@ const UNGROUNDED_READS_AS: [(&str, &[Reading]); 3] = [
         ],
     ),
     ("name_new_agent", &[("set_new_agent_command", None)]),
+    ("open_dir", &[("use_this_directory", None)]),
 ];
 
 /// One param, resolved against live state.
@@ -9626,6 +9636,56 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// Scenario: in the directory browser the model answers "okay this is the
+    /// one, pick this folder" with the opener, and the meaning check finds the
+    /// words ask to use the directory on screen rather than to open one. The
+    /// app uses this directory, with no directory param; a directory the user
+    /// named and asked to open is still opened.
+    #[tokio::test]
+    async fn voice_outcome_open_dir_read_as_use_this_directory() {
+        let code = code_dir();
+        let said = "okay this is the one, pick this folder";
+        let resolver = StubResolver::new()
+            .answering(
+                said,
+                IntentAnswer::new("open_dir").with_param("dir", "this folder"),
+            )
+            .judging(said, "open_dir", false)
+            .judging(said, "use_this_directory", true);
+        let outcome = run_with(&resolver, Screen::Overview, Some(&code), said).await;
+        assert_eq!(
+            outcome,
+            VoiceOutcome::Dispatch {
+                transcript: Transcript::new(said),
+                action: "use_this_directory".to_string(),
+                invoke: "useThisDirectory".to_string(),
+                params: Vec::new(),
+                sentence: "Using this directory.".to_string(),
+                then_submit: false,
+            }
+        );
+        assert!(
+            resolver.meaning_requests()[0]
+                .questions
+                .iter()
+                .any(|(action, _)| action == "use_this_directory"),
+            "the check is asked about the chooser beside the opener"
+        );
+
+        let said = "open the docs folder";
+        let resolver = StubResolver::new()
+            .answering(
+                said,
+                IntentAnswer::new("open_dir").with_param("dir", "docs"),
+            )
+            .judging(said, "use_this_directory", true);
+        let outcome = run_with(&resolver, Screen::Overview, Some(&code), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "open_dir"),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]

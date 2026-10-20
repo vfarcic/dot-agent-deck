@@ -341,7 +341,7 @@ try_saying  = "show only the dispatchers"
 id          = "clear_dashboard_filter"
 description = """Clear the agent dashboard's filter and show the whole dashboard, every agent,
 unfiltered — opening the dashboard from any other screen as well. Only when the user asks for
-EVERYTHING, all agents or no filter: "show the dashboard" or "open the dashboard" is
+EVERYTHING, all agents or no filter: a request for the dashboard that says none of that is
 `open_overview`, even where that cannot run. Use for show everything, show
 all agents, show all, clear the filter, remove the filter, unfiltered, or reset. With no filter
 set it simply opens the dashboard, as `open_overview` does. Filtering to some agents is
@@ -357,7 +357,17 @@ requires    = ["new_agent_dialog_closed"]
 unavailable_redirects = "clear_directory_filter"
 unavailable_hint = "the agent dashboard's filter can be cleared once the New agent dialog is closed"
 report      = "Showing every agent."
-asks_to     = "show the whole agent dashboard"
+# PRD #1733: the meaning check reads this, so it names what only this row
+# does. "Show the whole agent dashboard" was a yes for "show me the dashboard"
+# (4 in 6 replays of the check against `gpt-5-mini`), so over an agent's pane
+# the pick cleared a filter where issue #1496 decided the words get
+# `open_overview`'s "not here" (fixture `open-overview-unavailable`, red 6 in
+# 6). This wording: 0 in 8. The description's other sentence quoted "show the
+# dashboard" as `open_overview`'s, and the check read the quote as an example
+# of THIS row (8 in 8 for "show the dashboard"); naming it without quoting it:
+# 0 in 8. "Show me everything", "show everything", "show all agents", "clear
+# the filter", "remove the filter" and "reset" stay 8 in 8 (2026-10-20).
+asks_to     = "clear the agent dashboard's filter"
 try_saying  = "show everything"
 
 [[commands]]
@@ -1154,7 +1164,13 @@ screens     = ["overview"]
 requires    = ["new_agent_dialog_closed"]
 unavailable_hint = "the New agent dialog opens from the agent dashboard, when it is not already open"
 report      = "Opening the New agent dialog."
-asks_to     = "open the New agent dialog to start an agent"
+# PRD #1733: the meaning check read "Start orchestration" with the dialog
+# closed as no request to open it in 1 to 7 of 16 replays (fixture
+# `start-orchestration-dialog-closed`), and "start the orchestration" in up
+# to 3 of 8. Naming the orchestration took both to 8 in 8, left every other
+# opener fixture's sentence at 8 in 8, and moved none of the start's own
+# questions over an open dialog (2026-10-20).
+asks_to     = "open the New agent dialog to start an agent or an orchestration"
 try_saying  = "new agent"
 unavailable_redirects = "start_new_agent"
 
@@ -1574,7 +1590,15 @@ screens     = ["overview"]
 requires    = ["new_agent_form"]
 unavailable_hint = "choosing a mode needs a daemon and a directory chosen in the New agent dialog; choose those first"
 report      = "Mode: {mode}."
-asks_to     = "choose a Mode chip"
+# PRD #1733: "choose a Mode chip" left the meaning check weighing the
+# description's warning that "orchestration" and "start the run" name no chip,
+# and it answered "use the billing run orchestration" yes in 6 to 13 of 16
+# (fixture `choose-mode-orchestration`). Saying the chip is chosen by its name:
+# 16 in 16, the other mode fixtures' sentences 16 in 16, the Start button's
+# words still 0 (2026-10-20). "Orch billing run", the chip's label read
+# aloud, stays unreliable (5 to 12 in 16 under every wording tried): the
+# check takes "run" as a word besides the request.
+asks_to     = "choose a Mode chip by its name"
 try_saying  = "mode {mode}"
 
   [[commands.params]]
@@ -2017,7 +2041,15 @@ screens     = ["overview"]
 requires    = ["new_agent_dialog_closed"]
 unavailable_hint = "closing an orchestration works from the agent dashboard, with the New agent dialog closed"
 report      = "Confirm closing {orchestration} — nothing has been stopped yet."
-asks_to     = "close an orchestration"
+# PRD #1733: "close an orchestration" left the meaning check torn between its
+# rule that a close word means the view and this row's own name, and it
+# answered "close the orchestration" yes in only 9 of 12 replays against
+# `gpt-5-mini` (fixture `close-orchestration-by-category`, red 2 in 6). Saying
+# what the close does took it to 30 in 30, every other `close_orchestration`
+# fixture's sentence 10 in 10, and left "close the agent", "close this",
+# "close the orchestration view" and "hide the orchestration" at 0 (2026-10-20).
+# `must_name` is still what refuses a sentence that names no orchestration.
+asks_to     = "close an orchestration and stop its roles"
 try_saying  = "close the {orchestration} orchestration"
 must_name   = ["orchestration", "run", "every role", "all roles", "all the roles"]
 
