@@ -1,6 +1,5 @@
 ---
 source: tests/render_dashboard.rs
-assertion_line: 92
 expression: rendered
 ---
 ┏ ▸ 1 ClaudeCode… ● Thinking ┓
@@ -10,4 +9,4 @@ expression: rendered
 ┃                            ┃
 ┃                            ┃
 ┃                            ┃
-┗ #1234 ⊙ ◐ ━━ 1h · 14 tools ┛
+┗ #1234 ⊙ ◉ ━━ 1h · 14 tools ┛

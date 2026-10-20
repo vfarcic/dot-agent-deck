@@ -7,11 +7,11 @@
 //! (`xtask/linkage-check`'s desktop project boundary). Clients need only the
 //! value's shape, so the shape lives here, with no I/O at all.
 //!
-//! Both enums are tolerant of values they do not know: a newer daemon may
-//! report a state or review decision an older client has never heard of, and
-//! that must read as [`PullRequestState::Unknown`] /
-//! [`PullRequestReview::Unknown`] rather than fail the whole agent record it
-//! rides on.
+//! Every enum is tolerant of values it does not know: a newer daemon may
+//! report a state, review decision or check result an older client has never
+//! heard of, and that must read as [`PullRequestState::Unknown`] /
+//! [`PullRequestReview::Unknown`] / [`PullRequestChecksState::Unknown`] rather
+//! than fail the whole agent record it rides on.
 
 /// A pull request linked to an agent session.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -25,6 +25,44 @@ pub struct PullRequestInfo {
     /// The review decision, when the forge reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<PullRequestReview>,
+    /// Issue #1781: the PR's CI checks as GitHub rolls them up. Absent when
+    /// the PR has no checks, and from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<PullRequestChecks>,
+}
+
+/// Issue #1781: a pull request's CI checks, summarised the way GitHub's pull
+/// request list shows them — one overall result, and how many checks are in
+/// each bucket for the words beside it. Field names are single words so the
+/// desktop can pass the type to its webview as is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PullRequestChecks {
+    /// The overall result: failing when any check failed, otherwise pending
+    /// when any has not finished, otherwise passing.
+    pub state: PullRequestChecksState,
+    #[serde(default)]
+    pub passing: u32,
+    #[serde(default)]
+    pub failing: u32,
+    #[serde(default)]
+    pub pending: u32,
+    /// Skipped and neutral checks, which GitHub counts as neither passing nor
+    /// failing.
+    #[serde(default)]
+    pub skipped: u32,
+}
+
+/// Issue #1781: a pull request's overall CI result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestChecksState {
+    Passing,
+    Failing,
+    Pending,
+    /// A result this build does not know, sent by a newer daemon. Never
+    /// produced by this build; it only exists so deserialization succeeds.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A pull request's lifecycle state.

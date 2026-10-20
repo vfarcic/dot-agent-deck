@@ -22,10 +22,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### session/pr
 
-##### session/pr/001 — The daemon resolves the exact branch PR and serves its state and review.
+##### session/pr/001 — The daemon resolves the exact branch PR and serves its state, review and CI checks.
 - **Layer:** L2 headless, lane 1 (deterministic).
 - **Agent:** none (synthetic cat agent, strict offline gh stub).
-- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly. The stub requires explicit repository, all states and all required JSON fields.
+- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly; the winning PR's `statusCheckRollup` (check runs and a commit status) is served as its CI summary, failing first, with per-bucket counts (issue #1781). The stub requires explicit repository, all states and all required JSON fields, `statusCheckRollup` included.
 - **Does not assert:** periodic refresh (`session/pr/003`) or TUI rendering.
 - **Platform coverage:** mac+linux.
 
@@ -43,17 +43,17 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the particular event variant or metadata key used, browser invocation or real GitHub latency.
 - **Platform coverage:** mac+linux.
 
-##### session/pr/004 — A dashboard card shows the PR and o opens its URL.
+##### session/pr/004 — A dashboard card shows the PR with its CI and review, and o opens its URL.
 - **Layer:** L2 PTY-attached, lane 1 (deterministic).
 - **Agent:** none (synthetic cat agent, offline gh stub and BROWSER recorder).
-- **Asserts:** the real TUI displays `#1234 ⊙ ◐`; o on the selected card invokes BROWSER with the exact PR URL; the same key on a default-branch card spawns no opener and leaves Help usable.
+- **Asserts:** the real TUI displays `#1234 ⊙ ✓ ◉` for an open PR with passing CI awaiting review, with the review cell in inverse video and the CI cell not (issue #1781); o on the selected card invokes BROWSER with the exact PR URL; the same key on a default-branch card spawns no opener and leaves Help usable.
 - **Does not assert:** a real browser opening, real-agent execution or reel eligibility.
 - **Platform coverage:** mac+linux.
 
 ##### session/pr/005 — An interactive Haiku agent visibly works beside its pull request badge. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (real agent).
 - **Agent:** Claude Code (interactive Haiku; strict offline gh stub).
-- **Asserts:** a genuine agent on a fixture PR branch lists the files and reveals a uniquely named sentinel omitted from its prompt; the attached TUI displays that filename together with `#1234 ⊙ ◐`.
+- **Asserts:** a genuine agent on a fixture PR branch lists the files and reveals a uniquely named sentinel omitted from its prompt; the attached TUI displays that filename together with `#1234 ⊙ ✓ ◉`.
 - **Does not assert:** real GitHub authentication or network access, a browser opening, or live PR polling transitions.
 - **Platform coverage:** mac+linux.
 
@@ -170,8 +170,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/pane/016 — A card shows its pull request number with state and review glyphs at roomy and narrow widths.
 - **Layer:** L1 (ratatui TestBackend + insta).
 - **Agent:** none (synthetic SessionState).
-- **Asserts:** an open, review-required PR shows `#1234` at 80 and 30 columns; snapshots pin both sides of the review/state/stats/omission width boundaries and all lifecycle/review combinations, including Unknown (`?`) and absent review.
-- **Does not assert:** daemon resolution or browser invocation (`session/pr/*`).
+- **Asserts:** an open, review-required PR shows `#1234 ⊙ ◉` at 80 and 30 columns; snapshots pin both sides of the review/state/stats/omission width boundaries and all lifecycle/review combinations (`✓`, `±`, `◉`), including Unknown (`?`) and absent review.
+- **Does not assert:** daemon resolution or browser invocation (`session/pr/*`); CI glyphs (`dashboard/pane/017`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/017 — A card shows its pull request's CI result beside the review, which alone is filled.
+- **Layer:** L1 (ratatui TestBackend + insta).
+- **Agent:** none (synthetic SessionState).
+- **Asserts:** every CI result draws GitHub's mark in its colour between the state and the review (`✓` green, `✗` red, `●` yellow, `?` dark grey); the review cell is `REVERSED` and the CI cell is not, so an approval and passing CI differ; a PR with checks and no review shows the CI mark alone; narrowing drops the review, then CI, then the state, keeping the number, with snapshots of each boundary (issue #1781).
+- **Does not assert:** how `statusCheckRollup` becomes the CI result (`session/pr/001` and the `pull_request` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/stats

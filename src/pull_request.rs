@@ -88,13 +88,21 @@ use crate::untrusted_text::escape_control_and_bidi;
 // The wire types live in their own I/O-free module so the desktop crate can
 // name them without reaching this resolver. Re-exported so code that names
 // them through this module, as the e2e tests do, still resolves.
-pub use crate::pull_request_info::{PullRequestInfo, PullRequestReview, PullRequestState};
+pub use crate::pull_request_info::{
+    PullRequestChecks, PullRequestChecksState, PullRequestInfo, PullRequestReview, PullRequestState,
+};
 
 /// The `--json` fields the badge needs from `gh pr list`.
 /// `isCrossRepository` because `--head` matches a branch NAME, so a fork's
 /// pull request from a branch named like ours is listed too.
+///
+/// `statusCheckRollup` (issue #1781) is the heavy one: every check of the head
+/// commit, with its name, timestamps and URL. Measured against this
+/// repository's own open PR with 28 checks, it took the reply from 461 bytes
+/// to about 20 KB and the call from about 0.55–0.9 s to 0.87–1.4 s. The
+/// worktree reclaimer's lookup asks for its own, smaller list.
 pub(crate) const GH_PR_FIELDS: &str =
-    "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository";
+    "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository,statusCheckRollup";
 
 /// The arguments of `gh pr list` for `branch` of `repo_slug`, asking for
 /// `fields`. Shared with [`crate::worktree_reclaim`]'s PR lookup: `--state all`
@@ -231,6 +239,91 @@ struct GhPr {
     /// The PR's branch lives in a fork. Absent (an older `gh`) reads as not.
     #[serde(default)]
     is_cross_repository: bool,
+    /// Every check of the head commit. Absent (an older `gh`) or null reads
+    /// as no checks.
+    #[serde(default)]
+    status_check_rollup: Option<Vec<GhCheck>>,
+}
+
+/// One entry of `statusCheckRollup`: a check run (`status` and, once it has
+/// finished, `conclusion`) or a commit status (`state`).
+#[derive(serde::Deserialize)]
+struct GhCheck {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// Where one check counts on the badge.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckBucket {
+    Passing,
+    Failing,
+    Pending,
+    Skipped,
+}
+
+impl GhCheck {
+    /// The bucket GitHub puts this check in, or `None` for a value this build
+    /// does not know, which is left out of the counts rather than guessed.
+    fn bucket(&self) -> Option<CheckBucket> {
+        let field = |value: &Option<String>| value.clone().filter(|v| !v.is_empty());
+        if let Some(state) = field(&self.state) {
+            return match state.as_str() {
+                "SUCCESS" => Some(CheckBucket::Passing),
+                "PENDING" | "EXPECTED" => Some(CheckBucket::Pending),
+                "FAILURE" | "ERROR" => Some(CheckBucket::Failing),
+                _ => None,
+            };
+        }
+        if field(&self.status).is_some_and(|status| status != "COMPLETED") {
+            return Some(CheckBucket::Pending);
+        }
+        match field(&self.conclusion)?.as_str() {
+            "SUCCESS" => Some(CheckBucket::Passing),
+            "NEUTRAL" | "SKIPPED" => Some(CheckBucket::Skipped),
+            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => {
+                Some(CheckBucket::Failing)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Issue #1781: the badge's CI summary of `rollup`, or `None` when it holds no
+/// check this build can place. Failing wins over pending, and pending over
+/// passing, as GitHub's pull request list decides its one icon.
+fn summarize_checks(rollup: &[GhCheck]) -> Option<PullRequestChecks> {
+    let mut checks = PullRequestChecks {
+        state: PullRequestChecksState::Passing,
+        passing: 0,
+        failing: 0,
+        pending: 0,
+        skipped: 0,
+    };
+    for bucket in rollup.iter().filter_map(GhCheck::bucket) {
+        let count = match bucket {
+            CheckBucket::Passing => &mut checks.passing,
+            CheckBucket::Failing => &mut checks.failing,
+            CheckBucket::Pending => &mut checks.pending,
+            CheckBucket::Skipped => &mut checks.skipped,
+        };
+        *count = count.saturating_add(1);
+    }
+    if checks.passing + checks.failing + checks.pending + checks.skipped == 0 {
+        return None;
+    }
+    checks.state = if checks.failing > 0 {
+        PullRequestChecksState::Failing
+    } else if checks.pending > 0 {
+        PullRequestChecksState::Pending
+    } else {
+        PullRequestChecksState::Passing
+    };
+    Some(checks)
 }
 
 impl GhPr {
@@ -252,11 +345,13 @@ impl GhPr {
             Some("REVIEW_REQUIRED") => Some(PullRequestReview::ReviewRequired),
             _ => None,
         };
+        let checks = summarize_checks(self.status_check_rollup.as_deref().unwrap_or_default());
         Some(PullRequestInfo {
             number: self.number,
             url: self.url,
             state,
             review,
+            checks,
         })
     }
 }
@@ -952,6 +1047,7 @@ mod tests {
             url: "https://github.com/o/r/pull/1".into(),
             state,
             review: None,
+            checks: None,
         }))
     }
 
@@ -1056,9 +1152,108 @@ mod tests {
                 "--repo",
                 "o/r",
                 "--json",
-                "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository",
+                "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository,\
+                 statusCheckRollup",
             ]
         );
+    }
+
+    fn check_run(status: &str, conclusion: &str) -> serde_json::Value {
+        serde_json::json!({
+            "__typename": "CheckRun",
+            "name": "build",
+            "status": status,
+            "conclusion": conclusion,
+        })
+    }
+
+    fn status_context(state: &str) -> serde_json::Value {
+        serde_json::json!({ "__typename": "StatusContext", "context": "ci/x", "state": state })
+    }
+
+    fn checks_of(rollup: serde_json::Value) -> Option<PullRequestChecks> {
+        let mut pr = gh_pr(7, "feat/x", "OPEN", false, serde_json::json!(""));
+        pr["statusCheckRollup"] = rollup;
+        parse_pr_list(&gh(serde_json::json!([pr])), "feat/x")
+            .unwrap()
+            .unwrap()
+            .checks
+    }
+
+    /// Issue #1781: check runs and commit statuses land in GitHub's buckets,
+    /// and the overall result is GitHub's: any failure is red, otherwise
+    /// anything unfinished is pending, otherwise green.
+    #[test]
+    fn checks_roll_up_the_way_github_lists_them() {
+        use serde_json::json;
+        let all_kinds = checks_of(json!([
+            check_run("COMPLETED", "SUCCESS"),
+            check_run("COMPLETED", "FAILURE"),
+            check_run("COMPLETED", "TIMED_OUT"),
+            check_run("COMPLETED", "CANCELLED"),
+            check_run("COMPLETED", "ACTION_REQUIRED"),
+            check_run("COMPLETED", "STARTUP_FAILURE"),
+            check_run("COMPLETED", "SKIPPED"),
+            check_run("COMPLETED", "NEUTRAL"),
+            check_run("IN_PROGRESS", ""),
+            check_run("QUEUED", ""),
+            status_context("SUCCESS"),
+            status_context("ERROR"),
+            status_context("FAILURE"),
+            status_context("PENDING"),
+            status_context("EXPECTED"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            all_kinds,
+            PullRequestChecks {
+                state: PullRequestChecksState::Failing,
+                passing: 2,
+                failing: 7,
+                pending: 4,
+                skipped: 2,
+            }
+        );
+        let pending = checks_of(json!([
+            check_run("COMPLETED", "SUCCESS"),
+            check_run("IN_PROGRESS", ""),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (pending.state, pending.passing, pending.pending),
+            (PullRequestChecksState::Pending, 1, 1)
+        );
+        let passing = checks_of(json!([
+            check_run("COMPLETED", "SUCCESS"),
+            check_run("COMPLETED", "SKIPPED"),
+            status_context("SUCCESS"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (passing.state, passing.passing, passing.skipped),
+            (PullRequestChecksState::Passing, 2, 1)
+        );
+    }
+
+    /// Issue #1781: a PR with no checks shows no CI icon, whether `gh` sends
+    /// an empty rollup, a null one, none at all, or only values this build
+    /// cannot place.
+    #[test]
+    fn no_checks_means_no_ci_summary() {
+        use serde_json::json;
+        assert_eq!(checks_of(json!([])), None);
+        assert_eq!(checks_of(serde_json::Value::Null), None);
+        assert_eq!(
+            checks_of(json!([check_run("COMPLETED", "SOMETHING_NEW")])),
+            None
+        );
+        let pr = parse_pr_list(
+            &gh(json!([gh_pr(7, "feat/x", "OPEN", false, json!(""))])),
+            "feat/x",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(pr.checks, None);
     }
 
     /// The report a client applies carries the PR as JSON under the key, and
@@ -1077,6 +1272,7 @@ mod tests {
             url: "https://github.com/o/r/pull/1234".into(),
             state: PullRequestState::Open,
             review: Some(PullRequestReview::ReviewRequired),
+            checks: None,
         };
         let open = event(Some(info.clone()));
         assert_eq!(open.event_type, EventType::PullRequest);
@@ -1566,6 +1762,7 @@ mod tests {
             url: "https://github.com/o/r/pull/1401".to_string(),
             state: PullRequestState::Draft,
             review: Some(PullRequestReview::ChangesRequested),
+            checks: None,
         };
         let value = serde_json::to_value(&info).unwrap();
         assert_eq!(value["state"], "draft");
@@ -1581,6 +1778,7 @@ mod tests {
             url: "https://github.com/o/r/pull/7".to_string(),
             state: PullRequestState::Open,
             review: None,
+            checks: None,
         };
         let value = serde_json::to_value(&info).unwrap();
         assert!(value.get("review").is_none(), "None review must be omitted");
@@ -1588,8 +1786,9 @@ mod tests {
         assert_eq!(back, info);
     }
 
-    /// A newer daemon may send a state or review this build has never heard
-    /// of; the record must still deserialize, with the value read as Unknown.
+    /// A newer daemon may send a state, review or check result this build has
+    /// never heard of; the record must still deserialize, with the value read
+    /// as Unknown.
     #[test]
     fn unknown_state_and_review_values_deserialize_as_unknown() {
         let info: PullRequestInfo = serde_json::from_value(serde_json::json!({
@@ -1597,10 +1796,44 @@ mod tests {
             "url": "https://github.com/o/r/pull/9",
             "state": "queued_for_merge",
             "review": "dismissed_by_bot",
+            "checks": { "state": "awaiting_approval", "pending": 2 },
         }))
         .unwrap();
         assert_eq!(info.state, PullRequestState::Unknown);
         assert_eq!(info.review, Some(PullRequestReview::Unknown));
+        let checks = info.checks.unwrap();
+        assert_eq!(checks.state, PullRequestChecksState::Unknown);
+        assert_eq!((checks.pending, checks.passing), (2, 0));
+    }
+
+    /// Issue #1781: the checks summary is snake_case on the wire, and absent
+    /// when there are none, so an older client never sees the key.
+    #[test]
+    fn checks_round_trip_and_are_omitted_when_absent() {
+        let mut info = PullRequestInfo {
+            number: 7,
+            url: "https://github.com/o/r/pull/7".to_string(),
+            state: PullRequestState::Open,
+            review: None,
+            checks: None,
+        };
+        assert!(serde_json::to_value(&info).unwrap().get("checks").is_none());
+        info.checks = Some(PullRequestChecks {
+            state: PullRequestChecksState::Failing,
+            passing: 24,
+            failing: 1,
+            pending: 0,
+            skipped: 2,
+        });
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            value["checks"],
+            serde_json::json!({
+                "state": "failing", "passing": 24, "failing": 1, "pending": 0, "skipped": 2,
+            })
+        );
+        let back: PullRequestInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(back, info);
     }
 
     /// An older daemon's snapshot has no `pull_request` key; a newer client
@@ -1633,6 +1866,7 @@ mod tests {
             url: "https://github.com/o/r/pull/1401".to_string(),
             state: PullRequestState::Merged,
             review: Some(PullRequestReview::Approved),
+            checks: None,
         };
         snap.pull_request = Some(info.clone());
         let json = serde_json::to_string(&snap).unwrap();

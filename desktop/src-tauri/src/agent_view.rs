@@ -646,6 +646,7 @@ mod tests {
             url: "https://github.com/o/r/pull/1234".into(),
             state: PullRequestState::Open,
             review: Some(PullRequestReview::ReviewRequired),
+            checks: None,
         };
         let mut report = event("pane-7", "7", EventType::PullRequest);
         report.metadata.insert(
