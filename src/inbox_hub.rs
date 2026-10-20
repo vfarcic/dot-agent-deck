@@ -565,6 +565,10 @@ pub struct InboxHub {
     spill_manifest: Mutex<Option<(crate::inbox_spills::SpillManifest, u64)>>,
     /// Woken whenever a deadline may have moved, so the ticker re-plans.
     changed: Arc<Notify>,
+    /// U1 (R2-fix3): whether the ticker's [`Self::tick`] is running on the
+    /// blocking pool, and whether another was asked for meanwhile
+    /// ([`Self::request_tick`]).
+    clock_io: std::sync::Mutex<ClockIo>,
     keepalive: Duration,
     waiter_slots: Arc<Semaphore>,
     /// See [`ENV_TEST_PAUSE_WAITER_DELIVERY`].
@@ -578,6 +582,13 @@ pub struct InboxHub {
     #[cfg(test)]
     hold_caps:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+/// [`InboxHub::request_tick`]'s state.
+#[derive(Default)]
+struct ClockIo {
+    running: bool,
+    again: bool,
 }
 
 impl std::fmt::Debug for InboxHub {
@@ -702,6 +713,7 @@ impl InboxHub {
             }),
             spill_manifest: Mutex::new(None),
             changed: Arc::new(Notify::new()),
+            clock_io: std::sync::Mutex::new(ClockIo::default()),
             keepalive,
             waiter_slots: Arc::new(Semaphore::new(MAX_INBOX_WAITERS)),
             pause_waiter_delivery: false,
@@ -2234,6 +2246,14 @@ impl InboxHub {
 
     /// Run [`Self::tick`] at every ack deadline or claim expiry, for as long as
     /// the hub lives.
+    ///
+    /// U1 (R2-fix3): the ticker itself does no file IO. Each tick, whose
+    /// spool scans, caps writes and removals can stall for as long as the
+    /// filesystem does, runs on the blocking pool ([`Self::request_tick`]);
+    /// while it runs, the ticker still wakes for the one deadline that must
+    /// overtake a stalled write, a withheld attempt's staging, and applies it
+    /// itself ([`Self::expire_staging`]). The other deadlines wait for that
+    /// tick to end, which re-plans them.
     pub fn spawn_ticker(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let hub = Arc::downgrade(self);
         let changed = Arc::clone(&self.changed);
@@ -2243,22 +2263,7 @@ impl InboxHub {
                     let Some(hub) = hub.upgrade() else {
                         return;
                     };
-                    let st = hub.lock();
-                    let watched = st
-                        .delegates
-                        .values()
-                        .filter(|watch| !watch.notified)
-                        .map(|watch| watch.due)
-                        .min();
-                    [
-                        st.inbox.next_deadline(),
-                        watched,
-                        st.owed_retry_at,
-                        st.receipts.next_deadline(Instant::now()),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .min()
+                    hub.clock_deadline()
                 };
                 // A deadline that is far away still re-plans every minute, so a
                 // missed notification costs at most that long.
@@ -2273,9 +2278,84 @@ impl InboxHub {
                 let Some(hub) = hub.upgrade() else {
                     return;
                 };
-                hub.tick();
+                hub.expire_staging();
+                hub.request_tick();
             }
         })
+    }
+
+    /// The instant the ticker waits for: the earliest deadline, or, while a
+    /// tick it started is still running, the earliest staging deadline only,
+    /// since that tick applies the rest and re-plans when it ends.
+    fn clock_deadline(&self) -> Option<Instant> {
+        let ticking = self
+            .clock_io
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running;
+        let st = self.lock();
+        if ticking {
+            return st.receipts.staging_due_at();
+        }
+        let watched = st
+            .delegates
+            .values()
+            .filter(|watch| !watch.notified)
+            .map(|watch| watch.due)
+            .min();
+        [
+            st.inbox.next_deadline(),
+            watched,
+            st.owed_retry_at,
+            st.receipts.next_deadline(Instant::now()),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// U1 (R2-fix3): the ticker's own step, run whatever a tick is doing:
+    /// every withheld attempt whose staging ran out is released not handed
+    /// ([`engine::expire_staging`]). It does no file IO.
+    fn expire_staging(&self) {
+        let mut out = engine::Outbox::new();
+        {
+            let mut st = self.lock();
+            engine::expire_staging(&mut st, Instant::now(), &mut out);
+        }
+        engine::flush(out);
+    }
+
+    /// U1 (R2-fix3): run [`Self::tick`] on the blocking pool, so the ticker
+    /// that asked is never the thread its spool IO holds. One runs at a
+    /// time: a request while one runs makes it run once more when it ends,
+    /// and its end wakes the ticker to re-plan every deadline.
+    fn request_tick(self: &Arc<Self>) {
+        {
+            let mut io = self.clock_io.lock().unwrap_or_else(|e| e.into_inner());
+            if io.running {
+                io.again = true;
+                return;
+            }
+            io.running = true;
+        }
+        let hub = Arc::downgrade(self);
+        tokio::task::spawn_blocking(move || {
+            loop {
+                let Some(hub) = hub.upgrade() else {
+                    return;
+                };
+                hub.tick();
+                let mut io = hub.clock_io.lock().unwrap_or_else(|e| e.into_inner());
+                if std::mem::take(&mut io.again) {
+                    continue;
+                }
+                io.running = false;
+                drop(io);
+                hub.changed.notify_one();
+                return;
+            }
+        });
     }
 
     fn dispatch_all(&self) {
@@ -2313,6 +2393,9 @@ impl InboxHub {
             engine::dispatch(&mut st, &key, Instant::now(), &mut out);
             drop(st);
             engine::flush(out);
+            // A batch just staged has a staging deadline, which the ticker
+            // must know before the spool work below can stall (U1, R2-fix3).
+            self.changed.notify_one();
             // Releasing a batch can reclaim what it held back, whose files
             // go with the rest of the spool work.
             self.spool_work();
@@ -2731,6 +2814,9 @@ impl InboxHub {
     /// the lock — once batches' caps files, revoke markers and removals —
     /// then owed notices.
     fn after_receipts(&self) {
+        // A batch staged meanwhile has a staging deadline, which the ticker
+        // must know before the spool work can stall (U1, R2-fix3).
+        self.changed.notify_one();
         self.spool_work();
         self.changed.notify_one();
         self.post_owed_notices();
@@ -2810,7 +2896,8 @@ impl InboxHub {
     /// other threads' inbox calls go on taking the lock; the batch is then
     /// revalidated and sent under the lock ([`engine::release`]). R2-R02: a
     /// batch whose generation or waiter is already gone gets no caps file,
-    /// and one whose generation went during the write has its files removed.
+    /// and one whose generation went during the write has its files queued
+    /// for removal, which is best effort ([`engine::REMOVAL_TRIES`]).
     fn release_staged(&self) {
         loop {
             let staged = std::mem::take(&mut self.lock().receipts.staged);
@@ -2906,8 +2993,12 @@ impl InboxHub {
         if !checks.is_empty() {
             off_the_executor(|| {
                 for check in checks {
-                    let mut evidence = check.evidence.lock().unwrap_or_else(|e| e.into_inner());
-                    let engine::Evidence { store, scanner } = &mut *evidence;
+                    let mut scanner = check
+                        .evidence
+                        .scanner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let store = &mut &check.evidence.store;
                     let found = checked.entry(check.key).or_default();
                     let Some(scanner) = scanner.as_mut() else {
                         // §3's degraded policy: a generation whose receipts
@@ -3046,12 +3137,13 @@ impl InboxHub {
     /// second half refuses an attempt that went not handed meanwhile, the
     /// clock's scan still finds that receipt new and applies its commit.
     ///
-    /// The lookup is not repeated under the hub lock. What it found cannot
-    /// stop being true: a receipt is published once under an immutable name,
-    /// and only a holder of the attempt's commit cap could publish it, so a
-    /// later removal of the file does not undo that the commit happened. What
-    /// can change meanwhile is whether the model lets the attempt commit, and
-    /// that is checked again under the lock.
+    /// The lookup is not repeated under the hub lock. What it found stays
+    /// evidence of the commit: the record it read carried the attempt's own
+    /// commit cap, validated as it was read, and the publisher never
+    /// overwrites a record, so a later removal or replacement of the file —
+    /// which a same-user writer can make — does not undo that it was
+    /// published. What can change meanwhile is whether the model lets the
+    /// attempt commit, and that is checked again under the lock.
     pub(super) fn witnessed_commits(
         &self,
         key: &AgentKey,
@@ -3064,8 +3156,8 @@ impl InboxHub {
                 return candidates;
             }
             off_the_executor(|| {
-                let mut evidence = evidence.lock().unwrap_or_else(|e| e.into_inner());
-                let engine::Evidence { store, scanner } = &mut *evidence;
+                let mut scanner = evidence.scanner.lock().unwrap_or_else(|e| e.into_inner());
+                let store = &mut &evidence.store;
                 let Some(scanner) = scanner.as_mut() else {
                     return candidates;
                 };

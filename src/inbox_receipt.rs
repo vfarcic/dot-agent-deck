@@ -895,7 +895,7 @@ pub struct RecordScanner {
 }
 
 impl RecordScanner {
-    pub fn pass(&mut self, store: &mut EvidenceStore) -> ScanPass {
+    pub fn pass(&mut self, store: &mut impl Admit) -> ScanPass {
         let mut pass = ScanPass::default();
         if self.ended {
             self.ended = false;
@@ -1015,7 +1015,7 @@ impl RecordScanner {
     /// without error **and** that lookup finds neither name; unknown
     /// otherwise. Directory enumeration is not a snapshot, so the lookup, not
     /// the scan, is what sees a record linked behind the cursor.
-    pub fn presence(&mut self, store: &mut EvidenceStore, msg: &str, a: u32, e: u32) -> Presence {
+    pub fn presence(&mut self, store: &mut impl Admit, msg: &str, a: u32, e: u32) -> Presence {
         self.presence_of(
             store,
             msg,
@@ -1032,7 +1032,7 @@ impl RecordScanner {
     /// it never stands in for this lookup.
     pub fn commit_presence(
         &mut self,
-        store: &mut EvidenceStore,
+        store: &mut impl Admit,
         msg: &str,
         a: u32,
         e: u32,
@@ -1049,7 +1049,7 @@ impl RecordScanner {
     /// still recorded as one.
     pub fn commit_witnessed(
         &mut self,
-        store: &mut EvidenceStore,
+        store: &mut impl Admit,
         msg: &str,
         a: u32,
         e: u32,
@@ -1059,7 +1059,7 @@ impl RecordScanner {
 
     fn presence_of(
         &mut self,
-        store: &mut EvidenceStore,
+        store: &mut impl Admit,
         msg: &str,
         a: u32,
         e: u32,
@@ -1315,6 +1315,43 @@ impl EvidenceStore {
     /// caps are kept under its key).
     pub fn entries(&self) -> usize {
         self.issued.len() + self.admitted.len()
+    }
+}
+
+/// Where a scan admits the records it reads ([`RecordScanner::pass`] and the
+/// lookups): an [`EvidenceStore`] itself, or one behind its lock, which is
+/// then taken for each admission alone, so the scan's file IO holds no lock
+/// the store's other users wait for (U1, R2-fix3).
+pub trait Admit {
+    /// [`EvidenceStore::admitted`].
+    fn admitted(&mut self, key: &RecordKey) -> bool;
+    /// [`EvidenceStore::admit`].
+    fn admit(&mut self, body: &RecordBody) -> Admission;
+    /// [`EvidenceStore::check`].
+    fn check(&mut self, body: &RecordBody) -> Admission;
+}
+
+impl Admit for EvidenceStore {
+    fn admitted(&mut self, key: &RecordKey) -> bool {
+        EvidenceStore::admitted(self, key)
+    }
+    fn admit(&mut self, body: &RecordBody) -> Admission {
+        EvidenceStore::admit(self, body)
+    }
+    fn check(&mut self, body: &RecordBody) -> Admission {
+        EvidenceStore::check(self, body)
+    }
+}
+
+impl Admit for &std::sync::Mutex<EvidenceStore> {
+    fn admitted(&mut self, key: &RecordKey) -> bool {
+        self.lock().unwrap_or_else(|e| e.into_inner()).admitted(key)
+    }
+    fn admit(&mut self, body: &RecordBody) -> Admission {
+        self.lock().unwrap_or_else(|e| e.into_inner()).admit(body)
+    }
+    fn check(&mut self, body: &RecordBody) -> Admission {
+        self.lock().unwrap_or_else(|e| e.into_inner()).check(body)
     }
 }
 

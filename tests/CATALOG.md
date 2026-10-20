@@ -9051,10 +9051,10 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 
 ##### inbox/boundary/062 — A caps write that never returns is overtaken by its staging deadline.
-- **Layer:** Fast (`src/inbox_engine_tests.rs`), real spool, the caps write held by the test past one ack-wait, the clock ticked from the test.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), real spool, the hub's own ticker (`spawn_ticker`) as the only tick driver: producers hand nothing to waiters themselves, so the clock's tick issues and stages the batch and starts its caps write, which the test holds past one ack-wait; the test calls no `tick`.
 - **Agent:** none.
-- **Asserts:** with the write still held one ack-wait after staging, the attempt is `NotHanded`, the task is queued again and the card says receipts are degraded; when the write returns the waiter is sent no batch, and a waiter armed afterwards is handed attempt 1.2 without the possible-repeat line; a task cancelled under a hung write ends cancelled with its attempt reclaimed and no evidence reserved while the write is still held, and the caps file the late write links is removed (R2F-R01).
-- **Does not assert:** two batches taken in one release pass behind the stalled write (`still_staged` skipping the overtaken one), or a real filesystem stall.
+- **Asserts:** with the clock-owned write still held one ack-wait after staging, the attempt is `NotHanded`, the task is queued again and the card says receipts are degraded; when the write returns the waiter is sent no batch, and a waiter armed afterwards is handed attempt 1.2 without the possible-repeat line; a task cancelled under a hung write ends cancelled with its attempt reclaimed and no evidence reserved while the write is still held, and the caps file the late write links is removed (R2F-R01).
+- **Does not assert:** two batches taken in one release pass behind the stalled write (`still_staged` skipping the overtaken one), a stalled spool scan (rather than a caps write) under the clock, or a real filesystem stall.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/boundary/063 — An exact commit refused after its lookup still reaches the clock.
@@ -9382,10 +9382,24 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/024 — A stale hook waits for the SessionStart connected before it.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI child, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=none` knob, SessionStart's connection opened by the test before the hook runs and its event written after.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI child, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=none` knob, SessionStart's connection opened by a child process of the pane's scripted Claude (inside the agent's process tree, as Claude's own hooks are) before the hook runs, and its event written after.
 - **Agent:** none (synthetic Claude parent; no credential).
 - **Asserts:** in a pane with no agent type and nothing announced, a stale prompt hook's fetch that reaches the deck before the earlier SessionStart connection's event is held (the hook has not finished 400 ms later and the pane is still untyped); once that event reports Claude Code the fetch is refused: nothing of the task is printed, the task stays queued and the card's notice is `hooks_too_old` (R2F-R02).
-- **Does not assert:** the 2-second bound running out (an earlier connection that never sends a line), which serves the fetch the legacy way.
+- **Does not assert:** the 2-second bound running out (an earlier connection that never sends a line), which serves the fetch the legacy way (inbox/claude/025).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/025 — A silent earlier connection holds a stale fetch for two seconds, then legacy.
+- **Layer:** Fast (`src/daemon.rs`, `ingest_order_tests`), `route_hook_fetch` over a real registry with a `/bin/sh` agent and an `IngestOrder` whose earlier ticket never settles.
+- **Agent:** none.
+- **Asserts:** a doorbell-hook fetch with no integration from an untyped, unannounced generation is `Undecided`; with an earlier connection whose peer the deck cannot place, or one from the agent's own process tree, it is held for `HOOK_ROUTE_WAIT` (2 s, and less than 3 s more) and then served `Legacy`; with an earlier connection from a process outside the agent's tree it is routed at once; no ticket is left pending (R2-fix3 U2).
+- **Does not assert:** the hook socket's accept loop or a real stale hook binary (inbox/claude/024), or a SessionStart typing the generation within the hold.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/026 — Silent connections wait no more than the pool serves.
+- **Layer:** Fast (`src/daemon.rs`, `question_hold_tests`), the real hook loop (`run_hook_loop_with_limits`) with a pool of two and a 200 ms idle window, its `IngestOrder` read by the test.
+- **Agent:** none.
+- **Asserts:** with ten connections that send nothing, no more than two are ever pending a first message, all ten are accepted in turn as the idle window reclaims each, and none is left pending (R2-fix3 U2).
+- **Does not assert:** a fetch held while the pool is full, or the production pool size.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]

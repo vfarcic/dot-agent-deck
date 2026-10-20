@@ -3504,9 +3504,7 @@ fn once_waiter_fenced(
     let (a, e) = (at.a, at.e);
     let caps = hub.lock().receipts.gens[&key]
         .evidence
-        .lock()
-        .unwrap()
-        .store
+        .store()
         .caps(task.as_str(), a, e)
         .cloned()
         .expect("the deck minted the attempt's caps");
@@ -3562,9 +3560,7 @@ fn authority_held(hub: &InboxHub, id: &str, (a, e): (u32, u32)) -> bool {
     let key: AgentKey = ("p".into(), "a".into());
     let caps = hub.lock().receipts.gens[&key]
         .evidence
-        .lock()
-        .unwrap()
-        .store
+        .store()
         .caps(id, a, e)
         .is_some();
     caps && !reclaimed(hub, "p", id, a, e)
@@ -4497,9 +4493,7 @@ async fn boundary_061_an_exact_commit_needs_a_released_attempt_and_its_receipt()
     let publish_commit = |id: &str, e: u32| {
         let cap = hub.lock().receipts.gens[&("p".to_string(), "a".to_string())]
             .evidence
-            .lock()
-            .unwrap()
-            .store
+            .store()
             .caps(id, 1, e)
             .expect("the deck minted the attempt's caps")
             .commit
@@ -4579,17 +4573,35 @@ async fn boundary_061_an_exact_commit_needs_a_released_attempt_and_its_receipt()
     second.close().await;
 }
 
-/// Tick `hub` every 25 ms for `span`, from this thread.
-#[cfg(unix)]
-async fn tick_for(hub: &InboxHub, span: Duration) {
-    let started = Instant::now();
-    while started.elapsed() < span {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        hub.tick();
-    }
+/// A hub with a real spool and its own clock running, whose producers hand
+/// nothing to a waiter themselves ([`ENV_TEST_PAUSE_WAITER_DELIVERY`]), so a
+/// batch is issued and staged only by the clock's tick, which then writes
+/// its caps files itself. A generation other than `p`/`a` expects an
+/// integration soon, which wakes the clock once the test has posted.
+fn hub_staged_by_its_clock(
+    ack_wait: Duration,
+) -> (
+    Arc<InboxHub>,
+    tempfile::TempDir,
+    tokio::task::JoinHandle<()>,
+) {
+    let state = tempfile::tempdir().unwrap();
+    let limits = InboxLimits {
+        ack_wait,
+        ..InboxLimits::default()
+    };
+    let mut hub = InboxHub::new(deck(), limits, Duration::from_secs(30));
+    hub.pause_waiter_delivery = true;
+    let hub = Arc::new(hub);
+    hub.set_spool(
+        crate::inbox_receipt::Spool::start(&state.path().canonicalize().unwrap()).unwrap(),
+    );
+    hub.lock().receipts.arm_deadline = Duration::from_millis(50);
+    let ticker = hub.spawn_ticker();
+    (hub, state, ticker)
 }
 
-/// Scenario: A Claude once-waiter is issued a task and the deck's write of the batch's caps file hangs. With the write still hung, the clock runs past one ack-wait from staging: the attempt is recorded not handed by the deck, the task goes back to the queue, and the card says receipts are degraded. When the write finally returns, the waiter it was meant for is sent nothing, and a waiter armed afterwards is handed the task as attempt 1.2, not marked as a possible repeat. In a second pane, a task whose caps write hangs is cancelled: once the staging deadline passes it ends cancelled and its evidence is returned while the write is still hung, and when the write returns the caps file it linked is removed.
+/// Scenario: A Claude once-waiter is armed, and a task posted for it is issued and staged by the deck's own clock, whose tick then starts writing the batch's caps file, and the write hangs. Nothing else drives the clock. With the write still hung, the clock runs past one ack-wait from staging: the attempt is recorded not handed by the deck, the task goes back to the queue, and the card says receipts are degraded. When the write finally returns, the waiter it was meant for is sent nothing, and a waiter armed afterwards is handed the task as attempt 1.2, not marked as a possible repeat. In a second pane, a task whose clock-owned caps write hangs is cancelled: once the staging deadline passes it ends cancelled and its evidence is returned while the write is still hung, and when the write returns the caps file it linked is removed.
 #[cfg(unix)]
 #[spec("inbox/boundary/062")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4597,27 +4609,30 @@ async fn boundary_062_a_caps_write_that_never_returns_is_overtaken_by_its_stagin
     use crate::inbox_attempts::Stage;
     use crate::inbox_receipt::CapsLookup;
     let ack_wait = Duration::from_millis(150);
-    let (hub, _state) = hub_with_spool(Duration::from_secs(30), ack_wait);
+    let (hub, _state, ticker) = hub_staged_by_its_clock(ack_wait);
     let mut waiter = open_once(&hub, Some(HOOK_INTEGRATION));
     assert!(waiter.next().await.registered.is_some());
     let (entered, go) = hold_caps(&hub);
-    let posting = {
-        let hub = Arc::clone(&hub);
-        std::thread::spawn(move || {
-            hub.post_direct(Recipient::bound("p", "a"), content("hung write"))
-                .unwrap()
-        })
-    };
-    entered
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the caps write started");
-    let id = listed_id(&hub, "hung write");
-    tick_for(&hub, ack_wait * 3).await;
-    assert_eq!(
-        attempt_state(&hub, "p", "a", &id, 1, 1).0,
-        Stage::NotHanded,
-        "the staging deadline passed with the write still hung"
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("hung write"))
+        .unwrap();
+    assert!(
+        hub.lock().receipts.staged.is_empty(),
+        "the post staged nothing itself"
     );
+    hub.expect_integration("p", "b");
+    let started = tokio::task::spawn_blocking(move || {
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the clock's tick started the caps write")
+    });
+    started.await.unwrap();
+    let id = id.as_str().to_string();
+    until(
+        "the staging deadline to pass with the write still hung",
+        || attempt_state(&hub, "p", "a", &id, 1, 1).0 == Stage::NotHanded,
+    )
+    .await;
     assert_eq!(state_of(&hub, "p", &id), StateName::Queued);
     let degraded = hub.summary("p", "a").notices.receipts_degraded;
     assert!(
@@ -4627,7 +4642,6 @@ async fn boundary_062_a_caps_write_that_never_returns_is_overtaken_by_its_stagin
         "the card names the stalled write: {degraded:?}"
     );
     go.send(()).unwrap();
-    assert_eq!(posting.join().unwrap().as_str(), id);
     *hub.hold_caps.lock().unwrap() = None;
     let ended = tokio::time::timeout(Duration::from_secs(5), waiter.lines.next_line())
         .await
@@ -4646,22 +4660,23 @@ async fn boundary_062_a_caps_write_that_never_returns_is_overtaken_by_its_stagin
         batch[0].text
     );
     next.close().await;
+    ticker.abort();
 
-    let (hub, _state) = hub_with_spool(Duration::from_secs(30), ack_wait);
+    let (hub, _state, ticker) = hub_staged_by_its_clock(ack_wait);
     let mut waiter = open_once(&hub, Some(HOOK_INTEGRATION));
     assert!(waiter.next().await.registered.is_some());
     let (entered, go) = hold_caps(&hub);
-    let posting = {
-        let hub = Arc::clone(&hub);
-        std::thread::spawn(move || {
-            hub.post_direct(Recipient::bound("p", "a"), content("cancelled while hung"))
-                .unwrap()
-        })
-    };
-    entered
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the caps write started");
-    let id = listed_id(&hub, "cancelled while hung");
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("cancelled while hung"))
+        .unwrap();
+    hub.expect_integration("p", "b");
+    let started = tokio::task::spawn_blocking(move || {
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the clock's tick started the caps write")
+    });
+    started.await.unwrap();
+    let id = id.as_str().to_string();
     let revision = hub.lock().receipts.gens[&("p".to_string(), "a".to_string())]
         .model
         .delivery(&id)
@@ -4672,8 +4687,10 @@ async fn boundary_062_a_caps_write_that_never_returns_is_overtaken_by_its_stagin
         cancel.outcome,
         crate::daemon_protocol::InboxActionOutcome::Applied
     );
-    tick_for(&hub, ack_wait * 3).await;
-    assert_eq!(state_of(&hub, "p", &id), StateName::Undeliverable);
+    until("the staging deadline to end the cancelled task", || {
+        state_of(&hub, "p", &id) == StateName::Undeliverable
+    })
+    .await;
     assert_eq!(
         attempt_state(&hub, "p", "a", &id, 1, 1),
         (Stage::NotHanded, true),
@@ -4681,14 +4698,9 @@ async fn boundary_062_a_caps_write_that_never_returns_is_overtaken_by_its_stagin
     );
     assert_eq!(evidence_reserved(&hub, "p", "a"), 0);
     go.send(()).unwrap();
-    assert_eq!(posting.join().unwrap().as_str(), id);
     *hub.hold_caps.lock().unwrap() = None;
-    assert!(
-        matches!(caps_file(&hub, &id, 1, 1), CapsLookup::Missing),
-        "the caps file the late write linked was removed"
-    );
     // The Cancel revokes the attempt on the waiter's connection; no batch
-    // follows it.
+    // follows it, and the late release closes it.
     while let Some(line) = tokio::time::timeout(Duration::from_secs(5), waiter.lines.next_line())
         .await
         .expect("the waiter's connection ends")
@@ -4700,6 +4712,13 @@ async fn boundary_062_a_caps_write_that_never_returns_is_overtaken_by_its_stagin
             "the late release sent nothing: {line}"
         );
     }
+    // The removal runs in the same tick as that release, once it is done.
+    until("the caps file the late write linked to be removed", || {
+        !hub.clock_io.lock().unwrap().running
+            && matches!(caps_file(&hub, &id, 1, 1), CapsLookup::Missing)
+    })
+    .await;
+    ticker.abort();
 }
 
 /// Scenario: A Claude once-waiter is released a task, and its prompt hook publishes the task's committed receipt on the attempt's own cap. The exact-commit request's receipt lookup finds it, and then, before the request reaches the deck's lock, the deck records the attempt not handed. The request is refused under the lock, and the clock's next spool check still applies that receipt: the commit contradicting the not-handed witness is recorded and the task is acknowledged.

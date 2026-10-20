@@ -1025,20 +1025,52 @@ fn claude_023_a_raw_exact_commit_needs_the_attempts_receipt() {
     state(&daemon, &pane, &id, "acknowledged");
 }
 
-/// Scenario: In a pane started from its command alone, with no agent type and no deck waiter in Claude's settings, Claude's SessionStart hook has connected to the deck but its event has not been read yet when a prompt hook too old for the deck's messages fetches a queued task's doorbell. The deck holds the fetch until the earlier connection's event is in: the hook prints nothing while it waits, and once the SessionStart event reports Claude Code the fetch is refused as hooks too old, the task stays queued and the card names the notice.
+/// Scenario: In a pane started from its command alone, with no agent type and no deck waiter in Claude's settings, Claude's SessionStart hook — a process inside the pane's agent, as Claude's own hooks are — has connected to the deck but its event has not been read yet when a prompt hook too old for the deck's messages fetches a queued task's doorbell. The deck holds the fetch until the earlier connection's event is in: the hook prints nothing while it waits, and once the SessionStart event reports Claude Code the fetch is refused as hooks too old, the task stays queued and the card names the notice.
 #[spec("inbox/claude/024")]
 #[test]
 fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
-    use std::io::{Read, Write};
     let daemon = daemon(&[]);
     let pane = parent_as(&daemon, "claude-bare-early", None);
     let id = post(&daemon, &pane, NATIVE_BODY);
-    // SessionStart's connection, accepted before the fetch's, with its line
-    // not yet sent.
-    let mut session_start = std::os::unix::net::UnixStream::connect(daemon.hook_socket()).unwrap();
-    session_start
-        .set_read_timeout(Some(common::load_scaled(WAIT)))
-        .unwrap();
+    // SessionStart's connection, made from inside the pane's agent and
+    // accepted before the fetch's, with its line not yet sent: the child
+    // connects, says so, and sends the event only once told to.
+    let event = json!({"session_id":format!("native-{}", pane.agent),
+        "pane_id":pane.id,"agent_id":pane.agent,"token":pane.token,
+        "agent_type":"claude_code","event_type":"session_start",
+        "timestamp":chrono::Utc::now(),"cwd":daemon.cwd(),"metadata":{}});
+    let line = sidecar(&pane, "session-start-line");
+    std::fs::write(&line, format!("{event}\n")).unwrap();
+    let connected = sidecar(&pane, "session-start-connected");
+    let go = sidecar(&pane, "session-start-go");
+    let script = format!(
+        "import socket, os, time\n\
+         c = socket.socket(socket.AF_UNIX)\n\
+         c.connect({socket:?})\n\
+         open({connected:?}, 'w').close()\n\
+         end = time.time() + 30\n\
+         while not os.path.exists({go:?}) and time.time() < end: time.sleep(0.01)\n\
+         c.sendall(open({line:?}, 'rb').read())\n\
+         c.shutdown(socket.SHUT_WR)\n\
+         c.recv(4096)\n",
+        socket = daemon.hook_socket().to_string_lossy(),
+        connected = connected.to_string_lossy(),
+        go = go.to_string_lossy(),
+        line = line.to_string_lossy(),
+    );
+    let script_path = sidecar(&pane, "session-start.py");
+    std::fs::write(&script_path, script).unwrap();
+    command_with(
+        &pane,
+        "session-start",
+        json!({"kind":"wait","payload":{},
+               "shell":format!("python3 '{}'", script_path.to_string_lossy())}),
+    );
+    assert!(
+        common::wait_until(WAIT, || connected.exists()),
+        "SessionStart's hook connected: {:?}",
+        std::fs::read_to_string(sidecar(&pane, "stderr-session-start"))
+    );
     let mut hook = payload(&pane, "UserPromptSubmit");
     hook["prompt"] = json!(fixed_line(&id));
     command_with(
@@ -1061,14 +1093,7 @@ fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
         "nothing typed the pane yet: {}",
         record(&daemon, &pane)
     );
-    let event = json!({"session_id":format!("native-{}", pane.agent),
-        "pane_id":pane.id,"agent_id":pane.agent,"token":pane.token,
-        "agent_type":"claude_code","event_type":"session_start",
-        "timestamp":chrono::Utc::now(),"cwd":daemon.cwd(),"metadata":{}});
-    writeln!(session_start, "{event}").unwrap();
-    session_start.shutdown(std::net::Shutdown::Write).unwrap();
-    let mut answer = Vec::new();
-    let _ = session_start.read_to_end(&mut answer);
+    std::fs::write(&go, b"").unwrap();
     let stale = result(&pane, "stale");
     assert!(
         !stale["stdout"].as_str().unwrap().contains(NATIVE_BODY),

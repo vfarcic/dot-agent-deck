@@ -1042,7 +1042,8 @@ impl AttemptModel {
 
     /// Part 2 §2.4: hold one-shot attempt `(a, e)` of `id` back while the
     /// deck writes its caps file: it stays [`Attempt::withheld`] until
-    /// [`Self::released`], or for one ack-wait from `now` at most.
+    /// [`Self::released`], or until the clock's first step once one ack-wait
+    /// from `now` has passed ([`Self::expire_staging`]).
     ///
     /// R2F-R01: the write runs outside any lock and nothing bounds a stalled
     /// filesystem call, so the hold is bounded here instead. A healthy write
@@ -1083,12 +1084,15 @@ impl AttemptModel {
     }
 
     /// R2F-R01: every withheld attempt whose staging ran out by `now` is
-    /// released as not handed, by the deck's own witness. That is true
-    /// whenever the write finishes: the batch line goes only from
-    /// `engine::release`, under the same lock, after
-    /// [`Self::may_hand_over`], which refuses a final stage; so a release
-    /// that comes after this sends none of it. The caps file that late
-    /// write may leave is removed by that release, once the write is done.
+    /// released as not handed, by the deck's own witness. That holds from
+    /// this transition on, not from the deadline's instant: the batch line
+    /// goes only from `engine::release`, under the same lock, after
+    /// [`Self::may_hand_over`], which refuses a final stage, so a release
+    /// that comes after this sends none of it. A release that wins the lock
+    /// first, even past the deadline, finds the attempt still withheld and
+    /// may send it; this then finds nothing withheld and records nothing.
+    /// The caps file a late write may leave is queued for removal by that
+    /// release, once the write is done.
     fn staging_lapsed(&mut self, now: Instant) {
         let mut lapsed = Vec::new();
         for (id, msg) in self.messages.iter_mut() {
@@ -1107,6 +1111,15 @@ impl AttemptModel {
                 e,
             });
             self.deck_not_handed(now, &id, a, e, rx);
+        }
+    }
+
+    /// U1 (R2-fix3): [`Self::staging_lapsed`] on its own, for the clock's
+    /// step that must run while a tick is held up in spool IO; what
+    /// [`Self::tick_cleared`] would also do is left to that tick.
+    pub fn expire_staging(&mut self, now: Instant) {
+        if !self.exited {
+            self.staging_lapsed(now);
         }
     }
 

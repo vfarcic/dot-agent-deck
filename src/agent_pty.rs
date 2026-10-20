@@ -9408,9 +9408,12 @@ impl AgentPtyRegistry {
     /// reported ([`Self::set_agent_type_for_generation`]: an event its token
     /// attests, or, under the `warn` provenance policy, a token-less one when
     /// the generation is the pane's one speaker). Unlike
-    /// [`Self::spawn_agent_type`], a same-user hook producer can choose it,
-    /// so it may only steer a decision whose wrong answer refuses something
-    /// visibly, never one that grants.
+    /// [`Self::spawn_agent_type`], a same-user hook producer can choose it:
+    /// it is a routing hint, not authentication of the agent or its hooks.
+    /// `claude_hook_fetch` routes on it both ways: a claimed Claude type sends
+    /// a stale hook fetch to its visible refusal, and a non-Claude type
+    /// reported first keeps a real bare Claude on the legacy path, its mail
+    /// handed on legacy terms with no notice.
     pub fn reported_agent_type(&self, agent_id: &str) -> Option<AgentType> {
         self.inner
             .lock()

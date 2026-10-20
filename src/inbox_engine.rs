@@ -257,16 +257,28 @@ fn remove_later(st: &mut HubState, spool: Arc<GenerationSpool>, id: String, a: u
 }
 
 /// The evidence a generation's attempts publish into its spool.
+///
+/// U1 (R2-fix3): the store and the scanner have a lock each. The scanner's
+/// is held across the spool's file IO, and is taken only off the hub's lock;
+/// the store's is held for in-memory work alone, a scan taking it for each
+/// admission ([`crate::inbox_receipt::Admit`]), so the hub's lock, which
+/// takes the store's, never waits on a stalled read.
 pub(super) struct Evidence {
-    pub(super) store: EvidenceStore,
-    pub(super) scanner: Option<RecordScanner>,
+    pub(super) store: Mutex<EvidenceStore>,
+    pub(super) scanner: Mutex<Option<RecordScanner>>,
+}
+
+impl Evidence {
+    pub(super) fn store(&self) -> std::sync::MutexGuard<'_, EvidenceStore> {
+        self.store.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// One agent generation's receipt-owned delivery.
 pub(super) struct Gen {
     pub(super) model: AttemptModel,
     pub(super) spool: Option<Arc<GenerationSpool>>,
-    pub(super) evidence: Arc<Mutex<Evidence>>,
+    pub(super) evidence: Arc<Evidence>,
     pub(super) links: HashMap<Rx, Link>,
     /// §3: the generation's receipts cannot be recorded; sticky until exit.
     pub(super) degraded: Option<String>,
@@ -336,6 +348,16 @@ impl Receipts {
         self.floors.get(key).is_some_and(Floor::blocks)
     }
 
+    /// When the next withheld attempt's staging runs out: the deadline
+    /// [`expire_staging`] keeps, which the clock waits for even while a tick
+    /// it started is still in spool IO (U1, R2-fix3).
+    pub(super) fn staging_due_at(&self) -> Option<Instant> {
+        self.gens
+            .values()
+            .filter_map(|generation| generation.model.staging_due_at())
+            .min()
+    }
+
     /// The earliest instant [`tick`] has something to do for.
     pub(super) fn next_deadline(&self, now: Instant) -> Option<Instant> {
         let open = self.gens.values().any(|generation| {
@@ -386,12 +408,7 @@ impl Receipts {
             .min();
         // R2F-R01: a withheld attempt is released not handed when its
         // staging runs out.
-        let staging = self
-            .gens
-            .values()
-            .filter_map(|generation| generation.model.staging_due_at())
-            .min()
-            .map(|due| due.max(now));
+        let staging = self.staging_due_at().map(|due| due.max(now));
         // A removal that failed is tried again on the next tick.
         let retry = (!self.failed_removals.is_empty()).then(|| now + step);
         // C-3: a hook receiver is closed when its hold runs out.
@@ -481,10 +498,10 @@ pub(super) fn generation_mut<'a>(
         Gen {
             model,
             spool,
-            evidence: Arc::new(Mutex::new(Evidence {
-                store: EvidenceStore::default(),
-                scanner,
-            })),
+            evidence: Arc::new(Evidence {
+                store: Mutex::new(EvidenceStore::default()),
+                scanner: Mutex::new(scanner),
+            }),
             links: HashMap::new(),
             degraded,
             paused: false,
@@ -524,15 +541,12 @@ pub(super) fn register(
     // component sees the line. An attempt whose caps the store no longer
     // holds is left out: there is no authority to hand back.
     let correctable: Vec<InboxCorrectable> = {
-        let evidence = generation
-            .evidence
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let store = generation.evidence.store();
         registration
             .correctable
             .iter()
             .filter_map(|(id, a, e)| {
-                let caps = evidence.store.caps(id, *a, *e)?;
+                let caps = store.caps(id, *a, *e)?;
                 Some(InboxCorrectable {
                     id: id.clone(),
                     a: *a,
@@ -737,13 +751,7 @@ fn issue_to(
             }
         };
         generation.paused = false;
-        let caps = match generation
-            .evidence
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .store
-            .issue(id, issued.a, issued.e)
-        {
+        let caps = match generation.evidence.store().issue(id, issued.a, issued.e) {
             Ok(caps) => Some(InboxAttemptCaps {
                 handed: caps.handed.hex(),
                 commit: caps.commit.hex(),
@@ -920,9 +928,11 @@ fn same_spool(a: &Option<Arc<GenerationSpool>>, b: &Option<Arc<GenerationSpool>>
 /// handed by the deck itself, which is true: no byte of it left the deck
 /// (R2-R01: that needs no live receiver). With nothing left to send, the
 /// waiter's connection is closed, so it exits with nothing and the doorbell
-/// covers the mail.
+/// covers the mail. Sending here queues the line; the waiter's connection
+/// task writes it afterwards, outside the lock.
 ///
-/// R2-R02: until this runs, or until its staging runs out (R2F-R01), every
+/// R2-R02: until this runs, or until the clock applies its staging deadline
+/// (R2F-R01, [`expire_staging`]), every
 /// attempt of the batch is withheld, so no cleanup can reclaim it and remove
 /// its files while its caps file is being written. A batch whose generation
 /// exited meanwhile has no model left to reclaim it, and an attempt whose
@@ -1085,7 +1095,7 @@ pub(super) fn commit_candidates(
     st: &HubState,
     key: &AgentKey,
     attempts: &[InboxAttemptRef],
-) -> Option<(Vec<InboxAttemptRef>, Arc<Mutex<Evidence>>)> {
+) -> Option<(Vec<InboxAttemptRef>, Arc<Evidence>)> {
     let generation = st.receipts.gens.get(key)?;
     let admissible = attempts
         .iter()
@@ -1297,9 +1307,7 @@ pub(super) fn control(
             // handed the attempt's caps again; it never passes them on.
             let caps = generation
                 .evidence
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .store
+                .store()
                 .caps(&reply.id, reply.a, reply.e)
                 .map(|caps| InboxAttemptCaps {
                     handed: caps.handed.hex(),
@@ -1458,6 +1466,35 @@ pub(super) fn tick(
     }
 }
 
+/// U1 (R2-fix3): R2F-R01's staging deadline alone, for every generation:
+/// each withheld attempt whose staging ran out by `now` is released not
+/// handed ([`AttemptModel::expire_staging`]) and its verdict applied. This is
+/// the clock's own step, which [`tick`]'s spool IO does not hold up: it does
+/// no file IO, and the evidence store's lock it may take under the caller's
+/// is held for in-memory work only ([`Evidence`]). It dispatches nothing;
+/// issuing is left to the tick. Answers whether anything was released.
+pub(super) fn expire_staging(st: &mut HubState, now: Instant, out: &mut Outbox) -> bool {
+    let due: Vec<AgentKey> = st
+        .receipts
+        .gens
+        .iter()
+        .filter(|(_, generation)| {
+            generation
+                .model
+                .staging_due_at()
+                .is_some_and(|due| now >= due)
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in &due {
+        if let Some(generation) = st.receipts.gens.get_mut(key) {
+            generation.model.expire_staging(now);
+        }
+        apply(st, key, now, out);
+    }
+    !due.is_empty()
+}
+
 /// PRD #1666 G3: generation `key` reported a turn edge the registry accepted
 /// from its live owner, or kept for its reserved spawn, numbered `seen.seq`.
 /// A turn starting makes the clock busy; one under way ending makes it idle
@@ -1499,7 +1536,7 @@ pub(super) fn note_turn(st: &mut HubState, key: &AgentKey, seen: TurnSeen, now: 
 /// One generation's spool IO for the clock (§3).
 pub(super) struct Check {
     pub(super) key: AgentKey,
-    pub(super) evidence: Arc<Mutex<Evidence>>,
+    pub(super) evidence: Arc<Evidence>,
     /// The lapse candidates the spool lookup must clear.
     pub(super) candidates: Vec<LapseCheck>,
     /// The ended messages' fenced attempts the lookup must verify.
@@ -1639,12 +1676,7 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
                 let Some(generation) = st.receipts.gens.get(key) else {
                     continue;
                 };
-                generation
-                    .evidence
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .store
-                    .forget(&id, a, e);
+                generation.evidence.store().forget(&id, a, e);
                 if let Some(spool) = generation.spool.clone() {
                     remove_later(st, spool, id, a, e);
                 }
