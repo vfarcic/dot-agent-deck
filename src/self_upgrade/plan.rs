@@ -642,7 +642,7 @@ impl UpgradePlan {
     /// What the copy is called in every message.
     pub fn label(&self) -> &'static str {
         match self.installation.copy {
-            CopyKind::Cli => "dot-agent-deck",
+            CopyKind::Cli => "dot-agent-deck CLI",
             CopyKind::Desktop => "Agent Deck (desktop app)",
         }
     }
@@ -790,6 +790,31 @@ impl UpgradePlan {
             lines.push(PlanLine::Command(BETA_TO_STABLE_COMMAND.to_string()));
         }
         lines
+    }
+
+    /// The plan as a terminal client shows it: [`Self::items`], and, for a
+    /// CLI that is behind, what upgrading it does to the daemon on this
+    /// machine ([`Self::daemon_line`]). The TUI's dialog and
+    /// `dot-agent-deck upgrade` show this; the desktop app shows
+    /// [`Self::items`] and says what happens to the daemon in its own flow,
+    /// which restarts it from the app.
+    pub fn terminal_items(&self) -> Vec<PlanLine> {
+        let mut lines = self.items();
+        lines.extend(self.daemon_line());
+        lines
+    }
+
+    /// What upgrading this copy does to the daemon on this machine, for a
+    /// terminal client: the CLI is the daemon's binary, but replacing it does
+    /// not restart the daemon that is running, and the TUI's next start does,
+    /// under its usual question when agents are running. `None` for the
+    /// desktop app and for a copy that is up to date.
+    pub fn daemon_line(&self) -> Option<PlanLine> {
+        (self.installation.copy == CopyKind::Cli && self.action != PlanAction::UpToDate).then(|| {
+            PlanLine::Text(
+                "Upgrading does not restart the daemon on this machine, so its agents keep running. The next time you start the TUI, it restarts a daemon running another version onto its own, asking first when agents are running on it.".to_string(),
+            )
+        })
     }
 
     /// The plan as one block of text.
@@ -1190,7 +1215,7 @@ mod tests {
         );
         assert_eq!(
             plan.headline(),
-            "dot-agent-deck: update available: v0.46.0 (current: v0.45.0)"
+            "dot-agent-deck CLI: update available: v0.46.0 (current: v0.45.0)"
         );
         let command = install_binary_command(
             plan.installation.platform,
@@ -1207,7 +1232,7 @@ mod tests {
         assert!(!plan.text().contains("NOT be checked"));
         assert_eq!(
             plan.confirm_question().as_deref(),
-            Some("Upgrade dot-agent-deck to v0.46.0?")
+            Some("Upgrade dot-agent-deck CLI to v0.46.0?")
         );
     }
 
@@ -1522,7 +1547,7 @@ mod tests {
                 assert_eq!(plan.stable_switch.as_deref(), Some("0.47.0"));
                 assert_eq!(
                     plan.headline(),
-                    format!("dot-agent-deck: update available: v0.47.0 (current: v{version})")
+                    format!("dot-agent-deck CLI: update available: v0.47.0 (current: v{version})")
                 );
                 let text = plan.text();
                 assert!(
@@ -1571,7 +1596,7 @@ mod tests {
             assert_eq!(plan.stable_switch, None);
             assert_eq!(
                 plan.confirm_question().as_deref(),
-                Some("Upgrade dot-agent-deck to v0.47.0-beta.3?")
+                Some("Upgrade dot-agent-deck CLI to v0.47.0-beta.3?")
             );
             let text = plan.text();
             assert!(text.contains("brew upgrade dot-agent-deck-beta"), "{text}");
@@ -1606,7 +1631,7 @@ mod tests {
         assert_eq!(plan.stable_switch.as_deref(), Some("0.47.0"));
         assert_eq!(
             plan.confirm_question().as_deref(),
-            Some("Upgrade dot-agent-deck to v0.47.0-beta.3?")
+            Some("Upgrade dot-agent-deck CLI to v0.47.0-beta.3?")
         );
         let text = plan.text();
         assert!(text.contains("brew upgrade dot-agent-deck-beta"), "{text}");
@@ -1707,7 +1732,7 @@ mod tests {
         );
         assert_eq!(
             plan.confirm_question().as_deref(),
-            Some("Upgrade dot-agent-deck to v0.47.0?")
+            Some("Upgrade dot-agent-deck CLI to v0.47.0?")
         );
 
         // Already on the newest stable: up to date, never offered the beta.
@@ -1873,5 +1898,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn plan_032_terminal_clients_say_what_a_cli_upgrade_does_to_the_daemon() {
+        // Issue #1753: the CLI is the daemon's binary, so a terminal client's
+        // plan for it says the running daemon is left alone and what the
+        // TUI's next start does. The headline names the copy as the CLI, so
+        // it never reads as a statement about a daemon.
+        let exe = "/home/u/.local/bin/dot-agent-deck";
+        let behind = plan(
+            &cli(
+                exe,
+                InstallMethod::DownloadedWritable {
+                    binary: PathBuf::from(exe),
+                },
+            ),
+            &"0.46.0".into(),
+            &options(),
+        );
+        assert_eq!(
+            behind.headline(),
+            "dot-agent-deck CLI: update available: v0.46.0 (current: v0.45.0)"
+        );
+        let daemon = behind.daemon_line().expect("a CLI behind says it");
+        assert!(
+            daemon
+                .render()
+                .starts_with("Upgrading does not restart the daemon on this machine"),
+            "{daemon:?}"
+        );
+        assert_eq!(behind.terminal_items().last(), Some(&daemon));
+        assert_eq!(behind.terminal_items().len(), behind.items().len() + 1);
+        assert!(
+            !behind.items().contains(&daemon),
+            "the desktop's items stay as they were"
+        );
+
+        let current = plan(
+            &cli(
+                exe,
+                InstallMethod::DownloadedWritable {
+                    binary: PathBuf::from(exe),
+                },
+            ),
+            &"0.45.0".into(),
+            &options(),
+        );
+        assert_eq!(current.daemon_line(), None);
+        assert_eq!(
+            current.headline(),
+            "dot-agent-deck CLI is up to date (v0.45.0)."
+        );
+
+        let app = plan(
+            &install(
+                CopyKind::Desktop,
+                "/usr/bin/dot-agent-deck-desktop",
+                Platform::LinuxAmd64,
+                InstallMethod::DesktopDeb,
+            ),
+            &"0.46.0".into(),
+            &options(),
+        );
+        assert_eq!(app.daemon_line(), None);
+        assert!(
+            app.headline()
+                .starts_with("Agent Deck (desktop app): update available:")
+        );
     }
 }

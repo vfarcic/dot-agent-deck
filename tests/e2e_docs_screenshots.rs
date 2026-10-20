@@ -1174,7 +1174,7 @@ fn docs_screenshot_self_upgrade() {
         )) && grid.contains(&format!("Upgrade to v{SELF_UPGRADE_LATEST}"))
             && grid.contains("Downloaded binary at")
             && grid.contains(&format!(
-                "Upgrade dot-agent-deck to v{SELF_UPGRADE_LATEST}?"
+                "Upgrade dot-agent-deck CLI to v{SELF_UPGRADE_LATEST}?"
             ))
             && grid.contains("> Cancel"))
         .then(|| render_page(screen, "self-upgrade (TUI)", &RenderOptions::default()))

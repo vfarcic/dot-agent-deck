@@ -190,22 +190,20 @@ fn inspect_new_endpoints(paths: &EndpointPaths) -> Vec<String> {
     failures
 }
 
-/// Issue #1211: is `path` an owner-only Unix socket — the shape the daemon's
-/// legacy alias must have for an older client to trust it at all.
-fn is_owner_only_socket(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|md| md.file_type().is_socket() && md.mode() & 0o777 == 0o600)
-        .unwrap_or(false)
-}
-
-/// Issue #1211: wait for the daemon's exit to have unlinked `path`. `daemon
-/// stop` reports once the daemon is gone, and the alias is released just
-/// before that, so this normally holds on the first check; the bound is for a
-/// loaded box.
-fn wait_until_absent(path: &Path) -> bool {
-    common::wait_until(std::time::Duration::from_secs(10), || {
-        fs::symlink_metadata(path).is_err()
-    })
+/// Issue #1213: the daemon binds nothing at the redirected pre-#1121
+/// spellings. Releases v0.41.1 to v0.47.0 bound both there as #1211's alias;
+/// this is the check that the alias stays removed.
+fn legacy_spellings_left_unbound(legacy: &LegacyEndpointPaths, arm: &str) -> Vec<String> {
+    [&legacy.hook, &legacy.attach]
+        .into_iter()
+        .filter(|path| fs::symlink_metadata(path).is_ok())
+        .map(|path| {
+            format!(
+                "the {arm} daemon created the pre-#1121 spelling {}",
+                path.display()
+            )
+        })
+        .collect()
 }
 
 fn stop_resolved_daemon(
@@ -244,7 +242,7 @@ fn stop_resolved_daemon(
     }
 }
 
-/// Scenario: Launch the real deck with isolated fallback and legacy roots, with `XDG_RUNTIME_DIR` and both endpoint overrides absent. The dashboard should render while the hook and attach sockets live inside a mode-0700 per-uid directory, and the same daemon should also answer at the redirected pre-#1121 hook and attach spellings so an older client finds it, removing both when it stops; a second launch with `XDG_RUNTIME_DIR` set should retain its established endpoint spellings and bind no alias, and neither launch should change the literal production legacy paths.
+/// Scenario: Launch the real deck with isolated fallback and legacy roots, with `XDG_RUNTIME_DIR` and both endpoint overrides absent. The dashboard should render while the hook and attach sockets live inside a mode-0700 per-uid directory and nothing is created at the redirected pre-#1121 hook and attach spellings; a second launch with `XDG_RUNTIME_DIR` set should retain its established endpoint spellings and leave the pre-#1121 spellings alone too, and neither launch should change the literal production legacy paths.
 #[spec("error/socket/009")]
 #[test]
 fn socket_009_fallback_endpoints_use_owner_only_uid_directory() {
@@ -258,48 +256,13 @@ fn socket_009_fallback_endpoints_use_owner_only_uid_directory() {
     let deck = launch_fallback_deck(temp.path(), &legacy, &log);
     deck.wait_for_string(DASHBOARD_EMPTY_STATE);
     let mut failures = inspect_new_endpoints(&paths);
-
-    // Issue #1211: the old spellings are aliases of THIS daemon, not a second
-    // one. Both are owner-only sockets; the attach alias answers a real
-    // `ListAgents`; and the log still holds exactly one `Attach protocol
-    // listening` line, the count an operator (and `cargo xver`) reads as "one
-    // daemon".
-    for alias in [&legacy.hook, &legacy.attach] {
-        if !is_owner_only_socket(alias) {
-            failures.push(format!(
-                "the pre-#1121 alias {} is not an owner-only socket while the fallback daemon runs",
-                alias.display()
-            ));
-        }
-    }
-    let records = common::agent_records_on(&legacy.attach);
-    if !records.is_empty() {
-        failures.push(format!(
-            "the legacy attach alias reached a daemon with records: {records:?}"
-        ));
-    }
-    let log_contents = fs::read_to_string(&log).unwrap_or_default();
-    let listeners = log_contents.matches("Attach protocol listening").count();
-    if listeners != 1 {
-        failures.push(format!(
-            "expected one daemon behind the primary and its aliases, found {listeners} \
-             `Attach protocol listening` lines:\n{log_contents}"
-        ));
-    }
+    failures.extend(legacy_spellings_left_unbound(&legacy, "fallback"));
 
     let home = deck.home_dir().to_path_buf();
     if let Err(error) = stop_resolved_daemon(temp.path(), &legacy, None, &home) {
         failures.push(error);
     }
     drop(deck);
-    for alias in [&legacy.hook, &legacy.attach] {
-        if !wait_until_absent(alias) {
-            failures.push(format!(
-                "the pre-#1121 alias {} was left behind after the daemon stopped",
-                alias.display()
-            ));
-        }
-    }
 
     let runtime = common::harness_tempdir().expect("create isolated XDG_RUNTIME_DIR");
     let xdg_hook = runtime.path().join("dot-agent-deck.sock");
@@ -314,16 +277,7 @@ fn socket_009_fallback_endpoints_use_owner_only_uid_directory() {
         .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "30")
         .launch_with_fixture("minimal");
     xdg_deck.wait_for_string(DASHBOARD_EMPTY_STATE);
-    // Issue #1211: the XDG spellings are identical in every build, so there is
-    // no older client to serve and no alias to bind.
-    for alias in [&legacy.hook, &legacy.attach] {
-        if fs::symlink_metadata(alias).is_ok() {
-            failures.push(format!(
-                "an XDG_RUNTIME_DIR daemon bound the pre-#1121 alias {}",
-                alias.display()
-            ));
-        }
-    }
+    failures.extend(legacy_spellings_left_unbound(&legacy, "XDG_RUNTIME_DIR"));
     for endpoint in [&xdg_attach, &xdg_hook] {
         match fs::symlink_metadata(endpoint) {
             Ok(metadata) if metadata.file_type().is_socket() => {}
@@ -352,7 +306,7 @@ fn socket_009_fallback_endpoints_use_owner_only_uid_directory() {
     );
 }
 
-/// Scenario: Plant a regular file at an isolated legacy attach path, then launch the real deck with isolated fallback and legacy roots and endpoint overrides absent. Startup should still reach the dashboard, bind both endpoints in the new per-uid directory and the unsquatted legacy hook alias, leave the planted file untouched both while the daemon runs and after it stops, and never change the literal production legacy paths.
+/// Scenario: Plant a regular file at an isolated legacy attach path, then launch the real deck with isolated fallback and legacy roots and endpoint overrides absent. Startup should still reach the dashboard, bind both endpoints in the new per-uid directory, leave the planted file untouched both while the daemon runs and after it stops, and never change the literal production legacy paths.
 #[spec("error/socket/010")]
 #[test]
 fn socket_010_legacy_path_squatter_does_not_wedge_startup() {
@@ -384,27 +338,11 @@ fn socket_010_legacy_path_squatter_does_not_wedge_startup() {
     deck.wait_for_string(DASHBOARD_EMPTY_STATE);
     let mut failures = inspect_new_endpoints(&paths);
     check_squatter(&mut failures, "while the daemon runs");
-    // Issue #1211: the squatter costs the attach alias and nothing else — the
-    // daemon started (the dashboard above), its primary pair is bound, and the
-    // hook alias beside the squatted one still binds.
-    if !is_owner_only_socket(&legacy.hook) {
-        failures.push(format!(
-            "the unsquatted legacy hook alias {} was not bound beside the squatted attach path",
-            legacy.hook.display()
-        ));
-    }
     let home = deck.home_dir().to_path_buf();
     if let Err(error) = stop_resolved_daemon(temp.path(), &legacy, None, &home) {
         failures.push(error);
     }
     drop(deck);
-    // …and the daemon's exit removes its own alias and never the squatter.
-    if !wait_until_absent(&legacy.hook) {
-        failures.push(format!(
-            "the legacy hook alias {} was left behind after the daemon stopped",
-            legacy.hook.display()
-        ));
-    }
     check_squatter(&mut failures, "after the daemon stopped");
 
     literal_legacy.assert_unchanged();
@@ -658,7 +596,6 @@ fn bwrap_squat_source(scratch: &Path) -> Option<PathBuf> {
 /// to read after the namespace — and every process in it — is gone.
 const SQUAT_SCENARIO: &str = r#"
 set -u
-legacy_attach="$DOT_AGENT_DECK_TEST_LEGACY_ENDPOINT_ROOT/dot-agent-deck-attach-$(id -u).sock"
 "$DAD_BIN" daemon serve >"$OUT/serve.out" 2>&1 &
 pid=$!
 i=0
@@ -668,14 +605,13 @@ until "$DAD_BIN" daemon endpoint >"$OUT/endpoint" 2>"$OUT/endpoint.err"; do
     sleep 0.1
 done
 "$DAD_BIN" daemon status >"$OUT/status" 2>&1; echo $? >"$OUT/status.rc"
-[ -S "$legacy_attach" ] && echo bound >"$OUT/alias"
 kill "$pid"; wait "$pid"
 DOT_AGENT_DECK_EXIT_AFTER_HANDSHAKE=1 "$DAD_BIN" </dev/null >"$OUT/launch" 2>&1; echo $? >"$OUT/launch.rc"
 "$DAD_BIN" daemon endpoint >"$OUT/endpoint2" 2>&1
 "$DAD_BIN" daemon stop >"$OUT/stop" 2>&1; echo $? >"$OUT/stop.rc"
 "#;
 
-/// Scenario: Inside a bubblewrap namespace, bind a root-owned directory over the isolated `TMPDIR`'s `dot-agent-deck-<uid>` name so it reads as another user's, then run the real `daemon serve` with `XDG_RUNTIME_DIR` and both endpoint overrides absent. Instead of refusing to start, the daemon should bind inside one new owner-only `dot-agent-deck-<uid>.<16 hex>` directory that `daemon endpoint` and `daemon status` both find, still holding the redirected legacy alias; a later lazy-spawn through the launcher should reuse that same directory, and the literal production legacy paths should stay unchanged.
+/// Scenario: Inside a bubblewrap namespace, bind a root-owned directory over the isolated `TMPDIR`'s `dot-agent-deck-<uid>` name so it reads as another user's, then run the real `daemon serve` with `XDG_RUNTIME_DIR` and both endpoint overrides absent. Instead of refusing to start, the daemon should bind inside one new owner-only `dot-agent-deck-<uid>.<16 hex>` directory that `daemon endpoint` and `daemon status` both find; a later lazy-spawn through the launcher should reuse that same directory, and the literal production legacy paths should stay unchanged.
 #[spec("error/socket/014")]
 #[test]
 fn socket_014_a_foreign_owned_uid_directory_relocates_instead_of_wedging() {
@@ -815,12 +751,6 @@ fn socket_014_a_foreign_owned_uid_directory_relocates_instead_of_wedging() {
             "`daemon status` did not reach the relocated daemon: rc {:?}, output {:?}",
             read("status.rc"),
             read("status")
-        ));
-    }
-    if read("alias").trim() != "bound" {
-        failures.push(format!(
-            "the relocated daemon did not bind the redirected legacy attach alias {}",
-            legacy.attach.display()
         ));
     }
     if read("launch.rc").trim() != "0" {
