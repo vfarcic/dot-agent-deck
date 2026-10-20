@@ -874,6 +874,30 @@ action = "dictate_to_agent"
 outcome = "dispatch"
 dictate_prefix = "tell it to"
 
+[[fixtures]]
+name = "dictate-a-submit-word-in-passing-enter"
+utterance = "tell it to enter the result"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "tell it to"
+
+[[fixtures]]
+name = "dictate-a-submit-word-in-passing-finished"
+utterance = "tell it the build has finished"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "tell it"
+
+[[fixtures]]
+name = "dictate-a-submit-word-in-passing-go-ahead"
+utterance = "tell it to go ahead with the refactor"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "tell it to"
+
 # PRD #1260 — the dictation MODE's switches, in `Idle` (the only state these
 # fixtures run in: with the mode on nothing reaches the model, so in-mode
 # classification is proven by `voice::outcome`'s unit tests, not here).

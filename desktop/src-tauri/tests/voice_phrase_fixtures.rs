@@ -52,9 +52,9 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use dot_agent_deck_desktop::voice::{
-    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceChoice,
-    VoiceDictationTarget, VoiceDirectories, VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm,
-    VoiceOutcome,
+    IntentResolver, MeaningRequest, NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Strictness,
+    Transcript, VoiceChoice, VoiceDictationTarget, VoiceDirectories, VoiceDirectoryEntry,
+    VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome,
     dictation::normalise,
     handle_utterance_with_dictation,
     schema::DECK_HIDDEN_HINT,
@@ -439,6 +439,255 @@ async fn voice_paraphrase_fixtures_match_the_default_backend() {
     run_fixtures(fixtures).await;
 }
 
+/// Scenario: Force a submit-prompt meaning check for each historical G1 sentence
+/// that asks to dictate a submit word, bypassing command selection so it cannot
+/// hide an unsafe judge verdict; a bare send request must still be accepted.
+#[tokio::test]
+async fn voice_submit_words_in_passing_are_refused_by_the_real_judge() {
+    let submit = table().row("submit_prompt").expect("shipped submit row");
+    let (strictness, _) = submit.meaning_for(None, None).expect("submit is judged");
+    assert_eq!(strictness, Strictness::Whole);
+    let cases = [
+        ("tell it to put END after the report", false),
+        ("tell it to enter the result", false),
+        ("tell it the build has finished", false),
+        ("tell it to go ahead with the refactor", false),
+        ("send it", true),
+    ]
+    .into_iter()
+    .map(|(said, expected)| JudgeFixture::new("G1", "submit_prompt", said, expected, false))
+    .collect();
+    run_judge_fixtures(cases).await;
+}
+
+/// Scenario: Force each original F1 parameterless pick for "open docs" with
+/// the New agent dialog declared, so the real judge must refuse that action
+/// under its shipping strictness rather than rely on command-model no-match.
+#[tokio::test]
+async fn voice_parameterless_steering_is_refused_by_the_real_judge() {
+    let cases = [
+        "submit_prompt",
+        "go_to_parent",
+        "use_this_directory",
+        "close",
+        "voice_off",
+        "list_commands",
+        "open_overview",
+        "open_deck",
+        "open_settings",
+        "start_new_agent",
+        "open_new_agent",
+        "show_host_metrics",
+    ]
+    .into_iter()
+    .map(|action| JudgeFixture::new("F1", action, "open docs", false, true))
+    .collect();
+    run_judge_fixtures(cases).await;
+}
+
+/// Scenario: Force contextual close and destructive picks for sentences that
+/// ask for something else, and six whole-sentence picks containing extra
+/// content; the real judge must refuse them and accept the standalone controls.
+#[tokio::test]
+async fn voice_contextual_and_whole_controls_are_refused_by_the_real_judge() {
+    let mut cases = Vec::new();
+    for said in [
+        "name it done worker",
+        "call it leave-early and go back to the mode",
+        "hide nothing, use claude",
+        "close enough, set the mode to dispatcher",
+        "I'm done with this form, start it",
+    ] {
+        cases.push(JudgeFixture::new(
+            "contextual-close",
+            "close",
+            said,
+            false,
+            true,
+        ));
+    }
+    for (action, said, dialog) in [
+        ("close_orchestration", "close the billing agent", false),
+        ("stop_agent", "open the tester", false),
+        ("discard_new_agent", "close the new agent dialog", true),
+    ] {
+        cases.push(JudgeFixture::new(
+            "destructive",
+            action,
+            said,
+            false,
+            dialog,
+        ));
+    }
+    for (action, said, dialog) in [
+        ("close", "close the new agent dialog", true),
+        (
+            "close_orchestration",
+            "dismantle the build orchestration",
+            false,
+        ),
+        ("stop_agent", "destroy the tester", false),
+        (
+            "dictation_on",
+            "capture my speech as text from now on",
+            false,
+        ),
+        ("dictation_off", "treat my speech as commands again", false),
+        ("submit_prompt", "transmit the current prompt", false),
+        ("reading_on", "narrate future agent updates aloud", false),
+        ("reading_off", "disable spoken agent updates", false),
+        ("discard_new_agent", "throw away this draft", true),
+    ] {
+        cases.push(JudgeFixture::new("standalone", action, said, true, dialog));
+        if !matches!(action, "close" | "close_orchestration" | "stop_agent") {
+            cases.push(JudgeFixture::new(
+                "mixed-content",
+                action,
+                &format!("{said}; the meeting begins at noon"),
+                false,
+                dialog,
+            ));
+        }
+    }
+    run_judge_fixtures(cases).await;
+}
+
+struct JudgeFixture {
+    name: String,
+    action: &'static str,
+    said: String,
+    expected: bool,
+    dialog: bool,
+}
+
+impl JudgeFixture {
+    fn new(group: &str, action: &'static str, said: &str, expected: bool, dialog: bool) -> Self {
+        Self {
+            name: format!("{group}/{action}/{said}"),
+            action,
+            said: said.to_string(),
+            expected,
+            dialog,
+        }
+    }
+}
+
+/// These are independent meaning checks, with no command-model calls and
+/// therefore no command-model no-matches counted as successful refusals.
+/// Collect every repetition before asserting, so a red reports rates rather
+/// than concealing the remaining cases behind the first unsafe verdict.
+async fn run_judge_fixtures(cases: Vec<JudgeFixture>) {
+    let Some(resolver) = live_api_resolver() else {
+        return;
+    };
+    let resolver: std::sync::Arc<dyn IntentResolver> = resolver.into();
+    let filter = std::env::var(FIXTURE_FILTER_ENV).unwrap_or_default();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut failures = Vec::new();
+    let mut selected = 0;
+    for case in cases.into_iter().filter(|case| case.name.contains(&filter)) {
+        selected += 1;
+        let resolver = resolver.clone();
+        tasks.spawn(async move { run_judge_fixture(resolver.as_ref(), case).await });
+        // Bound request concurrency while five independent samples per case
+        // keep a one-off unsafe yes visible. No retry-to-green.
+        if tasks.len() == 4 {
+            failures.extend(
+                tasks
+                    .join_next()
+                    .await
+                    .expect("pending case")
+                    .expect("judge task"),
+            );
+        }
+    }
+    while let Some(result) = tasks.join_next().await {
+        failures.extend(result.expect("judge task"));
+    }
+    assert!(selected > 0, "no forced-judge fixture matches {filter:?}");
+    assert!(
+        failures.is_empty(),
+        "real forced-pick judge failures: {failures:#?}"
+    );
+}
+
+async fn run_judge_fixture(resolver: &dyn IntentResolver, case: JudgeFixture) -> Vec<String> {
+    const REPETITIONS: usize = 5;
+    let row = table().row(case.action).expect("shipped forced-pick row");
+    let dialog = VoiceNewAgent { form: None };
+    let (strictness, _) = row
+        .meaning_for(None, case.dialog.then_some(&dialog))
+        .expect("forced pick must be judged");
+    let transcript = Transcript::new(&case.said);
+    let mut failures = Vec::new();
+    let mut yes_count = 0;
+    let mut completed = 0;
+    for repetition in 1..=REPETITIONS {
+        let request = MeaningRequest::new(&transcript, table(), &[(row, strictness)]);
+        match tokio::time::timeout(
+            REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
+            resolver.judge_meaning(request),
+        )
+        .await
+        {
+            Ok(Ok(verdict)) => {
+                let yes = verdict.asks(case.action, strictness);
+                completed += 1;
+                yes_count += usize::from(yes);
+                eprintln!(
+                    "forced-judge: {} | {strictness:?} | run {repetition}/{REPETITIONS} | {}",
+                    case.name,
+                    if yes { "yes" } else { "no" }
+                );
+            }
+            Ok(Err(error)) => failures.push(format!("{}: judge failed: {error:?}", case.name)),
+            Err(_) => failures.push(format!("{}: judge timed out", case.name)),
+        }
+    }
+    eprintln!(
+        "forced-judge rate: {} | {strictness:?} | yes {yes_count}/{completed} | errors {} | expected {}",
+        case.name,
+        REPETITIONS - completed,
+        if case.expected { "yes" } else { "no" }
+    );
+    let expected_yes = if case.expected { REPETITIONS } else { 0 };
+    if yes_count != expected_yes {
+        failures.push(format!(
+            "{}: {strictness:?} yes {yes_count}/{completed}, expected {expected_yes}/{REPETITIONS}",
+            case.name
+        ));
+    }
+    failures
+}
+
+fn live_api_resolver() -> Option<Box<dyn IntentResolver>> {
+    let require_real_e2e = truthy_env(REQUIRE_REAL_E2E_ENV);
+    if truthy_env("CI") {
+        assert!(
+            !require_real_e2e,
+            "{REQUIRE_REAL_E2E_ENV} is set in CI, so this real-agent test must RUN, not skip"
+        );
+        skip("voice phrase fixtures never reach a real agent in CI");
+        return None;
+    }
+    if !require_real_e2e {
+        skip("set DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 to run the voice phrase fixtures");
+        return None;
+    }
+    let key = preflight_key().unwrap_or_else(|reason| {
+        panic!(
+            "{REQUIRE_REAL_E2E_ENV} is set, so this real-agent test must RUN, not skip: {reason}"
+        )
+    });
+    let (endpoint, model) = api_preset();
+    let resolver = api_resolver(&key);
+    eprintln!(
+        "backend: {} | {endpoint} | {model}",
+        resolver.backend_name()
+    );
+    Some(resolver)
+}
+
 async fn run_fixtures(fixtures: FixtureManifest) {
     assert!(
         fixtures.fixtures.len() >= MIN_FIXTURE_COUNT,
@@ -789,32 +1038,9 @@ async fn run_fixtures(fixtures: FixtureManifest) {
         }
     }
 
-    let require_real_e2e = truthy_env(REQUIRE_REAL_E2E_ENV);
-    if truthy_env("CI") {
-        assert!(
-            !require_real_e2e,
-            "{REQUIRE_REAL_E2E_ENV} is set in CI, so this real-agent test must RUN, not skip"
-        );
-        skip("voice phrase fixtures never reach a real agent in CI");
+    let Some(resolver) = live_api_resolver() else {
         return;
-    }
-    if !require_real_e2e {
-        skip("set DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 to run the voice phrase fixtures");
-        return;
-    }
-    let key = match preflight_key() {
-        Ok(key) => key,
-        Err(reason) => panic!(
-            "{REQUIRE_REAL_E2E_ENV} is set, so this real-agent test must RUN, not skip: {reason}"
-        ),
     };
-
-    let (endpoint, model) = api_preset();
-    let resolver = api_resolver(&key);
-    eprintln!(
-        "backend: {} | {endpoint} | {model}",
-        resolver.backend_name()
-    );
     let suite_started = Instant::now();
     let mut failures = Vec::new();
 
