@@ -1596,6 +1596,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the write-failure path itself, or which `MarkerWriteError` arm a given failure carries (`src/worktree_owner.rs`'s unit tests stage a real `ENOSPC` through `/dev/full` and an unremovable leftover through a read-only metadata dir); a *partial but non-empty* marker, which still reads as a claim by design — closing that would take the temp-and-rename dance the module argues against.
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/012 — A merged pull request from a FORK whose branch shares this worktree's branch name does not make the worktree reclaimable.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a deck-owned, clean worktree whose stub `gh` reply lists only a `MERGED` pull request carrying `isCrossRepository: true` — the shape `gh pr list --head <branch>` returns when a contributor's fork opened a pull request from a branch named like ours).
+- **Asserts:** a **fixture precondition** that the entry reads `owned: true` and `clean: true`, so PR state is the only gate deciding the verdict; then that `worktree list --json` reports `pr_state: "no_pr"` and `verdict: "keep"`; that the directory survives `worktree reclaim --yes`; and, as a **control**, that with the branch's own `MERGED` pull request listed beside the fork's the same entry reads `merged` / `remove`, so the `keep` is the fork filter's doing. Pins issue #1687: the reclaim's PR lookup matched on `headRefName` alone, so a stranger's merged fork PR read as this branch's and sent the worktree to the unattended `remove` verdict.
+- **Does not assert:** an entry that omits `isCrossRepository` (fails closed to `unresolvable`; unit-tested as `parse_pr_state_without_is_cross_repository_is_unresolvable` in `src/worktree_reclaim.rs`); the PR badge's own fork filter (`pull_request::tests::a_pull_request_from_a_fork_is_not_the_branchs`).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
