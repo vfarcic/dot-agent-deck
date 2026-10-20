@@ -300,6 +300,11 @@ pub struct StubResolver {
     /// PRD #1733: a raw reply for an utterance, read by the production reader
     /// ([`MeaningVerdict::read`]) — so a test can drive a malformed one.
     meaning_replies: BTreeMap<String, serde_json::Value>,
+    /// PRD #1733: a backend's whole reply for an utterance, as the bytes it
+    /// sent, read by the remote resolver's own reader
+    /// ([`super::meaning::parse_reply`]) — so a test can drive a reply that
+    /// answers twice through the pipeline.
+    meaning_wire_replies: BTreeMap<String, (super::meaning::Dialect, String)>,
     meaning_failure: Option<IntentError>,
     /// PRD #1733: the meaning call never answers, for the timeout's test.
     meaning_hangs: bool,
@@ -390,6 +395,19 @@ impl StubResolver {
         self
     }
 
+    /// PRD #1733: answer the meaning call for `utterance` with `reply`, the
+    /// bytes of a whole `dialect` reply, read as the remote resolver reads one.
+    pub fn meaning_wire_reply(
+        mut self,
+        utterance: &str,
+        dialect: super::meaning::Dialect,
+        reply: &str,
+    ) -> Self {
+        self.meaning_wire_replies
+            .insert(normalize(utterance), (dialect, reply.to_string()));
+        self
+    }
+
     /// PRD #1733: fail every meaning call with `error`.
     pub fn failing_meaning(mut self, error: IntentError) -> Self {
         self.meaning_failure = Some(error);
@@ -465,6 +483,8 @@ impl IntentResolver for StubResolver {
             Err(error.clone())
         } else if let Some(reply) = self.meaning_replies.get(&said) {
             MeaningVerdict::read(&request, reply)
+        } else if let Some((dialect, reply)) = self.meaning_wire_replies.get(&said) {
+            super::meaning::parse_reply(&request, *dialect, reply.as_bytes(), ceiling)
         } else {
             let picked = self.answers.get(&said).map(|answer| answer.action.as_str());
             Ok(MeaningVerdict::yes_to(

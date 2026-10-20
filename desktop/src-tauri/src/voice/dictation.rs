@@ -46,6 +46,34 @@
 //! round trip, and since the resolver runs on every utterance anyway to decide
 //! whether it is a command, the fallback costs **no extra** call — it is the
 //! call that was always going to happen.
+//!
+//! # The phrase lists here answer without a model, and that is a decision
+//!
+//! PRD #1733 replaced the word lists that held a MODEL'S pick to the user's
+//! words (`heard_as`, `heard_as_whole`) with a meaning check, and its success
+//! criterion says no phrase list answers or steers the model. The `*_PHRASES`
+//! lists in this file are the documented exception (the 2026-10-20 decision on
+//! issue #1733): the send phrases ([`SUBMIT_PHRASES`],
+//! [`SUBMIT_WHERE_CALLABLE_PHRASES`]), the close over the New agent dialog
+//! ([`CLOSE_OVER_DIALOG_PHRASES`]), and the dictation, typing-mode and
+//! reading phrases. They are not a check on a model's pick: no model is asked
+//! at all.
+//!
+//! **An observed name does not reach them.** Each is compared
+//! with the WHOLE utterance — the transcript's words, an edge politeness word
+//! aside (`outcome::whole_utterance`) — for equality with a fixed list written
+//! here, or, for [`DICTATION_OPENERS`], it slices the user's own transcript.
+//! None of them compares the utterance with a name from what the model is
+//! shown — an agent's label, a deck, a directory: the screen and whether the
+//! New agent dialog is open decide only where a list is answered. A
+//! whole-utterance list does not fire on a sentence that merely contains one
+//! of its phrases.
+//!
+//! **They exist for latency** (issue #1246): a bare "send it" presses Enter
+//! without the round trip, and routing it through the command model and then
+//! the meaning check would add about a second to it. Moving them behind the
+//! model would reverse that decision; `docs/develop/voice-first-design.md`
+//! names them as the exception.
 
 use std::ops::Range;
 
@@ -125,8 +153,10 @@ pub const SUBMIT_PHRASES: [&str; 6] = ["end", "send", "send it", "submit", "ente
 ///
 /// They were `submit_prompt`'s `heard_as_whole` entries in `commands.toml`
 /// until PRD #1733 replaced that column with the meaning check; the fast path
-/// answered from that column, so the list moved here rather than going.
-/// Whole-utterance for [`SUBMIT_PHRASES`]' reason.
+/// answered from that column, so the list moved here rather than going. It
+/// answers without the model or the meaning check, the module docs' documented
+/// exception, for #1246's latency. Whole-utterance for [`SUBMIT_PHRASES`]'
+/// reason.
 pub const SUBMIT_WHERE_CALLABLE_PHRASES: [&str; 5] = [
     "submit it",
     "go ahead",
@@ -143,7 +173,9 @@ pub const SUBMIT_WHERE_CALLABLE_PHRASES: [&str; 5] = [
 ///
 /// `close`'s `heard_as_whole_while` list in `commands.toml` until PRD #1733,
 /// which made that row's dialog rule a whole-sentence meaning check
-/// (`whole_while`); the fast path answered from the list, so it moved here.
+/// (`whole_while`); the fast path answered from the list, so it moved here,
+/// and still answers without the model or the meaning check (the module docs'
+/// documented exception).
 /// It leaves out the words a user filling a form says for other reasons —
 /// `done`, `leave`, `back` — which then go to the model and its check.
 pub const CLOSE_OVER_DIALOG_PHRASES: [&str; 15] = [

@@ -1099,18 +1099,13 @@ pub async fn handle_utterance_with_modes(
             &answer.params,
         ));
     }
-    // A redirect target is reached when the words ask for it, or — for every
-    // target but the start — when they ask for the pick: each redirect below
-    // lands on the row that answers the SAME request where the pick cannot run
-    // (the view's close for a "go back", the dialog's own Daemon field for the
-    // selector, the other half of a bare "go up"), and the meaning check,
-    // shown no screen, cannot know that. The start is the exception: it runs
-    // without a confirmation because its OWN words must ask for it (section 5
-    // of `docs/develop/voice-first-design.md`), so it is never reached on the
-    // opener's.
-    let reaches = |target: &CommandRow| {
-        judged.asks_for(target) || (asked && target.id != START_ROW && judged.guards_hold(target))
-    };
+    // A redirect target is reached only when the words ask for IT, by the
+    // target's own answer under the target's own strictness: a `yes` for the
+    // pick is not one for the row that runs instead, and a `no` or a missing
+    // answer for that row refuses (PRD #1733's audit, A1). The target is
+    // asked in the same call as the pick ([`questions_for`]), so this costs
+    // no second round trip.
+    let reaches = |target: &CommandRow| judged.asks_for(target);
 
     // Issue #1198: the deck is hidden, so the row that goes there is refused
     // with that reason — ahead of the screen check, whose own hint ("opens
@@ -1161,16 +1156,12 @@ pub async fn handle_utterance_with_modes(
         // the browser, and its close word asks for `close`, which closes the
         // page.
         //
-        // A close of the page is not the same request as opening a pull
-        // request, so that one needs the words to ask for the close itself.
+        // Either way the words must ask for the close itself (`reaches`).
         if (row.id == OPEN_DECK_ROW || row.id == OPEN_PR_ROW)
             && let Some(close) = table.row(CLOSE_ROW).filter(|close| {
                 close.callable(screen, directories, new_agent)
-                    && if row.id == OPEN_DECK_ROW {
-                        !names_the_daemons_screen(transcript.text()) && reaches(close)
-                    } else {
-                        judged.asks_for(close)
-                    }
+                    && (row.id == OPEN_PR_ROW || !names_the_daemons_screen(transcript.text()))
+                    && reaches(close)
             })
         {
             return finish(VoiceOutcome::Dispatch {
@@ -1296,6 +1287,11 @@ pub async fn handle_utterance_with_modes(
                     || !deck_reference(value).is_empty()
                     || !decks_called(value, decks).is_empty()
             })
+            // `open_pr`'s agent made only of the words that asked for the row
+            // — "show the pull request", which the command model was measured
+            // answering for "show the pull request" 4 times in 12 — names no
+            // agent, and is read exactly as an agent left out.
+            .filter(|value| row.id != OPEN_PR_ROW || names_an_agent_beyond_the_ask(value, row))
         else {
             // An optional param the model left out is simply not dispatched
             // (PRD #1223's "new agent" with no deck named), and says nothing:
@@ -1961,6 +1957,32 @@ fn said_beyond_the_ask(
     let rest = beyond_the_ask(transcript, row).join(" ");
     said(spoken, &rest)
         || (decks.iter().any(|deck| deck.label == spoken) && mentioned(spoken, &rest, decks))
+}
+
+/// Whether a model's agent value for `row` holds a word that could name an
+/// agent once the row's [`CommandRow::action_words`] and the
+/// [`AGENT_FILLER_WORDS`] are set aside, read the way [`resolve_param`] sets
+/// them aside from the transcript ([`word_sequence`]).
+/// `false` for "show the pull request" or "the PR"; `true` for "the ghost",
+/// which still goes on to be refused as matching nobody.
+///
+/// It reads only the model's value, never the transcript, and only to treat
+/// a value as absent. A value with a verb the row does not list ("display the
+/// pull request") keeps that verb and is refused as naming nobody, which is
+/// the side to err on. A name the user said reads as absent only when each
+/// of its words is one of those words or filler — an agent called "Show".
+fn names_an_agent_beyond_the_ask(value: &str, row: &CommandRow) -> bool {
+    let vocabulary: BTreeSet<String> = row
+        .action_words
+        .iter()
+        .flat_map(|entry| word_sequence(entry))
+        .collect();
+    let rest: Vec<String> = word_sequence(value)
+        .into_iter()
+        .filter(|word| !vocabulary.contains(word))
+        .collect();
+    let (_, content) = reference_words(&rest.join(" "));
+    !content.is_empty()
 }
 
 /// `transcript`'s words ([`spoken_words`]) less one occurrence of each of
@@ -10804,6 +10826,105 @@ mod tests {
         );
     }
 
+    /// Scenario: the user says "show the pull request" and the model puts the
+    /// request's own words into the agent — "the pull request", "show the
+    /// pull request", "open the PR". Made only of the row's request words and
+    /// filler, the value names no agent: the agent screen opens its pane's
+    /// pull request and the dashboard asks which agent, exactly as with no
+    /// value. A value with a word beyond those ("the ghost", or "display the
+    /// pull request", whose verb the row does not list) is still refused as
+    /// naming nobody.
+    #[tokio::test]
+    async fn voice_outcome_open_pr_reads_the_request_words_as_no_agent() {
+        let said = "show the pull request";
+        for value in [
+            "the pull request",
+            "show the pull request",
+            "open the PR",
+            "look at the PR",
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_pr").with_param("agent", value),
+            );
+            let pane = run_agents(&resolver, Screen::Agent, &fleet(), said).await;
+            assert!(
+                matches!(&pane, VoiceOutcome::Dispatch { params, sentence, .. }
+                    if params.is_empty() && sentence == "Opening the pull request."),
+                "{value}: {pane:?}"
+            );
+            let which = run_agents(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&which, VoiceOutcome::ParamAmbiguous { action, .. } if action == "open_pr"),
+                "{value}: {which:?}"
+            );
+        }
+        for (said, value) in [
+            ("open the PR for the ghost", "the ghost"),
+            ("open the PR for the ghost", "the PR for the ghost"),
+            ("display the pull request", "display the pull request"),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_pr").with_param("agent", value),
+            );
+            for screen in [Screen::Agent, Screen::Overview] {
+                let refused = run_agents(&resolver, screen, &fleet(), said).await;
+                assert!(
+                    matches!(&refused, VoiceOutcome::ParamUnresolved { action, .. } if action == "open_pr"),
+                    "{said} / {value} on {screen}: {refused:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: "inspect Mercury" with Mercury and Vega on the dashboard
+    /// opens Mercury. Beside an agent called Inspect, the same sentence and
+    /// the same answer are refused as naming nobody: "inspect" is not one of
+    /// `open_agent`'s request words, so it is read as a fact about an agent,
+    /// and Inspect's name accounts for it while Mercury's does not. A pinned
+    /// limitation, not a goal — it errs toward refusing, and
+    /// `docs/develop/voice-first-design.md` records why no list-free reading
+    /// separates the verb from the reference (PRD #1733's review, finding 4).
+    #[tokio::test]
+    async fn voice_outcome_a_request_verb_another_agent_is_named_refuses() {
+        let agents = vec![
+            agent("agent-mercury", Some("Mercury"), "claude"),
+            agent("agent-vega", Some("Vega"), "codex"),
+        ];
+        let said = "inspect Mercury";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Mercury"),
+        );
+        let opened = run_agents(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&opened, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-mercury"),
+            "{opened:?}"
+        );
+        let mut beside_inspect = agents.clone();
+        beside_inspect.push(agent("agent-inspect", Some("Inspect"), "pi"));
+        let refused = run_agents(&resolver, Screen::Overview, &beside_inspect, said).await;
+        assert!(
+            matches!(&refused, VoiceOutcome::ParamUnresolved { action, .. } if action == "open_agent"),
+            "{refused:?}"
+        );
+        // A verb the row lists is set aside: beside an agent called Open,
+        // "open Mercury" still opens Mercury.
+        let said = "open Mercury";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Mercury"),
+        );
+        let mut beside_open = agents;
+        beside_open.push(agent("agent-open", Some("Open"), "pi"));
+        let opened = run_agents(&resolver, Screen::Overview, &beside_open, said).await;
+        assert!(
+            matches!(&opened, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-mercury"),
+            "{opened:?}"
+        );
+    }
+
     /// Scenario: with a pull request open in the app, "close the PR" and
     /// "close the pull request" close the page and go back to the screen under
     /// it, whichever of the rows their words touch the model answers with —
@@ -15486,9 +15607,10 @@ mod tests {
     /// model answers with the app's Daemon selector, `switch_deck`, which the
     /// dialog blocks. The pick is the dialog's own Daemon field, with the same
     /// deck (#1260): `choose_deck` dispatches, resolved and reported exactly
-    /// as if it had been picked — on the meaning check's reading of the words
-    /// as a switch, since the field answers the same request where the
-    /// selector cannot run. Words read as neither keep the selector's hint; a
+    /// as if it had been picked — when the meaning check reads the words as a
+    /// choice of the dialog's daemon. Read as a switch alone, or with that
+    /// question unanswered, the field is not reached and the selector's hint
+    /// is given; read as neither, the switch is refused as not asked for. A
     /// switch that names no deck is asked which.
     #[tokio::test]
     async fn voice_outcome_a_switch_picked_over_the_open_dialog_chooses_its_daemon() {
@@ -15552,8 +15674,10 @@ mod tests {
             matches!(&not_about_a_deck, VoiceOutcome::ActionUngrounded { action, .. } if action == "switch_deck"),
             "{not_about_a_deck:?}"
         );
-        // Read as a switch, it is the dialog's Daemon field: the same request.
-        let a_switch = judged_as(
+        // Read as a switch but NOT as a choice of the dialog's daemon, the
+        // Daemon field is not reached: the target's own no refuses, whatever
+        // the pick's answer (PRD #1733's audit, A1).
+        let a_switch_only = judged_as(
             "switch to the build box",
             IntentAnswer::new("switch_deck").with_param("deck", "build box"),
             Screen::Overview,
@@ -15562,8 +15686,52 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(&a_switch, VoiceOutcome::Dispatch { action, .. } if action == "choose_deck"),
-            "{a_switch:?}"
+            matches!(&a_switch_only, VoiceOutcome::Unavailable { action, .. } if action == "switch_deck"),
+            "{a_switch_only:?}"
+        );
+        // So does a reply that answers the pick (`q1`) and leaves the
+        // target's question (`q2`) out.
+        let said = "switch to the build box";
+        let resolver = StubResolver::new()
+            .answering(
+                said,
+                IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+            )
+            .meaning_reply(said, serde_json::json!({ "explanation": "x", "q1": "yes" }));
+        let unanswered = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &decks(),
+            None,
+            Some(&form),
+            Transcript::new(said),
+        )
+        .await
+        .outcome;
+        assert!(
+            matches!(&unanswered, VoiceOutcome::Unavailable { action, .. } if action == "switch_deck"),
+            "{unanswered:?}"
+        );
+        let asked: Vec<String> = resolver.meaning_requests()[0]
+            .questions
+            .iter()
+            .map(|(action, _)| action.clone())
+            .collect();
+        assert_eq!(asked, vec!["switch_deck", "choose_deck"]);
+        // Read as a choice of the daemon, it is the dialog's Daemon field.
+        let a_choice = judged_as(
+            "switch to the build box",
+            IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+            Screen::Overview,
+            Some(&form),
+            &[("choose_deck", true), ("switch_deck", true)],
+        )
+        .await;
+        assert!(
+            matches!(&a_choice, VoiceOutcome::Dispatch { action, .. } if action == "choose_deck"),
+            "{a_choice:?}"
         );
         let which = heard_as_user_said(
             "switch deck",
@@ -17620,6 +17788,70 @@ mod tests {
             matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "stop_agent"),
             "{outcome:?}"
         );
+    }
+
+    /// Scenario: the backend's reply to the meaning check answers the same
+    /// question twice — two verdict tool calls, or one key written twice —
+    /// with a yes and a no in either order. Read by the remote resolver's own
+    /// reader, the pick is refused as unchecked whichever answer came first;
+    /// a reply that answers once still dispatches.
+    #[tokio::test]
+    async fn voice_outcome_a_meaning_reply_that_answers_twice_refuses_in_either_order() {
+        use crate::voice::meaning::{Dialect, MEANING_TOOL_NAME};
+        let said = "destroy the tester";
+        let answer = IntentAnswer::new("stop_agent").with_param("agent", "tester");
+        let block = |verdict: &str| {
+            format!(
+                r#"{{"type": "tool_use", "name": "{MEANING_TOOL_NAME}", "input": {{"explanation": "x", "q1": "{verdict}"}}}}"#
+            )
+        };
+        let content = |content: &str| {
+            serde_json::json!({ "choices": [{ "message": { "content": content } }] }).to_string()
+        };
+        for (first, second) in [("yes", "no"), ("no", "yes")] {
+            for (dialect, reply) in [
+                (
+                    Dialect::Anthropic,
+                    format!(r#"{{"content": [{}, {}]}}"#, block(first), block(second)),
+                ),
+                (
+                    Dialect::Anthropic,
+                    format!(
+                        r#"{{"content": [{{"type": "tool_use", "name": "{MEANING_TOOL_NAME}", "input": {{"q1": "{first}", "q1": "{second}"}}}}]}}"#
+                    ),
+                ),
+                (
+                    Dialect::OpenAiCompatible,
+                    content(&format!(r#"{{"q1": "{first}", "q1": "{second}"}}"#)),
+                ),
+            ] {
+                let resolver = StubResolver::new()
+                    .answering(said, answer.clone())
+                    .meaning_wire_reply(said, dialect, &reply);
+                let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ResolutionFailed { sentence, .. }
+                        if sentence.contains("could not check that this asks to stop an agent")),
+                    "{reply}: {outcome:?}"
+                );
+            }
+        }
+        for (dialect, reply) in [
+            (
+                Dialect::Anthropic,
+                format!(r#"{{"content": [{}]}}"#, block("yes")),
+            ),
+            (Dialect::OpenAiCompatible, content(r#"{"q1": "yes"}"#)),
+        ] {
+            let resolver = StubResolver::new()
+                .answering(said, answer.clone())
+                .meaning_wire_reply(said, dialect, &reply);
+            let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "stop_agent"),
+                "{reply}: {outcome:?}"
+            );
+        }
     }
 
     /// Scenario: the model picks a row that cannot be taken back, or a mode

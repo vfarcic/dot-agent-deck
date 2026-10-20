@@ -288,20 +288,34 @@ impl RemoteResolver {
                 reasoning_effort,
             ),
         };
-        let payload = self.post(body).await?;
-        match self.protocol {
-            Protocol::Anthropic => {
-                super::meaning::parse_anthropic(&request, &payload, self.max_tokens)
-            }
-            Protocol::OpenAiCompatible { .. } => {
-                super::meaning::parse_openai(&request, &payload, self.max_tokens)
-            }
+        // Read from the bytes rather than from `post`'s JSON: `serde_json`
+        // keeps one occurrence of a repeated key, so an Anthropic tool call
+        // whose input wrote `q1` twice would be read as whichever came last
+        // ([`super::meaning::parse_reply`]).
+        let (status, reply) = self.post_for_bytes(body).await?;
+        if !status.is_success() {
+            return Err(reply_error(status, &reply));
         }
+        let dialect = match self.protocol {
+            Protocol::Anthropic => super::meaning::Dialect::Anthropic,
+            Protocol::OpenAiCompatible { .. } => super::meaning::Dialect::OpenAiCompatible,
+        };
+        super::meaning::parse_reply(&request, dialect, &reply, self.max_tokens)
     }
 
     /// One request body to the endpoint, and its successful reply's JSON — the
     /// transport every call shares.
     async fn post(&self, body: Value) -> Result<Value, IntentError> {
+        let (status, reply) = self.post_for_bytes(body).await?;
+        read_reply(status, &reply)
+    }
+
+    /// [`Self::post`] stopped before the reply is parsed: its status and its
+    /// bytes, bounded.
+    async fn post_for_bytes(
+        &self,
+        body: Value,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>), IntentError> {
         // No key for a loopback endpoint; see `endpoint_credential`.
         let secret = endpoint_credential(&self.endpoint, &self.secrets)
             .await
@@ -332,8 +346,8 @@ impl RemoteResolver {
         // Bounded BEFORE the bytes become text or JSON. `Response::json` used
         // to collect the whole body first, so a body streamed fast enough could
         // exhaust this process inside the timeout — PRD #802's audit. The bound
-        // applies to the non-success path too, because the error detail below
-        // is quoted out of that same body.
+        // applies to the non-success path too, because the error detail
+        // ([`read_reply`]) is quoted out of that same body.
         let body = match super::http::capped_body(response, super::http::MAX_BODY_BYTES).await {
             Ok(body) => body,
             Err(super::http::BodyError::TooLarge) => {
@@ -348,14 +362,29 @@ impl RemoteResolver {
                 ));
             }
         };
-        let payload: Value = serde_json::from_slice(&body).map_err(|_| {
-            IntentError::Backend(format!("the command backend answered {status} unreadably"))
-        })?;
-        if !status.is_success() {
-            return Err(IntentError::Backend(api_error_detail(status, &payload)));
-        }
-        Ok(payload)
+        Ok((status, body))
     }
+}
+
+/// A reply's JSON, or the error its status and body say.
+fn read_reply(status: reqwest::StatusCode, body: &[u8]) -> Result<Value, IntentError> {
+    if !status.is_success() {
+        return Err(reply_error(status, body));
+    }
+    serde_json::from_slice(body).map_err(|_| unreadably(status))
+}
+
+/// The error an unsuccessful reply says, quoted out of its body when that is
+/// readable.
+fn reply_error(status: reqwest::StatusCode, body: &[u8]) -> IntentError {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(payload) => IntentError::Backend(api_error_detail(status, &payload)),
+        Err(_) => unreadably(status),
+    }
+}
+
+fn unreadably(status: reqwest::StatusCode) -> IntentError {
+    IntentError::Backend(format!("the command backend answered {status} unreadably"))
 }
 
 /// The credential for one request to `endpoint`, read at call time — or

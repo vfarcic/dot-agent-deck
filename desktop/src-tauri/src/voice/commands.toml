@@ -136,13 +136,11 @@
 #                    that is not callable, and carries no param value,
 #                    dispatches that row instead — with no params — when that
 #                    row is callable and the check finds the words ask for the
-#                    pick (the target answers the same request where the pick
-#                    cannot run) or for the target itself; a target that is
-#                    the New agent dialog's Start needs the check's `yes` for
-#                    the start itself. Otherwise the usual "Not here" stands. The target
+#                    TARGET, by the target's own `yes` (a `yes` for the pick
+#                    is not one for the row that runs instead). Otherwise the
+#                    usual "Not here" stands. The target
 #                    must exist, be another row, and declare no required
-#                    param. Two rows use it, each other's targets across the
-#                    New agent dialog's boundary
+#                    param. Four rows use it
 #                    (`voice_table_redirecting_rows_are_the_deliberate_set`).
 #   ungrounded       instead of `meaning`: why this row CANNOT be checked
 #                    against words. A row carries one or the other (absent
@@ -958,11 +956,21 @@ id          = "submit_prompt"
 description = """Send what is already in the open agent's prompt — press Enter for the user. Use
 when the user says to send it, submit it, press enter, go ahead, that is the end, or that the
 prompt is finished. A bare "send", "submit", "enter" or "end" means this. It sends what is
-ALREADY there and types nothing new: a request to write something down is `dictate_to_agent`."""
+ALREADY there and types nothing new: a request to write something down is `dictate_to_agent`, and so
+is a request to tell or ask the agent something ("tell it to …", "tell it that …"), whatever it is
+to be told — those words are written into the prompt for the user to send."""
 invoke      = "submitAgentPrompt"
 screens     = ["agent"]
 unavailable_hint = "sending a prompt needs an agent's pane open — open one first"
 report      = "Sent."
+# PRD #1733: the forced judge (`voice_submit_words_in_passing_are_refused_by_the_real_judge`)
+# answered "tell it to go ahead with the refactor" `yes` 5 times in 5 and "tell
+# it to enter the result" 4 to 5 in 5 on `gpt-5-mini`, reading the told words as
+# the request. The description's tell-it sentence above, with the whole
+# question's "words to pass on to the agent" (`meaning::system_turn`), took
+# both to 0 in 11 replays, every positive staying a yes (2026-10-20). Neither
+# alone held: the sentence alone left "enter the result" at 3 in 10, the
+# question alone left "go ahead with the refactor" at 2 in 5.
 asks_to     = "send the agent's prompt"
 try_saying  = "send it"
 meaning     = "whole"
@@ -1201,7 +1209,16 @@ report      = "Opening the New agent dialog."
 # to 3 of 8. Naming the orchestration took both to 8 in 8, left every other
 # opener fixture's sentence at 8 in 8, and moved none of the start's own
 # questions over an open dialog (2026-10-20).
-asks_to     = "open the New agent dialog to start an agent or an orchestration"
+#
+# Then the forced judge (`voice_parameterless_steering_is_refused_by_the_real_judge`)
+# took "open docs" as asking to "open the New agent dialog …" 5 times in 20:
+# the opener's verb led. Leading with what the user asks for — a start — and
+# saying the dialog is how the app does it took it to 0 in 40, with "start it"
+# 39 in 40 (it was 15 in 20) and every other opener sentence 40 in 40. Nine
+# other wordings measured worse on one or the other; with the parenthesis
+# turned into a clause ("…, which opens the New agent dialog") "open docs" was
+# 3 in 40 (2026-10-20).
+asks_to     = "start a new agent or orchestration (the app opens its New agent dialog for that)"
 try_saying  = "new agent"
 unavailable_redirects = "start_new_agent"
 
@@ -1303,7 +1320,12 @@ screens     = ["overview"]
 requires    = ["directory_listing"]
 unavailable_hint = "choosing a directory needs the New agent dialog's directory listing; say “new agent” and choose a daemon first"
 report      = "Using this directory."
-asks_to     = "use this directory"
+# PRD #1733: asked whether "open docs" asks to "use this directory", the
+# forced judge answered `yes` 4 to 5 times in 5, reading a directory named
+# docs as the one to use. Naming what only this row does — the directory the
+# browser is ALREADY in, with none named — took it to 0 in 11 and kept every
+# chooser sentence (fixtures and description phrasings) a yes (2026-10-20).
+asks_to     = "use the directory the browser is already in, without naming a directory"
 try_saying  = "use this directory"
 
 # PR #1451 round 3, change 5 — the directory browser's Filter box by voice,
@@ -1514,7 +1536,12 @@ try_saying  = "scroll to the bottom"
 #
 # `action_words` holds `pr`, the id's own word: speech-to-text writes "PR" or
 # "P.R.", and a word split across adjacent words is still set aside before the
-# agent reference is read.
+# agent reference is read. It holds the description's verbs too (`open`,
+# `show`, `look`), because the command model sometimes puts the request
+# itself into the optional `agent` ("show the pull request"): a value made of
+# nothing but these words and filler names no agent, and is read as no name
+# (`outcome.rs`'s `names_an_agent_beyond_the_ask`). Like every `action_words`
+# entry, never read to decide whether the action was asked for.
 [[commands]]
 id          = "open_pr"
 description = """Open one agent's pull request: GitHub's page for it, inside the app, over the current
@@ -1532,7 +1559,7 @@ unavailable_hint = "a pull request opens from the agent dashboard or from its ag
 report      = "Opening the pull request."
 asks_to     = "open an agent's pull request"
 try_saying  = "open the PR"
-action_words = ["pull request", "pr"]
+action_words = ["open", "show", "look", "pull request", "pr"]
 
   [[commands.params]]
   name     = "agent"

@@ -27,9 +27,9 @@
 //! agent, a deck, a directory listing, the New agent form or any other
 //! observed state, and its fields are private, so no caller can add one. The
 //! wire bodies ([`anthropic_body`], [`openai_body`]) are built from it alone.
-//! `outcome.rs`'s boundary tests plant instruction-shaped names in every piece
-//! of state the command model is shown and assert that neither body carries
-//! any of them.
+//! `outcome.rs`'s boundary tests plant instruction-shaped names in the state
+//! the command model is shown and assert that neither body carries any of
+//! them.
 //!
 //! # Fails closed
 //!
@@ -37,9 +37,14 @@
 //! says exactly `"yes"` for it. A missing answer, any other value, an
 //! unreadable reply, a backend error and a timeout are all a refusal — the
 //! caller never acts on a verdict it did not get ([`MeaningVerdict::asks`]).
+//! So is a reply that answers twice: two verdict blocks, or one key written
+//! twice ([`keys_written_once`]), which a reader that keeps the first or the
+//! last would turn into whichever answer came in that position.
 
 use std::collections::BTreeSet;
+use std::fmt;
 
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
 
 use super::Transcript;
@@ -279,9 +284,10 @@ pub fn system_turn(request: &MeaningRequest<'_>) -> String {
             Strictness::Asks => format!("Does the sentence ask to {}?", question.asks_to),
             Strictness::Whole => format!(
                 "Is the sentence a request to {}, in any words (the phrasings listed below \
-                 are only examples), and NOTHING else — no statement, question, time, name or \
-                 second request beside it? If the explanation quotes anything else, the answer \
-                 is no.",
+                 are only examples), and NOTHING else — no statement, question, time, name, \
+                 second request or words to pass on to the agent beside it? A sentence that \
+                 tells or asks the agent something (\"tell it to …\") is words to pass on, not \
+                 this request. If the explanation quotes anything else, the answer is no.",
                 question.asks_to
             ),
             Strictness::Write => format!(
@@ -406,7 +412,109 @@ fn unreadable() -> IntentError {
     IntentError::Backend("the command backend's check of what was asked was unreadable".into())
 }
 
-/// The verdict out of an Anthropic reply's `tool_use` block.
+/// Whether `json` is JSON in which no object writes the same key twice.
+///
+/// `serde_json` keeps one occurrence of a repeated key and drops the other
+/// without a word, so `{"q1": "yes", "q1": "no"}` reads as whichever came
+/// last: two answers to one question, reduced to one by position. The meaning
+/// reply is held to this before it is read — the whole reply as it arrived
+/// ([`parse_reply`]), which is where an Anthropic tool call's input is
+/// parsed, and the OpenAI-compatible content, itself JSON inside a string
+/// ([`parse_openai`]).
+pub fn keys_written_once(json: &[u8]) -> bool {
+    serde_json::from_slice::<EachKeyOnce>(json).is_ok()
+}
+
+/// Any JSON value, walked without being kept, that refuses to deserialize
+/// when an object in it repeats a key ([`keys_written_once`]).
+struct EachKeyOnce;
+
+impl<'de> Deserialize<'de> for EachKeyOnce {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(EachKeyOnceVisitor)
+    }
+}
+
+struct EachKeyOnceVisitor;
+
+impl<'de> Visitor<'de> for EachKeyOnceVisitor {
+    type Value = EachKeyOnce;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON whose objects write each key once")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<EachKeyOnce, E> {
+        Ok(EachKeyOnce)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<EachKeyOnce, E> {
+        Ok(EachKeyOnce)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<EachKeyOnce, E> {
+        Ok(EachKeyOnce)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<EachKeyOnce, E> {
+        Ok(EachKeyOnce)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<EachKeyOnce, E> {
+        Ok(EachKeyOnce)
+    }
+
+    fn visit_unit<E>(self) -> Result<EachKeyOnce, E> {
+        Ok(EachKeyOnce)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<EachKeyOnce, A::Error> {
+        while seq.next_element::<EachKeyOnce>()?.is_some() {}
+        Ok(EachKeyOnce)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<EachKeyOnce, A::Error> {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(de::Error::custom("a key written twice"));
+            }
+            map.next_value::<EachKeyOnce>()?;
+        }
+        Ok(EachKeyOnce)
+    }
+}
+
+/// The wire dialect a meaning reply is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Anthropic,
+    OpenAiCompatible,
+}
+
+/// The verdict out of a successful reply's bytes, as they arrived: refused
+/// when any object in them writes a key twice ([`keys_written_once`]), then
+/// read in its dialect. What the remote resolver reads every meaning reply
+/// with.
+pub fn parse_reply(
+    request: &MeaningRequest<'_>,
+    dialect: Dialect,
+    reply: &[u8],
+    max_tokens: TokenCeiling,
+) -> Result<MeaningVerdict, IntentError> {
+    if !keys_written_once(reply) {
+        return Err(unreadable());
+    }
+    let payload: Value = serde_json::from_slice(reply).map_err(|_| unreadable())?;
+    match dialect {
+        Dialect::Anthropic => parse_anthropic(request, &payload, max_tokens),
+        Dialect::OpenAiCompatible => parse_openai(request, &payload, max_tokens),
+    }
+}
+
+/// The verdict out of an Anthropic reply's `tool_use` block — the ONE block
+/// that answers: none, or two (which could disagree, and would then be read
+/// by whichever came first), is unreadable.
 pub fn parse_anthropic(
     request: &MeaningRequest<'_>,
     payload: &Value,
@@ -420,21 +528,31 @@ pub fn parse_anthropic(
     if payload["stop_reason"] == "max_tokens" {
         return Err(super::remote::truncated_at(max_tokens));
     }
-    let block = payload["content"]
+    let mut blocks = payload["content"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|block| block["type"] == "tool_use" && block["name"] == MEANING_TOOL_NAME)
-        .ok_or_else(unreadable)?;
+        .filter(|block| block["type"] == "tool_use" && block["name"] == MEANING_TOOL_NAME);
+    let (Some(block), None) = (blocks.next(), blocks.next()) else {
+        return Err(unreadable());
+    };
     MeaningVerdict::read(request, &block["input"])
 }
 
-/// The verdict out of a chat completion's content, fenced or not.
+/// The verdict out of a chat completion's content, fenced or not — the one
+/// choice's, and only when that content writes each key once
+/// ([`keys_written_once`]).
 pub fn parse_openai(
     request: &MeaningRequest<'_>,
     payload: &Value,
     max_tokens: TokenCeiling,
 ) -> Result<MeaningVerdict, IntentError> {
+    if payload["choices"]
+        .as_array()
+        .is_some_and(|choices| choices.len() > 1)
+    {
+        return Err(unreadable());
+    }
     let choice = &payload["choices"][0];
     if choice["message"]["refusal"]
         .as_str()
@@ -456,8 +574,12 @@ pub fn parse_openai(
         .and_then(|rest| rest.split_once('\n'))
         .and_then(|(_, rest)| rest.rsplit_once("```"))
         .map(|(inner, _)| inner)
-        .unwrap_or(trimmed);
-    let answers: Value = serde_json::from_str(body.trim()).map_err(|_| unreadable())?;
+        .unwrap_or(trimmed)
+        .trim();
+    if !keys_written_once(body.as_bytes()) {
+        return Err(unreadable());
+    }
+    let answers: Value = serde_json::from_str(body).map_err(|_| unreadable())?;
     MeaningVerdict::read(request, &answers)
 }
 
@@ -665,5 +787,89 @@ mod tests {
                 .expect("readable")
                 .asks("stop_agent", Strictness::Asks)
         );
+    }
+
+    /// Scenario: a reply that answers the same question twice — two verdict
+    /// tool calls, a key written twice, or two choices — is unreadable in
+    /// either order, so the yes is never read by its position; one answer
+    /// each is still read.
+    #[test]
+    fn meaning_replies_that_answer_twice_are_errors_in_either_order() {
+        let transcript = Transcript::new("destroy the tester");
+        let request = MeaningRequest::new(
+            &transcript,
+            table(),
+            &[(row("stop_agent"), Strictness::Asks)],
+        );
+        let verdict = |answer: &str| json!({ "type": "tool_use", "name": MEANING_TOOL_NAME, "input": { "q1": answer } });
+        for (first, second) in [("yes", "no"), ("no", "yes"), ("yes", "yes")] {
+            let payload = json!({ "content": [verdict(first), verdict(second)] });
+            assert!(
+                parse_anthropic(&request, &payload, ceiling()).is_err(),
+                "{first} then {second}"
+            );
+        }
+        let beside_text = json!({ "content": [
+            { "type": "text", "text": "Checking." },
+            verdict("yes"),
+        ] });
+        assert!(
+            parse_anthropic(&request, &beside_text, ceiling())
+                .expect("one verdict block")
+                .asks("stop_agent", Strictness::Asks)
+        );
+
+        let content = |content: &str| json!({ "choices": [{ "message": { "content": content } }] });
+        for (first, second) in [("yes", "no"), ("no", "yes")] {
+            let twice =
+                format!("{{\"explanation\": \"x\", \"q1\": \"{first}\", \"q1\": \"{second}\"}}");
+            assert!(!keys_written_once(twice.as_bytes()), "{twice}");
+            assert!(
+                parse_openai(&request, &content(&twice), ceiling()).is_err(),
+                "{twice}"
+            );
+            assert!(
+                parse_openai(
+                    &request,
+                    &content(&format!("```json\n{twice}\n```")),
+                    ceiling()
+                )
+                .is_err(),
+                "fenced {twice}"
+            );
+        }
+        let two_choices = json!({ "choices": [
+            { "message": { "content": "{\"q1\": \"yes\"}" } },
+            { "message": { "content": "{\"q1\": \"no\"}" } },
+        ] });
+        assert!(parse_openai(&request, &two_choices, ceiling()).is_err());
+        assert!(
+            parse_openai(&request, &content("{\"q1\": \"yes\"}"), ceiling())
+                .expect("one answer")
+                .asks("stop_agent", Strictness::Asks)
+        );
+    }
+
+    /// Scenario: a key written twice anywhere in a reply — at the top, or in
+    /// a tool call's input inside the content array — is caught before
+    /// `serde_json` would keep just one of them; distinct keys, arrays,
+    /// scalars and the same key in two different objects are fine.
+    #[test]
+    fn meaning_keys_written_once_finds_a_repeat_at_any_depth() {
+        for repeated in [
+            r#"{"a": 1, "a": 2}"#,
+            r#"{"content": [{"type": "tool_use", "input": {"q1": "yes", "q1": "no"}}]}"#,
+            r#"[{"x": {"y": [1, {"q2": "no", "q2": "yes"}]}}]"#,
+        ] {
+            assert!(!keys_written_once(repeated.as_bytes()), "{repeated}");
+        }
+        for once in [
+            r#"{"a": 1, "b": [true, null, 1.5, -2, "s"]}"#,
+            r#"[{"q1": "yes"}, {"q1": "no"}]"#,
+            r#""yes""#,
+        ] {
+            assert!(keys_written_once(once.as_bytes()), "{once}");
+        }
+        assert!(!keys_written_once(b"{"));
     }
 }

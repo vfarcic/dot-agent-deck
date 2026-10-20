@@ -502,10 +502,11 @@ pub struct CommandRow {
     /// `unavailable_redirects` column (PRD #1223, D3; named `unavailable_opens`
     /// while its only use opened something). A pick of this row that is not
     /// callable dispatches that row instead when it is callable and the meaning
-    /// check finds the words ask for the pick or for the target — for the
-    /// start, the start itself (`outcome`'s `reaches`) — with no params, or, for a target that requires one,
-    /// with the pick's own. Three rows use it, across the New agent dialog's
-    /// one boundary:
+    /// check finds the words ask for the target, by its own `yes` (`outcome`'s
+    /// `reaches`) — with no params, or, for a target that requires one, with
+    /// the pick's own. Four rows use it: `clear_dashboard_filter` →
+    /// `clear_directory_filter` (its row in `commands.toml` says why), and
+    /// three across the New agent dialog's one boundary:
     ///
     /// - `start_new_agent` → `open_new_agent`: a bare "start it" with the
     ///   dialog closed was answered with the start row in every measured run,
@@ -524,8 +525,8 @@ pub struct CommandRow {
     ///   resolved as that row's — against the decks a new agent can start on.
     ///
     /// None can chain: each redirects only where its target is callable, the
-    /// first two's requirements are exact complements, and `choose_deck`
-    /// redirects nowhere. The parser holds the target to existing, being
+    /// first two's requirements are exact complements, and `choose_deck` and
+    /// `clear_directory_filter` redirect nowhere. The parser holds the target to existing, being
     /// another row, and taking no required param or exactly the redirecting
     /// row's params by name and kind ([`TableError::UnknownUnavailableRedirect`]).
     pub unavailable_redirects: Option<String>,
