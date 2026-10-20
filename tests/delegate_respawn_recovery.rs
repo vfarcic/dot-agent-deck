@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, TabMembership};
-use dot_agent_deck::event::{AgentEvent, AgentType, DelegateSignal, EventType};
+use dot_agent_deck::event::{AgentEvent, AgentType, DelegateResponse, DelegateSignal, EventType};
 use spec::spec;
 
 mod common;
@@ -506,11 +506,17 @@ async fn fixture_with_orchestrator(
 }
 
 async fn delegate(fx: &Fixture, task: &str) {
+    delegate_with(fx, task, false).await;
+}
+
+/// [`delegate`] with `--supersede` as the caller chose, answering the daemon's
+/// reply.
+async fn delegate_with(fx: &Fixture, task: &str, supersede: bool) -> DelegateResponse {
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: task.to_string(),
         to: vec![WORKER_ROLE.to_string()],
-        supersede: false,
+        supersede,
         timestamp: chrono::Utc::now(),
         token: None,
     };
@@ -524,7 +530,7 @@ async fn delegate(fx: &Fixture, task: &str) {
             &fx.daemon.event_tx,
             Some(&fx.daemon.state),
         )
-        .await;
+        .await
 }
 
 /// Scenario: start an orchestration whose `coder` role is `clear = true`, wait
@@ -1813,5 +1819,162 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
         "#584's leading hypothesis was that the dispatch and StartAgent paths hand the respawn \
          DIFFERENT relaunch parameters. They do not — and a future change that makes them \
          diverge is what this assertion is here to catch"
+    );
+}
+
+/// Issue #1784: the task the worker is working on, and the addendum the
+/// orchestrator sends while it still owes the `work-done`. Each carries a token
+/// of its own, so an assertion can tell which one a worker generation was given.
+const ORIGINAL_TASK: &str = "Implement the change. original-task-body-1784";
+const ADDENDUM: &str = "Addendum to your current task: also cover the empty input. addendum-1784";
+
+/// Issue #1784: take the next task the worker pane holds the way an agent's
+/// component does — fetch and acknowledge it — for whichever agent holds the
+/// pane once a task is waiting for it. Answers that agent and the text it was
+/// handed.
+async fn take_worker_task(
+    registry: &AgentPtyRegistry,
+    timeout: Duration,
+) -> Option<(String, String)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(agent) = registry.pane_current_agent_id(WORKER_PANE)
+            && let Some(delivery) = registry.inbox().fetch_first_acked(
+                WORKER_PANE,
+                &agent,
+                dot_agent_deck::inbox::AckHow::FetchedByCli,
+            )
+        {
+            return Some((agent, delivery.text));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Issue #1784: what became of a worker that took [`ORIGINAL_TASK`] once the
+/// orchestrator sent it [`ADDENDUM`] with `--supersede`.
+struct SupersededWorker {
+    /// The agent that took the original task and was working on it.
+    working: String,
+    /// The agent the addendum was handed to.
+    addendum_taker: String,
+    /// What that agent was handed.
+    addendum_text: String,
+    /// Whether the agent that took the original task is still running.
+    working_still_live: bool,
+    /// `.dot-agent-deck/worker-task-coder.md` after the addendum.
+    task_file: String,
+}
+
+/// Issue #1784: delegate [`ORIGINAL_TASK`] to the `coder` role, let its worker
+/// take it, then send [`ADDENDUM`] the only way an orchestrator can while that
+/// worker still owes a `work-done`: a plain delegate is refused as busy, so
+/// `--supersede`.
+async fn send_addendum_with_supersede(clear: bool) -> SupersededWorker {
+    let fx = fixture(|_| "cat".to_string()).await;
+    if !clear {
+        // Read on every delegate, so rewriting it before the first one is enough.
+        tokio::fs::write(
+            fx._dir.path().join(".dot-agent-deck.toml"),
+            config("cat").replace("clear = true", "clear = false"),
+        )
+        .await
+        .expect("rewrite the orchestration config with a clear = false worker");
+    }
+    let budget = common::load_scaled(Duration::from_secs(20));
+
+    let first = delegate_with(&fx, ORIGINAL_TASK, false).await;
+    assert_eq!(
+        first.delivered,
+        vec![WORKER_ROLE.to_string()],
+        "precondition: the original task must be dispatched; reply = {first:?}"
+    );
+    let (working, original_text) = take_worker_task(&fx.daemon.registry, budget)
+        .await
+        .expect("precondition: the worker never took the original task");
+    assert!(
+        original_text.contains(ORIGINAL_TASK),
+        "precondition: the worker must have been handed the original task; text = {original_text:?}"
+    );
+
+    // CONTROL: why an orchestrator reaches for `--supersede` at all. The worker
+    // still owes a work-done, so a plain delegate is refused.
+    let refused = delegate_with(&fx, ADDENDUM, false).await;
+    assert!(
+        refused.delivered.is_empty() && refused.busy.iter().any(|b| b.role == WORKER_ROLE),
+        "control — a plain delegate to a worker that owes a work-done must be refused as busy; \
+         reply = {refused:?}"
+    );
+
+    let superseding = delegate_with(&fx, ADDENDUM, true).await;
+    assert_eq!(
+        superseding.delivered,
+        vec![WORKER_ROLE.to_string()],
+        "the --supersede addendum must be dispatched; reply = {superseding:?}"
+    );
+    let (addendum_taker, addendum_text) = take_worker_task(&fx.daemon.registry, budget)
+        .await
+        .expect("the addendum never reached the worker pane");
+    let working_still_live = fx.daemon.registry.agent_is_live(&working);
+    let task_file = std::fs::read_to_string(
+        std::path::Path::new(&fx.cwd).join(".dot-agent-deck/worker-task-coder.md"),
+    )
+    .unwrap_or_default();
+    SupersededWorker {
+        working,
+        addendum_taker,
+        addendum_text,
+        working_still_live,
+        task_file,
+    }
+}
+
+/// Scenario: Start an orchestration whose `coder` role is `clear = true`, delegate it a task and let its worker take it, so the worker owes a `work-done`. A plain delegate of an addendum is refused as busy, so send the addendum with `--supersede`, as an orchestrator has to today. The worker that was working is restarted: the addendum goes to a new agent, the old one is gone, and the task it is handed and its task file carry the addendum without the original task. The same steps on a `clear = false` worker hand the addendum to the agent that was working, which keeps running.
+///
+/// Issue #1784 reproduced: what this pins is `--supersede`'s documented meaning,
+/// which the issue keeps and the orchestrator's instructions now warn about. An
+/// addendum that keeps a `clear = true` worker's agent needs a path of its own;
+/// until it exists, this is the restart the orchestrator is told to avoid.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/052")]
+async fn delegate_052_a_supersede_addendum_restarts_a_clear_true_worker() {
+    let restarted = send_addendum_with_supersede(true).await;
+    assert_ne!(
+        restarted.addendum_taker, restarted.working,
+        "a --supersede delegate to a clear = true worker must hand the addendum to a new agent"
+    );
+    assert!(
+        !restarted.working_still_live,
+        "the clear = true agent that was working on the original task must be gone"
+    );
+    assert!(
+        restarted.addendum_text.contains(ADDENDUM)
+            && !restarted.addendum_text.contains(ORIGINAL_TASK),
+        "the new agent must be handed the addendum alone, without the original task; text = {:?}",
+        restarted.addendum_text
+    );
+    assert!(
+        restarted.task_file.contains(ADDENDUM) && !restarted.task_file.contains(ORIGINAL_TASK),
+        "the worker's task file must hold the addendum alone; file = {:?}",
+        restarted.task_file
+    );
+
+    // CONTROL: the restart comes from `clear = true`, not from `--supersede`.
+    let kept = send_addendum_with_supersede(false).await;
+    assert_eq!(
+        kept.addendum_taker, kept.working,
+        "control — a clear = false worker must be handed the addendum by the agent that was working"
+    );
+    assert!(
+        kept.working_still_live,
+        "control — the clear = false agent that was working must still be running"
+    );
+    assert!(
+        kept.addendum_text.contains(ADDENDUM),
+        "control — the clear = false worker must be handed the addendum; text = {:?}",
+        kept.addendum_text
     );
 }
