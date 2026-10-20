@@ -45,14 +45,23 @@ pub const LAUNCHD_LABEL: &str = "ai.devopstoolkit.dot-agent-deck";
 /// running (systemd) or start it again over and over (launchd).
 pub const IDLE_SHUTDOWN_ENV: (&str, &str) = ("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0");
 
-/// The installing shell's variables a service needs to reach the same daemon
-/// endpoint, configuration (the schedules file among it) and state as that
-/// shell's clients. Credentials are deliberately not here: the deck never
+/// The installing shell's variables a service needs so that its daemon finds
+/// the same endpoints, files and state as one started from that shell: the
+/// path overrides a daemon reads (`docs/configuration.md`, "Paths and
+/// endpoints", less the client-only ones) and the XDG directories they
+/// default under. Credentials are deliberately not here: the deck never
 /// writes them into a file.
 pub const CARRIED_ENV: &[&str] = &[
     "DOT_AGENT_DECK_SOCKET",
     "DOT_AGENT_DECK_ATTACH_SOCKET",
     "DOT_AGENT_DECK_STATE_DIR",
+    "DOT_AGENT_DECK_CONFIG",
+    "DOT_AGENT_DECK_SESSION",
+    "DOT_AGENT_DECK_SCHEDULES",
+    "DOT_AGENT_DECK_CONFIG_GEN_STATE",
+    "DOT_AGENT_DECK_STAR_PROMPT",
+    "DOT_AGENT_DECK_FEATURES_CONFIG",
+    "DOT_AGENT_DECK_BIN",
     "XDG_CONFIG_HOME",
     "XDG_STATE_HOME",
 ];
@@ -374,6 +383,28 @@ pub fn write_service_file(path: &Path, content: &str) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// Make `path` a file only its owner can read before something else opens it
+/// for appending: launchd creates a LaunchAgent's log with the default umask,
+/// and the daemon's output carries hook payloads and task text. An existing
+/// file is narrowed to the same mode.
+pub fn ensure_private_file(path: &Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        options.open(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    options.open(path)?;
+    Ok(())
+}
+
 /// Whether `loginctl show-user <uid> -p Linger --value` output means
 /// lingering is off. Anything unrecognised is not reported, so a host without
 /// logind prints no advice that does not apply to it.
@@ -616,6 +647,8 @@ async fn install_systemd(file: &Path, changed: bool) -> Result<(), String> {
 }
 
 async fn install_launchd(file: &Path, changed: bool) -> Result<(), String> {
+    let log = launchd_log_path(&crate::platform::paths::home_dir());
+    ensure_private_file(&log).map_err(|e| format!("could not prepare {}: {e}", log.display()))?;
     let file = file.to_string_lossy();
     let target = launchd_target();
     let job = launchd_job(&target)?;
@@ -829,6 +862,7 @@ mod tests {
             "DOT_AGENT_DECK_ATTACH_SOCKET" => Some("/s/attach.sock".to_string()),
             "DOT_AGENT_DECK_SOCKET" => Some(String::new()),
             "TMPDIR" => Some("/var/folders/x/T/".to_string()),
+            "DOT_AGENT_DECK_SCHEDULES" => Some("/s/schedules.toml".to_string()),
             "ANTHROPIC_API_KEY" => Some("secret".to_string()),
             _ => None,
         };
@@ -840,6 +874,10 @@ mod tests {
                 (
                     "DOT_AGENT_DECK_ATTACH_SOCKET".into(),
                     "/s/attach.sock".into()
+                ),
+                (
+                    "DOT_AGENT_DECK_SCHEDULES".into(),
+                    "/s/schedules.toml".into()
                 ),
             ]
         );
@@ -891,6 +929,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn ensure_private_file_creates_and_narrows_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let log = dir.path().join("Logs/dot-agent-deck.log");
+        ensure_private_file(&log).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&log), 0o600);
+        std::fs::write(&log, "kept").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_private_file(&log).unwrap();
+        assert_eq!(mode(&log), 0o600);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "kept");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn systemd_loads_only_the_written_file() {
         let dir = crate::test_temp::tempdir().unwrap();
         let written = dir.path().join("dot-agent-deck.service");
