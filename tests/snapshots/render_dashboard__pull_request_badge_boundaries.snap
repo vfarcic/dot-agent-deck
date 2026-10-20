@@ -1,6 +1,5 @@
 ---
 source: tests/render_dashboard.rs
-assertion_line: 139
 expression: boundaries
 ---
 width 22
@@ -11,7 +10,7 @@ width 22
 ┃                    ┃
 ┃                    ┃
 ┃                    ┃
-┗ #1234 ⊙ ◐  1h · 14 ┛
+┗ #1234 ⊙ ◉  1h · 14 ┛
 
 width 21
 ┏ ▸ 1 C… ● Thinking ┓
@@ -61,7 +60,7 @@ width 17
 ┃               ┃
 ┃               ┃
 ┃               ┃
-┗ #1234 ⊙ ◐ ━━━━┛
+┗ #1234 ⊙ ◉ ━━━━┛
 
 width 13
 ┏● Thinking ┓
@@ -71,7 +70,7 @@ width 13
 ┃           ┃
 ┃           ┃
 ┃           ┃
-┗ #1234 ⊙ ◐ ┛
+┗ #1234 ⊙ ◉ ┛
 
 width 12
 ┏ Thinking ┓

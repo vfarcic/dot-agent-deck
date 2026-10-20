@@ -1251,6 +1251,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
           url: "https://github.com/test-org/test-repo/pull/1234",
           state: "open",
           review: "review_required",
+          checks: { state: "passing", passing: 24, failing: 0, pending: 0, skipped: 0 },
         },
       }],
     };
