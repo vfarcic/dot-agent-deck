@@ -323,9 +323,11 @@ const HOOK_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// budgets one after another (about 20 s), while a deck that answers at all
 /// promptly needs a small part of it. Each phase still asks on its own
 /// connection and goes on only on that connection's answer; a phase reached
-/// with the budget spent asks nothing, says so
-/// ([`crate::inbox_oneshot::RECEIPTS_TIMED_OUT`]), and its mail stays queued
-/// for the next receiver. The `UserPromptSubmit` hook blocks the user's
+/// with the budget spent asks nothing and says so: the fetch
+/// ([`crate::inbox_oneshot::RECEIPTS_TIMED_OUT`]) leaves its mail queued for
+/// the next receiver, and the commit
+/// ([`crate::inbox_oneshot::RECEIPTS_COMMIT_TIMED_OUT`]) confirms nothing and
+/// promises nothing about the message its waiter already took. The `UserPromptSubmit` hook blocks the user's
 /// prompt for as long as it runs, which is why this is shared rather than per
 /// phase. The waiter's wait for a batch after it registers is not part of it.
 /// Like the question's budget, it bounds socket waits cooperatively, not the
@@ -420,8 +422,10 @@ pub fn one_shot_injection(
 /// ([`crate::inbox_oneshot::report_timed_out`]), as it does when the question
 /// is not answered by then. A deck that answers without confirming is sent
 /// nothing that could take mail, and the hook says so
-/// ([`crate::inbox_oneshot::report_unsupported`]); a socket this user may not
-/// use is asked nothing, and the hook says that
+/// ([`crate::inbox_oneshot::report_unsupported`]); a connection lost before
+/// the answer says that, and names no version
+/// ([`crate::inbox_oneshot::report_connection_lost`]); a socket this user may
+/// not use is asked nothing, and the hook says that
 /// ([`crate::inbox_oneshot::report_foreign_socket`]). A fetch request already
 /// sent whose reply misses the deadline says nothing: the deck may have
 /// assigned the mail by then, so it is not said to be queued.
@@ -446,6 +450,10 @@ pub fn fetch_with_receipts(
         Opened::Ready(connection) => connection,
         Opened::Unsupported => {
             crate::inbox_oneshot::report_unsupported();
+            return None;
+        }
+        Opened::Lost => {
+            crate::inbox_oneshot::report_connection_lost();
             return None;
         }
         Opened::TimedOut => {
@@ -615,13 +623,17 @@ pub fn commit_delivered(prompt: &str, receipts_by: std::time::Instant) {
 
 /// Say on stderr what `committed` leaves the user to act on, if anything:
 /// [`crate::inbox_oneshot::RECEIPTS_UNSUPPORTED`],
-/// [`crate::inbox_oneshot::RECEIPTS_TIMED_OUT`] or
-/// [`crate::inbox_oneshot::RECEIPTS_FOREIGN_SOCKET`].
+/// [`crate::inbox_oneshot::RECEIPTS_COMMIT_TIMED_OUT`],
+/// [`crate::inbox_oneshot::RECEIPTS_CONNECTION_LOST`] or
+/// [`crate::inbox_oneshot::RECEIPTS_FOREIGN_SOCKET`]. A commit's timeout says
+/// its own notice, not the fetch's: the waiter already took the message the
+/// prompt carries, so it is not promised to be queued.
 #[cfg(unix)]
 fn report_committed(committed: Committed) {
     match committed {
         Committed::Withheld => crate::inbox_oneshot::report_unsupported(),
-        Committed::TimedOut => crate::inbox_oneshot::report_timed_out(),
+        Committed::Lost => crate::inbox_oneshot::report_connection_lost(),
+        Committed::TimedOut => crate::inbox_oneshot::report_commit_timed_out(),
         Committed::Foreign => crate::inbox_oneshot::report_foreign_socket(),
         Committed::Nothing | Committed::Refused | Committed::Sent => {}
     }
@@ -640,10 +652,13 @@ pub struct CommitFor<'a> {
 pub enum Committed {
     /// There was nothing to tell the deck.
     Nothing,
-    /// The deck answered without confirming it serves receipts, or ended the
-    /// connection unanswered: no receipt was published and no
-    /// `inbox_committed` sent.
+    /// The deck answered without confirming it serves receipts: no receipt
+    /// was published and no `inbox_committed` sent.
     Withheld,
+    /// The connection was lost before the deck answered whether it serves
+    /// receipts ([`crate::inbox_oneshot::Opened::Lost`]): no receipt was
+    /// published and no `inbox_committed` sent.
+    Lost,
     /// The budget ran out before the deck answered whether it serves
     /// receipts ([`crate::inbox_oneshot::Opened::TimedOut`]): no receipt was
     /// published and no `inbox_committed` sent.
@@ -723,6 +738,7 @@ pub fn commit_attempts_by(
     let mut connection = match Connection::open_receipts_by(socket, &question, deadline) {
         Opened::Ready(connection) => connection,
         Opened::Unsupported => return Committed::Withheld,
+        Opened::Lost => return Committed::Lost,
         Opened::TimedOut => return Committed::TimedOut,
         Opened::Foreign => return Committed::Foreign,
         Opened::Refused(_) | Opened::Unreachable => return Committed::Refused,
@@ -1258,14 +1274,14 @@ mod tests {
     }
 
     /// Scenario: A submitted prompt carries a waiter's whole block, whose
-    /// caps file the deck wrote, and the hook commits it three times: at a
+    /// caps file the deck wrote, and the hook commits it four times: at a
     /// stand-in deck that answers its receipts question with nothing, as an
-    /// older daemon does, at one that answers without the capability, and at
-    /// one that says it serves receipts. The first two publish no receipt in
-    /// the spool and send nothing but the question, the first giving up as
-    /// timed out and the second as withheld; the third publishes the commit
-    /// receipt and sends the exact attempt as `inbox_committed` on the
-    /// connection that asked.
+    /// older daemon does, at one that answers without the capability, at one
+    /// that hangs up unanswered, and at one that says it serves receipts. The
+    /// first three publish no receipt in the spool and send nothing but the
+    /// question, giving up as timed out, withheld and lost; the fourth
+    /// publishes the commit receipt and sends the exact attempt as
+    /// `inbox_committed` on the connection that asked.
     #[cfg(unix)]
     #[spec("inbox/claude/030")]
     #[test]
@@ -1318,6 +1334,7 @@ mod tests {
             vec![
                 Some(Vec::new()),
                 Some(vec![r#"{"one_shot_receipts":0}"#.to_string()]),
+                None,
             ],
         );
         assert_eq!(
@@ -1328,8 +1345,12 @@ mod tests {
             commit_attempts(&path, who, vec![attempt.clone()], &pinned, wait),
             Committed::Withheld
         );
+        assert_eq!(
+            commit_attempts(&path, who, vec![attempt.clone()], &pinned, wait),
+            Committed::Lost
+        );
         let seen = older.join().unwrap();
-        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.len(), 3);
         for lines in &seen {
             assert_eq!(lines.len(), 1, "only the question: {seen:?}");
             let question: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
@@ -1581,21 +1602,27 @@ mod tests {
         drop(slow.join());
     }
 
-    /// Scenario: A prompt's doorbell fetch gives up three ways: at a stand-in
+    /// Scenario: A prompt's doorbell fetch gives up four ways: at a stand-in
     /// deck that says nothing within the budget, at one that answers without
-    /// the capability, and with the prompt's shared budget already spent;
-    /// and its commit's outcomes are reported. A deck that said nothing in
-    /// time and a spent budget make the hook say the deck did not answer in
-    /// time, never that it is most likely older; an answer without the
-    /// capability, or a withheld commit, makes it say the deck did not
-    /// confirm it serves receipts. The spent budget connects to nothing.
+    /// the capability, at one that hangs up unanswered, and with the prompt's
+    /// shared budget already spent; and its commit's outcomes are reported.
+    /// A deck that said nothing in time and a spent budget make the hook say
+    /// the deck did not answer in time, never that it is most likely older;
+    /// an answer without the capability, or a withheld commit, makes it say
+    /// the deck did not confirm it serves receipts; a hang-up, at the fetch
+    /// or the commit, says the connection was lost; and a commit out of time
+    /// says its own notice, not the fetch's queued one. The spent budget
+    /// connects to nothing.
     #[cfg(unix)]
     #[spec("inbox/claude/045")]
     #[test]
     fn claude_045_a_phase_out_of_time_says_so_rather_than_older_deck() {
         use std::time::{Duration, Instant};
 
-        use crate::inbox_oneshot::{forget_reports, reported_timed_out, reported_unsupported};
+        use crate::inbox_oneshot::{
+            forget_reports, reported_commit_timed_out, reported_connection_lost,
+            reported_timed_out, reported_unsupported,
+        };
         let fetch = || {
             hand_over_request(
                 InboxFetchConsumer::DoorbellHook,
@@ -1607,7 +1634,14 @@ mod tests {
                 "token-1".to_string(),
             )
         };
-        let said = || (reported_timed_out(), reported_unsupported());
+        let said = || {
+            (
+                reported_timed_out(),
+                reported_unsupported(),
+                reported_connection_lost(),
+                reported_commit_timed_out(),
+            )
+        };
         let wait = Duration::from_millis(300);
         let dir = crate::test_temp::tempdir().unwrap();
         let (path, deck) = crate::inbox_oneshot::tests::stand_in_deck(
@@ -1615,24 +1649,45 @@ mod tests {
             vec![
                 Some(Vec::new()),
                 Some(vec![r#"{"one_shot_receipts":0}"#.to_string()]),
+                None,
             ],
         );
 
         forget_reports();
         assert!(fetch_with_receipts(&path, fetch(), Instant::now() + wait).is_none());
-        assert_eq!(said(), (true, false), "a silent deck: timed out");
+        assert_eq!(
+            said(),
+            (true, false, false, false),
+            "a silent deck: timed out"
+        );
 
         forget_reports();
         assert!(fetch_with_receipts(&path, fetch(), Instant::now() + wait).is_none());
-        assert_eq!(said(), (false, true), "an answer without receipts");
-        assert_eq!(deck.join().unwrap().len(), 2);
+        assert_eq!(
+            said(),
+            (false, true, false, false),
+            "an answer without receipts"
+        );
+
+        forget_reports();
+        assert!(fetch_with_receipts(&path, fetch(), Instant::now() + wait).is_none());
+        assert_eq!(
+            said(),
+            (false, false, true, false),
+            "a hang-up: the connection was lost"
+        );
+        assert_eq!(deck.join().unwrap().len(), 3);
 
         let spent = dir.path().join("spent.sock");
         let listener = std::os::unix::net::UnixListener::bind(&spent).unwrap();
         listener.set_nonblocking(true).unwrap();
         forget_reports();
         assert!(fetch_with_receipts(&spent, fetch(), Instant::now()).is_none());
-        assert_eq!(said(), (true, false), "the shared budget spent");
+        assert_eq!(
+            said(),
+            (true, false, false, false),
+            "the shared budget spent"
+        );
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "a spent budget connects to nothing"
@@ -1640,9 +1695,20 @@ mod tests {
 
         forget_reports();
         report_committed(Committed::TimedOut);
-        assert_eq!(said(), (true, false), "a commit out of time");
+        assert_eq!(
+            said(),
+            (false, false, false, true),
+            "a commit out of time promises nothing queued"
+        );
         forget_reports();
         report_committed(Committed::Withheld);
-        assert_eq!(said(), (false, true), "a withheld commit");
+        assert_eq!(said(), (false, true, false, false), "a withheld commit");
+        forget_reports();
+        report_committed(Committed::Lost);
+        assert_eq!(
+            said(),
+            (false, false, true, false),
+            "a commit's lost connection"
+        );
     }
 }

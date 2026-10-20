@@ -798,11 +798,12 @@ pub fn receipts_answer_wait() -> Duration {
 }
 
 /// What a one-shot says when the deck answered without confirming that it
-/// serves receipts, or ended the connection unanswered
-/// ([`Opened::Unsupported`]): nothing was taken, and how to make the two
-/// agree. `hooks install` writes the waiter and the prompt hook together,
-/// from the one binary it runs as. A deck that did not answer in time gets
-/// [`RECEIPTS_TIMED_OUT`] instead.
+/// serves receipts ([`Opened::Unsupported`]): nothing was taken, and how to
+/// make the two agree. `hooks install` writes the waiter and the prompt hook
+/// together, from the one binary it runs as. A deck that did not answer in
+/// time gets [`RECEIPTS_TIMED_OUT`] instead, and a connection lost before
+/// any answer [`RECEIPTS_CONNECTION_LOST`]: neither is an answer, so neither
+/// is evidence of an older deck.
 pub const RECEIPTS_UNSUPPORTED: &str = "dot-agent-deck: the deck daemon did not confirm that it serves message receipts, so no message was taken. It is most likely older than the dot-agent-deck this agent's hooks run. Restart the deck daemon on that newer build, or run `dot-agent-deck hooks install --agent claude-code` with the build the daemon runs, which rewrites the waiter and the prompt hook together; then restart the agent.";
 
 static REPORTED_UNSUPPORTED: std::sync::atomic::AtomicBool =
@@ -822,12 +823,14 @@ pub fn reported_unsupported() -> bool {
     REPORTED_UNSUPPORTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// What a one-shot says when its receipts budget ran out before the deck
-/// answered whether it serves receipts, or before the phase could ask
-/// ([`Opened::TimedOut`]): nothing was asked that could take mail, so the
-/// messages stay queued. Fixed text, and not [`RECEIPTS_UNSUPPORTED`]'s: a
-/// slow deck that serves receipts and an older one, which answers nothing,
-/// look the same from here, so it names both rather than the likelier.
+/// What a one-shot that would have taken mail says when its receipts budget
+/// ran out before the deck answered whether it serves receipts, or before
+/// the phase could ask ([`Opened::TimedOut`]): nothing was asked that could
+/// take mail, so the messages stay queued. Fixed text, and not
+/// [`RECEIPTS_UNSUPPORTED`]'s: a slow deck that serves receipts and an older
+/// one, which answers nothing, look the same from here, so it names both
+/// rather than the likelier. A commit that runs out of time says
+/// [`RECEIPTS_COMMIT_TIMED_OUT`] instead, which promises nothing queued.
 pub const RECEIPTS_TIMED_OUT: &str = "dot-agent-deck: the deck daemon did not answer in time whether it serves message receipts, so this hook took no message and left the messages waiting for this agent queued. A busy deck daemon can answer late; one older than the dot-agent-deck this agent's hooks run does not answer at all. If this keeps happening, make the two the same build: restart the deck daemon on the hooks' build, or run `dot-agent-deck hooks install --agent claude-code` with the build the daemon runs, which rewrites the waiter and the prompt hook together; then restart the agent.";
 
 static REPORTED_TIMED_OUT: std::sync::atomic::AtomicBool =
@@ -847,6 +850,54 @@ pub fn reported_timed_out() -> bool {
     REPORTED_TIMED_OUT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// What the prompt hook says when its commit's receipts budget ran out before
+/// the deck answered whether it serves receipts ([`Opened::TimedOut`] on the
+/// commit's connection). The message the prompt carries was already taken by
+/// the waiter that wrote its block, so this says only what this exchange did
+/// not do: it confirmed no receipt and took no further message. It makes no
+/// claim that anything is still queued.
+pub const RECEIPTS_COMMIT_TIMED_OUT: &str = "dot-agent-deck: the deck daemon did not answer in time whether it serves message receipts, so this hook did not confirm to it that the message in this prompt was received, and took no further message. A busy deck daemon can answer late; one older than the dot-agent-deck this agent's hooks run does not answer at all. If this keeps happening, make the two the same build: restart the deck daemon on the hooks' build, or run `dot-agent-deck hooks install --agent claude-code` with the build the daemon runs, which rewrites the waiter and the prompt hook together; then restart the agent.";
+
+static REPORTED_COMMIT_TIMED_OUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Say [`RECEIPTS_COMMIT_TIMED_OUT`] on stderr, once per process, and
+/// remember it ([`reported_refusal`]).
+pub fn report_commit_timed_out() {
+    if !REPORTED_COMMIT_TIMED_OUT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("{RECEIPTS_COMMIT_TIMED_OUT}");
+    }
+}
+
+/// Whether this process said [`RECEIPTS_COMMIT_TIMED_OUT`].
+pub fn reported_commit_timed_out() -> bool {
+    REPORTED_COMMIT_TIMED_OUT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// What a one-shot says when its connection to the deck was lost before the
+/// deck answered whether it serves receipts ([`Opened::Lost`]): the
+/// connection ended, the question's write failed for another reason than
+/// running out of time, or a line could not be read. No answer came, so this
+/// is no evidence of the deck's version, and it names none: it says what this
+/// exchange did not do and how to check the deck is running.
+pub const RECEIPTS_CONNECTION_LOST: &str = "dot-agent-deck: the connection to the deck daemon was lost before it answered whether it serves message receipts, so this hook took no message and confirmed no receipt. The deck daemon may have stopped or restarted: check that it is running with `dot-agent-deck daemon status`, and if this keeps happening while it runs, restart the agent.";
+
+static REPORTED_CONNECTION_LOST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Say [`RECEIPTS_CONNECTION_LOST`] on stderr, once per process, and remember
+/// it ([`reported_refusal`]).
+pub fn report_connection_lost() {
+    if !REPORTED_CONNECTION_LOST.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("{RECEIPTS_CONNECTION_LOST}");
+    }
+}
+
+/// Whether this process said [`RECEIPTS_CONNECTION_LOST`].
+pub fn reported_connection_lost() -> bool {
+    REPORTED_CONNECTION_LOST.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Forget what this process said, so a test can tell which notice a later
 /// step says.
 #[cfg(test)]
@@ -854,6 +905,8 @@ pub(crate) fn forget_reports() {
     for said in [
         &REPORTED_UNSUPPORTED,
         &REPORTED_TIMED_OUT,
+        &REPORTED_COMMIT_TIMED_OUT,
+        &REPORTED_CONNECTION_LOST,
         &REPORTED_FOREIGN,
     ] {
         said.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -879,12 +932,15 @@ pub fn report_foreign_socket() {
     }
 }
 
-/// Whether this process said [`RECEIPTS_UNSUPPORTED`], [`RECEIPTS_TIMED_OUT`]
-/// or [`RECEIPTS_FOREIGN_SOCKET`]: a one-shot that did any of them took
+/// Whether this process said [`RECEIPTS_UNSUPPORTED`], [`RECEIPTS_TIMED_OUT`],
+/// [`RECEIPTS_COMMIT_TIMED_OUT`], [`RECEIPTS_CONNECTION_LOST`] or
+/// [`RECEIPTS_FOREIGN_SOCKET`]: a one-shot that did any of them took
 /// nothing, and a later phase of the same hook asks nothing more.
 pub fn reported_refusal() -> bool {
     reported_unsupported()
         || reported_timed_out()
+        || reported_commit_timed_out()
+        || reported_connection_lost()
         || REPORTED_FOREIGN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
@@ -919,10 +975,15 @@ pub enum Opened {
     /// deck that serves receipts, and not to this caller.
     Refused(Box<InboxWaitReply>),
     /// It answered without saying it serves them (the answer had no
-    /// [`crate::inbox_hub::ONE_SHOT_RECEIPTS`]), or the connection ended, or
-    /// the question's write failed, before an answer. Nothing that could take
-    /// mail or commit it was sent.
+    /// [`crate::inbox_hub::ONE_SHOT_RECEIPTS`]: a legacy batch, or a
+    /// capability below this binary's). Nothing that could take mail or
+    /// commit it was sent.
     Unsupported,
+    /// The connection was lost before an answer: it ended, a line could not
+    /// be read, or the question's write failed for another reason than
+    /// running out of time. No answer is no evidence of the deck's version.
+    /// Nothing that could take mail or commit it was sent.
+    Lost,
     /// The budget ran out first: it was already spent, or the connect, the
     /// question's write or the wait for the answer did not finish by the
     /// deadline (a full accept queue, a deck that does not read, a slow deck,
@@ -1034,14 +1095,14 @@ impl Connection {
             return if error.kind() == io::ErrorKind::TimedOut {
                 Opened::TimedOut
             } else {
-                Opened::Unsupported
+                Opened::Lost
             };
         }
         loop {
             let Some(reply) = connection.next(Some(deadline)) else {
                 // The connection ended unanswered, or the deadline passed.
                 return if connection.ended() {
-                    Opened::Unsupported
+                    Opened::Lost
                 } else {
                     Opened::TimedOut
                 };
@@ -2236,8 +2297,8 @@ pub(crate) mod tests {
     /// capability; a refusal; and a hang-up. Only the two answers that name
     /// the capability on their own connection open it, the second
     /// connection's silence is not excused by the first's answer and is
-    /// `TimedOut`, the answers without the capability and the hang-up are
-    /// `Unsupported`, and the question is all any connection is sent.
+    /// `TimedOut`, the answers without the capability are `Unsupported`, the
+    /// hang-up is `Lost`, and the question is all any connection is sent.
     #[cfg(unix)]
     #[spec("inbox/claude/029")]
     #[test]
@@ -2276,6 +2337,7 @@ pub(crate) mod tests {
                 Opened::Ready(_) => "ready",
                 Opened::Refused(_) => "refused",
                 Opened::Unsupported => "unsupported",
+                Opened::Lost => "lost",
                 Opened::TimedOut => "timed out",
                 Opened::Foreign => "foreign",
                 Opened::Unreachable => "unreachable",
@@ -2290,7 +2352,7 @@ pub(crate) mod tests {
                 "unsupported",
                 "ready",
                 "refused",
-                "unsupported"
+                "lost"
             ]
         );
         let seen = deck.join().unwrap();
@@ -2662,13 +2724,16 @@ pub(crate) mod tests {
 
     /// Scenario: Point a one-shot's receipts question at a stand-in deck that
     /// says nothing within the wait, then at one that answers without the
-    /// capability, and ask once more with the deadline already spent. The
-    /// silent deck and the spent deadline are `TimedOut`, the spent one
-    /// without connecting at all, and the answer without the capability is
-    /// `Unsupported`. The two notices differ: the timeout one says the deck
-    /// did not answer in time, that no message was taken and that the
-    /// messages stay queued, and does not call the deck most likely older,
-    /// which the unsupported one still does.
+    /// capability, then at one that hangs up unanswered, and ask once more
+    /// with the deadline already spent. The silent deck and the spent
+    /// deadline are `TimedOut`, the spent one without connecting at all, the
+    /// answer without the capability is `Unsupported` and the hang-up is
+    /// `Lost`. The four notices differ: the timeout one says the deck did not
+    /// answer in time, that no message was taken and that the messages stay
+    /// queued; the commit's timeout promises nothing queued; the lost one
+    /// says the connection was lost and how to check the deck is running;
+    /// and only the unsupported one, which follows a real answer, calls the
+    /// deck most likely older.
     #[cfg(unix)]
     #[spec("inbox/claude/044")]
     #[test]
@@ -2679,6 +2744,7 @@ pub(crate) mod tests {
             vec![
                 Some(Vec::new()),
                 Some(vec![r#"{"one_shot_receipts":0}"#.to_string()]),
+                None,
             ],
         );
         let question = receipts_question(PANE, Some(AGENT), "token-1").unwrap();
@@ -2689,7 +2755,10 @@ pub(crate) mod tests {
         let negative = Connection::open_receipts_within(&path, &question, wait);
         assert!(matches!(negative, Opened::Unsupported), "{negative:?}");
         drop(negative);
-        assert_eq!(deck.join().unwrap().len(), 2);
+        let hung_up = Connection::open_receipts_within(&path, &question, wait);
+        assert!(matches!(hung_up, Opened::Lost), "{hung_up:?}");
+        drop(hung_up);
+        assert_eq!(deck.join().unwrap().len(), 3);
 
         let spent = dir.path().join("spent.sock");
         let listener = std::os::unix::net::UnixListener::bind(&spent).unwrap();
@@ -2713,10 +2782,59 @@ pub(crate) mod tests {
                 "{says:?} missing: {RECEIPTS_TIMED_OUT}"
             );
         }
-        assert!(
-            !RECEIPTS_TIMED_OUT.contains("most likely"),
-            "a timeout is not evidence the deck is older: {RECEIPTS_TIMED_OUT}"
-        );
         assert!(RECEIPTS_UNSUPPORTED.contains("most likely older"));
+        let notices = [
+            RECEIPTS_UNSUPPORTED,
+            RECEIPTS_TIMED_OUT,
+            RECEIPTS_COMMIT_TIMED_OUT,
+            RECEIPTS_CONNECTION_LOST,
+        ];
+        for (i, a) in notices.iter().enumerate() {
+            for b in &notices[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        for notice in [
+            RECEIPTS_TIMED_OUT,
+            RECEIPTS_COMMIT_TIMED_OUT,
+            RECEIPTS_CONNECTION_LOST,
+        ] {
+            assert!(
+                !notice.contains("most likely"),
+                "no answer is no evidence the deck is older: {notice}"
+            );
+        }
+        for says in [
+            "did not answer in time",
+            "did not confirm",
+            "took no further message",
+            "hooks install --agent claude-code",
+        ] {
+            assert!(
+                RECEIPTS_COMMIT_TIMED_OUT.contains(says),
+                "{says:?} missing: {RECEIPTS_COMMIT_TIMED_OUT}"
+            );
+        }
+        assert!(
+            !RECEIPTS_COMMIT_TIMED_OUT.contains("queued"),
+            "the waiter already took the message a commit names: {RECEIPTS_COMMIT_TIMED_OUT}"
+        );
+        for says in [
+            "connection to the deck daemon was lost before it answered",
+            "took no message",
+            "confirmed no receipt",
+            "dot-agent-deck daemon status",
+        ] {
+            assert!(
+                RECEIPTS_CONNECTION_LOST.contains(says),
+                "{says:?} missing: {RECEIPTS_CONNECTION_LOST}"
+            );
+        }
+        for not in ["older", "queued", "hooks install"] {
+            assert!(
+                !RECEIPTS_CONNECTION_LOST.contains(not),
+                "{not:?}: a lost connection says nothing of versions or the queue: {RECEIPTS_CONNECTION_LOST}"
+            );
+        }
     }
 }

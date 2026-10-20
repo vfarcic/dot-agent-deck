@@ -112,9 +112,10 @@ pub const STREAM_NOT_IN_DECK_EXIT: u8 = 3;
 /// wakes Claude. A daemon that does not confirm it serves one-shot receipts —
 /// one older than this binary, which answers nothing — is handed nothing: the
 /// waiter says so on stderr and exits 1, with
-/// [`crate::inbox_oneshot::RECEIPTS_TIMED_OUT`] when no answer came in time
-/// and [`crate::inbox_oneshot::RECEIPTS_UNSUPPORTED`] when one came without
-/// the capability.
+/// [`crate::inbox_oneshot::RECEIPTS_TIMED_OUT`] when no answer came in time,
+/// [`crate::inbox_oneshot::RECEIPTS_UNSUPPORTED`] when one came without
+/// the capability and [`crate::inbox_oneshot::RECEIPTS_CONNECTION_LOST`] when
+/// the connection was lost before any answer.
 /// Everything else — run outside a deck, no daemon, superseded by a newer
 /// waiter, refused — exits 0 with no output, so a global hook never disturbs
 /// a session the deck does not manage.
@@ -301,6 +302,10 @@ fn wait_once(json: &str, question: Option<&str>) -> ExitCode {
             }
             Opened::Unsupported => {
                 crate::inbox_oneshot::report_unsupported();
+                return ExitCode::FAILURE;
+            }
+            Opened::Lost => {
+                crate::inbox_oneshot::report_connection_lost();
                 return ExitCode::FAILURE;
             }
             Opened::TimedOut => {
