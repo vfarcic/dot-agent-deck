@@ -67,9 +67,13 @@ export interface SelfUpgradeCheck {
   /** Which check this is; ids grow with every check. Upgrade sends it, and the bridge runs exactly that check's plan. */
   checkId: number;
   latest: string;
-  /** Whether a copy that can still be offered is behind the latest release. */
+  /**
+   * Whether the app itself is behind and can still be offered. A CLI that is
+   * behind does not count (issue #1753): the Local daemon section offers it,
+   * from `cli`, so the app-wide notice is about the app alone.
+   */
   updateAvailable: boolean;
-  /** The notice's text: the TUI badge's words, or, once the app itself was installed and nothing else is behind, the relaunch prompt. */
+  /** The notice's text: the app's headline, the TUI badge's words, or, once the app itself was installed, the relaunch prompt. */
   notice: string | null;
   /** The app's own copy, installed this session and waiting for a relaunch: its result. Shown in place of an offer, with Relaunch. */
   installed: SelfUpgradeResult | null;
@@ -126,16 +130,29 @@ export function newerCheck(current: SelfUpgradeCheck | undefined, answer: SelfUp
   return current && current.checkId > answer.checkId ? current : answer;
 }
 
-/** The plans the dialog shows, app first. */
-export function plansOf(check: SelfUpgradeCheck): SelfUpgradePlan[] {
-  return check.cli ? [check.app, check.cli] : [check.app];
+/**
+ * The plans a dialog about `copies` shows, app first: the banner's dialog
+ * shows the app's, and the Local daemon section's the CLI's (issue #1753).
+ */
+export function plansOf(check: SelfUpgradeCheck, copies: readonly SelfCopy[] = ["app", "cli"]): SelfUpgradePlan[] {
+  return (check.cli ? [check.app, check.cli] : [check.app]).filter((plan) => copies.includes(plan.copy));
 }
 
 /**
- * The copy to offer next: the first actionable plan after `done`, app before
- * CLI. The app goes first because its result decides whether Relaunch is
- * offered at the end.
+ * The copy to offer next: the first actionable plan among `copies` after
+ * `done`, app before CLI. The app goes first because its result decides
+ * whether Relaunch is offered at the end.
  */
-export function nextOffer(check: SelfUpgradeCheck, done: readonly SelfCopy[]): SelfUpgradePlan | undefined {
-  return plansOf(check).find((plan) => plan.actionable && !done.includes(plan.copy));
+export function nextOffer(check: SelfUpgradeCheck, done: readonly SelfCopy[], copies?: readonly SelfCopy[]): SelfUpgradePlan | undefined {
+  return plansOf(check, copies).find((plan) => plan.actionable && !done.includes(plan.copy));
+}
+
+/**
+ * Issue #1753 — the CLI's plan when this machine's `dot-agent-deck` CLI is
+ * behind the latest release: what the Dashboard's Local daemon section offers
+ * Upgrade for, beside a local daemon older than the app. `undefined` while
+ * the CLI is current or none is installed.
+ */
+export function cliBehind(check: SelfUpgradeCheck | undefined): SelfUpgradePlan | undefined {
+  return check?.cli && check.cli.action !== "up-to-date" ? check.cli : undefined;
 }

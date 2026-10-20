@@ -7,7 +7,8 @@ import { VoiceOn } from "../hooks/useVoiceOn";
 import type { DeckRuntimeState, DeckSnapshot } from "../types";
 import { AgentOverview } from "./AgentOverview";
 import { SelfUpgradeDialog } from "./SelfUpgradeDialog";
-import type { SelfUpgradeCheck } from "../lib/selfUpgrade";
+import type { SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
+import { CLI_LEAVES_DAEMON } from "./LocalUpgradeFlow";
 
 /**
  * PRD #1487 M5 — Upgrade on a deck's card on the agent dashboard (D9). The
@@ -145,7 +146,7 @@ describe("the newer-release dialog over the dashboard", () => {
     const { rerender } = render(
       <VoiceOn.Provider value={true}>
         <AgentOverview runtime={runtime(createFixtureFleet("upgrade"))} onNavigate={onNavigate} />
-        <SelfUpgradeDialog check={check} api={api} onClose={vi.fn()} />
+        <SelfUpgradeDialog check={check} api={api} copies={["app"]} onClose={vi.fn()} />
       </VoiceOn.Provider>,
     );
     expect(screen.getByTestId("self-upgrade-cancel")).toHaveFocus();
@@ -163,5 +164,122 @@ describe("the newer-release dialog over the dashboard", () => {
     );
     fireEvent.keyDown(document.body, { key: "1" });
     expect(onNavigate).toHaveBeenCalled();
+  });
+});
+
+describe("Upgrade on the Local daemon section (issue #1753)", () => {
+  const cliHeadline = "dot-agent-deck CLI: update available: v0.45.0 (current: v0.44.0)";
+  const cliPlan: SelfUpgradePlan = {
+    copy: "cli",
+    label: "dot-agent-deck CLI",
+    headline: cliHeadline,
+    current: "0.44.0",
+    latest: "0.45.0",
+    action: "brew-upgrade",
+    actionable: true,
+    confirmQuestion: "Upgrade dot-agent-deck CLI to v0.45.0?",
+    provenance: { checked: true, reason: null },
+    lines: [
+      { text: cliHeadline, command: null },
+      { text: "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.44.0/bin/dot-agent-deck). Upgrading runs `brew upgrade dot-agent-deck`, which installs the formula's latest release.", command: null },
+    ],
+  };
+  const appHeadline = "Agent Deck (desktop app) is up to date (v0.45.0).";
+  /* The app is current, so the app-wide notice is empty; only the CLI is behind. */
+  const check = (cli: SelfUpgradePlan | null = cliPlan): SelfUpgradeCheck => ({
+    checkId: 9,
+    latest: "0.45.0",
+    updateAvailable: false,
+    notice: null,
+    installed: null,
+    app: { copy: "app", label: "Agent Deck (desktop app)", headline: appHeadline, current: "0.45.0", latest: "0.45.0", action: "up-to-date", actionable: false, confirmQuestion: null, provenance: { checked: true, reason: null }, lines: [{ text: appHeadline, command: null }] },
+    cli,
+    recheckAfterSecs: 21600,
+  });
+  const brewed: SelfUpgradeResult = { copy: "cli", ok: true, relaunch: false, lines: [{ text: "`brew upgrade dot-agent-deck` finished; it now reports v0.45.0.", command: null }] };
+  const selfApi = () => ({ check: vi.fn(), run: vi.fn(async () => brewed), relaunch: vi.fn() });
+  /* The `upgrade` fleet with this machine's daemon on an older release than the app. */
+  const olderLocal = () => createFixtureFleet("upgrade").map((deck) => (
+    deck.connection.deckKind === "local" ? { ...deck, connection: { ...deck.connection, upgradeOffer: { kind: "offered" as const, from: "0.44.0", to: "0.45.0" } } } : deck
+  ));
+
+  /** Scenario: The app is current and the CLI is behind: the Local daemon section offers Upgrade, named for the CLI, with the CLI's notice on hover; pressing it shows the CLI's plan, saying the daemon is not restarted, and Upgrade upgrades the CLI alone — the daemon is never asked to restart. */
+  it("local_upgrade_001 offers the CLI on the Local daemon section and leaves the daemon alone", async () => {
+    const deck = runtime(createFixtureFleet("upgrade"));
+    const api = selfApi();
+    const onClosed = vi.fn();
+    render(<AgentOverview runtime={deck} onNavigate={vi.fn()} selfUpgrade={{ check: check(), api, onClosed }} />);
+
+    const button = within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade");
+    expect(button).toHaveAccessibleName("Upgrade the CLI on this machine");
+    expect(button).toHaveAttribute("title", cliHeadline);
+    // A remote deck's Upgrade is still about its own daemon.
+    expect(within(group(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("daemon-upgrade")).toHaveAccessibleName(`Upgrade the daemon on ${FIXTURE_REMOTE_DAEMON_ID}`);
+
+    fireEvent.click(button);
+    expect(screen.getByTestId("self-upgrade-plan-cli")).toHaveTextContent(cliHeadline);
+    expect(screen.queryByTestId("self-upgrade-plan-app")).not.toBeInTheDocument();
+    expect(screen.getByTestId("self-upgrade-then")).toHaveTextContent(CLI_LEAVES_DAEMON);
+    expect(screen.getByTestId("self-upgrade-cancel")).toHaveFocus();
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    expect(api.run).toHaveBeenCalledWith("cli", 9);
+    expect(await screen.findByTestId("self-upgrade-result-cli")).toHaveTextContent("it now reports v0.45.0");
+    fireEvent.click(screen.getByTestId("self-upgrade-close"));
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+    expect(onClosed).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: Both the CLI and the local daemon are behind: one Upgrade covers both. The CLI's dialog says the daemon restart follows; once the CLI is upgraded and the dialog closed, the daemon's restart onto the app's build starts on its own, through the daemon's usual question. */
+  it("local_upgrade_002 upgrades the CLI, then restarts the older local daemon", async () => {
+    const deck = runtime(olderLocal());
+    const api = selfApi();
+    render(<AgentOverview runtime={deck} onNavigate={vi.fn()} selfUpgrade={{ check: check(), api }} />);
+
+    const button = within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade");
+    expect(button).toHaveAccessibleName("Upgrade the CLI and the daemon on this machine");
+    expect(button).toHaveAttribute("title", `${cliHeadline} Its daemon runs 0.44.0; this app is 0.45.0.`);
+    fireEvent.click(button);
+    expect(screen.getByTestId("self-upgrade-then")).toHaveTextContent("After the CLI, Agent Deck restarts the daemon on this machine, which runs 0.44.0, onto 0.45.0, the version that came with this app.");
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    await screen.findByTestId("self-upgrade-result-cli");
+    expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("self-upgrade-close"));
+
+    await waitFor(() => expect(deck.upgradeDaemon).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, expect.any(Function)));
+    expect(await screen.findByTestId("upgrade-outcome")).toHaveTextContent("The daemon on this machine now runs 0.45.0");
+  });
+
+  /** Scenario: Both are behind and the user cancels the CLI's question: the whole Upgrade ends having changed nothing — no CLI upgrade and no daemon restart. */
+  it("local_upgrade_003 Cancel on the CLI ends the whole upgrade", () => {
+    const deck = runtime(olderLocal());
+    const api = selfApi();
+    render(<AgentOverview runtime={deck} onNavigate={vi.fn()} selfUpgrade={{ check: check(), api }} />);
+    fireEvent.click(within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade"));
+    fireEvent.click(screen.getByTestId("self-upgrade-cancel"));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(api.run).not.toHaveBeenCalled();
+    expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: The CLI is behind but cannot be upgraded from the app (Nix), and the daemon is older: the CLI's plan says what to do and offers only Close, after which the daemon's Upgrade asks first rather than starting on its own. */
+  it("local_upgrade_004 asks before the daemon restart when the CLI was not upgraded", () => {
+    const deck = runtime(olderLocal());
+    const nix: SelfUpgradePlan = { ...cliPlan, action: "notify-only", actionable: false, confirmQuestion: null, lines: [cliPlan.lines[0], { text: "Installed with Nix (/nix/store/abc/bin/dot-agent-deck), so it is not changed from here.", command: null }] };
+    render(<AgentOverview runtime={deck} onNavigate={vi.fn()} selfUpgrade={{ check: check(nix), api: selfApi() }} />);
+    fireEvent.click(within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade"));
+    expect(screen.queryByTestId("self-upgrade-start")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("self-upgrade-close"));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Upgrade the daemon on this machine?");
+    expect(screen.getByTestId("upgrade-dialog")).toHaveAttribute("data-phase", "confirm");
+    expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: The CLI is current and the local daemon is at the app's release: the Local daemon section offers no Upgrade. */
+  it("local_upgrade_005 offers nothing on the Local daemon section while both are current", () => {
+    const current: SelfUpgradePlan = { ...cliPlan, action: "up-to-date", actionable: false, confirmQuestion: null, headline: "dot-agent-deck CLI is up to date (v0.45.0)." };
+    render(<AgentOverview runtime={runtime(createFixtureFleet("upgrade"))} onNavigate={vi.fn()} selfUpgrade={{ check: check(current), api: selfApi() }} />);
+    expect(within(group(FIXTURE_DAEMON_ID)).queryByTestId("daemon-upgrade")).not.toBeInTheDocument();
   });
 });

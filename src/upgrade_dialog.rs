@@ -881,7 +881,7 @@ pub fn render(frame: &mut Frame, dialog: &mut UpgradeDialog) -> Vec<(UpgradeChoi
             body.push(Line::from(""));
         }
         let start = body.len();
-        let items = plan.items();
+        let items = plan.terminal_items();
         if let Some((headline, rest)) = items.split_first() {
             push_line(&mut body, headline, text_width, bold());
             for line in rest {

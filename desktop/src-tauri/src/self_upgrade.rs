@@ -106,13 +106,15 @@ pub(crate) struct CheckDto {
     pub check_id: u64,
     /// The latest release, without a leading `v`.
     pub latest: String,
-    /// Whether any copy is behind it and can still be offered. The notice
-    /// shows then, and while a relaunch is pending.
+    /// Whether the app is behind it and can still be offered. The notice
+    /// shows then, and while a relaunch is pending. A CLI that is behind is
+    /// not counted (issue #1753): it is offered on the Dashboard's Local
+    /// daemon section, from [`Self::cli`], so the app-wide notice never reads
+    /// as a statement about the daemon.
     pub update_available: bool,
-    /// The notice's text: the headline of the first copy that is behind — the
-    /// app's, else the CLI's, the same words as the TUI's badge — or, once
-    /// the app's own copy was installed and nothing else is behind, the
-    /// core's relaunch line.
+    /// The notice's text: the app's headline while it is behind — the same
+    /// words as the TUI's badge uses for it — or, once the app's own copy was
+    /// installed, the core's relaunch line.
     pub notice: Option<String>,
     /// The app's own copy was installed this session and the app still runs
     /// the old build: its result, which the dialog shows in place of an
@@ -493,25 +495,18 @@ pub(crate) fn plan_dto(copy: SelfCopy, plan: &UpgradePlan) -> PlanDto {
     }
 }
 
-/// Check `check_id`'s plans for the webview. Once the app's own copy is
-/// `installed`, it is no longer offered — the running build is still the old
-/// one, so a check would offer it again — and the notice names the next copy
-/// that is behind, or, when none is, says to relaunch.
+/// Check `check_id`'s plans for the webview. The notice is about the app
+/// alone (issue #1753); the CLI's plan rides along for the Local daemon
+/// section. Once the app's own copy is `installed`, it is no longer offered —
+/// the running build is still the old one, so a check would offer it again —
+/// and the notice says to relaunch.
 pub(crate) fn check_dto(
     check_id: u64,
     checked: &Checked,
     installed: Option<&Installed>,
 ) -> CheckDto {
-    let behind = |plan: &UpgradePlan| plan.action != PlanAction::UpToDate;
-    let offered = |copy: SelfCopy| !(copy == SelfCopy::App && installed.is_some());
-    let headline = [
-        (SelfCopy::App, Some(&checked.app)),
-        (SelfCopy::Cli, checked.cli.as_ref()),
-    ]
-    .into_iter()
-    .filter_map(|(copy, plan)| Some((copy, plan?)))
-    .find(|(copy, plan)| offered(*copy) && behind(plan))
-    .map(|(_, plan)| safe_message(plan.headline()));
+    let headline = (installed.is_none() && checked.app.action != PlanAction::UpToDate)
+        .then(|| safe_message(checked.app.headline()));
     let mut app = plan_dto(SelfCopy::App, &checked.app);
     if installed.is_some() {
         app.actionable = false;
@@ -1064,7 +1059,7 @@ mod tests {
         assert!(cli.actionable);
         assert_eq!(
             cli.confirm_question.as_deref(),
-            Some("Upgrade dot-agent-deck to v0.47.0?")
+            Some("Upgrade dot-agent-deck CLI to v0.47.0?")
         );
         assert!(
             texts(&cli.lines)
@@ -1170,7 +1165,7 @@ mod tests {
     // Unix install layout: native Windows is unsupported (#164).
     #[cfg(unix)]
     #[test]
-    fn self_upgrade_015_cli_behind_an_up_to_date_app_is_still_noticed() {
+    fn self_upgrade_015_cli_behind_an_up_to_date_app_is_left_to_the_local_daemon() {
         let host = deb_machine()
             .on_path("/home/u/.local/bin")
             .deck("/home/u/.local/bin/dot-agent-deck", CURRENT)
@@ -1185,10 +1180,15 @@ mod tests {
             Some(&path),
         ));
         assert_eq!(dto.app.action, "up-to-date");
-        assert!(dto.update_available);
+        // Issue #1753: the app-wide notice is about the app alone; the CLI is
+        // offered on the Local daemon section, from its own plan.
+        assert!(!dto.update_available);
+        assert_eq!(dto.notice, None);
+        let cli = dto.cli.expect("the CLI beside the app is planned");
+        assert_eq!(cli.action, "replace-binary");
         assert_eq!(
-            dto.notice.as_deref(),
-            Some("dot-agent-deck: update available: v0.47.0 (current: v0.46.0)")
+            cli.headline,
+            "dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)"
         );
     }
 
@@ -1449,15 +1449,22 @@ mod tests {
         state.mark_installed(SelfCopy::App, &installed, &result);
 
         // The next check still sees the old build running, so it plans the
-        // app again; the app is not offered, the CLI behind it is.
+        // app again; the app is not offered, and the notice is the relaunch
+        // prompt even with the CLI behind, which the Local daemon section
+        // offers (issue #1753).
         let answer = check_dto(id, &checked, state.installed().as_ref());
         assert!(!answer.app.actionable);
         assert_eq!(answer.app.confirm_question, None);
         assert_eq!(answer.installed.as_ref(), Some(&result));
-        assert!(answer.update_available);
+        assert!(!answer.update_available);
         assert_eq!(
             answer.notice.as_deref(),
-            Some("dot-agent-deck: update available: v0.47.0 (current: v0.46.0)")
+            Some("Agent Deck v0.47.0 is installed. Relaunch to run it.")
+        );
+        assert_eq!(
+            answer.cli.as_ref().map(|cli| cli.actionable),
+            Some(true),
+            "the CLI is still offered, from its own plan"
         );
         assert_eq!(
             state.plan_for(SelfCopy::App, id).unwrap_err(),
@@ -1465,7 +1472,6 @@ mod tests {
         );
         assert!(state.plan_for(SelfCopy::Cli, id).is_ok());
 
-        // With nothing else behind, the notice is the relaunch prompt.
         let mut app_only = checked.clone();
         app_only.cli = None;
         let answer = check_dto(id, &app_only, state.installed().as_ref());
@@ -1668,7 +1674,7 @@ mod tests {
         assert!(cli.actionable);
         assert_eq!(
             cli.confirm_question.as_deref(),
-            Some("Upgrade dot-agent-deck to v0.47.0-beta.3?")
+            Some("Upgrade dot-agent-deck CLI to v0.47.0-beta.3?")
         );
         let text = texts(&cli.lines).join("\n");
         assert!(text.contains("brew upgrade dot-agent-deck-beta"), "{text}");

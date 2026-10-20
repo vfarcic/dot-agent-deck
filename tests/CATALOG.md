@@ -5318,7 +5318,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 ##### upgrade/upgrade-dialog/001 — The TUI's upgrade dialog shows both copies' plans in the core's words and asks about this TUI's copy first, defaulting to Cancel.
 - **Layer:** L1 (`upgrade_dialog::UpgradeDialog` + ratatui `TestBackend` + `insta`), plans built by `self_upgrade::plan::plan` from faked installs.
 - **Agent:** none.
-- **Asserts:** every line of the in-place CLI plan and of the desktop `.deb` plan appears; the provenance line says it will NOT be checked; the question is `Upgrade dot-agent-deck to v<new>?` with `> Cancel` selected; the desktop app is not asked about yet.
+- **Asserts:** every line of the in-place CLI plan and of the desktop `.deb` plan appears; the CLI's section says upgrading does not restart the daemon on this machine and what the TUI's next start does, and the app's has no such line (issue #1753); the provenance line says it will NOT be checked; the question is `Upgrade dot-agent-deck CLI to v<new>?` with `> Cancel` selected; the desktop app is not asked about yet.
 - **Does not assert:** the spawned binary's badge and key (`upgrade/tui-upgrade/001`), executing an upgrade.
 - **Platform coverage:** mac+linux+windows.
 
@@ -5418,7 +5418,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.
 - **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server in the test serving a script that answers only `--version`, as the release, and fails on any other invocation, `e2e`-only seams for the running version, the running executable's path and the release URLs).
 - **Agent:** none.
-- **Asserts:** the footer shows `update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, and the dialog shows `Upgraded …`, the provenance result and the restart line; Escape closes it.
+- **Asserts:** the footer shows `dot-agent-deck CLI: update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Upgrading does not restart the daemon on this machine` (issue #1753), `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, and the dialog shows `Upgraded …`, the provenance result and the restart line; Escape closes it.
 - **Does not assert:** provenance verification with an authenticated `gh`, the desktop app's upgrade, a real GitHub release.
 - **Platform coverage:** mac+linux.
 
