@@ -53,6 +53,8 @@
 //! carry no raw `sleep` (linkage-check Decision 21 / rule 5).
 
 mod common;
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
 
 use std::time::Duration;
 
@@ -476,4 +478,94 @@ fn handshake_010_protocol_skew_with_matching_build_restarts_silently() {
         "a daemon on another attach protocol must be restarted, not attached to, even when \
          its build id matches"
     );
+}
+
+/// Scenario: Keep a TUI open while its fixture-owned daemon is stopped and replaced at the same socket. A same-protocol replacement must reconnect and show its new agent, while an N+1 replacement must show a refusal naming both protocol numbers and must not show that daemon's agent.
+#[spec("lifecycle/handshake/011")]
+#[test]
+fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
+    use inbox::*;
+    let own = dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
+    // Exercise the positive reconnect control before reaching the RED case.
+    for protocol in [own, own + 1] {
+        let mut original = spawn_daemon_at_build_and_protocol(NEW_BUILD, own);
+        let old = pane(&original, "before-replacement");
+        status(&original, &old, "idle", "claude_code");
+        let deck = TuiDeck::builder()
+            .with_env(
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_string_lossy().to_string(),
+            )
+            .with_env(
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_string_lossy().to_string(),
+            )
+            .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+            .with_env("RUST_LOG", "dot_agent_deck=debug")
+            .launch_with_fixture("minimal");
+        deck.wait_for_string("before-replacement");
+
+        let reply = original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .expect("stop only the fixture-owned daemon");
+        assert!(reply.ok, "fixture stop: {reply:?}");
+        assert!(
+            original.wait_for_exit(Duration::from_secs(10)),
+            "fixture daemon must stop"
+        );
+        let replacement = spawn_daemon_serve_with_env(
+            None,
+            "0",
+            &[
+                ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+                (
+                    "DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE",
+                    &protocol.to_string(),
+                ),
+                (
+                    "DOT_AGENT_DECK_ATTACH_SOCKET",
+                    original.attach_socket.to_str().unwrap(),
+                ),
+                (
+                    "DOT_AGENT_DECK_SOCKET",
+                    original.hook_socket.to_str().unwrap(),
+                ),
+            ],
+        );
+        let name = if protocol == own {
+            "same-version-returned"
+        } else {
+            "incompatible-returned"
+        };
+        // Recreate the pane the user already had open. The stand-in paints
+        // its label periodically, so reattachment is visible from live output
+        // as well as a replayed snapshot, including when daemon ids restart at 1.
+        let new = pane_with(
+            &replacement,
+            &old.id,
+            serde_json::json!({
+                "display_name":name, "env":[["DOORBELL_STANDIN_LABEL", name]]
+            }),
+        );
+        status(&replacement, &new, "idle", "claude_code");
+        if protocol == own {
+            deck.wait_for_string(name);
+            continue;
+        }
+        let refused = deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| {
+            let low = grid.to_lowercase();
+            low.contains("protocol")
+                && low.contains(&own.to_string())
+                && low.contains(&protocol.to_string())
+                && ["refus", "incompatib", "cannot"]
+                    .iter()
+                    .any(|word| low.contains(word))
+        });
+        let grid = deck.snapshot_grid();
+        assert!(
+            refused && !grid.contains(name),
+            "protocol-skew reconnect must refuse daemon v{protocol}, name client v{own}, and never reattach; replacement_visible={}; grid=\n{grid}",
+            grid.contains(name)
+        );
+    }
 }

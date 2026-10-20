@@ -131,15 +131,19 @@ pub fn pane_with(daemon: &impl Endpoint, name: &str, extra: Value) -> Pane {
     let script = daemon.home().join(format!("{name}.py"));
     // Raw mode preserves CR versus LF and disables kernel echo. Render the
     // received line so the same bytes can also be checked through vt100.
-    std::fs::write(&script, r#"import os, sys, tty, termios, time, json
+    std::fs::write(&script, r#"import os, sys, tty, termios, time, json, select
 tty.setraw(0, termios.TCSANOW)
 base = sys.argv[1]
 with open(base + '.pid', 'w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
 turns = open(base + '.turns', 'a', buffering=1)
-os.write(1, b'DOORBELL-STANDIN-READY\r\n')
+label = os.environ.get('DOORBELL_STANDIN_LABEL', '')
+os.write(1, ('DOORBELL-STANDIN-READY' + label + '\r\n').encode())
 line = bytearray()
 while True:
+    if label and not select.select([0], [], [], 0.2)[0]:
+        os.write(1, ('\r\n' + label + '\r\n').encode())
+        continue
     chunk = os.read(0, 4096)
     if not chunk: break
     capture.write(chunk)

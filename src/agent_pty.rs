@@ -10685,6 +10685,10 @@ impl AgentPtyRegistry {
         }
         let mut sink = w.daemon(stall);
         for (n, bytes) in steps.into_iter().enumerate() {
+            #[cfg(feature = "e2e")]
+            if pre_cr && line.is_some() && n == 1 {
+                crate::doorbell::pause_rering_for_test(pane_id, "after-pre-cr").await;
+            }
             if n > 0 {
                 tokio::time::sleep(SUBMIT_DELAY).await;
             }

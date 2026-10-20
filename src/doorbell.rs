@@ -423,6 +423,26 @@ fn status_explains_waiting(status: Option<&crate::state::SessionStatus>) -> bool
 
 type AgentKey = (String, String);
 
+/// E2E interleave fixture: park one re-ring phase for one named pane. The
+/// caller holds neither the app-state nor inbox-hub lock while parked.
+#[cfg(feature = "e2e")]
+pub(crate) async fn pause_rering_for_test(pane: &str, phase: &str) {
+    if std::env::var("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE").as_deref() != Ok(pane) {
+        return;
+    }
+    let Some(root) = std::env::var_os("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    if std::fs::remove_file(root.join(format!("{phase}.armed"))).is_err() {
+        return;
+    }
+    std::fs::write(root.join(format!("{phase}.reached")), b"").expect("report ring barrier");
+    while !root.join(format!("{phase}.release")).exists() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 #[derive(Default)]
 struct Slot {
     bell: Bell,
@@ -538,6 +558,10 @@ async fn run_tick(
                 Action::Ring { id, pre_cr } => (*pre_cr, Some(doorbell_line(id))),
                 _ => (true, None),
             };
+            #[cfg(feature = "e2e")]
+            if pre_cr && line.is_some() {
+                pause_rering_for_test(&pane, "decided").await;
+            }
             // PRD #1666 hardening H3: re-asked under the writer before every
             // byte. The same admission (nothing happened to the pane since
             // this tick) and, for a ring, still no native component armed or

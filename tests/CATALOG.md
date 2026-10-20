@@ -3149,6 +3149,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the fresh daemon's advertised protocol; the agents-present arms (009, and the scripted-daemon unit tests).
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/handshake/011 — Reconnect rechecks the replacement daemon's protocol before reattaching.
+- **Layer:** L2 lane 1 (`tests/e2e_handshake.rs`), real TUI in a PTY and isolated daemon processes replaced at the same socket.
+- **Agent:** none (raw Python stand-ins; no agent executable or credential).
+- **Asserts:** the same-protocol replacement reconnects and its new agent appears; an N+1 replacement shows a refusal naming both protocol numbers and its agent does not appear. The skew uses the existing e2e-only protocol override.
+- **Does not assert:** compatibility with a real previous-release binary, or desktop rendering; the desktop's link invalidation and handshake classifier have their own Rust tests.
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/login-path
 
 ##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).
@@ -8526,10 +8533,10 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
-##### inbox/doorbell/008 — A replacement agent never receives its predecessor's doorbell.
+##### inbox/doorbell/008 — A replacement agent waits for its own readiness and never receives its predecessor's doorbell.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
 - **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** A draft holds an old task while its agent is stopped and the same pane identity is respawned; the Idle replacement receives no old line, but its newly bound task rings.
+- **Asserts:** A draft holds an old task while its agent is stopped and the same pane identity is respawned; a ShellIdle carrier using the old session id and new agent id cannot establish readiness. A separate in-process daemon case seeds a bare hydrated placeholder and requires zero automatic bytes. After the replacement's own Idle hook, its newly bound task rings and can be fetched, while the old task never rings in the replacement.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
@@ -8698,6 +8705,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** a real agent delivering a ToolEnd after its Idle (the daemon cannot tell a late one from a timely one, so none starts a turn).
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
+
+##### inbox/doorbell/031 — Acknowledgement fences an already-decided retry at each admission boundary.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY with exact input capture and vt100 replay.
+- **Agent:** none (raw Python stand-in; no agent executable or credential).
+- **Asserts:** with Idle unchanged, acknowledging after the retry decision suppresses the stale line and second submission; acknowledging after the pre-CR suppresses the payload. Each phase first exercises a still-queued control that really submits the retry. Exact byte assertions allow the pre-CR already written and one owed cleanup CR.
+- **Does not assert:** a real editor's startup buffering, or acknowledgement atomic with an already-enqueued PTY-thread write. E2E-only barriers target one pane's retry at decision and after-pre-CR phases without holding state or inbox locks.
+- **Platform coverage:** mac+linux.
 
 #### inbox/boundary
 
