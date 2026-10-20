@@ -56,6 +56,11 @@ pub enum Attendance {
 // Orchestrator prompt construction
 // ---------------------------------------------------------------------------
 
+/// Issue #1784: how the available-agents list marks a `clear = true` role,
+/// which every delegate restarts. The delegation guidance refers to it by
+/// these words.
+const FRESH_FOR_EVERY_TASK: &str = " (starts fresh for every task)";
+
 /// Build the orchestrator context file content.
 /// Includes the role's own prompt_template, the available-agents list, and
 /// delegation protocol instructions.
@@ -80,7 +85,10 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
             continue;
         }
         let desc = role.description.as_deref().unwrap_or("(no description)");
-        content.push_str(&format!("- **{}**: {}\n", role.name, desc));
+        // Issue #1784: the orchestrator cannot see `clear`, and it decides
+        // whether an addendum or a follow-up costs the worker its agent.
+        let fresh = if role.clear { FRESH_FOR_EVERY_TASK } else { "" };
+        content.push_str(&format!("- **{}**: {}{fresh}\n", role.name, desc));
     }
 
     // 3. Delegation protocol.
@@ -198,6 +206,22 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          The daemon enforces this: a delegate to a worker that still owes a work-done is \
          refused, and the refusal names the worker and what to do. \
          Delegating to different workers in parallel is fine.\n\n\
+         To add information to a task a worker is still working on, mind which kind of worker \
+         it is. A worker marked *starts fresh for every task* above is restarted by every \
+         delegate it receives, `--supersede` included: its agent is replaced, the new agent \
+         sees only the text you send, and whatever the old one had not written to disk is lost. \
+         For that worker, wait for its work-done and delegate a follow-up; if the addition \
+         cannot wait, `{bin} delegate --supersede` with the whole task restated together with \
+         the addition, knowing the worker starts over. A worker without that mark keeps its \
+         agent, so `{bin} delegate --supersede` reaches the running agent with its work intact: \
+         say in the task that it adds to the task the worker is doing. The deck counts the \
+         addition as a task of its own, so a worker that had already taken the original task \
+         owes a work-done for each: tell it to report both, or your next delegate to it is \
+         refused as busy. The marks show `.dot-agent-deck.toml` as it was when this orchestration \
+         started, and every delegate reads it again, so if it may have changed, check the role's \
+         `clear` there before relying on a worker keeping its agent. A follow-up after a work-done is a new task too, so restate everything a \
+         worker that starts fresh for every task needs: the files, the branch, and what its \
+         last report said.\n\n\
          Delegation is one-way: orchestrator → worker. Workers NEVER delegate to other workers \
          — a `{bin} delegate` call from inside a worker does not route back through your \
          notification stream, so the downstream task is silently dropped and the calling worker \
@@ -5062,6 +5086,32 @@ mod tests {
             "the agent-facing context must not mention `--force` anywhere — restarting a \
              HEALTHY pane with --force is a people-only escalation, not guidance to hand the \
              orchestrating agent, per the upstream PR #918 review; got: {c}"
+        );
+    }
+
+    /// Issue #1784: the orchestrator is told which workers every delegate
+    /// restarts, and that `--supersede` on one of them throws its work away,
+    /// so an addition to a task in progress does not cost a worker its agent
+    /// unannounced.
+    #[test]
+    fn context_marks_the_workers_every_delegate_restarts() {
+        let mut config = config();
+        config.roles[1].clear = true;
+        let c = build_orchestrator_context(&config);
+        assert!(
+            c.contains(&format!(
+                "- **coder**: Implements features{FRESH_FOR_EVERY_TASK}\n"
+            )),
+            "a clear = true worker must be marked as starting fresh; got: {c}"
+        );
+        assert!(
+            c.contains("- **reviewer**: Reviews changes\n"),
+            "a clear = false worker must not be marked; got: {c}"
+        );
+        assert!(
+            c.contains("*starts fresh for every task*")
+                && c.contains("`--supersede` included: its agent is replaced"),
+            "the guidance must say what --supersede does to a worker marked that way; got: {c}"
         );
     }
 }
