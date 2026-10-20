@@ -186,19 +186,39 @@ pub fn support(words: usize, timing: &Timing, voice: &VoiceTimeline) -> Support 
         };
     }
 
-    // Each timed word belongs to the first segment whose time, widened by the
-    // tolerance, holds its middle. A word in no segment's time is checked on
-    // its own, and one off voice refuses the reply whole: nothing says which
-    // segment it came from.
+    // Each timed word belongs to the segment whose own time holds its middle
+    // or, failing that, the nearest one within the tolerance; a tie — the
+    // middle on the boundary two segments share — goes to the earlier one,
+    // since whisper times a segment's last word at that segment's end. The
+    // tolerance is not used to choose: widened windows overlap, and the first
+    // of them would take a later segment's word (Qodo on PR #1766). A word in
+    // no segment's reach is checked on its own, and one off voice refuses
+    // the reply whole: nothing says which segment it came from.
     let window = |segment: &Timed| (segment.start - tolerance, segment.end + tolerance);
+    let distance = |segment: &Timed, at: f64| {
+        if at < segment.start {
+            segment.start - at
+        } else if at > segment.end {
+            at - segment.end
+        } else {
+            0.0
+        }
+    };
     let mut owned: Vec<Vec<&Timed>> = vec![Vec::new(); timing.segments.len()];
     for word in &timing.words {
         let middle = (word.start + word.end) / 2.0;
-        match timing.segments.iter().position(|segment| {
-            let (from, to) = window(segment);
-            from <= middle && middle <= to
-        }) {
-            Some(index) => owned[index].push(word),
+        let nearest = timing
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(index, segment)| (index, distance(segment, middle)))
+            .filter(|&(_, away)| away <= tolerance)
+            .fold(None, |best: Option<(usize, f64)>, candidate| match best {
+                Some((_, away)) if away <= candidate.1 => best,
+                _ => Some(candidate),
+            });
+        match nearest {
+            Some((index, _)) => owned[index].push(word),
             None if off_voice(word) => return Support::Nothing(word_off_voice(word)),
             None => {}
         }
@@ -364,6 +384,29 @@ mod tests {
                 timed(1.0, 1.5, 1),
                 timed(2.5, 2.7, 1),
                 timed(2.7, 3.0, 1),
+            ],
+        };
+        assert_eq!(support(4, &timing, &voice), Support::Segments(vec![0]));
+    }
+
+    /// Scenario: two adjacent segments, the first real speech and the second
+    /// one invented word timed after the voice ended, close enough that their
+    /// windows widened by the tolerance overlap. The invented word belongs to
+    /// the second segment, which is dropped, and the speech is kept (Qodo on
+    /// PR #1766: the first widened window used to take the word).
+    #[test]
+    fn voice_evidence_a_word_belongs_to_its_own_segment_not_an_earlier_one() {
+        // Whisper timed the first segment to 1.9 s, past its voice's end at
+        // 1.2 s, so its widened window reaches 2.2 s and holds the middle of
+        // the second segment's word at 2.05 s, which is nowhere near voice.
+        let voice = voiced(4.0, 0.5, 1.2);
+        let timing = Timing {
+            segments: vec![timed(0.5, 1.9, 3), timed(2.0, 2.6, 1)],
+            words: vec![
+                timed(0.5, 0.8, 1),
+                timed(0.8, 1.0, 1),
+                timed(1.0, 1.9, 1),
+                timed(2.0, 2.1, 1),
             ],
         };
         assert_eq!(support(4, &timing, &voice), Support::Segments(vec![0]));
