@@ -1298,7 +1298,7 @@ const MAIL_VERBS: &[&str] = &[
     "ack",
 ];
 
-/// Scenario: Point Claude Code's waiter, its prompt hook answering a doorbell, and its prompt hook submitting a waiter's whole block at a stand-in for a 0.47.0 daemon, which hands its one queued message to the first legacy `inbox_wait` or `inbox_fetch` and answers nothing to a verb it cannot decode. Each asks whether the deck serves receipts, sends nothing that could take or commit mail, exits 1 and says on stderr that the daemon is older than its hooks, naming `hooks install`; the message is still there for a legacy `inbox fetch` afterwards.
+/// Scenario: Point Claude Code's waiter, its prompt hook answering a doorbell, and its prompt hook submitting a waiter's whole block at a stand-in for a 0.47.0 daemon, which hands its one queued message to the first legacy `inbox_wait` or `inbox_fetch` and answers nothing to a verb it cannot decode. Each asks whether the deck serves receipts, sends nothing that could take or commit mail, exits 1 and says on stderr that the deck did not answer in time, that an older daemon does not answer, and names `hooks install`; the message is still there for a legacy `inbox fetch` afterwards.
 #[spec("inbox/claude/028")]
 #[test]
 fn claude_028_newer_hooks_take_nothing_from_an_older_daemon() {
@@ -1324,9 +1324,13 @@ fn claude_028_newer_hooks_take_nothing_from_an_older_daemon() {
         assert_eq!(output.status.code(), Some(1), "{what}: {output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("did not confirm that it serves message receipts")
+            stderr.contains(dot_agent_deck::inbox_oneshot::RECEIPTS_TIMED_OUT)
                 && stderr.contains("hooks install --agent claude-code"),
             "{what} says why and how: {stderr}"
+        );
+        assert!(
+            !stderr.contains(dot_agent_deck::inbox_oneshot::RECEIPTS_UNSUPPORTED),
+            "{what} got no answer, so it does not say the deck is most likely older: {stderr}"
         );
         assert!(
             requests
@@ -1403,7 +1407,7 @@ fn claude_028_newer_hooks_take_nothing_from_an_older_daemon() {
     );
 }
 
-/// Scenario: Submit one prompt to Claude Code's prompt hook that carries both a waiter's whole block and a doorbell for a second message, against a stand-in for a 0.47.0 daemon that answers nothing it cannot decode. The hook asks whether the deck serves receipts once, not once for the commit and again for the doorbell's fetch, sends nothing that could take or commit mail, and exits 1 saying why.
+/// Scenario: Submit one prompt to Claude Code's prompt hook that carries both a waiter's whole block and a doorbell for a second message, against a stand-in for a 0.47.0 daemon that answers nothing it cannot decode. The hook asks whether the deck serves receipts once, not once for the commit and again for the doorbell's fetch, sends nothing that could take or commit mail, and exits 1 saying, once, that the deck did not answer in time.
 #[spec("inbox/claude/037")]
 #[test]
 fn claude_037_a_prompt_asks_an_older_daemon_once() {
@@ -1426,9 +1430,16 @@ fn claude_037_a_prompt_asks_an_older_daemon_once() {
         older,
     );
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches(dot_agent_deck::inbox_oneshot::RECEIPTS_TIMED_OUT)
+            .count(),
+        1,
+        "{output:?}"
+    );
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("did not confirm that it serves message receipts"),
+        !stderr.contains(dot_agent_deck::inbox_oneshot::RECEIPTS_UNSUPPORTED),
         "{output:?}"
     );
     let questions = requests
@@ -1442,10 +1453,10 @@ fn claude_037_a_prompt_asks_an_older_daemon_once() {
     }
 }
 
-/// Scenario: Point Claude Code's waiter, its prompt hook answering a doorbell, and its prompt hook submitting a waiter's whole block at a hook socket whose mode lets this user connect to none of it, as another user's private socket does. Each exits 1 and says on stderr, in fixed text without the socket's path, that the socket belongs to another user and how to point the hook at the user's own deck; the socket never accepts a connection, so no receipts question, which carries the token, is sent.
+/// Scenario: Point Claude Code's waiter, its prompt hook answering a doorbell, and its prompt hook submitting a waiter's whole block at a hook socket of this user's own whose mode lets no one connect, so the connect is denied as it is for another user's private socket. Each exits 1 and says on stderr, in fixed text without the socket's path, that the deck socket refused it access, either because another user's deck listens there or because of the socket's permissions, and the remedy for each; the socket never accepts a connection, so no receipts question, which carries the token, is sent.
 #[spec("inbox/claude/042")]
 #[test]
-fn claude_042_hooks_say_so_when_the_deck_socket_belongs_to_another_user() {
+fn claude_042_hooks_say_so_when_the_deck_socket_refuses_them() {
     use std::os::unix::fs::PermissionsExt;
     // SAFETY: getuid(2) has no failure mode and touches no memory.
     if unsafe { libc::getuid() } == 0 {
@@ -1471,7 +1482,7 @@ fn claude_042_hooks_say_so_when_the_deck_socket_belongs_to_another_user() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains(dot_agent_deck::inbox_oneshot::RECEIPTS_FOREIGN_SOCKET),
-            "{what} says the socket is another user's, and the remedy: {stderr}"
+            "{what} says the socket refused it, and the remedies: {stderr}"
         );
         assert!(
             !stderr.contains(&*path.to_string_lossy()),
@@ -1510,7 +1521,7 @@ fn claude_042_hooks_say_so_when_the_deck_socket_belongs_to_another_user() {
     );
 }
 
-/// Scenario: Submit one prompt to Claude Code's prompt hook that carries both a waiter's whole block and a doorbell for a second message, against a stand-in hook endpoint that serves receipts but waits 1.3 s before each answer, with the receipts budget set to 1.5 s. The hook is done within that one budget plus two seconds rather than spending a budget on each question and exchange: its commit asks first and is written in time, the doorbell's fetch, reached with the budget spent, asks nothing, and the hook exits 0.
+/// Scenario: Submit one prompt to Claude Code's prompt hook that carries both a waiter's whole block and a doorbell for a second message, against a stand-in hook endpoint that serves receipts but waits 1.3 s before each answer, with the receipts budget set to 1.5 s. The hook is done within that one budget plus two seconds rather than spending a budget on each question and exchange: its commit asks first and is written in time, the doorbell's fetch, reached with the budget spent, asks nothing, and the hook exits 1 saying the deck did not answer in time, not that it is most likely older.
 #[spec("inbox/claude/043")]
 #[test]
 fn claude_043_a_prompts_receipt_work_at_a_slow_deck_shares_one_budget() {
@@ -1592,7 +1603,13 @@ fn claude_043_a_prompts_receipt_work_at_a_slow_deck_shares_one_budget() {
         took < budget + tolerance,
         "the prompt hook took {took:?}, past one shared {budget:?}: {output:?}"
     );
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(dot_agent_deck::inbox_oneshot::RECEIPTS_TIMED_OUT)
+            && !stderr.contains(dot_agent_deck::inbox_oneshot::RECEIPTS_UNSUPPORTED),
+        "the fetch out of time says so: {output:?}"
+    );
     let requests = requests.lock().unwrap();
     let verbs: Vec<&str> = requests
         .iter()

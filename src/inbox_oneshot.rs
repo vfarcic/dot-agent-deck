@@ -770,13 +770,14 @@ pub fn declared_hook_integration() -> Option<u32> {
 /// The socket-wait budget of a one-shot's receipts question: the connect's
 /// wait for the deck to accept, writing the question and waiting for the
 /// answer ([`Connection::open_receipts_within`]). A deck that has not answered
-/// by then is taken for one that does not serve receipts. An older daemon
-/// answers nothing at all (it cannot decode the question), so this is what
-/// that pairing costs each question. It is a cooperative budget, checked
-/// around each socket wait, not a ceiling on the call: resolving the socket's
-/// path inside `connect(2)` is not pre-empted by it. The waiter asks once
-/// within it; Claude's prompt hook shares one such budget between all its
-/// receipt work ([`crate::inbox_prompt::prompt_receipts_wait`]).
+/// by then is sent nothing that could take mail ([`Opened::TimedOut`]). An
+/// older daemon answers nothing at all (it cannot decode the question), so
+/// this is what that pairing costs each question. It is a cooperative budget,
+/// checked around each socket wait, not a ceiling on the call: resolving the
+/// socket's path inside `connect(2)` is not pre-empted by it. The waiter asks
+/// once within it; Claude's prompt hook shares one such budget between its
+/// commit and its doorbell fetch
+/// ([`crate::inbox_prompt::prompt_receipts_wait`]).
 pub const RECEIPTS_ANSWER_WAIT: Duration = Duration::from_secs(5);
 
 /// TEST knob, read only by a build with the `e2e` feature:
@@ -796,10 +797,12 @@ pub fn receipts_answer_wait() -> Duration {
     RECEIPTS_ANSWER_WAIT
 }
 
-/// What a one-shot says when the deck did not confirm that it serves
-/// receipts ([`Opened::Unsupported`]): nothing was taken, and how to make the
-/// two agree. `hooks install` writes the waiter and the prompt hook together,
-/// from the one binary it runs as.
+/// What a one-shot says when the deck answered without confirming that it
+/// serves receipts, or ended the connection unanswered
+/// ([`Opened::Unsupported`]): nothing was taken, and how to make the two
+/// agree. `hooks install` writes the waiter and the prompt hook together,
+/// from the one binary it runs as. A deck that did not answer in time gets
+/// [`RECEIPTS_TIMED_OUT`] instead.
 pub const RECEIPTS_UNSUPPORTED: &str = "dot-agent-deck: the deck daemon did not confirm that it serves message receipts, so no message was taken. It is most likely older than the dot-agent-deck this agent's hooks run. Restart the deck daemon on that newer build, or run `dot-agent-deck hooks install --agent claude-code` with the build the daemon runs, which rewrites the waiter and the prompt hook together; then restart the agent.";
 
 static REPORTED_UNSUPPORTED: std::sync::atomic::AtomicBool =
@@ -819,11 +822,51 @@ pub fn reported_unsupported() -> bool {
     REPORTED_UNSUPPORTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// What a one-shot says when the deck socket it connects to is one this user
-/// may not use ([`Opened::Foreign`]): it asked nothing there, and how to point
-/// it at the user's own deck. Fixed text: the socket's path and the uids are
+/// What a one-shot says when its receipts budget ran out before the deck
+/// answered whether it serves receipts, or before the phase could ask
+/// ([`Opened::TimedOut`]): nothing was asked that could take mail, so the
+/// messages stay queued. Fixed text, and not [`RECEIPTS_UNSUPPORTED`]'s: a
+/// slow deck that serves receipts and an older one, which answers nothing,
+/// look the same from here, so it names both rather than the likelier.
+pub const RECEIPTS_TIMED_OUT: &str = "dot-agent-deck: the deck daemon did not answer in time whether it serves message receipts, so this hook took no message and left the messages waiting for this agent queued. A busy deck daemon can answer late; one older than the dot-agent-deck this agent's hooks run does not answer at all. If this keeps happening, make the two the same build: restart the deck daemon on the hooks' build, or run `dot-agent-deck hooks install --agent claude-code` with the build the daemon runs, which rewrites the waiter and the prompt hook together; then restart the agent.";
+
+static REPORTED_TIMED_OUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Say [`RECEIPTS_TIMED_OUT`] on stderr, once per process, and remember it,
+/// so the hook exits with the status that shows its stderr to the user
+/// ([`reported_refusal`]).
+pub fn report_timed_out() {
+    if !REPORTED_TIMED_OUT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("{RECEIPTS_TIMED_OUT}");
+    }
+}
+
+/// Whether this process said [`RECEIPTS_TIMED_OUT`].
+pub fn reported_timed_out() -> bool {
+    REPORTED_TIMED_OUT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Forget what this process said, so a test can tell which notice a later
+/// step says.
+#[cfg(test)]
+pub(crate) fn forget_reports() {
+    for said in [
+        &REPORTED_UNSUPPORTED,
+        &REPORTED_TIMED_OUT,
+        &REPORTED_FOREIGN,
+    ] {
+        said.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What a one-shot says when the deck socket it connects to refused it access
+/// ([`Opened::Foreign`]): it asked nothing there, and the remedy for each of
+/// the two causes the refusal cannot tell apart, a deck listening there as
+/// another user and permissions that deny this user (the socket's own mode,
+/// or a directory above it). Fixed text: the socket's path and the uids are
 /// not in it.
-pub const RECEIPTS_FOREIGN_SOCKET: &str = "dot-agent-deck: the deck socket this hook connects to belongs to another user, so the hook asked it nothing and no message was taken. If you set DOT_AGENT_DECK_SOCKET or DOT_AGENT_DECK_ATTACH_SOCKET, point them at paths under a directory only you can write, or unset them to use your own deck daemon; then restart the agent.";
+pub const RECEIPTS_FOREIGN_SOCKET: &str = "dot-agent-deck: the deck socket refused this hook access, either because the deck listening on it runs as another user or because of the permissions of the socket or a directory above it, so the hook asked it nothing and no message was taken. If you set DOT_AGENT_DECK_SOCKET or DOT_AGENT_DECK_ATTACH_SOCKET, point them at your own deck daemon's sockets, or unset them to use the default; if they already point at your own deck, or you set neither, fix the permissions of that socket and the directories above it, the default socket included, so that you can connect to it; then restart the agent.";
 
 static REPORTED_FOREIGN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -836,11 +879,13 @@ pub fn report_foreign_socket() {
     }
 }
 
-/// Whether this process said [`RECEIPTS_UNSUPPORTED`] or
-/// [`RECEIPTS_FOREIGN_SOCKET`]: a one-shot that did either took nothing, and
-/// a later phase of the same hook asks nothing more.
+/// Whether this process said [`RECEIPTS_UNSUPPORTED`], [`RECEIPTS_TIMED_OUT`]
+/// or [`RECEIPTS_FOREIGN_SOCKET`]: a one-shot that did any of them took
+/// nothing, and a later phase of the same hook asks nothing more.
 pub fn reported_refusal() -> bool {
-    reported_unsupported() || REPORTED_FOREIGN.load(std::sync::atomic::Ordering::SeqCst)
+    reported_unsupported()
+        || reported_timed_out()
+        || REPORTED_FOREIGN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Whether `reply`, the deck's answer to an `inbox_receipts` question, says
@@ -873,15 +918,21 @@ pub enum Opened {
     /// It answered with a refusal (of the token, the pane or the agent): a
     /// deck that serves receipts, and not to this caller.
     Refused(Box<InboxWaitReply>),
-    /// It did not say it serves them within the budget: the connect or the
-    /// question's write did not finish (a full accept queue, a deck that does
-    /// not read), no answer came, the connection ended, or the answer had no
-    /// [`crate::inbox_hub::ONE_SHOT_RECEIPTS`]. Nothing that could take mail
-    /// or commit it was sent.
+    /// It answered without saying it serves them (the answer had no
+    /// [`crate::inbox_hub::ONE_SHOT_RECEIPTS`]), or the connection ended, or
+    /// the question's write failed, before an answer. Nothing that could take
+    /// mail or commit it was sent.
     Unsupported,
+    /// The budget ran out first: it was already spent, or the connect, the
+    /// question's write or the wait for the answer did not finish by the
+    /// deadline (a full accept queue, a deck that does not read, a slow deck,
+    /// an older one, which answers nothing). Nothing that could take mail or
+    /// commit it was sent.
+    TimedOut,
     /// The socket is one this user may not use: its listener runs as another
-    /// user, or connecting to it was denied. Refused before the question,
-    /// which carries the token, was written.
+    /// user, or connecting to it was denied (the socket's mode, or a
+    /// directory above it). Refused before the question, which carries the
+    /// token, was written.
     Foreign,
     /// The connect failed for another reason than running out of time or
     /// [`Opened::Foreign`]: no socket, or nothing listening on it.
@@ -954,23 +1005,23 @@ impl Connection {
     }
 
     /// [`Connection::open_receipts`] by `deadline`, a socket-wait budget
-    /// checked around each wait: a connect parked on a full accept queue, a
-    /// question the deck does not read, and an answer received after it,
-    /// even queued behind keepalives that came in time, are all
-    /// [`Opened::Unsupported`]. It cannot pre-empt `connect(2)` resolving the
-    /// socket's path (a stalled filesystem); once that returns, a deadline
-    /// already past sends nothing.
+    /// checked around each wait: a deadline already spent, a connect parked
+    /// on a full accept queue, a question the deck does not read, and an
+    /// answer received after it, even queued behind keepalives that came in
+    /// time, are all [`Opened::TimedOut`]. It cannot pre-empt `connect(2)`
+    /// resolving the socket's path (a stalled filesystem); once that returns,
+    /// a deadline already past sends nothing.
     pub fn open_receipts_by(path: &Path, question: &str, deadline: Instant) -> Opened {
         let wait = deadline.saturating_duration_since(Instant::now());
         if wait.is_zero() {
-            return Opened::Unsupported;
+            return Opened::TimedOut;
         }
         let stream = match crate::platform::ipc::IpcClient::connect_timeout(path, wait) {
             Ok(client) => client.into_std(),
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => return Opened::Unsupported,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => return Opened::TimedOut,
             // A listener running as another user, or a socket this user may
-            // not connect to: refused before the question, which carries the
-            // token, is written.
+            // not connect to (its mode, or a directory above it): refused
+            // before the question, which carries the token, is written.
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 return Opened::Foreign;
             }
@@ -979,12 +1030,21 @@ impl Connection {
         let Ok(mut connection) = Connection::over(stream, MAX_LINE_BYTES) else {
             return Opened::Unreachable;
         };
-        if connection.send(question, deadline).is_err() {
-            return Opened::Unsupported;
+        if let Err(error) = connection.send(question, deadline) {
+            return if error.kind() == io::ErrorKind::TimedOut {
+                Opened::TimedOut
+            } else {
+                Opened::Unsupported
+            };
         }
         loop {
             let Some(reply) = connection.next(Some(deadline)) else {
-                return Opened::Unsupported;
+                // The connection ended unanswered, or the deadline passed.
+                return if connection.ended() {
+                    Opened::Unsupported
+                } else {
+                    Opened::TimedOut
+                };
             };
             if reply.keepalive {
                 continue;
@@ -2175,8 +2235,9 @@ pub(crate) mod tests {
     /// a legacy batch; a capability of 0; a keepalive and then the
     /// capability; a refusal; and a hang-up. Only the two answers that name
     /// the capability on their own connection open it, the second
-    /// connection's silence is not excused by the first's answer, and the
-    /// question is all any connection is sent.
+    /// connection's silence is not excused by the first's answer and is
+    /// `TimedOut`, the answers without the capability and the hang-up are
+    /// `Unsupported`, and the question is all any connection is sent.
     #[cfg(unix)]
     #[spec("inbox/claude/029")]
     #[test]
@@ -2215,6 +2276,7 @@ pub(crate) mod tests {
                 Opened::Ready(_) => "ready",
                 Opened::Refused(_) => "refused",
                 Opened::Unsupported => "unsupported",
+                Opened::TimedOut => "timed out",
                 Opened::Foreign => "foreign",
                 Opened::Unreachable => "unreachable",
             });
@@ -2223,7 +2285,7 @@ pub(crate) mod tests {
             outcomes,
             [
                 "ready",
-                "unsupported",
+                "timed out",
                 "unsupported",
                 "unsupported",
                 "ready",
@@ -2274,7 +2336,7 @@ pub(crate) mod tests {
     /// Scenario: Point a one-shot's receipts question at a socket whose accept
     /// queue is full and that never accepts, as a saturated deck's is. The gate
     /// comes back within its wait plus two seconds without opening it:
-    /// `Unsupported` where a full queue parks the connect (Linux),
+    /// `TimedOut` where a full queue parks the connect (Linux),
     /// `Unreachable` where the platform refuses it outright.
     #[cfg(unix)]
     #[spec("inbox/claude/033")]
@@ -2290,7 +2352,7 @@ pub(crate) mod tests {
         .expect("the gate is still parked in connect(2)");
         assert!(took < wait + TOLERANCE, "the gate took {took:?}");
         match listener.behaviour {
-            QueueFull::Parks => assert!(matches!(opened, Opened::Unsupported), "{opened:?}"),
+            QueueFull::Parks => assert!(matches!(opened, Opened::TimedOut), "{opened:?}"),
             QueueFull::Refuses => assert!(matches!(opened, Opened::Unreachable), "{opened:?}"),
         }
     }
@@ -2298,7 +2360,7 @@ pub(crate) mod tests {
     /// Scenario: A stand-in deck accepts a one-shot's connection and reads
     /// nothing, and the question is larger than the socket can buffer, as any
     /// question is once the deck's side has filled up. The gate gives up as
-    /// `Unsupported` within its wait plus two seconds instead of blocking in
+    /// `TimedOut` within its wait plus two seconds instead of blocking in
     /// the write. A batch of fifty thousand attempts run on a connection the
     /// deck stops reading gives up its `may` questions when the approval runs
     /// out and its report after `RECEIPTS_ANSWER_WAIT`, within both plus two
@@ -2319,7 +2381,7 @@ pub(crate) mod tests {
         })
         .expect("the gate is still blocked writing its question");
         assert!(took < wait + TOLERANCE, "the gate took {took:?}");
-        assert!(matches!(opened, Opened::Unsupported), "{opened:?}");
+        assert!(matches!(opened, Opened::TimedOut), "{opened:?}");
         drop(deck.join());
 
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2353,8 +2415,9 @@ pub(crate) mod tests {
     /// already waiting on a one-shot's connection when its deadline passes:
     /// reading with that deadline returns neither. Then a stand-in deck sends
     /// a keepalive every two milliseconds until past the wait and only then
-    /// the answer; a prompt's commit against it is withheld within the wait
-    /// plus two seconds, and the question is the only line the deck reads.
+    /// the answer; a prompt's commit against it gives up as timed out within
+    /// the wait plus two seconds, and the question is the only line the deck
+    /// reads.
     #[cfg(unix)]
     #[spec("inbox/claude/035")]
     #[test]
@@ -2416,7 +2479,7 @@ pub(crate) mod tests {
         })
         .expect("the commit is still waiting");
         assert!(took < wait + TOLERANCE, "the commit took {took:?}");
-        assert_eq!(committed, crate::inbox_prompt::Committed::Withheld);
+        assert_eq!(committed, crate::inbox_prompt::Committed::TimedOut);
         let seen = deck.join().unwrap();
         assert_eq!(seen.len(), 1, "only the question: {seen:?}");
         let question: serde_json::Value = serde_json::from_str(&seen[0]).unwrap();
@@ -2428,7 +2491,7 @@ pub(crate) mod tests {
     /// write more, having pushed no more than the connection's queue of lines
     /// and the socket's buffers rather than everything it had; and against a
     /// deck that floods keepalives and never answers, the gate is
-    /// `Unsupported` within its wait plus two seconds.
+    /// `TimedOut` within its wait plus two seconds.
     #[cfg(unix)]
     #[spec("inbox/claude/036")]
     #[test]
@@ -2486,7 +2549,7 @@ pub(crate) mod tests {
         })
         .expect("the gate is still reading keepalives");
         assert!(took < wait + TOLERANCE, "the gate took {took:?}");
-        assert!(matches!(opened, Opened::Unsupported), "{opened:?}");
+        assert!(matches!(opened, Opened::TimedOut), "{opened:?}");
         drop(opened);
         deck.join().unwrap();
     }
@@ -2548,16 +2611,18 @@ pub(crate) mod tests {
         );
     }
 
-    /// Scenario: Point a one-shot's receipts question at a socket this user
-    /// may not connect to, its mode letting no one write it, as another
-    /// user's private socket does. The gate is `Foreign`, neither
-    /// `Unreachable` nor `Unsupported`, and the listener accepts no
+    /// Scenario: Point a one-shot's receipts question at a socket of this
+    /// user's own whose mode lets no one connect, so the connect is denied
+    /// as it is for another user's private socket. The gate is `Foreign`,
+    /// neither `Unreachable` nor `Unsupported`, and the listener accepts no
     /// connection, so the question, which carries the token, is never
-    /// written. The diagnostic said for it is fixed text naming the remedy.
+    /// written. The diagnostic said for it is fixed text that claims neither
+    /// cause, another user's deck or the socket's permissions, over the
+    /// other, and names the remedy for each.
     #[cfg(unix)]
     #[spec("inbox/claude/041")]
     #[test]
-    fn claude_041_a_socket_of_another_user_is_refused_before_the_question() {
+    fn claude_041_a_socket_denied_to_this_user_is_refused_before_the_question() {
         use std::os::unix::fs::PermissionsExt;
         if crate::platform::paths::current_uid() == 0 {
             eprintln!("SKIP: root connects whatever a socket's mode says");
@@ -2576,8 +2641,82 @@ pub(crate) mod tests {
             "no connection was made, so no question was sent"
         );
         assert!(
-            RECEIPTS_FOREIGN_SOCKET.contains("belongs to another user")
-                && RECEIPTS_FOREIGN_SOCKET.contains("DOT_AGENT_DECK_SOCKET")
+            !RECEIPTS_FOREIGN_SOCKET.contains("belongs to another user"),
+            "a same-user socket is not another user's: {RECEIPTS_FOREIGN_SOCKET}"
         );
+        for says in [
+            "refused this hook access",
+            "runs as another user",
+            "permissions of the socket or a directory above it",
+            "DOT_AGENT_DECK_SOCKET",
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            "the default socket included",
+            "asked it nothing",
+        ] {
+            assert!(
+                RECEIPTS_FOREIGN_SOCKET.contains(says),
+                "{says:?} missing: {RECEIPTS_FOREIGN_SOCKET}"
+            );
+        }
+    }
+
+    /// Scenario: Point a one-shot's receipts question at a stand-in deck that
+    /// says nothing within the wait, then at one that answers without the
+    /// capability, and ask once more with the deadline already spent. The
+    /// silent deck and the spent deadline are `TimedOut`, the spent one
+    /// without connecting at all, and the answer without the capability is
+    /// `Unsupported`. The two notices differ: the timeout one says the deck
+    /// did not answer in time, that no message was taken and that the
+    /// messages stay queued, and does not call the deck most likely older,
+    /// which the unsupported one still does.
+    #[cfg(unix)]
+    #[spec("inbox/claude/044")]
+    #[test]
+    fn claude_044_a_receipts_timeout_is_told_apart_from_a_deck_without_receipts() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let (path, deck) = stand_in_deck(
+            dir.path(),
+            vec![
+                Some(Vec::new()),
+                Some(vec![r#"{"one_shot_receipts":0}"#.to_string()]),
+            ],
+        );
+        let question = receipts_question(PANE, Some(AGENT), "token-1").unwrap();
+        let wait = Duration::from_millis(300);
+        let silent = Connection::open_receipts_within(&path, &question, wait);
+        assert!(matches!(silent, Opened::TimedOut), "{silent:?}");
+        drop(silent);
+        let negative = Connection::open_receipts_within(&path, &question, wait);
+        assert!(matches!(negative, Opened::Unsupported), "{negative:?}");
+        drop(negative);
+        assert_eq!(deck.join().unwrap().len(), 2);
+
+        let spent = dir.path().join("spent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&spent).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let opened = Connection::open_receipts_by(&spent, &question, Instant::now());
+        assert!(matches!(opened, Opened::TimedOut), "{opened:?}");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "a spent deadline connects to nothing"
+        );
+
+        assert_ne!(RECEIPTS_TIMED_OUT, RECEIPTS_UNSUPPORTED);
+        for says in [
+            "did not answer in time",
+            "took no message",
+            "queued",
+            "hooks install --agent claude-code",
+        ] {
+            assert!(
+                RECEIPTS_TIMED_OUT.contains(says),
+                "{says:?} missing: {RECEIPTS_TIMED_OUT}"
+            );
+        }
+        assert!(
+            !RECEIPTS_TIMED_OUT.contains("most likely"),
+            "a timeout is not evidence the deck is older: {RECEIPTS_TIMED_OUT}"
+        );
+        assert!(RECEIPTS_UNSUPPORTED.contains("most likely older"));
     }
 }

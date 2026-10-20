@@ -9493,21 +9493,21 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/028 — Newer Claude hooks take nothing from an older daemon.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real waiter and prompt-hook CLI children against a stand-in 0.47.0 hook endpoint (hands its one message to the first legacy `inbox_wait`/`inbox_fetch`, answers nothing to a verb it cannot decode), the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob.
 - **Agent:** none (no credential).
-- **Asserts:** the once-waiter, the prompt hook answering a doorbell and the prompt hook submitting a waiter's whole block each send `inbox_receipts` and nothing that could take or commit mail (no `inbox_wait`, `inbox_fetch`, receipt verb, `inbox_committed` or `ack`), print nothing of the message, exit 1 and say on stderr that the daemon did not confirm it serves receipts, naming `hooks install --agent claude-code`; a legacy `inbox fetch` afterwards still takes and prints the message (wire audit W03–W06).
+- **Asserts:** the once-waiter, the prompt hook answering a doorbell and the prompt hook submitting a waiter's whole block each send `inbox_receipts` and nothing that could take or commit mail (no `inbox_wait`, `inbox_fetch`, receipt verb, `inbox_committed` or `ack`), print nothing of the message, exit 1 and say on stderr `RECEIPTS_TIMED_OUT` (the deck did not answer in time, an older daemon does not answer, naming `hooks install --agent claude-code`) and not `RECEIPTS_UNSUPPORTED`'s "most likely older"; a legacy `inbox fetch` afterwards still takes and prints the message (wire audit W03–W06).
 - **Does not assert:** a real 0.47.0 binary, or the desktop's or TUI's attach refusal (inbox/claude/032).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/029 — The receipts gate decides from its own connection's answer.
 - **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::open_receipts_within` against a stand-in socket, one connection per answer.
 - **Agent:** none.
-- **Asserts:** only an answer naming `one_shot_receipts >= ONE_SHOT_RECEIPTS` on that same connection (also after a keepalive) opens it; no answer within the wait, a legacy batch, a capability of 0 and a hang-up are `Unsupported`, a refusal is `Refused`, a missing socket `Unreachable`; a connection answered after one that was is not excused by it; the question is the only line any connection is sent.
+- **Asserts:** only an answer naming `one_shot_receipts >= ONE_SHOT_RECEIPTS` on that same connection (also after a keepalive) opens it; no answer within the wait is `TimedOut`; a legacy batch, a capability of 0 and a hang-up are `Unsupported`, a refusal is `Refused`, a missing socket `Unreachable`; a connection answered after one that was is not excused by it; the question is the only line any connection is sent.
 - **Does not assert:** the callers' handling of each outcome (inbox/claude/028, /030).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/030 — A prompt's exact commit is withheld from a deck that does not serve receipts.
 - **Layer:** Fast (`src/inbox_prompt.rs`), `commit_attempts` over a real generation spool with the attempt's caps file, against stand-in sockets.
 - **Agent:** none.
-- **Asserts:** against a deck that answers the receipts question with nothing it returns `Withheld`, publishes no commit receipt and sends only the question; against one that answers the capability it publishes the receipt and sends the exact attempt as `inbox_committed` on the connection that asked (wire audit W05).
+- **Asserts:** against a deck that answers the receipts question with nothing it returns `TimedOut`, and against one that answers without the capability `Withheld`; neither publishes a commit receipt, and each is sent only the question; against one that answers the capability it publishes the receipt and sends the exact attempt as `inbox_committed` on the connection that asked (wire audit W05).
 - **Does not assert:** the daemon applying the commit (inbox/claude/016, /023).
 - **Platform coverage:** mac+linux.
 
@@ -9528,35 +9528,35 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/033 — The receipts gate gives up on a deck that never accepts.
 - **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::open_receipts_within` against a listener whose accept queue is full (`platform::ipc::SaturatedListener`).
 - **Agent:** none.
-- **Asserts:** the gate returns within its wait plus 2 s, `Unsupported` where a full queue parks the connect (Linux) and `Unreachable` where it is refused (the BSDs); it is never `Ready`.
+- **Asserts:** the gate returns within its wait plus 2 s, `TimedOut` where a full queue parks the connect (Linux) and `Unreachable` where it is refused (the BSDs); it is never `Ready`.
 - **Does not assert:** a real daemon under load.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/034 — A one-shot's writes give up on a deck that does not read.
 - **Layer:** Fast (`src/inbox_oneshot.rs`), a stand-in socket that accepts and never reads, and a socket pair whose far end never reads.
 - **Agent:** none.
-- **Asserts:** a question larger than the socket buffers is `Unsupported` within the wait plus 2 s; a batch of 50 000 attempts gives up its `may` lines when the approval runs out and its report after `RECEIPTS_ANSWER_WAIT`, within both plus 2 s, with every block not handed.
+- **Asserts:** a question larger than the socket buffers is `TimedOut` within the wait plus 2 s; a batch of 50 000 attempts gives up its `may` lines when the approval runs out and its report after `RECEIPTS_ANSWER_WAIT`, within both plus 2 s, with every block not handed.
 - **Does not assert:** the deck's side of a stalled connection.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/035 — An answer after the deadline is not taken behind keepalives.
 - **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::next` over a socket pair, and `inbox_prompt::commit_attempts` against a stand-in socket.
 - **Agent:** none.
-- **Asserts:** a keepalive and a support answer already queued when the deadline passes are not returned for it; against a deck that sends keepalives every 2 ms past the wait and then the answer, the commit is `Withheld` within the wait plus 2 s and the question is the only line the deck reads.
+- **Asserts:** a keepalive and a support answer already queued when the deadline passes are not returned for it; against a deck that sends keepalives every 2 ms past the wait and then the answer, the commit is `TimedOut` within the wait plus 2 s and the question is the only line the deck reads.
 - **Does not assert:** a real daemon's keepalive cadence.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/036 — A reply flood stays bounded.
 - **Layer:** Fast (`src/inbox_oneshot.rs`), a connection over a socket pair and the gate against a stand-in socket.
 - **Agent:** none.
-- **Asserts:** a deck flooding 64 KiB keepalive lines the one-shot does not read is held back after `MAX_QUEUED_LINES` lines plus the socket buffers (under 16 MiB slack) rather than taking in 64 MiB; against a deck that floods keepalives and never answers the gate is `Unsupported` within the wait plus 2 s.
+- **Asserts:** a deck flooding 64 KiB keepalive lines the one-shot does not read is held back after `MAX_QUEUED_LINES` lines plus the socket buffers (under 16 MiB slack) rather than taking in 64 MiB; against a deck that floods keepalives and never answers the gate is `TimedOut` within the wait plus 2 s.
 - **Does not assert:** the process's resident memory directly.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/037 — A prompt asks an older daemon once.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real prompt-hook CLI child against a stand-in 0.47.0 hook endpoint, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob.
 - **Agent:** none (no credential).
-- **Asserts:** a prompt carrying a waiter's whole block and a doorbell sends exactly one `inbox_receipts`, nothing that could take or commit mail, and exits 1 naming the refusal.
+- **Asserts:** a prompt carrying a waiter's whole block and a doorbell sends exactly one `inbox_receipts`, nothing that could take or commit mail, and exits 1 with `RECEIPTS_TIMED_OUT` on stderr exactly once and not `RECEIPTS_UNSUPPORTED`.
 - **Does not assert:** a supporting daemon, where each of the commit and the fetch asks on its own connection (inbox/claude/030, /031).
 - **Platform coverage:** mac+linux.
 
@@ -9581,15 +9581,15 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the hook's status send or its own grant, output and spool work, which the budget does not cover.
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/041 — A socket of another user is refused before the question.
-- **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::open_receipts_within` against a socket whose mode lets no one connect.
+##### inbox/claude/041 — A socket denied to this user is refused before the question.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::open_receipts_within` against a socket of this user's own whose mode lets no one connect.
 - **Agent:** none.
-- **Asserts:** the gate is `Foreign` (not `Unreachable` or `Unsupported`) and the listener accepts no connection, so the token-bearing question is never sent.
+- **Asserts:** the gate is `Foreign` (not `Unreachable` or `Unsupported`) and the listener accepts no connection, so the token-bearing question is never sent; `RECEIPTS_FOREIGN_SOCKET` does not say the socket belongs to another user, names both causes (another user's deck, the permissions of the socket or a directory above it) and both remedies (the two socket variables, the permissions, the default socket included).
 - **Does not assert:** a listener running as another uid (the same `PermissionDenied` refusal, from the IPC client's peer-uid check); skipped under root.
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/042 — Hooks say so when the deck socket belongs to another user.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real waiter and prompt-hook CLI children against a socket whose mode lets no one connect, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob.
+##### inbox/claude/042 — Hooks say so when the deck socket refuses them.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real waiter and prompt-hook CLI children against a socket of this user's own whose mode lets no one connect, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob.
 - **Agent:** none (no credential).
 - **Asserts:** the waiter, a doorbell's prompt hook and a committing prompt hook each exit 1 with `RECEIPTS_FOREIGN_SOCKET` on stderr and not the socket's path, and none connects.
 - **Does not assert:** a listener running as another uid; skipped under root.
@@ -9598,8 +9598,22 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/043 — A prompt's receipt work at a slow deck shares one budget.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real prompt-hook CLI child against a stand-in hook endpoint that serves receipts and waits 1.3 s before each answer, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob at 1500.
 - **Agent:** none (no credential).
-- **Asserts:** a prompt carrying a whole block and a doorbell finishes within the 1.5 s budget plus 2 s (a budget per question and exchange would take over 5 s), exits 0, and sends `inbox_receipts` then `inbox_committed` and no fetch.
+- **Asserts:** a prompt carrying a whole block and a doorbell finishes within the 1.5 s budget plus 2 s (a budget per question and exchange would take over 5 s), sends `inbox_receipts` then `inbox_committed` and no fetch, and exits 1 with `RECEIPTS_TIMED_OUT` on stderr, not `RECEIPTS_UNSUPPORTED`.
 - **Does not assert:** a stalled spool or a stalled status send, which the budget does not cover.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/044 — A receipts timeout is told apart from a deck without receipts.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::open_receipts_within` / `open_receipts_by` against stand-in sockets.
+- **Agent:** none.
+- **Asserts:** a deck that says nothing within the wait is `TimedOut`, one that answers `one_shot_receipts` 0 is `Unsupported`, and a deadline already spent is `TimedOut` without connecting; `RECEIPTS_TIMED_OUT` differs from `RECEIPTS_UNSUPPORTED`, says the deck did not answer in time, that no message was taken and that the messages stay queued, names `hooks install --agent claude-code`, and does not say "most likely", which `RECEIPTS_UNSUPPORTED` still does.
+- **Does not assert:** which notice a caller prints (inbox/claude/045, /028, /043).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/045 — A phase out of time says so rather than calling the deck older.
+- **Layer:** Fast (`src/inbox_prompt.rs`), `fetch_with_receipts` against stand-in sockets and the commit's reporting (`report_committed`), with the process's said-notices cleared between steps (`inbox_oneshot::forget_reports`; nextest runs the test in a process of its own).
+- **Agent:** none.
+- **Asserts:** the doorbell fetch at a deck silent within the budget, and with the shared budget already spent (connecting to nothing), says `RECEIPTS_TIMED_OUT` and not `RECEIPTS_UNSUPPORTED`; at a deck answering without the capability it says `RECEIPTS_UNSUPPORTED` and not the timeout; a `TimedOut` commit says the timeout and a `Withheld` one the unsupported notice.
+- **Does not assert:** the stderr and exit status of the real hook (inbox/claude/028, /037, /043).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]

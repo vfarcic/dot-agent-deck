@@ -110,8 +110,11 @@ pub const STREAM_NOT_IN_DECK_EXIT: u8 = 3;
 /// **Once** (Claude Code's `asyncRewake` hook): blocks until the deck hands
 /// over messages, then writes their blocks to stderr and exits 2, which is what
 /// wakes Claude. A daemon that does not confirm it serves one-shot receipts —
-/// one older than this binary — is handed nothing: the waiter says so on
-/// stderr ([`crate::inbox_oneshot::RECEIPTS_UNSUPPORTED`]) and exits 1.
+/// one older than this binary, which answers nothing — is handed nothing: the
+/// waiter says so on stderr and exits 1, with
+/// [`crate::inbox_oneshot::RECEIPTS_TIMED_OUT`] when no answer came in time
+/// and [`crate::inbox_oneshot::RECEIPTS_UNSUPPORTED`] when one came without
+/// the capability.
 /// Everything else — run outside a deck, no daemon, superseded by a newer
 /// waiter, refused — exits 0 with no output, so a global hook never disturbs
 /// a session the deck does not manage.
@@ -298,6 +301,10 @@ fn wait_once(json: &str, question: Option<&str>) -> ExitCode {
             }
             Opened::Unsupported => {
                 crate::inbox_oneshot::report_unsupported();
+                return ExitCode::FAILURE;
+            }
+            Opened::TimedOut => {
+                crate::inbox_oneshot::report_timed_out();
                 return ExitCode::FAILURE;
             }
             Opened::Foreign => {

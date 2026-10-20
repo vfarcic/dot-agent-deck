@@ -312,10 +312,10 @@ impl std::fmt::Debug for OneShotInjection {
 const HOOK_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// R3a-fix2 (A03): the one socket-wait budget Claude's prompt hook shares
-/// between all its receipt work — the commit's question and exchange
-/// ([`commit_attempts_by`]) and the doorbell fetch's question and reply
-/// ([`one_shot_injection`]) — counted from one absolute deadline set when the
-/// prompt arrives. It is one [`crate::inbox_oneshot::RECEIPTS_ANSWER_WAIT`]
+/// between its commit and its doorbell fetch — the commit's question and
+/// exchange ([`commit_attempts_by`]) and the fetch's question, request and
+/// reply ([`one_shot_injection`]) — counted from one absolute deadline set
+/// when the prompt arrives. It is one [`crate::inbox_oneshot::RECEIPTS_ANSWER_WAIT`]
 /// (5 s), the same as one question's budget: an older daemon, which answers
 /// nothing, already costs a prompt that one budget (its commit's question,
 /// after which the fetch asks nothing), so a slow daemon that does serve
@@ -323,13 +323,20 @@ const HOOK_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// budgets one after another (about 20 s), while a deck that answers at all
 /// promptly needs a small part of it. Each phase still asks on its own
 /// connection and goes on only on that connection's answer; a phase reached
-/// with the budget spent asks nothing, and its mail stays queued for the next
-/// receiver. The `UserPromptSubmit` hook blocks the user's prompt for as long
-/// as it runs, which is why this is shared rather than per phase. The
-/// waiter's wait for a batch after it registers is not part of it. Like the
-/// question's budget, it bounds socket waits cooperatively, not the hook:
-/// path resolution inside `connect(2)`, the commit's spool IO and the hook's
-/// own work and status event are outside it.
+/// with the budget spent asks nothing, says so
+/// ([`crate::inbox_oneshot::RECEIPTS_TIMED_OUT`]), and its mail stays queued
+/// for the next receiver. The `UserPromptSubmit` hook blocks the user's
+/// prompt for as long as it runs, which is why this is shared rather than per
+/// phase. The waiter's wait for a batch after it registers is not part of it.
+/// Like the question's budget, it bounds socket waits cooperatively, not the
+/// hook. Outside it: path resolution inside `connect(2)`; the endpoint
+/// resolution each phase makes before it connects, whose liveness probes
+/// have budgets of their own; the commit's spool IO; and, once a fetch has
+/// brought a batch, that batch's `may` questions, waited for within the grant
+/// lifetime, and the control report it sends after the hand-over, whose write
+/// gets its own [`crate::inbox_oneshot::RECEIPTS_ANSWER_WAIT`]
+/// ([`crate::inbox_oneshot::OneShotBatch::run`]); and the hook's own output,
+/// spool work and status event.
 pub fn prompt_receipts_wait() -> std::time::Duration {
     crate::inbox_oneshot::receipts_answer_wait()
 }
@@ -408,11 +415,16 @@ pub fn one_shot_injection(
 /// ask whether it serves receipts, and only on that connection's own yes send
 /// the fetch on it and wait for its reply, every socket wait of the three by
 /// `receipts_by` ([`prompt_receipts_wait`]). The connection and the reply, or
-/// `None`. Reached with the budget spent it asks nothing. A deck that does not
-/// confirm is sent nothing that could take mail, and the hook says so
+/// `None`. Reached with the budget spent it asks nothing, and the hook says
+/// the deck did not answer in time
+/// ([`crate::inbox_oneshot::report_timed_out`]), as it does when the question
+/// is not answered by then. A deck that answers without confirming is sent
+/// nothing that could take mail, and the hook says so
 /// ([`crate::inbox_oneshot::report_unsupported`]); a socket this user may not
 /// use is asked nothing, and the hook says that
-/// ([`crate::inbox_oneshot::report_foreign_socket`]).
+/// ([`crate::inbox_oneshot::report_foreign_socket`]). A fetch request already
+/// sent whose reply misses the deadline says nothing: the deck may have
+/// assigned the mail by then, so it is not said to be queued.
 #[cfg(unix)]
 pub fn fetch_with_receipts(
     path: &std::path::Path,
@@ -421,6 +433,7 @@ pub fn fetch_with_receipts(
 ) -> Option<(crate::inbox_oneshot::Connection, InboxWaitReply)> {
     use crate::inbox_oneshot::{Connection, Opened};
     if receipts_by <= std::time::Instant::now() {
+        crate::inbox_oneshot::report_timed_out();
         return None;
     }
     let question = crate::inbox_oneshot::receipts_question(
@@ -433,6 +446,10 @@ pub fn fetch_with_receipts(
         Opened::Ready(connection) => connection,
         Opened::Unsupported => {
             crate::inbox_oneshot::report_unsupported();
+            return None;
+        }
+        Opened::TimedOut => {
+            crate::inbox_oneshot::report_timed_out();
             return None;
         }
         Opened::Foreign => {
@@ -579,7 +596,7 @@ pub fn commit_delivered(prompt: &str, receipts_by: std::time::Instant) {
         .ok()
         .filter(|agent| !agent.is_empty());
     #[cfg(unix)]
-    match commit_attempts_by(
+    report_committed(commit_attempts_by(
         &crate::endpoint_resolve::client_socket_path(),
         CommitFor {
             pane_id: &pane_id,
@@ -589,15 +606,25 @@ pub fn commit_delivered(prompt: &str, receipts_by: std::time::Instant) {
         attempts,
         &pinned_spool(),
         receipts_by,
-    ) {
-        Committed::Withheld => crate::inbox_oneshot::report_unsupported(),
-        Committed::Foreign => crate::inbox_oneshot::report_foreign_socket(),
-        Committed::Nothing | Committed::Refused | Committed::Sent => {}
-    }
+    ));
     // The one-shot receipt protocol is Unix only: no one-shot there wrote
     // a block for a prompt to carry.
     #[cfg(not(unix))]
     let _ = (pane_id, agent_id, token, receipts_by);
+}
+
+/// Say on stderr what `committed` leaves the user to act on, if anything:
+/// [`crate::inbox_oneshot::RECEIPTS_UNSUPPORTED`],
+/// [`crate::inbox_oneshot::RECEIPTS_TIMED_OUT`] or
+/// [`crate::inbox_oneshot::RECEIPTS_FOREIGN_SOCKET`].
+#[cfg(unix)]
+fn report_committed(committed: Committed) {
+    match committed {
+        Committed::Withheld => crate::inbox_oneshot::report_unsupported(),
+        Committed::TimedOut => crate::inbox_oneshot::report_timed_out(),
+        Committed::Foreign => crate::inbox_oneshot::report_foreign_socket(),
+        Committed::Nothing | Committed::Refused | Committed::Sent => {}
+    }
 }
 
 /// Whom [`commit_attempts`] commits for.
@@ -613,9 +640,14 @@ pub struct CommitFor<'a> {
 pub enum Committed {
     /// There was nothing to tell the deck.
     Nothing,
-    /// The deck did not confirm it serves receipts: no receipt was published
-    /// and no `inbox_committed` sent.
+    /// The deck answered without confirming it serves receipts, or ended the
+    /// connection unanswered: no receipt was published and no
+    /// `inbox_committed` sent.
     Withheld,
+    /// The budget ran out before the deck answered whether it serves
+    /// receipts ([`crate::inbox_oneshot::Opened::TimedOut`]): no receipt was
+    /// published and no `inbox_committed` sent.
+    TimedOut,
     /// The deck refused the question, or there was none to ask.
     Refused,
     /// The deck's socket is one this user may not use
@@ -662,8 +694,10 @@ pub fn commit_attempts(
 /// [`crate::inbox_oneshot::Connection::open_receipts_by`]), the
 /// `inbox_committed` write and the wait for the deck's reply — all share the
 /// one `deadline`, which for the prompt hook is the prompt's shared receipts
-/// budget ([`prompt_receipts_wait`]). No `inbox_committed` is written once it
-/// has passed. The spool work between the answer and that write (reading caps
+/// budget ([`prompt_receipts_wait`]). The send checks the deadline before
+/// each write and gives the write the time that is left; once it has seen
+/// the deadline pass it starts no further write, and it does not take back a
+/// write the OS scheduled late. The spool work between the answer and that write (reading caps
 /// files, publishing receipts) is synchronous file IO the deadline does not
 /// interrupt: a stalled spool can run past it and publish its receipts late,
 /// which is valid evidence, and the line that would tell the deck is then not
@@ -689,6 +723,7 @@ pub fn commit_attempts_by(
     let mut connection = match Connection::open_receipts_by(socket, &question, deadline) {
         Opened::Ready(connection) => connection,
         Opened::Unsupported => return Committed::Withheld,
+        Opened::TimedOut => return Committed::TimedOut,
         Opened::Foreign => return Committed::Foreign,
         Opened::Refused(_) | Opened::Unreachable => return Committed::Refused,
     };
@@ -1223,12 +1258,14 @@ mod tests {
     }
 
     /// Scenario: A submitted prompt carries a waiter's whole block, whose
-    /// caps file the deck wrote, and the hook commits it twice: first at a
+    /// caps file the deck wrote, and the hook commits it three times: at a
     /// stand-in deck that answers its receipts question with nothing, as an
-    /// older daemon does, then at one that says it serves receipts. The
-    /// first publishes no receipt in the spool and sends nothing but the
-    /// question; the second publishes the commit receipt and sends the exact
-    /// attempt as `inbox_committed` on the connection that asked.
+    /// older daemon does, at one that answers without the capability, and at
+    /// one that says it serves receipts. The first two publish no receipt in
+    /// the spool and send nothing but the question, the first giving up as
+    /// timed out and the second as withheld; the third publishes the commit
+    /// receipt and sends the exact attempt as `inbox_committed` on the
+    /// connection that asked.
     #[cfg(unix)]
     #[spec("inbox/claude/030")]
     #[test]
@@ -1276,17 +1313,28 @@ mod tests {
         let wait = std::time::Duration::from_millis(300);
 
         let dir = crate::test_temp::tempdir().unwrap();
-        let (path, older) =
-            crate::inbox_oneshot::tests::stand_in_deck(dir.path(), vec![Some(Vec::new())]);
+        let (path, older) = crate::inbox_oneshot::tests::stand_in_deck(
+            dir.path(),
+            vec![
+                Some(Vec::new()),
+                Some(vec![r#"{"one_shot_receipts":0}"#.to_string()]),
+            ],
+        );
+        assert_eq!(
+            commit_attempts(&path, who, vec![attempt.clone()], &pinned, wait),
+            Committed::TimedOut
+        );
         assert_eq!(
             commit_attempts(&path, who, vec![attempt.clone()], &pinned, wait),
             Committed::Withheld
         );
         let seen = older.join().unwrap();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].len(), 1, "only the question: {seen:?}");
-        let question: serde_json::Value = serde_json::from_str(&seen[0][0]).unwrap();
-        assert_eq!(question["message_type"], "inbox_receipts");
+        assert_eq!(seen.len(), 2);
+        for lines in &seen {
+            assert_eq!(lines.len(), 1, "only the question: {seen:?}");
+            let question: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+            assert_eq!(question["message_type"], "inbox_receipts");
+        }
         assert!(!holds_record(&rec, &key), "no commit receipt was published");
 
         let dir = crate::test_temp::tempdir().unwrap();
@@ -1531,5 +1579,70 @@ mod tests {
         assert!(!fetched, "the fetch, with the budget spent, takes nothing");
         stop.store(true, Ordering::SeqCst);
         drop(slow.join());
+    }
+
+    /// Scenario: A prompt's doorbell fetch gives up three ways: at a stand-in
+    /// deck that says nothing within the budget, at one that answers without
+    /// the capability, and with the prompt's shared budget already spent;
+    /// and its commit's outcomes are reported. A deck that said nothing in
+    /// time and a spent budget make the hook say the deck did not answer in
+    /// time, never that it is most likely older; an answer without the
+    /// capability, or a withheld commit, makes it say the deck did not
+    /// confirm it serves receipts. The spent budget connects to nothing.
+    #[cfg(unix)]
+    #[spec("inbox/claude/045")]
+    #[test]
+    fn claude_045_a_phase_out_of_time_says_so_rather_than_older_deck() {
+        use std::time::{Duration, Instant};
+
+        use crate::inbox_oneshot::{forget_reports, reported_timed_out, reported_unsupported};
+        let fetch = || {
+            hand_over_request(
+                InboxFetchConsumer::DoorbellHook,
+                crate::event::InboxComponent::ClaudeHooks.inline_budget(),
+                "framing",
+                Some(ID),
+                "2".to_string(),
+                Some("agent-a".to_string()),
+                "token-1".to_string(),
+            )
+        };
+        let said = || (reported_timed_out(), reported_unsupported());
+        let wait = Duration::from_millis(300);
+        let dir = crate::test_temp::tempdir().unwrap();
+        let (path, deck) = crate::inbox_oneshot::tests::stand_in_deck(
+            dir.path(),
+            vec![
+                Some(Vec::new()),
+                Some(vec![r#"{"one_shot_receipts":0}"#.to_string()]),
+            ],
+        );
+
+        forget_reports();
+        assert!(fetch_with_receipts(&path, fetch(), Instant::now() + wait).is_none());
+        assert_eq!(said(), (true, false), "a silent deck: timed out");
+
+        forget_reports();
+        assert!(fetch_with_receipts(&path, fetch(), Instant::now() + wait).is_none());
+        assert_eq!(said(), (false, true), "an answer without receipts");
+        assert_eq!(deck.join().unwrap().len(), 2);
+
+        let spent = dir.path().join("spent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&spent).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        forget_reports();
+        assert!(fetch_with_receipts(&spent, fetch(), Instant::now()).is_none());
+        assert_eq!(said(), (true, false), "the shared budget spent");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a spent budget connects to nothing"
+        );
+
+        forget_reports();
+        report_committed(Committed::TimedOut);
+        assert_eq!(said(), (true, false), "a commit out of time");
+        forget_reports();
+        report_committed(Committed::Withheld);
+        assert_eq!(said(), (false, true), "a withheld commit");
     }
 }
