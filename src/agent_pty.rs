@@ -9391,8 +9391,9 @@ impl AgentPtyRegistry {
     /// `agent_type` is upgradable in place by [`Self::set_agent_type`] from a
     /// hook event, so any same-user producer can claim a type there, while
     /// `spawn_agent_type` is what the deck itself exec'd and no hook path can
-    /// write it. Its production consumer, the typed delivery's readiness gate,
-    /// was removed by PRD #1666; tests read it now.
+    /// write it. PRD #1666 reads it to tell a Pi or a Claude Code generation
+    /// apart for its inbox (`daemon.rs`'s `pi_generation` and
+    /// `claude_hook_fetch`).
     pub fn spawn_agent_type(&self, agent_id: &str) -> Option<AgentType> {
         self.inner
             .lock()
@@ -9400,6 +9401,21 @@ impl AgentPtyRegistry {
             .agents
             .get(agent_id)
             .and_then(|agent| agent.spawn_agent_type.clone())
+    }
+
+    /// PRD #1666 part 2 (R2-R03): the agent type `agent_id`'s record carries
+    /// — its spawn's, else the first one a hook event attested to that
+    /// generation reported ([`Self::set_agent_type_for_generation`]). Unlike
+    /// [`Self::spawn_agent_type`], a same-user hook producer can choose it,
+    /// so it may only steer a decision whose wrong answer refuses something
+    /// visibly, never one that grants.
+    pub fn reported_agent_type(&self, agent_id: &str) -> Option<AgentType> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.agent_type.clone())
     }
 
     /// Issue #1602: how `agent_id` was configured to run — its

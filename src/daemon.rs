@@ -5494,22 +5494,32 @@ fn pi_generation(registry: &AgentPtyRegistry, pane_id: &str, agent_id: &str) -> 
 /// turn-end hand-over — which is served as a one-shot receiver of its own
 /// ([`crate::inbox_hub::serve_hook`]): one that declares the one-shot
 /// integration (only Claude's hook does, until H4), or one from a generation
-/// known to be Claude Code, by its spawn or by the Claude component it
-/// announced, so an older hook there meets the floor. A pane started from a
-/// bare command carries no spawn type, which is why the declaration and the
-/// announcement count. A CLI fetch stays on the legacy path until H4.
+/// known to be Claude Code, so an older hook there meets the floor and is
+/// refused visibly rather than handed mail on the legacy terms.
+///
+/// A generation is known to be Claude Code by its spawn, by the Claude
+/// component it announced, or by its own hook events reporting Claude Code
+/// (R2-R03). A pane started from a bare command carries no spawn type, and a
+/// Claude without the deck's waiter announces nothing, so the hook-reported
+/// type is what tells that Claude apart: its SessionStart event reports it
+/// before any prompt can carry a doorbell. A hook producer can claim that
+/// type, but the claim only routes a stale fetch to its refusal. Before any
+/// Claude hook event has arrived the deck has no evidence either way, and
+/// such a fetch is served on the legacy path. A CLI fetch stays on the
+/// legacy path until H4.
 fn claude_hook_fetch(
     registry: &AgentPtyRegistry,
     req: &crate::event::InboxFetchRequest,
     agent_id: &str,
 ) -> bool {
-    use crate::event::{InboxComponent, InboxFetchConsumer};
+    use crate::event::{AgentType, InboxComponent, InboxFetchConsumer};
     matches!(
         req.consumer,
         InboxFetchConsumer::DoorbellHook | InboxFetchConsumer::TurnEndHook
     ) && req.rx.is_none()
         && (req.hook_integration.is_some()
-            || registry.spawn_agent_type(agent_id) == Some(crate::event::AgentType::ClaudeCode)
+            || registry.spawn_agent_type(agent_id) == Some(AgentType::ClaudeCode)
+            || registry.reported_agent_type(agent_id) == Some(AgentType::ClaudeCode)
             || matches!(
                 registry.inbox().announced_component(&req.pane_id, agent_id),
                 Some(InboxComponent::ClaudeHooks | InboxComponent::ClaudeWaiter)
@@ -6331,7 +6341,13 @@ async fn run_hook_loop_with_limits(
                                     };
                                     // Part 2 §1.3: admitted from the agent's own
                                     // process tree, as `ack` is, for the
-                                    // generation the token attests.
+                                    // generation the token attests. That makes
+                                    // it an in-tree, same-user authority, not
+                                    // proof that Claude's hook sent it; what it
+                                    // may commit is bounded by the attempt's own
+                                    // witness instead (R2-A01): released by the
+                                    // deck, not positively not handed, and its
+                                    // commit receipt on its own cap in the spool.
                                     let reply = if mail_taker_admitted(
                                         &pty_registry,
                                         peer_pid,

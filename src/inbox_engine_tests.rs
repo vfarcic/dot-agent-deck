@@ -3328,7 +3328,7 @@ async fn boundary_046_deliveries_counts_every_receipt_hand_out() {
     }
 }
 
-/// Scenario: Each component the receipt policy does not cover opens a stream for an agent with a task queued, then a Claude waiter waits once on a connection that never reads its hand-over. Every stream is refused `unsupported`, arms nothing and leaves the task queued; the once-waiter's batch, which never reached its peer, goes back to the queue.
+/// Scenario: Each component that takes its mail one batch at a time (Claude's waiter and hooks, Codex and Devin hooks, an unknown component) opens a stream for an agent with a task queued. Every stream is refused `unsupported`, arms nothing and leaves the task queued.
 #[spec("inbox/boundary/036")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boundary_036_a_stream_from_a_component_that_cannot_stream_is_refused() {
@@ -4161,4 +4161,418 @@ async fn boundary_057_a_hook_receiver_takes_only_what_its_fetch_asked_for() {
     })
     .await;
     assert_eq!(state_of(&hub, "p", later.as_str()), StateName::Queued);
+}
+
+/// Hold every caps-file write until the test lets it go: the returned
+/// receiver hears each write start, and each `()` sent on the sender lets
+/// one go on.
+fn hold_caps(hub: &InboxHub) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel();
+    *hub.hold_caps.lock().unwrap() = Some((entered_tx, go_rx));
+    (entered, go)
+}
+
+/// The id of `p`'s message about `body`, once it is listed.
+fn listed_id(hub: &InboxHub, body: &str) -> String {
+    let subject = format!("about {body}");
+    hub.list("p")
+        .into_iter()
+        .find(|m| m.subject == subject)
+        .expect("the message is listed")
+        .id
+        .as_str()
+        .to_string()
+}
+
+/// Scenario: A Claude once-waiter is issued a task, and while the deck is still writing the batch's caps file a newer waiter registers and supersedes it, and a Claude prompt hook's fetch for that task is handed nothing. When the write finishes, the batch, which never left the deck, is not sent: its attempt is positively not handed (not left possibly handed), the task goes back to the queue, and the newer waiter is handed it at once, not marked as a possible repeat.
+#[spec("inbox/boundary/058")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boundary_058_a_batch_superseded_before_its_release_is_not_handed() {
+    use crate::inbox_attempts::Stage;
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let mut older = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(older.next().await.registered.is_some());
+    let (entered, go) = hold_caps(&hub);
+    let posting = {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            hub.post_direct(Recipient::bound("p", "a"), content("superseded meanwhile"))
+                .unwrap()
+        })
+    };
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the caps write started");
+    let id = listed_id(&hub, "superseded meanwhile");
+    let mut newer = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(newer.next().await.registered.is_some());
+    assert!(
+        older.next().await.superseded,
+        "the older waiter is superseded"
+    );
+    assert_eq!(
+        attempt_state(&hub, "p", "a", &id, 1, 1).0,
+        Stage::Fenced,
+        "the supersession fenced the attempt the deck still holds"
+    );
+    let mut hook = open_hook(&hub, Some(&id), Some(HOOK_INTEGRATION));
+    assert_eq!(
+        hook.next().await.messages.map(|m| m.len()),
+        Some(0),
+        "a hook's fetch takes nothing the deck still holds"
+    );
+    hook.close().await;
+    // One write for the held batch, one for the newer waiter's.
+    go.send(()).unwrap();
+    go.send(()).unwrap();
+    assert_eq!(posting.join().unwrap().as_str(), id);
+    *hub.hold_caps.lock().unwrap() = None;
+    let batch = newer.handout().await;
+    assert_eq!(batch[0].id, id);
+    assert_eq!((attempt(&batch[0]).a, attempt(&batch[0]).e), (1, 2));
+    assert!(
+        !batch[0].text.contains("This may repeat"),
+        "the batch never left the deck, so this is no repeat: {}",
+        batch[0].text
+    );
+    assert_eq!(
+        attempt_state(&hub, "p", "a", &id, 1, 1).0,
+        Stage::NotHanded,
+        "the deck's own witness, with its receiver gone"
+    );
+    newer.close().await;
+    older.close().await;
+}
+
+/// The gate a [`GatedWriter`] waits at.
+#[derive(Default)]
+struct Gate {
+    blocked: bool,
+    open: bool,
+    waker: Option<std::task::Waker>,
+}
+
+/// A writer that takes its first line whole, then waits at its gate before
+/// the next and, once the gate opens, takes not one byte of it.
+struct GatedWriter {
+    lines: usize,
+    gate: Arc<std::sync::Mutex<Gate>>,
+}
+
+impl tokio::io::AsyncWrite for GatedWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.lines == 0 {
+            if buf.ends_with(b"\n") {
+                self.lines = 1;
+            }
+            return std::task::Poll::Ready(Ok(buf.len()));
+        }
+        let mut gate = self.gate.lock().unwrap();
+        if gate.open {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        gate.blocked = true;
+        gate.waker = Some(cx.waker().clone());
+        std::task::Poll::Pending
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Scenario: A Claude once-waiter is released its batch, and the deck's write of the batch line stalls before a byte of it is taken. A newer waiter registers meanwhile and supersedes the first, and then the stalled write fails having taken nothing. The deck records the attempt positively not handed even though its waiter is gone, the task goes back to the queue, and the newer waiter is handed it unmarked.
+#[spec("inbox/boundary/059")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boundary_059_a_counted_write_that_took_nothing_is_not_handed_after_supersession() {
+    use crate::inbox_attempts::Stage;
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let gate = Arc::new(std::sync::Mutex::new(Gate::default()));
+    let (_client, server) = tokio::io::duplex(1 << 16);
+    let (read, _write) = tokio::io::split(server);
+    let older = tokio::spawn(serve_waiter(
+        Arc::clone(&hub),
+        "p".to_string(),
+        "a".to_string(),
+        InboxWaitMode::Once,
+        InboxComponent::ClaudeWaiter,
+        Some(4242),
+        ReceiptArm {
+            hook_integration: Some(HOOK_INTEGRATION),
+            ..ReceiptArm::default()
+        },
+        BufReader::new(read),
+        GatedWriter {
+            lines: 0,
+            gate: Arc::clone(&gate),
+        },
+        |_: &str| {},
+    ));
+    until("the older waiter to arm", || hub.armed("p", "a") == 1).await;
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("stalled write"))
+        .unwrap();
+    until("the batch line's write to stall", || {
+        gate.lock().unwrap().blocked
+    })
+    .await;
+    let mut newer = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(newer.next().await.registered.is_some());
+    assert_eq!(
+        attempt_state(&hub, "p", "a", id.as_str(), 1, 1).0,
+        Stage::Fenced,
+        "the supersession fenced the attempt mid-write"
+    );
+    {
+        let mut gate = gate.lock().unwrap();
+        gate.open = true;
+        if let Some(waker) = gate.waker.take() {
+            waker.wake();
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), older)
+        .await
+        .expect("the failed write ends the older waiter")
+        .unwrap();
+    let batch = newer.handout().await;
+    assert_eq!(batch[0].id, id.as_str());
+    assert_eq!((attempt(&batch[0]).a, attempt(&batch[0]).e), (1, 2));
+    assert!(
+        !batch[0].text.contains("This may repeat"),
+        "{}",
+        batch[0].text
+    );
+    assert_eq!(
+        attempt_state(&hub, "p", "a", id.as_str(), 1, 1).0,
+        Stage::NotHanded
+    );
+    newer.close().await;
+}
+
+/// Scenario: A Claude once-waiter is issued a task, and while the deck writes the batch's caps file the waiter is superseded and the task cancelled. The clock then runs well past every approval window and spool check: the cancelled task stays held, its attempt keeps its evidence, and nothing is removed under the write. When the write finishes, the attempt is not handed, the task ends cancelled, and its caps file is removed with its evidence. A second batch whose generation exits during its write has its caps file removed too.
+#[cfg(unix)]
+#[spec("inbox/boundary/060")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boundary_060_a_late_caps_write_leaves_no_file_behind() {
+    use crate::inbox_attempts::{MessageState as Model, Stage};
+    use crate::inbox_receipt::CapsLookup;
+    let key: AgentKey = ("p".into(), "a".into());
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_millis(150));
+    let mut older = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(older.next().await.registered.is_some());
+    let (entered, go) = hold_caps(&hub);
+    let posting = {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            hub.post_direct(Recipient::bound("p", "a"), content("cancelled meanwhile"))
+                .unwrap()
+        })
+    };
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the caps write started");
+    let id = listed_id(&hub, "cancelled meanwhile");
+    let mut newer = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(newer.next().await.registered.is_some());
+    let revision = hub.lock().receipts.gens[&key]
+        .model
+        .delivery(&id)
+        .unwrap()
+        .revision;
+    let cancel = hub.inbox_action("p", "a", &id, revision, false, "desktop-1");
+    assert_eq!(
+        cancel.outcome,
+        crate::daemon_protocol::InboxActionOutcome::Applied
+    );
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        hub.tick();
+    }
+    assert_eq!(
+        attempt_state(&hub, "p", "a", &id, 1, 1),
+        (Stage::Fenced, false),
+        "nothing reclaims an attempt whose caps file is still being written"
+    );
+    assert_eq!(
+        hub.lock().receipts.gens[&key].model.state(&id),
+        Some(Model::CancelHeld)
+    );
+    go.send(()).unwrap();
+    assert_eq!(posting.join().unwrap().as_str(), id);
+    until("the task to end cancelled", || {
+        state_of(&hub, "p", &id) == StateName::Undeliverable
+    })
+    .await;
+    assert_eq!(
+        attempt_state(&hub, "p", "a", &id, 1, 1),
+        (Stage::NotHanded, true)
+    );
+    assert!(
+        matches!(caps_file(&hub, &id, 1, 1), CapsLookup::Missing),
+        "the late caps file was removed with the attempt"
+    );
+    assert_eq!(evidence_reserved(&hub, "p", "a"), 0);
+
+    let posting = {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            hub.post_direct(Recipient::bound("p", "a"), content("exited meanwhile"))
+                .unwrap()
+        })
+    };
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the second caps write started");
+    let second = listed_id(&hub, "exited meanwhile");
+    {
+        // The generation exits as `engine::exit` makes it; the spawned
+        // removal of its whole directory is left out, so only the release
+        // can remove the file written after it.
+        let mut st = hub.lock();
+        let _ = engine::exit(&mut st, &key, Instant::now());
+    }
+    go.send(()).unwrap();
+    posting.join().unwrap();
+    *hub.hold_caps.lock().unwrap() = None;
+    assert!(
+        matches!(caps_file(&hub, &second, 1, 1), CapsLookup::Missing),
+        "a caps file written for an exited generation is removed"
+    );
+    newer.close().await;
+    older.close().await;
+}
+
+/// Scenario: Claude's prompt-hook commit is sent straight to the deck, naming exact attempts, as any process in the agent's tree could send it. An attempt whose caps file could not be written, so the deck never sent it, is not committed even with a commit receipt on its cap in the spool, and the task stays queued. An attempt the deck is still holding back is not committed either, receipt or not, and neither is it by an explicit ack. A released attempt with no commit receipt in the spool, or with one carrying the wrong cap, is not committed. Once the commit receipt is published on the attempt's own commit cap, the same request commits it and the task is acknowledged.
+#[cfg(unix)]
+#[spec("inbox/boundary/061")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boundary_061_an_exact_commit_needs_a_released_attempt_and_its_receipt() {
+    use crate::event::InboxAttemptRef;
+    use crate::inbox_attempts::Stage;
+    use crate::inbox_receipt::{CapsLookup, RecordKey, RecordStage};
+    use std::os::unix::fs::PermissionsExt;
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let commit = |id: &str, a: u32, e: u32| {
+        hub.one_shot_committed(
+            "p",
+            "a",
+            &[InboxAttemptRef {
+                id: id.to_string(),
+                a,
+                e,
+            }],
+            None,
+        )
+    };
+    let mut first = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(first.next().await.registered.is_some());
+    let (p, ag) = spool_names("p", "a");
+    let spool =
+        crate::inbox_receipt::GenerationSpool::open(&hub.spool_env().unwrap(), &p, &ag).unwrap();
+    let record = |id: &str, e: u32| RecordKey {
+        msg: id.to_string(),
+        a: 1,
+        e,
+        stage: RecordStage::Committed,
+    };
+    // A commit receipt published on the attempt's own commit cap, as the
+    // deck minted it: what a holder of that cap could publish.
+    let publish_commit = |id: &str, e: u32| {
+        let cap = hub.lock().receipts.gens[&("p".to_string(), "a".to_string())]
+            .evidence
+            .lock()
+            .unwrap()
+            .store
+            .caps(id, 1, e)
+            .expect("the deck minted the attempt's caps")
+            .commit
+            .clone();
+        spool.publish(&record(id, e), &cap).unwrap();
+    };
+    let caps_dir = hub
+        .spool_env()
+        .unwrap()
+        .join(spool_names("p", "a").0)
+        .join(spool_names("p", "a").1)
+        .join("caps");
+    std::fs::set_permissions(&caps_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("never sent"))
+        .unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), first.lines.next_line())
+        .await
+        .expect("the connection ends")
+        .unwrap();
+    std::fs::set_permissions(&caps_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(ended.is_none(), "nothing was sent: {ended:?}");
+    assert_eq!(
+        attempt_state(&hub, "p", "a", id.as_str(), 1, 1).0,
+        Stage::NotHanded
+    );
+    publish_commit(id.as_str(), 1);
+    assert_eq!(
+        commit(id.as_str(), 1, 1),
+        0,
+        "a not-handed attempt, even with a receipt on its cap"
+    );
+    assert_eq!(state_of(&hub, "p", id.as_str()), StateName::Queued);
+    assert_eq!(
+        attempt_state(&hub, "p", "a", id.as_str(), 1, 1).0,
+        Stage::NotHanded
+    );
+
+    let (entered, go) = hold_caps(&hub);
+    let mut second = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(second.next().await.registered.is_some());
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the caps write started");
+    publish_commit(id.as_str(), 2);
+    assert_eq!(
+        commit(id.as_str(), 1, 2),
+        0,
+        "a withheld attempt, even with a receipt on its cap"
+    );
+    assert_eq!(
+        hub.ack(id.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::Unknown,
+        "no attempt reached the agent, so an ack commits none"
+    );
+    assert_eq!(
+        attempt_state(&hub, "p", "a", id.as_str(), 1, 2).0,
+        Stage::Issued
+    );
+    std::fs::remove_file(rec_dir(&hub, "p", "a").join(record(id.as_str(), 2).file_name())).unwrap();
+    go.send(()).unwrap();
+    let batch = second.handout().await;
+    *hub.hold_caps.lock().unwrap() = None;
+    assert_eq!((attempt(&batch[0]).a, attempt(&batch[0]).e), (1, 2));
+    assert_eq!(commit(id.as_str(), 1, 2), 0, "no receipt in the spool");
+    let CapsLookup::Found(caps) = caps_file(&hub, id.as_str(), 1, 2) else {
+        panic!("the released attempt's caps file");
+    };
+    let key = record(id.as_str(), 2);
+    spool.publish(&key, &caps.handed).unwrap();
+    assert_eq!(commit(id.as_str(), 1, 2), 0, "a receipt on the wrong cap");
+    assert_eq!(state_of(&hub, "p", id.as_str()), StateName::Fetched);
+    std::fs::remove_file(rec_dir(&hub, "p", "a").join(key.file_name())).unwrap();
+    spool.publish(&key, &caps.commit).unwrap();
+    assert_eq!(commit(id.as_str(), 1, 2), 1, "its own commit receipt");
+    assert_eq!(state_of(&hub, "p", id.as_str()), StateName::Acknowledged);
+    second.close().await;
 }

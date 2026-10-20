@@ -631,6 +631,8 @@ pub fn deck_prompt_submit(
                 one_shot: Some(injection),
             });
         }
+        // The one-shot receivers are Unix only: no body is injected here,
+        // so a doorbell does not deliver to Claude on Windows yet.
         #[cfg(not(unix))]
         {
             let _ = crate::inbox_prompt::mark_event(event, &ids, &[]);

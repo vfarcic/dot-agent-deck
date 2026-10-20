@@ -2313,7 +2313,9 @@ impl InboxHub {
             engine::dispatch(&mut st, &key, Instant::now(), &mut out);
             drop(st);
             engine::flush(out);
-            self.release_staged();
+            // Releasing a batch can reclaim what it held back, whose files
+            // go with the rest of the spool work.
+            self.spool_work();
             self.changed.notify_one();
             return;
         }
@@ -2729,6 +2731,14 @@ impl InboxHub {
     /// the lock — once batches' caps files, revoke markers and removals —
     /// then owed notices.
     fn after_receipts(&self) {
+        self.spool_work();
+        self.changed.notify_one();
+        self.post_owed_notices();
+    }
+
+    /// [`Self::after_receipts`]' spool work: once batches' caps files, then
+    /// the removals and revoke markers queued so far, releasing included.
+    fn spool_work(&self) {
         self.release_staged();
         let (removals, markers) = {
             let mut st = self.lock();
@@ -2774,14 +2784,15 @@ impl InboxHub {
                 }
             }
         }
-        self.changed.notify_one();
-        self.post_owed_notices();
     }
 
     /// Part 2 §2.4: release the once batches [`engine::dispatch`] staged.
     /// Each one's caps files are written off the executor and outside the
-    /// lock, so a slow spool holds up that batch and no inbox call; the batch
-    /// is then revalidated and sent under the lock ([`engine::release`]).
+    /// lock, so a slow spool holds up the call that staged that batch, while
+    /// other threads' inbox calls go on taking the lock; the batch is then
+    /// revalidated and sent under the lock ([`engine::release`]). R2-R02: a
+    /// batch whose generation or waiter is already gone gets no caps file,
+    /// and one whose generation went during the write has its files removed.
     fn release_staged(&self) {
         loop {
             let staged = std::mem::take(&mut self.lock().receipts.staged);
@@ -2789,11 +2800,16 @@ impl InboxHub {
                 return;
             }
             for staged in staged {
-                let failed = self.write_caps_files(&staged);
+                let live = engine::still_staged(&self.lock(), &staged);
+                let written = if live {
+                    self.write_caps_files(&staged)
+                } else {
+                    vec![engine::CapsWrite::Skipped; staged.batch.len()]
+                };
                 let mut out = engine::Outbox::new();
                 {
                     let mut st = self.lock();
-                    engine::release(&mut st, staged, &failed, Instant::now(), &mut out);
+                    engine::release(&mut st, staged, &written, Instant::now(), &mut out);
                 }
                 engine::flush(out);
             }
@@ -2801,10 +2817,10 @@ impl InboxHub {
     }
 
     /// Each staged attempt's caps file, written for the prompt hook that
-    /// commits it (part 2 §1.3): the write error of each, in batch order.
+    /// commits it (part 2 §1.3): what each write came to, in batch order.
     /// With no spool this run there is nowhere to write one, and the
     /// generation already says its receipts are degraded.
-    fn write_caps_files(&self, staged: &engine::Staged) -> Vec<Option<String>> {
+    fn write_caps_files(&self, staged: &engine::Staged) -> Vec<engine::CapsWrite> {
         #[cfg(test)]
         if let Some(hold) = self
             .hold_caps
@@ -2816,7 +2832,7 @@ impl InboxHub {
             let _ = hold.1.recv();
         }
         let Some(spool) = staged.spool.as_ref() else {
-            return vec![None; staged.batch.len()];
+            return vec![engine::CapsWrite::Written; staged.batch.len()];
         };
         off_the_executor(|| {
             staged
@@ -2824,7 +2840,9 @@ impl InboxHub {
                 .iter()
                 .map(|delivery| {
                     use crate::inbox_receipt::{AttemptCaps, Cap};
-                    let at = delivery.attempt.as_ref()?;
+                    let Some(at) = delivery.attempt.as_ref() else {
+                        return engine::CapsWrite::Written;
+                    };
                     let caps = at.caps.as_ref().and_then(|caps| {
                         Some(AttemptCaps {
                             handed: Cap::from_hex(&caps.handed)?,
@@ -2832,12 +2850,14 @@ impl InboxHub {
                         })
                     });
                     let Some(caps) = caps else {
-                        return Some("the deck minted no caps for it".to_string());
+                        return engine::CapsWrite::Failed(
+                            "the deck minted no caps for it".to_string(),
+                        );
                     };
-                    spool
-                        .write_caps(&delivery.id, at.a, at.e, &caps)
-                        .err()
-                        .map(|error| error.to_string())
+                    match spool.write_caps(&delivery.id, at.a, at.e, &caps) {
+                        Ok(()) => engine::CapsWrite::Written,
+                        Err(error) => engine::CapsWrite::Failed(error.to_string()),
+                    }
                 })
                 .collect()
         })
@@ -2981,11 +3001,36 @@ impl InboxHub {
         attempts: &[crate::event::InboxAttemptRef],
         degraded: Option<&str>,
     ) -> usize {
+        use crate::inbox_receipt::Presence;
+        let key = (pane_id.to_string(), agent_id.to_string());
+        let candidates = engine::commit_candidates(&self.lock(), &key, attempts);
+        // R2-A01: an attempt commits here only on its commit receipt, found
+        // in the spool on the attempt's own cap as the clock's check finds
+        // one, read off the lock. A generation whose receipts the deck cannot
+        // read is degraded already, and takes the admissible attempts as
+        // named.
+        let verified = candidates.map_or_else(Vec::new, |(candidates, evidence)| {
+            if candidates.is_empty() {
+                return candidates;
+            }
+            off_the_executor(|| {
+                let mut evidence = evidence.lock().unwrap_or_else(|e| e.into_inner());
+                let engine::Evidence { store, scanner } = &mut *evidence;
+                let Some(scanner) = scanner.as_mut() else {
+                    return candidates;
+                };
+                candidates
+                    .into_iter()
+                    .filter(|at| {
+                        scanner.commit_presence(store, &at.id, at.a, at.e) == Presence::Found
+                    })
+                    .collect()
+            })
+        });
         let mut out = engine::Outbox::new();
         let applied = {
             let mut st = self.lock();
-            let key = (pane_id.to_string(), agent_id.to_string());
-            engine::one_shot_committed(&mut st, &key, attempts, degraded, Instant::now(), &mut out)
+            engine::one_shot_committed(&mut st, &key, &verified, degraded, Instant::now(), &mut out)
         };
         engine::flush(out);
         self.after_receipts();
@@ -3308,10 +3353,7 @@ async fn serve_once<R, W>(
                         }
                         crate::inbox_oneshot::Output::NotHanded => {
                             debug!(conn_id, "inbox: a once-waiter took no line of its batch");
-                            hub.receipt_control(&key, rx, &InboxStreamControl {
-                                not_handed: attempts,
-                                ..InboxStreamControl::default()
-                            });
+                            hub.deck_not_handed(&key, rx, &attempts);
                             break;
                         }
                         crate::inbox_oneshot::Output::Possible => break,
@@ -3485,14 +3527,7 @@ pub async fn serve_hook<R, W>(
     let ended = match write_counted_line(deadline, &mut writer, &reply).await {
         crate::inbox_oneshot::Output::Written => empty,
         crate::inbox_oneshot::Output::NotHanded => {
-            hub.receipt_control(
-                &key,
-                rx,
-                &InboxStreamControl {
-                    not_handed: attempts,
-                    ..InboxStreamControl::default()
-                },
-            );
+            hub.deck_not_handed(&key, rx, &attempts);
             true
         }
         crate::inbox_oneshot::Output::Possible => true,
@@ -3591,6 +3626,23 @@ where
 }
 
 impl InboxHub {
+    /// R2-R01: the deck's own counted write handed none of `attempts` to
+    /// `rx` ([`engine::deck_not_handed`]).
+    fn deck_not_handed(
+        &self,
+        key: &AgentKey,
+        rx: crate::inbox_attempts::Rx,
+        attempts: &[crate::event::InboxAttemptRef],
+    ) {
+        let mut out = engine::Outbox::new();
+        {
+            let mut st = self.lock();
+            engine::deck_not_handed(&mut st, key, rx, attempts, Instant::now(), &mut out);
+        }
+        engine::flush(out);
+        self.after_receipts();
+    }
+
     fn receipt_control(
         &self,
         key: &AgentKey,

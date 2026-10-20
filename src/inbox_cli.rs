@@ -328,7 +328,10 @@ fn raw_stderr() -> std::io::Result<std::fs::File> {
 }
 
 /// The one-shot receipt protocol runs on Unix only, as the receipt stream
-/// does: elsewhere the waiter exits quietly and the doorbell reaches Claude.
+/// does: elsewhere the waiter exits quietly. The deck may still type its
+/// doorbell line, but Claude's prompt hook injects nothing there either
+/// (`hook::deck_prompt_submit`), so nothing here shows a message body
+/// reaching Claude on Windows; it is untested until Windows ships.
 #[cfg(not(unix))]
 fn wait_once(_json: &str) -> ExitCode {
     ExitCode::SUCCESS

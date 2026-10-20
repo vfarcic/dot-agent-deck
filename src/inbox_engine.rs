@@ -802,6 +802,11 @@ fn spend(
     if let Some(link) = generation.links.get_mut(&rx) {
         link.kind = LinkKind::Once { spent: true };
     }
+    for delivery in &batch {
+        if let Some(at) = &delivery.attempt {
+            generation.model.withhold(&delivery.id, at.a, at.e);
+        }
+    }
     let spool = generation.spool.clone();
     forget_waiter(st, key, conn_id);
     st.receipts.staged.push(Staged {
@@ -824,18 +829,56 @@ fn forget_waiter(st: &mut HubState, key: &AgentKey, conn_id: u64) {
     }
 }
 
+/// What writing one staged attempt's caps file came to (part 2 §2.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CapsWrite {
+    Written,
+    /// Not tried: before the write, the batch's generation or its waiter's
+    /// link was already gone ([`still_staged`]).
+    Skipped,
+    Failed(String),
+}
+
+/// R2-R02: whether `staged` is still worth its caps files, read under the
+/// lock just before they are written: its generation is the one that issued
+/// it (the same spool) and its waiter's link is still there. A batch that is
+/// not is released as not handed with no file written.
+pub(super) fn still_staged(st: &HubState, staged: &Staged) -> bool {
+    st.receipts.gens.get(&staged.key).is_some_and(|generation| {
+        same_spool(&generation.spool, &staged.spool)
+            && generation
+                .links
+                .get(&staged.rx)
+                .is_some_and(|link| link.conn_id == staged.conn_id)
+    })
+}
+
+fn same_spool(a: &Option<Arc<GenerationSpool>>, b: &Option<Arc<GenerationSpool>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Part 2 §2.4: release a once batch whose caps files were written off the
-/// lock, `failed` holding each attempt's write error. Each attempt is
-/// revalidated under this lock — its link is the one it was issued on and
+/// lock, `written` holding what each attempt's write came to. Each attempt
+/// is revalidated under this lock — its link is the one it was issued on and
 /// the deck would still approve its hand-over — before it goes. One that
-/// fails either check, or whose caps file could not be written, is reported
-/// not handed by the deck itself, which is true: no byte of it left the
-/// deck. With nothing left to send, the waiter's connection is closed, so it
-/// exits with nothing and the doorbell covers the mail.
+/// fails either check, or whose caps file was not written, is recorded not
+/// handed by the deck itself, which is true: no byte of it left the deck
+/// (R2-R01: that needs no live receiver). With nothing left to send, the
+/// waiter's connection is closed, so it exits with nothing and the doorbell
+/// covers the mail.
+///
+/// R2-R02: until this runs, every attempt of the batch is withheld, so no
+/// cleanup can reclaim it and remove its files while its caps file is being
+/// written. A batch whose generation exited meanwhile has no model left to
+/// reclaim it: the caps files written for it are queued for removal here.
 pub(super) fn release(
     st: &mut HubState,
     staged: Staged,
-    failed: &[Option<String>],
+    written: &[CapsWrite],
     now: Instant,
     out: &mut Outbox,
 ) {
@@ -845,9 +888,26 @@ pub(super) fn release(
         conn_id,
         permit,
         batch,
-        ..
+        spool,
     } = staged;
-    let Some(generation) = st.receipts.gens.get_mut(&key) else {
+    let Some(generation) = st
+        .receipts
+        .gens
+        .get_mut(&key)
+        .filter(|generation| same_spool(&generation.spool, &spool))
+    else {
+        if let Some(spool) = spool {
+            for (delivery, write) in batch.iter().zip(written) {
+                if let (Some(at), CapsWrite::Written) = (&delivery.attempt, write) {
+                    st.receipts.removals.push((
+                        Arc::clone(&spool),
+                        delivery.id.clone(),
+                        at.a,
+                        at.e,
+                    ));
+                }
+            }
+        }
         return;
     };
     let linked = generation
@@ -855,12 +915,13 @@ pub(super) fn release(
         .get(&rx)
         .is_some_and(|link| link.conn_id == conn_id);
     let mut going = Vec::new();
-    for (mut delivery, failed) in batch.into_iter().zip(failed) {
+    let mut held_back = Vec::new();
+    for (mut delivery, write) in batch.into_iter().zip(written) {
         let Some(attempt) = delivery.attempt.as_mut() else {
             continue;
         };
         let (a, e) = (attempt.a, attempt.e);
-        if let Some(error) = failed {
+        if let CapsWrite::Failed(error) = write {
             generation
                 .degraded
                 .get_or_insert_with(|| format!("could not write a receipt caps file: {error}"));
@@ -870,16 +931,24 @@ pub(super) fn release(
                 .model
                 .may_hand_over(&delivery.id, a, e, rx)
                 .is_ok();
-        if approved && failed.is_none() {
+        if approved && *write == CapsWrite::Written {
             // The caps stay in the deck and the caps file: the waiter reads
             // its own from there.
             attempt.caps = None;
             going.push(delivery);
         } else {
+            held_back.push((delivery.id, a, e));
+        }
+    }
+    for delivery in &going {
+        if let Some(at) = &delivery.attempt {
             generation
                 .model
-                .stage(now, &delivery.id, a, e, Stage::NotHanded, Some(rx));
+                .released(now, &delivery.id, at.a, at.e, true);
         }
+    }
+    for (id, a, e) in &held_back {
+        generation.model.released(now, id, *a, *e, false);
     }
     if going.is_empty() {
         permit.send(WaiterSignal::Close);
@@ -889,6 +958,33 @@ pub(super) fn release(
         ))));
     }
     apply(st, &key, now, out);
+    if !held_back.is_empty() {
+        // What went back to the queue goes to whichever waiter is armed now.
+        dispatch(st, &key, now, out);
+    }
+}
+
+/// R2-R01: the deck's counted write of a one-shot's batch line to `rx` was
+/// accepted no byte up to its newline, so none of `attempts` was handed. The
+/// deck records that itself, whether or not `rx` is still live.
+pub(super) fn deck_not_handed(
+    st: &mut HubState,
+    key: &AgentKey,
+    rx: Rx,
+    attempts: &[InboxAttemptRef],
+    now: Instant,
+    out: &mut Outbox,
+) {
+    let Some(generation) = st.receipts.gens.get_mut(key) else {
+        return;
+    };
+    for at in attempts {
+        generation
+            .model
+            .deck_not_handed(now, &at.id, at.a, at.e, rx);
+    }
+    apply(st, key, now, out);
+    dispatch(st, key, now, out);
 }
 
 /// Part 2 §2.4: a hook receiver `rx`'s own fetch: the waiting mail that fits
@@ -923,15 +1019,37 @@ pub(super) fn hook_fetch(
     batch
 }
 
+/// R2-A01: the attempts of an `inbox_committed` that may commit at all
+/// ([`AttemptModel::commit_admissible`]: released by the deck and not
+/// positively not handed), with the generation's evidence to verify each
+/// one's commit receipt against, off the lock.
+pub(super) fn commit_candidates(
+    st: &HubState,
+    key: &AgentKey,
+    attempts: &[InboxAttemptRef],
+) -> Option<(Vec<InboxAttemptRef>, Arc<Mutex<Evidence>>)> {
+    let generation = st.receipts.gens.get(key)?;
+    let admissible = attempts
+        .iter()
+        .take(crate::inbox_prompt::MAX_IDS)
+        .filter(|at| generation.model.commit_admissible(&at.id, at.a, at.e))
+        .cloned()
+        .collect();
+    Some((admissible, Arc::clone(&generation.evidence)))
+}
+
 /// Part 2 §1.3: Claude's prompt hook commits the exact one-shot attempts a
 /// submitted prompt carried whole, after publishing their `committed`
-/// receipts, on its own admitted connection. An attempt that is not a
-/// one-shot's is left alone. `degraded` is why a receipt could not be
+/// receipts, on its own admitted connection. `verified` holds the attempts
+/// whose receipt the caller found in the spool on the attempt's own cap
+/// (R2-A01), or, for a generation the deck cannot read receipts of, every
+/// admissible one: that generation is degraded already. Each is checked
+/// again here, under the lock. `degraded` is why a receipt could not be
 /// published.
 pub(super) fn one_shot_committed(
     st: &mut HubState,
     key: &AgentKey,
-    attempts: &[InboxAttemptRef],
+    verified: &[InboxAttemptRef],
     degraded: Option<&str>,
     now: Instant,
     out: &mut Outbox,
@@ -945,13 +1063,8 @@ pub(super) fn one_shot_committed(
             .get_or_insert_with(|| crate::untrusted_text::display_line(error, 200));
     }
     let mut applied = 0;
-    for at in attempts.iter().take(crate::inbox_prompt::MAX_IDS) {
-        let one_shot = generation
-            .model
-            .delivery(&at.id)
-            .and_then(|d| d.attempt(at.a, at.e))
-            .is_some_and(|attempt| matches!(attempt.slot, Slot::OnceWaiter | Slot::Hook));
-        if one_shot
+    for at in verified.iter().take(crate::inbox_prompt::MAX_IDS) {
+        if generation.model.commit_admissible(&at.id, at.a, at.e)
             && matches!(
                 generation
                     .model

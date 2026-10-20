@@ -14,13 +14,18 @@
 //!
 //! Either way the prompt is the deck's, not the user's: the message's content
 //! is in the model's context, and the card shows `✉ <subject>` instead of the
-//! raw prompt and keeps it out of the user's prompt history. The hook
-//! acknowledges the ids whose content the prompt carries with the `ack` verb
-//! ([`crate::hook::acknowledge_handed_over`]), which the daemon admits only
-//! from the agent's own process tree, and names every id in the event's
-//! metadata so the daemon can stamp the card label
+//! raw prompt and keeps it out of the user's prompt history. The hook names
+//! every id in the event's metadata so the daemon can stamp the card label
 //! ([`stamp_deck_message_prompt`]), because only the daemon can attest the
 //! agent and knows the subject.
+//!
+//! How the hook settles what the prompt carries depends on the agent. Claude
+//! Code's (part 2's H3) commits the exact attempt each whole block names,
+//! through that attempt's caps file and the `inbox_committed` verb
+//! ([`delivered`], [`commit_delivered`]), and its doorbell is a receiver of
+//! its own that commits what it printed. Codex's, until H4, acknowledges the
+//! ids with the `ack` verb ([`crate::hook::acknowledge_handed_over`]). The
+//! daemon admits both verbs only from the agent's own process tree.
 //!
 //! Agent-neutral: Claude Code uses it in S6, and Codex, whose hooks take the
 //! same `additionalContext` shape, reuses it in S7 with its own budget.
@@ -55,10 +60,11 @@ pub const DECK_MESSAGE_METADATA_KEY: &str = "deck_message";
 const UNKNOWN_SUBJECT: &str = "dot-agent-deck message";
 
 /// The most ids one prompt is read for, and so the most blocks one budgeted
-/// hand-over carries (`inbox_hub`'s batch fitting): Claude's prompt hook
-/// acknowledges the ids it reads here, so a block past this count would be in
-/// the model's context unacknowledged and handed over again (PR #1735 fifth
-/// review, N1).
+/// hand-over carries (`inbox_hub`'s batch fitting): a prompt hook settles
+/// only the ids or attempts it reads here (Claude's commits, Codex's `ack`),
+/// so a block past this count would be in the model's context unsettled and
+/// handed over again (PR #1735 fifth review, N1). It also caps the attempts
+/// one `inbox_committed` names.
 pub const MAX_IDS: usize = 16;
 
 /// The most characters of a subject a card label carries.

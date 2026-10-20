@@ -66,6 +66,19 @@ while True:
             child.stdin.close()
             publish('waiter-' + tag, child.pid)
             running[tag] = (child, out, err)
+        elif request['kind'] == 'raw':
+            import socket
+            conn = socket.socket(socket.AF_UNIX)
+            conn.settimeout(15)
+            conn.connect(request['socket'])
+            conn.sendall(payload + b'\n')
+            reply = b''
+            while not reply.endswith(b'\n'):
+                chunk = conn.recv(4096)
+                if not chunk: break
+                reply += chunk
+            conn.close()
+            publish('result-' + tag, {'code':0, 'stdout':reply.decode(), 'stderr':''})
         else:
             result = subprocess.run([deck, 'hook', '--agent', 'claude-code'], input=payload, capture_output=True, timeout=15, env=env)
             publish('result-' + tag, {'code':result.returncode, 'stdout':result.stdout.decode(), 'stderr':result.stderr.decode()})
@@ -898,4 +911,116 @@ fn claude_020_hooks_too_old_names_the_fix_and_the_fix_delivers() {
     assert!(delivered["stderr"].as_str().unwrap().contains(NATIVE_BODY));
     state(&daemon, &pane, &id, "fetched");
     assert!(notice()["integration"].is_null(), "{}", notice());
+}
+
+/// The `caps` directory of the one generation spool under `root`.
+fn caps_dir(root: &std::path::Path) -> PathBuf {
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if entry.file_name() == "caps" {
+                    out.push(path);
+                } else {
+                    walk(&path, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    assert_eq!(out.len(), 1, "one generation spool: {out:?}");
+    out.remove(0)
+}
+
+/// Send `request` to the deck's hook socket from inside `pane`'s agent, as a
+/// process the agent runs could, and return its one-line answer.
+fn raw(daemon: &impl Endpoint, pane: &Pane, tag: &str, request: Value) -> Value {
+    command_with(
+        pane,
+        tag,
+        json!({"kind":"raw","payload":request,"socket":daemon.hook_socket()}),
+    );
+    let out = result(pane, tag);
+    serde_json::from_str(out["stdout"].as_str().unwrap().trim())
+        .unwrap_or_else(|error| panic!("{tag}: a JSON answer: {error}; {out}"))
+}
+
+/// Scenario: In a pane started from its command alone, with no agent type and no deck waiter in Claude's settings, the real Claude SessionStart hook runs, so Claude's own hook event is all that says the agent is Claude. A queued task's doorbell is then given to a prompt hook too old for the deck's messages. Its fetch is refused as hooks too old instead of being served the old way: the hook prints nothing of the task, the task stays queued, and the agent's card names the hooks-too-old notice.
+#[spec("inbox/claude/022")]
+#[test]
+fn claude_022_a_stale_hook_in_a_bare_claude_pane_is_refused_visibly() {
+    let daemon = daemon(&[]);
+    let pane = parent_as(&daemon, "claude-bare-stale", None);
+    run_hook(&pane, "start", payload(&pane, "SessionStart"));
+    assert!(
+        common::wait_until(WAIT, || record(&daemon, &pane)["agent_type"]
+            == "claude_code"),
+        "Claude's hook event typed the pane: {}",
+        record(&daemon, &pane)
+    );
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let mut hook = payload(&pane, "UserPromptSubmit");
+    hook["prompt"] = json!(fixed_line(&id));
+    command_with(
+        &pane,
+        "stale",
+        json!({"kind":"hook","payload":hook,
+               "env":{"DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION":"none"}}),
+    );
+    let stale = result(&pane, "stale");
+    assert!(
+        !stale["stdout"].as_str().unwrap().contains(NATIVE_BODY),
+        "the stale hook is handed nothing: {stale}"
+    );
+    let notice = || record(&daemon, &pane)["inbox"].clone();
+    assert!(
+        common::wait_until(WAIT, || notice()["integration"] == "hooks_too_old"),
+        "the card names the stale hooks: {}",
+        notice()
+    );
+    state(&daemon, &pane, &id, "queued");
+}
+
+/// Scenario: A process in a Claude agent's own tree sends the deck the prompt hook's exact-commit request directly, without the hook. First the deck cannot write the caps file of the task's first attempt, so it never sends it: a request naming that attempt commits nothing and the task stays queued. A waiter armed again is handed attempt 1.2: a request naming it, with no commit receipt in the spool, commits nothing either and the task stays fetched. The real notification through the real prompt hook, which publishes that receipt, commits it.
+#[spec("inbox/claude/023")]
+#[test]
+fn claude_023_a_raw_exact_commit_needs_the_attempts_receipt() {
+    use std::os::unix::fs::PermissionsExt;
+    let daemon = daemon(&[]);
+    let pane = parent(&daemon, "claude-raw");
+    wait(&pane, "first", "startup");
+    armed(&daemon, &pane, 1);
+    let caps = caps_dir(daemon.home().parent().unwrap());
+    std::fs::set_permissions(&caps, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let first = result(&pane, "first");
+    std::fs::set_permissions(&caps, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(first["code"], 0, "nothing reached the waiter: {first}");
+    assert_eq!(first["stderr"], "", "{first}");
+    state(&daemon, &pane, &id, "queued");
+    let commit = |a: u32, e: u32| {
+        json!({"message_type":"inbox_committed","pane_id":pane.id,"agent_id":pane.agent,
+               "token":pane.token,"attempts":[{"id":id,"a":a,"e":e}]})
+    };
+    // The deck answers once it has applied what it accepted, so the state
+    // read after the answer is the request's outcome.
+    let reply = raw(&daemon, &pane, "never-sent", commit(1, 1));
+    assert!(reply.get("refused").is_none(), "admitted: {reply}");
+    state(&daemon, &pane, &id, "queued");
+
+    wait(&pane, "second", "stop");
+    let second = result(&pane, "second");
+    assert_eq!(second["code"], 2, "the next waiter is handed it: {second}");
+    let stderr = second["stderr"].as_str().unwrap().to_string();
+    assert!(stderr.contains(" delivery 1.2 from "), "{stderr}");
+    state(&daemon, &pane, &id, "fetched");
+    raw(&daemon, &pane, "no-receipt", commit(1, 2));
+    state(&daemon, &pane, &id, "fetched");
+
+    run_hook(&pane, "notification", notification(&pane, &stderr));
+    state(&daemon, &pane, &id, "acknowledged");
 }

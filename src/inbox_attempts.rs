@@ -270,6 +270,12 @@ pub struct Attempt {
     /// A one-shot attempt fenced while its approval may still be in use:
     /// no spool check takes its verifier away before then (C-4).
     quiet_at: Option<Instant>,
+    /// Part 2 §2.4: issued to a once-waiter whose batch the deck still holds
+    /// while its caps file is written outside the lock. No byte of it has
+    /// left the deck, so it is not possibly handed, carries no commit
+    /// authority, keeps its message from ending and its evidence from being
+    /// reclaimed, until [`AttemptModel::released`] says what became of it.
+    pub withheld: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -691,9 +697,9 @@ impl AttemptModel {
     }
 
     /// C-5: the attempt an explicit `ack <id>` commits: the newest of the
-    /// current assignment that was not positively not handed. Every attempt
-    /// positively not handed names none, since none of them reached the
-    /// agent.
+    /// current assignment that was not positively not handed and that the
+    /// deck no longer withholds. Every attempt positively not handed or
+    /// still withheld names none, since none of them reached the agent.
     pub fn commit_target(&self, id: &str) -> Result<(u32, u32), CommitTargetRefusal> {
         let msg = self
             .messages
@@ -704,7 +710,7 @@ impl AttemptModel {
             return Err(CommitTargetRefusal::NoAttempt);
         }
         current
-            .filter(|at| at.stage != Stage::NotHanded)
+            .filter(|at| at.stage != Stage::NotHanded && !at.withheld)
             .map(|at| (at.a, at.e))
             .max()
             .ok_or(CommitTargetRefusal::NotHanded)
@@ -936,6 +942,7 @@ impl AttemptModel {
             resume_deadline: None,
             slot,
             quiet_at: None,
+            withheld: false,
         });
         msg.issued += 1;
         if kind == IssueKind::AutoRepeat {
@@ -1023,6 +1030,93 @@ impl AttemptModel {
         }
         self.finalize(now, id);
         StageOutcome::Applied
+    }
+
+    /// Part 2 §2.4: hold one-shot attempt `(a, e)` of `id` back while the
+    /// deck writes its caps file: it stays [`Attempt::withheld`] until
+    /// [`Self::released`].
+    pub fn withhold(&mut self, id: &str, a: u32, e: u32) {
+        if let Some(at) = self
+            .messages
+            .get_mut(id)
+            .and_then(|msg| msg.attempt_mut(a, e))
+        {
+            at.withheld = true;
+        }
+    }
+
+    /// Part 2 §2.4: the deck decided a withheld attempt. `handed_over` is
+    /// whether its batch line went to the waiter's connection; when it did
+    /// not, no byte of it left the deck, and that is recorded as the deck's
+    /// own witness ([`Self::deck_not_handed`]) whatever became of the
+    /// receiver it was issued to.
+    pub fn released(&mut self, now: Instant, id: &str, a: u32, e: u32, handed_over: bool) {
+        let Some(at) = self
+            .messages
+            .get_mut(id)
+            .and_then(|msg| msg.attempt_mut(a, e))
+        else {
+            return;
+        };
+        at.withheld = false;
+        let rx = at.rx;
+        if handed_over {
+            self.finalize(now, id);
+        } else {
+            self.deck_not_handed(now, id, a, e, rx);
+        }
+    }
+
+    /// R2-R01: the deck's own witness that no byte of one-shot attempt
+    /// `(a, e)`, issued to `rx`, left it — its batch was never released, or
+    /// the counted write of its line was accepted no byte up to its newline.
+    /// Unlike a receiver's report it needs no live incarnation: the deck
+    /// holds the fact, so a waiter superseded or a hook expired meanwhile,
+    /// which fences the attempt possibly handed, does not keep it so. It
+    /// moves only `Issued` or `Fenced`; a stage a receiver or a cap reported
+    /// stands.
+    pub fn deck_not_handed(
+        &mut self,
+        now: Instant,
+        id: &str,
+        a: u32,
+        e: u32,
+        rx: Rx,
+    ) -> StageOutcome {
+        if self.exited {
+            return StageOutcome::Exited;
+        }
+        let Some(at) = self
+            .messages
+            .get_mut(id)
+            .and_then(|msg| msg.attempt_mut(a, e))
+        else {
+            return StageOutcome::Unknown;
+        };
+        if at.rx != rx || !one_shot(at.slot) {
+            return StageOutcome::WrongReceiver;
+        }
+        if !matches!(at.stage, Stage::Issued | Stage::Fenced) {
+            return StageOutcome::NoOp;
+        }
+        at.stage = Stage::NotHanded;
+        at.verifier = false;
+        at.quiet_at = None;
+        self.finalize(now, id);
+        StageOutcome::Applied
+    }
+
+    /// R2-A01: whether an `inbox_committed` naming one-shot attempt `(a, e)`
+    /// may commit it: the deck released it to its receiver and nothing
+    /// positively says it was not handed. A withheld attempt never left the
+    /// deck, and a not-handed one is the deck's or its receiver's witness
+    /// that it did not reach the agent; only a commit receipt published on
+    /// its cap (the clock's spool scan) contradicts that.
+    pub fn commit_admissible(&self, id: &str, a: u32, e: u32) -> bool {
+        self.messages
+            .get(id)
+            .and_then(|msg| msg.attempt(a, e))
+            .is_some_and(|at| one_shot(at.slot) && !at.withheld && at.stage != Stage::NotHanded)
     }
 
     /// A stream receiver's possession snapshot (§4). `seen` is its contiguous
@@ -1163,6 +1257,7 @@ impl AttemptModel {
                 if at.stage == Stage::Fenced
                     && at.verifier
                     && !at.reclaimed
+                    && !at.withheld
                     && !replaying
                     && quiet
                     && !held
@@ -1833,10 +1928,12 @@ impl AttemptModel {
         let held = current
             .iter()
             .any(|at| possessed(&self.receivers, &self.limits, self.turn, id, at, now));
-        let resuming = current.iter().any(|at| at.resume_pending);
+        // A withheld attempt waits on the deck's own answer, as a resuming
+        // one waits on its incarnation's (part 2 §2.4).
+        let resuming = current.iter().any(|at| at.resume_pending || at.withheld);
         let all_final = current
             .iter()
-            .all(|at| at.stage.is_final() && !at.resume_pending);
+            .all(|at| at.stage.is_final() && !at.resume_pending && !at.withheld);
         let all_not_handed =
             !current.is_empty() && current.iter().all(|at| at.stage == Stage::NotHanded);
         let none_issued = current.is_empty();
@@ -2055,10 +2152,11 @@ impl AttemptModel {
     }
 
     /// Return an attempt's evidence reservation once it is quiescent (§7):
-    /// its message is terminal, it is final with no resume answer owed, and
-    /// it keeps no late-commit verifier (a `HandedInert` one's is kept while
+    /// its message is terminal, it is final with no resume answer owed, it
+    /// keeps no late-commit verifier (a `HandedInert` one's is kept while
     /// the message is not settled, a `Fenced` one's until a spool check after
-    /// the message ended).
+    /// the message ended), and the deck no longer withholds it: a caps file
+    /// still being written is removed only once that write is done (R2-R02).
     ///
     /// For a stream attempt, finality already implies that no approval under
     /// a current epoch is outstanding, so the model carries no separate
@@ -2096,7 +2194,8 @@ impl AttemptModel {
             if settled {
                 at.verifier = false;
             }
-            if terminal && at.stage.is_final() && !at.resume_pending && !at.verifier {
+            if terminal && at.stage.is_final() && !at.resume_pending && !at.verifier && !at.withheld
+            {
                 at.reclaimed = true;
                 self.evidence_reserved =
                     self.evidence_reserved.saturating_sub(EVIDENCE_PER_ATTEMPT);
@@ -2146,6 +2245,7 @@ fn owes_revoke(at: &Attempt) -> bool {
 /// not seen (§3).
 fn needs_clearance(at: &Attempt) -> bool {
     !at.resume_pending
+        && !at.withheld
         && matches!(
             at.stage,
             Stage::Issued | Stage::Handed | Stage::Fenced | Stage::HandedInert

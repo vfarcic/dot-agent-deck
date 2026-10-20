@@ -9022,6 +9022,34 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the real hook process (inbox/claude/019).
 - **Platform coverage:** mac+linux.
 
+##### inbox/boundary/058 — A once batch superseded before its release is not handed.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` over in-memory duplexes, a real spool, the caps write held by the test.
+- **Agent:** none.
+- **Asserts:** while a once-waiter's caps file is being written, a newer waiter supersedes it and fences its attempt, and a prompt hook's fetch naming the task gets an empty batch; once the write finishes the batch is not sent, the attempt is `NotHanded` with its receiver gone (R2-R01), and the newer waiter is handed the task at once as attempt 1.2 without the possible-repeat line.
+- **Does not assert:** a real waiter process (inbox/claude/006).
+- **Platform coverage:** all.
+
+##### inbox/boundary/059 — A counted write that took nothing is not handed after supersession.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), `serve_waiter` with a writer that stalls on the batch line, then takes none of it.
+- **Agent:** none.
+- **Asserts:** a once-waiter superseded while the deck's write of its released batch line stalls has that attempt recorded `NotHanded` by the deck once the write fails having taken no byte (R2-R01), and the newer waiter is handed the task as attempt 1.2, unmarked.
+- **Does not assert:** a partly written line (inbox/boundary/051).
+- **Platform coverage:** all.
+
+##### inbox/boundary/060 — A late caps write leaves no file behind.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), real spool, the caps write held by the test, a short ack-wait and the clock ticked.
+- **Agent:** none.
+- **Asserts:** with the write held, a supersession, a Cancel and ticks past every approval window leave the attempt unreclaimed and the task `CancelHeld`; after the write the attempt is `NotHanded` and reclaimed, the task cancelled, its caps file gone and no evidence reserved (R2-R02); a batch whose generation exits during its write has its caps file removed too.
+- **Does not assert:** the spawned removal of an exited generation's directory racing the write (a generation-wide removal, not per attempt).
+- **Platform coverage:** mac+linux.
+
+##### inbox/boundary/061 — An exact commit needs a released attempt and its receipt.
+- **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub's `one_shot_committed` (the `inbox_committed` verb's hub half), real spool.
+- **Agent:** none.
+- **Asserts:** an attempt whose caps file could not be written (never sent, `NotHanded`) is not committed even with a commit receipt on its own cap, and the task stays queued; an attempt still withheld is not committed, receipt or not, nor by an explicit `ack`; a released attempt with no commit receipt, or one published on the wrong cap, is not committed; the receipt on its own commit cap commits it (R2-A01).
+- **Does not assert:** the hook socket's process-tree admission (inbox/claude/023).
+- **Platform coverage:** mac+linux.
+
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
 - **Agent:** none.
@@ -9316,6 +9344,20 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none (synthetic Claude parent; no credential).
 - **Asserts:** the waiter that settings name exits 0 silently; the snapshot's inbox notice is `hooks_too_old`, with the deck's `hooks install --agent claude-code` command when it composes one; nothing is armed, a queued task stays queued and no doorbell is typed; after the deck's own `hooks install --agent claude-code` the settings no longer name the old binary, the waiter they name is handed the task with exit 2, and the notice is gone.
 - **Does not assert:** a genuinely older release (`cargo xver` pairs a previous release's daemon, not its hooks), or restarting a real agent.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/022 — A stale hook in a bare Claude pane is refused visibly.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children, the e2e-only `DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION=none` knob.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** in a pane started with no agent type and with no deck waiter in Claude's settings (so nothing is announced), once the real SessionStart hook's event reports Claude Code, a doorbell given to a prompt hook too old for the deck's messages is refused rather than served the legacy way: nothing of the task is printed, the task stays queued, and the card's notice is `hooks_too_old` (R2-R03).
+- **Does not assert:** a stale doorbell that arrives before any Claude hook event, which the deck cannot tell from another agent's.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/023 — A raw exact commit needs the attempt's receipt.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), a raw `inbox_committed` sent to the hook socket by the scripted Claude parent itself (inside the agent's process tree), real waiter and hook CLI children, real spool.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** with the generation's caps directory unwritable, the waiter is handed nothing and exits 0; a raw request naming that never-sent attempt is admitted but commits nothing (the task stays queued); a raw request naming the released attempt 1.2 with no commit receipt commits nothing (it stays fetched); the real notification through the real prompt hook commits it (R2-A01).
+- **Does not assert:** a same-user process that reads the caps file and publishes the receipt itself (the accepted same-user trade).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]
