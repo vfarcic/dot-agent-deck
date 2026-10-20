@@ -11,7 +11,7 @@ use common::DaemonProc;
 use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
 use serde_json::{Value, json};
 use spec::spec;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -1122,8 +1122,13 @@ fn mock_waiter_reply(daemon: &DaemonProc, pane: &Pane, path: &Path, reply: Optio
     };
     socket.set_read_timeout(Some(WAIT)).unwrap();
     let mut socket = BufReader::new(socket);
+    // The waiter asks whether the deck serves receipts, and waits on the
+    // receipt verb once it says so, on the same connection.
+    let question = line(&mut socket);
+    assert_eq!(question["message_type"], "inbox_receipts");
+    writeln!(socket.get_mut(), r#"{{"one_shot_receipts":1}}"#).unwrap();
     let req = line(&mut socket);
-    assert_eq!(req["message_type"], "inbox_wait");
+    assert_eq!(req["message_type"], "inbox_receipt_wait");
     assert_eq!(req["mode"], "once");
     assert_eq!(req["session"]["source"], "clear");
     if let Some(reply) = reply {
@@ -1133,7 +1138,7 @@ fn mock_waiter_reply(daemon: &DaemonProc, pane: &Pane, path: &Path, reply: Optio
     child.output()
 }
 
-/// Scenario: Point the real Claude waiter CLI at a synthetic hook endpoint which answers Superseded, NotInDeck or Refused, returns malformed JSON, or closes without a reply as an old daemon would. Each case must exit zero with no message on either output stream.
+/// Scenario: Point the real Claude waiter CLI at a synthetic hook endpoint that says it serves receipts and then answers the wait with Superseded, NotInDeck or Refused, returns malformed JSON, or closes without a reply. Each case must exit zero with no message on either output stream. A deck that does not say it serves receipts is inbox/claude/028.
 #[spec("inbox/cli/004")]
 #[test]
 fn inbox_cli_004_non_delivery_replies_never_wake() {
@@ -1214,10 +1219,12 @@ fn inbox_cli_005_a_doorbell_fetch_names_its_message_in_the_one_request() {
     let block = format!(
         "[dot-agent-deck message {id} from the orchestrator]\nwork\n[end of dot-agent-deck message {id}]"
     );
-    // Claude's prompt hook fetches as a one-shot receiver: its batch names
+    // Claude's prompt hook asks whether the deck serves receipts, then
+    // fetches as a one-shot receiver on the receipt verb: its batch names
     // each attempt and carries its caps, and its `may` is answered.
     let reply = |request: &Value| match request["message_type"].as_str() {
-        Some("inbox_fetch") if request["hook_integration"].is_u64() => Some(json!({
+        Some("inbox_receipts") => Some(json!({"one_shot_receipts":1})),
+        Some("inbox_receipt_fetch") => Some(json!({
             "registered":{"rx":1, "slot":"hook", "keepalive_ms":1000, "grant_ttl_ms":5000},
             "messages":[{"id":id, "subject":"task", "from":"the orchestrator", "text":block,
                 "a":1, "e":1, "d":1, "caps":{"handed":"00000000000000000000000000000000",
@@ -1261,9 +1268,13 @@ fn inbox_cli_005_a_doorbell_fetch_names_its_message_in_the_one_request() {
     success(&output);
     let fetches: Vec<&Value> = requests
         .iter()
-        .filter(|r| r["message_type"] == "inbox_fetch")
+        .filter(|r| r["message_type"] == "inbox_receipt_fetch")
         .collect();
     assert_eq!(fetches.len(), 1, "{requests:?}");
+    assert!(
+        !requests.iter().any(|r| r["message_type"] == "inbox_fetch"),
+        "a one-shot never fetches on the legacy verb: {requests:?}"
+    );
     assert_eq!(fetches[0]["doorbell"], id, "{requests:?}");
     assert_eq!(fetches[0]["hook_integration"], 1, "{requests:?}");
     assert!(
@@ -1274,5 +1285,120 @@ fn inbox_cli_005_a_doorbell_fetch_names_its_message_in_the_one_request() {
         String::from_utf8_lossy(&output.stdout).contains("work"),
         "the hook hands the fetched block over: {:?}",
         output
+    );
+}
+
+/// The hook-socket verbs that could hand mail over or commit it.
+const MAIL_VERBS: &[&str] = &[
+    "inbox_wait",
+    "inbox_fetch",
+    "inbox_receipt_wait",
+    "inbox_receipt_fetch",
+    "inbox_committed",
+    "ack",
+];
+
+/// Scenario: Point Claude Code's waiter, its prompt hook answering a doorbell, and its prompt hook submitting a waiter's whole block at a stand-in for a 0.47.0 daemon, which hands its one queued message to the first legacy `inbox_wait` or `inbox_fetch` and answers nothing to a verb it cannot decode. Each asks whether the deck serves receipts, sends nothing that could take or commit mail, exits 1 and says on stderr that the daemon is older than its hooks, naming `hooks install`; the message is still there for a legacy `inbox fetch` afterwards.
+#[spec("inbox/claude/028")]
+#[test]
+fn claude_028_newer_hooks_take_nothing_from_an_older_daemon() {
+    let daemon = daemon();
+    let pane = pane(&daemon, "older-daemon", "exec /bin/cat");
+    let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
+    let body = "older-daemon body 5e1d";
+    let block = format!(
+        "[dot-agent-deck message {id} from the orchestrator]\n{body}\n[end of dot-agent-deck message {id}]"
+    );
+    let taken = Cell::new(false);
+    let older = |request: &Value| match request["message_type"].as_str() {
+        Some("inbox_wait" | "inbox_fetch") if !taken.replace(true) => Some(json!({"messages":[
+            {"id":id, "subject":"task", "from":"the orchestrator", "text":block}]})),
+        Some("inbox_wait" | "inbox_fetch") => Some(json!({"messages":[]})),
+        Some("ack") => Some(json!({"kind":"signal_ack", "accepted":true,
+            "delivery":"acknowledged"})),
+        // `inbox_receipts`, the receipt verbs, `inbox_committed`: a 0.47.0
+        // daemon decodes none of them, and answers nothing.
+        _ => None,
+    };
+    let refused = |what: &str, output: &Output, requests: &[Value]| {
+        assert_eq!(output.status.code(), Some(1), "{what}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("did not confirm that it serves message receipts")
+                && stderr.contains("hooks install --agent claude-code"),
+            "{what} says why and how: {stderr}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r["message_type"] == "inbox_receipts"),
+            "{what} asks: {requests:?}"
+        );
+        for request in requests {
+            let verb = request["message_type"].as_str().unwrap_or_default();
+            assert!(
+                !MAIL_VERBS.contains(&verb),
+                "{what} sent {verb}: {requests:?}"
+            );
+        }
+        assert!(!taken.get(), "{what} took the message");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains(body),
+            "{what} handed nothing over"
+        );
+    };
+    let quick = [("DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS", "300")];
+
+    let session = json!({"hook_event_name":"SessionStart", "session_id":"older-daemon",
+        "source":"startup"})
+    .to_string();
+    let (output, requests) = record_requests(
+        cli(
+            &daemon,
+            Some(&pane),
+            &["inbox", "wait", "--agent", "claude-code"],
+        )
+        .envs(quick),
+        session.as_bytes(),
+        &daemon.home.join("older-wait.sock"),
+        older,
+    );
+    refused("the waiter", &output, &requests);
+
+    let doorbell = json!({"session_id":"older-daemon", "hook_event_name":"UserPromptSubmit",
+        "prompt":format!(" dot-agent-deck: message {id} waiting, run: dot-agent-deck inbox fetch"),
+        "cwd":daemon.home})
+    .to_string();
+    let (output, requests) = record_requests(
+        cli(&daemon, Some(&pane), &["hook", "--agent", "claude-code"]).envs(quick),
+        doorbell.as_bytes(),
+        &daemon.home.join("older-doorbell.sock"),
+        older,
+    );
+    refused("the doorbell hook", &output, &requests);
+
+    let notification = json!({"session_id":"older-daemon", "hook_event_name":"UserPromptSubmit",
+        "prompt":format!("[dot-agent-deck message {id} delivery 1.1 from the orchestrator]\n{body}\n[end of dot-agent-deck message {id}]"),
+        "cwd":daemon.home})
+    .to_string();
+    let (output, requests) = record_requests(
+        cli(&daemon, Some(&pane), &["hook", "--agent", "claude-code"]).envs(quick),
+        notification.as_bytes(),
+        &daemon.home.join("older-commit.sock"),
+        older,
+    );
+    refused("the committing prompt hook", &output, &requests);
+
+    let (output, _) = record_requests(
+        &mut cli(&daemon, Some(&pane), &["inbox", "fetch"]),
+        b"",
+        &daemon.home.join("older-fetch.sock"),
+        older,
+    );
+    success(&output);
+    assert!(taken.get(), "a legacy fetch still takes it");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(body),
+        "and prints it: {output:?}"
     );
 }

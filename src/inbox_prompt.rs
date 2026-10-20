@@ -313,6 +313,13 @@ const HOOK_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// that named `rung`, within `budget` including `framing`, as a one-shot
 /// receiver of its own. `None` outside a deck pane, without a token, when the
 /// deck refuses or does not answer, or when nothing is waiting.
+///
+/// It asks first whether the deck serves receipts, and fetches only from one
+/// that says so, on that same connection; one that does not is sent nothing
+/// that could take mail, and the hook says so
+/// ([`crate::inbox_oneshot::report_unsupported`]). A hook that declares no
+/// integration stands in for an older one and fetches unasked, on the legacy
+/// verb.
 #[cfg(unix)]
 pub fn one_shot_injection(
     budget: InboxBudget,
@@ -337,12 +344,30 @@ pub fn one_shot_injection(
         token,
     );
     request.hook_integration = crate::inbox_oneshot::declared_hook_integration();
-    let json = serde_json::to_string(&DaemonMessage::InboxFetch(request)).ok()?;
-    let mut connection = crate::inbox_oneshot::Connection::open(
-        &crate::endpoint_resolve::client_socket_path(),
-        &json,
-    )
-    .ok()?;
+    let path = crate::endpoint_resolve::client_socket_path();
+    let mut connection = if request.hook_integration.is_some() {
+        use crate::inbox_oneshot::{Connection, Opened};
+        let question = crate::inbox_oneshot::receipts_question(
+            &request.pane_id,
+            request.agent_id.as_deref(),
+            request.token.as_deref().unwrap_or_default(),
+        )?;
+        let json = serde_json::to_string(&DaemonMessage::InboxReceiptFetch(request)).ok()?;
+        match Connection::open_receipts(&path, &question) {
+            Opened::Ready(mut connection) => {
+                connection.send(&json).ok()?;
+                connection
+            }
+            Opened::Unsupported => {
+                crate::inbox_oneshot::report_unsupported();
+                return None;
+            }
+            Opened::Refused(_) | Opened::Unreachable => return None,
+        }
+    } else {
+        let json = serde_json::to_string(&DaemonMessage::InboxFetch(request)).ok()?;
+        crate::inbox_oneshot::Connection::open(&path, &json).ok()?
+    };
     let deadline = std::time::Instant::now() + HOOK_FETCH_WAIT;
     let reply = loop {
         let reply = connection.next(Some(deadline))?;
@@ -469,18 +494,9 @@ pub fn hook_output_parts(
 
 /// Part 2 §1.3: commit the exact attempts whose blocks `prompt` carries whole
 /// at its top level ([`delivered`]) — Claude submitted a once-waiter's
-/// notification. Each attempt's caps are read from its own caps file; for
-/// one found, its `committed` receipt is published on its commit cap and the
-/// attempt is named in an `inbox_committed` the deck admits from this
-/// agent's process tree. One whose caps file is missing (reclaimed, or never
-/// a one-shot's) commits nothing: that is no evidence the delivery did not
-/// happen, and its own lapse decides it. A caps file that is malformed or
-/// cannot be read commits nothing either, and tells the deck its receipts are
-/// degraded. Nothing is acknowledged by id. A deck that pinned no spool has
-/// written no caps file for any attempt, so the exact attempts are named
-/// with that said, and the authenticated connection is the witness.
+/// notification — for this pane's agent ([`commit_attempts`]). Outside a deck
+/// pane or without a token nothing is sent.
 pub fn commit_delivered(prompt: &str) {
-    use crate::inbox_receipt::{CapsLookup, RecordKey, RecordStage};
     let attempts = delivered(prompt);
     if attempts.is_empty() {
         return;
@@ -497,12 +513,90 @@ pub fn commit_delivered(prompt: &str) {
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
         .ok()
         .filter(|agent| !agent.is_empty());
-    let (committed, degraded) = match pinned_spool() {
-        crate::inbox_oneshot::Pinned::Unpinned => {
-            (attempts, Some("the deck has no receipt spool".to_string()))
-        }
-        crate::inbox_oneshot::Pinned::Failed(error) => (Vec::new(), Some(error)),
-        crate::inbox_oneshot::Pinned::Open(spool) => {
+    #[cfg(unix)]
+    if commit_attempts(
+        &crate::endpoint_resolve::client_socket_path(),
+        CommitFor {
+            pane_id: &pane_id,
+            agent_id: agent_id.as_deref(),
+            token: &token,
+        },
+        attempts,
+        &pinned_spool(),
+        crate::inbox_oneshot::receipts_answer_wait(),
+    ) == Committed::Withheld
+    {
+        crate::inbox_oneshot::report_unsupported();
+    }
+    // The one-shot receipt protocol is Unix only: no one-shot there wrote
+    // a block for a prompt to carry.
+    #[cfg(not(unix))]
+    let _ = (pane_id, agent_id, token);
+}
+
+/// Whom [`commit_attempts`] commits for.
+#[derive(Debug, Clone, Copy)]
+pub struct CommitFor<'a> {
+    pub pane_id: &'a str,
+    pub agent_id: Option<&'a str>,
+    pub token: &'a str,
+}
+
+/// What [`commit_attempts`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Committed {
+    /// There was nothing to tell the deck.
+    Nothing,
+    /// The deck did not confirm it serves receipts: no receipt was published
+    /// and no `inbox_committed` sent.
+    Withheld,
+    /// The deck refused the question, or there was none to ask.
+    Refused,
+    /// The commits were sent.
+    Sent,
+}
+
+/// Part 2 §1.3: commit `attempts` at the deck at `socket`, asking first
+/// whether it serves receipts and committing nothing, in the spool or to the
+/// deck, on one that does not say so (wire audit W05). Each attempt's caps are
+/// read from its own caps file; for one found, its `committed` receipt is
+/// published on its commit cap and the attempt is named in an
+/// `inbox_committed` the deck admits from this agent's process tree, sent on
+/// the connection that asked, which waits `wait` for the answer to its
+/// question. One whose caps file is missing (reclaimed, or
+/// never a one-shot's) commits nothing: that is no evidence the delivery did
+/// not happen, and its own lapse decides it. A caps file that is malformed or
+/// cannot be read commits nothing either, and tells the deck its receipts are
+/// degraded. Nothing is acknowledged by id. A deck that pinned no spool has
+/// written no caps file for any attempt, so the exact attempts are named with
+/// that said, and the authenticated connection is the witness.
+#[cfg(unix)]
+pub fn commit_attempts(
+    socket: &std::path::Path,
+    who: CommitFor<'_>,
+    attempts: Vec<crate::event::InboxAttemptRef>,
+    pinned: &crate::inbox_oneshot::Pinned,
+    wait: std::time::Duration,
+) -> Committed {
+    use crate::inbox_oneshot::{Connection, Opened, Pinned};
+    use crate::inbox_receipt::{CapsLookup, RecordKey, RecordStage};
+    if attempts.is_empty() {
+        return Committed::Nothing;
+    }
+    let Some(question) =
+        crate::inbox_oneshot::receipts_question(who.pane_id, who.agent_id, who.token)
+    else {
+        return Committed::Refused;
+    };
+    let mut connection = match Connection::open_receipts_within(socket, &question, wait) {
+        Opened::Ready(connection) => connection,
+        Opened::Unsupported => return Committed::Withheld,
+        Opened::Refused(_) | Opened::Unreachable => return Committed::Refused,
+    };
+    let (committed, degraded) = match pinned {
+        Pinned::Unpinned => (attempts, Some("the deck has no receipt spool".to_string())),
+        Pinned::Failed(error) => (Vec::new(), Some(error.clone())),
+        Pinned::Open(spool) => {
             let mut committed = Vec::new();
             let mut degraded = None;
             for at in attempts {
@@ -542,18 +636,28 @@ pub fn commit_delivered(prompt: &str) {
         }
     };
     if committed.is_empty() && degraded.is_none() {
-        return;
+        connection.finish();
+        return Committed::Nothing;
     }
     let request = DaemonMessage::InboxCommitted(crate::event::InboxCommittedRequest {
-        pane_id,
-        agent_id,
-        token: Some(token),
+        pane_id: who.pane_id.to_string(),
+        agent_id: who.agent_id.map(str::to_string),
+        token: Some(who.token.to_string()),
         attempts: committed,
         degraded,
     });
-    if let Ok(json) = serde_json::to_string(&request) {
-        let _ = crate::hook::request_from_socket(&json);
+    let Ok(json) = serde_json::to_string(&request) else {
+        return Committed::Nothing;
+    };
+    if connection.send(&json).is_err() {
+        return Committed::Nothing;
     }
+    connection.finish();
+    // The deck's answer, so it has read the line before the hook goes.
+    let _ = connection.next(Some(
+        std::time::Instant::now() + crate::inbox_oneshot::RECEIPTS_ANSWER_WAIT,
+    ));
+    Committed::Sent
 }
 
 /// The hook's stdout handing `context` to the model with the prompt or
@@ -1019,5 +1123,102 @@ mod tests {
             "an untrusted body's defused markers name nothing and close nothing"
         );
         assert!(delivered("no deck message here").is_empty());
+    }
+
+    /// Scenario: A submitted prompt carries a waiter's whole block, whose
+    /// caps file the deck wrote, and the hook commits it twice: first at a
+    /// stand-in deck that answers its receipts question with nothing, as an
+    /// older daemon does, then at one that says it serves receipts. The
+    /// first publishes no receipt in the spool and sends nothing but the
+    /// question; the second publishes the commit receipt and sends the exact
+    /// attempt as `inbox_committed` on the connection that asked.
+    #[cfg(unix)]
+    #[spec("inbox/claude/030")]
+    #[test]
+    fn claude_030_a_prompts_commit_is_withheld_from_a_deck_that_does_not_serve_receipts() {
+        use crate::inbox_oneshot::Pinned;
+        use crate::inbox_receipt::{AttemptCaps, Cap, RecordKey, RecordStage, Spool};
+        let state = crate::test_temp::tempdir().unwrap();
+        let spool = Spool::start(state.path()).unwrap();
+        let (pane, agent) = ("2", "agent-a");
+        let deck_side = spool
+            .generation(
+                &crate::inbox::encode_token(pane),
+                &crate::inbox::encode_token(agent),
+            )
+            .unwrap();
+        let caps = AttemptCaps {
+            handed: Cap::random().unwrap(),
+            commit: Cap::random().unwrap(),
+        };
+        deck_side.write_caps(ID, 1, 1, &caps).unwrap();
+        let rec = spool
+            .instance_path()
+            .join(crate::inbox::encode_token(pane))
+            .join(crate::inbox::encode_token(agent))
+            .join("rec");
+        let pinned = Pinned::Open(
+            crate::inbox_oneshot::open_pinned(&spool.instance_path(), pane, agent).unwrap(),
+        );
+        let attempt = crate::event::InboxAttemptRef {
+            id: ID.to_string(),
+            a: 1,
+            e: 1,
+        };
+        let who = CommitFor {
+            pane_id: pane,
+            agent_id: Some(agent),
+            token: "token-1",
+        };
+        let key = RecordKey {
+            msg: ID.to_string(),
+            a: 1,
+            e: 1,
+            stage: RecordStage::Committed,
+        };
+        let wait = std::time::Duration::from_millis(300);
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let (path, older) =
+            crate::inbox_oneshot::tests::stand_in_deck(dir.path(), vec![Some(Vec::new())]);
+        assert_eq!(
+            commit_attempts(&path, who, vec![attempt.clone()], &pinned, wait),
+            Committed::Withheld
+        );
+        let seen = older.join().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].len(), 1, "only the question: {seen:?}");
+        let question: serde_json::Value = serde_json::from_str(&seen[0][0]).unwrap();
+        assert_eq!(question["message_type"], "inbox_receipts");
+        assert!(!holds_record(&rec, &key), "no commit receipt was published");
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let (path, newer) = crate::inbox_oneshot::tests::stand_in_deck(
+            dir.path(),
+            vec![Some(vec![
+                r#"{"one_shot_receipts":1}"#.to_string(),
+                "{}".to_string(),
+            ])],
+        );
+        assert_eq!(
+            commit_attempts(&path, who, vec![attempt.clone()], &pinned, wait),
+            Committed::Sent
+        );
+        let seen = newer.join().unwrap();
+        assert_eq!(seen[0].len(), 2, "{seen:?}");
+        let committed: serde_json::Value = serde_json::from_str(&seen[0][1]).unwrap();
+        assert_eq!(committed["message_type"], "inbox_committed");
+        assert_eq!(
+            committed["attempts"],
+            serde_json::json!([{"id": ID, "a": 1, "e": 1}])
+        );
+        assert!(holds_record(&rec, &key), "the commit receipt was published");
+    }
+
+    /// Whether the generation's spool holds `key`'s record, read without
+    /// writing anything.
+    #[cfg(unix)]
+    fn holds_record(rec: &std::path::Path, key: &crate::inbox_receipt::RecordKey) -> bool {
+        rec.join(key.file_name()).exists()
     }
 }

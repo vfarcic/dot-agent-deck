@@ -370,6 +370,23 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// unversioned hook socket is declared separately, as
 /// `1666-inbox-replaces-typed-delivery` in [`CONTRACT_BREAKS`].
 ///
+/// **11 → 12 (PRD #1666 part 2).** 11 shipped in `v0.47.0`, so part 2 cannot
+/// ride it. The bump is for one shape change on the attach wire: the agent
+/// card's integration notice gained the value `hooks_too_old`
+/// ([`crate::inbox_display::IntegrationNotice::HooksTooOld`]), a new value of
+/// a serialized enum that a 0.47.0 reader has no fallback for. It rides the
+/// `inbox` and `inbox-handover` broadcasts and the inbox summary on an agent
+/// record, so a 0.47.0 client would fail to decode the very event that tells
+/// it how to recover. The meanings that moved behind the unversioned hook
+/// socket are declared separately in [`CONTRACT_BREAKS`]:
+/// `1666-claude-one-shot-receipts` and
+/// `1666-explicit-ack-requires-handed-attempt`. The hook socket's own skew,
+/// a newer hook against an older daemon, is not something this number can
+/// refuse — a one-shot CLI runs no handshake — so it is closed on that socket:
+/// a one-shot asks `inbox_receipts` and sends its request only to a daemon
+/// that answers [`crate::inbox_hub::ONE_SHOT_RECEIPTS`], on verbs an older
+/// daemon cannot decode.
+///
 /// **PRD #1105 narrows the bump rule the paragraphs above restate, and
 /// contributes no bump of its own for [`AttachRequest::FocusGained`].** The 10
 /// is issue #1049's, for `StopDaemon`. `focus-gained` ships under that number
@@ -593,7 +610,7 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// deliberately not on. The bump is what makes a skew *nameable* — the number
 /// the handshake reports and `daemon hello` prints — and, at the two sites
 /// above, what makes it *refused*.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The attach-protocol version the daemon's `Hello` handler advertises as
 /// [`AttachResponse::server_version`]. [`PROTOCOL_VERSION`] in every shipped
@@ -1519,6 +1536,24 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // extension predate the inbox gets the doorbell instead of the typed task. Listed beside the bump for #1049's
     // reason: `changelog.d/1666.breaking.md` exists.
     "1666-inbox-replaces-typed-delivery",
+    // PRD #1666 part 2, beside the 11 -> 12 bump. Claude Code's once-waiter
+    // and prompt hook become one-shot receivers on receipts: each block is
+    // handed over on an attempt the deck issued, the waiter's block is
+    // committed by the exact attempt a later prompt carries, a hook's by
+    // writing it whole, and a lost one repeats marked or turns uncertain
+    // instead of being re-sent after the ack-wait. The receiver floor refuses
+    // an older hook (`hooks_too_old`), and a newer hook asks the daemon first
+    // and takes nothing from one that does not serve receipts. An older
+    // prompt hook beside a newer waiter still settles by the broad `ack <id>`,
+    // an accepted downgrade. A new entry rather than the one above, because
+    // both builds already carry that one.
+    "1666-claude-one-shot-receipts",
+    // PRD #1666 part 2. An explicit `ack <id>` used to settle the message's
+    // newest attempt; it now settles the newest attempt that may have reached
+    // the agent, and is refused (`unknown`) when every attempt is positively
+    // not handed. Same request, same reply type; what moved is which acks
+    // settle, for OpenCode and Pi as well as Claude Code.
+    "1666-explicit-ack-requires-handed-attempt",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.

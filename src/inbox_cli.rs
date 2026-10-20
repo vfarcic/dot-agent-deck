@@ -109,9 +109,12 @@ pub const STREAM_NOT_IN_DECK_EXIT: u8 = 3;
 ///
 /// **Once** (Claude Code's `asyncRewake` hook): blocks until the deck hands
 /// over messages, then writes their blocks to stderr and exits 2, which is what
-/// wakes Claude. Everything else — run outside a deck, no daemon, an older
-/// daemon, superseded by a newer waiter, refused — exits 0 with no output, so a
-/// global hook never disturbs a session the deck does not manage.
+/// wakes Claude. A daemon that does not confirm it serves one-shot receipts —
+/// one older than this binary — is handed nothing: the waiter says so on
+/// stderr ([`crate::inbox_oneshot::RECEIPTS_UNSUPPORTED`]) and exits 1.
+/// Everything else — run outside a deck, no daemon, superseded by a newer
+/// waiter, refused — exits 0 with no output, so a global hook never disturbs
+/// a session the deck does not manage.
 ///
 /// **Stream** (the OpenCode plugin, the Pi extension): prints each handed-over
 /// message as one JSON line on stdout and forwards the component's receipt
@@ -147,7 +150,20 @@ pub fn wait(agent: &str, stream: bool, receipt: Receipt) -> ExitCode {
         return not_in_deck;
     }
     let session = if stream { None } else { read_hook_session() };
-    let request = DaemonMessage::InboxWait(InboxWaitRequest {
+    // PRD #1666 part 2: the once-waiter asks the deck whether it serves
+    // receipts, on the connection its wait then takes.
+    let question = if stream {
+        None
+    } else {
+        identity.token.as_deref().and_then(|token| {
+            crate::inbox_oneshot::receipts_question(
+                &identity.pane_id,
+                identity.agent_id.as_deref(),
+                token,
+            )
+        })
+    };
+    let wait_request = InboxWaitRequest {
         pane_id: identity.pane_id,
         agent_id: identity.agent_id,
         token: identity.token,
@@ -168,14 +184,22 @@ pub fn wait(agent: &str, stream: bool, receipt: Receipt) -> ExitCode {
         } else {
             crate::inbox_oneshot::declared_hook_integration()
         },
-    });
+    };
+    // A waiter that declares no integration stands in for an older
+    // dot-agent-deck, and speaks its legacy `inbox_wait` unasked.
+    let receipts = !stream && wait_request.hook_integration.is_some();
+    let request = if receipts {
+        DaemonMessage::InboxReceiptWait(wait_request)
+    } else {
+        DaemonMessage::InboxWait(wait_request)
+    };
     let Ok(json) = serde_json::to_string(&request) else {
         return ExitCode::SUCCESS;
     };
     if stream {
         crate::inbox_watcher::wait_receipt_stream(&json)
     } else {
-        wait_once(&json)
+        wait_once(&json, question.as_deref().filter(|_| receipts))
     }
 }
 
@@ -248,13 +272,35 @@ fn parent_of(_pid: u32) -> Option<u32> {
 /// The commit comes later, from the prompt hook that sees the block in
 /// Claude's notification. Exits 2 when anything reached stderr, 1 when
 /// nothing of the batch did, and 0, silent, when no batch came.
+///
+/// With `question`, it first asks the deck whether it serves receipts, and
+/// sends `json` only on a deck that says so; one that does not is sent
+/// nothing that could take mail, and the waiter says so and exits 1
+/// ([`crate::inbox_oneshot::Connection::open_receipts`]). Without it, it is
+/// a stand-in for an older waiter and sends `json` unasked.
 #[cfg(unix)]
-fn wait_once(json: &str) -> ExitCode {
-    use crate::inbox_oneshot::{Connection, OneShotBatch, Piece, Pinned, Receiver};
+fn wait_once(json: &str, question: Option<&str>) -> ExitCode {
+    use crate::inbox_oneshot::{Connection, OneShotBatch, Opened, Piece, Pinned, Receiver};
     exit_when_orphaned();
     let path = crate::endpoint_resolve::client_socket_path();
-    let Ok(mut connection) = Connection::open(&path, json) else {
-        return ExitCode::SUCCESS;
+    let mut connection = match question {
+        Some(question) => match Connection::open_receipts(&path, question) {
+            Opened::Ready(mut connection) => {
+                if connection.send(json).is_err() {
+                    return ExitCode::SUCCESS;
+                }
+                connection
+            }
+            Opened::Unsupported => {
+                crate::inbox_oneshot::report_unsupported();
+                return ExitCode::FAILURE;
+            }
+            Opened::Refused(_) | Opened::Unreachable => return ExitCode::SUCCESS,
+        },
+        None => match Connection::open(&path, json) {
+            Ok(connection) => connection,
+            Err(_) => return ExitCode::SUCCESS,
+        },
     };
     let mut grant_ttl = crate::inbox::DEFAULT_ACK_WAIT;
     let messages = loop {
@@ -333,7 +379,7 @@ fn raw_stderr() -> std::io::Result<std::fs::File> {
 /// (`hook::deck_prompt_submit`), so nothing here shows a message body
 /// reaching Claude on Windows; it is untested until Windows ships.
 #[cfg(not(unix))]
-fn wait_once(_json: &str) -> ExitCode {
+fn wait_once(_json: &str, _question: Option<&str>) -> ExitCode {
     ExitCode::SUCCESS
 }
 

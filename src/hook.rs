@@ -264,6 +264,13 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         Some(announce) => send_lines_and_drain(&format!("{announce}\n{json}")),
         None => send_to_socket(&json),
     };
+    // PRD #1666 part 2: a daemon that did not confirm it serves receipts was
+    // handed nothing, and the hook said so on stderr. Claude Code shows the
+    // stderr of a hook that exits non-zero (other than 2) and goes on with the
+    // prompt.
+    if crate::inbox_oneshot::reported_unsupported() {
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 

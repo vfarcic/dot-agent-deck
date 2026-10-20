@@ -123,6 +123,16 @@ pub const ADAPTER_INTEGRATION: u32 = 2;
 /// and is refused before anything is issued to it.
 pub const HOOK_INTEGRATION: u32 = 1;
 
+/// PRD #1666 part 2 (wire audit W03–W05): the one-shot receipt support this
+/// daemon serves — `inbox_receipt_wait`, `inbox_receipt_fetch` and
+/// `inbox_committed` — answered to every `inbox_receipts` question. It is the
+/// daemon's side of [`HOOK_INTEGRATION`]: that floor refuses an older hook
+/// before this daemon issues it anything, and this one lets a newer hook
+/// refuse an older daemon before it sends anything that could take mail or
+/// commit it. A one-shot of this binary goes ahead only on a daemon that
+/// answers at least this ([`crate::inbox_oneshot::Connection::open_receipts`]).
+pub const ONE_SHOT_RECEIPTS: u32 = 1;
+
 #[path = "inbox_engine.rs"]
 mod engine;
 #[cfg(test)]

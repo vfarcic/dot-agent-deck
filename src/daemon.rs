@@ -4820,6 +4820,15 @@ const INBOX_NOT_AGENT_PROCESS: &str = "inbox_not_agent_process";
 const INBOX_NOT_AGENT_PROCESS_MESSAGE: &str = "this process is not the pane's agent or one of its processes, so it may not receive \
      the agent's inbox";
 
+/// PRD #1666 part 2: the refusal code of a receipt verb asking for what is
+/// not served on receipts — a wait other than Claude's once-waiter, or a
+/// fetch a stream bound or the CLI made (H4 moves the CLI).
+const INBOX_RECEIPT_UNSUPPORTED: &str = "unsupported";
+
+/// [`INBOX_RECEIPT_UNSUPPORTED`]'s message.
+const INBOX_RECEIPT_UNSUPPORTED_MESSAGE: &str =
+    "this receiver is not served on one-shot receipts, so nothing was handed to it";
+
 /// TEST knob, honoured only in a build with the `e2e` feature: inbox
 /// components may connect from outside the pane's agent process tree, as the
 /// synthetic lane-1 tests that drive the inbox wire from the test process do.
@@ -6165,11 +6174,56 @@ async fn run_hook_loop_with_limits(
                                 provenance,
                                 crate::hook_provenance::Provenance::Unattested
                             );
+                            // PRD #1666 part 2: the one-shot wait and fetch on
+                            // receipts have verbs of their own, which an older
+                            // daemon cannot decode; past the gate they share
+                            // the legacy verbs' arms.
+                            let receipt_verb = matches!(
+                                msg,
+                                DaemonMessage::InboxReceiptWait(_)
+                                    | DaemonMessage::InboxReceiptFetch(_)
+                            );
                             match msg {
-                                DaemonMessage::InboxWait(req) => {
+                                DaemonMessage::InboxReceipts(_) => {
+                                    if attested_agent.is_none() {
+                                        continue;
+                                    }
+                                    let reply = crate::event::InboxWaitReply {
+                                        one_shot_receipts: Some(
+                                            crate::inbox_hub::ONE_SHOT_RECEIPTS,
+                                        ),
+                                        ..crate::event::InboxWaitReply::default()
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::InboxWait(req)
+                                | DaemonMessage::InboxReceiptWait(req) => {
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
+                                    // Only Claude's once-waiter waits on
+                                    // receipts; anything else asking to is
+                                    // handed nothing.
+                                    if receipt_verb
+                                        && !(req.mode == crate::event::InboxWaitMode::Once
+                                            && req.component
+                                                == crate::event::InboxComponent::ClaudeWaiter)
+                                    {
+                                        let reply = crate::event::InboxWaitReply::refused(
+                                            INBOX_RECEIPT_UNSUPPORTED,
+                                            INBOX_RECEIPT_UNSUPPORTED_MESSAGE,
+                                        );
+                                        if let Ok(json) = serde_json::to_string(&reply) {
+                                            let line = format!("{json}\n");
+                                            let _ = write_half.write_all(line.as_bytes()).await;
+                                            let _ = write_half.flush().await;
+                                        }
+                                        continue;
+                                    }
                                     let hub = Arc::clone(pty_registry.inbox());
                                     if pty_registry.pane_current_agent_id(&req.pane_id).as_deref()
                                         != Some(agent_id.as_str())
@@ -6311,7 +6365,8 @@ async fn run_hook_loop_with_limits(
                                         let _ = write_half.flush().await;
                                     }
                                 }
-                                DaemonMessage::InboxFetch(req) => {
+                                DaemonMessage::InboxFetch(req)
+                                | DaemonMessage::InboxReceiptFetch(req) => {
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
@@ -6319,16 +6374,40 @@ async fn run_hook_loop_with_limits(
                                     // a one-shot receiver of its own, held on
                                     // this connection for its controls; below
                                     // the integration floor nothing is issued
-                                    // ([`crate::inbox_hub::serve_hook`]).
-                                    let route = route_hook_fetch(
-                                        &pty_registry,
-                                        &req,
-                                        &agent_id,
-                                        &ingest_order,
-                                        ingest.seq(),
-                                        HOOK_ROUTE_WAIT,
-                                    )
-                                    .await;
+                                    // ([`crate::inbox_hub::serve_hook`]). On the
+                                    // receipt verb it says so itself; a legacy
+                                    // fetch is routed. Until H4, only a hook's
+                                    // fetch that no stream bound is served on
+                                    // receipts.
+                                    let route = if receipt_verb {
+                                        if req.rx.is_some()
+                                            || req.consumer
+                                                == crate::event::InboxFetchConsumer::Cli
+                                        {
+                                            let reply = crate::event::InboxWaitReply::refused(
+                                                INBOX_RECEIPT_UNSUPPORTED,
+                                                INBOX_RECEIPT_UNSUPPORTED_MESSAGE,
+                                            );
+                                            if let Ok(json) = serde_json::to_string(&reply) {
+                                                let line = format!("{json}\n");
+                                                let _ =
+                                                    write_half.write_all(line.as_bytes()).await;
+                                                let _ = write_half.flush().await;
+                                            }
+                                            continue;
+                                        }
+                                        HookRoute::OneShot
+                                    } else {
+                                        route_hook_fetch(
+                                            &pty_registry,
+                                            &req,
+                                            &agent_id,
+                                            &ingest_order,
+                                            ingest.seq(),
+                                            HOOK_ROUTE_WAIT,
+                                        )
+                                        .await
+                                    };
                                     if route == HookRoute::OneShot {
                                         if !mail_taker_admitted(
                                             &pty_registry,

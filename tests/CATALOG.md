@@ -8461,16 +8461,17 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 - **Asserts:** missing pane identity and absent hook socket each cause exit zero with empty stdout and stderr.
 - **Platform coverage:** mac+linux.
 
-##### inbox/cli/004 — Non-delivery replies and old-daemon EOF never wake Claude.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real CLI against a scripted hook endpoint.
+##### inbox/cli/004 — Non-delivery replies and EOF never wake Claude.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), real CLI against a scripted hook endpoint that answers the receipts question.
 - **Agent:** none.
-- **Asserts:** Superseded, NotInDeck, Refused, invalid JSON and EOF each produce exit zero and empty output; request carries Once mode and the hook's session source.
+- **Asserts:** after the deck says it serves receipts, Superseded, NotInDeck, Refused, invalid JSON and EOF each produce exit zero and empty output; the waiter asks `inbox_receipts` first, and its wait is `inbox_receipt_wait` with Once mode and the hook's session source.
+- **Does not assert:** a deck that does not answer the question, which refuses visibly (inbox/claude/028).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/cli/005 — A doorbell fetch names its message in the one request.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real `inbox fetch --json --doorbell <id>` CLI and the real `hook --agent claude-code` for a doorbell-line prompt, each against a synthetic hook endpoint that records every request and lists the message as queued.
 - **Agent:** none (`cat` stand-in supplies the pane identity).
-- **Asserts:** the CLI sends exactly one `inbox_fetch`, naming the doorbell's message and not acknowledging; the hook sends one `inbox_fetch` naming it with `hook_integration: 1` and no `inbox_list`, and prints the fetched block once its `may` is granted.
+- **Asserts:** the CLI sends exactly one `inbox_fetch`, naming the doorbell's message and not acknowledging; the hook asks `inbox_receipts`, then sends one `inbox_receipt_fetch` naming it with `hook_integration: 1`, no legacy `inbox_fetch` and no `inbox_list`, and prints the fetched block once its `may` is granted.
 - **Platform coverage:** mac+linux.
 #### Fixed doorbell
 
@@ -9465,6 +9466,41 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** with ten connections that send nothing, no more than two are ever pending a first message, all ten are accepted in turn as the idle window reclaims each, and none is left pending (R2-fix3 U2).
 - **Does not assert:** a fetch held while the pool is full, or the production pool size.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/028 — Newer Claude hooks take nothing from an older daemon.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), the real waiter and prompt-hook CLI children against a stand-in 0.47.0 hook endpoint (hands its one message to the first legacy `inbox_wait`/`inbox_fetch`, answers nothing to a verb it cannot decode), the e2e-only `DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS` knob.
+- **Agent:** none (no credential).
+- **Asserts:** the once-waiter, the prompt hook answering a doorbell and the prompt hook submitting a waiter's whole block each send `inbox_receipts` and nothing that could take or commit mail (no `inbox_wait`, `inbox_fetch`, receipt verb, `inbox_committed` or `ack`), print nothing of the message, exit 1 and say on stderr that the daemon did not confirm it serves receipts, naming `hooks install --agent claude-code`; a legacy `inbox fetch` afterwards still takes and prints the message (wire audit W03–W06).
+- **Does not assert:** a real 0.47.0 binary, or the desktop's or TUI's attach refusal (inbox/claude/032).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/029 — The receipts gate decides from its own connection's answer.
+- **Layer:** Fast (`src/inbox_oneshot.rs`), `Connection::open_receipts_within` against a stand-in socket, one connection per answer.
+- **Agent:** none.
+- **Asserts:** only an answer naming `one_shot_receipts >= ONE_SHOT_RECEIPTS` on that same connection (also after a keepalive) opens it; no answer within the wait, a legacy batch, a capability of 0 and a hang-up are `Unsupported`, a refusal is `Refused`, a missing socket `Unreachable`; a connection answered after one that was is not excused by it; the question is the only line any connection is sent.
+- **Does not assert:** the callers' handling of each outcome (inbox/claude/028, /030).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/030 — A prompt's exact commit is withheld from a deck that does not serve receipts.
+- **Layer:** Fast (`src/inbox_prompt.rs`), `commit_attempts` over a real generation spool with the attempt's caps file, against stand-in sockets.
+- **Agent:** none.
+- **Asserts:** against a deck that answers the receipts question with nothing it returns `Withheld`, publishes no commit receipt and sends only the question; against one that answers the capability it publishes the receipt and sends the exact attempt as `inbox_committed` on the connection that asked (wire audit W05).
+- **Does not assert:** the daemon applying the commit (inbox/claude/016, /023).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/031 — The deck answers its receipt support and refuses what the receipt verbs do not serve.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), raw requests from a process inside a scripted Claude parent's tree to the real daemon.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** `inbox_receipts` is answered with `one_shot_receipts` 1; `inbox_receipt_wait` from a Codex component or for a stream, and `inbox_receipt_fetch` from the CLI or bound to a stream, are each refused `unsupported` with no messages, and a task queued beforehand stays queued.
+- **Does not assert:** the served paths, which the real waiter and hook take in inbox/claude/016–/020.
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/032 — A 0.47.0 reader of hooks_too_old is refused at the handshake.
+- **Layer:** Fast (`src/build_version_handshake.rs`), the TUI's `ProtocolCheck` and a copy of the integration-notice enum as 0.47.0 shipped it.
+- **Agent:** none.
+- **Asserts:** the 0.47.0 enum cannot decode `hooks_too_old`; `PROTOCOL_VERSION` is above 11, a daemon at 11 is `Skewed` and one at this build's version `Compatible`.
+- **Does not assert:** the desktop's `classify_handshake` (same exact-equality rule, pinned in `desktop/src-tauri`), or a real 0.47.0 binary.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]

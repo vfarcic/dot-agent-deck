@@ -754,13 +754,101 @@ pub const ENV_TEST_HOOK_INTEGRATION: &str = "DOT_AGENT_DECK_INBOX_TEST_HOOK_INTE
 /// byte, as a hook killed between its grant and its print would.
 pub const ENV_TEST_EXIT_AFTER_GRANT: &str = "DOT_AGENT_DECK_INBOX_TEST_EXIT_AFTER_GRANT";
 
-/// The one-shot integration this process declares (part 2 §2.7).
+/// The one-shot integration this process declares (part 2 §2.7). A process
+/// that declares none stands in for an older dot-agent-deck, and speaks the
+/// legacy verbs as one would: it asks no `inbox_receipts` question and sends
+/// `inbox_wait` or `inbox_fetch`. Only [`ENV_TEST_HOOK_INTEGRATION`] makes it
+/// `None`.
 pub fn declared_hook_integration() -> Option<u32> {
     #[cfg(feature = "e2e")]
     if let Ok(raw) = std::env::var(ENV_TEST_HOOK_INTEGRATION) {
         return raw.trim().parse().ok();
     }
     Some(crate::inbox_hub::HOOK_INTEGRATION)
+}
+
+/// How long a one-shot waits for the deck's answer to its `inbox_receipts`
+/// question before it takes the deck for one that does not serve receipts.
+/// An older daemon answers nothing at all (it cannot decode the question),
+/// so this is what that pairing costs each one-shot.
+pub const RECEIPTS_ANSWER_WAIT: Duration = Duration::from_secs(5);
+
+/// TEST knob, read only by a build with the `e2e` feature:
+/// [`RECEIPTS_ANSWER_WAIT`] in milliseconds, so a test of an older daemon
+/// does not wait the whole of it.
+pub const ENV_TEST_RECEIPTS_WAIT_MS: &str = "DOT_AGENT_DECK_INBOX_TEST_RECEIPTS_WAIT_MS";
+
+/// [`RECEIPTS_ANSWER_WAIT`], or what [`ENV_TEST_RECEIPTS_WAIT_MS`] sets.
+pub fn receipts_answer_wait() -> Duration {
+    #[cfg(feature = "e2e")]
+    if let Some(ms) = std::env::var(ENV_TEST_RECEIPTS_WAIT_MS)
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    RECEIPTS_ANSWER_WAIT
+}
+
+/// What a one-shot says when the deck did not confirm that it serves
+/// receipts ([`Opened::Unsupported`]): nothing was taken, and how to make the
+/// two agree. `hooks install` writes the waiter and the prompt hook together,
+/// from the one binary it runs as.
+pub const RECEIPTS_UNSUPPORTED: &str = "dot-agent-deck: the deck daemon did not confirm that it serves message receipts, so no message was taken. It is most likely older than the dot-agent-deck this agent's hooks run. Restart the deck daemon on that newer build, or run `dot-agent-deck hooks install --agent claude-code` with the build the daemon runs, which rewrites the waiter and the prompt hook together; then restart the agent.";
+
+static REPORTED_UNSUPPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Say [`RECEIPTS_UNSUPPORTED`] on stderr, once per process, and remember it,
+/// so the hook exits with the status that shows its stderr to the user
+/// ([`reported_unsupported`]).
+pub fn report_unsupported() {
+    if !REPORTED_UNSUPPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("{RECEIPTS_UNSUPPORTED}");
+    }
+}
+
+/// Whether this process said [`RECEIPTS_UNSUPPORTED`].
+pub fn reported_unsupported() -> bool {
+    REPORTED_UNSUPPORTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether `reply`, the deck's answer to an `inbox_receipts` question, says
+/// it serves the one-shot receipts this binary speaks.
+pub fn serves_receipts(reply: &InboxWaitReply) -> bool {
+    reply
+        .one_shot_receipts
+        .is_some_and(|served| served >= crate::inbox_hub::ONE_SHOT_RECEIPTS)
+}
+
+/// The `inbox_receipts` question for the agent `agent_id` in `pane_id`.
+pub fn receipts_question(pane_id: &str, agent_id: Option<&str>, token: &str) -> Option<String> {
+    serde_json::to_string(&crate::event::DaemonMessage::InboxReceipts(
+        crate::event::InboxReceiptsRequest {
+            pane_id: pane_id.to_string(),
+            agent_id: agent_id.map(str::to_string),
+            token: Some(token.to_string()),
+        },
+    ))
+    .ok()
+}
+
+/// What the deck said when a one-shot asked whether it serves receipts
+/// ([`Connection::open_receipts`]).
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum Opened {
+    /// It serves them: the connection is ready for the one-shot's request.
+    Ready(Connection),
+    /// It answered with a refusal (of the token, the pane or the agent): a
+    /// deck that serves receipts, and not to this caller.
+    Refused(Box<InboxWaitReply>),
+    /// It did not say it serves them: no answer in time, the connection
+    /// ended, or an answer without [`crate::inbox_hub::ONE_SHOT_RECEIPTS`].
+    /// Nothing that could take mail or commit it was sent.
+    Unsupported,
+    /// There is no deck to connect to.
+    Unreachable,
 }
 
 /// The most of one line from the daemon a one-shot reads.
@@ -773,6 +861,7 @@ pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// for good, and nothing after it is read. So [`Connection::arrivals`] is a
 /// non-blocking [`Incoming`] that never splits a line.
 #[cfg(unix)]
+#[derive(Debug)]
 pub struct Connection {
     stream: std::os::unix::net::UnixStream,
     lines: std::sync::mpsc::Receiver<Option<InboxWaitReply>>,
@@ -790,6 +879,41 @@ impl Connection {
         stream.write_all(format!("{request}\n").as_bytes())?;
         stream.flush()?;
         Connection::over(stream, MAX_LINE_BYTES)
+    }
+
+    /// PRD #1666 part 2 (wire audit W03–W05): connect to the deck at `path`,
+    /// ask `question` (an `inbox_receipts` line, [`receipts_question`]) and
+    /// read the answer, within [`RECEIPTS_ANSWER_WAIT`]. Every one-shot that
+    /// could take mail or commit it asks first, on the connection that then
+    /// carries its request, and decides from this answer alone, never from
+    /// an earlier one: the deck that answers is the one the request reaches.
+    /// An older daemon cannot decode the question and answers nothing, so it
+    /// is never sent the request.
+    pub fn open_receipts(path: &Path, question: &str) -> Opened {
+        Connection::open_receipts_within(path, question, receipts_answer_wait())
+    }
+
+    /// [`Connection::open_receipts`], waiting `wait` for the answer.
+    pub fn open_receipts_within(path: &Path, question: &str, wait: Duration) -> Opened {
+        let Ok(mut connection) = Connection::open(path, question) else {
+            return Opened::Unreachable;
+        };
+        let deadline = Instant::now() + wait;
+        loop {
+            let Some(reply) = connection.next(Some(deadline)) else {
+                return Opened::Unsupported;
+            };
+            if reply.keepalive {
+                continue;
+            }
+            return if reply.refused.is_some() {
+                Opened::Refused(Box::new(reply))
+            } else if serves_receipts(&reply) {
+                Opened::Ready(connection)
+            } else {
+                Opened::Unsupported
+            };
+        }
     }
 
     /// The connection on `stream`, reading lines of at most `max` bytes.
@@ -915,6 +1039,15 @@ impl Connection {
     }
 }
 
+/// A connection given up shuts its socket, so its reader thread ends and the
+/// deck sees it close rather than wait out its idle window.
+#[cfg(unix)]
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// See [`Connection::arrivals`].
 #[cfg(unix)]
 pub struct Arrivals<'a>(&'a mut Connection);
@@ -957,7 +1090,7 @@ pub fn open_pinned(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
 
     use spec::spec;
@@ -1828,5 +1961,123 @@ mod tests {
             classify_frame(frame.as_bytes(), Some(cut.len()), false),
             Output::NotHanded
         );
+    }
+
+    /// A stand-in deck in `dir`: its `n`th connection is answered, once its
+    /// first line is in, with `answers[n]` (`None`: it hangs up instead),
+    /// and every line each connection sends is recorded until its peer
+    /// closes it.
+    #[cfg(unix)]
+    pub(crate) fn stand_in_deck(
+        dir: &Path,
+        answers: Vec<Option<Vec<String>>>,
+    ) -> (
+        std::path::PathBuf,
+        std::thread::JoinHandle<Vec<Vec<String>>>,
+    ) {
+        use std::io::BufRead;
+        let path = dir.join("stand-in.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let serve = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for answer in answers {
+                let (socket, _) = listener.accept().unwrap();
+                let mut writer = socket.try_clone().unwrap();
+                let mut lines = io::BufReader::new(socket).lines();
+                let mut got = vec![lines.next().unwrap().unwrap()];
+                match answer {
+                    None => {
+                        let _ = writer.shutdown(std::net::Shutdown::Both);
+                    }
+                    Some(answer) => {
+                        for line in answer {
+                            writeln!(writer, "{line}").unwrap();
+                        }
+                        got.extend(lines.map_while(Result::ok));
+                    }
+                }
+                seen.push(got);
+            }
+            seen
+        });
+        (path, serve)
+    }
+
+    /// Scenario: Point a one-shot's receipts question at a stand-in deck
+    /// seven times, one connection each, answered in turn: that it serves
+    /// receipts; nothing, as an older daemon answers a verb it cannot decode;
+    /// a legacy batch; a capability of 0; a keepalive and then the
+    /// capability; a refusal; and a hang-up. Only the two answers that name
+    /// the capability on their own connection open it, the second
+    /// connection's silence is not excused by the first's answer, and the
+    /// question is all any connection is sent.
+    #[cfg(unix)]
+    #[spec("inbox/claude/029")]
+    #[test]
+    fn claude_029_the_receipts_gate_decides_from_its_own_connections_answer() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let mut legacy = handout(ID1, 1, 1, None);
+        legacy.attempt = None;
+        let legacy = serde_json::to_string(&InboxWaitReply::messages(vec![legacy])).unwrap();
+        let answers = vec![
+            Some(vec![r#"{"one_shot_receipts":1}"#.to_string()]),
+            Some(Vec::new()),
+            Some(vec![legacy]),
+            Some(vec![r#"{"one_shot_receipts":0}"#.to_string()]),
+            Some(vec![
+                r#"{"keepalive":true}"#.to_string(),
+                r#"{"one_shot_receipts":1}"#.to_string(),
+            ]),
+            Some(vec![
+                r#"{"refused":"unknown_token","error":"no such token"}"#.to_string(),
+            ]),
+            None,
+        ];
+        let rounds = answers.len();
+        let (path, deck) = stand_in_deck(dir.path(), answers);
+        let question = receipts_question(PANE, Some(AGENT), "token-1").unwrap();
+        let wait = Duration::from_millis(300);
+        let mut outcomes = Vec::new();
+        for _ in 0..rounds {
+            let started = Instant::now();
+            let opened = Connection::open_receipts_within(&path, &question, wait);
+            assert!(
+                started.elapsed() < wait + Duration::from_secs(2),
+                "the answer is waited for no longer than the wait"
+            );
+            outcomes.push(match opened {
+                Opened::Ready(_) => "ready",
+                Opened::Refused(_) => "refused",
+                Opened::Unsupported => "unsupported",
+                Opened::Unreachable => "unreachable",
+            });
+        }
+        assert_eq!(
+            outcomes,
+            [
+                "ready",
+                "unsupported",
+                "unsupported",
+                "unsupported",
+                "ready",
+                "refused",
+                "unsupported"
+            ]
+        );
+        let seen = deck.join().unwrap();
+        assert_eq!(seen.len(), rounds);
+        for lines in seen {
+            assert_eq!(
+                lines,
+                std::slice::from_ref(&question),
+                "only the question is sent"
+            );
+        }
+        let question: serde_json::Value = serde_json::from_str(&question).unwrap();
+        assert_eq!(question["message_type"], "inbox_receipts");
+        assert!(matches!(
+            Connection::open_receipts_within(&dir.path().join("absent.sock"), "{}", wait),
+            Opened::Unreachable
+        ));
     }
 }

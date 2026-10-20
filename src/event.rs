@@ -1743,6 +1743,25 @@ pub enum DaemonMessage {
     /// each one's `committed` receipt. Answered with an [`InboxWaitReply`].
     #[serde(rename = "inbox_committed")]
     InboxCommitted(InboxCommittedRequest),
+    /// PRD #1666 part 2 (wire audit W03–W05): a one-shot receiver asks whether
+    /// this daemon serves one-shot receipts, before it sends anything that
+    /// could take mail or commit it. Answered with an [`InboxWaitReply`]
+    /// carrying [`InboxWaitReply::one_shot_receipts`], on the same connection,
+    /// which then carries the receiver's request. An older daemon decodes it
+    /// as neither a `DaemonMessage` nor an [`AgentEvent`] and answers nothing,
+    /// so the receiver takes no mail ([`crate::inbox_oneshot::Connection::open_receipts`]).
+    #[serde(rename = "inbox_receipts")]
+    InboxReceipts(InboxReceiptsRequest),
+    /// PRD #1666 part 2: Claude's once-waiter on receipts. The request is an
+    /// `inbox_wait`'s, on a verb of its own that a 0.47.0 daemon cannot
+    /// decode, so no daemon that does not serve receipts can hand it mail on
+    /// legacy terms.
+    #[serde(rename = "inbox_receipt_wait")]
+    InboxReceiptWait(InboxWaitRequest),
+    /// PRD #1666 part 2: a hook's fetch as a one-shot receiver on receipts,
+    /// on a verb of its own for [`Self::InboxReceiptWait`]'s reason.
+    #[serde(rename = "inbox_receipt_fetch")]
+    InboxReceiptFetch(InboxFetchRequest),
     /// PRD #1666: list the caller's inbox (and with `all`, an orchestrator's
     /// scope). Answered with an [`InboxListReply`].
     #[serde(rename = "inbox_list")]
@@ -1801,6 +1820,9 @@ impl DaemonMessage {
             DaemonMessage::InboxAnnounce(r) => &r.pane_id,
             DaemonMessage::InboxFetch(r) => &r.pane_id,
             DaemonMessage::InboxCommitted(r) => &r.pane_id,
+            DaemonMessage::InboxReceipts(r) => &r.pane_id,
+            DaemonMessage::InboxReceiptWait(r) => &r.pane_id,
+            DaemonMessage::InboxReceiptFetch(r) => &r.pane_id,
             DaemonMessage::InboxList(r) => &r.pane_id,
             DaemonMessage::InboxPublish(r) => &r.pane_id,
             DaemonMessage::InboxOffer(r) => &r.pane_id,
@@ -1825,6 +1847,9 @@ impl DaemonMessage {
             DaemonMessage::InboxAnnounce(r) => r.token.as_deref(),
             DaemonMessage::InboxFetch(r) => r.token.as_deref(),
             DaemonMessage::InboxCommitted(r) => r.token.as_deref(),
+            DaemonMessage::InboxReceipts(r) => r.token.as_deref(),
+            DaemonMessage::InboxReceiptWait(r) => r.token.as_deref(),
+            DaemonMessage::InboxReceiptFetch(r) => r.token.as_deref(),
             DaemonMessage::InboxList(r) => r.token.as_deref(),
             DaemonMessage::InboxPublish(r) => r.token.as_deref(),
             DaemonMessage::InboxOffer(r) => r.token.as_deref(),
@@ -1843,6 +1868,9 @@ impl DaemonMessage {
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
             | DaemonMessage::InboxCommitted(_)
+            | DaemonMessage::InboxReceipts(_)
+            | DaemonMessage::InboxReceiptWait(_)
+            | DaemonMessage::InboxReceiptFetch(_)
             | DaemonMessage::InboxList(_)
             | DaemonMessage::InboxPublish(_)
             | DaemonMessage::InboxOffer(_)
@@ -1868,6 +1896,9 @@ impl DaemonMessage {
             DaemonMessage::InboxAnnounce(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxFetch(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxCommitted(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxReceipts(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxReceiptWait(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxReceiptFetch(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxList(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxPublish(r) => r.agent_id.as_deref(),
             DaemonMessage::InboxOffer(r) => r.agent_id.as_deref(),
@@ -1903,6 +1934,9 @@ impl DaemonMessage {
             DaemonMessage::InboxAnnounce(_) => "inbox_announce",
             DaemonMessage::InboxFetch(_) => "inbox_fetch",
             DaemonMessage::InboxCommitted(_) => "inbox_committed",
+            DaemonMessage::InboxReceipts(_) => "inbox_receipts",
+            DaemonMessage::InboxReceiptWait(_) => "inbox_receipt_wait",
+            DaemonMessage::InboxReceiptFetch(_) => "inbox_receipt_fetch",
             DaemonMessage::InboxList(_) => "inbox_list",
             DaemonMessage::InboxPublish(_) => "inbox_publish",
             DaemonMessage::InboxOffer(_) => "inbox_offer",
@@ -1967,6 +2001,9 @@ impl DaemonMessage {
             DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxFetch(_)
             | DaemonMessage::InboxCommitted(_)
+            | DaemonMessage::InboxReceipts(_)
+            | DaemonMessage::InboxReceiptWait(_)
+            | DaemonMessage::InboxReceiptFetch(_)
             | DaemonMessage::InboxList(_) => {
                 serde_json::to_string(&InboxWaitReply::refused(reason, message))
             }
@@ -2034,6 +2071,9 @@ impl DaemonMessage {
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
             | DaemonMessage::InboxCommitted(_)
+            | DaemonMessage::InboxReceipts(_)
+            | DaemonMessage::InboxReceiptWait(_)
+            | DaemonMessage::InboxReceiptFetch(_)
             | DaemonMessage::InboxList(_)
             | DaemonMessage::InboxPublish(_)
             | DaemonMessage::InboxOffer(_)
@@ -3566,6 +3606,17 @@ pub struct InboxIssued {
     pub caps: InboxAttemptCaps,
 }
 
+/// Payload of [`DaemonMessage::InboxReceipts`]: who asks. Admitted like
+/// every inbox verb, for the agent its token attests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxReceiptsRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
 /// Payload of [`DaemonMessage::InboxAnnounce`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxAnnounceRequest {
@@ -3819,6 +3870,12 @@ pub struct InboxWaitReply {
     /// inbox stream protocol; not part of the TUI↔daemon attach contract.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub correctable: Vec<InboxCorrectable>,
+    /// PRD #1666 part 2: the answer to [`DaemonMessage::InboxReceipts`], the
+    /// one-shot receipt support this daemon serves
+    /// ([`crate::inbox_hub::ONE_SHOT_RECEIPTS`]). Additive and optional; a
+    /// line without it is not a daemon that serves them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_shot_receipts: Option<u32>,
 }
 
 impl InboxWaitReply {

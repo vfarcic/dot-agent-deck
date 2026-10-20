@@ -1107,3 +1107,50 @@ fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
     );
     state(&daemon, &pane, &id, "queued");
 }
+
+/// Scenario: A process in a Claude agent's own tree asks the deck directly whether it serves one-shot receipts, then sends the receipt verbs for what they do not serve: a once-wait from a Codex component, a Claude stream wait, a CLI fetch and a fetch a stream bound. The deck answers the question with the receipt support it serves; it refuses each of the others as unsupported, and a task queued beforehand stays queued.
+#[spec("inbox/claude/031")]
+#[test]
+fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve() {
+    let daemon = daemon(&[]);
+    let pane = parent(&daemon, "claude-receipts");
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let ask = |tag: &str, verb: &str, extra: Value| {
+        let mut request = json!({"message_type":verb, "pane_id":pane.id,
+            "agent_id":pane.agent, "token":pane.token, "pid":pane.pid});
+        for (key, value) in extra.as_object().unwrap() {
+            request[key] = value.clone();
+        }
+        raw(&daemon, &pane, tag, request)
+    };
+    let answer = ask("question", "inbox_receipts", json!({}));
+    assert_eq!(answer["one_shot_receipts"], 1, "{answer}");
+    for (tag, verb, extra) in [
+        (
+            "codex-once",
+            "inbox_receipt_wait",
+            json!({"component":"codex_hooks", "mode":"once", "hook_integration":1}),
+        ),
+        (
+            "claude-stream",
+            "inbox_receipt_wait",
+            json!({"component":"claude_waiter", "mode":"stream", "hook_integration":1}),
+        ),
+        (
+            "cli-fetch",
+            "inbox_receipt_fetch",
+            json!({"consumer":"cli", "max_chars":65536, "hook_integration":1}),
+        ),
+        (
+            "bound-fetch",
+            "inbox_receipt_fetch",
+            json!({"consumer":"doorbell_hook", "max_chars":65536, "rx":7,
+                "hook_integration":1}),
+        ),
+    ] {
+        let reply = ask(tag, verb, extra);
+        assert_eq!(reply["refused"], "unsupported", "{tag}: {reply}");
+        assert!(reply.get("messages").is_none(), "{tag}: {reply}");
+    }
+    state(&daemon, &pane, &id, "queued");
+}
