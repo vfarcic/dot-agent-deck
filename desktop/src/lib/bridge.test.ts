@@ -3558,6 +3558,23 @@ describe("the command stage's answer ceiling (PRD #802)", () => {
       expect(preset).not.toHaveProperty("max_tokens");
     }
   });
+
+  /**
+   * Issue #1458: the speech language is carried when it is one this build
+   * offers and folds to English otherwise, as Rust's `SpeechLanguage` folds
+   * it — and a document written before the setting reads as English.
+   */
+  it("keeps an offered speech language and folds anything else to English", async () => {
+    const { normalizeDesktopSettings } = await import("./bridge");
+    const languageOf = (transcription: unknown) =>
+      normalizeDesktopSettings({ version: 1, voice: { transcription } }).voice?.transcription.language;
+    expect(languageOf({ backend: "remote", language: "sr" })).toBe("sr");
+    expect(languageOf({ backend: "local", language: "auto" })).toBe("auto");
+    expect(languageOf({ backend: "local" })).toBe("en");
+    expect(languageOf({ backend: "local", language: "serbian" })).toBe("en");
+    expect(languageOf({ backend: "local", language: 7 })).toBe("en");
+    expect(languageOf("remote")).toBe("en");
+  });
 });
 
 describe("desktop settings hold no credential (issue 827)", () => {
@@ -3638,10 +3655,11 @@ describe("desktop settings hold no credential (issue 827)", () => {
         // declared and are carried verbatim — deliberately, because coercing
         // an endpoint is how a user's own URL silently becomes somebody else's
         // service, and Rust refuses an invalid one at the document seam with a
-        // diagnostic instead. The command stage declares a fourth, the answer
-        // ceiling, which the speech stage has no counterpart for.
+        // diagnostic instead. Each stage declares a fourth of its own: the
+        // command stage its answer ceiling, the speech stage its language,
+        // which folds to a closed set of codes.
         expect(Object.keys(normalized.voice.transcription).sort())
-          .toEqual(["backend", "endpoint", "model"]);
+          .toEqual(["backend", "endpoint", "language", "model"]);
         expect(Object.keys(normalized.voice.intent).sort())
           .toEqual(["backend", "endpoint", "max_tokens", "model"]);
       } else {

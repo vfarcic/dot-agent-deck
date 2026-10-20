@@ -323,6 +323,7 @@ level = 1.0
 | `voice.transcription.backend` | string | `"local"` | `"local"` (no key; the endpoint must be on this machine), `"remote"` |
 | `voice.transcription.endpoint` | URL | `http://127.0.0.1:18000/v1/audio/transcriptions` for `local`, `https://api.openai.com/v1/audio/transcriptions` for `remote` | any URL; a `local` backend refuses one that is not a loopback address |
 | `voice.transcription.model` | string | `Systran/faster-whisper-tiny.en` for `local`, `whisper-1` for `remote` | |
+| `voice.transcription.language` | string | `"en"` | `"auto"` (the Speech service detects the language), or the two-letter code of a language the [Language](desktop/voice.md#settings--voice) row offers, such as `"de"` or `"sr"`; an unrecognised value means `"en"` |
 | `voice.intent.backend` | string | `"openai_compatible"` | `"openai_compatible"`, `"anthropic"` |
 | `voice.intent.endpoint` | URL | `https://api.openai.com/v1/chat/completions` for `openai_compatible`, `https://api.anthropic.com/v1/messages` for `anthropic` | |
 | `voice.intent.model` | string | `gpt-5-mini` for `openai_compatible`, `claude-haiku-4-5` for `anthropic` | |
