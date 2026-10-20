@@ -38,9 +38,7 @@ function expectedPhrases(name: string): string[] {
 }
 
 function submitPhrases(): string[] {
-  const row = commandsSource.match(/id\s*=\s*"submit_prompt"[\s\S]*?heard_as_whole\s*=\s*\[([\s\S]*?)\]/);
-  if (!row) throw new Error("Rust submit_prompt heard_as_whole list was not found");
-  return [...new Set([...rustPhrases("SUBMIT_PHRASES"), ...phrases(row[1])])];
+  return [...new Set([...rustPhrases("SUBMIT_PHRASES"), ...rustPhrases("SUBMIT_WHERE_CALLABLE_PHRASES")])];
 }
 
 describe("browser fixture voice in typing mode", () => {

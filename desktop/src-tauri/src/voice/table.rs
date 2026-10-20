@@ -314,7 +314,7 @@ impl Requirement {
 
     /// The requirement as a user-facing clause — "while the New agent dialog
     /// is open" — for a refusal that depends on it
-    /// ([`CommandRow::grounding_while`]).
+    /// ([`CommandRow::whole_while`]).
     pub fn while_phrase(self) -> &'static str {
         match self {
             Requirement::DirectoryListing => "while a directory listing is showing",
@@ -342,9 +342,9 @@ impl Requirement {
 
     /// Whether the webview's pending-answer staleness check notices this
     /// requirement changing while an answer is in flight — and so whether a
-    /// row may key `heard_as_whole_while` on it (issue #1248).
+    /// row may key `whole_while` on it (issue #1248).
     ///
-    /// A contextual grounding is only sound if an answer grounded under one
+    /// A contextual strictness is only sound if an answer judged under one
     /// side of the requirement can never be applied on the other. That check
     /// is `sameNewAgentDeclaration` in `desktop/src/components/
     /// VoiceControlPanel.tsx`, which refuses a pending answer
@@ -445,42 +445,65 @@ pub struct CommandRow {
     /// "open {dir}". A `{param}` placeholder is filled with what the model
     /// heard for that param only when the user said every word of it, and the
     /// suggestion is left out otherwise, so the sentence never repeats a value
-    /// the model supplied on its own. The parser holds it to the row's own
-    /// grounding ([`TableError::UngroundedTrySaying`]): a suggestion that would
-    /// itself be refused is worse than none.
+    /// the model supplied on its own.
     pub try_saying: String,
     pub params: Vec<ParamSpec>,
-    /// What in a transcript counts as the user having asked for THIS action
-    /// (PRD #1223, closing audit F1). See [`ActionGrounding`].
-    pub grounding: ActionGrounding,
-    /// A stricter grounding that replaces [`CommandRow::grounding`] while a
-    /// requirement holds — the `heard_as_whole_while` column (PRD #1223,
-    /// closing audit H1). Empty for every row but `open_deck` and `close`, and
-    /// never longer than one ([`TableError::SeveralGroundingsWhile`]). See
-    /// [`ContextGrounding`] and [`CommandRow::grounding_for`].
-    pub grounding_while: Vec<ContextGrounding>,
-    /// Words the transcript must ALSO contain, beside one of the row's
-    /// `heard_as` entries — the `heard_as_also` column (PRD #1223). Empty for
-    /// every row but `close_orchestration`.
+    /// How the meaning check reads the transcript for THIS action (PRD #1733)
+    /// — the `meaning` column, or the `ungrounded` reason. See [`Meaning`].
+    pub meaning: Meaning,
+    /// The context in which a reversible row is read as strictly as an
+    /// irreversible one — the `whole_while` column (PRD #1223, closing audit
+    /// H1, kept by PRD #1733). `None` for every row but `open_deck` and
+    /// `close`, both keyed on the New agent dialog. See
+    /// [`CommandRow::meaning_for`].
+    pub whole_while: Option<Requirement>,
+    /// A refuse-only guard: the transcript must contain one of these, or a
+    /// pick of the row is refused whatever the meaning check said — the
+    /// `must_name` column (PRD #1733; `heard_as_also` before it, PRD #1223).
+    /// Empty for every row but `close_orchestration`.
     ///
-    /// **Why a conjunction.** `close_orchestration` stops every role of a run
-    /// at once, and its verbs are the words a user closes a VIEW with: "close
-    /// the billing agent" grounded it on `close`, and a model reading that as
-    /// the whole `billing` run turned a request to close a pane into a request
-    /// to stop several agents. The rule is that an utterance with a
-    /// destructive and a non-destructive reading resolves to the
-    /// non-destructive one, so this row needs the orchestration or the run
-    /// NAMED as well. Grounding on those nouns alone would have dropped the
-    /// verb — "show me the build orchestration" would ground a stop — so both
-    /// are required. Only valid beside `heard_as`
-    /// ([`TableError::MisplacedGroundingAlso`]), and under the same own-words
-    /// rule.
-    pub grounding_also: Vec<String>,
+    /// **Why a word list survives here.** `close_orchestration` stops every
+    /// role of a run at once, and its verbs are the words a user closes a VIEW
+    /// with. The meaning check is told that ambiguity resolves to the view,
+    /// but it is a model and can be wrong; this guard is the code half of that
+    /// rule, so a destructive multi-agent stop needs the orchestration or run
+    /// NAMED as well. It only ever refuses: its cost is a paraphrase that names
+    /// no run ("stop all of them") being refused — and that refusal is the
+    /// harmless direction — never a stop. Only parsed words of the row's own
+    /// id or description ([`TableError::ForeignWord`]).
+    pub must_name: Vec<String>,
+    /// A refuse-only guard: a pick of the row is refused when the transcript
+    /// contains one of these, whatever the meaning check said — the
+    /// `must_not_say` column (PRD #1733). Empty for every row but
+    /// `stop_agent`, whose entry is "close".
+    ///
+    /// **Why a word list survives here.** D1 (PRD #1223): when words could
+    /// mean closing a view or stopping something they mean the view, and a
+    /// destructive action needs wording that can only mean destruction. The
+    /// dashboard row's stop button is labelled "Close <name> agent" (issue
+    /// #1045), and the meaning check, reading the row's description, answered
+    /// "Close tester agent" as a stop in 5 of 5 runs on `gpt-5-mini`
+    /// (2026-10-20) — so the rule is held in code, not left to a model. It
+    /// only ever refuses, and the refused pick is then read as `close`
+    /// (`outcome::UNGROUNDED_READS_AS`), which stops nothing; its cost is a
+    /// sentence that says "close" and also asks to stop ("close the pane and
+    /// stop the tester") being refused, which the user repeats as a stop.
+    pub must_not_say: Vec<String>,
+    /// The words that usually carry this action — the `action_words` column
+    /// (PRD #1733; part of what `heard_as` was). **Never read to decide
+    /// whether the user asked for the action**: that is the meaning check's.
+    /// They are set aside before the transcript is read as a REFERENCE, so the
+    /// verb of "open Mercury" is not read as a fact about an agent called
+    /// Open, and the "switch" of "switch daemon" does not name a daemon called
+    /// Switch. Present only on the rows whose references are read that way;
+    /// `voice_table_action_words_are_the_reference_readers_set` pins which.
+    pub action_words: Vec<String>,
     /// The row that answers the same words where this one cannot run — the
     /// `unavailable_redirects` column (PRD #1223, D3; named `unavailable_opens`
     /// while its only use opened something). A pick of this row that is not
-    /// callable dispatches that row instead when it is callable and grounded by
-    /// the same words — with no params, or, for a target that requires one,
+    /// callable dispatches that row instead when it is callable and the meaning
+    /// check finds the words ask for the pick or for the target — for the
+    /// start, the start itself (`outcome`'s `reaches`) — with no params, or, for a target that requires one,
     /// with the pick's own. Three rows use it, across the New agent dialog's
     /// one boundary:
     ///
@@ -491,9 +514,9 @@ pub struct CommandRow {
     /// - `open_new_agent` → `start_new_agent`: with the dialog OPEN, "Start
     ///   agent" (its button) and "Start the new agent" were answered with the
     ///   opener, which the open dialog cannot serve. The start is reached only
-    ///   through its OWN grounding — a start word in the transcript — which is
-    ///   what lets it start without a confirmation at all, so the redirect adds
-    ///   no path to a start that saying "start it" did not already have.
+    ///   when the meaning check finds the words ask for the start itself —
+    ///   what lets it start without a confirmation at all — so the redirect
+    ///   adds no path to a start that saying "start it" did not already have.
     /// - `switch_deck` → `choose_deck` (#1260): with the dialog open, "use the
     ///   build box deck" was answered with the app's Daemon selector, which the
     ///   dialog blocks, in 13 of 15 measured runs. The dialog's own Daemon
@@ -508,99 +531,84 @@ pub struct CommandRow {
     pub unavailable_redirects: Option<String>,
 }
 
-/// A row's grounding while one [`Requirement`] holds (PRD #1223, closing
-/// audit H1): always [`ActionGrounding::HeardAsWhole`], and always NARROWER than
-/// the row's own `heard_as` — every entry contains one of those words, which
-/// the parser checks ([`TableError::LooserGroundingWhile`]), so a context can
-/// only take phrasings away.
-///
-/// # Why grounding needed a context at all
-///
-/// The grounding mode was a static property of a row, chosen by one criterion:
-/// is the action irreversible? For `close` that had one answer — it closes a
-/// VIEW, and a view reopens — until the view is the New agent dialog, whose
-/// deck, directory, Mode, Name and hand-edited Command are
-/// component-local state that unmounting discards. So the same row is
-/// reversible over an agent's pane and destructive over a filled form, and
-/// the declaration that says which is the one the webview already sends with
-/// every utterance ([`super::VoiceNewAgent`], present while the dialog is
-/// mounted). Moving `close` wholesale into `heard_as_whole` would have made
-/// "I'm done with this agent" stop closing a pane, which costs nothing to
-/// undo; this keeps that and holds only the destructive case to the whole
-/// utterance.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextGrounding {
-    pub requires: Requirement,
-    pub grounding: ActionGrounding,
-}
-
 /// How a row's ACTION is held against the transcript before it dispatches
-/// (PRD #1223, closing audit F1) — the `heard_as` / `heard_as_whole` /
-/// `ungrounded` columns, of which every row declares exactly one.
+/// (PRD #1733) — the `meaning` / `ungrounded` columns.
 ///
-/// **Why the action and not only its references.** The model is shown names
-/// from repositories, configuration files and remote machines, and a name can
-/// be written to steer it. Grounding a row's *references* (`outcome::grounding`)
-/// stops a steered model from naming a thing the user did not name, but a row
-/// with no reference — `submit_prompt`, which presses Enter in the open agent's
-/// prompt, `go_to_parent`, `use_this_directory`, `close`, `voice_off` — had
-/// nothing to hold against the transcript at all. So every row now also says
-/// which words ask for it, and a pick whose words the user did not say is
-/// refused (`VoiceOutcome::ActionUngrounded`).
+/// **Why the action is held at all.** The model is shown names from
+/// repositories, configuration files and remote machines, and a name can be
+/// written to steer it (PRD #1223, closing audit F1). A row with no reference
+/// — `submit_prompt`, which presses Enter in the open agent's prompt,
+/// `go_to_parent`, `close`, `voice_off` — has nothing else to hold against the
+/// transcript, so every pick is checked: a separate model call, shown ONLY the
+/// transcript and this row's own `asks_to` and `description`
+/// ([`super::meaning`]), answers whether the user's words ask for it. Before
+/// PRD #1733 that was a word list per row (`heard_as`), which also refused
+/// every phrasing nobody had listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActionGrounding {
-    /// The row is asked for when the transcript contains at least one of these
-    /// words or phrases. Each is drawn from the row's own `id` or `description`
-    /// — the parser refuses one that is not ([`TableError::ForeignHeardAs`]) —
-    /// so the vocabulary is the one the model is already picking on, curated
-    /// rather than scraped, and reviewable beside the row.
-    HeardAs(Vec<String>),
-    /// The row is asked for only when the WHOLE utterance is one of these
-    /// words or phrases — case, punctuation and a leading or trailing
-    /// politeness word ("okay", "please", "now", …) aside — never when one
-    /// merely occurs in it (PRD #1223, closing audit G1). Drawn from the row's own
-    /// words under the same rule as [`ActionGrounding::HeardAs`].
-    ///
-    /// **First, for a row whose action cannot be taken back** — `submit_prompt`
-    /// was the first; every row using it, and why, is pinned by
-    /// `voice_table_whole_utterance_rows_are_the_deliberate_set`. Token presence is evidence that the user
-    /// talked ABOUT a thing, and for most rows that is enough: a wrong
-    /// navigation is one more utterance to undo. A prompt submitted to an
-    /// agent cannot be recalled once the agent has it, and this row's
-    /// vocabulary is ordinary English — "tell it to put END after the report",
-    /// "tell it the build has finished" — so an unrelated occurrence of one of
-    /// its words would otherwise ground a steered pick. Whole-utterance equality is the same
-    /// defence the local fast path already relies on
-    /// (`dictation::SUBMIT_PHRASES`), applied to the model's path too.
-    ///
-    /// Do not reach for it on an ordinary row: it makes every phrasing but the
-    /// listed ones fail, which is the right trade only where a false positive
-    /// is unrecoverable.
-    HeardAsWhole(Vec<String>),
-    /// The row cannot be grounded by words, and this is why. Enumerated per
-    /// row, like a `no_voice` reason, rather than being an implicit exemption;
-    /// `voice_table_no_row_is_exempt_from_action_grounding` pins the set.
+pub enum Meaning {
+    /// Asked for when the sentence asks for it in any words — the default.
+    Asks,
+    /// Asked for only when the WHOLE sentence is a request for it and nothing
+    /// else (PRD #1223, closing audit G1, now asked of meaning). For a row
+    /// whose action cannot be taken back; every row using it, and why, is
+    /// pinned by `voice_table_whole_utterance_rows_are_the_deliberate_set`.
+    /// Do not reach for it on an ordinary row: a sentence that asks for two
+    /// things is refused outright.
+    Whole,
+    /// Asked for only by a sentence that opens by asking to write into an
+    /// agent's prompt, the rest being what to write — `dictate_to_agent`'s
+    /// rule, and [`super::meaning::Strictness::Write`] says why a write
+    /// needs one of its own.
+    Write,
+    /// The row cannot be checked against words, and this is why. Enumerated
+    /// per row, like a `no_voice` reason, rather than being an implicit
+    /// exemption; `voice_table_no_row_is_exempt_from_action_grounding` pins
+    /// the set, which is empty.
     Exempt(String),
 }
 
+impl Meaning {
+    /// The strictness the meaning check asks with, or `None` for an exempt row.
+    pub fn strictness(&self) -> Option<super::meaning::Strictness> {
+        use super::meaning::Strictness;
+        match self {
+            Meaning::Asks => Some(Strictness::Asks),
+            Meaning::Whole => Some(Strictness::Whole),
+            Meaning::Write => Some(Strictness::Write),
+            Meaning::Exempt(_) => None,
+        }
+    }
+}
+
 impl CommandRow {
-    /// The grounding that holds this row with `directories` and `new_agent`
-    /// declared, and the requirement that selected it: the
-    /// [`CommandRow::grounding_while`] entry if its requirement is met, or the
-    /// row's own [`CommandRow::grounding`] with `None`. There is at most one
-    /// entry — the parser refuses a second
-    /// ([`TableError::SeveralGroundingsWhile`]) — so no precedence is involved.
-    pub fn grounding_for(
+    /// How strictly the meaning check reads the transcript for this row with
+    /// `directories` and `new_agent` declared, and the requirement that made
+    /// it stricter, if one did: [`Meaning::Whole`] while
+    /// [`CommandRow::whole_while`] is met, the row's own
+    /// [`CommandRow::meaning`] otherwise. `None` for an exempt row.
+    ///
+    /// # Why strictness needs a context at all (closing audit H1)
+    ///
+    /// `close` closes a VIEW, and a view reopens — until the view is the New
+    /// agent dialog, whose form a close keeps only as a draft the overview
+    /// holds (#1247). So the same row is reversible over an agent's pane and
+    /// costly over a filled form, and the declaration that says which is the
+    /// one the webview already sends with every utterance.
+    pub fn meaning_for(
         &self,
         directories: Option<&VoiceDirectories>,
         new_agent: Option<&VoiceNewAgent>,
-    ) -> (&ActionGrounding, Option<Requirement>) {
-        self.grounding_while
-            .iter()
-            .find(|context| context.requires.met_by(directories, new_agent))
-            .map_or((&self.grounding, None), |context| {
-                (&context.grounding, Some(context.requires))
-            })
+    ) -> Option<(super::meaning::Strictness, Option<Requirement>)> {
+        let own = self.meaning.strictness()?;
+        Some(
+            match self
+                .whole_while
+                .filter(|requirement| requirement.met_by(directories, new_agent))
+            {
+                Some(requirement) => (super::meaning::Strictness::Whole, Some(requirement)),
+                None => (own, None),
+            },
+        )
     }
 
     /// Whether this row can run on `screen`.
@@ -758,127 +766,95 @@ impl CommandTable {
                 }
             }
 
-            // Exactly one grounding mode per row, so no row is exempt by
-            // omission and none is ambiguous about which rule holds it.
-            let declared = [
-                row.heard_as.is_some(),
-                row.heard_as_whole.is_some(),
-                row.ungrounded.is_some(),
-            ];
-            if declared.iter().filter(|&&present| present).count() > 1 {
-                return Err(TableError::ConflictingGrounding { id: id.clone() });
-            }
-            // Drawn from the row's own words, so a vocabulary cannot quietly
-            // grow a word the model is never told the row answers to.
-            let own_words = |phrases: Vec<String>| -> Result<Vec<String>, TableError> {
+            // A row is checked by meaning unless it says why not, so no row is
+            // exempt by omission; `meaning` absent is the reversible check.
+            let meaning = match (row.meaning, row.ungrounded) {
+                (Some(_), Some(_)) => {
+                    return Err(TableError::ConflictingGrounding { id: id.clone() });
+                }
+                (None, Some(reason)) => {
+                    if reason.trim().is_empty() {
+                        return Err(TableError::MissingGrounding { id: id.clone() });
+                    }
+                    Meaning::Exempt(reason)
+                }
+                (None, None) => Meaning::Asks,
+                (Some(meaning), None) => match meaning.as_str() {
+                    "asks" => Meaning::Asks,
+                    "whole" => Meaning::Whole,
+                    "write" => Meaning::Write,
+                    _ => {
+                        return Err(TableError::UnknownMeaning {
+                            id: id.clone(),
+                            meaning,
+                        });
+                    }
+                },
+            };
+            // Drawn from the row's own words, so neither list can quietly grow
+            // a word the model is never told the row is about.
+            let own_words = |column: &'static str,
+                             phrases: Vec<String>|
+             -> Result<Vec<String>, TableError> {
                 if phrases.is_empty() {
-                    return Err(TableError::MissingGrounding { id: id.clone() });
+                    return Err(TableError::ForeignWord {
+                        id: id.clone(),
+                        column,
+                        phrase: String::new(),
+                    });
                 }
                 let own = spoken_words(&format!("{id} {description}"));
                 for phrase in &phrases {
                     let words = spoken_words(phrase);
                     if words.is_empty() || !own.windows(words.len()).any(|window| window == words) {
-                        return Err(TableError::ForeignHeardAs {
+                        return Err(TableError::ForeignWord {
                             id: id.clone(),
+                            column,
                             phrase: phrase.clone(),
                         });
                     }
                 }
                 Ok(phrases)
             };
-            let grounding = if let Some(phrases) = row.heard_as {
-                ActionGrounding::HeardAs(own_words(phrases)?)
-            } else if let Some(phrases) = row.heard_as_whole {
-                ActionGrounding::HeardAsWhole(own_words(phrases)?)
-            } else if let Some(reason) = row.ungrounded {
-                if reason.trim().is_empty() {
-                    return Err(TableError::MissingGrounding { id: id.clone() });
-                }
-                ActionGrounding::Exempt(reason)
-            } else {
-                return Err(TableError::MissingGrounding { id: id.clone() });
-            };
 
-            // Only a token-grounded row can be made stricter in a context: a
-            // whole-utterance row is already as strict as this gets, and an
-            // exempt one has no words to be strict about.
-            let contexts = row.heard_as_whole_while.unwrap_or_default();
-            // One context per row (closing audit I2). Two would both be
-            // narrower than `heard_as`, but nothing would say which wins
-            // where both hold — `grounding_for` takes the first met, and the
-            // map's order is alphabetical, not a decision.
-            if contexts.len() > 1 {
-                return Err(TableError::SeveralGroundingsWhile {
-                    id: id.clone(),
-                    requirements: contexts.keys().cloned().collect(),
-                });
-            }
-            let mut grounding_while = Vec::new();
-            for (requirement, phrases) in contexts {
-                let ActionGrounding::HeardAs(base) = &grounding else {
-                    return Err(TableError::MisplacedGroundingWhile { id: id.clone() });
-                };
-                let requires = Requirement::parse(&requirement).ok_or_else(|| {
-                    TableError::UnknownRequirement {
-                        id: id.clone(),
-                        requirement: requirement.clone(),
+            let whole_while = match row.whole_while {
+                None => None,
+                Some(requirement) => {
+                    if meaning != Meaning::Asks {
+                        return Err(TableError::MisplacedWholeWhile { id: id.clone() });
                     }
-                })?;
-                // A context the staleness check cannot see would let an answer
-                // grounded on one side of it dispatch on the other.
-                if !requires.rechecked_before_dispatch() {
-                    return Err(TableError::UnrecheckedGroundingWhile {
-                        id: id.clone(),
-                        requirement: requires,
-                    });
-                }
-                let phrases = own_words(phrases)?;
-                // Narrower only: each entry, said on its own, must already be
-                // grounded by the row's `heard_as` — checked as a contiguous
-                // run of words, which is stricter than the transcript check,
-                // so it implies it.
-                for phrase in &phrases {
-                    let words = spoken_words(phrase);
-                    let covered = base.iter().any(|entry| {
-                        let wanted = spoken_words(entry);
-                        !wanted.is_empty()
-                            && words.windows(wanted.len()).any(|window| window == wanted)
-                    });
-                    if !covered {
-                        return Err(TableError::LooserGroundingWhile {
+                    let requires = Requirement::parse(&requirement).ok_or_else(|| {
+                        TableError::UnknownRequirement {
+                            id: id.clone(),
+                            requirement: requirement.clone(),
+                        }
+                    })?;
+                    // A context the staleness check cannot see would let an
+                    // answer judged on one side of it dispatch on the other.
+                    if !requires.rechecked_before_dispatch() {
+                        return Err(TableError::UnrecheckedWholeWhile {
                             id: id.clone(),
                             requirement: requires,
-                            phrase: phrase.clone(),
                         });
                     }
+                    Some(requires)
                 }
-                grounding_while.push(ContextGrounding {
-                    requires,
-                    grounding: ActionGrounding::HeardAsWhole(phrases),
-                });
-            }
-
-            // A second list the transcript must also contain. Only beside a
-            // token grounding, and never beside a context: a context replaces
-            // `heard_as` with whole utterances, and nothing would say whether
-            // those must contain these words too.
-            let grounding_also = match row.heard_as_also {
+            };
+            let must_name = match row.must_name {
                 None => Vec::new(),
-                Some(phrases) => {
-                    if !matches!(grounding, ActionGrounding::HeardAs(_))
-                        || !grounding_while.is_empty()
-                    {
-                        return Err(TableError::MisplacedGroundingAlso { id: id.clone() });
-                    }
-                    own_words(phrases)?
-                }
+                Some(phrases) => own_words("must_name", phrases)?,
+            };
+            let must_not_say = match row.must_not_say {
+                None => Vec::new(),
+                Some(phrases) => own_words("must_not_say", phrases)?,
+            };
+            let action_words = match row.action_words {
+                None => Vec::new(),
+                Some(phrases) => own_words("action_words", phrases)?,
             };
 
             // The suggestion: each placeholder names a REQUIRED param, as a
-            // report's does, and the fixed words — the text between
-            // placeholders, each run on its own — must ask for the row under
-            // its own grounding. Checked as a contiguous run of words, which
-            // is stricter than the transcript check and so implies it.
+            // report's does.
             for placeholder in placeholders(&try_saying, &id, "try_saying")? {
                 if !params
                     .iter()
@@ -889,45 +865,6 @@ impl CommandTable {
                         placeholder,
                     });
                 }
-            }
-            // `placeholders` has already refused unpaired braces.
-            let mut segments: Vec<Vec<String>> = Vec::new();
-            let mut rest = try_saying.as_str();
-            while let Some(open) = rest.find('{') {
-                segments.push(spoken_words(&rest[..open]));
-                let close = rest[open..]
-                    .find('}')
-                    .map_or(rest.len(), |at| open + at + 1);
-                rest = &rest[close..];
-            }
-            segments.push(spoken_words(rest));
-            let contains = |words: &[String], phrase: &str| {
-                let wanted = spoken_words(phrase);
-                !wanted.is_empty() && words.windows(wanted.len()).any(|window| window == wanted)
-            };
-            let suggestion_grounded = match &grounding {
-                ActionGrounding::HeardAs(phrases) => {
-                    segments
-                        .iter()
-                        .any(|words| phrases.iter().any(|phrase| contains(words, phrase)))
-                        && (grounding_also.is_empty()
-                            || segments.iter().any(|words| {
-                                grounding_also.iter().any(|phrase| contains(words, phrase))
-                            }))
-                }
-                ActionGrounding::HeardAsWhole(phrases) => {
-                    segments.len() == 1
-                        && phrases
-                            .iter()
-                            .any(|phrase| spoken_words(phrase) == segments[0])
-                }
-                ActionGrounding::Exempt(_) => true,
-            };
-            if !suggestion_grounded {
-                return Err(TableError::UngroundedTrySaying {
-                    id: id.clone(),
-                    phrase: try_saying,
-                });
             }
 
             commands.push(CommandRow {
@@ -941,9 +878,11 @@ impl CommandTable {
                 asks_to,
                 try_saying,
                 params,
-                grounding,
-                grounding_while,
-                grounding_also,
+                meaning,
+                whole_while,
+                must_name,
+                must_not_say,
+                action_words,
                 unavailable_redirects: row.unavailable_redirects,
             });
         }
@@ -1016,8 +955,8 @@ fn required(value: Option<String>, id: &str, field: &'static str) -> Result<Stri
 
 /// A text's words, lowercased, with every non-alphanumeric character spoken as
 /// a space — so `billing.api`, `billing-api` and `schedule: issues` are the
-/// words a transcriber writes for them. The one tokenisation every grounding
-/// check uses: the parser's `heard_as` check here, and `outcome`'s transcript
+/// words a transcriber writes for them. The one tokenisation the word checks
+/// share: the parser's own-words check here, and `outcome`'s transcript
 /// checks.
 pub(crate) fn spoken_words(text: &str) -> Vec<String> {
     text.chars()
@@ -1111,46 +1050,31 @@ pub enum TableError {
     /// A `try_saying` placeholder naming no declared param, or an optional
     /// one: either would leave a hole in the suggestion.
     TrySayingPlaceholder { id: String, placeholder: String },
-    /// A `try_saying` whose words the row's own grounding would refuse, so
-    /// the refusal would suggest a phrasing that is refused in turn.
-    UngroundedTrySaying { id: String, phrase: String },
-    /// A row with none of a non-empty `heard_as`, a non-empty
-    /// `heard_as_whole` or an `ungrounded` reason: nothing would say whether
-    /// the user asked for it.
+    /// A row whose `ungrounded` reason is blank: nothing would say why it is
+    /// exempt from the meaning check.
     MissingGrounding { id: String },
-    /// A row declaring more than one of `heard_as`, `heard_as_whole` and
-    /// `ungrounded`.
+    /// A row declaring both a `meaning` and an `ungrounded` reason.
     ConflictingGrounding { id: String },
-    /// A `heard_as` or `heard_as_whole` entry that is not words of the row's
-    /// own `id` or `description`.
-    ForeignHeardAs { id: String, phrase: String },
-    /// A `heard_as_whole_while` on a row whose own grounding is not
-    /// `heard_as` — there is nothing for a context to narrow.
-    MisplacedGroundingWhile { id: String },
-    /// A `heard_as_whole_while` entry that none of the row's `heard_as`
-    /// entries grounds, which would make the row LOOSER in that context.
-    LooserGroundingWhile {
+    /// A `meaning` outside `asks`, `whole` and `write`.
+    UnknownMeaning { id: String, meaning: String },
+    /// An `action_words`, `must_name` or `must_not_say` entry that is not
+    /// words of the row's own `id` or `description`, or an empty list.
+    ForeignWord {
         id: String,
-        requirement: Requirement,
+        column: &'static str,
         phrase: String,
     },
-    /// A `heard_as_whole_while` naming more than one context: where two held
-    /// at once, which one grounded the row would be decided by key order.
-    SeveralGroundingsWhile {
-        id: String,
-        requirements: Vec<String>,
-    },
-    /// A `heard_as_whole_while` keyed on a requirement the pending-answer
-    /// staleness check does not compare
-    /// ([`Requirement::rechecked_before_dispatch`]), so an answer grounded
-    /// before it changed could still dispatch after (issue #1248).
-    UnrecheckedGroundingWhile {
+    /// A `whole_while` on a row that is not read with `meaning = "asks"` —
+    /// there is nothing for a context to make stricter.
+    MisplacedWholeWhile { id: String },
+    /// A `whole_while` keyed on a requirement the pending-answer staleness
+    /// check does not compare ([`Requirement::rechecked_before_dispatch`]),
+    /// so an answer judged before it changed could still dispatch after
+    /// (issue #1248).
+    UnrecheckedWholeWhile {
         id: String,
         requirement: Requirement,
     },
-    /// A `heard_as_also` on a row that is not token-grounded by `heard_as`,
-    /// or that also declares `heard_as_whole_while`.
-    MisplacedGroundingAlso { id: String },
     /// An `unavailable_redirects` naming no row, the row itself, or a row
     /// with params that differ from the redirecting row's (name, kind or
     /// optionality) when either of the two requires one — none of which a
@@ -1225,52 +1149,35 @@ impl fmt::Display for TableError {
                 f,
                 "command `{id}`'s try_saying names `{{{placeholder}}}`, which is not one of its required params"
             ),
-            TableError::UngroundedTrySaying { id, phrase } => write!(
-                f,
-                "command `{id}`'s try_saying `{phrase}` would not itself ask for the row under its own grounding"
-            ),
             TableError::MissingGrounding { id } => write!(
                 f,
-                "command `{id}` has no `heard_as` or `heard_as_whole` (the words that ask for it) and no `ungrounded` reason"
+                "command `{id}` declares `ungrounded` with no reason; a row is exempt from the meaning check only with one"
             ),
             TableError::ConflictingGrounding { id } => write!(
                 f,
-                "command `{id}` declares more than one of `heard_as`, `heard_as_whole` and `ungrounded`; it is exactly one"
+                "command `{id}` declares both `meaning` and `ungrounded`; it is one or the other"
             ),
-            TableError::ForeignHeardAs { id, phrase } => write!(
+            TableError::UnknownMeaning { id, meaning } => write!(
                 f,
-                "command `{id}`'s grounding entry `{phrase}` is not words of its own id or description"
+                "command `{id}` declares the unknown meaning `{meaning}`; the meanings are `asks`, `whole` and `write`"
             ),
-            TableError::MisplacedGroundingWhile { id } => write!(
+            TableError::ForeignWord { id, column, phrase } => write!(
                 f,
-                "command `{id}` declares `heard_as_whole_while` without `heard_as`; only a token-grounded row can be narrowed in a context"
+                "command `{id}`'s `{column}` entry `{phrase}` is not words of its own id or description"
             ),
-            TableError::LooserGroundingWhile {
-                id,
-                requirement,
-                phrase,
-            } => write!(
+            TableError::MisplacedWholeWhile { id } => write!(
                 f,
-                "command `{id}`'s `heard_as_whole_while.{requirement}` entry `{phrase}` contains none of its `heard_as` entries, so it would loosen the row there rather than narrow it"
+                "command `{id}` declares `whole_while` on a row not read with `meaning = \"asks\"`; only such a row can be made stricter in a context"
             ),
-            TableError::SeveralGroundingsWhile { id, requirements } => write!(
+            TableError::UnrecheckedWholeWhile { id, requirement } => write!(
                 f,
-                "command `{id}` declares `heard_as_whole_while` for more than one context ({}); a row takes one, since nothing would decide which grounds it where both hold",
-                joined(requirements.iter().map(String::as_str))
-            ),
-            TableError::UnrecheckedGroundingWhile { id, requirement } => write!(
-                f,
-                "command `{id}` declares `heard_as_whole_while.{requirement}`, but a pending answer is not re-checked against `{requirement}` before it dispatches, so an answer grounded before it changed could run after; the contexts are {}",
+                "command `{id}` declares `whole_while = \"{requirement}\"`, but a pending answer is not re-checked against `{requirement}` before it dispatches, so an answer judged before it changed could run after; the contexts are {}",
                 joined(
                     Requirement::ALL
                         .into_iter()
                         .filter(|requirement| requirement.rechecked_before_dispatch())
                         .map(Requirement::as_str)
                 )
-            ),
-            TableError::MisplacedGroundingAlso { id } => write!(
-                f,
-                "command `{id}` declares `heard_as_also` without `heard_as`, or beside `heard_as_whole_while`; it only adds a second list to a token grounding"
             ),
             TableError::UnknownUnavailableRedirect { id, target } => write!(
                 f,
@@ -1331,7 +1238,7 @@ mod tests {
             "report = \"Opening {agent}.\"",
             "asks_to = \"open an agent\"",
             "try_saying = \"open {agent}\"",
-            "heard_as = [\"open\"]",
+            "meaning = \"asks\"",
             "",
             "[[commands.params]]",
             "name = \"agent\"",
@@ -1577,18 +1484,6 @@ mod tests {
                 ..
             }
         ));
-        // The row's word is split by the placeholder, so no run of fixed words
-        // contains it; and a suggestion without it asks for nothing.
-        for ungrounded in ["op{agent}en", "show {agent}"] {
-            assert_eq!(
-                CommandTable::parse(&with(ungrounded)).expect_err("refused"),
-                TableError::UngroundedTrySaying {
-                    id: "open_agent".to_string(),
-                    phrase: ungrounded.to_string(),
-                },
-                "{ungrounded}"
-            );
-        }
         // An optional param may not be interpolated either.
         let optional = with("open {agent}")
             .replace(
@@ -1603,23 +1498,6 @@ mod tests {
                 placeholder: "agent".to_string(),
             }
         );
-        // A whole-utterance row's suggestion is one of its entries, exactly.
-        let whole = one_row().replace("heard_as = [\"open\"]", "heard_as_whole = [\"open agent\"]");
-        for (try_saying, accepted) in [
-            ("open agent", true),
-            ("open agent now", false),
-            ("open {agent}", false),
-        ] {
-            let source = whole.replace(
-                "try_saying = \"open {agent}\"",
-                &format!("try_saying = \"{try_saying}\""),
-            );
-            assert_eq!(
-                CommandTable::parse(&source).is_ok(),
-                accepted,
-                "{try_saying}"
-            );
-        }
     }
 
     #[test]
@@ -1929,33 +1807,42 @@ mod tests {
         );
     }
 
-    // -- action grounding (PRD #1223, closing audit F1) --------------------
+    // -- the meaning check's columns (PRD #1733) ---------------------------
 
+    /// Scenario: a row that names no `meaning` is read with the reversible
+    /// check — checked, never exempt by omission — and each declared meaning
+    /// parses to its own reading.
     #[test]
-    fn voice_table_rejects_a_row_that_says_nothing_about_grounding() {
-        let source = one_row().replace("heard_as = [\"open\"]\n", "");
-        let error = CommandTable::parse(&source).expect_err("refused");
+    fn voice_table_reads_a_row_by_meaning_unless_it_says_otherwise() {
+        let without = one_row().replace("meaning = \"asks\"\n", "");
+        let table = CommandTable::parse(&without).expect("parses");
+        assert_eq!(table.rows()[0].meaning, Meaning::Asks);
+        for (declared, meaning) in [
+            ("asks", Meaning::Asks),
+            ("whole", Meaning::Whole),
+            ("write", Meaning::Write),
+        ] {
+            let source =
+                one_row().replace("meaning = \"asks\"", &format!("meaning = \"{declared}\""));
+            let table = CommandTable::parse(&source).expect("parses");
+            assert_eq!(table.rows()[0].meaning, meaning, "{declared}");
+        }
+        let error =
+            CommandTable::parse(&one_row().replace("\"asks\"", "\"heard\"")).expect_err("refused");
         assert_eq!(
             error,
-            TableError::MissingGrounding {
-                id: "open_agent".to_string()
+            TableError::UnknownMeaning {
+                id: "open_agent".to_string(),
+                meaning: "heard".to_string(),
             }
         );
-        for empty in ["heard_as = []", "ungrounded = \"  \""] {
-            let source = one_row().replace("heard_as = [\"open\"]", empty);
-            let error = CommandTable::parse(&source).expect_err("refused");
-            assert!(
-                matches!(error, TableError::MissingGrounding { .. }),
-                "{empty}: {error:?}"
-            );
-        }
     }
 
     #[test]
-    fn voice_table_rejects_a_row_both_grounded_and_exempt() {
+    fn voice_table_rejects_a_row_both_checked_and_exempt() {
         let source = one_row().replace(
-            "heard_as = [\"open\"]",
-            "heard_as = [\"open\"]\nungrounded = \"because\"",
+            "meaning = \"asks\"",
+            "meaning = \"asks\"\nungrounded = \"because\"",
         );
         let error = CommandTable::parse(&source).expect_err("refused");
         assert_eq!(
@@ -1964,34 +1851,58 @@ mod tests {
                 id: "open_agent".to_string()
             }
         );
+        let blank = one_row().replace("meaning = \"asks\"", "ungrounded = \"  \"");
+        assert_eq!(
+            CommandTable::parse(&blank).expect_err("refused"),
+            TableError::MissingGrounding {
+                id: "open_agent".to_string()
+            }
+        );
     }
 
+    /// Scenario: `action_words`, `must_name` and `must_not_say` hold only words of the row's
+    /// own id or description, and never an empty list.
     #[test]
-    fn voice_table_rejects_a_heard_as_entry_not_in_the_rows_own_words() {
+    fn voice_table_rejects_a_word_not_in_the_rows_own_words() {
         // "Open one agent." is the description, so `open agent` (the id's
         // words) and `one agent` are its own; `send` and `agent one` are not.
-        for good in ["open", "one agent", "open agent", "OPEN"] {
-            let source = one_row()
-                .replace("heard_as = [\"open\"]", &format!("heard_as = [\"{good}\"]"))
-                .replace(
-                    "try_saying = \"open {agent}\"",
-                    &format!("try_saying = \"{good}\""),
+        for column in ["action_words", "must_name", "must_not_say"] {
+            for good in ["open", "one agent", "open agent", "OPEN"] {
+                let source = one_row().replace(
+                    "meaning = \"asks\"",
+                    &format!("meaning = \"asks\"\n{column} = [\"{good}\"]"),
                 );
-            assert!(CommandTable::parse(&source).is_ok(), "{good}");
-        }
-        for foreign in ["send", "agent one", "", "  "] {
-            let source = one_row().replace(
-                "heard_as = [\"open\"]",
-                &format!("heard_as = [\"{foreign}\"]"),
+                assert!(CommandTable::parse(&source).is_ok(), "{column} {good}");
+            }
+            for foreign in ["send", "agent one", "", "  "] {
+                let source = one_row().replace(
+                    "meaning = \"asks\"",
+                    &format!("meaning = \"asks\"\n{column} = [\"{foreign}\"]"),
+                );
+                assert_eq!(
+                    CommandTable::parse(&source).expect_err("refused"),
+                    TableError::ForeignWord {
+                        id: "open_agent".to_string(),
+                        column: match column {
+                            "must_name" => "must_name",
+                            "must_not_say" => "must_not_say",
+                            _ => "action_words",
+                        },
+                        phrase: foreign.to_string()
+                    },
+                    "{column} {foreign:?}"
+                );
+            }
+            let empty = one_row().replace(
+                "meaning = \"asks\"",
+                &format!("meaning = \"asks\"\n{column} = []"),
             );
-            let error = CommandTable::parse(&source).expect_err("refused");
-            assert_eq!(
-                error,
-                TableError::ForeignHeardAs {
-                    id: "open_agent".to_string(),
-                    phrase: foreign.to_string()
-                },
-                "{foreign:?}"
+            assert!(
+                matches!(
+                    CommandTable::parse(&empty),
+                    Err(TableError::ForeignWord { .. })
+                ),
+                "{column}"
             );
         }
     }
@@ -1999,17 +1910,18 @@ mod tests {
     #[test]
     fn voice_table_accepts_an_exempt_row_with_its_reason() {
         let source = one_row().replace(
-            "heard_as = [\"open\"]",
+            "meaning = \"asks\"",
             "ungrounded = \"a reason someone can disagree with\"",
         );
         let table = CommandTable::parse(&source).expect("parses");
         assert_eq!(
-            table.rows()[0].grounding,
-            ActionGrounding::Exempt("a reason someone can disagree with".to_string())
+            table.rows()[0].meaning,
+            Meaning::Exempt("a reason someone can disagree with".to_string())
         );
+        assert_eq!(table.rows()[0].meaning_for(None, None), None);
     }
 
-    /// Every shipped row is grounded by its own words, and the set of rows
+    /// Every shipped row is held to the meaning check, and the set of rows
     /// exempt from that is pinned — empty today — so an exemption is a
     /// decision someone makes in review rather than an omission.
     #[test]
@@ -2017,41 +1929,32 @@ mod tests {
         let exempt: Vec<&str> = super::table()
             .rows()
             .iter()
-            .filter(|row| matches!(row.grounding, ActionGrounding::Exempt(_)))
+            .filter(|row| matches!(row.meaning, Meaning::Exempt(_)))
             .map(|row| row.id.as_str())
             .collect();
         assert_eq!(exempt, Vec::<&str>::new());
-        for row in super::table().rows() {
-            let (ActionGrounding::HeardAs(phrases) | ActionGrounding::HeardAsWhole(phrases)) =
-                &row.grounding
-            else {
-                continue;
-            };
-            assert!(!phrases.is_empty(), "{}", row.id);
-        }
     }
 
-    /// The rows held to the WHOLE utterance rather than a word in it (PRD
-    /// #1223, closing audit G1), pinned: exactly the rows whose action cannot
-    /// be taken back — `submit_prompt`, and since #1247 `discard_new_agent`. Adding one makes every phrasing but its listed ones
-    /// fail, so it is a decision for review, not a default.
+    /// The rows whose WHOLE sentence must be the request (PRD #1223, closing
+    /// audit G1, asked of meaning since PRD #1733), pinned: the rows whose
+    /// action cannot be taken back or changes how every later utterance is
+    /// treated. Adding one refuses every sentence that asks for it and says
+    /// anything else, so it is a decision for review, not a default.
     #[test]
     fn voice_table_whole_utterance_rows_are_the_deliberate_set() {
         let whole: Vec<&str> = super::table()
             .rows()
             .iter()
-            .filter(|row| matches!(row.grounding, ActionGrounding::HeardAsWhole(_)))
+            .filter(|row| row.meaning == Meaning::Whole)
             .map(|row| row.id.as_str())
             .collect();
         // `discard_new_agent` (#1247) for `submit_prompt`'s reason: it cannot
-        // be taken back, and "discard" is an ordinary word. The dictation
-        // mode's pair (PRD #1260) because a switch changes how every later
-        // utterance is treated, so it must not ground on words said in passing.
-        // PRD #1541's three prompt commands because their whole-utterance
-        // vocabulary is exactly what the agent screen answers locally outside
-        // typing mode, which is what keeps the model from ever dispatching them.
-        // PRD #1497's reading pair for the dictation pair's reason, and `hush_reading`
-        // because "silence" or "hush" said in passing must not cut the app off.
+        // be taken back. The dictation mode's pair (PRD #1260) because a
+        // switch changes how every later utterance is treated. PRD #1541's
+        // three prompt commands because they act on an agent's turn and its
+        // prompt. PRD #1497's reading pair for the dictation pair's reason,
+        // and `hush_reading` because a request in passing must not cut the
+        // app off.
         assert_eq!(
             whole,
             vec![
@@ -2067,22 +1970,26 @@ mod tests {
                 "discard_new_agent"
             ]
         );
+        // And the one row read as a write: the request, then the words.
+        let write: Vec<&str> = super::table()
+            .rows()
+            .iter()
+            .filter(|row| row.meaning == Meaning::Write)
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(write, vec!["dictate_to_agent"]);
     }
 
-    /// The rows whose grounding changes with a declared context (PRD #1223,
-    /// closing audit H1), pinned with the context and its phrases: `open_deck`
-    /// and `close`, over the New agent dialog — the two rows whose dispatch
-    /// unmounts it — and nothing else.
+    /// The rows read more strictly in a declared context (PRD #1223, closing
+    /// audit H1), pinned with the context: `open_deck` and `close`, over the
+    /// New agent dialog — the two rows whose dispatch unmounts it — and
+    /// nothing else.
     #[test]
     fn voice_table_context_grounded_rows_are_the_deliberate_set() {
         let contextual: Vec<(&str, Requirement)> = super::table()
             .rows()
             .iter()
-            .flat_map(|row| {
-                row.grounding_while
-                    .iter()
-                    .map(move |context| (row.id.as_str(), context.requires))
-            })
+            .filter_map(|row| row.whole_while.map(|requires| (row.id.as_str(), requires)))
             .collect();
         assert_eq!(
             contextual,
@@ -2091,169 +1998,58 @@ mod tests {
                 ("close", Requirement::NewAgentDialog),
             ]
         );
-        let open_deck = super::table().row("open_deck").expect("row");
-        assert_eq!(
-            open_deck.grounding_while[0].grounding,
-            ActionGrounding::HeardAsWhole(
-                [
-                    "open daemons",
-                    "go back to the daemons",
-                    "back to the daemons",
-                    "go back to the deck",
-                    "back to the deck",
-                    "return to the deck",
-                    // No bare "deck"/"the deck" (#1263) nor "daemons"/"the
-                    // daemons": over the dialog those name its Daemon field
-                    // (`choose_deck`).
-                    "show me the deck",
-                    "show the deck",
-                    "show the terminals",
-                ]
-                .map(String::from)
-                .to_vec()
-            )
-        );
         let close = super::table().row("close").expect("row");
+        let dialog = VoiceNewAgent { form: None };
         assert_eq!(
-            close.grounding_while[0].grounding,
-            ActionGrounding::HeardAsWhole(
-                [
-                    "close",
-                    "close this",
-                    "close it",
-                    "close the dialog",
-                    "close this dialog",
-                    "close the new agent dialog",
-                    // The dialog's X button's accessible name (PRD #1223's
-                    // label rule).
-                    "close new agent",
-                    "cancel",
-                    "cancel this",
-                    "cancel it",
-                    "never mind",
-                    "dismiss",
-                    "dismiss this",
-                    "hide this",
-                    "get rid of this",
-                ]
-                .map(String::from)
-                .to_vec()
-            )
+            close.meaning_for(None, Some(&dialog)),
+            Some((
+                super::super::meaning::Strictness::Whole,
+                Some(Requirement::NewAgentDialog)
+            ))
+        );
+        assert_eq!(
+            close.meaning_for(None, None),
+            Some((super::super::meaning::Strictness::Asks, None))
         );
     }
 
     #[test]
-    fn voice_table_parses_a_context_grounding_under_the_own_words_rule() {
-        let with = |column: &str| one_row().replace("heard_as = [\"open\"]", column);
+    fn voice_table_parses_a_context_strictness() {
+        let with = |column: &str| one_row().replace("meaning = \"asks\"", column);
         let table = CommandTable::parse(&with(
-            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_dialog = [\"open agent\"]",
+            "meaning = \"asks\"\nwhole_while = \"new_agent_dialog\"",
         ))
         .expect("parses");
         let row = &table.rows()[0];
-        assert_eq!(
-            row.grounding_while,
-            vec![ContextGrounding {
-                requires: Requirement::NewAgentDialog,
-                grounding: ActionGrounding::HeardAsWhole(vec!["open agent".to_string()]),
-            }]
-        );
-        // Outside the context the row's own grounding holds.
-        assert_eq!(
-            row.grounding_for(None, None),
-            (&ActionGrounding::HeardAs(vec!["open".to_string()]), None)
-        );
+        assert_eq!(row.whole_while, Some(Requirement::NewAgentDialog));
 
-        // A context on a row with nothing to narrow.
-        for base in ["heard_as_whole = [\"open\"]", "ungrounded = \"because\""] {
+        // A context on a row with nothing to make stricter.
+        for base in [
+            "meaning = \"whole\"",
+            "meaning = \"write\"",
+            "ungrounded = \"because\"",
+        ] {
             let error = CommandTable::parse(&with(&format!(
-                "{base}\nheard_as_whole_while.new_agent_dialog = [\"open\"]"
+                "{base}\nwhole_while = \"new_agent_dialog\""
             )))
             .expect_err("refused");
             assert_eq!(
                 error,
-                TableError::MisplacedGroundingWhile {
+                TableError::MisplacedWholeWhile {
                     id: "open_agent".to_string()
                 },
                 "{base}"
             );
         }
         // An unknown context.
-        let error = CommandTable::parse(&with(
-            "heard_as = [\"open\"]\nheard_as_whole_while.somewhere = [\"open\"]",
-        ))
-        .expect_err("refused");
+        let error = CommandTable::parse(&with("whole_while = \"somewhere\"")).expect_err("refused");
         assert!(
             matches!(error, TableError::UnknownRequirement { ref requirement, .. } if requirement == "somewhere"),
             "{error:?}"
         );
-        // A foreign phrase, and an empty list.
-        let error = CommandTable::parse(&with(
-            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_dialog = [\"send\"]",
-        ))
-        .expect_err("refused");
-        assert!(
-            matches!(error, TableError::ForeignHeardAs { .. }),
-            "{error:?}"
-        );
-        let error = CommandTable::parse(&with(
-            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_dialog = []",
-        ))
-        .expect_err("refused");
-        assert!(
-            matches!(error, TableError::MissingGrounding { .. }),
-            "{error:?}"
-        );
     }
 
-    /// A context may only take phrasings away: an entry that none of the
-    /// row's `heard_as` grounds would make the row LOOSER there.
-    #[test]
-    fn voice_table_rejects_a_context_grounding_that_loosens_the_row() {
-        let source = one_row().replace(
-            "heard_as = [\"open\"]",
-            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_dialog = [\"one agent\"]",
-        );
-        let error = CommandTable::parse(&source).expect_err("refused");
-        assert_eq!(
-            error,
-            TableError::LooserGroundingWhile {
-                id: "open_agent".to_string(),
-                requirement: Requirement::NewAgentDialog,
-                phrase: "one agent".to_string(),
-            }
-        );
-        assert!(
-            error.to_string().contains("would loosen the row"),
-            "{error}"
-        );
-    }
-
-    /// One context per row (closing audit I2): two narrower lists that both
-    /// hold would be ordered by map key — `new_agent_dialog` before
-    /// `new_agent_form` — rather than by any decision, so a second is refused.
-    #[test]
-    fn voice_table_rejects_a_row_narrowed_in_more_than_one_context() {
-        let source = one_row().replace(
-            "heard_as = [\"open\"]",
-            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_form = [\"open agent\"]\nheard_as_whole_while.new_agent_dialog = [\"open\"]",
-        );
-        let error = CommandTable::parse(&source).expect_err("refused");
-        assert_eq!(
-            error,
-            TableError::SeveralGroundingsWhile {
-                id: "open_agent".to_string(),
-                requirements: vec!["new_agent_dialog".to_string(), "new_agent_form".to_string()],
-            }
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("`new_agent_dialog`, `new_agent_form`"),
-            "{error}"
-        );
-    }
-
-    /// Issue #1248: a context grounding is sound only where the webview's
+    /// Issue #1248: a context strictness is sound only where the webview's
     /// pending-answer staleness check (`sameNewAgentDeclaration`) would notice
     /// the context changing mid-flight. That check compares the dialog's and
     /// the form's presence and nothing else, so a context keyed on the
@@ -2262,15 +2058,15 @@ mod tests {
     fn voice_table_rejects_a_context_grounding_the_staleness_check_cannot_see() {
         let with = |requirement: &str| {
             one_row().replace(
-                "heard_as = [\"open\"]",
-                &format!("heard_as = [\"open\"]\nheard_as_whole_while.{requirement} = [\"open\"]"),
+                "meaning = \"asks\"",
+                &format!("whole_while = \"{requirement}\""),
             )
         };
         for requirement in [Requirement::DirectoryListing, Requirement::ParentDirectory] {
             let error = CommandTable::parse(&with(requirement.as_str())).expect_err("refused");
             assert_eq!(
                 error,
-                TableError::UnrecheckedGroundingWhile {
+                TableError::UnrecheckedWholeWhile {
                     id: "open_agent".to_string(),
                     requirement,
                 },
@@ -2290,57 +2086,30 @@ mod tests {
         ] {
             let table = CommandTable::parse(&with(requirement.as_str()))
                 .unwrap_or_else(|error| panic!("{requirement}: {error}"));
-            assert_eq!(table.rows()[0].grounding_while[0].requires, requirement);
+            assert_eq!(table.rows()[0].whole_while, Some(requirement));
         }
     }
 
+    /// Scenario: the retired grounding columns are refused by name, so a row
+    /// written against the old table cannot parse with its list silently
+    /// ignored.
     #[test]
-    fn voice_table_rejects_a_row_declaring_more_than_one_grounding_mode() {
-        for extra in [
-            "heard_as = [\"open\"]\nheard_as_whole = [\"open\"]",
-            "heard_as_whole = [\"open\"]\nungrounded = \"because\"",
-            "heard_as = [\"open\"]\nheard_as_whole = [\"open\"]\nungrounded = \"because\"",
+    fn voice_table_refuses_the_retired_word_list_columns() {
+        for retired in [
+            "heard_as = [\"open\"]",
+            "heard_as_whole = [\"open\"]",
+            "heard_as_also = [\"agent\"]",
+            "heard_as_whole_while.new_agent_dialog = [\"open\"]",
         ] {
-            let source = one_row().replace("heard_as = [\"open\"]", extra);
-            let error = CommandTable::parse(&source).expect_err("refused");
-            assert_eq!(
-                error,
-                TableError::ConflictingGrounding {
-                    id: "open_agent".to_string()
-                },
-                "{extra}"
+            let source = one_row().replace("meaning = \"asks\"", retired);
+            assert!(
+                matches!(
+                    CommandTable::parse(&source),
+                    Err(TableError::Malformed { .. })
+                ),
+                "{retired}"
             );
         }
-    }
-
-    #[test]
-    fn voice_table_parses_a_whole_utterance_row_under_the_own_words_rule() {
-        let source = one_row()
-            .replace("heard_as = [\"open\"]", "heard_as_whole = [\"open agent\"]")
-            .replace(
-                "try_saying = \"open {agent}\"",
-                "try_saying = \"open agent\"",
-            );
-        let table = CommandTable::parse(&source).expect("parses");
-        assert_eq!(
-            table.rows()[0].grounding,
-            ActionGrounding::HeardAsWhole(vec!["open agent".to_string()])
-        );
-        let empty = one_row().replace("heard_as = [\"open\"]", "heard_as_whole = []");
-        assert_eq!(
-            CommandTable::parse(&empty).expect_err("refused"),
-            TableError::MissingGrounding {
-                id: "open_agent".to_string()
-            }
-        );
-        let foreign = one_row().replace("heard_as = [\"open\"]", "heard_as_whole = [\"send\"]");
-        assert_eq!(
-            CommandTable::parse(&foreign).expect_err("refused"),
-            TableError::ForeignHeardAs {
-                id: "open_agent".to_string(),
-                phrase: "send".to_string()
-            }
-        );
     }
 
     #[test]
@@ -2605,11 +2374,7 @@ mod tests {
                 row.id,
                 row.description
             );
-            assert!(
-                matches!(&row.grounding, ActionGrounding::HeardAs(words) if !words.is_empty()),
-                "{} needs grounded spoken vocabulary",
-                row.id
-            );
+            assert_eq!(row.meaning, Meaning::Asks, "{}", row.id);
         }
         for screen in [Screen::Deck, Screen::Overview, Screen::Agent] {
             assert!(
@@ -2629,9 +2394,10 @@ mod tests {
         );
     }
 
-    /// Scenario: each mode switch is an agent-pane-only command whose phrases
-    /// ground the whole utterance. A word mentioned inside a prompt cannot
-    /// switch the mode through the Commands path.
+    /// Scenario: each mode switch is an agent-pane-only command read as a
+    /// whole-sentence request, whose phrases its description names. A word
+    /// mentioned inside a prompt cannot switch the mode through the Commands
+    /// path.
     #[test]
     fn voice_table_dictation_switch_rows_are_agent_only_and_whole_utterance_grounded() {
         let table = super::table();
@@ -2679,11 +2445,16 @@ mod tests {
             assert_eq!(row.invoke, invoke, "{id}");
             assert_eq!(row.screens, vec![Screen::Agent], "{id}");
             assert!(row.params.is_empty(), "{id} takes no params");
-            assert_eq!(
-                row.grounding,
-                ActionGrounding::HeardAsWhole(phrases.iter().map(|s| s.to_string()).collect()),
-                "{id}"
-            );
+            assert_eq!(row.meaning, Meaning::Whole, "{id}");
+            let description = row
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            for phrase in phrases {
+                assert!(description.contains(phrase), "{id}: {phrase}");
+            }
         }
     }
 
@@ -3124,15 +2895,14 @@ mod tests {
             "report = \"Opening the list.\"",
             "asks_to = \"open the list\"",
             "try_saying = \"open the list\"",
-            "heard_as = [\"open\"]",
         ]
         .join("\n");
         let first_opens = |target: &str, then: &str| {
             format!(
                 "{}\n\n{then}",
                 one_row().replace(
-                    "heard_as = [\"open\"]",
-                    &format!("heard_as = [\"open\"]\nunavailable_redirects = \"{target}\""),
+                    "meaning = \"asks\"",
+                    &format!("meaning = \"asks\"\nunavailable_redirects = \"{target}\""),
                 )
             )
         };
@@ -3209,20 +2979,20 @@ mod tests {
         }
     }
 
-    /// The rows that need a SECOND list heard beside `heard_as` (PRD #1223,
-    /// D1), pinned with their words: exactly `close_orchestration`, the row
-    /// that stops several agents at once, whose verbs are also the words a
-    /// user closes a view with. "Close the agent" must never ground it.
+    /// The rows carrying a refuse-only `must_name` guard (PRD #1733;
+    /// `heard_as_also` under PRD #1223, D1), pinned with their words: exactly
+    /// `close_orchestration`, the row that stops several agents at once, whose
+    /// verbs are also the words a user closes a view with.
     #[test]
     fn voice_table_conjunctive_rows_are_the_deliberate_set() {
         let conjunctive: Vec<(&str, Vec<&str>)> = super::table()
             .rows()
             .iter()
-            .filter(|row| !row.grounding_also.is_empty())
+            .filter(|row| !row.must_name.is_empty())
             .map(|row| {
                 (
                     row.id.as_str(),
-                    row.grounding_also.iter().map(String::as_str).collect(),
+                    row.must_name.iter().map(String::as_str).collect(),
                 )
             })
             .collect();
@@ -3241,25 +3011,21 @@ mod tests {
         );
     }
 
-    /// D1's rule as a table property: no row that STOPS something is grounded
-    /// by "close the agent" or its view synonyms, and `close` is.
+    /// D1's rule as a table property: "close the agent" and its view synonyms
+    /// name no orchestration, so the refuse-only guard keeps every one of them
+    /// from stopping a run whatever the meaning check answers — and neither
+    /// stop row lists "close" among the words it sets aside as its verb.
     #[test]
     fn voice_table_close_the_agent_grounds_only_the_view() {
         let table = super::table();
-        let close = table.row("close").expect("present");
-        let ActionGrounding::HeardAs(close_words) = &close.grounding else {
-            panic!("close is token-grounded");
-        };
-        assert!(close_words.iter().any(|word| word == "close"));
         let stop = table.row("stop_agent").expect("present");
-        let ActionGrounding::HeardAs(stop_words) = &stop.grounding else {
-            panic!("stop_agent is token-grounded");
-        };
         assert!(
-            !stop_words
+            !stop
+                .action_words
                 .iter()
                 .any(|word| spoken_words(word).contains(&"close".to_string())),
-            "stop_agent must not answer to close: {stop_words:?}"
+            "stop_agent must not take close for its verb: {:?}",
+            stop.action_words
         );
         let orchestration = table.row("close_orchestration").expect("present");
         for said in [
@@ -3270,7 +3036,7 @@ mod tests {
             let words = spoken_words(said);
             assert!(
                 !orchestration
-                    .grounding_also
+                    .must_name
                     .iter()
                     .any(|entry| words.contains(entry)),
                 "{said} must not name an orchestration"
@@ -3278,49 +3044,50 @@ mod tests {
         }
     }
 
+    /// The rows carrying a refuse-only `must_not_say` guard (PRD #1733),
+    /// pinned: exactly `stop_agent`, refused by "close" — D1 held in code.
     #[test]
-    fn voice_table_parses_heard_as_also_only_beside_a_token_grounding() {
-        let with = |column: &str| {
-            one_row().replace("heard_as = [\"open\"]", column).replace(
-                "try_saying = \"open {agent}\"",
-                "try_saying = \"open agent {agent}\"",
-            )
-        };
-        let table =
-            CommandTable::parse(&with("heard_as = [\"open\"]\nheard_as_also = [\"agent\"]"))
-                .expect("parses");
-        assert_eq!(table.rows()[0].grounding_also, vec!["agent".to_string()]);
-        // A suggestion must satisfy BOTH lists, or the refusal would suggest a
-        // phrasing that is itself refused.
-        let bare = one_row().replace(
-            "heard_as = [\"open\"]",
-            "heard_as = [\"open\"]\nheard_as_also = [\"agent\"]",
+    fn voice_table_rows_refused_by_a_word_are_the_deliberate_set() {
+        let refused: Vec<(&str, Vec<&str>)> = super::table()
+            .rows()
+            .iter()
+            .filter(|row| !row.must_not_say.is_empty())
+            .map(|row| {
+                (
+                    row.id.as_str(),
+                    row.must_not_say.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(refused, vec![("stop_agent", vec!["close"])]);
+    }
+
+    /// The rows carrying `action_words` (PRD #1733), pinned: exactly the rows
+    /// whose references are read with the action's verb set aside — the
+    /// agent references (`open_agent`, `open_pr`, `stop_agent`), the daemon
+    /// a required `deck` may be read from ([`super::super::outcome`]'s
+    /// `names_the_daemon`: `switch_deck`, `choose_deck`) and the daemon the
+    /// Host figures are asked for (`show_host_metrics`). A list anywhere else
+    /// would be read by nothing.
+    #[test]
+    fn voice_table_action_words_are_the_reference_readers_set() {
+        let with_words: Vec<&str> = super::table()
+            .rows()
+            .iter()
+            .filter(|row| !row.action_words.is_empty())
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(
+            with_words,
+            vec![
+                "open_agent",
+                "show_host_metrics",
+                "switch_deck",
+                "open_pr",
+                "choose_deck",
+                "stop_agent"
+            ]
         );
-        assert!(matches!(
-            CommandTable::parse(&bare),
-            Err(TableError::UngroundedTrySaying { .. })
-        ));
-        for misplaced in [
-            "heard_as_whole = [\"open\"]\nheard_as_also = [\"agent\"]",
-            "ungrounded = \"because\"\nheard_as_also = [\"agent\"]",
-            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_dialog = [\"open\"]\nheard_as_also = [\"agent\"]",
-        ] {
-            assert!(
-                matches!(
-                    CommandTable::parse(&with(misplaced)),
-                    Err(TableError::MisplacedGroundingAlso { .. })
-                ),
-                "{misplaced}"
-            );
-        }
-        assert!(matches!(
-            CommandTable::parse(&with("heard_as = [\"open\"]\nheard_as_also = [\"send\"]")),
-            Err(TableError::ForeignHeardAs { .. })
-        ));
-        assert!(matches!(
-            CommandTable::parse(&with("heard_as = [\"open\"]\nheard_as_also = []")),
-            Err(TableError::MissingGrounding { .. })
-        ));
     }
 
     /// "start it" needs the dialog OPEN, not a complete form: an incomplete
@@ -3372,17 +3139,18 @@ mod tests {
                 "{id}"
             );
         }
-        // Grounded by the word "daemon" (or "deck", its name before #1045,
-        // or "demon", how speech-to-text writes it) alone — no shared verb —
-        // so a steered pick needs the user to have talked about a daemon (see
-        // commands.toml).
+        // Its verb is the field's own name, "daemon" (or "deck", its name
+        // before #1045, or "demon", how speech-to-text writes it): those are
+        // the words set aside before a daemon is read from the rest of the
+        // sentence, so "daemon build box" names the build box and not a daemon
+        // called Daemon.
         assert_eq!(
-            table.row("choose_deck").expect("present").grounding,
-            ActionGrounding::HeardAs(vec![
+            table.row("choose_deck").expect("present").action_words,
+            vec![
                 "daemon".to_string(),
                 "deck".to_string(),
                 "demon".to_string()
-            ])
+            ]
         );
     }
 
@@ -3464,25 +3232,22 @@ mod tests {
             assert!(row.requires.is_empty(), "{id}");
             assert!(row.params.is_empty(), "{id}");
             assert_eq!(row.report, report, "{id}");
-            let ActionGrounding::HeardAs(heard_as) = &row.grounding else {
-                panic!("{id} is grounded by `heard_as`");
-            };
-            assert!(heard_as.iter().any(|heard| heard == word), "{id}");
+            assert_eq!(row.meaning, Meaning::Asks, "{id}");
+            assert!(row.description.to_lowercase().contains(word), "{id}");
             assert!(row.callable(Screen::Overview, None, None), "{id}");
             assert!(row.callable(Screen::Deck, None, None), "{id}");
             assert!(!row.callable(Screen::Agent, None, None), "{id}");
         }
         let back = table.row("previous_page").expect("present");
-        assert!(
-            matches!(&back.grounding, ActionGrounding::HeardAs(heard_as) if heard_as.iter().any(|heard| heard == "back"))
-        );
+        assert!(back.description.to_lowercase().contains("back"));
     }
 
     /// Issue #1492: scrolling the agent dashboard, which no longer splits into
     /// pages while voice is on. Pinned by value: no params, `overview` only,
     /// and callable only while the New agent dialog is closed, since the
-    /// dashboard is what they scroll and the dialog covers it. Each is grounded
-    /// by its direction's word, so "scroll up" never grounds a scroll down.
+    /// dashboard is what they scroll and the dialog covers it. Each one's
+    /// description names its direction's word, which is what the meaning
+    /// check reads it by.
     #[test]
     fn voice_table_scroll_rows_are_pinned_by_value() {
         let table = super::table();
@@ -3523,11 +3288,9 @@ mod tests {
             );
             assert!(row.params.is_empty(), "{id}");
             assert_eq!(row.report, report, "{id}");
-            let ActionGrounding::HeardAs(heard_as) = &row.grounding else {
-                panic!("{id} is grounded by `heard_as`");
-            };
-            assert!(heard_as.iter().any(|heard| heard == word), "{id}");
-            assert!(!heard_as.iter().any(|heard| heard == opposite), "{id}");
+            assert_eq!(row.meaning, Meaning::Asks, "{id}");
+            assert!(row.description.to_lowercase().contains(word), "{id}");
+            assert_ne!(word, opposite, "{id}");
             assert!(row.callable(Screen::Overview, None, None), "{id}");
             assert!(
                 !row.callable(Screen::Overview, None, Some(&dialog)),
@@ -3543,8 +3306,8 @@ mod tests {
     /// and the agent screen's, and takes the agent it names as an optional
     /// `agent_ref` (no name on the agent screen is the open pane's agent);
     /// "open it in the browser" is the pull request browser's own and takes
-    /// no param. Both are grounded by their own words and only change what is
-    /// on screen.
+    /// no param. Both are read by meaning, their descriptions name their own
+    /// words, and both only change what is on screen.
     #[test]
     fn voice_table_pull_request_rows_are_pinned_by_value() {
         let table = super::table();
@@ -3560,11 +3323,9 @@ mod tests {
                 optional: true,
             }]
         );
-        let ActionGrounding::HeardAs(heard) = &open.grounding else {
-            panic!("open_pr is grounded by `heard_as`");
-        };
-        assert!(heard.iter().any(|word| word == "pull request"));
-        assert!(heard.iter().any(|word| word == "pr"));
+        assert_eq!(open.meaning, Meaning::Asks);
+        assert!(open.description.to_lowercase().contains("pull request"));
+        assert!(open.action_words.iter().any(|word| word == "pr"));
         for screen in [Screen::Deck, Screen::PullRequest] {
             assert!(!open.callable(screen, None, None), "open_pr on {screen}");
         }
@@ -3577,10 +3338,8 @@ mod tests {
         assert_eq!(handoff.invoke, "openPullRequestInBrowser");
         assert_eq!(handoff.screens, vec![Screen::PullRequest]);
         assert!(handoff.params.is_empty());
-        let ActionGrounding::HeardAs(heard) = &handoff.grounding else {
-            panic!("open_pr_in_browser is grounded by `heard_as`");
-        };
-        assert!(heard.iter().any(|word| word == "browser"));
+        assert_eq!(handoff.meaning, Meaning::Asks);
+        assert!(handoff.description.to_lowercase().contains("browser"));
         for screen in [Screen::Deck, Screen::Overview, Screen::Agent] {
             assert!(
                 !handoff.callable(screen, None, None),
@@ -3703,10 +3462,11 @@ struct RawCommand {
     report: Option<String>,
     asks_to: Option<String>,
     try_saying: Option<String>,
-    heard_as: Option<Vec<String>>,
-    heard_as_whole: Option<Vec<String>>,
-    heard_as_whole_while: Option<std::collections::BTreeMap<String, Vec<String>>>,
-    heard_as_also: Option<Vec<String>>,
+    meaning: Option<String>,
+    whole_while: Option<String>,
+    must_name: Option<Vec<String>>,
+    must_not_say: Option<Vec<String>>,
+    action_words: Option<Vec<String>>,
     unavailable_redirects: Option<String>,
     ungrounded: Option<String>,
     #[serde(default)]

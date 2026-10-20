@@ -49,6 +49,7 @@ pub mod hold;
 pub mod http;
 pub mod human_voice;
 pub mod lease;
+pub mod meaning;
 pub mod numbers;
 pub mod openai;
 pub mod option_match;
@@ -391,6 +392,7 @@ pub use capture::{
 };
 pub use choice::{ChoiceAnswer, ChoiceLive, MAX_CHOICES};
 pub use hold::VoiceHold;
+pub use meaning::{MeaningRequest, MeaningVerdict, Strictness};
 pub use outcome::{
     ChoiceMatch, DeckRefMatch, DirRefMatch, FILTER_DASHBOARD_ROW, ResolvedParam,
     SHOW_HOST_METRICS_ROW, SWITCH_DECK_ROW, VoiceDeckIdentity, VoiceDeckSelection, VoiceOutcome,

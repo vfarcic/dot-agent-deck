@@ -853,7 +853,6 @@ mod tests {
             "report = \"Done.\"",
             "asks_to = \"do it\"",
             "try_saying = \"anywhere\"",
-            "heard_as = [\"anywhere\"]",
         ]
         .join("\n");
         let parsed = CommandTable::parse(&source).expect("parses");

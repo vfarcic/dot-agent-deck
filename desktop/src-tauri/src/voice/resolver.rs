@@ -20,6 +20,7 @@ use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
+use super::meaning::{MeaningRequest, MeaningVerdict, Strictness};
 use super::schema::AnnotatedCommand;
 use super::{Transcript, VoiceDeck, VoiceDirectories, VoiceNewAgent};
 use crate::dto::DesktopAgent;
@@ -171,6 +172,10 @@ pub type ResolveFuture<'a> =
 pub type QuestionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<super::question::ModelAnswer, IntentError>> + Send + 'a>>;
 
+/// The future [`IntentResolver::judge_meaning`] returns (PRD #1733).
+pub type MeaningFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<MeaningVerdict, IntentError>> + Send + 'a>>;
+
 /// A backend that turns an utterance into a structured answer.
 pub trait IntentResolver: Send + Sync {
     fn resolve<'a>(&'a self, request: IntentRequest<'a>) -> ResolveFuture<'a>;
@@ -186,6 +191,24 @@ pub trait IntentResolver: Send + Sync {
         Box::pin(async {
             Err(IntentError::NotConfigured(
                 "this command backend cannot answer an agent's questions".into(),
+            ))
+        })
+    }
+
+    /// PRD #1733: the meaning check — whether the transcript asks for the
+    /// actions in `request` ([`super::meaning`]). Its request holds the
+    /// transcript and the app's own text about each action, and nothing
+    /// observed.
+    ///
+    /// **The default refuses**: a backend that cannot ask the question answers
+    /// [`IntentError::NotConfigured`], and the caller acts on nothing it did
+    /// not get a `yes` for. So a backend added later without this method
+    /// cannot be a way around the check — it is a backend on which every
+    /// model pick is refused, which its first use makes obvious.
+    fn judge_meaning<'a>(&'a self, _request: MeaningRequest<'a>) -> MeaningFuture<'a> {
+        Box::pin(async {
+            Err(IntentError::NotConfigured(
+                "this command backend cannot check what was asked".into(),
             ))
         })
     }
@@ -265,6 +288,33 @@ pub struct StubResolver {
     /// spent none.
     question_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     failure: Option<IntentError>,
+    /// PRD #1733: scripted meaning verdicts, keyed by utterance, action and —
+    /// when only one reading is scripted — strictness. An unscripted question
+    /// is answered `yes` for the action this stub's `answers` picked for the
+    /// utterance and `no` for every other: the stub models a judge that agrees
+    /// with the command model and with nothing else.
+    meaning: BTreeMap<(String, String, Option<Strictness>), bool>,
+    /// PRD #1733: what an unscripted question is answered when set, in place
+    /// of agreeing with the pick alone.
+    meaning_default: Option<bool>,
+    /// PRD #1733: a raw reply for an utterance, read by the production reader
+    /// ([`MeaningVerdict::read`]) — so a test can drive a malformed one.
+    meaning_replies: BTreeMap<String, serde_json::Value>,
+    meaning_failure: Option<IntentError>,
+    /// PRD #1733: the meaning call never answers, for the timeout's test.
+    meaning_hangs: bool,
+    /// PRD #1733: every meaning request this stub was handed, as the wire
+    /// bodies both dialects would send — what the boundary tests read.
+    meaning_log: std::sync::Arc<std::sync::Mutex<Vec<RecordedMeaning>>>,
+}
+
+/// One meaning request a [`StubResolver`] was handed (PRD #1733): the
+/// questions it asked, and the request body each dialect would have sent for
+/// it, serialized — the exact bytes that would leave the machine.
+#[derive(Debug, Clone)]
+pub struct RecordedMeaning {
+    pub questions: Vec<(String, Strictness)>,
+    pub bodies: Vec<String>,
 }
 
 impl StubResolver {
@@ -301,6 +351,64 @@ impl StubResolver {
             ..Self::default()
         }
     }
+
+    /// PRD #1733: judge whether `utterance` asks for `action`, under every
+    /// strictness.
+    pub fn judging(mut self, utterance: &str, action: &str, asks: bool) -> Self {
+        self.meaning
+            .insert((normalize(utterance), action.to_string(), None), asks);
+        self
+    }
+
+    /// PRD #1733: answer every question no script answers with `asks` —
+    /// `true` models a sentence that asks for every row the pipeline may
+    /// consult on the pick's behalf (its redirects and readings included).
+    pub fn judging_everything(mut self, asks: bool) -> Self {
+        self.meaning_default = Some(asks);
+        self
+    }
+
+    /// PRD #1733: judge `utterance` for `action` under one strictness only.
+    pub fn judging_as(
+        mut self,
+        utterance: &str,
+        action: &str,
+        strictness: Strictness,
+        asks: bool,
+    ) -> Self {
+        self.meaning.insert(
+            (normalize(utterance), action.to_string(), Some(strictness)),
+            asks,
+        );
+        self
+    }
+
+    /// PRD #1733: answer the meaning call for `utterance` with `reply`, read
+    /// as a backend's reply would be.
+    pub fn meaning_reply(mut self, utterance: &str, reply: serde_json::Value) -> Self {
+        self.meaning_replies.insert(normalize(utterance), reply);
+        self
+    }
+
+    /// PRD #1733: fail every meaning call with `error`.
+    pub fn failing_meaning(mut self, error: IntentError) -> Self {
+        self.meaning_failure = Some(error);
+        self
+    }
+
+    /// PRD #1733: never answer a meaning call.
+    pub fn hanging_meaning(mut self) -> Self {
+        self.meaning_hangs = true;
+        self
+    }
+
+    /// PRD #1733: the meaning requests made so far.
+    pub fn meaning_requests(&self) -> Vec<RecordedMeaning> {
+        self.meaning_log
+            .lock()
+            .map(|log| log.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl IntentResolver for StubResolver {
@@ -329,6 +437,51 @@ impl IntentResolver for StubResolver {
                 .get(&normalize(request.transcript.text()))
                 .cloned()
                 .unwrap_or_else(super::question::ModelAnswer::not_answer)),
+        };
+        Box::pin(async move { outcome })
+    }
+
+    fn judge_meaning<'a>(&'a self, request: MeaningRequest<'a>) -> MeaningFuture<'a> {
+        let ceiling = crate::model_service::TokenCeiling::default();
+        let recorded = RecordedMeaning {
+            questions: request
+                .questions()
+                .iter()
+                .map(|question| (question.action().to_string(), question.strictness()))
+                .collect(),
+            bodies: vec![
+                super::meaning::anthropic_body(&request, "stub", ceiling).to_string(),
+                super::meaning::openai_body(&request, "stub", ceiling, Some("minimal")).to_string(),
+            ],
+        };
+        if let Ok(mut log) = self.meaning_log.lock() {
+            log.push(recorded);
+        }
+        if self.meaning_hangs {
+            return Box::pin(std::future::pending());
+        }
+        let said = normalize(request.transcript().text());
+        let outcome = if let Some(error) = &self.meaning_failure {
+            Err(error.clone())
+        } else if let Some(reply) = self.meaning_replies.get(&said) {
+            MeaningVerdict::read(&request, reply)
+        } else {
+            let picked = self.answers.get(&said).map(|answer| answer.action.as_str());
+            Ok(MeaningVerdict::yes_to(
+                request
+                    .questions()
+                    .iter()
+                    .filter(|question| {
+                        let action = question.action().to_string();
+                        self.meaning
+                            .get(&(said.clone(), action.clone(), Some(question.strictness())))
+                            .or_else(|| self.meaning.get(&(said.clone(), action, None)))
+                            .copied()
+                            .or(self.meaning_default)
+                            .unwrap_or(picked == Some(question.action()))
+                    })
+                    .map(|question| (question.action(), question.strictness())),
+            ))
         };
         Box::pin(async move { outcome })
     }

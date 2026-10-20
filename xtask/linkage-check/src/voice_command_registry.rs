@@ -129,6 +129,12 @@ const QUIET_LIST: &str = "QUIET_PHRASES";
 const READING_ON_ROW: &str = "reading_on";
 const READING_OFF_ROW: &str = "reading_off";
 const QUIET_ROW: &str = "hush_reading";
+/// PRD #1733 — the two locally answered lists that were `commands.toml`
+/// columns until the meaning check replaced them: the rest of the send
+/// phrases, and a plain close over the New agent dialog.
+const SUBMIT_WHERE_CALLABLE_LIST: &str = "SUBMIT_WHERE_CALLABLE_PHRASES";
+const CLOSE_OVER_DIALOG_LIST: &str = "CLOSE_OVER_DIALOG_PHRASES";
+const CLOSE_ROW: &str = "close";
 
 /// The rule sentence, quoted in every failure.
 ///
@@ -347,6 +353,8 @@ fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
         (READING_ON_LIST, READING_ON_ROW),
         (READING_OFF_LIST, READING_OFF_ROW),
         (QUIET_LIST, QUIET_ROW),
+        (SUBMIT_WHERE_CALLABLE_LIST, SUBMIT_ROW),
+        (CLOSE_OVER_DIALOG_LIST, CLOSE_ROW),
     ]
     .into_iter()
     .map(|(name, row_id)| (name, list(name, findings), row_id))
@@ -1557,6 +1565,8 @@ mod tests {
             "READING_ON_PHRASES",
             "READING_OFF_PHRASES",
             "QUIET_PHRASES",
+            "SUBMIT_WHERE_CALLABLE_PHRASES",
+            "CLOSE_OVER_DIALOG_PHRASES",
         ] {
             let mut sources = checked_in();
             let original = sources.dictation_rs.clone();

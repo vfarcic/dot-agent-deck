@@ -269,8 +269,38 @@ impl RemoteResolver {
         }
     }
 
+    /// PRD #1733: the meaning check — the same transport, credential and
+    /// failure wording again, with [`super::meaning`]'s body and reader. Its
+    /// body is built from the [`super::meaning::MeaningRequest`] alone, which
+    /// holds nothing observed.
+    async fn run_meaning(
+        &self,
+        request: super::meaning::MeaningRequest<'_>,
+    ) -> Result<super::meaning::MeaningVerdict, IntentError> {
+        let body = match self.protocol {
+            Protocol::Anthropic => {
+                super::meaning::anthropic_body(&request, self.model.as_str(), self.max_tokens)
+            }
+            Protocol::OpenAiCompatible { reasoning_effort } => super::meaning::openai_body(
+                &request,
+                self.model.as_str(),
+                self.max_tokens,
+                reasoning_effort,
+            ),
+        };
+        let payload = self.post(body).await?;
+        match self.protocol {
+            Protocol::Anthropic => {
+                super::meaning::parse_anthropic(&request, &payload, self.max_tokens)
+            }
+            Protocol::OpenAiCompatible { .. } => {
+                super::meaning::parse_openai(&request, &payload, self.max_tokens)
+            }
+        }
+    }
+
     /// One request body to the endpoint, and its successful reply's JSON — the
-    /// transport both calls share.
+    /// transport every call shares.
     async fn post(&self, body: Value) -> Result<Value, IntentError> {
         // No key for a loopback endpoint; see `endpoint_credential`.
         let secret = endpoint_credential(&self.endpoint, &self.secrets)
@@ -403,6 +433,13 @@ impl IntentResolver for RemoteResolver {
         request: super::question::QuestionRequest<'a>,
     ) -> super::resolver::QuestionFuture<'a> {
         Box::pin(self.run_question(request))
+    }
+
+    fn judge_meaning<'a>(
+        &'a self,
+        request: super::meaning::MeaningRequest<'a>,
+    ) -> super::resolver::MeaningFuture<'a> {
+        Box::pin(self.run_meaning(request))
     }
 
     fn backend_name(&self) -> &'static str {
@@ -1035,6 +1072,59 @@ mod tests {
     }
 
     // -- the credential ----------------------------------------------------
+
+    /// Scenario: PRD #1733's meaning check goes over the same connection in
+    /// both dialects and fails closed in each: with no key stored for a hosted
+    /// endpoint it is not configured and opens no socket, and against a server
+    /// on this machine (the local-model case) that is not listening it is a
+    /// transport failure — either way an error, which the pipeline refuses on,
+    /// and never a verdict.
+    #[tokio::test]
+    async fn voice_remote_meaning_check_fails_closed_in_both_dialects() {
+        let stop = crate::voice::table::table()
+            .row("stop_agent")
+            .expect("a shipped row");
+        let transcript = Transcript::new("destroy the tester");
+        for protocol in [
+            Protocol::Anthropic,
+            Protocol::OpenAiCompatible {
+                reasoning_effort: None,
+            },
+        ] {
+            for (endpoint, keyless) in [
+                ("https://voice-intent.invalid/never", false),
+                ("http://127.0.0.1:1/v1/chat/completions", true),
+            ] {
+                let resolver = RemoteResolver::new(
+                    protocol,
+                    Arc::new(MemorySecretStore::new()),
+                    ServiceUrl::parse(endpoint).expect("valid"),
+                    ModelId::parse(HOSTED_COMMAND_MODEL).expect("valid"),
+                    TokenCeiling::default(),
+                );
+                let request = crate::voice::meaning::MeaningRequest::new(
+                    &transcript,
+                    crate::voice::table::table(),
+                    &[(stop, crate::voice::meaning::Strictness::Asks)],
+                );
+                let error = resolver
+                    .judge_meaning(request)
+                    .await
+                    .expect_err("no verdict without an answer");
+                if keyless {
+                    assert!(
+                        matches!(&error, IntentError::Backend(_)),
+                        "{protocol:?} {endpoint}: {error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(&error, IntentError::NotConfigured(detail) if detail.contains("no key is stored")),
+                        "{protocol:?} {endpoint}: {error:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn voice_remote_without_a_key_is_not_configured_and_opens_no_socket() {
