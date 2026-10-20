@@ -19516,20 +19516,23 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // ── Clickable geometry (overlaid / computed after the Paragraph) ────────
     let line_y = |n: usize| popup_area.y + 1 + n as u16;
     // PRD #144 A1: the overlays below (mode chips, Submit/Cancel row, cursor)
-    // are placed by absolute line index, but on a degenerate short terminal the
-    // `modal_rect`-clamped popup can be far shorter than the form's reserved
-    // rows. Any write whose row falls at/below `popup_bottom` would land past
-    // the buffer (`set_span` only guards the x-axis) → panic, so every overlay
-    // row is skipped when it doesn't fit — mirroring how `render_scheduled_tasks`
-    // bounds its rows. `popup_bottom <= buffer height` because `modal_rect`
-    // clamps the popup to the terminal.
-    let popup_bottom = popup_area.bottom();
+    // and the click rects are placed by absolute line index, but on a degenerate
+    // short terminal the `modal_rect`-clamped popup can be far shorter than the
+    // form's reserved rows. A write past the buffer would panic (`set_span` only
+    // guards the x-axis), and one on the bottom border would erase it, so every
+    // overlay row and click rect is kept above `inner_bottom` — the popup's
+    // bottom-border row — and skipped when it doesn't fit, mirroring how
+    // `render_scheduled_tasks` bounds its rows. `inner_bottom < buffer height`
+    // because `modal_rect` clamps the popup to the terminal.
+    let inner_bottom = popup_area.bottom().saturating_sub(1);
     let row_x = popup_area.x + 1;
     let row_width = popup_area.width.saturating_sub(2);
     let inner_end = row_x + row_width;
 
     let mut field_rects: Vec<(FormField, Rect)> = Vec::new();
-    if let Some(ni) = name_line_idx {
+    if let Some(ni) = name_line_idx
+        && line_y(ni) < inner_bottom
+    {
         field_rects.push((
             FormField::Name,
             Rect {
@@ -19540,7 +19543,9 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
             },
         ));
     }
-    if let Some(ci) = cmd_line_idx {
+    if let Some(ci) = cmd_line_idx
+        && line_y(ci) < inner_bottom
+    {
         field_rects.push((
             FormField::Command,
             Rect {
@@ -19559,7 +19564,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // mode-chip click hit-test still selects the right option.
     let mut chip_rects: Vec<(usize, Rect)> = Vec::new();
     if let Some(mi) = mode_line_idx
-        && line_y(mi) < popup_bottom
+        && line_y(mi) < inner_bottom
     {
         let mode_y = line_y(mi);
         // Whole chip area (off-chip clicks focus the Mode field).
@@ -19569,7 +19574,8 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                 x: row_x,
                 y: mode_y,
                 width: row_width,
-                height: mode_lines,
+                // Only the chip rows the popup shows (PRD #168).
+                height: mode_lines.min(inner_bottom - mode_y),
             },
         ));
         let mode_label_style = if form.focused == FormField::Mode {
@@ -19592,8 +19598,8 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         for (i, &(row, x_off)) in chip_positions.iter().enumerate() {
             let cx = row_x + x_off;
             let chip_y = mode_y.saturating_add(row);
-            // PRD #144 A1: a wrapped row below the clamped popup is skipped.
-            if chip_y >= popup_bottom {
+            // PRD #144 A1: a wrapped row past the clamped popup is skipped.
+            if chip_y >= inner_bottom {
                 break;
             }
             let chip = format!("[{}]", form.mode_option_name(i));
@@ -19638,7 +19644,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // PRD #144 A1: skip the button row entirely when it falls outside the
     // clamped popup (degenerate short terminal) rather than writing past the
     // buffer bottom.
-    let button_rects = if btn_row.y < popup_bottom {
+    let button_rects = if btn_row.y < inner_bottom {
         render_modal_button_row(frame, &buttons, btn_row, 1)
     } else {
         Vec::new()
@@ -19648,13 +19654,13 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // PRD #144 A1: only place the cursor when its row fits inside the popup.
     if form.focused == FormField::Name
         && let Some(ni) = name_line_idx
-        && line_y(ni) < popup_bottom
+        && line_y(ni) < inner_bottom
     {
         let cursor_x = popup_area.x + 12 + form.name.len() as u16;
         frame.set_cursor_position(Position::new(cursor_x, line_y(ni)));
     } else if form.focused == FormField::Command
         && let Some(ci) = cmd_line_idx
-        && line_y(ci) < popup_bottom
+        && line_y(ci) < inner_bottom
     {
         let cursor_x = popup_area.x + 12 + form.command.len() as u16;
         frame.set_cursor_position(Position::new(cursor_x, line_y(ci)));
@@ -29153,7 +29159,8 @@ mod tests {
     /// `[No mode]`; it is drawn REVERSED there, its click rect covers exactly its
     /// label, the Mode field's click area spans every chip row, and the Name row
     /// sits below the last of them. Rendered again at 80x6, the rows that fall
-    /// past the clamped popup are skipped instead of written out of bounds.
+    /// past the clamped popup are skipped: nothing draws over its bottom border
+    /// and no click target reaches the rows below it.
     #[test]
     fn new_pane_form_wrapped_mode_chips_keep_highlight_and_click_targets() {
         let orchestrations = [
@@ -29230,13 +29237,39 @@ mod tests {
         );
 
         let mut short = None;
-        render_overlay_to_buffer(80, 6, |frame| {
+        let short_buf = render_overlay_to_buffer(80, 6, |frame| {
             short = Some(render_new_pane_form(frame, &form));
         });
-        let (_, short_chips, _) = short.expect("rendered");
+        let short_rendered = buffer_to_string(&short_buf);
+        let (short_fields, short_chips, _) = short.expect("rendered");
+        // The popup's bottom border: the row holding its `└` corner.
+        let border_y = short_rendered
+            .lines()
+            .position(|line| line.contains('└'))
+            .expect("bottom border") as u16;
+        let border = short_rendered.lines().nth(border_y as usize).unwrap();
         assert!(
-            short_chips.len() < chips.len() && short_chips.iter().all(|(_, chip)| chip.y < 6),
+            border
+                .trim()
+                .trim_start_matches('└')
+                .trim_end_matches('┘')
+                .chars()
+                .all(|c| c == '─'),
+            "no overlay may draw over the popup's bottom border, got:\n{short_rendered}"
+        );
+        assert!(
+            short_chips.len() < chips.len()
+                && short_chips
+                    .iter()
+                    .all(|(_, chip)| chip.bottom() <= border_y),
             "on a short terminal the wrapped rows past the popup must be skipped"
+        );
+        assert!(
+            short_fields
+                .iter()
+                .all(|(_, rect)| rect.bottom() <= border_y),
+            "no click target may reach the border or the rows below the popup, \
+             got {short_fields:?}\n{short_rendered}"
         );
     }
 
