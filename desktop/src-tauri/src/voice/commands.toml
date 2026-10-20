@@ -2036,7 +2036,8 @@ meaning     = "whole"
 # because Close is the glossary's word for ending one agent. Reading that label
 # aloud is not a stop: the meaning check is told a close means the view
 # (`voice::meaning::MEANING_INSTRUCTIONS`), and a model's pick of this row for
-# "Close the agent" read as a close is answered as `close`
+# "Close the agent" is refused by its `must_not_say` guard and, when the meaning
+# check answers `close` yes, answered as `close`
 # (`outcome::UNGROUNDED_READS_AS`) rather than opening a stop confirmation for
 # whichever agent it guessed — the D1 misreading this rule exists to prevent. Its spoken form stays "stop
 # <name> agent"; `voice_outcome_the_row_close_label_is_not_a_stop_phrase` pins

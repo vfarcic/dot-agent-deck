@@ -112,8 +112,9 @@ pub const TOOL_NAME: &str = "run_deck_action";
 /// sentence ("show me everything" 14 of 20 against 19, "Daemon BuildBoxDeck."
 /// 15 of 20 against 20). Naming the action a start IS answered by keeps them
 /// (20 and 19 of 20) at 9 of 60 stop picks; "ask to start" in its place left
-/// 28 of 60. A stop picked for words that hold no stop word is refused, or read
-/// as the start those words ground (`outcome::UNGROUNDED_READS_AS`).
+/// 28 of 60. A stop the meaning check refuses is refused, or, where it names
+/// nothing the user said, read as the start or the opener when the check
+/// answers that row `yes` (`outcome::UNGROUNDED_READS_AS`).
 pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked for. Pick exactly one. \
     Every action is listed whether or not it can run right now: `callable: false` \
     means it exists but the current screen cannot run it, and picking it is the \

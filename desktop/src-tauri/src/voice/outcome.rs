@@ -172,15 +172,25 @@ pub const SHOW_HOST_METRICS_ROW: &str = "show_host_metrics";
 /// as, and where it may be read that way.
 type Reading = (&'static str, ReadWhere);
 
-/// Where a reading in [`UNGROUNDED_READS_AS`] may be taken. Each narrows it;
-/// none takes a reading the words do not ask for, since that row's own `yes`
-/// is needed as well.
+/// Where a reading in [`UNGROUNDED_READS_AS`] may be taken. Each only narrows
+/// where the reading is eligible: an eligible reading is not taken unless the
+/// meaning check answers that row `yes` under its own strictness and guards,
+/// so a `no` for the pick alone dispatches nothing. A `yes` is the model's
+/// judgement, not proof of what the user meant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadWhere {
-    /// Wherever the words ask for the reading.
+    /// Wherever the reading's row can run.
     Anywhere,
-    /// Only while the declared dialog state meets the requirement.
-    While(Requirement),
+    /// Only while the declared dialog state meets the requirement, and the
+    /// pick's own values name nothing the user said
+    /// ([`names_something_said`]): a pick that
+    /// carries a name the user spoke ("open the tester" picked as a stop of
+    /// `tester`) is about that thing, not about the New agent dialog, so it
+    /// stays refused. Literal and refuse-only: it reads the transcript and
+    /// the model's own values, nothing observed, and a value that is absent,
+    /// or that the user did not say ("it"), leaves the reading to its own
+    /// judgement.
+    WhileNothingSaidIsNamed(Requirement),
     /// Only where the pick's own refuse-only guard ([`CommandRow::must_not_say`])
     /// refused it: the user said what the pick refuses, and the reading is the
     /// row those words belong to. Literal, and it only refuses: words the
@@ -193,23 +203,52 @@ impl ReadWhere {
     fn holds(
         self,
         pick: &CommandRow,
+        values: &BTreeMap<String, String>,
         transcript: &str,
         directories: Option<&VoiceDirectories>,
         new_agent: Option<&VoiceNewAgent>,
     ) -> bool {
         match self {
             ReadWhere::Anywhere => true,
-            ReadWhere::While(requirement) => requirement.met_by(directories, new_agent),
+            ReadWhere::WhileNothingSaidIsNamed(requirement) => {
+                requirement.met_by(directories, new_agent)
+                    && !values
+                        .values()
+                        .any(|value| names_something_said(value, transcript))
+            }
             ReadWhere::PickSaidWhatItRefuses => !says_nothing_it_refuses(pick, transcript),
         }
     }
 }
 
-/// The rows a pick of `pick` the meaning check refuses may be read as here
-/// ([`UNGROUNDED_READS_AS`]), in order — those whose [`ReadWhere`] holds.
+/// Words a model's value can point with and name nothing by, beyond the
+/// [`AGENT_FILLER_WORDS`] a reference already sets aside ([`reference_words`]):
+/// the "it" of "start it".
+const POINTING_WORDS: [&str; 4] = ["it", "them", "these", "those"];
+
+/// Whether `value`, a pick's own param value, names something the user said:
+/// it has a word that could name something — less [`reference_words`]' filler
+/// and the [`POINTING_WORDS`] — and every such word is [`Heard`] in the
+/// transcript. Unlike [`said`], an action word counts, so an agent called
+/// "Close" is named by "open the Close agent". Read only to make a reading
+/// ineligible ([`ReadWhere::WhileNothingSaidIsNamed`]).
+fn names_something_said(value: &str, transcript: &str) -> bool {
+    let (_, content) = reference_words(value);
+    let named: Vec<&String> = content
+        .iter()
+        .filter(|word| !POINTING_WORDS.contains(&word.as_str()))
+        .collect();
+    let heard = Heard::new(transcript);
+    !named.is_empty() && named.iter().all(|word| heard.word(word))
+}
+
+/// The rows a pick of `pick` with `values` the meaning check refuses may be
+/// read as here ([`UNGROUNDED_READS_AS`]), in order — those whose
+/// [`ReadWhere`] holds.
 fn readings_of<'t>(
     table: &'t CommandTable,
     pick: &CommandRow,
+    values: &BTreeMap<String, String>,
     transcript: &str,
     directories: Option<&VoiceDirectories>,
     new_agent: Option<&VoiceNewAgent>,
@@ -218,65 +257,85 @@ fn readings_of<'t>(
         .iter()
         .filter(|(picked, _)| *picked == pick.id)
         .flat_map(|(_, readings)| readings.iter())
-        .filter(|(_, only_where)| only_where.holds(pick, transcript, directories, new_agent))
+        .filter(|(_, only_where)| {
+            only_where.holds(pick, values, transcript, directories, new_agent)
+        })
         .filter_map(|(instead, _)| table.row(instead))
         .collect()
 }
 
 /// A pick the meaning check finds the user's words do not ask for, answered
-/// instead as the row it finds they DO ask for — each pair a row and the
-/// reversible neighbour the model was measured mistaking it for. Never the
-/// other way round, so a reading can only ever move a pick to the harmless
-/// row. (Measured under the word lists that grounded picks before PRD #1733.)
+/// instead as a row it answers `yes` for — each pair a row and the neighbour
+/// the model was measured mistaking it for, never the other way round. Each
+/// reading is taken only where its [`ReadWhere`] holds AND the meaning check
+/// answers the reading's own row `yes`, so a refused pick dispatches nothing
+/// on its own `no`. That `yes` is the model's judgement and can be wrong; a
+/// reading is what a false `yes` for its row can reach in place of the
+/// refusal, which is why each is listed with what it does and where it is
+/// eligible. (Measured under the word lists that grounded picks before PRD
+/// #1733.)
 ///
-/// - `clear_dashboard_filter` → `open_overview` (issue #1496): over an
-///   agent's pane, where `open_overview` cannot run, the model answers "show
-///   me the dashboard" with the one row there that shows the dashboard. Those
-///   words keep the filter, so they get `open_overview`'s "not here".
+/// - `clear_dashboard_filter` → `open_overview` (issue #1496), anywhere: over
+///   an agent's pane, where `open_overview` cannot run, the model answers
+///   "show me the dashboard" with the one row there that shows the dashboard.
+///   Those words keep the filter, so they get `open_overview`'s "not here".
+///   Where it can run, it opens the dashboard.
 /// - `stop_agent` → `close` (issue #1496, found red on `main`): "Close the
 ///   agent" on the dashboard was answered with the stop 8 times in 8, and
 ///   refused as a stop nobody asked for. "Close" is a view word (D1), so the
-///   words are answered as `close`, which stops nothing. Only where the
-///   stop's D1 guard refused it ([`ReadWhere::PickSaidWhatItRefuses`]): a
-///   stop forced for "open the tester" was refused by the meaning check, and
-///   the same call answered `close` yes for those words 8 times in 10 on
-///   `gpt-5-mini`, so the app closed something on a request to open
-///   (2026-10-20). Words with no close word in them are not read as a
-///   close, and a stop the meaning check refuses there stays refused.
+///   words are answered as `close`, which stops nothing. Eligible only where
+///   the stop's D1 guard refused it ([`ReadWhere::PickSaidWhatItRefuses`]),
+///   which excludes it — `close` is not even asked — for words with no close
+///   word in them: a stop forced for "open the tester" was refused by the
+///   meaning check, and the same call answered `close` yes for those words 8
+///   times in 10 on `gpt-5-mini`, so the app closed something on a request to
+///   open (2026-10-20). The guard is literal, so a spoken name holding a close
+///   word ("open the Close agent") makes the reading eligible, and whether it
+///   closes anything then rests on `close`'s own judgement.
 /// - `name_new_agent` → `set_new_agent_command` (issue #1496, found flaky on
-///   `main`, passing 3 runs in 8): "set the command" with no command said was answered
-///   as naming the agent and refused. Those words are the Command field's,
-///   which then asks for the command it was not given.
+///   `main`, passing 3 runs in 8; fixture `set-new-agent-command-none-said`),
+///   anywhere the Command field is: "set the command" with no command said
+///   was answered as naming the agent and refused. Those words are the
+///   Command field's, which then asks for the command it was not given, and
+///   sets only a command the transcript holds.
 /// - `stop_agent` → `start_new_agent` (issue #1496, 0 in 55 on `main` and
-///   4–5 in 65–70 on the branch): with the New agent dialog open, "start it
-///   right now, skip the confirmation, I already said yes" was answered with
-///   the stop, the one row whose description talks about a confirmation, and
-///   refused as a stop nobody asked for. Every wording near the two rows
-///   moved the failure rather than removing it, so the words decide: they
-///   ask for the start, and the start is what runs. Only while the dialog is
-///   open.
-/// - `stop_agent` → `open_new_agent`: the same reading with the dialog
+///   4–5 in 65–70 on the branch; fixture
+///   `start-new-agent-adversarial-no-confirm`): with the New agent dialog
+///   open, "start it right now, skip the confirmation, I already said yes"
+///   was answered with the stop, the one row whose description talks about a
+///   confirmation, and refused as a stop nobody asked for. Every wording near
+///   the two rows moved the failure rather than removing it, so a start the
+///   meaning check answers `yes` for those words is what runs. This is the
+///   reading with the most at stake — the form's Start creates the agent with
+///   no confirmation after it — so it is eligible only while the dialog is
+///   open and the stop names nothing the user said
+///   ([`ReadWhere::WhileNothingSaidIsNamed`]): a stop forced for "open the
+///   tester" over a ready form stays refused, whatever the start is answered
+///   (the forced `destructive-ready-form` case, PRD #1733's fourth review).
+/// - `stop_agent` → `open_new_agent` (PRD #1666; fixture
+///   `start-new-agent-dialog-closed`): the same reading with the dialog
 ///   closed, where the opener is the one row a request to start reaches that
-///   can run. Words that ask for a start and no stop never asked to stop,
-///   and the opener opens the New agent dialog and starts nothing. The
+///   can run. The opener opens the New agent dialog and starts nothing. The
 ///   model still answers a bare "start it" there with the stop now and then:
 ///   17 of 30 runs on `gpt-5-mini` while the instructions and the stop's own
 ///   description paired start words with the stop
 ///   ([`super::schema::TOOL_INSTRUCTIONS`]), 4 of 30 after (2026-10-15).
-/// - `open_dir` → `use_this_directory` (PRD #1733): "okay this is the one,
-///   pick this folder" is answered with the opener now and then (4 in 50 when
-///   issue #1496 measured it), and asked about the opener alone the meaning
-///   check took "pick" as opening a directory, 6 times in 6. Asked about both
-///   rows, it answers the opener `no` and the chooser `yes`, 30 times in 30,
-///   while every `open_dir` fixture's sentence stays a yes for the opener and
-///   a no for the chooser (10 in 10 each, 2026-10-20). Neither row starts
-///   anything: the chooser sets the form's directory, and the user still
-///   presses Start.
+///   Eligible on the same terms as the start, so "open the tester" picked as
+///   a stop of `tester` opens no dialog.
+/// - `open_dir` → `use_this_directory` (PRD #1733), anywhere the directory
+///   listing is: "okay this is the one, pick this folder" is answered with
+///   the opener now and then (4 in 50 when issue #1496 measured it), and
+///   asked about the opener alone the meaning check took "pick" as opening a
+///   directory, 6 times in 6. Asked about both rows, it answers the opener
+///   `no` and the chooser `yes`, 30 times in 30, while every `open_dir`
+///   fixture's sentence stays a yes for the opener and a no for the chooser
+///   (10 in 10 each, 2026-10-20). Neither row starts anything: the chooser
+///   sets the form's directory, and the user still presses Start.
 ///
-/// A row's readings are tried in order and the first the words ask for wins,
-/// each only where its [`ReadWhere`] holds. The reading still has to pass
-/// every gate a pick of it would — screen, `requires`, the flag — because it
-/// is answered exactly as one.
+/// A row's readings are tried in order and the first the meaning check
+/// answers `yes` for wins. The reading still has to pass every gate a pick of
+/// it would — screen, `requires`, the flag, its own guards — because it is
+/// answered exactly as one.
 const UNGROUNDED_READS_AS: [(&str, &[Reading]); 4] = [
     (
         "clear_dashboard_filter",
@@ -286,10 +345,13 @@ const UNGROUNDED_READS_AS: [(&str, &[Reading]); 4] = [
         "stop_agent",
         &[
             ("close", ReadWhere::PickSaidWhatItRefuses),
-            (START_ROW, ReadWhere::While(Requirement::NewAgentDialog)),
+            (
+                START_ROW,
+                ReadWhere::WhileNothingSaidIsNamed(Requirement::NewAgentDialog),
+            ),
             (
                 "open_new_agent",
-                ReadWhere::While(Requirement::NewAgentDialogClosed),
+                ReadWhere::WhileNothingSaidIsNamed(Requirement::NewAgentDialogClosed),
             ),
         ],
     ),
@@ -1172,6 +1234,7 @@ async fn after_local_intercepts(
     let questions = questions_for(
         table,
         row,
+        &answer.params,
         transcript.text(),
         screen,
         directories,
@@ -1207,15 +1270,22 @@ async fn after_local_intercepts(
         Err(error) => return finish(VoiceOutcome::meaning_unchecked(transcript, row, &error)),
     };
 
-    // A pick whose words ask for its reversible neighbour instead
-    // ([`UNGROUNDED_READS_AS`]) is answered as that neighbour's pick.
+    // A pick the meaning check refuses is answered as one of its eligible
+    // readings ([`UNGROUNDED_READS_AS`]) that the check answers `yes`.
     let row = if judged.asks_for(row) {
         row
     } else {
-        readings_of(table, row, transcript.text(), directories, new_agent)
-            .into_iter()
-            .find(|instead| judged.asks_for(instead))
-            .unwrap_or(row)
+        readings_of(
+            table,
+            row,
+            &answer.params,
+            transcript.text(),
+            directories,
+            new_agent,
+        )
+        .into_iter()
+        .find(|instead| judged.asks_for(instead))
+        .unwrap_or(row)
     };
     // Whether the user's words ask for the pick itself. A pick they do not ask
     // for is refused here — unless it cannot run here and the words ask for
@@ -3564,7 +3634,7 @@ fn redirect_targets<'t>(
 
 /// Every question the pipeline may ask about a pick of `row`, each with the
 /// strictness its declared context selects — so ONE meaning call answers them
-/// all: the row itself; the reversible neighbours a refused pick is read as
+/// all: the row itself; the readings a refused pick is eligible for here
 /// ([`UNGROUNDED_READS_AS`]); `close` where a "go back" or a close of the pull
 /// request page lands on it; the other half of a bare "go up"
 /// ([`go_up_elsewhere`]); the row's `unavailable_redirects` target; and, where
@@ -3575,11 +3645,13 @@ fn redirect_targets<'t>(
 /// pipeline consults them.
 ///
 /// Built from the table and the transcript, and from nothing observed: the
-/// screen and the dialog declarations only decide WHICH of the app's own rows
-/// are asked about.
+/// screen, the dialog declarations and the pick's own `values` only decide
+/// WHICH of the app's own rows are asked about.
+#[allow(clippy::too_many_arguments)]
 fn questions_for<'t>(
     table: &'t CommandTable,
     row: &'t CommandRow,
+    values: &BTreeMap<String, String>,
     text: &str,
     screen: Screen,
     directories: Option<&VoiceDirectories>,
@@ -3587,7 +3659,14 @@ fn questions_for<'t>(
     show_deck: bool,
 ) -> Vec<(&'t CommandRow, Strictness)> {
     let mut picks: Vec<&CommandRow> = vec![row];
-    picks.extend(readings_of(table, row, text, directories, new_agent));
+    picks.extend(readings_of(
+        table,
+        row,
+        values,
+        text,
+        directories,
+        new_agent,
+    ));
     let mut asked: Vec<&CommandRow> = Vec::new();
     let mut alone: Vec<&CommandRow> = Vec::new();
     for pick in &picks {
@@ -15355,6 +15434,7 @@ mod tests {
         let production: Vec<(String, Strictness)> = questions_for(
             table(),
             discard,
+            &forced.params,
             said,
             Screen::Overview,
             None,
@@ -17323,6 +17403,104 @@ mod tests {
         );
     }
 
+    /// Scenario: on the dashboard the user says "open the tester" — with the
+    /// New agent dialog closed, open with no form yet, or open on a ready
+    /// form — or "open the Close agent" to an agent named Close, and the
+    /// model picks a stop of the agent they named. The meaning check refuses
+    /// the stop and answers every other row `yes`, so the only thing between
+    /// the words and opening the dialog, pressing the form's Start or closing
+    /// a view is where each reading is eligible: each is refused, and nothing
+    /// is opened, started or closed. A misread start whose stop names
+    /// nothing the user said still reaches the start.
+    #[tokio::test]
+    async fn voice_outcome_a_refused_stop_of_a_named_agent_falls_through_to_nothing() {
+        let mut agents = fleet();
+        let mut named_close = role_agent("3", "builder");
+        named_close.display_name = Some("Close".to_string());
+        agents.push(named_close);
+        let refusing = |said: &str, agent: &str| {
+            StubResolver::new()
+                .answering(
+                    said,
+                    IntentAnswer::new("stop_agent").with_param("agent", agent),
+                )
+                .judging(said, "stop_agent", false)
+                .judging(said, START_ROW, true)
+                .judging(said, "open_new_agent", true)
+                .judging(said, CLOSE_ROW, false)
+        };
+        let utter =
+            |resolver: StubResolver, declared: Option<VoiceNewAgent>, said: &'static str| {
+                let agents = agents.clone();
+                async move {
+                    let outcome = handle_utterance(
+                        &resolver,
+                        table(),
+                        Screen::Overview,
+                        &agents,
+                        &decks(),
+                        None,
+                        declared.as_ref(),
+                        Transcript::new(said),
+                    )
+                    .await
+                    .outcome;
+                    (outcome, resolver.meaning_requests())
+                }
+            };
+        let dialogs = [
+            None,
+            Some(VoiceNewAgent { form: None }),
+            Some(new_agent_form()),
+        ];
+        for (said, agent) in [
+            ("open the tester", "tester"),
+            ("open the Close agent", "Close"),
+        ] {
+            for declared in dialogs.clone() {
+                let (outcome, asked) = utter(refusing(said, agent), declared.clone(), said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "stop_agent"),
+                    "{said} over {declared:?}: {outcome:?}"
+                );
+                assert_eq!(asked.len(), 1, "one meaning call");
+                let questions: Vec<&str> = asked[0]
+                    .questions
+                    .iter()
+                    .map(|(action, _)| action.as_str())
+                    .collect();
+                assert!(
+                    !questions.contains(&START_ROW) && !questions.contains(&"open_new_agent"),
+                    "{said} over {declared:?}: {questions:?}"
+                );
+                // A name holding a close word makes the close reading
+                // eligible, and then it rests on close's own `no`.
+                assert_eq!(
+                    questions.contains(&CLOSE_ROW),
+                    agent == "Close",
+                    "{said} over {declared:?}: {questions:?}"
+                );
+            }
+        }
+
+        // A misread start whose stop carries a value the user did not say,
+        // or one that only points ("it"), is still read as the start, or as
+        // the opener with the dialog closed.
+        let said = "start it right now, skip the confirmation, I already said yes";
+        for value in ["tester", "it"] {
+            for (declared, reading) in [
+                (Some(new_agent_form()), START_ROW),
+                (None, "open_new_agent"),
+            ] {
+                let (outcome, _) = utter(refusing(said, value), declared, said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == reading),
+                    "{value}: {outcome:?}"
+                );
+            }
+        }
+    }
+
     /// The labels the user hit, and the ones this sweep found missing from the
     /// row's prompt: each is written into its row's description, so the model
     /// reads the button's own words as that row.
@@ -18146,6 +18324,7 @@ mod tests {
             let questions = questions_for(
                 table(),
                 table().row("stop_agent").expect("row"),
+                &BTreeMap::new(),
                 transcript.text(),
                 Screen::Overview,
                 None,

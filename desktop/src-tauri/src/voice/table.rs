@@ -484,7 +484,8 @@ pub struct CommandRow {
     /// #1045), and the meaning check, reading the row's description, answered
     /// "Close tester agent" as a stop in 5 of 5 runs on `gpt-5-mini`
     /// (2026-10-20) — so the rule is held in code, not left to a model. It
-    /// only ever refuses, and the refused pick is then read as `close`
+    /// only ever refuses, and the refused pick is then eligible to be read as
+    /// `close` when the meaning check answers `close` yes
     /// (`outcome::UNGROUNDED_READS_AS`), which stops nothing; its cost is a
     /// sentence that says "close" and also asks to stop ("close the pane and
     /// stop the tester") being refused, which the user repeats as a stop.
