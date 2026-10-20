@@ -16,7 +16,7 @@
     "rustfmt":                      "1.98.1",
     "path:gcloud#google-cloud-sdk": "",
     "asciinema-agg":                "1.9.0",
-    "ffmpeg":                       "9.0.1",
+    "ffmpeg":                       "9.0.2",
     "jq":                           "1.8.2",
     "curl":                         "8.22.0",
     "ripgrep":                      "15.2.0",
