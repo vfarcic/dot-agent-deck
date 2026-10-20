@@ -411,14 +411,15 @@ impl EndpointMatrix {
     /// anything this harness can know in advance: every build before #1121
     /// binds the flat pair; a build with #1121 binds the per-uid pair; and a
     /// build with #1211 as well also holds the flat pair beside it, in the same
-    /// process, as an alias. That holds in both directions — in reverse the
-    /// daemon is a branch build, in forward it is the previous release (v0.41.0
-    /// and older bind the flat pair; #1121 and #1211 landed together in #1179,
-    /// first released in v0.41.1).
+    /// process, as an alias, until #1213 removed it. That holds in both
+    /// directions — in reverse the daemon is a branch build, in forward it is
+    /// the previous release (v0.41.0 and older bind the flat pair; #1121 and
+    /// #1211 landed together in #1179, first released in v0.41.1; #1213 then
+    /// removed the alias).
     ///
-    /// #1211's alias is best-effort per address (`bind_legacy_aliases` in
-    /// `src/daemon.rs` skips a hook or attach alias it cannot clear, and both
-    /// when their lock is unavailable or another daemon answers there), so the
+    /// #1211's alias is best-effort per address (the releases that bind it skip
+    /// a hook or attach alias they cannot clear, and both when their lock is
+    /// unavailable or another daemon answers there), so the
     /// per-uid layout is a candidate with every subset of the flat pair as its
     /// aliases, the whole pair first. A skipped alias is then held absent like
     /// any other address outside the layout.
