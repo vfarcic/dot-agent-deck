@@ -1982,11 +1982,11 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** authoring seed delivery or the spawned agent's command behavior.
 - **Platform coverage:** mac+linux.
 
-##### prompt/new-pane/009 — The built-in `[schedule]` Mode chip stays fully visible inside the modal even when the chip row is wider than the modal (overflow regression guard).
-- **Layer:** L2 (no public L1 render seam for the dialog — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
-- **Agent:** none (drives Ctrl+n → dir-picker → new-pane form, then cycles the Mode field to the `schedule` option).
-- **Asserts:** with two long orchestration chips widening the Mode row beyond the capped modal, selecting the trailing `[schedule]` option leaves that chip fully visible between the modal borders. This passes with wrapping or windowing.
-- **Does not assert:** the exact layout used to keep the chip visible (wrap vs. window/scroll); the visibility of the non-selected chips when the row overflows; the authoring hint text (covered by `prompt/new-pane/007`).
+##### prompt/new-pane/009 — Every Mode chip, the built-in `[schedule]` included, stays fully visible inside the modal at 80 columns, where the chip row is wider than the capped modal and wraps onto further rows (PRD #168).
+- **Layer:** L2 (the real dialog is driven via PTY keystrokes and asserted on the rendered vt100 grid; the L1 half of the wrap is `render/layout/007`).
+- **Agent:** none (drives Ctrl+n → dir-picker → new-pane form at 80×24, then cycles the Mode field to the `schedule` option).
+- **Asserts:** with two long orchestration chips widening the Mode row past the modal's 90%-of-terminal cap at 80 columns, selecting the trailing `[schedule]` option leaves every chip — `[No mode]`, both `[Orch: …]` chips, `[schedule]` and `[dispatcher]` — fully visible between the modal borders, and the chips occupy more than one row.
+- **Does not assert:** which chip lands on which row; the selected-chip highlight and click rects on a wrapped row (covered at L1 by `ui::tests::new_pane_form_wrapped_mode_chips_keep_highlight_and_click_targets`); the authoring hint text (covered by `prompt/new-pane/007`).
 - **Platform coverage:** mac+linux.
 
 ##### prompt/new-pane/010 — The new-pane Mode cycler offers an experimental `schedule: issues` issue-dispatch authoring option only when the experimental flag is ON; it is hidden when OFF while the plain `[schedule]` option still shows (PRD #120).
@@ -3352,6 +3352,13 @@ note).
 - **Agent:** none (two synthetic role panes, `orchestrator` focused and `worker` not).
 - **Asserts:** rendered UNZOOMED at 100x30 the focused role's pane box starts at the 34%-width sidebar boundary, the non-focused `worker` role is visible beside it, and no zoom indicator is drawn; rendered ZOOMED the same frame puts the focused pane's box at column 0 — it still HAS a box, so the border that carries the title, the focus/status colour (PRD #155 M3) and the command-mode weight (`9345a74`) was not dropped along with the sidebar, which is PRD #313 Open Question 2's decision — the `worker` role appears nowhere at all, and the border title carries `[Z]`, mirroring tmux's status-line marker so nobody concludes their other agents disappeared.
 - **Does not assert:** the geometry arithmetic itself (covered by `orchestration/layout/008`); the PTY dims the same layout drives (covered by `orchestration/layout/010`); the live rendered grid and the key that produces it (covered by the PTY-attached `tabs/orchestration/011`).
+- **Platform coverage:** mac+linux+windows.
+
+##### render/layout/007 — A new-pane Mode chip row wider than the capped modal wraps onto further rows instead of clipping, and the fields below re-flow (PRD #168).
+- **Layer:** L1 (in-process `TestBackend` via `render_new_pane_form_to_buffer`; no PTY, no subprocess). Structural assertions first, an `insta` snapshot of the frame after them.
+- **Agent:** none (renders the new-pane form with four long orchestration names into an 80×30 buffer).
+- **Asserts:** every Mode chip — `[No mode]`, the four `[Orch: …]` chips, `[schedule]` and `[dispatcher]` — renders whole, exactly once, between the modal's `│ … │` borders; the chips occupy more than one row; and the `Name:` and `Command:` fields still render on rows of their own below them.
+- **Does not assert:** the highlight and click rects of a chip on a wrapped row (covered by `ui::tests::new_pane_form_wrapped_mode_chips_keep_highlight_and_click_targets`); the live binary at 80 columns (covered by `prompt/new-pane/009`); behaviour on a terminal too short for the form (covered by `render/layout/005`).
 - **Platform coverage:** mac+linux+windows.
 
 #### render/seam-bound

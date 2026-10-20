@@ -1,0 +1,27 @@
+---
+source: tests/render_layout.rs
+expression: text
+---
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+    ┌ New Agent ───────────────────────────────────────────────────────────┐    
+    │  Dir: /tmp/project                                                   │    
+    │                                                                      │    
+    │  Mode:  [No mode] [Orch: ci-deployment-alpha]                        │    
+    │         [Orch: ci-deployment-bravo]                                  │    
+    │         [Orch: release-pipeline-charlie]                             │    
+    │         [Orch: nightly-regression-delta] [schedule] [dispatcher]     │    
+    │                                                                      │    
+    │  Name:    myname                                                     │    
+    │                                                                      │    
+    │  Command: mycmd                                                      │    
+    │                                                                      │    
+    │ [Submit] [Cancel]                                                    │    
+    │  Tab: switch  ◀▶: mode  Enter: next  Esc: cancel                     │    
+    │                                                                      │    
+    │                                                                      │    
+    └──────────────────────────────────────────────────────────────────────┘

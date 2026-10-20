@@ -1,6 +1,6 @@
 # PRD #168: Wrap the new-pane Mode-chip row instead of clipping it
 
-**Status**: Planning
+**Status**: Complete (2026-10-20)
 **Priority**: Low
 **Created**: 2026-06-15
 **GitHub Issue**: [#168](https://github.com/vfarcic/dot-agent-deck/issues/168)
@@ -32,11 +32,20 @@ PRD #144 deliberately accepted this clip as the consequence of the approved "con
 
 ## Implementation Milestones
 
-- [ ] **Mode-chip row wraps** onto additional rows inside the content-sized new-pane/new-deck modal — no horizontal clip.
-- [ ] **Trailing `[schedule]` chip stays fully visible and selectable** at narrow widths with a large mode/orchestration list.
-- [ ] **Cycler + highlight + field re-flow correct** across wrapped rows (Mode cycling, selected-chip highlight, no overlap with fields below).
-- [ ] **Tests** cover the overflow case — extend `prompt/new-pane/009` (and/or add a sibling test) at a width where the single-row layout would clip, proving every chip is visible after wrap; degenerate-size guard stays green.
-- [ ] **Docs/changelog** updated if user-visible — changelog fragment; **no experimental flag** (visible by default, consistent with PRD #144).
+- [x] **Mode-chip row wraps** onto additional rows inside the content-sized new-pane/new-deck modal — no horizontal clip.
+- [x] **Trailing `[schedule]` chip stays fully visible and selectable** at narrow widths with a large mode/orchestration list.
+- [x] **Cycler + highlight + field re-flow correct** across wrapped rows (Mode cycling, selected-chip highlight, no overlap with fields below).
+- [x] **Tests** cover the overflow case — extend `prompt/new-pane/009` (and/or add a sibling test) at a width where the single-row layout would clip, proving every chip is visible after wrap; degenerate-size guard stays green.
+- [x] **Docs/changelog** updated if user-visible — changelog fragment; **no experimental flag** (visible by default, consistent with PRD #144).
+
+## Decisions
+
+- **2026-10-20 — Wrap, not window/scroll.** Reading `render_new_pane_form` showed no reason against wrap: every overlay is already placed by line index and bounded by the PRD #144 A1 guard, so extra chip rows slot in the same way. All chips stay visible at once and it matches the button-bar wrap. The clip reproduced at `origin/main` (`1f2ca35b`) before the change: at 80×30 with four long orchestration names the row ended mid-`[Orch: ci-deployment-br` and `[schedule]`/`[dispatcher]` were gone (`render/layout/007`, RED first).
+- **2026-10-20 — Wrap only once the modal is capped.** The modal stays content-sized: it first grows in width to hold the whole row on one line (PRD #144), and only when `modal_rect`'s 90% cap stops it does the row wrap and the modal grow in height. Because `modal_rect` clamps each axis independently, the width is settled first and the chip rows (and the Mode block's height) are computed from it. Wrapped rows start under the first chip; a chip wraps when it would end inside the 2-column right margin the content width already reserves. The layout lives inline in `render_new_pane_form`, not in a separate helper, per this PRD's Out of Scope.
+- **2026-10-20 — Re-flow, then the existing clamp.** The taller Mode block pushes Name, Command, the hint and the buttons down. On a terminal too short for the result the modal is clamped to 90% of its height as before, and chip rows that fall past the popup are skipped, like every other overlay row under the A1 guard.
+- **2026-10-20 — A single over-wide chip is clipped on its own row.** At a width where one chip is wider than the modal's inner width, that chip keeps a row to itself and is clipped there; the chips after it still wrap normally. Sub-80-col remains out of scope; at 80 columns an orchestration name of up to 51 characters fits whole.
+- **2026-10-20 — Desktop parity (CLAUDE.md rule 22): already wraps.** `desktop/src/components/NewAgentDialog.tsx` renders its chips in `.new-agent-chips { flex-wrap: wrap }`, and with Voice on it pages them instead. A new Playwright check (`voice-off modes wrap whole in a narrow window` in `desktop/e2e/voice-paged-lists.spec.ts`) pins that, at 420 px with the crowded project's twelve orchestration chips plus No mode and the built-in ones, every chip is whole inside the Mode field and the dialog across several rows; it fails if the wrap is removed. No desktop code changed.
+- **2026-10-20 — No experimental flag.** This changes an existing surface rather than adding one (CLAUDE.md rule 9 does not apply).
 
 ## Success Criteria
 

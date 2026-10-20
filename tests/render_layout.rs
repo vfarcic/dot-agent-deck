@@ -25,6 +25,10 @@
 //! characters and no attributes, so there a display name spelling `[Z]` is
 //! indistinguishable from the real marker, while here the `Buffer` keeps the
 //! cells and the marker's own `zoom_marker_style` span is visible.
+//!
+//! The fourth (`render/layout/007`, PRD #168) pins the new-pane form's Mode
+//! chip row wrapping, rather than clipping, once it is wider than the modal's
+//! 90%-of-terminal cap.
 
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
@@ -226,4 +230,71 @@ fn layout_006_zoom_hides_the_sidebar_and_keeps_the_marked_border() {
     // record the whole frame for review and for browsing the diff.
     insta::assert_snapshot!("layout_006_orchestration_unzoomed", unzoomed);
     insta::assert_snapshot!("layout_006_orchestration_zoomed", zoomed);
+}
+
+/// Scenario: Render the new-pane form with four long orchestration names into
+/// an 80×30 `TestBackend` buffer, so the Mode chip row (`[No mode]`, four
+/// `[Orch: …]` chips, `[schedule]`, `[dispatcher]`) is far wider than the modal,
+/// which is capped at 90% of the terminal. Every chip must render whole between
+/// the modal's `│ … │` borders on some row, exactly once, and the Name and
+/// Command fields must still render below the chips rather than being
+/// overwritten by them (PRD #168: the chip row wraps instead of clipping).
+#[spec("render/layout/007")]
+#[test]
+fn layout_007_new_pane_mode_chips_wrap_instead_of_clipping() {
+    const ORCHESTRATIONS: [&str; 4] = [
+        "ci-deployment-alpha",
+        "ci-deployment-bravo",
+        "release-pipeline-charlie",
+        "nightly-regression-delta",
+    ];
+    let buffer = render_new_pane_form_to_buffer(&ORCHESTRATIONS, 80, 30);
+    let text = joined_rows(&buffer);
+
+    // The inner span of every row that carries both modal borders.
+    let bar = '\u{2502}';
+    let inner_rows: Vec<&str> = text
+        .lines()
+        .filter_map(|line| match (line.find(bar), line.rfind(bar)) {
+            (Some(l), Some(r)) if r > l => Some(&line[l + bar.len_utf8()..r]),
+            _ => None,
+        })
+        .collect();
+
+    let mut chips: Vec<String> = vec!["[No mode]".to_string()];
+    chips.extend(ORCHESTRATIONS.iter().map(|n| format!("[Orch: {n}]")));
+    chips.push("[schedule]".to_string());
+    chips.push("[dispatcher]".to_string());
+    for chip in &chips {
+        let count: usize = inner_rows
+            .iter()
+            .map(|row| row.matches(chip.as_str()).count())
+            .sum();
+        assert_eq!(
+            count, 1,
+            "the Mode chip {chip} must render whole, exactly once, between the \
+             new-pane modal's borders — a chip row wider than the modal wraps \
+             onto further rows instead of clipping its trailing chips\n{text}"
+        );
+    }
+
+    // The chips wrapped (more than one row carries them) and the fields below
+    // re-flowed: Name and Command each keep a row of their own.
+    let chip_rows = inner_rows
+        .iter()
+        .filter(|row| chips.iter().any(|c| row.contains(c.as_str())))
+        .count();
+    assert!(
+        chip_rows > 1,
+        "at 80 columns this chip row cannot fit one modal row, so it must wrap \
+         onto more than one\n{text}"
+    );
+    for field in ["Name:    myname", "Command: mycmd"] {
+        assert!(
+            inner_rows.iter().any(|row| row.contains(field)),
+            "the {field:?} field must still render below the wrapped chip rows\n{text}"
+        );
+    }
+
+    insta::assert_snapshot!("layout_007_new_pane_mode_chips_wrapped", text);
 }
