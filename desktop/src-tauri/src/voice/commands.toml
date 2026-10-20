@@ -872,19 +872,24 @@ meaning     = "write"
 # pane does (the panel owns the state — `VoiceControlPanel.tsx`).
 #
 # **The descriptions say the listed phrasings are examples (PRD #1733)**, so
-# neither is a word list for either model. Their first wording for that, "Use
-# when the user asks for this and nothing else: …", moved a row they do not
-# touch: on an agent's screen the command model filled `open_pr`'s `agent` with
-# the request itself ("open the PR", "the pull request") in 52 of 400 replays
-# of fixtures `open-pr` and `open-pr-show-the-pull-request`, against 19 of 400
-# with the wording before PRD #1733; reverting only this pair accounted for
-# most of it. "Use only when the WHOLE utterance asks for this, as … or the same
-# request in other words do", with `open_pr`'s own sentence below: 19 of 400,
-# both paraphrase fixtures still 30 of 30, and the meaning check unchanged on
-# the pair's sentences ("done typing, thanks" 32 of 40 against 28; "we should
-# stop typing the logs" 4 of 40 against 4) (2026-10-20, `gpt-5-mini`). The
-# closer "Use only when the WHOLE utterance is …, or the same request in other
-# words" made the check refuse "done typing, thanks" more (17 of 40).
+# neither is a word list for either model, and the meaning check reads them as
+# examples whatever they say. Their first wording for that, "Use when the user
+# asks for this and nothing else: …", was the edit that moved fixtures
+# `open-pr` and `open-pr-show-the-pull-request` (the command model filling
+# `open_pr`'s `agent` with the request itself): reverting only this pair took
+# 52 of 400 replays down to 16 of 300, and this wording took them to 19 of 400,
+# the rate before PRD #1733 (2026-10-20, `gpt-5-mini`). That rate is not a
+# property of this pair alone: with the later `choose_mode` and `hush_reading`
+# edits beside it, the same replays measured 36 of 400 against 19 for the
+# wording before PRD #1733 and 40 for "nothing else". Both paraphrase fixtures
+# route 30 of 30 either way, and the meaning check reads the pair's sentences
+# as it did ("done typing, thanks" 32 of 40 against 28; "we should stop typing
+# the logs" 4 of 40 against 4). The closer "Use only when the WHOLE utterance
+# is …, or the same request in other words" made the check refuse "done
+# typing, thanks" more (17 of 40), and a sentence in `open_pr`'s description
+# saying the request's own words name no agent made it refuse "close the PR"
+# over the pull request page as a close (84 of 100 against 97), so neither
+# shipped.
 [[commands]]
 id          = "dictation_on"
 description = """Start typing mode for the open agent: from now on everything the user says is
@@ -1510,11 +1515,6 @@ try_saying  = "scroll to the bottom"
 # `action_words` holds `pr`, the id's own word: speech-to-text writes "PR" or
 # "P.R.", and a word split across adjacent words is still set aside before the
 # agent reference is read.
-#
-# The description says the words asking for the pull request name no agent:
-# with no agent named, the command model sometimes answered `agent` with the
-# request itself, which no agent matches, so the pick was refused. See the
-# dictation pair above for the measurements (PRD #1733).
 [[commands]]
 id          = "open_pr"
 description = """Open one agent's pull request: GitHub's page for it, inside the app, over the current
@@ -1522,8 +1522,7 @@ screen — the voice form of the pull request badge on an agent's dashboard row.
 show the PR, open the pull request, show the pull request, show me its pull request, look at the
 pull request, open the PR for the coder, open the coder's PR, show the pull request for the
 reviewer, or open the tester's pull request. Set `agent` the way `open_agent` does when the user
-names an agent, to the words that name it and no others; leave it out when they name none — the
-words asking for the pull request name no agent. On an agent's screen no agent means the agent whose
+names an agent; leave it out when they name none — on an agent's screen that means the agent whose
 pane is open, and on the dashboard the app asks which agent. It opens a page to read and nothing
 else: it does not merge, approve, comment on or change the pull request. An agent with no pull
 request has none to open, and the app says so."""
