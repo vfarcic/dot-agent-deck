@@ -20729,6 +20729,60 @@ mod tests {
         cards[0].clone()
     }
 
+    /// Scenario: Give a live pane a bare placeholder or only its own SessionStart, then age its session and pane timestamps by five seconds, one day and to the oldest representable startup without another agent signal. Aging must not change doorbell admission; the paired PTY pins require silence without own readiness, and an own Idle here must admit the pane at each age.
+    #[spec("inbox/doorbell/008")]
+    #[test]
+    fn doorbell_008_session_age_cannot_change_readiness() {
+        for session_start in [false, true] {
+            let now = Utc::now();
+            for old in [
+                now - chrono::TimeDelta::seconds(5),
+                now - chrono::TimeDelta::days(1),
+                DateTime::<Utc>::MIN_UTC,
+            ] {
+                let age_secs = (now - old).num_seconds();
+                let mut state = AppState::default();
+                state.register_pane("pane-x".into());
+                state.insert_placeholder_session(
+                    "pane-x".into(),
+                    None,
+                    Some(AgentType::ClaudeCode),
+                    Some("agent-x".into()),
+                );
+                let own_event = |kind| {
+                    let mut event = codex_status_frame(kind, false, 0);
+                    event.agent_type = AgentType::ClaudeCode;
+                    event.timestamp = Utc::now();
+                    event
+                };
+                if session_start {
+                    state.apply_event(own_event(EventType::SessionStart));
+                }
+                let fresh = state.doorbell_admission("agent-x", "pane-x").is_some();
+                // These are the actual wall-clock age sources, not the
+                // separate monotonic doorbell retry/stall decision clock.
+                for session in state.sessions.values_mut() {
+                    session.started_at = old;
+                    session.last_activity = old;
+                    for event in &mut session.recent_events {
+                        event.timestamp = old;
+                    }
+                }
+                state.pane_started_at.insert("pane-x".into(), old);
+                assert_eq!(
+                    state.doorbell_admission("agent-x", "pane-x").is_some(),
+                    fresh,
+                    "session age must not grant readiness: age={age_secs}s, SessionStart={session_start}"
+                );
+                state.apply_event(own_event(EventType::Idle));
+                assert!(
+                    state.doorbell_admission("agent-x", "pane-x").is_some(),
+                    "own Idle must admit the live pane at age={age_secs}s"
+                );
+            }
+        }
+    }
+
     /// Scenario: a deck-launched Codex's native hooks start a session and
     /// submit a prompt, and only then does the wrapper's interface-ready start
     /// arrive, stamped after them because the wrapper noticed the interface

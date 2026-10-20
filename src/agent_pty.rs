@@ -12862,6 +12862,19 @@ impl AgentPtyRegistry {
         records
     }
 
+    /// Age the actual process-start source in one isolated readiness fixture.
+    /// Not present without e2e, and inert unless the test calls it explicitly.
+    #[cfg(feature = "e2e")]
+    pub fn set_spawned_at_for_test(&self, agent_id: &str, at: chrono::DateTime<chrono::Utc>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get_mut(agent_id)
+            .expect("fixture owns the live agent")
+            .spawned_at = Some(at);
+    }
+
     /// The record [`Self::agent_record_any`] returns, built under a lock the
     /// caller already holds.
     fn cleanup_record(id: &str, agent: &RunningAgent) -> AgentRecord {

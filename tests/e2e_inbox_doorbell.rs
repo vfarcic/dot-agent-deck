@@ -282,11 +282,28 @@ fn doorbell_007_outstanding_ring_gets_pre_ring_and_cleanup_cr() {
     }
 }
 
-/// Scenario: Hold a task behind an old agent's human draft, stop it, and spawn a new agent in the same pane identity. A predecessor-session ShellIdle must not type into the replacement at controlled policy ages of 5 seconds, 10 seconds and up to one day, nor during the real observation window; its own Idle then submits only the newly bound task, which can be fetched.
+/// Scenario: Hold a task behind an old agent's human draft, stop it, and spawn a new agent in the same pane identity, on both one-worker and four-worker daemons. A predecessor-session ShellIdle must not type into the replacement at completed policy ages of 5 seconds, 10 seconds and up to one day, nor during the real observation window; its own Idle then submits only the newly bound task, which can be fetched.
 #[spec("inbox/doorbell/008")]
 #[test]
 fn doorbell_008_respawn_never_rings_old_agents_message() {
-    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers")]);
+    for workers in ["1", "4"] {
+        assert_respawn_waits_for_ready(workers);
+    }
+}
+
+fn assert_respawn_waits_for_ready(workers: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let daemon = daemon_unbound(&[
+        ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
+        ("TOKIO_WORKER_THREADS", workers),
+    ]);
+    // Prepare this fixture's control directory before the first human-input
+    // observation. A daemon-side mkdir can race its socket-bind umask and
+    // leave the directory without the owner's search bit.
+    let controls = daemon.home.join("ring-barriers");
+    std::fs::create_dir_all(&controls).unwrap();
+    std::fs::set_permissions(&controls, std::fs::Permissions::from_mode(0o700)).unwrap();
     let old = pane(&daemon, "respawn");
     status(&daemon, &old, "idle", "claude_code");
     let user = input(&daemon, &old, DRAFT);
@@ -340,7 +357,7 @@ fn doorbell_008_respawn_never_rings_old_agents_message() {
     assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
 }
 
-/// Scenario: Seed only the bare hydrated placeholder for a live synthetic pane and queue a task. An Idle placeholder must receive zero automatic bytes before the agent reports its own readiness; after its Idle hook, the fixed line is submitted and the task can be fetched.
+/// Scenario: Seed only the bare hydrated placeholder for a live synthetic pane, with its actual session and process startup timestamps set to the oldest representable value, and queue a task. An Idle placeholder must receive zero automatic bytes before the agent reports its own readiness; after its Idle hook, the fixed line is submitted and the task can be fetched.
 #[spec("inbox/doorbell/008")]
 #[test]
 fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
@@ -376,6 +393,36 @@ fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
         let mut state = fixture.daemon.state.write().await;
         state.register_pane(pane.id.clone());
         state.insert_placeholder_session(pane.id.clone(), None, None, Some(pane.agent.clone()));
+        // Age the data the real admission and its independent writer recheck
+        // read, rather than only the scheduler's injected decision clock.
+        let old = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+        let mut aged = 0;
+        for session in state.sessions.values_mut() {
+            if session.agent_id.as_deref() == Some(pane.agent.as_str()) {
+                session.started_at = old;
+                session.last_activity = old;
+                for event in &mut session.recent_events {
+                    event.timestamp = old;
+                }
+                aged += 1;
+            }
+        }
+        assert_eq!(aged, 1, "the actual placeholder generation must be aged");
+        fixture
+            .daemon
+            .registry
+            .set_spawned_at_for_test(&pane.agent, old);
+        assert!(
+            fixture
+                .daemon
+                .registry
+                .agent_records()
+                .iter()
+                .any(|record| {
+                    record.id == pane.agent && record.spawned_at_ms == Some(old.timestamp_millis())
+                }),
+            "the independent process-start source must also be aged"
+        );
     });
     let id = enqueue(&fixture, &pane, BODY);
     assert!(

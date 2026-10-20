@@ -556,13 +556,19 @@ pub fn spawn(
             #[cfg(not(feature = "e2e"))]
             run_tick(&registry, &state, &config, &slots).await;
             #[cfg(feature = "e2e")]
-            if let Some((root, ms)) = clock_step
-                && slots
+            if let Some((root, ms)) = clock_step {
+                // Stop scheduling this controlled step while its attempts are
+                // in flight. In particular, a writer-only readiness guard may
+                // withhold every attempt; let that child finish before acking,
+                // including on a one-worker runtime.
+                while slots
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .values()
-                    .all(|slot| !slot.busy)
-            {
+                    .any(|slot| slot.busy)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
                 std::fs::write(root.join("clock-observed"), ms.to_string())
                     .expect("report completed policy tick");
             }
