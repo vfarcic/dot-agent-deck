@@ -19237,10 +19237,13 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // behavior and the render stays byte-identical.
     let show_mode = form.has_mode_field && !form.schedule_locked;
     let show_name = !form.schedule_locked;
-    // PRD #144: the Mode chips render on a SINGLE row (no `layout_mode_chips`
-    // wrap band-aid) and the modal is content-sized via `modal_rect` to be wide
-    // enough to contain the whole row — so the trailing `[schedule]` chip is
-    // never clipped. `  Mode: ` is 8 cols; chips start one space after it.
+    // PRD #144: the modal is content-sized via `modal_rect`, wide enough to hold
+    // the whole Mode chip row on one line whenever the terminal allows it.
+    // PRD #168: once that width reaches `modal_rect`'s 90% cap, the chips WRAP
+    // onto further rows and the modal grows in height instead, so no chip — the
+    // trailing built-in ones included — is clipped at the right border.
+    // `  Mode: ` is 8 cols; chips start one space after it, and every wrapped
+    // row starts at that same column.
     let chip_label_w: u16 = 8; // "  Mode: "
     let first_chip_x: u16 = chip_label_w + 1;
     let chip_widths: Vec<u16> = if show_mode {
@@ -19250,34 +19253,13 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     } else {
         Vec::new()
     };
-    // x-offset of each chip on the single chip row (relative to the inner area):
-    // each chip follows the previous one plus a trailing space.
-    let chip_x_offsets: Vec<u16> = {
-        let mut xs = Vec::with_capacity(chip_widths.len());
-        let mut cx = first_chip_x;
-        for &w in &chip_widths {
-            xs.push(cx);
-            cx = cx.saturating_add(w).saturating_add(1);
-        }
-        xs
-    };
-    // Inner width the chip row needs: the rightmost chip's end column.
-    let chip_row_w = chip_x_offsets
+    // Inner width the chip row needs on ONE line: every chip plus a separating
+    // space, after the label.
+    let chip_row_w = chip_widths
         .iter()
-        .zip(&chip_widths)
-        .map(|(&x, &w)| x.saturating_add(w))
-        .max()
-        .unwrap_or(first_chip_x);
-    let mode_lines: u16 = 1;
-    // The mode field (when modes exist) or the tip line (when they don't) needs
-    // its content line plus one spacing row before the next field. PRD #170: the
-    // locked schedule form drops the whole mode block.
-    let mode_extra: u16 = if form.schedule_locked {
-        0
-    } else {
-        mode_lines + 1
-    };
-    // PRD #170: the locked schedule form also drops the Name row.
+        .fold(first_chip_x, |end, &w| end.saturating_add(w))
+        .saturating_add(chip_widths.len().saturating_sub(1) as u16);
+    // PRD #170: the locked schedule form drops the Name row.
     let name_rows: u16 = if show_name { 1 } else { 0 };
     // PRD #106: when the Command field is hidden (orchestration selected) the
     // form is two rows shorter — Command's label row plus its spacing row.
@@ -19328,9 +19310,40 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // than the chip row (`warning_w` is 0 when no warning shows, so the width is
     // unchanged in every other state).
     let desired_w = chip_row_w.max(warning_w).saturating_add(4).max(56);
+    // PRD #168: `modal_rect` sizes each axis independently, so the width is
+    // settled before the height — the chip rows, and with them the Mode block's
+    // height, depend on it.
+    let popup_width = modal_rect(desired_w, 0, area, 56, 10).width;
+    // `(row, x-offset)` of each chip, the offset relative to the inner area. A
+    // chip that would end within the 2-col right margin `desired_w` reserves
+    // starts a new row, unless it would be the row's first chip: one chip wider
+    // than the whole modal stays on its own row and is clipped there rather than
+    // pushing every following chip onto rows of its own.
+    let chip_limit = popup_width.saturating_sub(4);
+    let chip_positions: Vec<(u16, u16)> = {
+        let mut positions = Vec::with_capacity(chip_widths.len());
+        let (mut row, mut cx) = (0u16, first_chip_x);
+        for &w in &chip_widths {
+            if cx > first_chip_x && cx.saturating_add(w) > chip_limit {
+                row += 1;
+                cx = first_chip_x;
+            }
+            positions.push((row, cx));
+            cx = cx.saturating_add(w).saturating_add(1);
+        }
+        positions
+    };
+    let mode_lines: u16 = chip_positions.last().map_or(1, |&(row, _)| row + 1);
+    // The mode field (when modes exist) or the tip line (when they don't) needs
+    // its content line(s) plus one spacing row before the next field. PRD #170:
+    // the locked schedule form drops the whole mode block.
+    let mode_extra: u16 = if form.schedule_locked {
+        0
+    } else {
+        mode_lines + 1
+    };
     let desired_h = 9 + name_rows + mode_extra + cmd_rows + schedule_rows + warning_rows;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
-    let popup_width = popup_area.width;
 
     frame.render_widget(Clear, popup_area);
 
@@ -19539,11 +19552,10 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         ));
     }
 
-    // Mode chip row: render `  Mode: ` then one `[name]` chip per option, the
-    // selected one highlighted. PRD #144: the chips sit on a SINGLE row —
-    // `chip_x_offsets`, computed up front, gives each chip's x-offset, and the
-    // modal was sized wide enough to contain the rightmost chip (e.g.
-    // `[schedule]`) un-clipped. Each chip records its own clickable rect so the
+    // Mode chip rows: render `  Mode: ` then one `[name]` chip per option, the
+    // selected one highlighted. PRD #168: `chip_positions`, computed up front,
+    // gives each chip's row and x-offset — one row when the modal is wide enough,
+    // more once it is capped. Each chip records its own clickable rect so the
     // mode-chip click hit-test still selects the right option.
     let mut chip_rects: Vec<(usize, Rect)> = Vec::new();
     if let Some(mi) = mode_line_idx
@@ -19577,8 +19589,13 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
             &Span::styled("  Mode: ", mode_label_style),
             inner_end.saturating_sub(row_x),
         );
-        for (i, &x_off) in chip_x_offsets.iter().enumerate() {
+        for (i, &(row, x_off)) in chip_positions.iter().enumerate() {
             let cx = row_x + x_off;
+            let chip_y = mode_y.saturating_add(row);
+            // PRD #144 A1: a wrapped row below the clamped popup is skipped.
+            if chip_y >= popup_bottom {
+                break;
+            }
             let chip = format!("[{}]", form.mode_option_name(i));
             let w = chip.chars().count() as u16;
             let style = if i == form.selection_index {
@@ -19587,12 +19604,12 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                 chip_style
             };
             let avail = inner_end.saturating_sub(cx);
-            let (_after, _) = buf.set_span(cx, mode_y, &Span::styled(chip, style), avail);
+            let (_after, _) = buf.set_span(cx, chip_y, &Span::styled(chip, style), avail);
             chip_rects.push((
                 i,
                 Rect {
                     x: cx,
-                    y: mode_y,
+                    y: chip_y,
                     width: w.min(avail),
                     height: 1,
                 },
@@ -29127,6 +29144,99 @@ mod tests {
                 FormField::Command,
                 FormField::Mode
             ]
+        );
+    }
+
+    /// Scenario: render the new-pane form with four long orchestrations into an
+    /// 80x30 `TestBackend` with the trailing `dispatcher` option selected. The
+    /// chips wrap (PRD #168), so the selected chip sits on a later row than
+    /// `[No mode]`; it is drawn REVERSED there, its click rect covers exactly its
+    /// label, the Mode field's click area spans every chip row, and the Name row
+    /// sits below the last of them. Rendered again at 80x6, the rows that fall
+    /// past the clamped popup are skipped instead of written out of bounds.
+    #[test]
+    fn new_pane_form_wrapped_mode_chips_keep_highlight_and_click_targets() {
+        let orchestrations = [
+            "ci-deployment-alpha",
+            "ci-deployment-bravo",
+            "release-pipeline-charlie",
+            "nightly-regression-delta",
+        ]
+        .iter()
+        .map(|name| OrchestrationConfig {
+            default: false,
+            name: (*name).to_string(),
+            roles: Vec::new(),
+        })
+        .collect();
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/project"),
+            "myname".to_string(),
+            "claude".to_string(),
+            orchestrations,
+        );
+        form.selection_index = form.mode_option_count() - 1;
+
+        let mut targets = None;
+        let buf = render_overlay_to_buffer(80, 30, |frame| {
+            targets = Some(render_new_pane_form(frame, &form));
+        });
+        let rendered = buffer_to_string(&buf);
+        let (fields, chips, _) = targets.expect("rendered");
+        assert_eq!(chips.len(), form.mode_option_count(), "got:\n{rendered}");
+
+        let first = chips[0].1;
+        let (selected_idx, selected) = *chips.last().expect("chips");
+        assert!(
+            selected.y > first.y,
+            "the trailing chip must have wrapped below the first row, got:\n{rendered}"
+        );
+        let label: String = (selected.x..selected.right())
+            .map(|x| buf[(x, selected.y)].symbol())
+            .collect();
+        assert_eq!(label, format!("[{}]", form.mode_option_name(selected_idx)));
+        let reversed = |x: u16, y: u16| {
+            buf[(x, y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        };
+        assert!(
+            (selected.x..selected.right()).all(|x| reversed(x, selected.y)),
+            "the selected chip on a wrapped row must be highlighted"
+        );
+        assert!(
+            !reversed(first.x, first.y),
+            "an unselected chip must not be highlighted"
+        );
+
+        let rect_of = |wanted: FormField| {
+            fields
+                .iter()
+                .find(|(field, _)| *field == wanted)
+                .map(|(_, rect)| *rect)
+                .expect("field rect")
+        };
+        let mode = rect_of(FormField::Mode);
+        assert!(
+            chips
+                .iter()
+                .all(|(_, chip)| mode.contains(Position::new(chip.x, chip.y))),
+            "the Mode field's click area must span every chip row"
+        );
+        assert!(
+            rect_of(FormField::Name).y > selected.y,
+            "the Name row must re-flow below the last chip row, got:\n{rendered}"
+        );
+
+        let mut short = None;
+        render_overlay_to_buffer(80, 6, |frame| {
+            short = Some(render_new_pane_form(frame, &form));
+        });
+        let (_, short_chips, _) = short.expect("rendered");
+        assert!(
+            short_chips.len() < chips.len() && short_chips.iter().all(|(_, chip)| chip.y < 6),
+            "on a short terminal the wrapped rows past the popup must be skipped"
         );
     }
 
