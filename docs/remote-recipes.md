@@ -72,7 +72,7 @@ If your key is not one ssh finds by default, add `--key ~/.ssh/<key>` to `remote
 
 Check it worked: `remote add` ends with `Added remote 'dad-dev' …`, `dot-agent-deck remote list` shows the entry, and `connect` opens an empty dashboard where `Ctrl+N` starts an agent.
 
-**5. Optional:** run the daemon as a systemd user service so it restarts with the host; see [Keep the daemon running](remote-requirements.md#keep-the-daemon-running).
+**5. Optional:** run `~/.local/bin/dot-agent-deck daemon install` on the host, so the daemon starts with the host and after a crash; see [Keep the daemon running](remote-requirements.md#keep-the-daemon-running).
 
 On a home network, the host's mDNS name (`hostname.local`) works as the address. To reach the host from outside that network, set up a VPN such as Tailscale or ZeroTier, or a forwarded ssh port, before running `remote add`.
 

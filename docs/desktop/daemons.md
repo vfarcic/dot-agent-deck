@@ -73,7 +73,7 @@ A test also lists what your ssh config adds to the tunnel (for example port forw
    DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 nohup ~/.local/bin/dot-agent-deck daemon serve >/dev/null 2>&1 &
    ```
 
-   To have it come back after a logout, a crash or a reboot, run it under `systemd --user` or a macOS LaunchAgent as [Remote Environment Requirements](../remote-requirements.md#recommended-for-persistent-and-safe-use) describes.
+   To have it come back after a logout, a crash or a reboot, run it as a service: `dot-agent-deck daemon install` on that machine sets one up ([Run the Daemon as a Service](../daemon-service.md)).
 
 While the desktop app is connected to a daemon, that connection counts as a client, so the daemon does not idle out under it.
 
