@@ -5361,8 +5361,9 @@ fn nested_between(
     parent_of: impl Fn(u32) -> Option<u32>,
     executable_of: impl Fn(u32) -> Option<std::path::PathBuf>,
 ) -> Option<bool> {
-    /// Deeper than any real agent's process tree, as `descends_from`'s.
-    const MAX_DEPTH: usize = 128;
+    /// Bounds the walk, as `descends_from`'s; nothing keeps a real tree
+    /// shallower, and a walk that runs out answers "not nested".
+    const MAX_DEPTH: usize = crate::platform::proc::MAX_ANCESTRY_DEPTH;
     if peer == claimed {
         return Some(false);
     }
@@ -5513,7 +5514,10 @@ enum HookRoute {
 /// events accepted before it ([`route_hook_fetch`]). An event is usually in
 /// within milliseconds; the bound is reached when a connection accepted
 /// earlier has not sent a complete line, or its message is slow to process,
-/// and it stays well inside the hook's own 5-second request timeout.
+/// and it stays well inside the hook's own 5-second request timeout. A wait
+/// budget, not a wall-clock bound: the placement reads
+/// ([`may_type_generation`]) run synchronously before each wait, so slow
+/// process-table reads or a starved runtime can stretch the hold past it.
 const HOOK_ROUTE_WAIT: Duration = Duration::from_secs(2);
 
 /// Part 2 §2.4: how `req`, a fetch from `agent_id`, is served. A Claude
@@ -5590,8 +5594,8 @@ fn claude_hook_fetch(
 /// pressure for that long. Only `Undecided` fetches wait at all (a hook
 /// fetch declaring no integration, from a bare-command pane nothing types
 /// yet). And only earlier connections from the agent's own process tree, or
-/// ones the deck cannot place ([`may_type_generation`]), hold one: a silent
-/// peer outside that tree does not.
+/// ones the deck cannot place ([`may_type_generation`], best-effort ancestry
+/// placement), hold one: a silent peer placed outside that tree does not.
 async fn route_hook_fetch(
     registry: &AgentPtyRegistry,
     req: &crate::event::InboxFetchRequest,
@@ -5599,6 +5603,29 @@ async fn route_hook_fetch(
     order: &IngestOrder,
     seq: u64,
     wait: Duration,
+) -> HookRoute {
+    route_hook_fetch_with(
+        registry,
+        req,
+        agent_id,
+        order,
+        seq,
+        wait,
+        may_type_generation,
+    )
+    .await
+}
+
+/// [`route_hook_fetch`] with the placement of each earlier connection's peer
+/// (`may_type`) injected, so a test can stand in a process table.
+async fn route_hook_fetch_with(
+    registry: &AgentPtyRegistry,
+    req: &crate::event::InboxFetchRequest,
+    agent_id: &str,
+    order: &IngestOrder,
+    seq: u64,
+    wait: Duration,
+    may_type: impl Fn(&AcceptedPeer, Option<u32>) -> bool,
 ) -> HookRoute {
     let route = claude_hook_fetch(registry, req, agent_id);
     if route != HookRoute::Undecided {
@@ -5610,7 +5637,7 @@ async fn route_hook_fetch(
     );
     let root = registry.child_pid(agent_id);
     let settled = order
-        .earlier_settled(seq, wait, |peer| may_type_generation(peer, root))
+        .earlier_settled(seq, wait, |peer| may_type(peer, root))
         .await;
     match claude_hook_fetch(registry, req, agent_id) {
         HookRoute::Undecided => {
@@ -5626,18 +5653,49 @@ async fn route_hook_fetch(
 }
 
 /// R2-fix3 (U2): whether the connection `peer` made could carry a hook event
-/// for the generation whose agent process is `root`: it came from that
-/// process's tree, or the deck cannot tell — no agent process, a peer that
-/// exited or whose pid was reused since it connected, an ancestry it cannot
-/// read.
+/// for the generation whose agent process is `root`. Best-effort ancestry
+/// placement, a scheduling hint for the routing hold and not a check of what
+/// the peer runs: the peer is left out only on positive evidence that it is
+/// outside `root`'s tree (R2-fix4, [`may_type_generation_with`]); every
+/// uncertain case keeps it.
 fn may_type_generation(peer: &AcceptedPeer, root: Option<u32>) -> bool {
-    let Some(root) = root else {
+    may_type_generation_with(
+        peer,
+        root,
+        crate::platform::proc::placement_parent_of,
+        crate::platform::proc::process_start_of,
+    )
+}
+
+/// [`may_type_generation`] over `parent_of` and `started_of`.
+///
+/// R2-fix4 (U2): the peer is left out only when all three hold: it is
+/// identifiable (its start time was read at accept), the walk up from its pid
+/// ends outside `root`'s tree ([`Ancestry::Outside`], not a parent it cannot
+/// read nor a walk that runs out of steps), and its pid still names the
+/// process accepted once the walk has answered, as
+/// [`admit_inbox_component_with`] checks, so the walk read the accepted
+/// process's ancestry and not a later one's that reuses its pid. It is still
+/// best effort: a parent that exits during the walk can reparent the peer
+/// out of the tree (to init on Linux), and the walk reads ancestry now, not
+/// at connect.
+///
+/// [`Ancestry::Outside`]: crate::platform::proc::Ancestry::Outside
+fn may_type_generation_with(
+    peer: &AcceptedPeer,
+    root: Option<u32>,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    started_of: impl Fn(u32) -> Option<u64>,
+) -> bool {
+    let (Some(root), Some(started)) = (root, peer.started) else {
         return true;
     };
-    if crate::platform::proc::process_start_of(peer.pid) != peer.started {
+    if crate::platform::proc::ancestry_with(peer.pid, root, parent_of)
+        != crate::platform::proc::Ancestry::Outside
+    {
         return true;
     }
-    crate::platform::proc::descends_from(peer.pid, root) != Some(false)
+    started_of(peer.pid) != Some(started)
 }
 
 /// R2F-R02: the hook socket's accepted connections whose first message the
@@ -7684,6 +7742,127 @@ mod ingest_order_tests {
         assert!(
             took < HOOK_ROUTE_WAIT / 2,
             "a silent peer outside the agent's tree holds nothing: {took:?}"
+        );
+        assert_eq!(order.pending(), 0);
+        registry.shutdown_all();
+    }
+
+    /// Scenario: In a pane started from a bare command, a hook fetch that declares no integration is routed while an earlier hook connection has sent nothing, over a stand-in process table. A peer whose ancestry reaches the agent only past the walk's step limit, a peer whose start time could not be read, and a peer whose pid names another process once the walk has answered each hold the fetch for the whole wait and it is served the legacy way; a readable peer whose walk ends outside the agent's tree is routed at once.
+    #[cfg(unix)]
+    #[spec("inbox/claude/027")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claude_027_a_peer_the_deck_cannot_place_outside_the_tree_holds_the_fetch() {
+        use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const PEER: u32 = 3_000_000;
+        const STARTED: u64 = 7;
+        const WAIT: Duration = Duration::from_millis(400);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-p".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+        let root = registry.child_pid(&agent).expect("the agent's pid");
+        let req: crate::event::InboxFetchRequest = serde_json::from_value(serde_json::json!({
+            "pane_id": "pane-p",
+            "consumer": "doorbell_hook",
+        }))
+        .unwrap();
+        let order = Arc::new(IngestOrder::default());
+        let route =
+            async |started: Option<u64>, may_type: &dyn Fn(&AcceptedPeer, Option<u32>) -> bool| {
+                let silent = order.admit();
+                silent.place(Some(AcceptedPeer { pid: PEER, started }));
+                let mut fetch = order.admit();
+                fetch.settle();
+                let begun = tokio::time::Instant::now();
+                let route = route_hook_fetch_with(
+                    &registry,
+                    &req,
+                    &agent,
+                    &order,
+                    fetch.seq(),
+                    WAIT,
+                    may_type,
+                )
+                .await;
+                drop(silent);
+                (route, begun.elapsed())
+            };
+        let outside = |pid: u32| (pid == PEER).then_some(1);
+        let stable = |_: u32| Some(STARTED);
+
+        let (routed, took) = route(Some(STARTED), &|peer, root| {
+            may_type_generation_with(peer, root, outside, stable)
+        })
+        .await;
+        assert_eq!(routed, HookRoute::Legacy);
+        assert!(
+            took < WAIT / 2,
+            "a readable peer outside the tree holds nothing: {took:?}"
+        );
+
+        let deep = |pid: u32| {
+            let depth = pid.checked_sub(PEER)?;
+            match depth {
+                0..200 => Some(pid + 1),
+                200 => Some(root),
+                _ => None,
+            }
+        };
+        let (routed, took) = route(Some(STARTED), &|peer, root| {
+            may_type_generation_with(peer, root, deep, stable)
+        })
+        .await;
+        assert_eq!(routed, HookRoute::Legacy, "served the legacy way");
+        assert!(
+            took >= WAIT,
+            "a peer in the tree past the walk's limit holds it: {took:?}"
+        );
+
+        let (routed, took) = route(None, &|peer, root| {
+            may_type_generation_with(peer, root, outside, |_| None)
+        })
+        .await;
+        assert_eq!(routed, HookRoute::Legacy);
+        assert!(
+            took >= WAIT,
+            "a peer whose start time was never read holds it: {took:?}"
+        );
+
+        let walked = AtomicBool::new(false);
+        let reused = |pid: u32| {
+            walked.store(true, Ordering::SeqCst);
+            outside(pid)
+        };
+        let after_walk = |_: u32| {
+            if walked.load(Ordering::SeqCst) {
+                Some(STARTED + 1)
+            } else {
+                Some(STARTED)
+            }
+        };
+        let (routed, took) = route(Some(STARTED), &|peer, root| {
+            may_type_generation_with(peer, root, reused, after_walk)
+        })
+        .await;
+        assert_eq!(routed, HookRoute::Legacy);
+        assert!(
+            took >= WAIT,
+            "a peer whose pid was reused during the walk holds it: {took:?}"
+        );
+
+        let (routed, took) = route(Some(STARTED), &|peer, root| {
+            may_type_generation_with(peer, root, outside, |_| None)
+        })
+        .await;
+        assert_eq!(routed, HookRoute::Legacy);
+        assert!(
+            took >= WAIT,
+            "a peer that cannot be identified after the walk holds it: {took:?}"
         );
         assert_eq!(order.pending(), 0);
         registry.shutdown_all();

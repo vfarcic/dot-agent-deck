@@ -2316,7 +2316,7 @@ impl InboxHub {
 
     /// U1 (R2-fix3): the ticker's own step, run whatever a tick is doing:
     /// every withheld attempt whose staging ran out is released not handed
-    /// ([`engine::expire_staging`]). It does no file IO.
+    /// ([`engine::expire_staging`]). It does no file IO and issues nothing.
     fn expire_staging(&self) {
         let mut out = engine::Outbox::new();
         {
@@ -2327,9 +2327,10 @@ impl InboxHub {
     }
 
     /// U1 (R2-fix3): run [`Self::tick`] on the blocking pool, so the ticker
-    /// that asked is never the thread its spool IO holds. One runs at a
-    /// time: a request while one runs makes it run once more when it ends,
-    /// and its end wakes the ticker to re-plan every deadline.
+    /// that asked is never the thread its spool IO holds. One tick requested
+    /// here runs at a time: a request while one runs makes it run once more
+    /// when it ends, and its end wakes the ticker to re-plan every deadline.
+    /// A direct call of the public [`Self::tick`] is not serialized with it.
     fn request_tick(self: &Arc<Self>) {
         {
             let mut io = self.clock_io.lock().unwrap_or_else(|e| e.into_inner());

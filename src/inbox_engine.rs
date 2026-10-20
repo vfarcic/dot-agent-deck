@@ -260,9 +260,10 @@ fn remove_later(st: &mut HubState, spool: Arc<GenerationSpool>, id: String, a: u
 ///
 /// U1 (R2-fix3): the store and the scanner have a lock each. The scanner's
 /// is held across the spool's file IO, and is taken only off the hub's lock;
-/// the store's is held for in-memory work alone, a scan taking it for each
-/// admission ([`crate::inbox_receipt::Admit`]), so the hub's lock, which
-/// takes the store's, never waits on a stalled read.
+/// the store's is held for no spool file IO (in-memory work, and the OS
+/// randomness issuing a cap draws), a scan taking it for each admission
+/// ([`crate::inbox_receipt::Admit`]), so the hub's lock, which takes the
+/// store's, does not wait on a stalled spool read.
 pub(super) struct Evidence {
     pub(super) store: Mutex<EvidenceStore>,
     pub(super) scanner: Mutex<Option<RecordScanner>>,
@@ -1471,7 +1472,7 @@ pub(super) fn tick(
 /// handed ([`AttemptModel::expire_staging`]) and its verdict applied. This is
 /// the clock's own step, which [`tick`]'s spool IO does not hold up: it does
 /// no file IO, and the evidence store's lock it may take under the caller's
-/// is held for in-memory work only ([`Evidence`]). It dispatches nothing;
+/// is held for no spool file IO ([`Evidence`]). It dispatches nothing;
 /// issuing is left to the tick. Answers whether anything was released.
 pub(super) fn expire_staging(st: &mut HubState, now: Instant, out: &mut Outbox) -> bool {
     let due: Vec<AgentKey> = st

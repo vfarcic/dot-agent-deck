@@ -9395,6 +9395,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Does not assert:** the hook socket's accept loop or a real stale hook binary (inbox/claude/024), or a SessionStart typing the generation within the hold.
 - **Platform coverage:** mac+linux.
 
+##### inbox/claude/027 — A silent peer the deck cannot place outside the tree holds a stale fetch.
+- **Layer:** Fast (`src/daemon.rs`, `ingest_order_tests`), `route_hook_fetch_with` over a real registry with a `/bin/sh` agent, an `IngestOrder` whose earlier ticket never settles, and the production placement (`may_type_generation_with`) over a stand-in parent and start-time lookup.
+- **Agent:** none.
+- **Asserts:** with a 400 ms wait, an earlier connection whose peer is readable and whose walk ends outside the agent's tree routes the fetch at once; one whose ancestry reaches the agent only past the walk's step limit, one whose start time was never read, one whose pid names another process once the walk has answered, and one whose start time cannot be read after the walk each hold the fetch for the whole wait, then it is served `Legacy`; no ticket is left pending (R2-fix4 U2).
+- **Does not assert:** a real process tree, the Windows parent lookup, or a parent that exits during the walk and reparents the peer out of the tree (best-effort placement).
+- **Platform coverage:** mac+linux.
+
 ##### inbox/claude/026 — Silent connections wait no more than the pool serves.
 - **Layer:** Fast (`src/daemon.rs`, `question_hold_tests`), the real hook loop (`run_hook_loop_with_limits`) with a pool of two and a 200 ms idle window, its `IngestOrder` read by the test.
 - **Agent:** none.
