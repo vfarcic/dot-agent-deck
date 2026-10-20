@@ -1022,6 +1022,7 @@ impl RecordScanner {
             a,
             e,
             &[RecordStage::Handed, RecordStage::Committed],
+            true,
         )
     }
 
@@ -1036,7 +1037,24 @@ impl RecordScanner {
         a: u32,
         e: u32,
     ) -> Presence {
-        self.presence_of(store, msg, a, e, &[RecordStage::Committed])
+        self.presence_of(store, msg, a, e, &[RecordStage::Committed], true)
+    }
+
+    /// R2F-R03: [`Self::commit_presence`] that admits nothing into `store`.
+    /// A record it finds on the attempt's own commit cap answers `Found` and
+    /// is left for the clock's scan to admit, so the scan still hands that
+    /// commit to the attempt model even when the caller ends up applying
+    /// nothing — `inbox_committed` refusing an attempt that went not handed
+    /// meanwhile — and a commit that contradicts a not-handed witness is
+    /// still recorded as one.
+    pub fn commit_witnessed(
+        &mut self,
+        store: &mut EvidenceStore,
+        msg: &str,
+        a: u32,
+        e: u32,
+    ) -> Presence {
+        self.presence_of(store, msg, a, e, &[RecordStage::Committed], false)
     }
 
     fn presence_of(
@@ -1046,6 +1064,7 @@ impl RecordScanner {
         a: u32,
         e: u32,
         stages: &[RecordStage],
+        admit: bool,
     ) -> Presence {
         if !valid_component(msg) {
             return Presence::Unknown;
@@ -1072,7 +1091,11 @@ impl RecordScanner {
                 Ok(Fetched::Missing) => {}
                 Ok(Fetched::Body(body))
                     if matches!(
-                        store.admit(&body),
+                        if admit {
+                            store.admit(&body)
+                        } else {
+                            store.check(&body)
+                        },
                         Admission::Admitted | Admission::Duplicate
                     ) =>
                 {
@@ -1249,6 +1272,15 @@ impl EvidenceStore {
     /// that stage's cap — the commit cap for `Committed`, the hand-out cap for
     /// `Handed`, so a hand-out cap never proves a commit.
     pub fn admit(&mut self, body: &RecordBody) -> Admission {
+        let admission = self.check(body);
+        if admission == Admission::Admitted {
+            self.admitted.insert(body.key());
+        }
+        admission
+    }
+
+    /// What [`Self::admit`] would answer for `body`, admitting nothing.
+    pub fn check(&self, body: &RecordBody) -> Admission {
         let Some(issued) = self.issued.get(&(body.msg.clone(), body.a, body.e)) else {
             return Admission::NotIssued;
         };
@@ -1260,7 +1292,7 @@ impl EvidenceStore {
         if Cap::hash_hex(&body.cap) != *expected {
             return Admission::WrongCap;
         }
-        if !self.admitted.insert(body.key()) {
+        if self.admitted.contains(&body.key()) {
             return Admission::Duplicate;
         }
         Admission::Admitted

@@ -1024,3 +1024,61 @@ fn claude_023_a_raw_exact_commit_needs_the_attempts_receipt() {
     run_hook(&pane, "notification", notification(&pane, &stderr));
     state(&daemon, &pane, &id, "acknowledged");
 }
+
+/// Scenario: In a pane started from its command alone, with no agent type and no deck waiter in Claude's settings, Claude's SessionStart hook has connected to the deck but its event has not been read yet when a prompt hook too old for the deck's messages fetches a queued task's doorbell. The deck holds the fetch until the earlier connection's event is in: the hook prints nothing while it waits, and once the SessionStart event reports Claude Code the fetch is refused as hooks too old, the task stays queued and the card names the notice.
+#[spec("inbox/claude/024")]
+#[test]
+fn claude_024_a_stale_hook_waits_for_the_session_start_connected_before_it() {
+    use std::io::{Read, Write};
+    let daemon = daemon(&[]);
+    let pane = parent_as(&daemon, "claude-bare-early", None);
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    // SessionStart's connection, accepted before the fetch's, with its line
+    // not yet sent.
+    let mut session_start = std::os::unix::net::UnixStream::connect(daemon.hook_socket()).unwrap();
+    session_start
+        .set_read_timeout(Some(common::load_scaled(WAIT)))
+        .unwrap();
+    let mut hook = payload(&pane, "UserPromptSubmit");
+    hook["prompt"] = json!(fixed_line(&id));
+    command_with(
+        &pane,
+        "stale",
+        json!({"kind":"hook","payload":hook,
+               "env":{"DOT_AGENT_DECK_INBOX_TEST_HOOK_INTEGRATION":"none"}}),
+    );
+    assert!(
+        !common::wait_until(Duration::from_millis(400), || sidecar(
+            &pane,
+            "result-stale"
+        )
+        .exists()),
+        "the fetch is held for the event connected before it: {:?}",
+        std::fs::read_to_string(sidecar(&pane, "result-stale"))
+    );
+    assert!(
+        record(&daemon, &pane)["agent_type"].is_null(),
+        "nothing typed the pane yet: {}",
+        record(&daemon, &pane)
+    );
+    let event = json!({"session_id":format!("native-{}", pane.agent),
+        "pane_id":pane.id,"agent_id":pane.agent,"token":pane.token,
+        "agent_type":"claude_code","event_type":"session_start",
+        "timestamp":chrono::Utc::now(),"cwd":daemon.cwd(),"metadata":{}});
+    writeln!(session_start, "{event}").unwrap();
+    session_start.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut answer = Vec::new();
+    let _ = session_start.read_to_end(&mut answer);
+    let stale = result(&pane, "stale");
+    assert!(
+        !stale["stdout"].as_str().unwrap().contains(NATIVE_BODY),
+        "the stale hook is handed nothing: {stale}"
+    );
+    let notice = || record(&daemon, &pane)["inbox"].clone();
+    assert!(
+        common::wait_until(WAIT, || notice()["integration"] == "hooks_too_old"),
+        "the card names the stale hooks: {}",
+        notice()
+    );
+    state(&daemon, &pane, &id, "queued");
+}

@@ -229,6 +229,33 @@ pub(super) struct Staged {
     pub(super) spool: Option<Arc<GenerationSpool>>,
 }
 
+/// An attempt whose spool files go once the lock is released, with how many
+/// times removing them has failed so far.
+pub(super) struct Removal {
+    pub(super) spool: Arc<GenerationSpool>,
+    pub(super) id: String,
+    pub(super) a: u32,
+    pub(super) e: u32,
+    pub(super) failures: u32,
+}
+
+/// How many times a removal is tried, on the clock's ticks, before the deck
+/// stops and logs it: its files then stay until the generation's whole spool
+/// directory goes at exit.
+pub(super) const REMOVAL_TRIES: u32 = 3;
+
+/// Queue the spool files of `id`'s attempt `(a, e)` for removal once the
+/// lock is released.
+fn remove_later(st: &mut HubState, spool: Arc<GenerationSpool>, id: String, a: u32, e: u32) {
+    st.receipts.removals.push(Removal {
+        spool,
+        id,
+        a,
+        e,
+        failures: 0,
+    });
+}
+
 /// The evidence a generation's attempts publish into its spool.
 pub(super) struct Evidence {
     pub(super) store: EvidenceStore,
@@ -258,7 +285,9 @@ pub(super) struct Receipts {
     /// The card notices last broadcast per generation.
     pub(super) told: HashMap<AgentKey, InboxCardNotices>,
     /// Reclaimed attempts whose spool files go once the lock is released.
-    pub(super) removals: Vec<(Arc<GenerationSpool>, String, u32, u32)>,
+    pub(super) removals: Vec<Removal>,
+    /// Removals that failed, tried again on the clock's next tick.
+    pub(super) failed_removals: Vec<Removal>,
     /// Part 2 §2.5: revoked one-shot attempts whose revoke markers are
     /// written once the lock is released, with their generation.
     pub(super) markers: Vec<(AgentKey, Arc<GenerationSpool>, String, u32, u32)>,
@@ -281,6 +310,7 @@ impl Receipts {
             floors: HashMap::new(),
             told: HashMap::new(),
             removals: Vec::new(),
+            failed_removals: Vec::new(),
             markers: Vec::new(),
             staged: Vec::new(),
             arm_deadline,
@@ -354,6 +384,16 @@ impl Receipts {
             .values()
             .filter_map(|generation| generation.model.verify_due_at(now))
             .min();
+        // R2F-R01: a withheld attempt is released not handed when its
+        // staging runs out.
+        let staging = self
+            .gens
+            .values()
+            .filter_map(|generation| generation.model.staging_due_at())
+            .min()
+            .map(|due| due.max(now));
+        // A removal that failed is tried again on the next tick.
+        let retry = (!self.failed_removals.is_empty()).then(|| now + step);
         // C-3: a hook receiver is closed when its hold runs out.
         let hold = self
             .gens
@@ -377,6 +417,8 @@ impl Receipts {
             revoke,
             verify,
             hold,
+            staging,
+            retry,
             not_started,
         ]
         .into_iter()
@@ -778,7 +820,7 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
     let batch = issue_to(st, key, rx, &ids, Some(budget), consumer, once, now);
     if !batch.is_empty() {
         if once {
-            spend(st, key, rx, conn_id, permit, batch);
+            spend(st, key, rx, conn_id, permit, batch, now);
         } else {
             out.push((permit, InboxWaitReply::messages(batch)));
         }
@@ -795,6 +837,7 @@ fn spend(
     conn_id: u64,
     permit: mpsc::OwnedPermit<WaiterSignal>,
     batch: Vec<InboxDelivery>,
+    now: Instant,
 ) {
     let Some(generation) = st.receipts.gens.get_mut(key) else {
         return;
@@ -804,7 +847,7 @@ fn spend(
     }
     for delivery in &batch {
         if let Some(at) = &delivery.attempt {
-            generation.model.withhold(&delivery.id, at.a, at.e);
+            generation.model.withhold(now, &delivery.id, at.a, at.e);
         }
     }
     let spool = generation.spool.clone();
@@ -841,7 +884,9 @@ pub(super) enum CapsWrite {
 
 /// R2-R02: whether `staged` is still worth its caps files, read under the
 /// lock just before they are written: its generation is the one that issued
-/// it (the same spool) and its waiter's link is still there. A batch that is
+/// it (the same spool), its waiter's link is still there, and (R2F-R01) one
+/// of its attempts is still withheld, so a batch queued behind a stalled
+/// write that outran its staging meanwhile writes nothing. A batch that is
 /// not is released as not handed with no file written.
 pub(super) fn still_staged(st: &HubState, staged: &Staged) -> bool {
     st.receipts.gens.get(&staged.key).is_some_and(|generation| {
@@ -850,6 +895,12 @@ pub(super) fn still_staged(st: &HubState, staged: &Staged) -> bool {
                 .links
                 .get(&staged.rx)
                 .is_some_and(|link| link.conn_id == staged.conn_id)
+            && staged.batch.iter().any(|delivery| {
+                delivery
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|at| generation.model.is_withheld(&delivery.id, at.a, at.e))
+            })
     })
 }
 
@@ -871,10 +922,13 @@ fn same_spool(a: &Option<Arc<GenerationSpool>>, b: &Option<Arc<GenerationSpool>>
 /// waiter's connection is closed, so it exits with nothing and the doorbell
 /// covers the mail.
 ///
-/// R2-R02: until this runs, every attempt of the batch is withheld, so no
-/// cleanup can reclaim it and remove its files while its caps file is being
-/// written. A batch whose generation exited meanwhile has no model left to
-/// reclaim it: the caps files written for it are queued for removal here.
+/// R2-R02: until this runs, or until its staging runs out (R2F-R01), every
+/// attempt of the batch is withheld, so no cleanup can reclaim it and remove
+/// its files while its caps file is being written. A batch whose generation
+/// exited meanwhile has no model left to reclaim it, and an attempt whose
+/// staging ran out may have been reclaimed, its removal run, before this
+/// write finished: the caps files written for either are queued for removal
+/// here, after the write.
 pub(super) fn release(
     st: &mut HubState,
     staged: Staged,
@@ -899,12 +953,7 @@ pub(super) fn release(
         if let Some(spool) = spool {
             for (delivery, write) in batch.iter().zip(written) {
                 if let (Some(at), CapsWrite::Written) = (&delivery.attempt, write) {
-                    st.receipts.removals.push((
-                        Arc::clone(&spool),
-                        delivery.id.clone(),
-                        at.a,
-                        at.e,
-                    ));
+                    remove_later(st, Arc::clone(&spool), delivery.id.clone(), at.a, at.e);
                 }
             }
         }
@@ -937,7 +986,7 @@ pub(super) fn release(
             attempt.caps = None;
             going.push(delivery);
         } else {
-            held_back.push((delivery.id, a, e));
+            held_back.push((delivery.id, a, e, write.clone()));
         }
     }
     for delivery in &going {
@@ -947,8 +996,12 @@ pub(super) fn release(
                 .released(now, &delivery.id, at.a, at.e, true);
         }
     }
-    for (id, a, e) in &held_back {
+    let mut late = Vec::new();
+    for (id, a, e, write) in held_back.iter() {
         generation.model.released(now, id, *a, *e, false);
+        if *write == CapsWrite::Written && generation.model.is_reclaimed(id, *a, *e) {
+            late.push((id.clone(), *a, *e));
+        }
     }
     if going.is_empty() {
         permit.send(WaiterSignal::Close);
@@ -956,6 +1009,11 @@ pub(super) fn release(
         permit.send(WaiterSignal::Once(Box::new(InboxWaitReply::messages(
             going,
         ))));
+    }
+    if let Some(spool) = spool.as_ref() {
+        for (id, a, e) in late {
+            remove_later(st, Arc::clone(spool), id, a, e);
+        }
     }
     apply(st, &key, now, out);
     if !held_back.is_empty() {
@@ -1043,9 +1101,11 @@ pub(super) fn commit_candidates(
 /// receipts, on its own admitted connection. `verified` holds the attempts
 /// whose receipt the caller found in the spool on the attempt's own cap
 /// (R2-A01), or, for a generation the deck cannot read receipts of, every
-/// admissible one: that generation is degraded already. Each is checked
-/// again here, under the lock. `degraded` is why a receipt could not be
-/// published.
+/// admissible one: that generation is degraded already. Whether the model
+/// still lets each one commit ([`AttemptModel::commit_admissible`]) is
+/// checked again here, under the lock; the receipt lookup is not repeated
+/// (`InboxHub::witnessed_commits` says why). `degraded` is why a receipt
+/// could not be published.
 pub(super) fn one_shot_committed(
     st: &mut HubState,
     key: &AgentKey,
@@ -1550,6 +1610,14 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
             Effect::WitnessViolation { id, a, e } => {
                 warn!(message_id = %id, a, e, "inbox: a commit contradicted a not-handed witness");
             }
+            Effect::StagingLapsed { id, a, e } => {
+                warn!(message_id = %id, a, e, "inbox: a caps file write outlasted its staging; the attempt was not handed");
+                if let Some(generation) = st.receipts.gens.get_mut(key) {
+                    generation.degraded.get_or_insert_with(|| {
+                        "a receipt caps file write did not finish within the ack-wait".to_string()
+                    });
+                }
+            }
             Effect::AlsoReachedOldWorker { id, a } => {
                 also_reached(st, key, &id, a);
             }
@@ -1578,7 +1646,7 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
                     .store
                     .forget(&id, a, e);
                 if let Some(spool) = generation.spool.clone() {
-                    st.receipts.removals.push((spool, id, a, e));
+                    remove_later(st, spool, id, a, e);
                 }
             }
             // C-2/C-3: a superseded once-waiter is told so and its

@@ -274,8 +274,12 @@ pub struct Attempt {
     /// while its caps file is written outside the lock. No byte of it has
     /// left the deck, so it is not possibly handed, carries no commit
     /// authority, keeps its message from ending and its evidence from being
-    /// reclaimed, until [`AttemptModel::released`] says what became of it.
+    /// reclaimed, until [`AttemptModel::released`] says what became of it,
+    /// or until `staged_until` passes ([`AttemptModel::tick_cleared`]).
     pub withheld: bool,
+    /// R2F-R01: when a withheld attempt's staging runs out, one ack-wait
+    /// after it was staged.
+    staged_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +449,9 @@ pub enum Effect {
     Reclaimed { id: String, a: u32, e: u32 },
     /// Close a one-shot receiver's connection.
     Close { rx: Rx },
+    /// R2F-R01: a withheld attempt's caps write outlasted its staging, so it
+    /// was released as not handed without it.
+    StagingLapsed { id: String, a: u32, e: u32 },
 }
 
 /// Why a hand-out was refused (T1).
@@ -943,6 +950,7 @@ impl AttemptModel {
             slot,
             quiet_at: None,
             withheld: false,
+            staged_until: None,
         });
         msg.issued += 1;
         if kind == IssueKind::AutoRepeat {
@@ -1034,15 +1042,86 @@ impl AttemptModel {
 
     /// Part 2 §2.4: hold one-shot attempt `(a, e)` of `id` back while the
     /// deck writes its caps file: it stays [`Attempt::withheld`] until
-    /// [`Self::released`].
-    pub fn withhold(&mut self, id: &str, a: u32, e: u32) {
+    /// [`Self::released`], or for one ack-wait from `now` at most.
+    ///
+    /// R2F-R01: the write runs outside any lock and nothing bounds a stalled
+    /// filesystem call, so the hold is bounded here instead. A healthy write
+    /// takes milliseconds; the ack-wait is the window the model already gives
+    /// every answer a one-shot owes it (a resume answer, an approval, the
+    /// idle grace), so only a spool that stalls for that long is overtaken.
+    /// When it passes, [`Self::tick_cleared`] records the attempt not handed
+    /// ([`Self::staging_lapsed`]).
+    pub fn withhold(&mut self, now: Instant, id: &str, a: u32, e: u32) {
+        let until = now + self.limits.ack_wait;
         if let Some(at) = self
             .messages
             .get_mut(id)
             .and_then(|msg| msg.attempt_mut(a, e))
         {
             at.withheld = true;
+            at.staged_until = Some(until);
         }
+    }
+
+    /// R2F-R01: whether `(a, e)` of `id` is still withheld, so a batch whose
+    /// staging every attempt has outrun is not worth its caps files.
+    pub fn is_withheld(&self, id: &str, a: u32, e: u32) -> bool {
+        self.messages
+            .get(id)
+            .and_then(|msg| msg.attempt(a, e))
+            .is_some_and(|at| at.withheld)
+    }
+
+    /// R2F-R01: whether `(a, e)` of `id` has had its evidence returned, or is
+    /// no longer known: a caps file written for it now is removed by whoever
+    /// wrote it, since the reclaim's own removal may have run first.
+    pub fn is_reclaimed(&self, id: &str, a: u32, e: u32) -> bool {
+        self.messages
+            .get(id)
+            .and_then(|msg| msg.attempt(a, e))
+            .is_none_or(|at| at.reclaimed)
+    }
+
+    /// R2F-R01: every withheld attempt whose staging ran out by `now` is
+    /// released as not handed, by the deck's own witness. That is true
+    /// whenever the write finishes: the batch line goes only from
+    /// `engine::release`, under the same lock, after
+    /// [`Self::may_hand_over`], which refuses a final stage; so a release
+    /// that comes after this sends none of it. The caps file that late
+    /// write may leave is removed by that release, once the write is done.
+    fn staging_lapsed(&mut self, now: Instant) {
+        let mut lapsed = Vec::new();
+        for (id, msg) in self.messages.iter_mut() {
+            for at in msg.attempts.iter_mut() {
+                if at.withheld && at.staged_until.is_some_and(|until| now >= until) {
+                    at.withheld = false;
+                    at.staged_until = None;
+                    lapsed.push((id.clone(), at.a, at.e, at.rx));
+                }
+            }
+        }
+        for (id, a, e, rx) in lapsed {
+            self.effects.push(Effect::StagingLapsed {
+                id: id.clone(),
+                a,
+                e,
+            });
+            self.deck_not_handed(now, &id, a, e, rx);
+        }
+    }
+
+    /// R2F-R01: when the next withheld attempt's staging runs out
+    /// ([`Self::withhold`]), so the clock wakes for it.
+    pub fn staging_due_at(&self) -> Option<Instant> {
+        if self.exited {
+            return None;
+        }
+        self.messages
+            .values()
+            .flat_map(|msg| msg.attempts.iter())
+            .filter(|at| at.withheld)
+            .filter_map(|at| at.staged_until)
+            .min()
     }
 
     /// Part 2 §2.4: the deck decided a withheld attempt. `handed_over` is
@@ -1059,6 +1138,7 @@ impl AttemptModel {
             return;
         };
         at.withheld = false;
+        at.staged_until = None;
         let rx = at.rx;
         if handed_over {
             self.finalize(now, id);
@@ -1582,6 +1662,7 @@ impl AttemptModel {
         }
         self.expire_holds(now);
         self.retire_closed(now);
+        self.staging_lapsed(now);
         let ids: Vec<String> = self.messages.keys().cloned().collect();
         for id in &ids {
             if let Some(msg) = self.messages.get_mut(id) {

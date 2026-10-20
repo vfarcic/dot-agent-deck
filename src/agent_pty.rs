@@ -9404,8 +9404,10 @@ impl AgentPtyRegistry {
     }
 
     /// PRD #1666 part 2 (R2-R03): the agent type `agent_id`'s record carries
-    /// — its spawn's, else the first one a hook event attested to that
-    /// generation reported ([`Self::set_agent_type_for_generation`]). Unlike
+    /// — its spawn's, else the first one a hook event for that generation
+    /// reported ([`Self::set_agent_type_for_generation`]: an event its token
+    /// attests, or, under the `warn` provenance policy, a token-less one when
+    /// the generation is the pane's one speaker). Unlike
     /// [`Self::spawn_agent_type`], a same-user hook producer can choose it,
     /// so it may only steer a decision whose wrong answer refuses something
     /// visibly, never one that grants.

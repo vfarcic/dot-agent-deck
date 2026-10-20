@@ -2748,13 +2748,31 @@ impl InboxHub {
             )
         };
         if !removals.is_empty() {
-            off_the_executor(|| {
-                for (spool, id, a, e) in removals {
-                    if let Err(error) = spool.remove_attempt(&id, a, e) {
-                        debug!(message_id = %id, a, e, %error, "inbox: could not remove a reclaimed attempt's receipts");
-                    }
-                }
+            // A removal that fails is tried again on the clock's next tick,
+            // up to `REMOVAL_TRIES` times in all, and then logged: its files
+            // stay until the generation's spool directory goes at exit.
+            let failed: Vec<engine::Removal> = off_the_executor(|| {
+                removals
+                    .into_iter()
+                    .filter_map(|mut removal| {
+                        let error = removal
+                            .spool
+                            .remove_attempt(&removal.id, removal.a, removal.e)
+                            .err()?;
+                        removal.failures += 1;
+                        if removal.failures < engine::REMOVAL_TRIES {
+                            debug!(message_id = %removal.id, a = removal.a, e = removal.e, %error, "inbox: could not remove an attempt's spool files; trying again on the next tick");
+                            Some(removal)
+                        } else {
+                            warn!(message_id = %removal.id, a = removal.a, e = removal.e, %error, tries = removal.failures, "inbox: gave up removing an attempt's spool files; they stay until the agent exits");
+                            None
+                        }
+                    })
+                    .collect()
             });
+            if !failed.is_empty() {
+                self.lock().receipts.failed_removals.extend(failed);
+            }
         }
         if !markers.is_empty() {
             // Part 2 §2.5: a marker that cannot be written leaves a one-shot
@@ -2879,7 +2897,9 @@ impl InboxHub {
     fn tick_receipts_with(&self, clock: impl Fn() -> Instant) {
         use crate::inbox_receipt::{Presence, RecordStage};
         let checks = {
-            let st = self.lock();
+            let mut st = self.lock();
+            let failed = std::mem::take(&mut st.receipts.failed_removals);
+            st.receipts.removals.extend(failed);
             engine::lapse_checks(&st, clock())
         };
         let mut checked: HashMap<AgentKey, engine::Checked> = HashMap::new();
@@ -3001,15 +3021,45 @@ impl InboxHub {
         attempts: &[crate::event::InboxAttemptRef],
         degraded: Option<&str>,
     ) -> usize {
-        use crate::inbox_receipt::Presence;
         let key = (pane_id.to_string(), agent_id.to_string());
-        let candidates = engine::commit_candidates(&self.lock(), &key, attempts);
-        // R2-A01: an attempt commits here only on its commit receipt, found
-        // in the spool on the attempt's own cap as the clock's check finds
-        // one, read off the lock. A generation whose receipts the deck cannot
-        // read is degraded already, and takes the admissible attempts as
-        // named.
-        let verified = candidates.map_or_else(Vec::new, |(candidates, evidence)| {
+        let verified = self.witnessed_commits(&key, attempts);
+        let mut out = engine::Outbox::new();
+        let applied = {
+            let mut st = self.lock();
+            engine::one_shot_committed(&mut st, &key, &verified, degraded, Instant::now(), &mut out)
+        };
+        engine::flush(out);
+        self.after_receipts();
+        applied
+    }
+
+    /// [`Self::one_shot_committed`]'s first half, off the lock: of
+    /// `attempts`, those the model would let commit
+    /// ([`engine::commit_candidates`]) whose committed receipt is in the spool
+    /// on the attempt's own cap, the exact lookup the clock's spool check
+    /// makes (R2-A01). A generation whose receipts the deck cannot read — no
+    /// spool, or no scanner — is degraded already, and every admissible
+    /// attempt is answered as named.
+    ///
+    /// The lookup admits nothing into the evidence store (R2F-R03,
+    /// [`crate::inbox_receipt::RecordScanner::commit_witnessed`]): when the
+    /// second half refuses an attempt that went not handed meanwhile, the
+    /// clock's scan still finds that receipt new and applies its commit.
+    ///
+    /// The lookup is not repeated under the hub lock. What it found cannot
+    /// stop being true: a receipt is published once under an immutable name,
+    /// and only a holder of the attempt's commit cap could publish it, so a
+    /// later removal of the file does not undo that the commit happened. What
+    /// can change meanwhile is whether the model lets the attempt commit, and
+    /// that is checked again under the lock.
+    pub(super) fn witnessed_commits(
+        &self,
+        key: &AgentKey,
+        attempts: &[crate::event::InboxAttemptRef],
+    ) -> Vec<crate::event::InboxAttemptRef> {
+        use crate::inbox_receipt::Presence;
+        let candidates = engine::commit_candidates(&self.lock(), key, attempts);
+        candidates.map_or_else(Vec::new, |(candidates, evidence)| {
             if candidates.is_empty() {
                 return candidates;
             }
@@ -3022,19 +3072,11 @@ impl InboxHub {
                 candidates
                     .into_iter()
                     .filter(|at| {
-                        scanner.commit_presence(store, &at.id, at.a, at.e) == Presence::Found
+                        scanner.commit_witnessed(store, &at.id, at.a, at.e) == Presence::Found
                     })
                     .collect()
             })
-        });
-        let mut out = engine::Outbox::new();
-        let applied = {
-            let mut st = self.lock();
-            engine::one_shot_committed(&mut st, &key, &verified, degraded, Instant::now(), &mut out)
-        };
-        engine::flush(out);
-        self.after_receipts();
-        applied
+        })
     }
 
     /// PRD #1666 §11: a fetch or stream from a component the receipt policy

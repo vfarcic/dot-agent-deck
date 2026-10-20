@@ -4364,7 +4364,7 @@ async fn boundary_059_a_counted_write_that_took_nothing_is_not_handed_after_supe
     newer.close().await;
 }
 
-/// Scenario: A Claude once-waiter is issued a task, and while the deck writes the batch's caps file the waiter is superseded and the task cancelled. The clock then runs well past every approval window and spool check: the cancelled task stays held, its attempt keeps its evidence, and nothing is removed under the write. When the write finishes, the attempt is not handed, the task ends cancelled, and its caps file is removed with its evidence. A second batch whose generation exits during its write has its caps file removed too.
+/// Scenario: A Claude once-waiter is issued a task, and while the deck writes the batch's caps file the waiter is superseded and the task cancelled. The clock then runs for a while inside the batch's staging deadline: the cancelled task stays held, its attempt keeps its evidence, and nothing is removed under the write. When the write finishes, the attempt is not handed, the task ends cancelled, and its caps file is removed with its evidence. A second batch whose generation exits during its write has its caps file removed too.
 #[cfg(unix)]
 #[spec("inbox/boundary/060")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4372,7 +4372,9 @@ async fn boundary_060_a_late_caps_write_leaves_no_file_behind() {
     use crate::inbox_attempts::{MessageState as Model, Stage};
     use crate::inbox_receipt::CapsLookup;
     let key: AgentKey = ("p".into(), "a".into());
-    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_millis(150));
+    // The staging deadline is one ack-wait from staging (R2F-R01,
+    // inbox/boundary/062 runs past it); this test stays inside it.
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(5));
     let mut older = open_once(&hub, Some(HOOK_INTEGRATION));
     assert!(older.next().await.registered.is_some());
     let (entered, go) = hold_caps(&hub);
@@ -4575,4 +4577,279 @@ async fn boundary_061_an_exact_commit_needs_a_released_attempt_and_its_receipt()
     assert_eq!(commit(id.as_str(), 1, 2), 1, "its own commit receipt");
     assert_eq!(state_of(&hub, "p", id.as_str()), StateName::Acknowledged);
     second.close().await;
+}
+
+/// Tick `hub` every 25 ms for `span`, from this thread.
+#[cfg(unix)]
+async fn tick_for(hub: &InboxHub, span: Duration) {
+    let started = Instant::now();
+    while started.elapsed() < span {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        hub.tick();
+    }
+}
+
+/// Scenario: A Claude once-waiter is issued a task and the deck's write of the batch's caps file hangs. With the write still hung, the clock runs past one ack-wait from staging: the attempt is recorded not handed by the deck, the task goes back to the queue, and the card says receipts are degraded. When the write finally returns, the waiter it was meant for is sent nothing, and a waiter armed afterwards is handed the task as attempt 1.2, not marked as a possible repeat. In a second pane, a task whose caps write hangs is cancelled: once the staging deadline passes it ends cancelled and its evidence is returned while the write is still hung, and when the write returns the caps file it linked is removed.
+#[cfg(unix)]
+#[spec("inbox/boundary/062")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boundary_062_a_caps_write_that_never_returns_is_overtaken_by_its_staging_deadline() {
+    use crate::inbox_attempts::Stage;
+    use crate::inbox_receipt::CapsLookup;
+    let ack_wait = Duration::from_millis(150);
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), ack_wait);
+    let mut waiter = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(waiter.next().await.registered.is_some());
+    let (entered, go) = hold_caps(&hub);
+    let posting = {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            hub.post_direct(Recipient::bound("p", "a"), content("hung write"))
+                .unwrap()
+        })
+    };
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the caps write started");
+    let id = listed_id(&hub, "hung write");
+    tick_for(&hub, ack_wait * 3).await;
+    assert_eq!(
+        attempt_state(&hub, "p", "a", &id, 1, 1).0,
+        Stage::NotHanded,
+        "the staging deadline passed with the write still hung"
+    );
+    assert_eq!(state_of(&hub, "p", &id), StateName::Queued);
+    let degraded = hub.summary("p", "a").notices.receipts_degraded;
+    assert!(
+        degraded
+            .as_deref()
+            .is_some_and(|why| why.contains("did not finish")),
+        "the card names the stalled write: {degraded:?}"
+    );
+    go.send(()).unwrap();
+    assert_eq!(posting.join().unwrap().as_str(), id);
+    *hub.hold_caps.lock().unwrap() = None;
+    let ended = tokio::time::timeout(Duration::from_secs(5), waiter.lines.next_line())
+        .await
+        .expect("the waiter's connection ends")
+        .unwrap();
+    assert!(ended.is_none(), "the late release sent nothing: {ended:?}");
+    assert_eq!(state_of(&hub, "p", &id), StateName::Queued);
+    let mut next = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(next.next().await.registered.is_some());
+    let batch = next.handout().await;
+    assert_eq!(batch[0].id, id);
+    assert_eq!((attempt(&batch[0]).a, attempt(&batch[0]).e), (1, 2));
+    assert!(
+        !batch[0].text.contains("This may repeat"),
+        "attempt 1.1 never left the deck: {}",
+        batch[0].text
+    );
+    next.close().await;
+
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), ack_wait);
+    let mut waiter = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(waiter.next().await.registered.is_some());
+    let (entered, go) = hold_caps(&hub);
+    let posting = {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            hub.post_direct(Recipient::bound("p", "a"), content("cancelled while hung"))
+                .unwrap()
+        })
+    };
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the caps write started");
+    let id = listed_id(&hub, "cancelled while hung");
+    let revision = hub.lock().receipts.gens[&("p".to_string(), "a".to_string())]
+        .model
+        .delivery(&id)
+        .unwrap()
+        .revision;
+    let cancel = hub.inbox_action("p", "a", &id, revision, false, "desktop-1");
+    assert_eq!(
+        cancel.outcome,
+        crate::daemon_protocol::InboxActionOutcome::Applied
+    );
+    tick_for(&hub, ack_wait * 3).await;
+    assert_eq!(state_of(&hub, "p", &id), StateName::Undeliverable);
+    assert_eq!(
+        attempt_state(&hub, "p", "a", &id, 1, 1),
+        (Stage::NotHanded, true),
+        "cancelled and reclaimed with the write still hung"
+    );
+    assert_eq!(evidence_reserved(&hub, "p", "a"), 0);
+    go.send(()).unwrap();
+    assert_eq!(posting.join().unwrap().as_str(), id);
+    *hub.hold_caps.lock().unwrap() = None;
+    assert!(
+        matches!(caps_file(&hub, &id, 1, 1), CapsLookup::Missing),
+        "the caps file the late write linked was removed"
+    );
+    // The Cancel revokes the attempt on the waiter's connection; no batch
+    // follows it.
+    while let Some(line) = tokio::time::timeout(Duration::from_secs(5), waiter.lines.next_line())
+        .await
+        .expect("the waiter's connection ends")
+        .unwrap()
+    {
+        let reply: InboxWaitReply = serde_json::from_str(&line).unwrap();
+        assert!(
+            reply.messages.is_none(),
+            "the late release sent nothing: {line}"
+        );
+    }
+}
+
+/// Scenario: A Claude once-waiter is released a task, and its prompt hook publishes the task's committed receipt on the attempt's own cap. The exact-commit request's receipt lookup finds it, and then, before the request reaches the deck's lock, the deck records the attempt not handed. The request is refused under the lock, and the clock's next spool check still applies that receipt: the commit contradicting the not-handed witness is recorded and the task is acknowledged.
+#[cfg(unix)]
+#[spec("inbox/boundary/063")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boundary_063_an_exact_commit_refused_after_its_lookup_still_reaches_the_clock() {
+    use crate::event::InboxAttemptRef;
+    use crate::inbox_attempts::Stage;
+    use crate::inbox_receipt::{CapsLookup, RecordKey, RecordStage};
+    let key: AgentKey = ("p".into(), "a".into());
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let mut waiter = open_once(&hub, Some(HOOK_INTEGRATION));
+    let rx = waiter
+        .next()
+        .await
+        .registered
+        .expect("the waiter registered")
+        .rx;
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("contradicted"))
+        .unwrap();
+    let batch = waiter.handout().await;
+    assert_eq!((attempt(&batch[0]).a, attempt(&batch[0]).e), (1, 1));
+    let CapsLookup::Found(caps) = caps_file(&hub, id.as_str(), 1, 1) else {
+        panic!("the released attempt's caps file");
+    };
+    let (p, ag) = spool_names("p", "a");
+    crate::inbox_receipt::GenerationSpool::open(&hub.spool_env().unwrap(), &p, &ag)
+        .unwrap()
+        .publish(
+            &RecordKey {
+                msg: id.as_str().to_string(),
+                a: 1,
+                e: 1,
+                stage: RecordStage::Committed,
+            },
+            &caps.commit,
+        )
+        .unwrap();
+    let named = [InboxAttemptRef {
+        id: id.as_str().to_string(),
+        a: 1,
+        e: 1,
+    }];
+    let witnessed = hub.witnessed_commits(&key, &named);
+    assert_eq!(witnessed.len(), 1, "the lookup found the receipt");
+    hub.deck_not_handed(&key, crate::inbox_attempts::Rx(rx), &named);
+    assert_eq!(
+        attempt_state(&hub, "p", "a", id.as_str(), 1, 1).0,
+        Stage::NotHanded
+    );
+    let mut out = engine::Outbox::new();
+    let applied = {
+        let mut st = hub.lock();
+        engine::one_shot_committed(&mut st, &key, &witnessed, None, Instant::now(), &mut out)
+    };
+    engine::flush(out);
+    assert_eq!(
+        applied, 0,
+        "refused under the lock: the attempt is not handed"
+    );
+    assert_eq!(state_of(&hub, "p", id.as_str()), StateName::Queued);
+    hub.tick();
+    assert_eq!(
+        attempt_state(&hub, "p", "a", id.as_str(), 1, 1).0,
+        Stage::Committed,
+        "the clock's scan applied the receipt the refused request had found"
+    );
+    assert_eq!(state_of(&hub, "p", id.as_str()), StateName::Acknowledged);
+    waiter.close().await;
+}
+
+/// Scenario: A Claude once-waiter's task is committed while the generation's caps directory cannot be written to, so removing the reclaimed attempt's caps file fails. The caps file stays and the removal is kept; once the directory can be written again, the clock's next tick removes it. A second task's removal that keeps failing is tried on three ticks in all and then given up, its caps file left for the agent's exit.
+#[cfg(unix)]
+#[spec("inbox/boundary/064")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boundary_064_a_failed_removal_is_tried_again_on_the_next_tick() {
+    use crate::event::InboxAttemptRef;
+    use crate::inbox_receipt::{CapsLookup, RecordKey, RecordStage};
+    use std::os::unix::fs::PermissionsExt;
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let mut waiter = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(waiter.next().await.registered.is_some());
+    let (p, ag) = spool_names("p", "a");
+    let spool =
+        crate::inbox_receipt::GenerationSpool::open(&hub.spool_env().unwrap(), &p, &ag).unwrap();
+    let caps_dir = hub.spool_env().unwrap().join(&p).join(&ag).join("caps");
+    let failed = || hub.lock().receipts.failed_removals.len();
+    let commit_with_caps_locked = |id: &str| {
+        let CapsLookup::Found(caps) = caps_file(&hub, id, 1, 1) else {
+            panic!("the released attempt's caps file");
+        };
+        let key = RecordKey {
+            msg: id.to_string(),
+            a: 1,
+            e: 1,
+            stage: RecordStage::Committed,
+        };
+        spool.publish(&key, &caps.commit).unwrap();
+        std::fs::set_permissions(&caps_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let named = [InboxAttemptRef {
+            id: id.to_string(),
+            a: 1,
+            e: 1,
+        }];
+        assert_eq!(hub.one_shot_committed("p", "a", &named, None), 1);
+    };
+
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("removed later"))
+        .unwrap();
+    waiter.handout().await;
+    commit_with_caps_locked(id.as_str());
+    assert!(reclaimed(&hub, "p", id.as_str(), 1, 1));
+    assert!(
+        matches!(caps_file(&hub, id.as_str(), 1, 1), CapsLookup::Found(_)),
+        "the removal failed"
+    );
+    assert_eq!(failed(), 1, "and is kept for the next tick");
+    std::fs::set_permissions(&caps_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    hub.tick();
+    assert!(
+        matches!(caps_file(&hub, id.as_str(), 1, 1), CapsLookup::Missing),
+        "the next tick removed it"
+    );
+    assert_eq!(failed(), 0);
+    waiter.close().await;
+
+    let mut waiter = open_once(&hub, Some(HOOK_INTEGRATION));
+    assert!(waiter.next().await.registered.is_some());
+    let second = hub
+        .post_direct(Recipient::bound("p", "a"), content("never removed"))
+        .unwrap();
+    waiter.handout().await;
+    commit_with_caps_locked(second.as_str());
+    for tick in 1..engine::REMOVAL_TRIES {
+        assert_eq!(failed(), 1, "kept before tick {tick}");
+        hub.tick();
+    }
+    assert_eq!(
+        failed(),
+        0,
+        "given up after {} tries",
+        engine::REMOVAL_TRIES
+    );
+    std::fs::set_permissions(&caps_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(
+        caps_file(&hub, second.as_str(), 1, 1),
+        CapsLookup::Found(_)
+    ));
+    waiter.close().await;
 }

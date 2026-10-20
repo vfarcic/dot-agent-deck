@@ -2663,6 +2663,9 @@ struct QuestionConnection<'a, R, W> {
     slot: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
     holds: &'a Arc<tokio::sync::Semaphore>,
     hold_deadline: Duration,
+    /// R2F-R02: the connection's place in the ingest order, settled once the
+    /// question's agent type is written.
+    ingest: Option<&'a mut IngestTicket>,
 }
 
 /// PRD #1631: apply a producer's [`crate::event::QuestionSignal`] and, for a
@@ -2712,7 +2715,7 @@ async fn handle_question_signal<R, W>(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
-    conn: QuestionConnection<'_, R, W>,
+    mut conn: QuestionConnection<'_, R, W>,
 ) -> Option<crate::agent_pty::HeldReply>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -2774,6 +2777,9 @@ where
             attested_agent.as_deref().or(event.agent_id.as_deref()),
             &event.agent_type,
         );
+    }
+    if let Some(ingest) = conn.ingest.take() {
+        ingest.settle();
     }
     let Some((id, agent_id, _budget)) = holding else {
         ingest_hook_event(state, event_tx, registry, event, unproven, attested_agent).await;
@@ -5490,40 +5496,164 @@ fn pi_generation(registry: &AgentPtyRegistry, pane_id: &str, agent_id: &str) -> 
             == Some(crate::event::InboxComponent::PiExtension)
 }
 
-/// Part 2 §2.4: whether `req` is a Claude hook's fetch — a doorbell or
-/// turn-end hand-over — which is served as a one-shot receiver of its own
-/// ([`crate::inbox_hub::serve_hook`]): one that declares the one-shot
-/// integration (only Claude's hook does, until H4), or one from a generation
-/// known to be Claude Code, so an older hook there meets the floor and is
-/// refused visibly rather than handed mail on the legacy terms.
+/// How a hook's inbox fetch is served ([`claude_hook_fetch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookRoute {
+    /// A one-shot receiver of its own ([`crate::inbox_hub::serve_hook`]).
+    OneShot,
+    /// The legacy fetch.
+    Legacy,
+    /// A hook fetch that declares no one-shot integration, from a generation
+    /// nothing yet types: one-shot if it turns out to be Claude Code, legacy
+    /// otherwise.
+    Undecided,
+}
+
+/// R2F-R02: how long an [`HookRoute::Undecided`] fetch is held for the hook
+/// events accepted before it ([`IngestOrder::earlier_settled`]). An event is
+/// usually in within milliseconds; the bound is reached when a connection
+/// accepted earlier has not sent a complete line, or its message is slow to
+/// process, and it stays well inside the hook's own 5-second request timeout.
+const HOOK_ROUTE_WAIT: Duration = Duration::from_secs(2);
+
+/// Part 2 §2.4: how `req`, a fetch from `agent_id`, is served. A Claude
+/// hook's fetch — a doorbell or turn-end hand-over — is served as a one-shot
+/// receiver of its own: one that declares the one-shot integration (only
+/// Claude's hook does, until H4), or one from a generation known to be
+/// Claude Code, so an older hook there meets the floor and is refused
+/// visibly rather than handed mail on the legacy terms.
 ///
 /// A generation is known to be Claude Code by its spawn, by the Claude
 /// component it announced, or by its own hook events reporting Claude Code
 /// (R2-R03). A pane started from a bare command carries no spawn type, and a
 /// Claude without the deck's waiter announces nothing, so the hook-reported
-/// type is what tells that Claude apart: its SessionStart event reports it
+/// type is what tells that Claude apart: its SessionStart hook sends it
 /// before any prompt can carry a doorbell. A hook producer can claim that
-/// type, but the claim only routes a stale fetch to its refusal. Before any
-/// Claude hook event has arrived the deck has no evidence either way, and
-/// such a fetch is served on the legacy path. A CLI fetch stays on the
-/// legacy path until H4.
+/// type, but the claim only routes a stale fetch to its refusal. The first
+/// type reported stands, so a non-Claude type reported first keeps a later
+/// Claude report from typing the generation.
+///
+/// A hook fetch from a generation nothing types yet is
+/// [`HookRoute::Undecided`]: the caller holds it until the hook events
+/// accepted before it are in (R2F-R02), since SessionStart's send returns
+/// before the deck has read it. A CLI fetch stays on the legacy path until
+/// H4.
 fn claude_hook_fetch(
     registry: &AgentPtyRegistry,
     req: &crate::event::InboxFetchRequest,
     agent_id: &str,
-) -> bool {
+) -> HookRoute {
     use crate::event::{AgentType, InboxComponent, InboxFetchConsumer};
-    matches!(
+    if !matches!(
         req.consumer,
         InboxFetchConsumer::DoorbellHook | InboxFetchConsumer::TurnEndHook
-    ) && req.rx.is_none()
-        && (req.hook_integration.is_some()
-            || registry.spawn_agent_type(agent_id) == Some(AgentType::ClaudeCode)
-            || registry.reported_agent_type(agent_id) == Some(AgentType::ClaudeCode)
-            || matches!(
-                registry.inbox().announced_component(&req.pane_id, agent_id),
-                Some(InboxComponent::ClaudeHooks | InboxComponent::ClaudeWaiter)
-            ))
+    ) || req.rx.is_some()
+    {
+        return HookRoute::Legacy;
+    }
+    if req.hook_integration.is_some() {
+        return HookRoute::OneShot;
+    }
+    let announced = registry.inbox().announced_component(&req.pane_id, agent_id);
+    if matches!(
+        announced,
+        Some(InboxComponent::ClaudeHooks | InboxComponent::ClaudeWaiter)
+    ) {
+        return HookRoute::OneShot;
+    }
+    match registry
+        .spawn_agent_type(agent_id)
+        .or_else(|| registry.reported_agent_type(agent_id))
+    {
+        Some(AgentType::ClaudeCode) => HookRoute::OneShot,
+        None if announced.is_none() => HookRoute::Undecided,
+        _ => HookRoute::Legacy,
+    }
+}
+
+/// R2F-R02: the hook socket's accepted connections whose first message the
+/// daemon has not yet ingested, numbered in accept order. A producer whose
+/// connect returned before another's began is queued, and so accepted,
+/// ahead of it (a listener accepts from its backlog in order), so once every
+/// connection numbered below a fetch's has settled, whatever type those
+/// first lines reported is in.
+#[derive(Default)]
+struct IngestOrder {
+    next: std::sync::atomic::AtomicU64,
+    pending: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    settled: tokio::sync::Notify,
+}
+
+impl IngestOrder {
+    /// The next accepted connection's ticket, pending until it settles.
+    fn admit(self: &Arc<Self>) -> IngestTicket {
+        let seq = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(seq);
+        IngestTicket {
+            order: Arc::clone(self),
+            seq,
+            settled: false,
+        }
+    }
+
+    /// Wait, for at most `bound`, until no connection accepted before `seq`
+    /// is pending. Answers whether that happened within the bound.
+    async fn earlier_settled(&self, seq: u64, bound: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .range(..seq)
+                .next()
+                .is_some();
+            if !pending {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return false;
+            }
+        }
+    }
+}
+
+/// One accepted connection's place in [`IngestOrder`]: it settles once, when
+/// its first message is in or the connection ends.
+struct IngestTicket {
+    order: Arc<IngestOrder>,
+    seq: u64,
+    settled: bool,
+}
+
+impl IngestTicket {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    fn settle(&mut self) {
+        if std::mem::replace(&mut self.settled, true) {
+            return;
+        }
+        self.order
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.seq);
+        self.order.settled.notify_waiters();
+    }
+}
+
+impl Drop for IngestTicket {
+    fn drop(&mut self) {
+        self.settle();
+    }
 }
 
 /// The budget a fetch asked for: `max_bytes` when set, else `max_chars`.
@@ -5768,6 +5898,9 @@ async fn run_hook_loop_with_limits(
     // PRD #1631 (audit A6): held questions wait under a budget of their own,
     // not in the connection pool above.
     let hold_limit = Arc::new(tokio::sync::Semaphore::new(limits.max_holds));
+    // R2F-R02: which accepted connections have not yet had their first
+    // message ingested, in accept order.
+    let ingest_order = Arc::new(IngestOrder::default());
     // Whether the cap is currently holding, so the warning below fires on the
     // transition into saturation rather than once per waiting connection.
     let mut at_cap = false;
@@ -5793,6 +5926,10 @@ async fn run_hook_loop_with_limits(
             accept_res = accept_hook_connection(&listener, &conn_limit, limits.max_connections, &mut at_cap) => match accept_res {
             Ok((permit, stream)) => {
                 let hold_limit = Arc::clone(&hold_limit);
+                // Taken here, in the accept loop, so tickets follow the order
+                // the listener accepted connections in.
+                let mut ingest = ingest_order.admit();
+                let ingest_order = Arc::clone(&ingest_order);
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
@@ -5839,7 +5976,13 @@ async fn run_hook_loop_with_limits(
                     // daemon owns. `read_capped_line` resolves the same three
                     // outcomes under a ceiling; see `MAX_HOOK_LINE_BYTES` for
                     // where the number comes from.
+                    let mut first_line = true;
                     loop {
+                        // R2F-R02: the connection's first message is in by
+                        // the time it asks for a second.
+                        if !std::mem::take(&mut first_line) {
+                            ingest.settle();
+                        }
                         // The `timeout` is what keeps a stalled connection from
                         // holding its slot forever — see
                         // `HOOK_CONNECTION_IDLE_TIMEOUT`. It wraps the READ and
@@ -5912,6 +6055,12 @@ async fn run_hook_loop_with_limits(
                             }
                         };
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
+                            // R2F-R02: a question types its generation as an
+                            // event does, and settles once it has; every other
+                            // verb types nothing a fetch could be waiting for.
+                            if !matches!(msg, DaemonMessage::Question(_)) {
+                                ingest.settle();
+                            }
                             // Issue #1077: ONE provenance gate for every verb on
                             // this socket, ahead of the match rather than inside
                             // each arm.
@@ -6270,7 +6419,28 @@ async fn run_hook_loop_with_limits(
                                     // this connection for its controls; below
                                     // the integration floor nothing is issued
                                     // ([`crate::inbox_hub::serve_hook`]).
-                                    if claude_hook_fetch(&pty_registry, &req, &agent_id) {
+                                    let mut route =
+                                        claude_hook_fetch(&pty_registry, &req, &agent_id);
+                                    if route == HookRoute::Undecided {
+                                        info!(
+                                            pane_id = %escape_id_for_log(&req.pane_id),
+                                            "holding a hook fetch until the hook events \
+                                             accepted before it are in"
+                                        );
+                                        let settled = ingest_order
+                                            .earlier_settled(ingest.seq(), HOOK_ROUTE_WAIT)
+                                            .await;
+                                        route = claude_hook_fetch(&pty_registry, &req, &agent_id);
+                                        if route == HookRoute::Undecided {
+                                            info!(
+                                                pane_id = %escape_id_for_log(&req.pane_id),
+                                                settled,
+                                                "no hook event typed this generation; serving \
+                                                 its hook fetch the legacy way"
+                                            );
+                                        }
+                                    }
+                                    if route == HookRoute::OneShot {
                                         if !mail_taker_admitted(
                                             &pty_registry,
                                             peer_pid,
@@ -6348,6 +6518,10 @@ async fn run_hook_loop_with_limits(
                                     // witness instead (R2-A01): released by the
                                     // deck, not positively not handed, and its
                                     // commit receipt on its own cap in the spool.
+                                    // A generation whose receipts the deck
+                                    // cannot read (no spool, or no scanner) is
+                                    // the exception: it is degraded already, and
+                                    // there the first two alone decide.
                                     let reply = if mail_taker_admitted(
                                         &pty_registry,
                                         peer_pid,
@@ -6941,6 +7115,7 @@ async fn run_hook_loop_with_limits(
                                             slot: &mut permit,
                                             holds: &hold_limit,
                                             hold_deadline: limits.hold_deadline,
+                                            ingest: Some(&mut ingest),
                                         },
                                     )
                                     .await
@@ -7228,6 +7403,8 @@ async fn run_hook_loop_with_limits(
                                     );
                                 }
                             }
+                            // R2F-R02: the type this event reports is in.
+                            ingest.settle();
                             // Fan out to subscribed attach connections and
                             // apply locally as ONE ordered operation, so a
                             // client can never observe two concurrent events
@@ -7299,6 +7476,44 @@ async fn run_hook_loop_with_limits(
             }
             } // end accept_res match
         } // end tokio::select!
+    }
+}
+
+#[cfg(test)]
+mod ingest_order_tests {
+    use super::*;
+
+    /// R2F-R02: a fetch waits for the connections accepted before it, not
+    /// for its own or later ones, and a ticket dropped unsettled settles.
+    #[tokio::test]
+    async fn a_fetch_waits_only_for_connections_accepted_before_it() {
+        let order = Arc::new(IngestOrder::default());
+        let mut earlier = order.admit();
+        let mut fetch = order.admit();
+        let later = order.admit();
+        fetch.settle();
+        let short = Duration::from_millis(50);
+        assert!(
+            !order.earlier_settled(fetch.seq(), short).await,
+            "an earlier connection is still pending"
+        );
+        let waiting = {
+            let order = Arc::clone(&order);
+            let seq = fetch.seq();
+            tokio::spawn(async move { order.earlier_settled(seq, Duration::from_secs(5)).await })
+        };
+        tokio::time::sleep(short).await;
+        earlier.settle();
+        assert!(
+            waiting.await.unwrap(),
+            "settled once the earlier one was in"
+        );
+        drop(later);
+        let mut next = order.admit();
+        let unsettled = order.admit();
+        drop(unsettled);
+        next.settle();
+        assert!(order.earlier_settled(next.seq() + 2, short).await);
     }
 }
 
@@ -8558,6 +8773,7 @@ mod hook_ingestion_tests {
                 slot: &mut slot,
                 holds: &holds,
                 hold_deadline: Duration::from_secs(5),
+                ingest: None,
             },
         )
         .await;
