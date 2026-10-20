@@ -169,8 +169,59 @@ pub const OPEN_PR_ROW: &str = "open_pr";
 /// refused: the figures are per daemon, so the user is asked which.
 pub const SHOW_HOST_METRICS_ROW: &str = "show_host_metrics";
 /// One reading of a pick in [`UNGROUNDED_READS_AS`]: the row it is answered
-/// as, and the requirement that has to hold for it to be read that way.
-type Reading = (&'static str, Option<Requirement>);
+/// as, and where it may be read that way.
+type Reading = (&'static str, ReadWhere);
+
+/// Where a reading in [`UNGROUNDED_READS_AS`] may be taken. Each narrows it;
+/// none takes a reading the words do not ask for, since that row's own `yes`
+/// is needed as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadWhere {
+    /// Wherever the words ask for the reading.
+    Anywhere,
+    /// Only while the declared dialog state meets the requirement.
+    While(Requirement),
+    /// Only where the pick's own refuse-only guard ([`CommandRow::must_not_say`])
+    /// refused it: the user said what the pick refuses, and the reading is the
+    /// row those words belong to. Literal, and it only refuses: words the
+    /// guard finds take nothing on their own, and words it does not find
+    /// leave the pick refused.
+    PickSaidWhatItRefuses,
+}
+
+impl ReadWhere {
+    fn holds(
+        self,
+        pick: &CommandRow,
+        transcript: &str,
+        directories: Option<&VoiceDirectories>,
+        new_agent: Option<&VoiceNewAgent>,
+    ) -> bool {
+        match self {
+            ReadWhere::Anywhere => true,
+            ReadWhere::While(requirement) => requirement.met_by(directories, new_agent),
+            ReadWhere::PickSaidWhatItRefuses => !says_nothing_it_refuses(pick, transcript),
+        }
+    }
+}
+
+/// The rows a pick of `pick` the meaning check refuses may be read as here
+/// ([`UNGROUNDED_READS_AS`]), in order — those whose [`ReadWhere`] holds.
+fn readings_of<'t>(
+    table: &'t CommandTable,
+    pick: &CommandRow,
+    transcript: &str,
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
+) -> Vec<&'t CommandRow> {
+    UNGROUNDED_READS_AS
+        .iter()
+        .filter(|(picked, _)| *picked == pick.id)
+        .flat_map(|(_, readings)| readings.iter())
+        .filter(|(_, only_where)| only_where.holds(pick, transcript, directories, new_agent))
+        .filter_map(|(instead, _)| table.row(instead))
+        .collect()
+}
 
 /// A pick the meaning check finds the user's words do not ask for, answered
 /// instead as the row it finds they DO ask for — each pair a row and the
@@ -185,7 +236,13 @@ type Reading = (&'static str, Option<Requirement>);
 /// - `stop_agent` → `close` (issue #1496, found red on `main`): "Close the
 ///   agent" on the dashboard was answered with the stop 8 times in 8, and
 ///   refused as a stop nobody asked for. "Close" is a view word (D1), so the
-///   words are answered as `close`, which stops nothing.
+///   words are answered as `close`, which stops nothing. Only where the
+///   stop's D1 guard refused it ([`ReadWhere::PickSaidWhatItRefuses`]): a
+///   stop forced for "open the tester" was refused by the meaning check, and
+///   the same call answered `close` yes for those words 8 times in 10 on
+///   `gpt-5-mini`, so the app closed something on a request to open
+///   (2026-10-20). Words with no close word in them are not read as a
+///   close, and a stop the meaning check refuses there stays refused.
 /// - `name_new_agent` → `set_new_agent_command` (issue #1496, found flaky on
 ///   `main`, passing 3 runs in 8): "set the command" with no command said was answered
 ///   as naming the agent and refused. Those words are the Command field's,
@@ -217,21 +274,30 @@ type Reading = (&'static str, Option<Requirement>);
 ///   presses Start.
 ///
 /// A row's readings are tried in order and the first the words ask for wins,
-/// each only where its requirement, if it names one, holds. The reading still
-/// has to pass every gate a pick of it would — screen, `requires`, the flag —
-/// because it is answered exactly as one.
+/// each only where its [`ReadWhere`] holds. The reading still has to pass
+/// every gate a pick of it would — screen, `requires`, the flag — because it
+/// is answered exactly as one.
 const UNGROUNDED_READS_AS: [(&str, &[Reading]); 4] = [
-    ("clear_dashboard_filter", &[("open_overview", None)]),
+    (
+        "clear_dashboard_filter",
+        &[("open_overview", ReadWhere::Anywhere)],
+    ),
     (
         "stop_agent",
         &[
-            ("close", None),
-            (START_ROW, Some(Requirement::NewAgentDialog)),
-            ("open_new_agent", Some(Requirement::NewAgentDialogClosed)),
+            ("close", ReadWhere::PickSaidWhatItRefuses),
+            (START_ROW, ReadWhere::While(Requirement::NewAgentDialog)),
+            (
+                "open_new_agent",
+                ReadWhere::While(Requirement::NewAgentDialogClosed),
+            ),
         ],
     ),
-    ("name_new_agent", &[("set_new_agent_command", None)]),
-    ("open_dir", &[("use_this_directory", None)]),
+    (
+        "name_new_agent",
+        &[("set_new_agent_command", ReadWhere::Anywhere)],
+    ),
+    ("open_dir", &[("use_this_directory", ReadWhere::Anywhere)]),
 ];
 
 /// One param, resolved against live state.
@@ -1146,14 +1212,8 @@ async fn after_local_intercepts(
     let row = if judged.asks_for(row) {
         row
     } else {
-        UNGROUNDED_READS_AS
-            .iter()
-            .filter(|(picked, _)| *picked == row.id)
-            .flat_map(|(_, readings)| readings.iter())
-            .filter(|(_, only_where)| {
-                only_where.is_none_or(|requirement| requirement.met_by(directories, new_agent))
-            })
-            .filter_map(|(instead, _)| table.row(instead))
+        readings_of(table, row, transcript.text(), directories, new_agent)
+            .into_iter()
             .find(|instead| judged.asks_for(instead))
             .unwrap_or(row)
     };
@@ -3527,16 +3587,7 @@ fn questions_for<'t>(
     show_deck: bool,
 ) -> Vec<(&'t CommandRow, Strictness)> {
     let mut picks: Vec<&CommandRow> = vec![row];
-    picks.extend(
-        UNGROUNDED_READS_AS
-            .iter()
-            .filter(|(picked, _)| *picked == row.id)
-            .flat_map(|(_, readings)| readings.iter())
-            .filter(|(_, only_where)| {
-                only_where.is_none_or(|requirement| requirement.met_by(directories, new_agent))
-            })
-            .filter_map(|(instead, _)| table.row(instead)),
-    );
+    picks.extend(readings_of(table, row, text, directories, new_agent));
     let mut asked: Vec<&CommandRow> = Vec::new();
     let mut alone: Vec<&CommandRow> = Vec::new();
     for pick in &picks {
@@ -14788,7 +14839,8 @@ mod tests {
                         action: CLOSE_ROW.to_string(),
                         sentence: format!(
                             "Heard: \u{201c}{said}\u{201d} — asking to close what is on top \
-                             needs to be said on its own while the New agent dialog is open, \
+                             and go back to what is under it needs to be said on its own while \
+                             the New agent dialog is open, \
                              like \u{201c}close this\u{201d}, so nothing was done."
                         ),
                     },
@@ -15046,6 +15098,117 @@ mod tests {
             ask("back to the terminals").await,
             VoiceOutcome::Unavailable { action, .. } if action == "open_deck"
         ));
+    }
+
+    /// Scenario: the five phrase fixtures the A1 fix turned red (2026-10-20):
+    /// "go back" picked as the hidden Daemons screen, and four daemon choices
+    /// picked as the Daemon selector over the open New agent dialog. Each
+    /// reaches its target only by the target's own `yes`, so the one meaning
+    /// call asks about the target in words those sentences ask for — going
+    /// back for `close`, choosing which daemon to use for `choose_deck` —
+    /// under instructions that say the questions are not a choice between
+    /// them. Judged yes for the target and no for the pick, the target runs;
+    /// judged no for the target and yes for the pick, it does not (A1).
+    #[tokio::test]
+    async fn voice_outcome_a_redirect_target_is_asked_in_the_words_that_reach_it() {
+        const GO_BACK: &str =
+            "Does the sentence ask to close what is on top and go back to what is under it?";
+        const CHOOSE: &str = "Does the sentence ask to choose which daemon to use (the app sets \
+                              it in the New agent dialog)?";
+        let form = new_agent_form();
+        let cases = [
+            (
+                "go back",
+                IntentAnswer::new("open_deck"),
+                None,
+                false,
+                CLOSE_ROW,
+                GO_BACK,
+            ),
+            (
+                "use the build box deck",
+                IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+                Some(&VoiceNewAgent { form: None }),
+                true,
+                "choose_deck",
+                CHOOSE,
+            ),
+            (
+                "switch to the local deck",
+                IntentAnswer::new("switch_deck").with_param("deck", "local"),
+                Some(&form),
+                true,
+                "choose_deck",
+                CHOOSE,
+            ),
+            (
+                "deck build box",
+                IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+                Some(&form),
+                true,
+                "choose_deck",
+                CHOOSE,
+            ),
+            (
+                "Daemon BuildBoxDeck.",
+                IntentAnswer::new("switch_deck").with_param("deck", "BuildBoxDeck"),
+                Some(&form),
+                true,
+                "choose_deck",
+                CHOOSE,
+            ),
+        ];
+        for (said, answer, new_agent, show_deck, target, question) in cases {
+            let pick = answer.action.clone();
+            for target_asked in [true, false] {
+                let resolver = StubResolver::new()
+                    .answering(said, answer.clone())
+                    .judging(said, &pick, !target_asked)
+                    .judging(said, target, target_asked);
+                let outcome = handle_utterance_with(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks(),
+                    None,
+                    new_agent,
+                    Transcript::new(said),
+                    LabelSharing::Shared,
+                    show_deck,
+                )
+                .await
+                .outcome;
+                let asked = resolver.meaning_requests();
+                assert_eq!(asked.len(), 1, "{said}: one meaning call");
+                assert!(
+                    asked[0]
+                        .questions
+                        .iter()
+                        .any(|(action, _)| action == target),
+                    "{said}: {:?}",
+                    asked[0].questions
+                );
+                for body in &asked[0].bodies {
+                    assert!(body.contains(question), "{said}: {body}");
+                    assert!(
+                        body.contains("The questions are not a choice between them"),
+                        "{said}"
+                    );
+                }
+                if target_asked {
+                    assert!(
+                        matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == target),
+                        "{said}: {outcome:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(&outcome, VoiceOutcome::Unavailable { action, .. } if *action == pick),
+                        "{said}: {outcome:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -17111,6 +17274,55 @@ mod tests {
         );
     }
 
+    /// Scenario: on the dashboard the user says "open the tester", the model
+    /// picks the stop, and the meaning check refuses it — while answering
+    /// `close` yes for the same words, as `gpt-5-mini` did 8 times in 10 in
+    /// the forced production test (2026-10-20). Nothing in the words is a
+    /// close word, so the stop is not read as `close`: it is refused, nothing
+    /// closes, and `close` is not even asked about. Said with a close word,
+    /// the reading is still taken.
+    #[tokio::test]
+    async fn voice_outcome_a_refused_stop_is_read_as_close_only_for_a_close_word() {
+        let said = "open the tester";
+        let resolver = StubResolver::new()
+            .answering(
+                said,
+                IntentAnswer::new("stop_agent").with_param("agent", "tester"),
+            )
+            .judging(said, "stop_agent", false)
+            .judging(said, CLOSE_ROW, true)
+            .judging(said, "open_new_agent", false);
+        let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "stop_agent"),
+            "{outcome:?}"
+        );
+        let asked = resolver.meaning_requests();
+        assert_eq!(asked.len(), 1, "one meaning call");
+        assert!(
+            asked[0]
+                .questions
+                .iter()
+                .all(|(action, _)| action != CLOSE_ROW),
+            "{:?}",
+            asked[0].questions
+        );
+
+        let said = "close the tester";
+        let resolver = StubResolver::new()
+            .answering(
+                said,
+                IntentAnswer::new("stop_agent").with_param("agent", "tester"),
+            )
+            .judging(said, "stop_agent", false)
+            .judging(said, CLOSE_ROW, true);
+        let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == CLOSE_ROW),
+            "{outcome:?}"
+        );
+    }
+
     /// The labels the user hit, and the ones this sweep found missing from the
     /// row's prompt: each is written into its row's description, so the model
     /// reads the button's own words as that row.
@@ -17917,29 +18129,41 @@ mod tests {
     /// so the boundary does not depend on any caller remembering it.
     #[test]
     fn voice_outcome_a_meaning_question_is_made_of_the_rows_own_words() {
-        let transcript = Transcript::new("get rid of that agent");
-        let questions = questions_for(
-            table(),
-            table().row("stop_agent").expect("row"),
-            transcript.text(),
-            Screen::Overview,
-            None,
-            None,
-            true,
-        );
-        let request = MeaningRequest::new(&transcript, table(), &questions);
-        let system = crate::voice::meaning::system_turn(&request);
-        for (row, _) in &questions {
-            assert!(system.contains(&row.asks_to), "{}", row.id);
+        // The stop's readings are asked in the same call: with the dialog
+        // closed, its opener, and the view's close only where the words say
+        // a close word, the one place that reading is taken.
+        for (said, readings) in [
+            (
+                "close that agent",
+                vec!["stop_agent", CLOSE_ROW, "open_new_agent"],
+            ),
+            (
+                "get rid of that agent",
+                vec!["stop_agent", "open_new_agent"],
+            ),
+        ] {
+            let transcript = Transcript::new(said);
+            let questions = questions_for(
+                table(),
+                table().row("stop_agent").expect("row"),
+                transcript.text(),
+                Screen::Overview,
+                None,
+                None,
+                true,
+            );
+            let request = MeaningRequest::new(&transcript, table(), &questions);
+            let system = crate::voice::meaning::system_turn(&request);
+            for (row, _) in &questions {
+                assert!(system.contains(&row.asks_to), "{}", row.id);
+            }
+            let asked: Vec<&str> = request
+                .questions()
+                .iter()
+                .map(|question| question.action())
+                .collect();
+            assert_eq!(asked, readings, "{said}");
         }
-        // The stop's readings are asked in the same call: the view's close and,
-        // with the dialog closed, its opener.
-        let asked: Vec<&str> = request
-            .questions()
-            .iter()
-            .map(|question| question.action())
-            .collect();
-        assert_eq!(asked, vec!["stop_agent", CLOSE_ROW, "open_new_agent"]);
     }
 
     /// Scenario: the model picks a row and the meaning check cannot answer —

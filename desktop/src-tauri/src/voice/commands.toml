@@ -527,7 +527,13 @@ terminal pane, and does NOT turn voice off."""
 invoke      = "closeTopmost"
 unavailable_hint = "closing what is on top works anywhere"
 report      = "Closed."
-asks_to     = "close what is on top"
+# PRD #1733: a "go back" over the agent dashboard with the Daemons screen
+# hidden is picked as `open_deck` and reaches this row only by this row's own
+# `yes` (audit A1). Asked together with `open_deck`, the meaning check answered
+# "go back" `no` for "close what is on top" 3 times in 3 manifest runs
+# (`deck-hidden-go-back`, 2026-10-20). Saying what the close does, as the
+# description's first sentence does, names the going back.
+asks_to     = "close what is on top and go back to what is under it"
 try_saying  = "close this"
 whole_while = "new_agent_dialog"
 
@@ -1829,7 +1835,15 @@ screens     = ["overview"]
 requires    = ["new_agent_dialog"]
 unavailable_hint = "choosing the daemon this way works while the New agent dialog is open; say “new agent on” and the daemon to open it on one"
 report      = "Daemon: {deck}."
-asks_to     = "choose the new agent's daemon"
+# PRD #1733: over the open dialog the model often picks `switch_deck`, which
+# cannot run there and reaches this row only by this row's own `yes` (audit
+# A1). Asked about "choose the new agent's daemon" beside "switch daemon",
+# the meaning check answered "use the build box deck", "switch to the local
+# deck", "deck build box" and "Daemon BuildBoxDeck." `no` in 3 of 3 manifest
+# runs each (2026-10-20): it is not shown the dialog, and none of those says
+# "new agent". Leading with what the user asks for, and saying where the app
+# puts it, follows `open_new_agent`'s measured wording.
+asks_to     = "choose which daemon to use (the app sets it in the New agent dialog)"
 try_saying  = "daemon {deck}"
 action_words = ["daemon", "deck", "demon"]
 
