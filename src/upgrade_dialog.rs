@@ -293,14 +293,10 @@ impl RunResult {
             None
         };
         lines.extend(restart.clone());
-        let on_disk = matches!(
-            outcome,
-            Outcome::Replaced { .. } | Outcome::Installed { .. } | Outcome::BrewUpgraded { .. }
-        );
         Self {
             ok: outcome.upgraded(),
             lines,
-            tui_restart: restart.filter(|_| on_disk),
+            tui_restart: restart.filter(|_| outcome.installed()),
         }
     }
 

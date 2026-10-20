@@ -2369,10 +2369,11 @@ export function fixtureSelfUpgradeApi(search: string = window.location.search): 
     app: {
       copy: "app",
       ok: true,
+      installed: true,
       relaunch: true,
       lines: [`Replaced /Applications/Agent Deck.app with v${latest}. Quit and reopen Agent Deck to run it.`, "Build provenance verified with `gh attestation verify`."].map(line),
     },
-    cli: { copy: "cli", ok: true, relaunch: false, lines: [line(`\`brew upgrade dot-agent-deck\` finished; it now reports v${latest}.`)] },
+    cli: { copy: "cli", ok: true, installed: true, relaunch: false, lines: [line(`\`brew upgrade dot-agent-deck\` finished; it now reports v${latest}.`)] },
   };
   /* Once the CLI is upgraded, the next check finds it current, as the bridge's would. */
   const cliHeadline = `dot-agent-deck CLI is up to date (v${latest}).`;

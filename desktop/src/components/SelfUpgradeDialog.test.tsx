@@ -99,6 +99,7 @@ function stagedResult(command: string, text = command): SelfUpgradeResult {
   return {
     copy: "cli",
     ok: true,
+    installed: false,
     relaunch: false,
     lines: [
       { text: "Downloaded and checked. Install it with:", command: null },
@@ -110,6 +111,7 @@ function stagedResult(command: string, text = command): SelfUpgradeResult {
 const SWAPPED: SelfUpgradeResult = {
   copy: "app",
   ok: true,
+  installed: true,
   relaunch: true,
   lines: [
     { text: "Replaced /Applications/Agent Deck.app with v0.47.0. Quit and reopen Agent Deck to run it.", command: null },
@@ -122,6 +124,7 @@ const SWAPPED: SelfUpgradeResult = {
 const DEB_INSTALLED: SelfUpgradeResult = {
   copy: "app",
   ok: true,
+  installed: true,
   relaunch: true,
   lines: [{ text: "Installed v0.47.0.", command: null }],
 };
@@ -131,6 +134,7 @@ const DEB_INSTALLED: SelfUpgradeResult = {
 const DEB_STAGED: SelfUpgradeResult = {
   copy: "app",
   ok: true,
+  installed: false,
   relaunch: false,
   lines: [
     { text: "Downloaded and checked. Install it with:", command: null },
@@ -141,6 +145,7 @@ const DEB_STAGED: SelfUpgradeResult = {
 const BREWED: SelfUpgradeResult = {
   copy: "cli",
   ok: true,
+  installed: true,
   relaunch: false,
   lines: [{ text: "`brew upgrade dot-agent-deck` finished; it now reports v0.47.0.", command: null }],
 };
@@ -270,6 +275,7 @@ describe("SelfUpgradeDialog", () => {
     await finish({
       copy: "app",
       ok: false,
+      installed: false,
       relaunch: false,
       lines: [
         { text: "`/usr/bin/pkexec /usr/bin/apt-get install -y /stage/x.deb` failed: Request dismissed", command: null },
@@ -395,6 +401,7 @@ describe("SelfUpgradeDialog", () => {
     await finish({
       copy: "cli",
       ok: false,
+      installed: false,
       relaunch: false,
       lines: [{ text: "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.46.0, not v0.47.0: Homebrew does not offer v0.47.0 yet. Try again later.", command: null }],
     });
@@ -418,7 +425,7 @@ describe("SelfUpgradeDialog", () => {
     expect(screen.getByTestId("self-upgrade-done")).toBeInTheDocument();
     expect(api.run).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByTestId("self-upgrade-close"));
-    expect(onClose).toHaveBeenCalledWith({ upgraded: true });
+    expect(onClose).toHaveBeenCalledWith({ installed: true });
   });
 
   /** Scenario: The Local daemon section's dialog covers the CLI alone (issue #1753): it is titled with the CLI's release, says what follows it, never offers Relaunch for an app installed earlier, and tells its opener whether it closed having changed nothing or after an upgrade. */
@@ -441,9 +448,19 @@ describe("SelfUpgradeDialog", () => {
     render(<SelfUpgradeDialog copies={["cli"]} check={appInstalled} api={api} onClose={onClose} />);
     fireEvent.click(screen.getByTestId("self-upgrade-start"));
     expect(api.run).toHaveBeenCalledWith("cli", 3);
-    await finish({ ...BREWED, ok: false });
+    await finish({ ...BREWED, ok: false, installed: false });
     expect(screen.queryByTestId("self-upgrade-relaunch")).not.toBeInTheDocument();
     fireEvent.keyDown(screen.getByTestId("self-upgrade-dialog"), { key: "Escape" });
-    expect(onClose).toHaveBeenLastCalledWith({ upgraded: false });
+    expect(onClose).toHaveBeenLastCalledWith({ installed: false });
+  });
+
+  /** Scenario: While the dialog is open, the rest of the window is inert, so a rail button cannot be reached with Tab and switch screens under a running upgrade; closing the dialog gives the window back. */
+  it("self_upgrade_dialog_017 fences the window behind it", () => {
+    const { api } = controlledApi();
+    const { rerender } = render(<><button data-testid="rail">Daemons</button><SelfUpgradeDialog copies={["cli"]} check={checkOf(APP_SWAP, CLI_BREW)} api={api} onClose={vi.fn()} /></>);
+    expect(screen.getByTestId("rail")).toHaveAttribute("inert");
+    expect(screen.getByTestId("self-upgrade-dialog")).not.toHaveAttribute("inert");
+    rerender(<><button data-testid="rail">Daemons</button></>);
+    expect(screen.getByTestId("rail")).not.toHaveAttribute("inert");
   });
 });

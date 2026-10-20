@@ -37,9 +37,10 @@ export function restartAfterCli(daemon: UpgradeTarget): string {
  * 2. When the daemon runs an older release than the app, the daemon's
  *    restart onto the app's build: the Upgrade dialog's local flow, with its
  *    question naming every agent and role a restart would stop, defaulting to
- *    Keep current daemon. It starts at once when the user has just upgraded
+ *    Keep current daemon. It starts at once when the user has just installed
  *    the CLI, which they did knowing this step follows (the CLI dialog says
- *    so); otherwise, after a CLI that could not be upgraded from here, it asks
+ *    so); otherwise — a CLI that could not be upgraded from here, a failed
+ *    upgrade, or a download whose install command is still to run — it asks
  *    first, as Upgrade on its own does.
  */
 export function LocalUpgradeFlow({ daemon, cli, runtime, onClose }: LocalUpgradeRequest & {
@@ -55,7 +56,7 @@ export function LocalUpgradeFlow({ daemon, cli, runtime, onClose }: LocalUpgrade
         copies={["cli"]}
         then={daemon ? restartAfterCli(daemon) : CLI_LEAVES_DAEMON}
         onClose={(closed) => {
-          if (closed && daemon) setStep({ step: "daemon", autoStart: closed.upgraded });
+          if (closed && daemon) setStep({ step: "daemon", autoStart: closed.installed });
           else onClose();
         }}
       />

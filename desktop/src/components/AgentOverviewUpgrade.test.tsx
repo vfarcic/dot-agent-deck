@@ -196,7 +196,7 @@ describe("Upgrade on the Local daemon section (issue #1753)", () => {
     cli,
     recheckAfterSecs: 21600,
   });
-  const brewed: SelfUpgradeResult = { copy: "cli", ok: true, relaunch: false, lines: [{ text: "`brew upgrade dot-agent-deck` finished; it now reports v0.45.0.", command: null }] };
+  const brewed: SelfUpgradeResult = { copy: "cli", ok: true, installed: true, relaunch: false, lines: [{ text: "`brew upgrade dot-agent-deck` finished; it now reports v0.45.0.", command: null }] };
   const selfApi = () => ({ check: vi.fn(), run: vi.fn(async () => brewed), relaunch: vi.fn() });
   /* The `upgrade` fleet with this machine's daemon on an older release than the app. */
   const olderLocal = () => createFixtureFleet("upgrade").map((deck) => (
@@ -272,6 +272,21 @@ describe("Upgrade on the Local daemon section (issue #1753)", () => {
     expect(screen.queryByTestId("self-upgrade-start")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("self-upgrade-close"));
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Upgrade the daemon on this machine?");
+    expect(screen.getByTestId("upgrade-dialog")).toHaveAttribute("data-phase", "confirm");
+    expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: Both are behind and the CLI's folder is not writable, so Upgrade only downloads and checks it, showing the command to install it: closing that result leads to the daemon's Upgrade asking first, never restarting the daemon on its own while the CLI is still the old one. */
+  it("local_upgrade_006 asks before the daemon restart after a CLI that was only downloaded", async () => {
+    const deck = runtime(olderLocal());
+    const command = "sudo install -m 0755 /stage/dot-agent-deck /usr/local/bin/dot-agent-deck";
+    const staged: SelfUpgradeResult = { copy: "cli", ok: true, installed: false, relaunch: false, lines: [{ text: "Downloaded and checked. Install it with:", command: null }, { text: command, command }] };
+    const api = { check: vi.fn(), run: vi.fn(async () => staged), relaunch: vi.fn() };
+    render(<AgentOverview runtime={deck} onNavigate={vi.fn()} selfUpgrade={{ check: check(), api }} />);
+    fireEvent.click(within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade"));
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    expect(await screen.findByTestId("self-upgrade-result-cli")).toHaveTextContent(command);
+    fireEvent.click(screen.getByTestId("self-upgrade-close"));
     expect(screen.getByTestId("upgrade-dialog")).toHaveAttribute("data-phase", "confirm");
     expect(deck.upgradeDaemon).not.toHaveBeenCalled();
   });

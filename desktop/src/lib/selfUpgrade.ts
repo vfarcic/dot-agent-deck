@@ -88,6 +88,8 @@ export interface SelfUpgradeCheck {
 export interface SelfUpgradeResult {
   copy: SelfCopy;
   ok: boolean;
+  /** Whether the release is now installed: `false` for a download the user has still to install with the command shown, and for a failure. */
+  installed: boolean;
   lines: SelfUpgradeLine[];
   /** The app bundle was replaced, so Relaunch runs the new one. */
   relaunch: boolean;

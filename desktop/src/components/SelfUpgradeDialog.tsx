@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { CircleArrowUp, Copy, LoaderCircle, RotateCcw } from "lucide-react";
 
+import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 import { writeClipboardText } from "../lib/clipboard";
 import { DISPLAY_LIMITS, displayText, sanitizeText } from "../lib/displayText";
 import {
@@ -16,8 +17,8 @@ import {
 
 /** How a {@link SelfUpgradeDialog} closed: `undefined` when it closed before anything ran, having changed nothing. */
 export interface SelfUpgradeClosed {
-  /** Whether a copy was upgraded. */
-  upgraded: boolean;
+  /** Whether a copy is now installed: not a download whose install command the user has still to run (`SelfUpgradeResult.installed`). */
+  installed: boolean;
 }
 
 /**
@@ -70,13 +71,17 @@ export function SelfUpgradeDialog({ check, api, copies, then, onClose, copyText 
   const relaunch = shownResults.some((result) => result.relaunch);
   const anyRun = shownResults.length > 0;
   /* Closed once something ran, or with nothing left to ask; before that, a close changes nothing. */
-  const close = () => onClose(anyRun || phase === "done" ? { upgraded: shownResults.some((result) => result.ok) } : undefined);
+  const close = () => onClose(anyRun || phase === "done" ? { installed: shownResults.some((result) => result.installed) } : undefined);
+  /* Fence the rest of the window while it is open (Greptile, PR #1769): a
+     rail button reached with Tab would otherwise switch screens and unmount
+     this dialog mid-upgrade, losing its result and any command to run. */
+  const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog);
 
   const upgrade = (plan: SelfUpgradePlan) => {
     setRunning(plan.copy);
     api.run(plan.copy, shown.checkId).then(
       (result) => setResults((current) => ({ ...current, [plan.copy]: result })),
-      (cause: unknown) => setResults((current) => ({ ...current, [plan.copy]: { copy: plan.copy, ok: false, relaunch: false, lines: [{ text: String(cause instanceof Error ? cause.message : cause), command: null }] } })),
+      (cause: unknown) => setResults((current) => ({ ...current, [plan.copy]: { copy: plan.copy, ok: false, installed: false, relaunch: false, lines: [{ text: String(cause instanceof Error ? cause.message : cause), command: null }] } })),
     ).finally(() => {
       setDone((current) => [...current, plan.copy]);
       setRunning(undefined);
@@ -97,6 +102,8 @@ export function SelfUpgradeDialog({ check, api, copies, then, onClose, copyText 
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={dismiss}>
       <section
+        ref={ref}
+        tabIndex={-1}
         className="confirm-dialog upgrade-dialog self-upgrade-dialog"
         role="alertdialog"
         aria-modal="true"

@@ -133,6 +133,11 @@ pub(crate) struct CheckDto {
 pub(crate) struct RunDto {
     pub copy: SelfCopy,
     pub ok: bool,
+    /// Whether the offered release is now installed ([`Outcome::installed`]):
+    /// `false` for a download the user has still to install with the
+    /// command shown, and for a failure. The Local daemon section restarts
+    /// the daemon on its own only after an installed CLI (issue #1753).
+    pub installed: bool,
     pub lines: Vec<LineDto>,
     /// Whether the app bundle was replaced, so a relaunch runs the new one.
     pub relaunch: bool,
@@ -531,6 +536,7 @@ pub(crate) fn outcome_dto(copy: SelfCopy, outcome: &Outcome) -> RunDto {
     RunDto {
         copy,
         ok: outcome.upgraded(),
+        installed: outcome.installed(),
         lines: line_dtos(outcome.items()),
         relaunch: copy == SelfCopy::App && outcome.app_relaunch_notice().is_some(),
     }
@@ -549,6 +555,7 @@ pub(crate) fn failure_dto(copy: SelfCopy, error: &UpgradeError) -> RunDto {
     RunDto {
         copy,
         ok: false,
+        installed: false,
         lines: line_dtos(lines),
         relaunch: false,
     }
@@ -1258,6 +1265,54 @@ mod tests {
             commands(&staged.lines),
             vec!["sudo apt install /stage/x.deb"]
         );
+    }
+
+    /// Issue #1753 (Greptile, Qodo on PR #1769): a staged download is a
+    /// success that installed nothing yet, so the Local daemon section must
+    /// not take it for an installed CLI and restart the daemon on its own.
+    #[test]
+    fn self_upgrade_034_a_staged_download_is_ok_but_not_installed() {
+        let staged = Outcome::Staged {
+            path: PathBuf::from("/stage/dot-agent-deck"),
+            command: Some(
+                "sudo install /stage/dot-agent-deck /usr/local/bin/dot-agent-deck".into(),
+            ),
+            version: LATEST.into(),
+            provenance: provenance(),
+        };
+        let dto = outcome_dto(SelfCopy::Cli, &staged);
+        assert!(dto.ok && !dto.installed);
+        let not_brewed = Outcome::BrewNotUpgraded {
+            formula: "dot-agent-deck",
+            reported: Some(CURRENT.into()),
+            offered: LATEST.into(),
+        };
+        assert!(!outcome_dto(SelfCopy::Cli, &not_brewed).installed);
+        for installed in [
+            Outcome::Replaced {
+                path: PathBuf::from("/home/u/.local/bin/dot-agent-deck"),
+                version: LATEST.into(),
+                provenance: provenance(),
+                synced: true,
+            },
+            Outcome::BrewUpgraded {
+                formula: "dot-agent-deck",
+                reported: Some(LATEST.into()),
+            },
+            Outcome::Installed {
+                version: LATEST.into(),
+                provenance: provenance(),
+            },
+        ] {
+            assert!(
+                outcome_dto(SelfCopy::Cli, &installed).installed,
+                "{installed:?}"
+            );
+        }
+        let failed = failure_dto(SelfCopy::Cli, &UpgradeError::Io("boom".into()));
+        assert!(!failed.ok && !failed.installed);
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["installed"], false);
     }
 
     #[test]
