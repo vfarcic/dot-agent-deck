@@ -470,8 +470,8 @@ pub(crate) struct KeyEntry {
     pub kicked: bool,
     /// The current run of failures has been logged.
     pub failure_logged: bool,
-    /// When a lookup first answered with this key's PR merged or closed;
-    /// `None` while it is open, or there is none.
+    /// When a lookup first answered with this key's PR merged or closed —
+    /// that PR, by number; `None` while it is open, or there is none.
     pub terminal_since: Option<Instant>,
 }
 
@@ -484,10 +484,16 @@ impl KeyEntry {
                 PullRequestState::Merged | PullRequestState::Closed
             )
         });
-        self.terminal_since = if terminal {
-            Some(self.terminal_since.unwrap_or(now))
-        } else {
-            None
+        // The clock belongs to one PR: a different one, as when a branch's
+        // closed PR is replaced by another, starts it again.
+        let same_pr = matches!(
+            (&self.value, &value),
+            (Some(Some(old)), Some(new)) if old.number == new.number
+        );
+        self.terminal_since = match (terminal, self.terminal_since) {
+            (false, _) => None,
+            (true, Some(since)) if same_pr => Some(since),
+            (true, _) => Some(now),
         };
         self.value = Some(value);
         self.failed = false;
@@ -1210,6 +1216,12 @@ mod tests {
             at + TERMINAL_PENDING_CHECKS_WINDOW + interval,
             interval
         ));
+        // A different closed PR on the branch has a clock of its own.
+        let mut replacement = closed.clone();
+        replacement.number = 2;
+        let mut other = entry.clone();
+        other.record(Some(replacement), later);
+        assert_eq!(other.terminal_since, Some(later));
         // Reopened, the PR is open again and the clock starts over.
         let mut open = closed;
         open.state = PullRequestState::Open;
