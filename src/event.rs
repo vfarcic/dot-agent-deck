@@ -5077,6 +5077,67 @@ mod tests {
         assert!(serde_json::from_str::<AgentEvent>(&json).is_err());
     }
 
+    /// PRD #1666 part 2 (wire audit W03–W05): every line a one-shot sends
+    /// that could take mail or commit it is a verb a 0.47.0 daemon does not
+    /// decode (its list copied from `v0.47.0`) and is no [`AgentEvent`]
+    /// either, so an older daemon logs it as malformed and answers nothing:
+    /// it can neither hand the one-shot mail on legacy terms nor ingest the
+    /// line as a status report.
+    #[test]
+    fn a_one_shots_receipt_lines_are_nothing_a_0_47_daemon_decodes() {
+        const RELEASED_0_47: &[&str] = &[
+            "delegate",
+            "work_done",
+            "get_seed",
+            "dispatch",
+            "list_targets",
+            "restart_role",
+            "spawn_role",
+            "ack",
+            "inbox_wait",
+            "inbox_announce",
+            "inbox_fetch",
+            "inbox_list",
+            "inbox_publish",
+            "inbox_offer",
+            "inbox_complete",
+            "inbox_release",
+            "question",
+        ];
+        let who = serde_json::json!({"pane_id":"7", "agent_id":"a", "token":"tok"});
+        let with = |verb: &str, extra: serde_json::Value| {
+            let mut line = who.clone();
+            line["message_type"] = serde_json::json!(verb);
+            for (key, value) in extra.as_object().unwrap() {
+                line[key] = value.clone();
+            }
+            let msg: DaemonMessage = serde_json::from_value(line).expect(verb);
+            serde_json::to_string(&msg).unwrap()
+        };
+        for line in [
+            with("inbox_receipts", serde_json::json!({})),
+            with(
+                "inbox_receipt_wait",
+                serde_json::json!({"component":"claude_waiter", "mode":"once",
+                    "hook_integration":1}),
+            ),
+            with(
+                "inbox_receipt_fetch",
+                serde_json::json!({"consumer":"doorbell_hook", "hook_integration":1}),
+            ),
+            with(
+                "inbox_committed",
+                serde_json::json!({"attempts":[{"id":"m-k3xzq2ab-0f3c9a71d2e4b850",
+                    "a":1, "e":1}]}),
+            ),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let verb = value["message_type"].as_str().unwrap();
+            assert!(!RELEASED_0_47.contains(&verb), "{line}");
+            assert!(serde_json::from_str::<AgentEvent>(&line).is_err(), "{line}");
+        }
+    }
+
     /// Issue #1383: `ack` is attested by its pane like `work-done` and answers
     /// a refusal at the gate with a `SignalAck`. An admission is NOT answered at
     /// the gate (PR #1414 review): its handler answers once it has looked the id

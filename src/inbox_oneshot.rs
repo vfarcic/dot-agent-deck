@@ -1966,7 +1966,8 @@ pub(crate) mod tests {
     /// A stand-in deck in `dir`: its `n`th connection is answered, once its
     /// first line is in, with `answers[n]` (`None`: it hangs up instead),
     /// and every line each connection sends is recorded until its peer
-    /// closes it.
+    /// closes it. Connections made in the half second after the scripted
+    /// ones are recorded too, unanswered.
     #[cfg(unix)]
     pub(crate) fn stand_in_deck(
         dir: &Path,
@@ -1997,6 +1998,27 @@ pub(crate) mod tests {
                     }
                 }
                 seen.push(got);
+            }
+            // A deck that answered its scripted connections still accepts
+            // more, as a real one does: record whatever comes next.
+            listener.set_nonblocking(true).unwrap();
+            let until = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < until {
+                match listener.accept() {
+                    Ok((socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        seen.push(
+                            io::BufReader::new(socket)
+                                .lines()
+                                .map_while(Result::ok)
+                                .collect(),
+                        );
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
             }
             seen
         });
