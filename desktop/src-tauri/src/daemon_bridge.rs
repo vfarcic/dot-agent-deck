@@ -323,6 +323,11 @@ pub(crate) struct DaemonLinks {
     /// Total handshakes performed, for tests and for the milestone's
     /// before/after measurement. Never read by production logic.
     handshakes: AtomicUsize,
+    // Per-instance clock seam. No process environment or global clock changes.
+    #[cfg(test)]
+    test_cache_age: std::sync::Mutex<Option<Duration>>,
+    #[cfg(test)]
+    test_cache_lookups: std::sync::Mutex<Vec<Duration>>,
     /// Issue #1490: the last answer to "why is this remote deck not
     /// connected?", by deck. Asking costs ssh round trips, so the deck's
     /// watcher asks at most every [`REMOTE_REASON_TTL`] and every snapshot
@@ -377,12 +382,38 @@ impl Default for DaemonLinks {
             gates: std::sync::Mutex::new(HashMap::new()),
             tunnels: Arc::new(EndpointTunnels::default()),
             handshakes: AtomicUsize::new(0),
+            #[cfg(test)]
+            test_cache_age: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_cache_lookups: std::sync::Mutex::new(Vec::new()),
             reasons: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl DaemonLinks {
+    #[cfg(test)]
+    pub(crate) fn pin_cache_age_for_test(&self, age: Duration) {
+        *self.test_cache_age.lock().unwrap() = Some(age);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_fresh_cache_clock_for_test(&self) {
+        assert_eq!(
+            *self.test_cache_age.lock().unwrap(),
+            Some(Duration::ZERO),
+            "stale-cache reproduction must stay inside the five-second cache lifetime"
+        );
+        assert!(
+            self.test_cache_lookups
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|age| *age == Duration::ZERO),
+            "a cached lookup aged out: expiry is not evidence of EOF invalidation"
+        );
+    }
+
     /// Why `endpoint`'s deck is not connected (issue #1490). A local deck is
     /// asked now; a remote one answers from what its watcher last stored, or
     /// "not checked yet" before the first answer.
@@ -561,10 +592,16 @@ impl DaemonLinks {
         let _establishing = gate.lock().await;
         {
             let mut links = self.links.lock().await;
-            if let Some(held) = links.get(&key)
-                && held.is_fresh(Instant::now())
-            {
-                return Ok(Arc::clone(held));
+            if let Some(held) = links.get(&key) {
+                let now = Instant::now();
+                #[cfg(test)]
+                let now = self.test_cache_age.lock().unwrap().map_or(now, |age| {
+                    self.test_cache_lookups.lock().unwrap().push(age);
+                    held.established + age
+                });
+                if held.is_fresh(now) {
+                    return Ok(Arc::clone(held));
+                }
             }
             // Removed BEFORE the handshake and while nothing else can be
             // establishing for this deck, so a stale classification is never

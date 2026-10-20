@@ -423,7 +423,8 @@ fn status_explains_waiting(status: Option<&crate::state::SessionStatus>) -> bool
 
 type AgentKey = (String, String);
 
-/// E2E interleave fixture, armed through files below the isolated daemon HOME.
+/// E2E interleave fixture, configured below HOME by the isolated harness.
+/// Directory checks assume a trusted fixture filesystem, including marker leaves.
 /// The caller holds neither the app-state nor inbox-hub lock while parked.
 #[cfg(feature = "e2e")]
 pub(crate) async fn pause_rering_for_test(pane: &str, phase: &str) {
@@ -437,12 +438,12 @@ pub(crate) async fn pause_rering_for_test(pane: &str, phase: &str) {
         return;
     }
     std::fs::write(root.join(format!("{phase}.reached")), b"").expect("report ring barrier");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     while !root.join(format!("{phase}.release")).exists() {
         if tokio::time::Instant::now() >= deadline {
             std::fs::write(root.join(format!("{phase}.timed-out")), b"barrier timeout")
                 .expect("report barrier timeout");
-            panic!("doorbell test barrier {phase} timed out after 10s for pane {pane}");
+            panic!("doorbell test barrier {phase} timed out after 8s for pane {pane}");
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -452,8 +453,8 @@ pub(crate) async fn pause_rering_for_test(pane: &str, phase: &str) {
 fn test_control_root() -> Option<std::path::PathBuf> {
     let root = std::env::var_os("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR")?;
     let root = std::path::PathBuf::from(root);
-    // A relative single directory under this subprocess's private HOME is the
-    // entire control surface. Do not accept arbitrary external marker paths.
+    // Check the configured directory under HOME. The harness supplies a private
+    // HOME and trusted marker leaves; this is not a no-follow filesystem boundary.
     if root.components().count() != 1
         || !matches!(
             root.components().next(),
@@ -472,7 +473,7 @@ fn test_control_root() -> Option<std::path::PathBuf> {
     Some(root)
 }
 
-/// Append-only observations, enabled only inside an e2e fixture HOME.
+/// Append-only observations, enabled by fixture configuration under HOME.
 #[cfg(feature = "e2e")]
 pub(crate) fn record_for_test(event: &str) {
     use std::io::Write;
@@ -495,6 +496,31 @@ struct Slot {
     stall: StallClock,
 }
 
+// Test-only cancellation cleanup: a seam timeout/panic must not strand a
+// logical busy slot, even when it unwinds while holding the pane writer.
+#[cfg(feature = "e2e")]
+struct TestBusyGuard {
+    slots: Arc<Mutex<HashMap<AgentKey, Slot>>>,
+    key: Option<AgentKey>,
+}
+
+#[cfg(feature = "e2e")]
+impl Drop for TestBusyGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        if let Some(slot) = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&key)
+        {
+            slot.busy = false;
+        }
+    }
+}
+
 /// Run the doorbell for as long as the returned task lives.
 pub fn spawn(
     registry: Arc<AgentPtyRegistry>,
@@ -503,11 +529,43 @@ pub fn spawn(
 ) -> tokio::task::JoinHandle<()> {
     let slots: Arc<Mutex<HashMap<AgentKey, Slot>>> = Arc::default();
     tokio::spawn(async move {
+        #[cfg(feature = "e2e")]
+        let clock_origin = Instant::now();
         let mut tick = tokio::time::interval(config.tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            #[cfg(feature = "e2e")]
+            let now = Instant::now();
+            // Advance policy age without sleeping. With e2e enabled, a
+            // configured daemon reads this trusted fixture file.
+            #[cfg(feature = "e2e")]
+            let clock_step = test_control_root().and_then(|root| {
+                let ms = std::fs::read_to_string(root.join("clock-ms"))
+                    .ok()?
+                    .parse::<u64>()
+                    .ok()?;
+                Some((root, ms))
+            });
+            #[cfg(feature = "e2e")]
+            let now = clock_step
+                .as_ref()
+                .map_or(now, |(_, ms)| clock_origin + Duration::from_millis(*ms));
+            #[cfg(feature = "e2e")]
+            run_tick(&registry, &state, &config, &slots, now).await;
+            #[cfg(not(feature = "e2e"))]
             run_tick(&registry, &state, &config, &slots).await;
+            #[cfg(feature = "e2e")]
+            if let Some((root, ms)) = clock_step
+                && slots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .all(|slot| !slot.busy)
+            {
+                std::fs::write(root.join("clock-observed"), ms.to_string())
+                    .expect("report completed policy tick");
+            }
         }
     })
 }
@@ -517,6 +575,7 @@ async fn run_tick(
     state: &SharedState,
     config: &DoorbellConfig,
     slots: &Arc<Mutex<HashMap<AgentKey, Slot>>>,
+    #[cfg(feature = "e2e")] now: Instant,
 ) {
     let hub = registry.inbox();
     // Every agent generation with queued messages, plus every one the doorbell
@@ -556,6 +615,7 @@ async fn run_tick(
             })
             .collect()
     };
+    #[cfg(not(feature = "e2e"))]
     let now = Instant::now();
     for ((pane, agent), (admission, explained)) in keys.into_iter().zip(admissions) {
         let facts = Facts {
@@ -597,6 +657,11 @@ async fn run_tick(
         let config = config.clone();
         let queued = facts.inbox.queued;
         tokio::spawn(async move {
+            #[cfg(feature = "e2e")]
+            let mut _busy_guard = TestBusyGuard {
+                slots: Arc::clone(&slots),
+                key: Some((pane.clone(), agent.clone())),
+            };
             let (pre_cr, line) = match &action {
                 Action::Ring { id, pre_cr } => (*pre_cr, Some(doorbell_line(id))),
                 _ => (true, None),
@@ -641,6 +706,12 @@ async fn run_tick(
             #[cfg(feature = "e2e")]
             pause_rering_for_test(&pane, "completed").await;
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "e2e")]
+            {
+                // Normal completion owns the slot lock: disarm before making
+                // it available, so Drop cannot clear a newer attempt's busy bit.
+                _busy_guard.key = None;
+            }
             let Some(slot) = slots.get_mut(&(pane.clone(), agent.clone())) else {
                 return;
             };

@@ -243,6 +243,9 @@ fn assert_clear_waits_for_ready(session_start: bool) {
         );
         state(&daemon, &new, &id, "queued");
     }
+    // The submitted ring is consumed only once by the stand-in. Arm its
+    // fetch before readiness so any correct wake/submit ordering can fetch.
+    route::fetch_enable(&new);
     status(&daemon, &new, "idle", "claude_code");
     assert!(
         common::wait_until(Duration::from_secs(1), || bytes(&new).ends_with(b"\r")),

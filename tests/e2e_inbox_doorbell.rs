@@ -3,6 +3,8 @@
 mod common;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
+#[path = "support/inbox_route.rs"]
+mod route;
 
 use inbox::*;
 use serde_json::json;
@@ -280,11 +282,11 @@ fn doorbell_007_outstanding_ring_gets_pre_ring_and_cleanup_cr() {
     }
 }
 
-/// Scenario: Hold a task behind an old agent's human draft, stop it, and spawn a new agent in the same pane identity. A ShellIdle sample carrying the predecessor's session id must not type into the replacement before its own readiness; its own Idle then submits only the newly bound task, which can be fetched.
+/// Scenario: Hold a task behind an old agent's human draft, stop it, and spawn a new agent in the same pane identity. A predecessor-session ShellIdle must not type into the replacement at controlled policy ages of 5 seconds, 10 seconds and up to one day, nor during the real observation window; its own Idle then submits only the newly bound task, which can be fetched.
 #[spec("inbox/doorbell/008")]
 #[test]
 fn doorbell_008_respawn_never_rings_old_agents_message() {
-    let daemon = daemon_unbound(&[]);
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers")]);
     let old = pane(&daemon, "respawn");
     status(&daemon, &old, "idle", "claude_code");
     let user = input(&daemon, &old, DRAFT);
@@ -313,6 +315,10 @@ fn doorbell_008_respawn_never_rings_old_agents_message() {
     let mut socket = connect(&daemon, &event).into_inner();
     socket.shutdown(std::net::Shutdown::Write).unwrap();
     std::io::Read::read_to_end(&mut socket, &mut Vec::new()).unwrap();
+    for age_ms in [5_000, 10_000, 86_399_000, 86_400_000] {
+        clock_step(&daemon, &new, age_ms);
+    }
+    std::fs::remove_file(daemon.home.join("ring-barriers/clock-ms")).unwrap();
     assert!(
         !common::wait_until(Duration::from_millis(6500), || !bytes(&new).is_empty()),
         "replacement received automatic input before current-generation readiness: {:?}; grid={}",
@@ -365,7 +371,7 @@ fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
         daemon: runtime.block_on(common::spawn_inprocess_daemon()),
         root: common::harness_tempdir().unwrap(),
     };
-    let pane = pane(&fixture, "placeholder-readiness");
+    let pane = route::start(&fixture, "placeholder-readiness", json!({}));
     runtime.block_on(async {
         let mut state = fixture.daemon.state.write().await;
         state.register_pane(pane.id.clone());
@@ -379,13 +385,15 @@ fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
         screen(&fixture, &pane)
     );
     state(&fixture, &pane, &id, "queued");
+    route::fetch_enable(&pane);
     status(&fixture, &pane, "idle", "claude_code");
     assert!(
-        common::wait_until(Duration::from_secs(1), || !rings(&pane).is_empty()),
+        common::wait_until(Duration::from_secs(1), || bytes(&pane).ends_with(b"\r")),
         "own ready must promptly submit placeholder's fixed line"
     );
-    ring(&fixture, &pane, &id);
-    let fetched = fetch(&fixture, &pane, true).to_string();
+    // Fetch from the fixture agent itself: this in-process daemon deliberately
+    // keeps real component ancestry admission, unlike daemon_unbound fixtures.
+    let fetched = route::fetched(&fixture, &pane, &id, BODY, "");
     assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
 }
 
@@ -438,6 +446,46 @@ fn doorbell_031_human_draft_after_decision_withholds_retry() {
     assert_ack_fences_rering("decided", true, true);
 }
 
+/// Scenario: After the retry payload reaches the pane, a human input frame arrives before its final submit CR. The already-written payload is allowed, but releasing the writer must deliver only the human draft and no automatic submit; the unchanged-message control still submits.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_human_draft_before_submit_withholds_final_cr() {
+    assert_ack_fences_rering("before-submit", true, true);
+}
+
+/// Scenario: Leave completion and writer-held barriers unreleased in separate fixtures until their test-only timeouts unwind the tasks. Each pane must then accept and submit another scheduled ring, proving recovery of its writer and logical busy slot.
+#[spec("inbox/doorbell/031")]
+#[test]
+fn doorbell_031_timed_out_barrier_does_not_strand_slot() {
+    for phase in ["completed", "after-delay"] {
+        let daemon = daemon_unbound(&[
+            ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
+            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "timeout-control"),
+            ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
+        ]);
+        let root = daemon.home.join("ring-barriers");
+        std::fs::create_dir_all(&root).unwrap();
+        let pane = pane(&daemon, "timeout-control");
+        std::fs::write(root.join(format!("{phase}.armed")), "").unwrap();
+        status(&daemon, &pane, "idle", "claude_code");
+        let id = enqueue(&daemon, &pane, BODY);
+        ring(&daemon, &pane, &id);
+        assert!(
+            common::wait_until(WAIT, || root.join(format!("{phase}.reached")).exists()),
+            "timeout control must reach its seam"
+        );
+        assert!(
+            common::wait_until(WAIT, || root.join(format!("{phase}.timed-out")).exists()),
+            "unreleased seam must report its bounded timeout"
+        );
+        assert!(
+            common::wait_until(WAIT, || rings(&pane).len() >= 2),
+            "seam timeout stranded the doorbell's busy slot"
+        );
+        fetch(&daemon, &pane, true);
+    }
+}
+
 fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
     // Run the queued control FIRST, so a RED below still proves the barrier
     // releases a real re-ring with the ordinary payload and submission.
@@ -449,18 +497,21 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
             ("RUST_LOG", "dot_agent_deck::doorbell=debug"),
         ]);
         let root = daemon.home.join("ring-barriers");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join(format!("{phase}.armed")), "").unwrap();
+        std::fs::create_dir_all(&root).unwrap();
         let pane = pane(&daemon, "fenced");
         // Attach before the writer is parked. The observation seam proves the
         // human frame arrived while its PTY write waits behind that writer.
         let mut user = common::AttachInput::attach(&daemon.attach_socket, &pane.agent);
+        let _budget = InterleaveBudget::start(&root);
+        std::fs::write(root.join(format!("{phase}.armed")), "").unwrap();
         status(&daemon, &pane, "idle", "claude_code");
         let id = enqueue(&daemon, &pane, BODY);
         ring(&daemon, &pane, &id);
         let first = format!("{}\r", fixed_line(&id));
         assert!(
-            common::wait_until(WAIT, || root.join(format!("{phase}.reached")).exists()),
+            common::wait_until(wait_budget(), || root
+                .join(format!("{phase}.reached"))
+                .exists()),
             "re-ring must reach {phase} barrier"
         );
         let parked = match phase {
@@ -469,7 +520,7 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
             _ => format!("{first}\r"),
         };
         assert!(
-            common::wait_until(WAIT, || bytes(&pane) == parked.as_bytes()),
+            common::wait_until(wait_budget(), || bytes(&pane) == parked.as_bytes()),
             "{phase}: barrier must precede payload: {:?}",
             bytes(&pane)
         );
@@ -490,23 +541,25 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
         if acknowledge && draft {
             user.write(DRAFT);
             assert!(
-                common::wait_until(WAIT, || std::fs::read_to_string(root.join("observations"))
-                    .unwrap_or_default()
-                    .contains("human-arrived fenced")),
+                common::wait_until(wait_budget(), || std::fs::read_to_string(
+                    root.join("observations")
+                )
+                .unwrap_or_default()
+                .contains("human-arrived fenced")),
                 "human frame must arrive before releasing the writer"
             );
         }
         std::fs::write(root.join("completed.armed"), "").unwrap();
         std::fs::write(root.join(format!("{phase}.release")), "").unwrap();
         assert!(
-            common::wait_until(WAIT, || root.join("completed.reached").exists()),
+            common::wait_until(wait_budget(), || root.join("completed.reached").exists()),
             "{phase}: attempt must complete within the bounded seam; timeout={}",
             root.join(format!("{phase}.timed-out")).exists()
         );
         drained(&pane);
         if !acknowledge {
             assert!(
-                common::wait_until(WAIT, || rings(&pane).len() >= 2),
+                common::wait_until(wait_budget(), || rings(&pane).len() >= 2),
                 "{phase}: still-queued control must submit its second ring"
             );
             assert_eq!(
@@ -524,7 +577,7 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
         };
         if draft {
             assert!(
-                common::wait_until(WAIT, || bytes(&pane).ends_with(DRAFT.as_bytes())),
+                common::wait_until(wait_budget(), || bytes(&pane).ends_with(DRAFT.as_bytes())),
                 "human input must resume after writer release"
             );
         }

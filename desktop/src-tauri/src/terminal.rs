@@ -2316,7 +2316,7 @@ mod tests {
         Channel::new(|_body: tauri::ipc::InvokeResponseBody| Ok(()))
     }
 
-    /// Scenario: A terminal reaches EOF, then its daemon socket is replaced before the independent event watcher invalidates cached trust. Reopening must refuse a different protocol with zero attach requests; the same-protocol control must really reopen a terminal stream.
+    /// Scenario: With cached-handshake age pinned to zero at its actual lookup, a terminal reaches EOF and its daemon socket is replaced before watcher invalidation. Reopening must refuse a different protocol with zero attach requests; the same-protocol control must really reopen a terminal stream, and cache expiry cannot satisfy either case.
     #[cfg(unix)]
     #[tokio::test]
     async fn terminal_reopen_after_eof_rechecks_protocol_before_cached_trust() {
@@ -2333,6 +2333,7 @@ mod tests {
             let (listener, _local_deck) = bind_local_deck(&socket);
             crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
             let state = DesktopState::default();
+            state.daemon.pin_cache_age_for_test(Duration::ZERO);
             let original = tokio::spawn(async move {
                 let _hello = answer_one(&listener, matching_hello(), None, None).await;
                 let (_, writer) = answer_one(&listener, AttachResponse::ok(), None, None).await;
@@ -2371,6 +2372,8 @@ mod tests {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
             let admissions = Arc::new(AtomicUsize::new(0));
             let count = Arc::clone(&admissions);
+            let hellos = Arc::new(AtomicUsize::new(0));
+            let hello_count = Arc::clone(&hellos);
             let replacement = tokio::spawn(async move {
                 let mut streams = Vec::new();
                 while let Ok((stream, _)) = listener.accept().await {
@@ -2384,6 +2387,7 @@ mod tests {
                     let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
                     let reply = match request["op"].as_str().unwrap() {
                         "hello" => {
+                            hello_count.fetch_add(1, Ordering::SeqCst);
                             let mut hello = matching_hello();
                             hello.server_version = Some(protocol);
                             hello
@@ -2407,6 +2411,14 @@ mod tests {
             .await
             .expect("bounded terminal reopen");
             replacement.abort();
+            state.daemon.assert_fresh_cache_clock_for_test();
+            if protocol != PROTOCOL_VERSION && reopened.is_ok() {
+                assert_eq!(
+                    hellos.load(Ordering::SeqCst),
+                    0,
+                    "successful incompatible reopen must reproduce cached-trust reuse, not fresh Hello admission"
+                );
+            }
             if protocol == PROTOCOL_VERSION {
                 let attached = reopened.expect("same-version terminal must reopen");
                 assert!(

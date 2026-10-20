@@ -310,13 +310,16 @@ fn doorbell_031_codex_flush_only_rechecks_selected_message() {
     );
     let root = codex.daemon.home.join("ring-barriers");
     std::fs::create_dir_all(&root).unwrap();
+    let _budget = InterleaveBudget::start(&root);
     std::fs::write(root.join("before-pre-cr.armed"), "").unwrap();
     let base = codex.pane.capture.with_extension("strand");
     std::fs::write(base.with_extension("empty"), COMPOSER).unwrap();
     std::fs::write(&base, "").unwrap();
     let id = codex.queued(BODY);
     assert!(
-        common::wait_until(WAIT, || root.join("before-pre-cr.reached").exists()),
+        common::wait_until(wait_budget(), || root
+            .join("before-pre-cr.reached")
+            .exists()),
         "recognized Codex CR-only retry must reach its fence"
     );
     let first = format!("{}\r", fixed_line(&id));
@@ -328,7 +331,7 @@ fn doorbell_031_codex_flush_only_rechecks_selected_message() {
     std::fs::write(root.join("completed.armed"), "").unwrap();
     std::fs::write(root.join("before-pre-cr.release"), "").unwrap();
     assert!(
-        common::wait_until(WAIT, || root.join("completed.reached").exists()),
+        common::wait_until(wait_budget(), || root.join("completed.reached").exists()),
         "CR-only attempt must complete"
     );
     drained(&codex.pane);
