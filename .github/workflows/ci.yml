@@ -914,6 +914,20 @@ jobs:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
+    env:
+      # NO debug info in the e2e build, unlike the `test` job's line tables.
+      # Every shard downloads this archive, and its transfer from GitHub's
+      # artifact storage was the slowest step of the tier: 2.9 GB, measured at
+      # 31 s to 14.5 min per shard on 2026-10-19, against 2-4 min of tests.
+      # Even line tables were 37% of a test binary. Nothing here needs them: CI
+      # sets no RUST_BACKTRACE, and a panic's file:line is compiled in
+      # regardless of debug info. What is lost is file:line in a backtrace if
+      # someone reruns a shard with RUST_BACKTRACE=1.
+      # Job-level, not on the archive step: rust-cache folds the CARGO*
+      # variables it can see into its key, so the cache keeps a separate entry
+      # for this profile instead of restoring artifacts built with debug info
+      # and, on an exact key hit, never saving the rebuild.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -939,16 +953,6 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
       - run: cargo nextest archive --workspace --features e2e --archive-file e2e.tar.zst
-        env:
-          # NO debug info in the e2e build, unlike the `test` job's line tables.
-          # Every shard downloads this archive, and its transfer from GitHub's
-          # artifact storage was the slowest step of the tier: 2.9 GB, measured
-          # at 31 s to 14.5 min per shard on 2026-10-19, against 2-4 min of
-          # tests. Even line tables were 37% of a test binary. Nothing here
-          # needs them: CI sets no RUST_BACKTRACE, and a panic's file:line is
-          # compiled in regardless of debug info. What is lost is file:line in a
-          # backtrace if someone reruns a shard with RUST_BACKTRACE=1.
-          CARGO_PROFILE_DEV_DEBUG: "0"
       - name: Record the archive's size
         run: |
           echo "e2e archive: $(du -h e2e.tar.zst | cut -f1)" | tee -a "$GITHUB_STEP_SUMMARY"
