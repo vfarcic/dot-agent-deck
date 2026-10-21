@@ -512,8 +512,8 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       # Exact, and in lockstep with devbox.json — see `desktop-web` above.
@@ -594,7 +594,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           components: rustfmt
       - run: cargo fmt --check
 
@@ -608,9 +608,9 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       # The desktop crate's Linux build deps, needed because clippy/nextest below
@@ -691,8 +691,8 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       # The desktop crate's Linux build deps — the comment on `clippy`'s copy of
@@ -722,8 +722,8 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
@@ -914,14 +914,28 @@ jobs:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
+    env:
+      # NO debug info in the e2e build, unlike the `test` job's line tables.
+      # Every shard downloads this archive, and its transfer from GitHub's
+      # artifact storage was the slowest step of the tier: 2.9 GB, measured at
+      # 31 s to 14.5 min per shard on 2026-10-19, against 2-4 min of tests.
+      # Even line tables were 37% of a test binary. Nothing here needs them: CI
+      # sets no RUST_BACKTRACE, and a panic's file:line is compiled in
+      # regardless of debug info. What is lost is file:line in a backtrace if
+      # someone reruns a shard with RUST_BACKTRACE=1.
+      # Job-level, not on the archive step: rust-cache folds the CARGO*
+      # variables it can see into its key, so the cache keeps a separate entry
+      # for this profile instead of restoring artifacts built with debug info
+      # and, on an exact key hit, never saving the rebuild.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
@@ -939,11 +953,9 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
       - run: cargo nextest archive --workspace --features e2e --archive-file e2e.tar.zst
-        env:
-          # Line tables keep file:line in panics and backtraces and drop the rest of
-          # the debug info, which is most of a test build's `target/`: it links
-          # faster and leaves a smaller cache entry for the 10 GB repository limit.
-          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      - name: Record the archive's size
+        run: |
+          echo "e2e archive: $(du -h e2e.tar.zst | cut -f1)" | tee -a "$GITHUB_STEP_SUMMARY"
       # One name for every attempt, NOT the `-attempt-<n>` suffix the JUnit
       # uploads carry. "Re-run failed jobs" reruns a failed shard under a new
       # `github.run_attempt` without rerunning this job when it passed, so a
@@ -998,7 +1010,7 @@ jobs:
       # needed although the tier itself is not compiled here.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-nextest@0.9.146
@@ -1007,7 +1019,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      # The archive download's time varies far more than its size explains
+      # (31 s to 14.5 min for the same 2.9 GB on 2026-10-19, typically 1-3 min),
+      # and a slow transfer usually goes faster on a fresh connection. So the
+      # first attempt gets a short limit and a second attempt a long one; a
+      # failure that survives both still fails the shard.
+      - id: download-archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          name: e2e-archive
+      - if: steps.download-archive.outcome != 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        timeout-minutes: 20
         with:
           name: e2e-archive
       # Issues #351/#818: a single ~16-21s stall lands on ONE arbitrary test per
@@ -1107,8 +1132,8 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, and
@@ -1270,9 +1295,9 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - name: Type-check the workspace for Windows from Linux
@@ -1379,10 +1404,10 @@ jobs:
           scripts/check-symlinks.sh
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           targets: x86_64-pc-windows-msvc
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
@@ -1455,9 +1480,9 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
@@ -1526,8 +1551,8 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - run: cargo install cargo-audit --locked

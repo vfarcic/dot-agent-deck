@@ -33,18 +33,19 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 [ "$head" = feat/pr-badge ] && [ "$repo" = test-org/test-repo ] && [ "$state" = all ] || exit 93
-for field in number state isDraft reviewDecision url headRefName; do
+for field in number state isDraft reviewDecision url headRefName statusCheckRollup; do
     case ",$fields," in
         *",$field,"*) ;;
         *) exit 94 ;;
     esac
 done
-printf '%s\n' '[{"number":1234,"headRefName":"feat/pr-badge","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","url":"https://github.com/test-org/test-repo/pull/1234"}]'
+printf '%s\n' '[{"number":1234,"headRefName":"feat/pr-badge","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","url":"https://github.com/test-org/test-repo/pull/1234","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS"}]}]'
 "#;
 
 /// Scenario: Launch an interactive Haiku agent in a fixture PR branch and ask
 /// it to list the files without naming the sentinel in the prompt. The attached
-/// TUI must show the discovered filename alongside the open/review-required PR badge.
+/// TUI must show the discovered filename alongside the PR badge with its
+/// open, CI-passing and review-required glyphs.
 #[spec("session/pr/005")]
 #[test]
 fn pr_005_real_haiku_work_and_pull_request_badge() {
@@ -126,7 +127,7 @@ fn pr_005_real_haiku_work_and_pull_request_badge() {
     deck.wait_for_absence("No active agents");
     deck.send_keys(b"1");
     assert!(
-        deck.wait_for_grid_string_within("#1234 ⊙ ◐", WAIT),
+        deck.wait_for_grid_string_within("#1234 ⊙ ✓ ◉", WAIT),
         "real-agent card must show PR number, state and review:\n{}",
         deck.snapshot_grid()
     );
@@ -159,7 +160,7 @@ fn pr_005_real_haiku_work_and_pull_request_badge() {
     );
     assert!(
         deck.wait_for_grid_predicate_within(WAIT, |grid| {
-            grid.contains(SENTINEL) && grid.contains("#1234 ⊙ ◐")
+            grid.contains(SENTINEL) && grid.contains("#1234 ⊙ ✓ ◉")
         }),
         "the attached TUI must visibly show the discovered sentinel and PR badge together:\n{}",
         deck.snapshot_grid()

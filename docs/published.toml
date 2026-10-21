@@ -53,6 +53,11 @@ title = "Schedules"
 description = "Run a prompt on a cron schedule, or dispatch agents onto open GitHub issues: set up, check, troubleshoot, plus the full schedules.toml, cron and schedule CLI reference."
 
 [[page]]
+slug = "daemon-service"
+title = "Run the Daemon as a Service"
+description = "Keep the daemon running across reboots, crashes and remote upgrades with dot-agent-deck daemon install: a systemd user unit on Linux, a LaunchAgent on macOS."
+
+[[page]]
 slug = "configuration"
 title = "Configuration"
 description = "Every configuration file and environment variable: config.toml (default_command, default_dir, bell), the project .dot-agent-deck.toml, the experimental flag, and the desktop app's desktop.toml."

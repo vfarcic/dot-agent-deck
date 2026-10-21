@@ -1,6 +1,5 @@
 ---
 source: tests/render_dashboard.rs
-assertion_line: 176
 expression: values
 ---
 Open/None
@@ -8,9 +7,9 @@ Open/None
 Open/Some(Approved)
 ┗ #1234 ⊙ ✓ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Open/Some(ChangesRequested)
-┗ #1234 ⊙ ✗ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ⊙ ± ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Open/Some(ReviewRequired)
-┗ #1234 ⊙ ◐ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ⊙ ◉ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Open/Some(Unknown)
 ┗ #1234 ⊙ ? ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Draft/None
@@ -18,9 +17,9 @@ Draft/None
 Draft/Some(Approved)
 ┗ #1234 ◌ ✓ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Draft/Some(ChangesRequested)
-┗ #1234 ◌ ✗ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ◌ ± ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Draft/Some(ReviewRequired)
-┗ #1234 ◌ ◐ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ◌ ◉ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Draft/Some(Unknown)
 ┗ #1234 ◌ ? ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Merged/None
@@ -28,9 +27,9 @@ Merged/None
 Merged/Some(Approved)
 ┗ #1234 ◆ ✓ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Merged/Some(ChangesRequested)
-┗ #1234 ◆ ✗ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ◆ ± ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Merged/Some(ReviewRequired)
-┗ #1234 ◆ ◐ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ◆ ◉ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Merged/Some(Unknown)
 ┗ #1234 ◆ ? ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Closed/None
@@ -38,9 +37,9 @@ Closed/None
 Closed/Some(Approved)
 ┗ #1234 ⊘ ✓ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Closed/Some(ChangesRequested)
-┗ #1234 ⊘ ✗ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ⊘ ± ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Closed/Some(ReviewRequired)
-┗ #1234 ⊘ ◐ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ⊘ ◉ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Closed/Some(Unknown)
 ┗ #1234 ⊘ ? ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Unknown/None
@@ -48,8 +47,8 @@ Unknown/None
 Unknown/Some(Approved)
 ┗ #1234 ? ✓ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Unknown/Some(ChangesRequested)
-┗ #1234 ? ✗ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ? ± ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Unknown/Some(ReviewRequired)
-┗ #1234 ? ◐ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
+┗ #1234 ? ◉ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛
 Unknown/Some(Unknown)
 ┗ #1234 ? ? ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 1h  Tools: 14 ┛

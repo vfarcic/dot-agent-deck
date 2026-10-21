@@ -44,6 +44,7 @@ pub mod capture;
 pub mod choice;
 mod command_text;
 pub mod dictation;
+pub mod evidence;
 mod filter;
 pub mod hold;
 pub mod http;

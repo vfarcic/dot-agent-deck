@@ -28,11 +28,17 @@
 //!
 //! **The rule proves every registry ENTRY is classified. It does not prove the
 //! registry is COMPLETE.** A control wired with a bare `onClick` that never
-//! reaches `VOICE_ACTIONS` is invisible to it — 80 `onClick=` sites in non-test
-//! `.tsx` under `desktop/src` when PRD #802 was written, against 7 static
-//! palette entries and 7 rail buttons. Most of the sampled ones are chrome, and
-//! the rule could not tell a capability from a close button anyway, so the
-//! residue is not claimed to be harmless.
+//! reaches `VOICE_ACTIONS` is invisible to these assertions — 80 `onClick=`
+//! sites in non-test `.tsx` under `desktop/src` when PRD #802 was written,
+//! against 7 static palette entries and 7 rail buttons. Most of the sampled
+//! ones are chrome, and the rule could not tell a capability from a close
+//! button anyway, so the residue is not claimed to be harmless.
+//!
+//! **Issue #1701 gave rule 14 a second half for that case**:
+//! [`crate::voice_control_sites`], run from [`run`], lists every such site
+//! by identity with a written reason and fails the build on a new one. It is
+//! a ratchet, not a proof — what it cannot see is in its own module comment
+//! and its own rule sentence.
 //!
 //! What makes the narrower claim worth having is that the registry is
 //! **load-bearing at runtime**: the rail, the palette, the agent tile's
@@ -146,8 +152,9 @@ pub const VOICE_REGISTRY_RULE: &str = "PRD #802 rule 14: `desktop/src-tauri/src/
      `voice: true` or a written `no_voice` reason, and the locally-matched phrase lists in \
      `desktop/src-tauri/src/voice/dictation.rs` must stay pairwise disjoint and covered by their own rows' \
      descriptions. WHAT THIS RULE DOES NOT SEE: a control wired with a bare `onClick` \
-     that never reaches the registry — 80 such sites in non-test `.tsx` when this was written — so a green rule 14 is \
-     NOT evidence that no capability was forgotten";
+     that never reaches the registry — its control-site ratchet (`voice_control_sites.rs`, issue #1701) is what \
+     lists those, and it carries its own residual — so a green rule 14 is NOT evidence that no capability was \
+     forgotten";
 
 /// The texts the rule reads, so the assertions can be driven from planted input
 /// as well as from the tree.
@@ -163,8 +170,18 @@ pub struct Sources {
     pub dictation_rs: String,
 }
 
-/// Read every file and check them. Every read failure is a finding.
+/// Read every file and check them, then run the control-site ratchet
+/// ([`crate::voice_control_sites`], issue #1701) — the half of rule 14 that
+/// sees a control which never became an entry. Every read failure is a
+/// finding.
 pub fn run(root: &Path) -> Vec<String> {
+    let mut findings = run_registry(root);
+    findings.extend(crate::voice_control_sites::run(root));
+    findings
+}
+
+/// Assertions 1–6, over the files they name.
+fn run_registry(root: &Path) -> Vec<String> {
     let mut missing = Vec::new();
     let read = |rel: &'static str, missing: &mut Vec<String>| match std::fs::read_to_string(
         root.join(rel),

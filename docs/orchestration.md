@@ -243,6 +243,8 @@ Roles are yours to define; the deck imposes no fixed set. When it [generates a c
 | `release` | Runs the project's release/PR/merge workflow; never modifies code | `false` |
 | `researcher` | Investigates the codebase or external sources to gather context | `true` |
 
+Each suggested `prompt_template` also tells the worker how to share a checkout with the rest of the team. A worker reports back to the orchestrator rather than stopping to ask you something or handing work to another role, and opens that report with its outcome: done, blocked, or needs a decision. Every role except `researcher` checks it is on the branch or commit the task tells it to work from, and stops rather than switching if it is not. Roles that change files leave other agents' changes alone, stage the files they changed by name rather than everything in the checkout, and check what is staged before committing.
+
 A `release` role uses `clear = false` because a release spans several tasks (open the PR, wait for CI, merge), and a restarted agent would forget the branch and PR it was working on.
 
 ## Example orchestrations
@@ -449,6 +451,15 @@ When the earlier task is not coming back:
 - **Wait.** Seven days after a task was sent, the deck stops counting it.
 
 If the orchestrator's own agent was replaced since it delegated, the new orchestrator is not blocked by the old one's tasks; `delegate` says which earlier task it superseded.
+
+### Adding to a task in progress
+
+When the orchestrator needs to give a worker more information about the task it is already doing (a correction, a missing detail, a forgotten constraint), whether the worker keeps its work depends on the role's `clear`:
+
+- **`clear = false`:** `delegate --supersede` reaches the running agent, which keeps its conversation and its work. The orchestrator says in the task that it adds to the current one. The deck counts the addition as a task of its own, so a worker that had already taken the original task owes a `work-done` for each, and until it sends both, a plain `delegate` to it is refused as busy.
+- **`clear = true`:** every delegate restarts the worker's agent, `--supersede` included, so the worker loses its conversation and anything it had not saved. The orchestrator waits for the `work-done` and delegates a follow-up that restates what the worker needs, or supersedes with the whole task restated and lets the worker start over.
+
+The deck marks the `clear = true` workers in the orchestrator's instructions as starting fresh for every task, and tells it the above. This is the same whether you run the orchestration in the TUI or the desktop app: the orchestrator's agent runs the same commands in either. A follow-up delegated after a `work-done` is a new task too, so a `clear = true` worker starts it without the earlier conversation. If a role's work usually continues from one task to the next, for example a coder that addresses review findings on its own change, set `clear = false` on that role.
 
 ### What `clear` does to delivery
 

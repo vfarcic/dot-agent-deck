@@ -1542,7 +1542,7 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
             )
             .launch_with_fixture("minimal")
     };
-    let deck = live_surface.then(&launch_deck);
+    let deck = live_surface.then(launch_deck);
     if let Some(deck) = &deck {
         deck.wait_for_string("No active agents");
     }

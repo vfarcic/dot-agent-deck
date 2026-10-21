@@ -365,7 +365,7 @@ pub async fn run(
         if i > 0 {
             let _ = writeln!(out);
         }
-        say_items(out, &plan.items());
+        say_items(out, &plan.terminal_items());
     }
     if args.check {
         return true;
@@ -605,7 +605,7 @@ mod tests {
         );
         assert!(yes);
         assert!(
-            out.contains("Upgrade dot-agent-deck to v0.46.0? yes (--yes)"),
+            out.contains("Upgrade dot-agent-deck CLI to v0.46.0? yes (--yes)"),
             "{out}"
         );
     }

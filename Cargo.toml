@@ -29,7 +29,7 @@ members = [
 # claim with nothing behind it. `docs/develop/versioning.md` has the rest,
 # including what this means for `cargo update` and Renovate.
 [workspace.package]
-rust-version = "1.98.1"
+rust-version = "1.99.0"
 
 [package]
 name = "dot-agent-deck"

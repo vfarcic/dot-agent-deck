@@ -366,7 +366,16 @@ describe("fixtureSelfUpgradeApi", () => {
     expect(check.checkId).toBeGreaterThan(0);
     expect(check.notice).toBe("Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)");
     expect(check.app).toMatchObject({ action: "swap-app", actionable: true, confirmQuestion: "Upgrade Agent Deck (desktop app) to v0.47.0?" });
-    expect(check.cli).toMatchObject({ action: "brew-upgrade", actionable: true, confirmQuestion: "Upgrade dot-agent-deck to v0.47.0?" });
+    expect(check.cli).toMatchObject({ action: "brew-upgrade", actionable: true, confirmQuestion: "Upgrade dot-agent-deck CLI to v0.47.0?" });
     expect(check.app.lines[0].text).toBe(check.app.headline);
+  });
+
+  // Issue #1753 — the Local daemon section's preview: the app current, the CLI behind.
+  it("plays a current app beside a Homebrew CLI one release behind, with no app-wide notice", async () => {
+    const check = await fixtureSelfUpgradeApi("?selfupgrade=cli")!.check();
+    expect(check.updateAvailable).toBe(false);
+    expect(check.notice).toBeNull();
+    expect(check.app).toMatchObject({ action: "up-to-date", actionable: false, headline: "Agent Deck (desktop app) is up to date (v0.47.0)." });
+    expect(check.cli).toMatchObject({ action: "brew-upgrade", actionable: true, headline: "dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)" });
   });
 });

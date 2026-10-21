@@ -16,7 +16,9 @@ use dot_agent_deck::agent_pty::AgentRecord;
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_EVENT, KIND_REQ, KIND_RESP,
 };
-use dot_agent_deck::pull_request::{PullRequestInfo, PullRequestReview, PullRequestState};
+use dot_agent_deck::pull_request::{
+    PullRequestChecks, PullRequestChecksState, PullRequestInfo, PullRequestReview, PullRequestState,
+};
 use serde_json::{Value, json};
 use spec::spec;
 
@@ -42,7 +44,7 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s\n' "$all_args" >> "$PR_STUB_DIR/calls"
 [ "$repo" = test-org/test-repo ] && [ "$state" = all ] && [ -n "$head" ] || exit 93
-for field in number state isDraft reviewDecision url headRefName; do
+for field in number state isDraft reviewDecision url headRefName statusCheckRollup; do
     case ",$fields," in
         *",$field,"*) ;;
         *) printf 'missing JSON field: %s\n' "$field" >&2; exit 94 ;;
@@ -215,6 +217,26 @@ fn pr_json(number: u64, branch: &str, state: &str, draft: bool, review: Value) -
         "url": format!("https://github.com/test-org/test-repo/pull/{number}")})
 }
 
+/// `pr` with a CI rollup of `passing` successful check runs, `failing` failed
+/// ones and one commit status in `status_state`, as `gh` reports them. Each run
+/// has a name of its own, since repeated runs of one check count once.
+fn with_checks(mut pr: Value, passing: usize, failing: usize, status_state: &str) -> Value {
+    let conclusions =
+        std::iter::repeat_n("SUCCESS", passing).chain(std::iter::repeat_n("FAILURE", failing));
+    let mut rollup: Vec<Value> = conclusions
+        .enumerate()
+        .map(|(i, conclusion)| {
+            json!({"__typename": "CheckRun", "name": format!("job-{i}"), "status": "COMPLETED",
+                "conclusion": conclusion, "workflowName": "CI"})
+        })
+        .collect();
+    rollup.push(
+        json!({"__typename": "StatusContext", "context": "ci/legacy", "state": status_state}),
+    );
+    pr["statusCheckRollup"] = Value::Array(rollup);
+    pr
+}
+
 fn select_dashboard_card(deck: &TuiDeck) {
     deck.wait_until_grid("TUI input mode chip", |grid| {
         grid.lines()
@@ -263,7 +285,12 @@ fn pr_001_daemon_resolves_branch_pull_request() {
     fixture.set_reply(json!([
         pr_json(9000, "feat/x-other", "OPEN", false, json!("APPROVED")),
         pr_json(8000, "feat/x", "MERGED", false, json!("APPROVED")),
-        pr_json(1234, "feat/x", "OPEN", false, json!("REVIEW_REQUIRED")),
+        with_checks(
+            pr_json(1234, "feat/x", "OPEN", false, json!("REVIEW_REQUIRED")),
+            23,
+            1,
+            "PENDING"
+        ),
         pr_json(1000, "feat/x", "CLOSED", false, Value::Null)
     ]));
     let daemon = fixture.daemon();
@@ -275,6 +302,14 @@ fn pr_001_daemon_resolves_branch_pull_request() {
             url: PR_URL.into(),
             state: PullRequestState::Open,
             review: Some(PullRequestReview::ReviewRequired),
+            // Issue #1781: GitHub's rollup, failing first.
+            checks: Some(PullRequestChecks {
+                state: PullRequestChecksState::Failing,
+                passing: 23,
+                failing: 1,
+                pending: 1,
+                skipped: 0,
+            }),
         },
     );
 
@@ -312,6 +347,7 @@ fn pr_001_daemon_resolves_branch_pull_request() {
                 url: PR_URL.into(),
                 state: expected_state,
                 review,
+                checks: None,
             },
         );
     }
@@ -405,6 +441,7 @@ fn pr_002_absent_pull_request_keeps_daemon_healthy() {
             url: PR_URL.into(),
             state: PullRequestState::Open,
             review: Some(PullRequestReview::ReviewRequired),
+            checks: None,
         };
         expect_pr(&daemon, &open);
         let calls_before = std::fs::read_to_string(fixture.scratch.path().join("calls"))
@@ -578,6 +615,7 @@ fn pr_003_refresh_reaches_attached_client_without_reconnect() {
             url: PR_URL.into(),
             state: PullRequestState::Open,
             review: Some(PullRequestReview::ReviewRequired),
+            checks: None,
         },
     );
     let _traffic = ToolTraffic::start(&daemon, &agent);
@@ -606,6 +644,7 @@ fn pr_003_refresh_reaches_attached_client_without_reconnect() {
         url: PR_URL.into(),
         state: PullRequestState::Merged,
         review: Some(PullRequestReview::Approved),
+        checks: None,
     };
     assert!(
         daemon
@@ -651,10 +690,12 @@ fn pr_003_refresh_reaches_attached_client_without_reconnect() {
     );
 }
 
-/// Scenario: Attach the real TUI to a synthetic agent on a PR branch. Its
-/// dashboard card shows #1234 with open/review-required glyphs, and pressing o invokes the configured browser
-/// with the exact GitHub PR URL; the same key on a default-branch card opens
-/// nothing and leaves the dashboard usable.
+/// Scenario: Attach the real TUI to a synthetic agent on a PR branch whose CI
+/// passes. Its dashboard card shows #1234 with open, CI-passing and
+/// review-required glyphs, the review as a filled cell and the CI mark bare,
+/// and pressing o invokes the configured browser with the exact GitHub PR URL;
+/// the same key on a default-branch card opens nothing and leaves the
+/// dashboard usable.
 #[spec("session/pr/004")]
 #[test]
 fn pr_004_dashboard_badge_and_browser_shortcut() {
@@ -683,14 +724,37 @@ fn pr_004_dashboard_badge_and_browser_shortcut() {
         );
     }
     let fixture = Fixture::new("feat/x");
+    fixture.set_reply(json!([with_checks(
+        pr_json(1234, "feat/x", "OPEN", false, json!("REVIEW_REQUIRED")),
+        24,
+        0,
+        "SUCCESS"
+    )]));
     let daemon = fixture.daemon();
     fixture.start(&daemon);
     let deck = fixture.tui(&daemon);
     deck.wait_for_string("pr-fixture-agent");
     assert!(
-        deck.wait_for_grid_string_within("#1234 ⊙ ◐", WAIT),
-        "dashboard card must show #1234 with open/review-required glyphs:\n{}",
+        deck.wait_for_grid_string_within("#1234 ⊙ ✓ ◉", WAIT),
+        "dashboard card must show #1234 with open, CI-passing and review-required glyphs:\n{}",
         deck.snapshot_grid()
+    );
+    // Issue #1781: the review is a filled cell and the CI mark is not, so the
+    // two never read alike.
+    let grid = deck.snapshot_grid();
+    let (row, line) = grid
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("#1234 ⊙ ✓ ◉"))
+        .expect("badge row");
+    let col = line[..line.find("#1234").unwrap()].chars().count() as u16;
+    let ci = deck.grid_cell_style(row as u16, col + 8).expect("CI cell");
+    let review = deck
+        .grid_cell_style(row as u16, col + 10)
+        .expect("review cell");
+    assert!(
+        !ci.inverse && review.inverse,
+        "the CI mark must be bare and the review filled: CI {ci:?}, review {review:?}"
     );
     select_dashboard_card(&deck);
     deck.send_keys(b"o");

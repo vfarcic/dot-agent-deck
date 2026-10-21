@@ -76,6 +76,20 @@
 
   /* Red: failed / destructive. */
   --red: #a13e38;
+  /* Issue #1781: GitHub's own Primer colours, for the pull request badge only,
+     so it reads the way the pull request does on GitHub. The *-fg tokens are
+     an icon on the surface; the *-emphasis ones fill a circle under
+     --gh-on-emphasis, as GitHub's review icons do. */
+  --gh-open-fg: #1a7f37;
+  --gh-closed-fg: #d1242f;
+  --gh-merged-fg: #8250df;
+  --gh-draft-fg: #59636e;
+  --gh-attention-fg: #9a6700;
+  --gh-success-emphasis: #1f883d;
+  --gh-danger-emphasis: #cf222e;
+  --gh-attention-emphasis: #9a6700;
+  --gh-neutral-emphasis: #59636e;
+  --gh-on-emphasis: #ffffff;
   --red-ink: #7d2e29;
   --red-rim-strong: #c87e78;
   --red-rim: #d9aaa5;
@@ -249,6 +263,17 @@
     --amber-bright: #241d0e;  /* the subtlest amber ground, as it is in light */
     /* Red: failed / destructive. */
     --red: #e28880;
+    /* Issue #1781: GitHub's dark Primer colours. */
+    --gh-open-fg: #3fb950;
+    --gh-closed-fg: #f85149;
+    --gh-merged-fg: #ab7df8;
+    --gh-draft-fg: #9198a1;
+    --gh-attention-fg: #d29922;
+    --gh-success-emphasis: #238636;
+    --gh-danger-emphasis: #da3633;
+    --gh-attention-emphasis: #9e6a03;
+    --gh-neutral-emphasis: #656c76;
+    --gh-on-emphasis: #ffffff;
     --red-ink: #efaba4;
     --red-rim-strong: #8f4f49;
     --red-rim: #743e39;
@@ -358,6 +383,17 @@
   --amber-bright: #241d0e;  /* the subtlest amber ground, as it is in light */
   /* Red: failed / destructive. */
   --red: #e28880;
+  /* Issue #1781: GitHub's dark Primer colours. */
+  --gh-open-fg: #3fb950;
+  --gh-closed-fg: #f85149;
+  --gh-merged-fg: #ab7df8;
+  --gh-draft-fg: #9198a1;
+  --gh-attention-fg: #d29922;
+  --gh-success-emphasis: #238636;
+  --gh-danger-emphasis: #da3633;
+  --gh-attention-emphasis: #9e6a03;
+  --gh-neutral-emphasis: #656c76;
+  --gh-on-emphasis: #ffffff;
   --red-ink: #efaba4;
   --red-rim-strong: #8f4f49;
   --red-rim: #743e39;
@@ -1827,15 +1863,23 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .pr-badge { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px; padding: 1px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--ink-soft); background: var(--paper-sunken); font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 700; line-height: 1.3; font-variant-numeric: tabular-nums; }
 button.pr-badge { cursor: pointer; }
 button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-focus); background: var(--teal-soft); }
-.pr-state-open .pr-badge-state { color: var(--green); }
-.pr-state-draft .pr-badge-state { color: var(--muted); }
-.pr-state-merged .pr-badge-state { color: var(--teal); }
-.pr-state-closed .pr-badge-state { color: var(--red); }
+.pr-state-open .pr-badge-state { color: var(--gh-open-fg); }
+.pr-state-draft .pr-badge-state { color: var(--gh-draft-fg); }
+.pr-state-merged .pr-badge-state { color: var(--gh-merged-fg); }
+.pr-state-closed .pr-badge-state { color: var(--gh-closed-fg); }
 .pr-state-unknown .pr-badge-state { color: var(--faint); }
-.pr-review-approved .pr-badge-review { color: var(--green); }
-.pr-review-changes_requested .pr-badge-review { color: var(--red); }
-.pr-review-review_required .pr-badge-review { color: var(--amber); }
-.pr-review-unknown .pr-badge-review { color: var(--faint); }
+/* Issue #1781 — CI as GitHub's pull request list draws it: a bare green check,
+   red cross or amber dot. */
+.pr-checks-passing .pr-badge-checks { color: var(--gh-open-fg); }
+.pr-checks-failing .pr-badge-checks { color: var(--gh-closed-fg); }
+.pr-checks-pending .pr-badge-checks { color: var(--gh-attention-fg); }
+.pr-checks-unknown .pr-badge-checks { color: var(--faint); }
+/* The review sits in a filled circle, so an approval and passing CI — both a
+   check on GitHub — never look alike. */
+.pr-badge-review { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 12px; height: 12px; border-radius: 50%; color: var(--gh-on-emphasis); background: var(--gh-neutral-emphasis); }
+.pr-review-approved .pr-badge-review { background: var(--gh-success-emphasis); }
+.pr-review-changes_requested .pr-badge-review { background: var(--gh-danger-emphasis); }
+.pr-review-review_required .pr-badge-review { background: var(--gh-attention-emphasis); }
 
 /* The browser. Over the agent's pane (90) and below the voice row (95) and
    every modal (100): the page is drawn by a native webview in `.pr-browser-frame`,

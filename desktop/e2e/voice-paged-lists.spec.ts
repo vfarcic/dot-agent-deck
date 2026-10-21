@@ -243,6 +243,34 @@ test.describe("visible pages for voice-selected lists", () => {
     await expect(page.getByTestId("new-agent-dialog").getByText(/Page 1 of [2-9]\d*/i)).toBeVisible();
   });
 
+  /** Scenario: with Voice off in a narrow window, the crowded project's modes wrap onto several rows of the Mode field, and every chip is whole inside the field and the dialog — none is cut off at the right edge (PRD #168, the TUI form's wrap). */
+  test("voice-off modes wrap whole in a narrow window", async ({ page }) => {
+    await page.setViewportSize({ width: 420, height: 800 });
+    const decks = await openCrowdedDialog(page, false);
+    await decks.first().click();
+    await useDocsDirectory(page);
+    const modes = page.getByTestId("new-agent-modes");
+    const geometry = await modes.evaluate((element) => {
+      const dialog = element.closest<HTMLElement>("[data-testid='new-agent-dialog']")!.getBoundingClientRect();
+      const field = element.getBoundingClientRect();
+      const chips = [...element.querySelectorAll<HTMLElement>("button")];
+      return {
+        count: chips.length,
+        rows: new Set(chips.map((chip) => Math.round(chip.getBoundingClientRect().top))).size,
+        cut: chips.filter((chip) => {
+          const box = chip.getBoundingClientRect();
+          return box.left < field.left - 0.5 || box.right > field.right + 0.5 || box.left < dialog.left || box.right > dialog.right || chip.scrollWidth > chip.clientWidth;
+        }).map((chip) => chip.textContent),
+        overflows: element.scrollWidth > element.clientWidth,
+      };
+    });
+    expect(geometry.count).toBeGreaterThan(12);
+    expect(geometry.rows).toBeGreaterThan(1);
+    expect(geometry.cut).toEqual([]);
+    expect(geometry.overflows).toBe(false);
+    await expect(page.getByTestId("new-agent-mode-page")).toHaveCount(0);
+  });
+
   /** Scenario: with Voice off, the last of the crowded project's modes is chosen in a short window. Turning Voice on, and then shrinking the window, each shows the Mode page holding that chosen chip. */
   test("mode page shows the chosen mode when voice turns on and the window shrinks", async ({ page }) => {
     await page.setViewportSize({ width: 720, height: 420 });
