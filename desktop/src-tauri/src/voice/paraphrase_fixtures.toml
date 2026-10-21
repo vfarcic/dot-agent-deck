@@ -1,7 +1,8 @@
 # Unlisted paraphrases: expected behavior after meaning grounding.
-# Run through voice_paraphrase_fixtures_match_the_default_backend, using the
-# same default-backend runner as phrase_fixtures.toml. These are deliberately
-# RED with literal grounding; do not change their expectations to refusals.
+# Run through voice_desktop_phrases_002_paraphrase_fixtures_match_the_default_backend,
+# using the same default-backend runner as phrase_fixtures.toml. These are
+# deliberately RED with literal grounding; do not change their expectations to
+# refusals.
 # No positive contains any complete heard_as/heard_as_whole entry for its row.
 # Stops still dispatch to their normal confirmation, never directly stop work.
 

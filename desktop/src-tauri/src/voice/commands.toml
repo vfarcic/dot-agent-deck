@@ -980,7 +980,7 @@ invoke      = "submitAgentPrompt"
 screens     = ["agent"]
 unavailable_hint = "sending a prompt needs an agent's pane open — open one first"
 report      = "Sent."
-# PRD #1733: the forced judge (`voice_submit_words_in_passing_are_refused_by_the_real_judge`)
+# PRD #1733: the forced judge (`voice_desktop_phrases_003_submit_words_in_passing_are_refused_by_the_real_judge`)
 # answered "tell it to go ahead with the refactor" `yes` 5 times in 5 and "tell
 # it to enter the result" 4 to 5 in 5 on `gpt-5-mini`, reading the told words as
 # the request. The description's tell-it sentence above, with the whole
@@ -1227,7 +1227,7 @@ report      = "Opening the New agent dialog."
 # opener fixture's sentence at 8 in 8, and moved none of the start's own
 # questions over an open dialog (2026-10-20).
 #
-# Then the forced judge (`voice_parameterless_steering_is_refused_by_the_real_judge`)
+# Then the forced judge (`voice_desktop_phrases_004_parameterless_steering_is_refused_by_the_real_judge`)
 # took "open docs" as asking to "open the New agent dialog …" 5 times in 20:
 # the opener's verb led. Leading with what the user asks for — a start — and
 # saying the dialog is how the app does it took it to 0 in 40, with "start it"
