@@ -803,6 +803,149 @@ fn handshake_013_ctrl_w_after_a_same_build_restart_preserves_the_successor() {
     );
 }
 
+/// Scenario: Restart the private deck while typing a filter with twelve agents listed. The notice stays in a footer row beside the field, independent of the expiring status slot, and remains after Escape; `a` opens a scrollable list containing every name, Escape keeps the notice, a second restart joins it, and `c` dismisses it. While the notice is held, typing `ac` into the successor's pane still reaches that pane.
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_the_held_notice_survives_filter_and_joins_later_restarts() {
+    use inbox::*;
+    let mut original = spawn_daemon_at_build(NEW_BUILD);
+    let names: Vec<String> = (0..12).map(|i| format!("held-{i:02}")).collect();
+    let old: Vec<_> = names.iter().map(|name| pane(&original, name)).collect();
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 18)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            original.attach_socket.to_string_lossy(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            original.hook_socket.to_string_lossy(),
+        )
+        .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("12 agent(s)");
+    deck.send_keys(b"/ac");
+    deck.wait_until_grid("control: filter receives a and c before a restart", |g| {
+        g.contains("/ ac")
+    });
+    assert!(!deck.snapshot_grid().contains("The deck restarted"));
+
+    assert!(
+        original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .unwrap()
+            .ok
+    );
+    assert!(original.wait_for_exit(Duration::from_secs(10)));
+    drop(old);
+    let mut successor = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    let summary =
+        "The deck restarted; these agents were stopped: held-00, held-01, held-02 and 9 more.";
+    deck.wait_until_grid("held notice has its own row while Filter owns input", |g| {
+        g.contains("/ ac")
+            && g.lines()
+                .any(|line| line.contains(summary) && !line.contains("/ ac"))
+    });
+    // This pins the held footer rather than waiting out the old 15-second
+    // status timer: that status slot is not rendered in Filter mode.
+    deck.send_keys(b"ac");
+    deck.wait_until_grid("notice keys remain field input", |g| {
+        g.contains("/ acac") && g.contains(summary)
+    });
+    deck.send_keys(b"\x1b");
+    deck.wait_until_grid("leaving Filter keeps the notice", |g| {
+        !g.contains("/ acac") && g.contains(summary)
+    });
+    deck.send_keys(b"a");
+    deck.wait_until_grid("restart list opens on its first page", |g| {
+        g.contains("Restart notice") && g.contains("held-00") && !g.contains("held-11")
+    });
+    let mut seen = String::new();
+    for name in &names {
+        if !seen.contains(name) {
+            deck.wait_until_grid("scrollable restart list", |g| g.contains(name));
+            seen.push_str(&deck.snapshot_grid());
+        }
+        deck.send_keys(b"\x1b[B");
+    }
+    for name in &names {
+        assert!(seen.contains(name), "full list omitted {name}: {seen}");
+    }
+    deck.send_keys(b"\x1b");
+    deck.wait_until_grid("closing the list keeps the footer", |g| {
+        g.contains(summary) && !g.contains("Restart notice")
+    });
+    // A fresh successor card is a control for pane input with the notice held.
+    let new = pane(&successor, "held-successor");
+    deck.send_keys(b"/\r");
+    deck.wait_for_string("held-successor");
+    deck.send_keys(b"\r");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_keys(b"ac\r");
+    deck.wait_for_string("SUBMITTED:ac");
+    assert!(deck.snapshot_grid().contains("and 9 more."));
+    deck.send_keys(b"\x04");
+    assert!(
+        successor
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .unwrap()
+            .ok
+    );
+    assert!(successor.wait_for_exit(Duration::from_secs(10)));
+    drop(new);
+    let mut final_deck = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    deck.wait_until_grid("later restart joins the held notice", |g| {
+        g.contains("and 10 more.")
+    });
+    deck.send_keys(b"a");
+    for _ in 0..names.len() {
+        deck.send_keys(b"\x1b[B");
+    }
+    deck.wait_until_grid("joined list still names old and new agents", |g| {
+        g.contains("held-successor")
+    });
+    deck.send_keys(b"\x1b");
+    deck.wait_until_grid("second Escape keeps accumulated footer", |g| {
+        g.contains("and 10 more.")
+    });
+    deck.send_keys(b"c");
+    deck.wait_until_grid("dismiss removes the held notice", |g| {
+        !g.contains("The deck restarted") && !g.contains("[Agents a]")
+    });
+    assert!(
+        final_deck.is_alive_public(),
+        "dismiss must leave the restarted fixture running"
+    );
+}
+
 /// Scenario: Start an empty TUI and surface a card without attaching it, then restart its private daemon reusing its ids. With event subscriptions held, stale close, digit and Enter refuse visibly and leave the successor alive with no input; the same-process actions still work (controls). Once subscriptions resume, the old card disappears with one notice, selection falls back to an earlier fresh card rather than the same-pane successor, and Enter opens only that earlier card.
 #[spec("lifecycle/handshake/013")]
 #[test]

@@ -47,7 +47,7 @@ fn handshake_013_the_restart_notice_has_a_footer_row_of_its_own() {
     );
 }
 
-/// Scenario: A deck restart stopped five agents while the user types a filter. The filter's field and the notice are both in the footer: the notice names the first three agents and says there are two more, and at ninety columns its buttons take a row of their own below it rather than cut it short.
+/// Scenario: A deck restart stopped five agents while the user types a filter. The filter's field and the notice are both in the footer: the notice names the first three agents and says there are two more, and at ninety columns its buttons take a row of their own below it rather than cut it short. Typing `ac` into Filter or Rename edits the field and keeps the notice; Help and confirmation dialogs also retain their keyboard ownership and leave the notice visible.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_the_restart_notice_shows_beside_a_text_field() {
@@ -67,6 +67,47 @@ fn handshake_013_the_restart_notice_shows_beside_a_text_field() {
         "{shown}"
     );
     insta::assert_snapshot!(shown);
+    for (mode, field) in [(UiMode::Filter, "/"), (UiMode::Rename, "Rename:")] {
+        let typed = render_restart_notice_key_sequence_to_buffers(
+            &["coder", "reviewer", "tester", "docs", "release"],
+            mode,
+            None,
+            &[key(KeyCode::Char('a')), key(KeyCode::Char('c'))],
+            90,
+            10,
+        );
+        let last = text(typed.last().unwrap());
+        assert!(last.contains(&format!("{field} ac")), "{mode:?}: {last}");
+        assert!(last.contains("and 2 more."), "{mode:?}: {last}");
+        assert!(!last.contains("Agents stopped by"), "{mode:?}: {last}");
+    }
+    for mode in [
+        UiMode::Help,
+        UiMode::QuitConfirm,
+        UiMode::StopConfirm,
+        UiMode::CloseConfirm,
+    ] {
+        let frames = render_restart_notice_key_sequence_to_buffers(
+            &["coder", "reviewer"],
+            mode,
+            None,
+            &[key(KeyCode::Char('a')), key(KeyCode::Char('c'))],
+            120,
+            40,
+        );
+        for frame in &frames[1..] {
+            let shown = text(frame);
+            assert_eq!(
+                frame, &frames[0],
+                "{mode:?}: notice shortcuts stole modal input"
+            );
+            assert!(
+                shown.contains("these agents were stopped: coder, reviewer."),
+                "restart notice hidden in {mode:?}:\n{shown}"
+            );
+            assert!(!shown.contains("│ Restart notice"), "{mode:?}: {shown}");
+        }
+    }
 }
 
 /// Scenario: A deck restart stopped twenty agents, more than a sixteen-row terminal shows at once. Press `a` to open the list of every agent the notice names, then PageDown to its end: the title says which of the twenty are shown and the last agent is on screen. Escape closes the list and the footer still shows the notice.

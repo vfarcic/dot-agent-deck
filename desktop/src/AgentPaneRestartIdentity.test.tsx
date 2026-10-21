@@ -28,7 +28,7 @@ import { DeckShell } from "./App";
  * listing nobody, which is what a restarted deck usually lists.
  *
  * G-fix7c (the user's decision): a pane of an agent the restart stopped
- * closes, nothing is sent to the deck, and one notice names what went.
+ * closes, no stop, close or cleanup is asked of the deck, and one notice names what went.
  */
 function deckOf(process: "process-a" | "process-b", empty = false): DeckSnapshot {
   const snapshot = createFixtureSnapshot("connected");
@@ -86,7 +86,7 @@ const openPlanner = (name = "Plan / architecture") => fireEvent.click(screen.get
 describe("an open pane across a deck restart that reuses its agent id", () => {
   beforeEach(() => window.localStorage.clear());
 
-  /** Scenario: open Planner from the overview, then the deck restarts and its first snapshot lists an unrelated Planner under the same id. The pane closes rather than becoming the newcomer's, one notice names every agent the restart stopped, nothing is declared for the newcomer, and nothing is sent to the deck. */
+  /** Scenario: open Planner from the overview, then the deck restarts and its first snapshot lists an unrelated Planner under the same id. The pane closes rather than becoming the newcomer's, one notice names every agent the restart stopped, nothing is declared for the newcomer, and no stop, close or cleanup is asked of the deck. */
   it("closes an overview pane of an agent the restart stopped, and names it in the notice", async () => {
     const deck = harness();
     const { rerender } = render(<DeckShell runtime={deck.runtime("process-a")} initialView={{ kind: "overview" }} />);
