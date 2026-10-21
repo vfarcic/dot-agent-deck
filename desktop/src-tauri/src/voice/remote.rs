@@ -233,13 +233,10 @@ impl RemoteResolver {
                 reasoning_effort,
             ),
         };
-        let payload = self.post(body).await?;
-        match self.protocol {
-            Protocol::Anthropic => parse_response(&payload, self.max_tokens),
-            Protocol::OpenAiCompatible { .. } => {
-                super::openai::parse_response(&payload, self.max_tokens)
-            }
-        }
+        // Read from the bytes rather than from `post`'s JSON, for the meaning
+        // check's reason ([`answer_from_reply`]).
+        let (status, reply) = self.post_for_bytes(body).await?;
+        answer_from_reply(self.protocol, status, &reply, self.max_tokens)
     }
 
     /// PRD #1631: the question call — the same transport, credential and
@@ -269,9 +266,55 @@ impl RemoteResolver {
         }
     }
 
+    /// PRD #1733: one vote of the meaning check — the same transport,
+    /// credential and failure wording again, with [`super::meaning`]'s body
+    /// and reader. Its body is built from the
+    /// [`super::meaning::MeaningRequest`] alone, which holds the transcript,
+    /// the app's own action text and the closed-enum screen kind and dialog
+    /// state — never an observed name, screen contents or the pick.
+    async fn run_meaning(
+        &self,
+        request: super::meaning::MeaningRequest<'_>,
+    ) -> Result<super::meaning::MeaningVerdict, IntentError> {
+        let body = match self.protocol {
+            Protocol::Anthropic => {
+                super::meaning::anthropic_body(&request, self.model.as_str(), self.max_tokens)
+            }
+            Protocol::OpenAiCompatible { reasoning_effort } => super::meaning::openai_body(
+                &request,
+                self.model.as_str(),
+                self.max_tokens,
+                reasoning_effort,
+            ),
+        };
+        // Read from the bytes rather than from `post`'s JSON: `serde_json`
+        // keeps one occurrence of a repeated key, so an Anthropic tool call
+        // whose input wrote `yes` twice would be read as whichever came last
+        // ([`super::meaning::parse_reply`]).
+        let (status, reply) = self.post_for_bytes(body).await?;
+        if !status.is_success() {
+            return Err(reply_error(status, &reply));
+        }
+        let dialect = match self.protocol {
+            Protocol::Anthropic => super::meaning::Dialect::Anthropic,
+            Protocol::OpenAiCompatible { .. } => super::meaning::Dialect::OpenAiCompatible,
+        };
+        super::meaning::parse_reply(&request, dialect, &reply, self.max_tokens)
+    }
+
     /// One request body to the endpoint, and its successful reply's JSON — the
-    /// transport both calls share.
+    /// transport every call shares.
     async fn post(&self, body: Value) -> Result<Value, IntentError> {
+        let (status, reply) = self.post_for_bytes(body).await?;
+        read_reply(status, &reply)
+    }
+
+    /// [`Self::post`] stopped before the reply is parsed: its status and its
+    /// bytes, bounded.
+    async fn post_for_bytes(
+        &self,
+        body: Value,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>), IntentError> {
         // No key for a loopback endpoint; see `endpoint_credential`.
         let secret = endpoint_credential(&self.endpoint, &self.secrets)
             .await
@@ -302,8 +345,8 @@ impl RemoteResolver {
         // Bounded BEFORE the bytes become text or JSON. `Response::json` used
         // to collect the whole body first, so a body streamed fast enough could
         // exhaust this process inside the timeout — PRD #802's audit. The bound
-        // applies to the non-success path too, because the error detail below
-        // is quoted out of that same body.
+        // applies to the non-success path too, because the error detail
+        // ([`read_reply`]) is quoted out of that same body.
         let body = match super::http::capped_body(response, super::http::MAX_BODY_BYTES).await {
             Ok(body) => body,
             Err(super::http::BodyError::TooLarge) => {
@@ -318,14 +361,29 @@ impl RemoteResolver {
                 ));
             }
         };
-        let payload: Value = serde_json::from_slice(&body).map_err(|_| {
-            IntentError::Backend(format!("the command backend answered {status} unreadably"))
-        })?;
-        if !status.is_success() {
-            return Err(IntentError::Backend(api_error_detail(status, &payload)));
-        }
-        Ok(payload)
+        Ok((status, body))
     }
+}
+
+/// A reply's JSON, or the error its status and body say.
+fn read_reply(status: reqwest::StatusCode, body: &[u8]) -> Result<Value, IntentError> {
+    if !status.is_success() {
+        return Err(reply_error(status, body));
+    }
+    serde_json::from_slice(body).map_err(|_| unreadably(status))
+}
+
+/// The error an unsuccessful reply says, quoted out of its body when that is
+/// readable.
+fn reply_error(status: reqwest::StatusCode, body: &[u8]) -> IntentError {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(payload) => IntentError::Backend(api_error_detail(status, &payload)),
+        Err(_) => unreadably(status),
+    }
+}
+
+fn unreadably(status: reqwest::StatusCode) -> IntentError {
+    IntentError::Backend(format!("the command backend answered {status} unreadably"))
 }
 
 /// The credential for one request to `endpoint`, read at call time — or
@@ -403,6 +461,13 @@ impl IntentResolver for RemoteResolver {
         request: super::question::QuestionRequest<'a>,
     ) -> super::resolver::QuestionFuture<'a> {
         Box::pin(self.run_question(request))
+    }
+
+    fn judge_meaning<'a>(
+        &'a self,
+        request: super::meaning::MeaningRequest<'a>,
+    ) -> super::resolver::MeaningFuture<'a> {
+        Box::pin(self.run_meaning(request))
     }
 
     fn backend_name(&self) -> &'static str {
@@ -562,6 +627,35 @@ pub fn parse_response(
             "the command backend picked an action this build could not read".into(),
         )
     })
+}
+
+/// The answer out of a command reply's bytes, as they arrived: refused when
+/// any object in them writes a key twice
+/// ([`super::meaning::keys_written_once`]), then read in `protocol`. What
+/// [`RemoteResolver`] reads every command reply with.
+///
+/// `serde_json` keeps one occurrence of a repeated key, so an Anthropic tool
+/// call whose input named a param twice — `{"agent": "tester", "agent":
+/// "coder"}` — would reach [`IntentAnswer`] already reduced to whichever came
+/// last, and its own refusal of a repeated param could not see it. The
+/// OpenAI-compatible answer is JSON inside a string, which [`IntentAnswer`]
+/// reads from its text, repeats included.
+fn answer_from_reply(
+    protocol: Protocol,
+    status: reqwest::StatusCode,
+    reply: &[u8],
+    max_tokens: TokenCeiling,
+) -> Result<IntentAnswer, IntentError> {
+    if status.is_success() && !super::meaning::keys_written_once(reply) {
+        return Err(IntentError::Backend(
+            "the command backend picked an action this build could not read".into(),
+        ));
+    }
+    let payload = read_reply(status, reply)?;
+    match protocol {
+        Protocol::Anthropic => parse_response(&payload, max_tokens),
+        Protocol::OpenAiCompatible { .. } => super::openai::parse_response(&payload, max_tokens),
+    }
 }
 
 /// What a non-2xx reply becomes.
@@ -923,6 +1017,73 @@ mod tests {
         assert_eq!(answer.params.get("agent"), Some(&"tester".to_string()));
     }
 
+    /// Scenario: a command reply names the agent param twice — two values, or
+    /// a value and a `null` in either order — as an object or as a list, in
+    /// an Anthropic tool call and in an OpenAI-compatible answer. Read from
+    /// the reply's bytes as the resolver reads it, each is refused rather
+    /// than kept by position; the same replies naming it once still parse.
+    #[test]
+    fn voice_remote_a_command_reply_naming_a_param_twice_is_refused() {
+        let ok = reqwest::StatusCode::OK;
+        let anthropic = |params: &str| {
+            format!(
+                r#"{{"stop_reason": "tool_use", "content": [{{"type": "tool_use", "id": "toolu_1", "name": "{TOOL_NAME}", "input": {{"action": "open_agent", "params": {params}}}}}]}}"#
+            )
+        };
+        let openai = |params: &str| {
+            json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": format!(r#"{{"action": "open_agent", "params": {params}}}"#),
+                    },
+                }],
+            })
+            .to_string()
+        };
+        let openai_protocol = Protocol::OpenAiCompatible {
+            reasoning_effort: None,
+        };
+        for twice in [
+            r#"{"agent": "tester", "agent": "coder"}"#,
+            r#"{"agent": "tester", "agent": null}"#,
+            r#"{"agent": null, "agent": "coder"}"#,
+            r#"[{"name": "agent", "value": "tester"}, {"name": "agent", "value": "coder"}]"#,
+        ] {
+            for (protocol, reply) in [
+                (Protocol::Anthropic, anthropic(twice)),
+                (openai_protocol, openai(twice)),
+            ] {
+                let read =
+                    answer_from_reply(protocol, ok, reply.as_bytes(), TokenCeiling::default());
+                assert!(
+                    matches!(&read, Err(IntentError::Backend(detail))
+                        if detail.contains("could not read")),
+                    "{protocol:?}: {twice}: {read:?}"
+                );
+            }
+        }
+        for once in [
+            r#"{"agent": "coder"}"#,
+            r#"{"agent": "coder", "deck": null}"#,
+            r#"[{"name": "agent", "value": "coder"}]"#,
+        ] {
+            for (protocol, reply) in [
+                (Protocol::Anthropic, anthropic(once)),
+                (openai_protocol, openai(once)),
+            ] {
+                let answer =
+                    answer_from_reply(protocol, ok, reply.as_bytes(), TokenCeiling::default())
+                        .expect("parses");
+                assert_eq!(
+                    answer.params,
+                    std::collections::BTreeMap::from([("agent".to_string(), "coder".to_string())]),
+                    "{protocol:?}: {once}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn voice_remote_parses_the_none_escape() {
         let answer = parse(&reply(json!({"action": "none"}))).expect("parses");
@@ -1035,6 +1196,57 @@ mod tests {
     }
 
     // -- the credential ----------------------------------------------------
+
+    /// Scenario: PRD #1733's meaning check goes over the same connection in
+    /// both dialects and fails closed in each: with no key stored for a hosted
+    /// endpoint it is not configured and opens no socket, and against a server
+    /// on this machine (the local-model case) that is not listening it is a
+    /// transport failure — either way an error, which the pipeline refuses on,
+    /// and never a verdict.
+    #[tokio::test]
+    async fn voice_remote_meaning_check_fails_closed_in_both_dialects() {
+        let transcript = Transcript::new("destroy the tester");
+        for protocol in [
+            Protocol::Anthropic,
+            Protocol::OpenAiCompatible {
+                reasoning_effort: None,
+            },
+        ] {
+            for (endpoint, keyless) in [
+                ("https://voice-intent.invalid/never", false),
+                ("http://127.0.0.1:1/v1/chat/completions", true),
+            ] {
+                let resolver = RemoteResolver::new(
+                    protocol,
+                    Arc::new(MemorySecretStore::new()),
+                    ServiceUrl::parse(endpoint).expect("valid"),
+                    ModelId::parse(HOSTED_COMMAND_MODEL).expect("valid"),
+                    TokenCeiling::default(),
+                );
+                let table = crate::voice::table::table();
+                let request = crate::voice::meaning::MeaningRequest::new(
+                    &transcript,
+                    table,
+                    &crate::voice::meaning::every_action(table),
+                );
+                let error = resolver
+                    .judge_meaning(request)
+                    .await
+                    .expect_err("no verdict without an answer");
+                if keyless {
+                    assert!(
+                        matches!(&error, IntentError::Backend(_)),
+                        "{protocol:?} {endpoint}: {error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(&error, IntentError::NotConfigured(detail) if detail.contains("no key is stored")),
+                        "{protocol:?} {endpoint}: {error:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn voice_remote_without_a_key_is_not_configured_and_opens_no_socket() {
