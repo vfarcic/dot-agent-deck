@@ -1256,7 +1256,10 @@ async fn launch_configured_orchestration<D: OrchestrationDaemon + Sync>(
     })
 }
 
-fn ensure_main_webview(webview: &Webview) -> Result<(), String> {
+/// Generic over the runtime (PRD #1666 part 2, G-fix5) so a command built on
+/// it can also be invoked through Tauri's mock runtime, which is how a test
+/// drives a command's real body over IPC.
+fn ensure_main_webview<R: tauri::Runtime>(webview: &Webview<R>) -> Result<(), String> {
     if webview.label() == "main" {
         Ok(())
     } else {
@@ -2251,7 +2254,7 @@ async fn desktop_bootstrap(
 }
 
 #[tauri::command]
-// Eight, and the shape is the IPC boundary's rather than a design choice: Tauri
+// Nine, and the shape is the IPC boundary's rather than a design choice: Tauri
 // deserialises a command's arguments from the webview's payload by NAME, so each
 // wire field has to be a parameter. Grouping them into a struct would change the
 // JSON the frontend sends, not the number of things being passed.
@@ -2279,6 +2282,10 @@ async fn desktop_terminal_attach(
     // constrains nothing.
     rows: Option<u16>,
     cols: Option<u16>,
+    // PRD #1666 part 2 (G-fix5): the card's `DesktopAgent::incarnation`, the
+    // daemon process that listed the agent. The attach is bound to it; absent,
+    // it names no process and the attach is refused.
+    incarnation: Option<String>,
 ) -> Result<TerminalAttachResult, String> {
     ensure_main_webview(&webview)?;
     let viewport = match (rows, cols) {
@@ -2287,7 +2294,16 @@ async fn desktop_terminal_attach(
         // missing axis would register a constraint nobody asked for.
         _ => None,
     };
-    terminal::attach(&app, &state, deck_id, agent_id, on_output, viewport).await
+    terminal::attach(
+        &app,
+        &state,
+        deck_id,
+        agent_id,
+        Incarnation::from(incarnation),
+        on_output,
+        viewport,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -3814,10 +3830,15 @@ const VOICE_ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
 /// immediately before the request is written — so a pane change during a
 /// stalled snapshot read or link sends nothing, and one that lands after the
 /// write is reported as too late rather than as nothing sent.
+///
+/// **Generic over the Tauri runtime** (PRD #1666 part 2, G-fix5) and nothing
+/// else: the app registers it on its own runtime, and a test registers the same
+/// command on [`tauri::test::MockRuntime`] and invokes it over IPC, so the pin
+/// on its incarnation binding runs this body rather than a copy of it.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-async fn desktop_voice_answer_question(
-    webview: Webview,
+async fn desktop_voice_answer_question<R: tauri::Runtime>(
+    webview: Webview<R>,
     state: State<'_, DesktopState>,
     deck_id: String,
     agent_id: String,
@@ -3855,6 +3876,10 @@ async fn desktop_voice_answer_question(
         Err(stale) => return Ok(stale),
     };
     let answers = voice::question::answers_of(&form);
+    // PRD #1666 part 2 (G-fix5): a send the binding refused wrote nothing, so
+    // it is reported as the refusal it is — never as an answer that "may have
+    // been sent", which is what a failure after the lease's gate reads as.
+    let refused = std::sync::Mutex::new(None::<String>);
     let leased = voice::lease::send_leased(&lease, |still_wanted| async {
         if !still_wanted() {
             return Ok(dot_agent_deck::daemon_client::AnswerReport::Superseded);
@@ -3877,11 +3902,23 @@ async fn desktop_voice_answer_question(
             confirmed_always,
         );
         match tokio::time::timeout(VOICE_ANSWER_TIMEOUT, sent).await {
+            Ok(Err(
+                error @ (dot_agent_deck::daemon_client::ClientError::DaemonRestarted
+                | dot_agent_deck::daemon_client::ClientError::DaemonUnnamed),
+            )) => {
+                let sentence = error.to_string();
+                *refused.lock().unwrap_or_else(|p| p.into_inner()) = Some(sentence.clone());
+                Err(sentence)
+            }
             Ok(report) => report.map_err(|error| safe_message(error.to_string())),
             Err(_) => Err("the deck did not answer in time".to_string()),
         }
     })
-    .await?;
+    .await;
+    if let Some(sentence) = refused.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(sentence);
+    }
+    let leased = leased?;
     Ok(voice::question::leased_outcome(
         &agent, &question, &form, leased,
     ))
@@ -6304,6 +6341,7 @@ async fn desktop_run_action(
         DesktopAction::AttachTerminal {
             agent_id,
             on_output,
+            incarnation,
         } => {
             let channel: Channel<Response> = on_output.channel_on(webview.clone());
             // PRD #882: this action carries no measured geometry (it is the
@@ -6313,8 +6351,16 @@ async fn desktop_run_action(
             // No deck: this action is the legacy declarative attach path and has
             // always meant the selected deck. The webview's own attach command
             // names one.
-            let attached =
-                terminal::attach(&app, &state, None, agent_id.clone(), channel, None).await?;
+            let attached = terminal::attach(
+                &app,
+                &state,
+                None,
+                agent_id.clone(),
+                incarnation,
+                channel,
+                None,
+            )
+            .await?;
             result_agent_id = Some(agent_id);
             result_terminal = Some(attached);
         }

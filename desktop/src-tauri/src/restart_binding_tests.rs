@@ -28,6 +28,9 @@ struct Script {
     restart_after: Option<(&'static str, &'static str)>,
     hellos: HashMap<&'static str, usize>,
     terminal_probe: bool,
+    /// Agent `1`'s live session state on every listing, when set — the voice
+    /// answer pin's pending question rides in it.
+    live: Option<serde_json::Value>,
 }
 
 /// A deck whose daemon restarts at its socket as the same build. Every request
@@ -106,6 +109,22 @@ fn serve(op: &str) -> AttachResponse {
     }
 }
 
+/// `reply` with agent `1`'s live session state set to `live`, when it lists
+/// agents and `live` is set.
+fn with_live(reply: AttachResponse, live: Option<serde_json::Value>) -> AttachResponse {
+    let Some(live) = live else {
+        return reply;
+    };
+    let mut value = serde_json::to_value(&reply).expect("serialize the reply");
+    if let Some(record) = value
+        .get_mut("agent_records")
+        .and_then(|records| records.get_mut(0))
+    {
+        record["live"] = live;
+    }
+    serde_json::from_value(value).expect("a reply with the live state")
+}
+
 impl RestartingDeck {
     /// Serve as the process `first` until told to restart.
     pub(crate) fn start(tag: &str, first: &'static str) -> Self {
@@ -155,7 +174,8 @@ impl RestartingDeck {
                                 if op != "host-metrics" {
                                     recorded.lock().unwrap().push((process, op.clone()));
                                 }
-                                serve(&op)
+                                let live = script.lock().unwrap().live.clone();
+                                with_live(serve(&op), live)
                             };
                             let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
                             let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
@@ -217,6 +237,15 @@ impl RestartingDeck {
 
     pub(crate) fn enable_terminal_probe(&self) {
         self.script.lock().unwrap().terminal_probe = true;
+    }
+
+    /// Agent `1` waits on `question` in every listing from now on.
+    pub(crate) fn ask(&self, question: &dot_agent_deck::question::PendingQuestion) {
+        self.script.lock().unwrap().live = Some(serde_json::json!({
+            "status": "WaitingForInput",
+            "tool_count": 0,
+            "pending_question": question,
+        }));
     }
 
     /// The daemon restarts as `next` right after the current process serves
@@ -621,4 +650,134 @@ async fn handshake_013_a_rollback_after_a_restart_stops_nothing() {
         deck.received_by("b"),
         vec!["start-agent".to_string(), "stop-agent".to_string()]
     );
+}
+
+/// A permission prompt agent `1` waits on, answered through the keys its
+/// option table names.
+fn permission_question() -> dot_agent_deck::question::PendingQuestion {
+    use dot_agent_deck::question::{
+        AnswerChannel, OptionRole, PendingQuestion, Question, QuestionKind, QuestionOption,
+    };
+    let option = |index: u32, label: &str, role: OptionRole| QuestionOption {
+        index,
+        label: label.to_string(),
+        description: None,
+        role,
+        keyboard_only: false,
+        scope: None,
+        maybe_hidden: false,
+    };
+    PendingQuestion {
+        id: "q-g5".to_string(),
+        kind: QuestionKind::Permission,
+        questions: vec![Question {
+            prompt: "Allow Bash?".to_string(),
+            header: None,
+            options: vec![
+                option(1, "Yes", OptionRole::AllowOnce),
+                option(2, "No", OptionRole::Deny),
+            ],
+            multi_select: false,
+        }],
+        raised_at_ms: 1,
+        tool: None,
+        channel: AnswerChannel::Keys,
+        subagent_id: None,
+        revision: Some(3),
+    }
+}
+
+/// Scenario: agent `1` waits on a permission question and the voice panel answers it through the real `desktop_voice_answer_question` command, invoked over IPC on Tauri's mock runtime, after the same-build deck restarted. The answer is refused with the gone sentence and the successor is sent no answer; with no restart, the deck that listed the question receives the answer (control).
+#[test]
+fn handshake_013_a_voice_answer_after_a_restart_answers_nothing() {
+    use tauri::ipc::{CallbackFn, InvokeBody};
+    use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
+    use tauri::webview::InvokeRequest;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime for the scripted deck");
+    let _selection = runtime.block_on(crate::dto::SELECTION_LOCK.lock());
+    for restarted in [false, true] {
+        let deck = {
+            let _entered = runtime.enter();
+            RestartingDeck::start("g5-voice", "a")
+        };
+        deck.ask(&permission_question());
+        let _local = select(&deck);
+        // The row the voice panel resolved its answer against.
+        let row = runtime.block_on(listed_row(&deck, &DesktopState::default()));
+        let question = row
+            .pending_question
+            .clone()
+            .expect("agent 1 waits on a question");
+        assert_eq!(row.incarnation.as_deref(), Some("a"));
+        if restarted {
+            // The command reads the question afresh, then sends the answer:
+            // the deck restarts between the two.
+            deck.restart_after("list-agents", "b");
+        }
+
+        let app = mock_builder()
+            .manage(DesktopState::default())
+            .invoke_handler(tauri::generate_handler![
+                crate::desktop_voice_answer_question
+            ])
+            .build(crate::app_context())
+            .expect("a mock app");
+        let main = tauri::WebviewWindowBuilder::new(
+            &app,
+            crate::pr_browser::MAIN_WEBVIEW_LABEL,
+            tauri::WebviewUrl::default(),
+        )
+        .build()
+        .expect("the main webview");
+        let answer = get_ipc_response(
+            &main,
+            InvokeRequest {
+                cmd: "desktop_voice_answer_question".into(),
+                callback: CallbackFn(0),
+                error: CallbackFn(1),
+                url: "tauri://localhost".parse().expect("the app origin"),
+                body: InvokeBody::Json(serde_json::json!({
+                    "deckId": crate::dto::deck_wire_id(&deck.endpoint()),
+                    "agentId": "1",
+                    "agent": "planner",
+                    "questionId": question.id,
+                    "form": [{"questionIndex": 0, "optionIndices": [1]}],
+                    "confirmedAlways": false,
+                    "lease": "7",
+                    "revision": question.revision,
+                    "incarnation": row.incarnation,
+                })),
+                headers: Default::default(),
+                invoke_key: INVOKE_KEY.to_string(),
+            },
+        );
+        if restarted {
+            assert_eq!(
+                deck.received_by("b"),
+                Vec::<String>::new(),
+                "a voice answer reached the successor; answer={answer:?}"
+            );
+            assert_eq!(
+                answer.as_ref().err(),
+                Some(&serde_json::Value::String(
+                    AGENT_GONE_AFTER_RESTART.to_string()
+                )),
+                "{:?}",
+                answer.as_ref().map(|body| format!("{body:?}"))
+            );
+        } else {
+            assert!(answer.is_ok(), "control: {answer:?}");
+            assert!(
+                deck.received_by("a")
+                    .contains(&"answer-question".to_string()),
+                "control: the answer reaches the deck that listed the question; {:?}",
+                deck.received_by("a")
+            );
+        }
+    }
 }

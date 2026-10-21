@@ -77,12 +77,22 @@ pub enum ClientError {
     NotAdmitted(String),
     /// PRD #1666 part 2 (G-fix4): a request from a handle bound to a daemon
     /// incarnation ([`DaemonClient::bound_to`]) reached a daemon process other
-    /// than the one the handle was bound to, so nothing was sent. A restart
-    /// stops every agent and the new daemon numbers its agents and viewers
-    /// from 1 again, so the id the request names may now be an unrelated
-    /// agent's. Both clients show [`AGENT_GONE_AFTER_RESTART`].
+    /// than the one the handle was bound to, so nothing was sent. The new
+    /// daemon numbers its agents and viewers from 1 again, so the id the
+    /// request names may now be an unrelated agent's. A changed process says
+    /// the old agent is not reachable through this daemon; it does not prove
+    /// the old agent's process stopped. Both clients show
+    /// [`AGENT_GONE_AFTER_RESTART`].
     #[error("{AGENT_GONE_AFTER_RESTART}")]
     DaemonRestarted,
+    /// PRD #1666 part 2 (G-fix5): a request from a handle bound to a daemon
+    /// incarnation ([`DaemonClient::bound_to`]) was not sent, because the
+    /// binding or the `Hello` on its connection names no daemon process
+    /// ([`Incarnation::UNNAMED`]). Without both names there is no telling the
+    /// process that issued the id from a successor that reuses it, so the
+    /// request fails closed. Both clients show [`AGENT_IDENTITY_UNKNOWN`].
+    #[error("{AGENT_IDENTITY_UNKNOWN}")]
+    DaemonUnnamed,
 }
 
 /// PRD #1666 part 2 (G-fix4): what both clients say when an action aimed at an
@@ -90,6 +100,12 @@ pub enum ClientError {
 /// ([`ClientError::DaemonRestarted`]). One sentence, so the TUI and the
 /// desktop say the same thing (CLAUDE.md rule 22).
 pub const AGENT_GONE_AFTER_RESTART: &str = "that agent is gone (the deck restarted)";
+
+/// PRD #1666 part 2 (G-fix5): what both clients say when an action aimed at an
+/// agent is refused because the deck did not say which daemon process it is
+/// ([`ClientError::DaemonUnnamed`]).
+pub const AGENT_IDENTITY_UNKNOWN: &str =
+    "the deck did not identify itself, so the action on that agent was not sent";
 
 /// PRD #1666 part 2 (G-fix4): which daemon process an agent id or viewer token
 /// was learned from — the [`AttachResponse::instance_id`] of the `Hello` on the
@@ -102,10 +118,13 @@ pub const AGENT_GONE_AFTER_RESTART: &str = "that agent is gone (the deck restart
 /// id to it ([`DaemonClient::bound_to`]), so the action reaches the process
 /// that issued the id or nothing.
 ///
-/// `None` inside is a daemon that named no process: one that could not read OS
-/// randomness, or a test fixture. Two of those compare equal, so a client
-/// cannot tell such a daemon from its same-build replacement; every daemon on
-/// this protocol names itself otherwise. Serialized as the string or `null`.
+/// `None` inside is a daemon that named no process: a test fixture, or a build
+/// whose daemon could not read OS randomness (this one falls back to its pid
+/// and start time, [`crate::daemon_protocol::daemon_instance_id`]). Such a
+/// daemon cannot be told from its same-build replacement, so it is never the
+/// same process as anything ([`Self::same_process`]), and a handle bound to it,
+/// or answered by it, sends no action ([`ClientError::DaemonUnnamed`]).
+/// Serialized as the string or `null`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Incarnation(Option<String>);
@@ -122,6 +141,14 @@ impl Incarnation {
     /// The process identity, or `None` for a daemon that named none.
     pub fn as_deref(&self) -> Option<&str> {
         self.0.as_deref()
+    }
+
+    /// Whether `self` and `other` name the same daemon process. Never for an
+    /// unnamed one: two daemons that named nothing are not evidence of one
+    /// process, so this is `false` even when both are unnamed — unlike `==`,
+    /// which compares the values.
+    pub fn same_process(&self, other: &Self) -> bool {
+        matches!((&self.0, &other.0), (Some(a), Some(b)) if a == b)
     }
 
     /// Whether this is a daemon that named no process — for a
@@ -1669,7 +1696,9 @@ impl DaemonClient {
     /// daemon that replaced that process since — whatever its build, the same
     /// one included — is sent nothing, and the call fails with
     /// [`ClientError::DaemonRestarted`]. A request whose connection's `Hello`
-    /// names the same process goes ahead exactly as on the unbound handle.
+    /// names the same process goes ahead exactly as on the unbound handle. A
+    /// binding to [`Incarnation::UNNAMED`], or a `Hello` that names no process,
+    /// sends nothing ([`ClientError::DaemonUnnamed`]).
     ///
     /// Every id a bound handle learns — a start's, a listing's, an attach's —
     /// therefore comes from that process too, which is how an orchestration
@@ -1788,7 +1817,8 @@ impl DaemonClient {
     ///
     /// On a handle bound by [`Self::bound_to`], the reply must also name the
     /// bound daemon process, or the check fails with
-    /// [`ClientError::DaemonRestarted`]. The process it names is returned
+    /// [`ClientError::DaemonRestarted`] — or with [`ClientError::DaemonUnnamed`]
+    /// when the binding or the reply names none. The process it names is returned
     /// either way, for a caller that records it beside the ids it learns.
     async fn protocol_hello(
         &self,
@@ -1842,13 +1872,16 @@ impl DaemonClient {
         let incarnation = Incarnation::of_hello(&resp);
         // After the capabilities are stored: the reply is this endpoint's
         // current daemon, which is all the cache describes. What a mismatch
-        // refuses is this request, aimed at the process before it.
-        if self
-            .bound
-            .as_ref()
-            .is_some_and(|bound| *bound != incarnation)
-        {
-            return Err(ClientError::DaemonRestarted);
+        // refuses is this request, aimed at the process before it. A binding
+        // or a reply that names no process fails closed (G-fix5): there is
+        // nothing to tell the process from a successor by.
+        if let Some(bound) = &self.bound {
+            if bound.is_unnamed() || incarnation.is_unnamed() {
+                return Err(ClientError::DaemonUnnamed);
+            }
+            if !bound.same_process(&incarnation) {
+                return Err(ClientError::DaemonRestarted);
+            }
         }
         if follow_on && !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON) {
             return Err(ClientError::Server(
@@ -8286,6 +8319,10 @@ pub(crate) mod gate_fixture {
                             checked = true;
                             let mut reply =
                                 AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+                            // One process for the fixture's life, as a running
+                            // daemon names itself: a client that binds to it
+                            // (G-fix5) is refused only by the protocol.
+                            reply.instance_id = Some("gate-fixture".into());
                             match hello {
                                 GateHello::Matching => {}
                                 GateHello::Newer => {
@@ -8937,6 +8974,32 @@ mod incarnation_binding_tests {
             failures.is_empty(),
             "missing incarnation must fail closed:\n{}",
             failures.join("\n")
+        );
+    }
+
+    /// Scenario: two daemons that name no process are never the same process, and a handle bound to one — or answered by one — is refused as a deck that did not identify itself, not as a restart; two named alike are the same process.
+    #[spec("lifecycle/handshake/013")]
+    #[tokio::test]
+    async fn handshake_013_an_unnamed_incarnation_is_refused_as_unidentified() {
+        let named = |name: &str| Incarnation::from(Some(name.to_string()));
+        assert!(!Incarnation::UNNAMED.same_process(&Incarnation::UNNAMED));
+        assert!(!Incarnation::UNNAMED.same_process(&named("a")));
+        assert!(named("a").same_process(&named("a")));
+        assert!(!named("a").same_process(&named("b")));
+
+        let daemon = RestartingDaemon::spawn("unnamed-a");
+        let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+        for bound in [Incarnation::UNNAMED, named("a")] {
+            let refused = client.bound_to(bound.clone()).stop_agent("1").await;
+            assert!(
+                matches!(refused, Err(ClientError::DaemonUnnamed)),
+                "{bound:?}: {refused:?}"
+            );
+        }
+        assert_eq!(daemon.received_by("unnamed-a"), Vec::<String>::new());
+        assert_eq!(
+            ClientError::DaemonUnnamed.to_string(),
+            AGENT_IDENTITY_UNKNOWN
         );
     }
 

@@ -1015,7 +1015,9 @@ export interface AgentSession {
    * HONEST. The daemon process that listed this agent (PRD #1666 part 2). A
    * restarted deck numbers its agents from 1 again, so an action on this agent
    * carries this value, captured when the action was offered, and the desktop
-   * sends the action only to that process. Absent from a deck that names none.
+   * sends the action only to that process — opening its terminal included.
+   * Absent from a deck that names none, and then the desktop sends no action
+   * on the agent at all.
    */
   incarnation?: string;
 }

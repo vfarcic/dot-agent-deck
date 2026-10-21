@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity, FocusReport};
+use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity, FocusReport, Incarnation};
 use dot_agent_deck::daemon_protocol::{
     KIND_DETACH, KIND_GEOMETRY, KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT,
     KIND_STREAM_REJECT, parse_geometry_frame, read_frame, write_frame,
@@ -774,6 +774,11 @@ async fn establish(
     state: &DesktopState,
     deck_id: Option<String>,
     agent_id: String,
+    // PRD #1666 part 2 (G-fix5): the daemon process that listed the card being
+    // opened (`DesktopAgent::incarnation`). The attach is bound to it, so a
+    // card from before a restart opens nothing on the successor's agent with
+    // the same id: no terminal, no PTY bytes either way, and the gone sentence.
+    incarnation: Incarnation,
     on_output: &Channel<Response>,
     viewport: Option<(u16, u16)>,
 ) -> Result<Established, String> {
@@ -795,11 +800,17 @@ async fn establish(
     let channel_id = on_output.id();
     // The deck is part of the reuse check for the same reason it is part of the
     // registry key: `(agent_id, channel_id)` alone would answer "you already
-    // have this" for another deck's namesake.
+    // have this" for another deck's namesake. So is the daemon process (G-fix5):
+    // a session attached on another incarnation is a namesake on a successor,
+    // and is replaced below by an attach bound to the card's own.
     if let Some((session_id, session)) = state.sessions()?.iter().find(|(_, session)| {
         session.agent_id == agent_id
             && session.channel_id == channel_id
             && session.endpoint.identity() == deck
+            && session
+                .incarnation
+                .as_ref()
+                .is_some_and(|attached| attached.same_process(&incarnation))
     }) {
         return Ok(Established {
             endpoint: scope.endpoint().clone(),
@@ -843,14 +854,14 @@ async fn establish(
     // daemon that has since been replaced at this socket by another build,
     // which would otherwise be handed a terminal on the strength of its
     // predecessor's reply.
+    //
+    // PRD #1666 part 2 (G-fix5): and only on the daemon process that listed the
+    // card, checked on that same connection, so a successor that numbered an
+    // unrelated agent with this id is sent nothing but the `Hello`.
+    let client = daemon.client.bound_to(incarnation);
     let connection = match viewport {
-        Some(viewport) => {
-            daemon
-                .client
-                .attach_as_viewer(&agent_id, Some(viewport))
-                .await
-        }
-        None => daemon.client.attach_pending_viewport(&agent_id).await,
+        Some(viewport) => client.attach_as_viewer(&agent_id, Some(viewport)).await,
+        None => client.attach_pending_viewport(&agent_id).await,
     }
     .map_err(|error| match error {
         // In the words `TrustedDaemon::require_compatible` refuses with, so the
@@ -1092,6 +1103,9 @@ pub(crate) async fn attach(
     // and why the resolution is against the observed set.
     deck_id: Option<String>,
     agent_id: String,
+    // PRD #1666 part 2 (G-fix5): the opened card's daemon process; see
+    // [`establish`].
+    incarnation: Incarnation,
     on_output: Channel<Response>,
     // PRD #882 — the geometry this tile can draw the agent at, measured by
     // `FitAddon` in the webview. Declaring it registers the tile as a viewer, so
@@ -1104,7 +1118,7 @@ pub(crate) async fn attach(
         stream,
         endpoint,
         ..
-    } = establish(state, deck_id, agent_id, &on_output, viewport).await?;
+    } = establish(state, deck_id, agent_id, incarnation, &on_output, viewport).await?;
     let Some(mut reader) = stream else {
         // A reused session: the caller already has a live stream task and an
         // `Attached` event from the attach that created it.
@@ -2404,7 +2418,14 @@ mod tests {
             let channel = fixture_channel();
             let first = tokio::time::timeout(
                 Duration::from_secs(5),
-                establish(&state, None, "planner".into(), &channel, None),
+                establish(
+                    &state,
+                    None,
+                    "planner".into(),
+                    fixture_incarnation(),
+                    &channel,
+                    None,
+                ),
             )
             .await
             .expect("bounded attach")
@@ -2479,7 +2500,14 @@ mod tests {
         let first_channel = fixture_channel();
         tokio::time::timeout(
             Duration::from_secs(5),
-            establish(&state, None, "planner".into(), &first_channel, None),
+            establish(
+                &state,
+                None,
+                "planner".into(),
+                fixture_incarnation(),
+                &first_channel,
+                None,
+            ),
         )
         .await
         .expect("bounded attach")
@@ -2529,7 +2557,14 @@ mod tests {
         });
         let reopened = tokio::time::timeout(
             Duration::from_secs(5),
-            establish(&state, None, "planner".into(), &fixture_channel(), None),
+            establish(
+                &state,
+                None,
+                "planner".into(),
+                fixture_incarnation(),
+                &fixture_channel(),
+                None,
+            ),
         )
         .await
         .expect("bounded reopen");
@@ -2582,7 +2617,14 @@ mod tests {
             });
             tokio::time::timeout(
                 Duration::from_secs(5),
-                establish(&state, None, "planner".into(), &fixture_channel(), None),
+                establish(
+                    &state,
+                    None,
+                    "planner".into(),
+                    fixture_incarnation(),
+                    &fixture_channel(),
+                    None,
+                ),
             )
             .await
             .expect("bounded attach")
@@ -2626,6 +2668,9 @@ mod tests {
                                 crate::daemon_bridge::hello_from_a_deck_one_declared_break_behind()
                                     .with_capabilities();
                             hello.build_version = matching_hello().build_version;
+                            // The replacement under test differs by its contract,
+                            // not by its process (PRD #1666 part 2, G-fix5).
+                            hello.instance_id = matching_hello().instance_id;
                             if next_protocol {
                                 hello.server_version =
                                     Some(dot_agent_deck::daemon_protocol::PROTOCOL_VERSION + 1);
@@ -2649,7 +2694,14 @@ mod tests {
             });
             let reopened = tokio::time::timeout(
                 Duration::from_secs(5),
-                establish(&state, None, "planner".into(), &fixture_channel(), None),
+                establish(
+                    &state,
+                    None,
+                    "planner".into(),
+                    fixture_incarnation(),
+                    &fixture_channel(),
+                    None,
+                ),
             )
             .await
             .expect("bounded reopen");
@@ -2719,7 +2771,14 @@ mod tests {
             let channel = fixture_channel();
             let mut first = tokio::time::timeout(
                 Duration::from_secs(5),
-                establish(&state, None, "planner".into(), &channel, None),
+                establish(
+                    &state,
+                    None,
+                    "planner".into(),
+                    fixture_incarnation(),
+                    &channel,
+                    None,
+                ),
             )
             .await
             .expect("bounded initial attach")
@@ -2790,7 +2849,14 @@ mod tests {
             });
             let reopened = tokio::time::timeout(
                 Duration::from_secs(5),
-                establish(&state, None, "planner".into(), &channel, None),
+                establish(
+                    &state,
+                    None,
+                    "planner".into(),
+                    fixture_incarnation(),
+                    &channel,
+                    None,
+                ),
             )
             .await
             .expect("bounded terminal reopen");
@@ -2836,7 +2902,25 @@ mod tests {
         let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
             .with_running_agents(dot_agent_deck::daemon_protocol::RunningAgentsSummary::default());
         reply.build_version = Some(dot_agent_deck::build_id::local_build_id());
+        reply.instance_id = Some(FIXTURE_PROCESS.to_string());
         reply
+    }
+
+    /// The daemon process every scripted deck's `Hello` names
+    /// ([`matching_hello`]), so a terminal opened on one of its cards is bound
+    /// to it (PRD #1666 part 2, G-fix5).
+    const FIXTURE_PROCESS: &str = "fixture-process";
+
+    fn fixture_incarnation() -> Incarnation {
+        Incarnation::from(Some(FIXTURE_PROCESS.to_string()))
+    }
+
+    /// The daemon process of a deck served in this test process by the real
+    /// attach handler, which names this process.
+    fn this_process() -> Incarnation {
+        Incarnation::from(Some(
+            dot_agent_deck::daemon_protocol::daemon_instance_id().to_string(),
+        ))
     }
 
     /// Answer one connection with one reply, after `hold` resolves.
@@ -2978,14 +3062,10 @@ mod tests {
         // selection move below is then doubly irrelevant to which deck is
         // stopped, and this test still pins which deck's session is detached.
         let wire_a = crate::dto::deck_wire_id(&deck_a);
-        // The scripted deck names no process, so the row it listed carried
-        // none either (PRD #1666 part 2, G-fix4).
-        let stopping = crate::stop_agent_action(
-            &state,
-            &wire_a,
-            "planner",
-            &dot_agent_deck::daemon_client::Incarnation::UNNAMED,
-        );
+        // The row the scripted deck listed carries the process its `Hello`
+        // names (PRD #1666 part 2, G-fix4/G-fix5).
+        let listed = fixture_incarnation();
+        let stopping = crate::stop_agent_action(&state, &wire_a, "planner", &listed);
         let moving = async {
             stop_arrived_rx
                 .await
@@ -3097,7 +3177,14 @@ mod tests {
         });
 
         let channel = fixture_channel();
-        let attaching = establish(&state, Some(wire_a), "planner".into(), &channel, None);
+        let attaching = establish(
+            &state,
+            Some(wire_a),
+            "planner".into(),
+            fixture_incarnation(),
+            &channel,
+            None,
+        );
         let removing = async {
             attach_arrived_rx
                 .await
@@ -3168,7 +3255,14 @@ mod tests {
         let ahead = state.attach_gate.lock().await;
 
         let channel = fixture_channel();
-        let attaching = establish(&state, Some(wire_a), "planner".into(), &channel, None);
+        let attaching = establish(
+            &state,
+            Some(wire_a),
+            "planner".into(),
+            fixture_incarnation(),
+            &channel,
+            None,
+        );
         let removing = async {
             // The attach is now parked on the gate with its scope captured.
             crate::dto::apply_settings_selection(&fleet_selecting(
@@ -3459,9 +3553,16 @@ mod tests {
         let state = DesktopState::default();
 
         let channel = fixture_channel();
-        establish(&state, None, agent_a.clone(), &channel, Some((22, 153)))
-            .await
-            .expect("attach a pane on deck A");
+        establish(
+            &state,
+            None,
+            agent_a.clone(),
+            this_process(),
+            &channel,
+            Some((22, 153)),
+        )
+        .await
+        .expect("attach a pane on deck A");
         let link_b = state
             .daemon
             .trusted(&deck_b.endpoint)
@@ -3720,9 +3821,16 @@ mod tests {
         let state = DesktopState::default();
         let channel = fixture_channel();
 
-        let unfocused = establish(&state, None, agent.clone(), &channel, Some((22, 153)))
-            .await
-            .expect("attach while unfocused");
+        let unfocused = establish(
+            &state,
+            None,
+            agent.clone(),
+            this_process(),
+            &channel,
+            Some((22, 153)),
+        )
+        .await
+        .expect("attach while unfocused");
         assert!(
             unfocused.focus_claim.is_none(),
             "an unfocused window claims nothing"
@@ -3735,9 +3843,16 @@ mod tests {
         );
         assert_eq!(deck.registry.focused_client(), None);
 
-        let focused = establish(&state, None, agent, &channel, Some((22, 153)))
-            .await
-            .expect("attach while focused");
+        let focused = establish(
+            &state,
+            None,
+            agent,
+            this_process(),
+            &channel,
+            Some((22, 153)),
+        )
+        .await
+        .expect("attach while focused");
         let claim = focused
             .focus_claim
             .expect("a pane opened in a focused window claims focus on its deck");
@@ -3776,6 +3891,7 @@ mod tests {
                 &state,
                 Some(crate::dto::deck_wire_id(&deck.endpoint())),
                 card.id,
+                card.incarnation,
                 &fixture_channel(),
                 Some((24, 80)),
             )
@@ -3826,6 +3942,64 @@ mod tests {
         }
     }
 
+    /// Scenario (PRD #1666 part 2, G-fix5): a terminal is open on agent `1` of a deck, the deck restarts as the same build, and the tile opens agent `1` again from the restarted deck's own row, on the same channel. The open session from before the restart is not reused for it: the restarted deck gets an attach of its own. Reopening the same row without a restart reuses the session (control).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_013_a_session_from_before_a_restart_is_not_reused_for_its_successor() {
+        use crate::restart_binding_tests::RestartingDeck;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for restarted in [false, true] {
+            let deck = RestartingDeck::start("g5-reuse", "a");
+            let _local = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            let channel = fixture_channel();
+            let process = |name: &str| Incarnation::from(Some(name.to_string()));
+            establish(
+                &state,
+                None,
+                "1".into(),
+                process("a"),
+                &channel,
+                Some((24, 80)),
+            )
+            .await
+            .expect("a terminal on the first process");
+            let current = if restarted {
+                deck.restart_as("b");
+                "b"
+            } else {
+                "a"
+            };
+            let reopened = establish(
+                &state,
+                None,
+                "1".into(),
+                process(current),
+                &channel,
+                Some((24, 80)),
+            )
+            .await
+            .expect("the current row opens");
+            if restarted {
+                assert!(
+                    !reopened.result.reused,
+                    "the session from before the restart was reused for its successor"
+                );
+                assert!(
+                    deck.received_by("b").contains(&"attach-stream".to_string()),
+                    "the restarted deck gets an attach of its own: {:?}",
+                    deck.received_by("b")
+                );
+            } else {
+                assert!(
+                    reopened.result.reused,
+                    "control: the same row reuses its session"
+                );
+            }
+        }
+    }
+
     /// Scenario (PRD #1666 part 2, G-fix4): a terminal is open on agent `1`
     /// with viewer `v1`, and the deck restarts as the same build, whose own
     /// agent `1` has another client's viewer `v1`. The tile's next resize is
@@ -3846,7 +4020,14 @@ mod tests {
             let state = DesktopState::default();
             let established = tokio::time::timeout(
                 Duration::from_secs(5),
-                establish(&state, None, "1".into(), &fixture_channel(), Some((24, 80))),
+                establish(
+                    &state,
+                    None,
+                    "1".into(),
+                    Incarnation::from(Some("a".to_string())),
+                    &fixture_channel(),
+                    Some((24, 80)),
+                ),
             )
             .await
             .expect("bounded attach")

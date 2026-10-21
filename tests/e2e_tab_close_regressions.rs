@@ -186,6 +186,10 @@ async fn handle_connection(
                 _ => PROTOCOL_VERSION,
             };
             let mut response = AttachResponse::hello(version).with_running_agents(summary);
+            // One process for the fixture's life, as a running daemon names
+            // itself: the TUI acts on no agent of a daemon that names none
+            // (PRD #1666 part 2, G-fix5).
+            response.instance_id = Some("tab-close-fixture".into());
             // Advertise only the added protocol exchange. Advertising every
             // real-daemon capability selects snapshot subscription, which this
             // close fixture does not implement, and hides a background panic.

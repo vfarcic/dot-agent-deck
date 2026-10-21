@@ -3859,16 +3859,44 @@ pub struct AttachResponse {
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
 /// — 16 bytes of OS randomness, hex-encoded, minted on first use and fixed for
 /// the life of the process (an `exec` into a successor mints a new one).
-/// `None` when OS randomness is unavailable, which a client reads as a daemon
-/// that does not say.
-pub fn daemon_instance_id() -> Option<&'static str> {
-    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+///
+/// PRD #1666 part 2 (G-fix5): every daemon on this build names itself. When
+/// OS randomness is unavailable the identity falls back to
+/// [`fallback_instance_id`], the process id and the time it was minted, so a
+/// client never has to compare two daemons that named nothing — which it now
+/// refuses to act on at all ([`crate::daemon_client::Incarnation`]).
+pub fn daemon_instance_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
         let mut bytes = [0u8; 16];
-        getrandom::fill(&mut bytes).ok()?;
-        Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+        mint_instance_id(getrandom::fill(&mut bytes).ok().map(|()| bytes), || {
+            fallback_instance_id(
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default(),
+            )
+        })
     })
-    .as_deref()
+}
+
+/// [`daemon_instance_id`]'s choice: the random bytes hex-encoded when there
+/// are some, and `fallback` otherwise.
+fn mint_instance_id(random: Option<[u8; 16]>, fallback: impl FnOnce() -> String) -> String {
+    match random {
+        Some(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        None => fallback(),
+    }
+}
+
+/// The identity of a daemon process that could not read OS randomness: its
+/// pid and the wall-clock nanoseconds at which it minted the identity. Two
+/// processes alive at once differ by pid, and a later process given a recycled
+/// pid differs by time. The `pid-` prefix keeps it apart from the 32 hex
+/// characters of a random identity.
+fn fallback_instance_id(pid: u32, minted_at_nanos: u128) -> String {
+    format!("pid-{pid}-{minted_at_nanos}")
 }
 
 /// Issue #1045: which spelling of the prepare verb a request used, or a client
@@ -4059,7 +4087,7 @@ impl AttachResponse {
     /// ([`Self::instance_id`]). Only the live daemon's `Hello` handler calls
     /// it.
     pub fn with_instance_id(mut self) -> Self {
-        self.instance_id = daemon_instance_id().map(str::to_string);
+        self.instance_id = Some(daemon_instance_id().to_string());
         self
     }
 }
@@ -12222,6 +12250,25 @@ mod tests {
         assert_eq!(serde_json::to_value(back).unwrap(), value);
     }
 
+    /// PRD #1666 part 2 (G-fix5): a daemon that cannot read OS randomness
+    /// still names its process, and two such processes are told apart.
+    #[test]
+    fn instance_id_without_randomness_still_names_the_process() {
+        let random = mint_instance_id(Some([0xab; 16]), || unreachable!());
+        assert_eq!(random, "ab".repeat(16));
+        let a = mint_instance_id(None, || fallback_instance_id(41, 1_000));
+        let b = mint_instance_id(None, || fallback_instance_id(42, 1_000));
+        let recycled = mint_instance_id(None, || fallback_instance_id(41, 2_000));
+        assert!(!a.is_empty(), "a daemon without randomness names itself");
+        assert_ne!(a, b, "two live processes differ by pid");
+        assert_ne!(a, recycled, "a recycled pid differs by time");
+        assert_ne!(
+            a.len(),
+            random.len(),
+            "never mistaken for a random identity"
+        );
+    }
+
     #[test]
     fn instance_id_is_additive_and_names_this_process() {
         let plain = serde_json::to_value(AttachResponse::hello(PROTOCOL_VERSION)).unwrap();
@@ -12240,7 +12287,7 @@ mod tests {
             .expect("this process has an identity");
         assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
-        assert_eq!(daemon_instance_id(), Some(id.as_str()));
+        assert_eq!(daemon_instance_id(), id.as_str());
         let back: AttachResponse =
             serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
         assert_eq!(back.instance_id, Some(id));

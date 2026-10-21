@@ -789,12 +789,13 @@ pub struct DesktopAgent {
     /// PRD #1666 part 2 (G-fix4): the daemon process this row was listed by,
     /// which the webview sends back with every action on the agent
     /// (`StopAgent`, `StopOrchestration`, `RenameAgent`, an inbox action, a
-    /// voice answer). The action is then sent only to that process: after a
+    /// voice answer, opening its terminal). The action is then sent only to that process: after a
     /// restart, a successor that numbered an unrelated agent with this id is
     /// sent nothing, and the action fails with
     /// [`dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART`]. Absent
-    /// from a daemon that names no process; an action sent without one is
-    /// bound to such a daemon, which no current daemon is.
+    /// from a daemon that names no process, and then every action on the agent
+    /// is refused, an action sent without one included (G-fix5): such a
+    /// daemon cannot be told from its successor.
     #[serde(skip_serializing_if = "Incarnation::is_unnamed")]
     pub incarnation: Incarnation,
 }
@@ -1320,6 +1321,11 @@ pub enum DesktopAction {
     AttachTerminal {
         agent_id: String,
         on_output: JavaScriptChannelId,
+        /// PRD #1666 part 2 (G-fix5): the row's
+        /// [`DesktopAgent::incarnation`], which the attach is bound to. A
+        /// caller that sends none names no process, and is refused.
+        #[serde(default)]
+        incarnation: Incarnation,
     },
     DetachTerminal {
         session_id: String,

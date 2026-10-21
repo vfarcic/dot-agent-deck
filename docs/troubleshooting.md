@@ -519,7 +519,13 @@ If neither fits, capture a log ([Enabling Debug Logs](#enabling-debug-logs); the
 
 *Applies to the TUI and the desktop app.*
 
-You closed, renamed or messaged an agent, retried or cancelled one of its messages, or answered its question by voice, and the deck restarted after you last saw that agent. A restart stops every agent, and the restarted deck numbers its new agents from 1 again, so a new agent may now have the number the old one had. The deck sent your action to nobody rather than to that new agent. Nothing needs undoing: the old agent stopped with the restart. The dashboard shows the restarted deck's agents once it refreshes; act on those. In the TUI, the close still removes the pane. An orchestration whose cleanup meets a restart names its roles in the cleanup warning with this message; they stopped with the restart too.
+You opened, closed, renamed or messaged an agent, retried or cancelled one of its messages, or answered its question by voice, and the deck restarted after you last saw that agent. That agent can no longer be reached through the deck, and the restarted deck may be running a different agent under the same name or in the same pane. Your action was not sent, so it did nothing to that other agent. Refresh the dashboard and act on the agents the restarted deck lists.
+
+In the TUI, a pane whose deck restarted while it was reconnecting is marked `disconnected` and the status line shows this message. Anything you typed into it while it was reconnecting is discarded rather than sent to the new agent. Closing the pane removes it. A pane that only lost its connection for a moment, while the deck kept running, reconnects to its own agent as before. In the desktop app, opening the terminal of such an agent shows this message instead of a terminal.
+
+An orchestration whose cleanup meets a restart names its roles in the cleanup warning with this message.
+
+If an action says `the deck did not identify itself, so the action on that agent was not sent`, the app could not tell whether the deck had restarted since it listed that agent, so it did not send the action. Restart the deck and try again.
 
 ### The deck is missing cards — a role or agent I know is running has no card
 

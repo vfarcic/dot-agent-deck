@@ -1747,7 +1747,7 @@ export type DesktopRunActionDto =
   | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string }
   | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[] }
   | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string }
-  | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
+  | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer>; incarnation?: string }
   | { type: "detach_terminal"; sessionId: string }
   | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; force?: boolean }
@@ -3710,6 +3710,21 @@ interface InstalledTerminalSession {
   result: TerminalAttachResult;
 }
 
+/**
+ * PRD #1666 part 2 (G-fix5): what a terminal tile says when its attach fails.
+ * A refusal because the deck restarted since the card was listed means the
+ * card's agent is gone, so the tile says exactly that, in the words the TUI
+ * uses; anything else is a failed attach to an agent that is still running.
+ */
+export const AGENT_GONE_AFTER_RESTART = "that agent is gone (the deck restarted)";
+
+function terminalAttachFailure(cause: unknown): string {
+  const text = cause instanceof Error ? cause.message : String(cause);
+  return text === AGENT_GONE_AFTER_RESTART
+    ? AGENT_GONE_AFTER_RESTART
+    : "Terminal attach failed. The agent is still running; reconnect to retry its terminal.";
+}
+
 export class TauriDeckBridge implements DeckBridge {
   readonly mode = "live" as const;
   /*
@@ -4220,6 +4235,10 @@ export class TauriDeckBridge implements DeckBridge {
           onOutput,
           rows: viewport?.rows,
           cols: viewport?.cols,
+          /* PRD #1666 part 2 (G-fix5): the daemon process that listed the card.
+             The backend binds the attach to it, so a card from before a deck
+             restart opens nothing on the successor's agent with the same id. */
+          incarnation: target.incarnation ?? null,
         });
         const appliedRows = session.appliedRows;
         const appliedCols = session.appliedCols;
@@ -4299,7 +4318,7 @@ export class TauriDeckBridge implements DeckBridge {
             data: new Uint8Array(),
             stream: "error",
             operation: "append",
-            message: "Terminal attach failed. The agent is still running; reconnect to retry its terminal.",
+            message: terminalAttachFailure(cause),
           });
         }
         throw cause;

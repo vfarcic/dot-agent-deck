@@ -550,7 +550,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * of panes that do.
    */
   const overviewShown = base === "overview"
-    ? (agentView && paneAgent && paneDeckAttachable ? [{ deckId: agentView.deckId, agentId: agentView.agentId }] : [])
+    ? (agentView && paneAgent && paneDeckAttachable ? [{ deckId: agentView.deckId, agentId: agentView.agentId, ...(paneAgent.incarnation ? { incarnation: paneAgent.incarnation } : {}) }] : [])
     : undefined;
   useShownTerminals(runtime.setShownTerminals, overviewShown);
   /**
@@ -1861,7 +1861,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     /* The agent's OWN deck, which on this screen is always the selected one —
        written as the agent's rather than read off the connection so the
        declaration cannot drift from what the tile actually mounted. */
-    .map((agent) => ({ deckId: agent.daemonId, agentId: agent.id }));
+    /* PRD #1666 part 2 (G-fix5): with the daemon process that listed the row,
+       so the terminal opened for it is bound to that process. */
+    .map((agent) => ({ deckId: agent.daemonId, agentId: agent.id, ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }));
 
   /**
    * ONE call per render commit carrying ALL the shown ids, never one call per

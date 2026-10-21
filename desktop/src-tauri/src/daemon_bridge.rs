@@ -1906,8 +1906,8 @@ fn held_host_metrics(view: &AgentView) -> Option<HostMetricsReportDto> {
 /// daemon process whose reply `records` is, so an action the webview sends
 /// back for one of them is bound to that process. `None` — a listing over an
 /// unbound, ungated handle, which the held client never is — stamps a daemon
-/// that named no process, and an action bound to that is refused by every
-/// daemon that names one.
+/// that named no process, and an action bound to that is refused outright
+/// (PRD #1666 part 2, G-fix5: `ClientError::DaemonUnnamed`).
 fn connected_snapshot(
     connection: DesktopConnection,
     records: Vec<dot_agent_deck::daemon_client::AgentRecord>,
@@ -5323,9 +5323,9 @@ mod tests {
         /// action on one of its agents is bound to. Every `RealDeck` serves
         /// from this test process, so they all name the same one.
         fn incarnation(&self) -> dot_agent_deck::daemon_client::Incarnation {
-            dot_agent_deck::daemon_client::Incarnation::from(
-                dot_agent_deck::daemon_protocol::daemon_instance_id().map(str::to_string),
-            )
+            dot_agent_deck::daemon_client::Incarnation::from(Some(
+                dot_agent_deck::daemon_protocol::daemon_instance_id().to_string(),
+            ))
         }
 
         /// A real PTY child under this daemon's registry, and the **registry's**
