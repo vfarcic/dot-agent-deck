@@ -70,7 +70,7 @@ describe("TauriDeckBridge", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
-  /** Scenario: Open a card listed before a same-build restart. A backend that checks the card incarnation refuses it with the gone sentence before sending terminal output or accepting keyboard input. */
+  /** Scenario: Open a card listed before a same-build restart. A backend that checks the card incarnation refuses it with the gone sentence; keyboard input rejects as not attached and no PTY bytes move. */
   it("opening a stale card preserves its incarnation and transfers no PTY bytes", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const listed = structuredClone(snapshot);
@@ -93,7 +93,7 @@ describe("TauriDeckBridge", () => {
     const card = view.agents[0];
     const oldTarget = { deckId: card.daemonId!, agentId: card.id, incarnation: card.incarnation };
     await bridge.setShownTerminals([oldTarget]).catch(() => undefined);
-    await bridge.sendTerminalInput(on("agent-1"), "old-card-input");
+    await expect(bridge.sendTerminalInput(on("agent-1"), "old-card-input")).rejects.toThrow("Terminal for agent-1 is not attached.");
     expect(output.mock.calls.filter(([event]) => event.stream === "output" && event.data.length > 0), "stale card must receive no successor PTY output").toEqual([]);
     expect(invoke.mock.calls.filter(([command]) => command === "desktop_terminal_write"), "stale card must send no PTY input").toEqual([]);
     expect(JSON.stringify(output.mock.calls)).toContain(gone);
