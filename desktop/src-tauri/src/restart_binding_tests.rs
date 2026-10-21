@@ -27,6 +27,7 @@ struct Script {
     /// accepted afterwards are served by `next`.
     restart_after: Option<(&'static str, &'static str)>,
     hellos: HashMap<&'static str, usize>,
+    terminal_probe: bool,
 }
 
 /// A deck whose daemon restarts at its socket as the same build. Every request
@@ -69,6 +70,23 @@ fn serve(op: &str) -> AttachResponse {
             .expect("the second role's record"),
         ]),
         "start-agent" | "start-prepared-agent" => AttachResponse::with_id("1".into()),
+        "resolve-project" => serde_json::from_value(serde_json::json!({
+            "ok": true, "project": {"path":"/project", "orchestrations":[]}
+        }))
+        .unwrap(),
+        "prepare-orchestration" => AttachResponse::prepared(
+            dot_agent_deck::event::PreparedOrchestration {
+                path: "/project".into(),
+                token: "prep-1".into(),
+                context_path: "/project/.dot-agent-deck/context.md".into(),
+                prompt: "Read the context and do the task".into(),
+                roles: vec![dot_agent_deck::event::ProjectRole {
+                    name: "orchestrator".into(),
+                    start: true,
+                }],
+            },
+            dot_agent_deck::daemon_protocol::PrepareSpelling::Orchestration,
+        ),
         "attach-stream" | "resize" => {
             let mut reply = AttachResponse::ok();
             reply.viewer = Some("v1".into());
@@ -152,9 +170,27 @@ impl RestartingDeck {
                                         script.restart_after = None;
                                     }
                                 }
+                                if op == "attach-stream" && script.lock().unwrap().terminal_probe {
+                                    let _ = write_frame(
+                                        &mut writer,
+                                        dot_agent_deck::daemon_protocol::KIND_STREAM_OUT,
+                                        b"SUCCESSOR-PTY-1666",
+                                    )
+                                    .await;
+                                }
                                 // Hold an attach or subscription open, as a
                                 // daemon would, until the client leaves.
-                                while let Ok(Some(_)) = read_frame(&mut reader).await {}
+                                while let Ok(Some((kind, bytes))) = read_frame(&mut reader).await {
+                                    if kind == dot_agent_deck::daemon_protocol::KIND_STREAM_IN {
+                                        recorded.lock().unwrap().push((
+                                            process,
+                                            format!(
+                                                "pty-input:{}",
+                                                String::from_utf8_lossy(&bytes)
+                                            ),
+                                        ));
+                                    }
+                                }
                             }
                         }
                     });
@@ -177,6 +213,10 @@ impl RestartingDeck {
     /// The daemon restarts now, as the process `next`.
     pub(crate) fn restart_as(&self, next: &'static str) {
         self.script.lock().unwrap().current = next;
+    }
+
+    pub(crate) fn enable_terminal_probe(&self) {
+        self.script.lock().unwrap().terminal_probe = true;
     }
 
     /// The daemon restarts as `next` right after the current process serves
@@ -231,6 +271,93 @@ fn select(deck: &RestartingDeck) -> crate::local_deck::test_override::LocalDeckO
     let guard = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
     crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
     guard
+}
+
+/// Scenario: the Runs screen starts an orchestration, and the same-build daemon restarts after preparing it but before the first role starts. No role is started on the successor and the launch reports the gone sentence.
+#[tokio::test]
+async fn handshake_013_runs_launch_never_starts_on_the_preparations_successor() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("g5-runs", "a");
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    deck.restart_after("prepare-orchestration", "b");
+    let result = crate::activate_orchestration_action(
+        &state,
+        crate::ActivateOrchestrationRequest {
+            name: "review".into(),
+            display_title: None,
+            cwd: "/project".into(),
+            task_prompt: "list the files".into(),
+            roles: vec![crate::dto::OrchestrationRoleInput {
+                role: "orchestrator".into(),
+                command: "claude".into(),
+                start: true,
+            }],
+            rows: Some(24),
+            cols: Some(80),
+            config_revision: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        deck.received_by("b"),
+        Vec::<String>::new(),
+        "Runs launch must not start or roll back successor agents"
+    );
+    let failure = result.expect_err("a restarted launch must fail");
+    assert!(
+        failure.message().contains(AGENT_GONE_AFTER_RESTART),
+        "{}",
+        failure.message()
+    );
+    assert!(
+        deck.received_by("a")
+            .contains(&"prepare-orchestration".to_string()),
+        "precondition: real launch caller prepared on a"
+    );
+}
+
+/// Scenario: the New Agent dialog launches a configured orchestration and its daemon restarts after preparing it. The dialog must report the gone sentence without starting or stopping anything on the successor.
+#[tokio::test]
+async fn handshake_013_configured_launch_never_starts_on_the_preparations_successor() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("g5-configured", "a");
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    deck.restart_after("prepare-orchestration", "b");
+    let result = crate::start_orchestration_action(
+        &state,
+        &wire,
+        crate::StartOrchestrationRequest {
+            path: "/project".into(),
+            orchestration: "review".into(),
+            display_title: None,
+            config_revision: None,
+            rows: Some(24),
+            cols: Some(80),
+        },
+    )
+    .await;
+    assert_eq!(
+        deck.received_by("b"),
+        Vec::<String>::new(),
+        "configured launch must not start or roll back successor agents"
+    );
+    let failure = match result {
+        Err(failure) => failure,
+        Ok(_) => panic!("a restarted launch must fail"),
+    };
+    assert!(
+        failure.message().contains(AGENT_GONE_AFTER_RESTART),
+        "{}",
+        failure.message()
+    );
+    assert!(
+        deck.received_by("a")
+            .contains(&"prepare-orchestration".to_string()),
+        "precondition: real launch caller prepared on a"
+    );
 }
 
 /// Scenario: the user opens the Stop confirmation on a card for agent `1`,

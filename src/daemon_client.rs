@@ -8810,7 +8810,8 @@ pub(crate) mod restart_fixture {
                                     *script.lock().unwrap().hellos.entry(process).or_default() += 1;
                                     let mut reply =
                                         AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
-                                    reply.instance_id = Some(process.to_string());
+                                    reply.instance_id = (!process.starts_with("unnamed-"))
+                                        .then(|| process.to_string());
                                     let _ = write_resp(&mut stream, &reply).await;
                                     follow_on = request["follow_on"] == true;
                                     {
@@ -8903,6 +8904,41 @@ mod incarnation_binding_tests {
     use super::restart_fixture::RestartingDaemon;
     use super::*;
     use spec::spec;
+
+    /// Scenario: a displayed agent has no daemon incarnation, or its named daemon is replaced by one that omits its identity. Stop, rename and the other agent-directed requests must all be refused without reaching that daemon, including when both old and new Hello replies omit the identity.
+    #[spec("lifecycle/handshake/013")]
+    #[tokio::test]
+    async fn handshake_013_missing_incarnations_never_authorize_agent_actions() {
+        let mut failures = Vec::new();
+        for (first, second) in [
+            ("unnamed-a", "unnamed-a"),
+            ("unnamed-a", "unnamed-b"),
+            ("a", "unnamed-b"),
+            ("unnamed-a", "b"),
+        ] {
+            let daemon = RestartingDaemon::spawn(first);
+            let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+            let listed = client
+                .list_agents_detailed()
+                .await
+                .expect("read-only listing");
+            let bound = client.bound_to(listed.incarnation.expect("gated Hello"));
+            daemon.restart_as(second);
+            let before = daemon.received_by(second).len();
+            let results = every_agent_action(&bound).await;
+            let received = daemon.received_by(second)[before..].to_vec();
+            if results.iter().any(|(_, result)| result.is_ok()) || !received.is_empty() {
+                failures.push(format!(
+                    "{first} -> {second}: results={results:?}; received={received:?}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "missing incarnation must fail closed:\n{}",
+            failures.join("\n")
+        );
+    }
 
     /// Every request aimed at agent `"1"` (or its viewer `"v1"`), called once
     /// on `client`; what each returned is kept, the daemon's record is the

@@ -70,6 +70,36 @@ describe("TauriDeckBridge", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
+  /** Scenario: Open a card listed before a same-build restart. A backend that checks the card incarnation refuses it with the gone sentence before sending terminal output or accepting keyboard input. */
+  it("opening a stale card preserves its incarnation and transfers no PTY bytes", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const listed = structuredClone(snapshot);
+    listed.agents[0].incarnation = "process-a";
+    const gone = "that agent is gone (the deck restarted)";
+    const output = vi.fn();
+    invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "desktop_bootstrap") return listed;
+      if (command === "desktop_terminal_attach") {
+        if (args?.incarnation === "process-a") throw new Error(gone);
+        (args?.onOutput as MockChannel<ArrayBuffer>).onmessage?.(new Uint8Array([66]).buffer);
+        return { sessionId: "successor-session", agentId: "agent-1", generation: 8, reused: false };
+      }
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+    const updates = vi.fn();
+    await bridge.subscribe(updates, output);
+    const [view] = await bridge.connect();
+    const card = view.agents[0];
+    const oldTarget = { deckId: card.daemonId!, agentId: card.id, incarnation: card.incarnation };
+    await bridge.setShownTerminals([oldTarget]).catch(() => undefined);
+    await bridge.sendTerminalInput(on("agent-1"), "old-card-input");
+    expect(output.mock.calls.filter(([event]) => event.stream === "output" && event.data.length > 0), "stale card must receive no successor PTY output").toEqual([]);
+    expect(invoke.mock.calls.filter(([command]) => command === "desktop_terminal_write"), "stale card must send no PTY input").toEqual([]);
+    expect(JSON.stringify(output.mock.calls)).toContain(gone);
+    await bridge.dispose();
+  });
+
   it("maps nullable daemon metadata honestly and uses session IDs for terminal RPCs", async () => {
     const { TauriDeckBridge, mapDesktopSnapshot } = await import("./bridge");
     const incompatible = structuredClone(snapshot);

@@ -55,6 +55,8 @@
 mod common;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
+#[path = "support/reconnect.rs"]
+mod reconnect;
 
 use std::time::Duration;
 
@@ -480,7 +482,7 @@ fn handshake_010_protocol_skew_with_matching_build_restarts_silently() {
     );
 }
 
-/// Scenario: Replace the daemon under an open TUI at the same socket. A compatible replacement must display a terminal-only sentinel; an incompatible replacement must admit zero terminal/event streams throughout the attempt and show a persistent refusal associating the daemon and client versions.
+/// Scenario: Drop the TUI's transports while its original daemon and agent keep running, then type into the reconnected pane and see its reply. Separately replace the daemon with an incompatible one: it must admit zero terminal/event streams throughout the attempt and show a persistent refusal associating the daemon and client versions; a same-protocol replacement is deliberately not a continuity control.
 #[spec("lifecycle/handshake/011")]
 #[test]
 fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
@@ -491,10 +493,17 @@ fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
         let mut original = spawn_daemon_at_build_and_protocol(NEW_BUILD, own);
         let old = pane(&original, "before-replacement");
         status(&original, &old, "idle", "claude_code");
+        let proxy = reconnect::AttachProxy::new(&original.attach_socket);
         let deck = TuiDeck::builder()
             .with_env(
                 "DOT_AGENT_DECK_ATTACH_SOCKET",
-                original.attach_socket.to_string_lossy().to_string(),
+                if protocol == own {
+                    &proxy.socket
+                } else {
+                    &original.attach_socket
+                }
+                .to_string_lossy()
+                .to_string(),
             )
             .with_env(
                 "DOT_AGENT_DECK_SOCKET",
@@ -504,6 +513,30 @@ fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
             .with_env("RUST_LOG", "dot_agent_deck=debug")
             .launch_with_fixture("minimal");
         deck.wait_for_string("before-replacement");
+
+        if protocol == own {
+            let previous = proxy.attach_count();
+            assert!(previous > 0, "control: original terminal attached");
+            proxy.disconnect();
+            assert!(
+                common::wait_until(Duration::from_secs(10), || proxy.attach_count() > previous),
+                "same-incarnation terminal must reattach after transient disconnect"
+            );
+            deck.send_keys(b"\r");
+            deck.wait_for_string("[Command Mode Ctrl+D]");
+            deck.send_keys(b"SAME-INCARNATION-RECONNECTED-9f71\r");
+            deck.wait_for_string("SUBMITTED:SAME-INCARNATION-RECONNECTED-9f71");
+            assert!(
+                original.is_alive_public(),
+                "control: original daemon survives"
+            );
+            assert!(
+                std::fs::read_to_string(&old.capture)
+                    .unwrap()
+                    .contains("SAME-INCARNATION-RECONNECTED-9f71")
+            );
+            continue;
+        }
 
         let reply = original
             .send_attach_request(&AttachRequest::StopDaemon { force: true })
@@ -553,10 +586,6 @@ fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
             }),
         );
         status(&replacement, &new, "idle", "claude_code");
-        if protocol == own {
-            deck.wait_for_string(&sentinel);
-            continue;
-        }
         let observations = replacement.home.join("reconnect-observations/observations");
         let admission_count = || {
             std::fs::read_to_string(&observations)
@@ -672,6 +701,142 @@ fn handshake_013_ctrl_w_after_a_same_build_restart_preserves_the_successor() {
             Duration::from_secs(5),
         ),
         "control: a fresh card closes the successor agent"
+    );
+}
+
+/// Scenario: keep a terminal open while the daemon restarts as the same build and reuses both the agent id and pane id. Input typed during the disconnect must not migrate, the successor's terminal output must never appear in the old pane, and Ctrl+W must show the gone sentence while leaving the successor running.
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_auto_reattach_never_adopts_a_same_pane_successor() {
+    use inbox::*;
+    let mut original = spawn_daemon_at_build(NEW_BUILD);
+    let old = pane_with(
+        &original,
+        "reused-pane",
+        serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "ORIGINAL-PTY-1666"]]}),
+    );
+    let old_id = old.agent.clone();
+    let deck = launch_tui_against(&original, NEW_BUILD);
+    deck.wait_for_string("ORIGINAL-PTY-1666");
+    deck.send_keys(b"\r");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    assert!(
+        original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .unwrap()
+            .ok
+    );
+    assert!(original.wait_for_exit(Duration::from_secs(10)));
+    drop(old);
+    // These keystrokes belong to the old pane, before any successor exists.
+    deck.send_keys(b"QUEUED-FOR-ORIGINAL-1666\r");
+    let successor = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    let new = pane_with(
+        &successor,
+        "reused-pane",
+        serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "SUCCESSOR-PTY-1666"]]}),
+    );
+    assert_eq!(
+        new.agent, old_id,
+        "precondition: agent and pane ids are reused"
+    );
+    let gone = dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART;
+    let observed = deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| {
+        grid.contains(gone) || grid.contains("SUCCESSOR-PTY-1666")
+    });
+    let grid = deck.snapshot_grid();
+    let bytes = std::fs::read(&new.capture).unwrap_or_default();
+    assert!(
+        observed && grid.contains(gone) && !grid.contains("SUCCESSOR-PTY-1666") && bytes.is_empty(),
+        "old pane adopted the replacement or migrated buffered input; successor_input={bytes:?}; grid=\n{grid}"
+    );
+    deck.send_keys(b"\x04\x17");
+    deck.wait_for_string("Close selected agent?");
+    deck.send_keys(b"\x1b[B\r");
+    deck.wait_for_string(gone);
+    assert!(
+        wait_for_agent_display_name(
+            &successor.attach_socket,
+            "reused-pane",
+            true,
+            Duration::from_secs(5)
+        ),
+        "later close must leave the successor alive"
+    );
+}
+
+/// Scenario: rename an attached agent successfully, then restart its daemon as the same build and try another rename on its stale card. The refusal must be visible in the TUI as the shared gone sentence, and the successor's name must stay unchanged.
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_a_stale_rename_shows_the_gone_sentence() {
+    use inbox::*;
+    let mut original = spawn_daemon_at_build(NEW_BUILD);
+    let old = pane(&original, "rename-original");
+    let deck = launch_tui_against(&original, NEW_BUILD);
+    deck.wait_for_string("rename-original");
+    deck.send_keys(b"r");
+    deck.wait_for_string("Rename:");
+    deck.send_keys(b"rename-control\r");
+    deck.wait_for_string("rename-control");
+    assert!(
+        wait_for_agent_display_name(
+            &original.attach_socket,
+            "rename-control",
+            true,
+            Duration::from_secs(5)
+        ),
+        "same-incarnation rename control"
+    );
+    assert!(
+        original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .unwrap()
+            .ok
+    );
+    assert!(original.wait_for_exit(Duration::from_secs(10)));
+    drop(old);
+    let successor = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    let _new = pane(&successor, "rename-successor");
+    deck.send_keys(b"r");
+    deck.wait_for_string("Rename:");
+    deck.send_keys(b"stale-rename\r");
+    deck.wait_for_string(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART);
+    assert!(
+        wait_for_agent_display_name(
+            &successor.attach_socket,
+            "rename-successor",
+            true,
+            Duration::from_secs(5)
+        ),
+        "stale rename must not relabel successor"
     );
 }
 

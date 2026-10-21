@@ -6678,6 +6678,79 @@ mod incarnation_binding_tests {
 
     const ACTIONS: [&str; 4] = ["set-agent-label", "post-message", "resize", "stop-agent"];
 
+    /// Scenario: an agent card is known to the TUI but its terminal is detached, then the same-build daemon restarts and reuses its pane id. Ctrl+W must close only the stale card, display the gone sentence, and send the successor neither a listing nor a stop; a detached card on the original incarnation still closes its agent.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_an_unattached_stale_card_stops_nothing() {
+        let runtime = runtime();
+        for restarted in [false, true] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller =
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate();
+            let hydrated = controller.hydrate_from_daemon();
+            assert_eq!(hydrated.len(), 1);
+            controller
+                .detach_pane("pane-1")
+                .expect("card without a local terminal");
+            assert!(controller.pane_ids().is_empty());
+            if restarted {
+                daemon.restart_as("b");
+            }
+            let result = controller.close_pane("pane-1");
+            assert!(result.is_ok(), "closing the card completes: {result:?}");
+            if restarted {
+                assert_eq!(
+                    daemon.received_by("b"),
+                    Vec::<String>::new(),
+                    "stale unattached card must not resolve or stop the successor"
+                );
+                assert_eq!(
+                    controller.take_close_warnings(),
+                    vec![crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string()]
+                );
+            } else {
+                assert!(
+                    daemon.received_by("a").contains(&"stop-agent".to_string()),
+                    "control: current detached card stops its agent"
+                );
+            }
+        }
+    }
+
+    /// Scenario: hydrate a card, detach its terminal, and restart the daemon with an unrelated agent under the same pane id. Focusing that stale card must not hydrate the successor or send it a terminal attach; the same operation without a restart succeeds.
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_hydrating_a_stale_card_never_adopts_the_successor() {
+        let runtime = runtime();
+        for restarted in [false, true] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller =
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate();
+            assert_eq!(controller.hydrate_from_daemon().len(), 1);
+            controller.detach_pane("pane-1").unwrap();
+            if restarted {
+                daemon.restart_as("b");
+            }
+            let hydrated = controller.hydrate_pane("pane-1");
+            if restarted {
+                assert!(
+                    !hydrated,
+                    "stale card hydrated the replacement's same-pane agent; received={:?}",
+                    daemon.received_by("b")
+                );
+                assert!(
+                    !daemon
+                        .received_by("b")
+                        .contains(&"attach-stream".to_string())
+                );
+            } else {
+                assert!(hydrated, "control: same-incarnation card hydrates");
+            }
+        }
+    }
+
     /// Rename, message, resize and close the pane, in that order.
     fn act_on(controller: &EmbeddedPaneController, pane: &str) -> Result<(), PaneError> {
         let _ = controller.rename_pane(pane, "renamed");

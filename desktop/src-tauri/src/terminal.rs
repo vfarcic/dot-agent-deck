@@ -3745,6 +3745,87 @@ mod tests {
         assert_eq!(deck.registry.focused_client().as_deref(), Some(desktop));
     }
 
+    /// Scenario: a card is listed before a same-build restart, then Open is requested for its recycled agent id. No successor terminal may be established, no PTY output or keyboard input may cross, and the returned failure must say that the agent is gone; a card opened on its original incarnation still works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_013_opening_a_stale_card_transfers_no_pty_bytes() {
+        use crate::restart_binding_tests::RestartingDeck;
+        use dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART;
+        use dot_agent_deck::daemon_protocol::{KIND_STREAM_OUT, read_frame};
+        use std::time::Duration;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for restarted in [false, true] {
+            let deck = RestartingDeck::start("g5-open", "a");
+            deck.enable_terminal_probe();
+            let _local = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            let card = crate::daemon_bridge::snapshot_of(&deck.endpoint(), &state.daemon)
+                .await
+                .agents
+                .into_iter()
+                .find(|card| card.id == "1")
+                .unwrap();
+            assert_eq!(card.incarnation.as_deref(), Some("a"));
+            if restarted {
+                deck.restart_as("b");
+            }
+            // These are the existing terminal-open caller's arguments from the
+            // selected card; carrying card.incarnation is part of the repair.
+            let opened = establish(
+                &state,
+                Some(crate::dto::deck_wire_id(&deck.endpoint())),
+                card.id,
+                &fixture_channel(),
+                Some((24, 80)),
+            )
+            .await;
+            let mut received = Vec::new();
+            let failure = match opened {
+                Err(error) => Some(error),
+                Ok(mut opened) => {
+                    write(&state, &opened.result.session_id, b"OLD-CARD-INPUT")
+                        .await
+                        .expect("admitted terminal writer");
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        let process = if restarted { "b" } else { "a" };
+                        while !deck
+                            .received_by(process)
+                            .iter()
+                            .any(|op| op == "pty-input:OLD-CARD-INPUT")
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("fixture observes the terminal keyboard delivery");
+                    if let Some(reader) = opened.stream.as_mut()
+                        && let Ok(Ok(Some((KIND_STREAM_OUT, bytes)))) =
+                            tokio::time::timeout(Duration::from_secs(5), read_frame(reader)).await
+                    {
+                        received = bytes;
+                    }
+                    detach(&state, &opened.result.session_id).await.unwrap();
+                    None
+                }
+            };
+            if restarted {
+                assert!(
+                    failure.as_deref() == Some(AGENT_GONE_AFTER_RESTART)
+                        && received.is_empty()
+                        && deck.received_by("b").is_empty(),
+                    "stale card opened successor terminal; failure={failure:?}; output={received:?}; successor_received={:?}",
+                    deck.received_by("b")
+                );
+            } else {
+                assert!(
+                    failure.is_none() && received == b"SUCCESSOR-PTY-1666",
+                    "control: current card terminal works"
+                );
+            }
+        }
+    }
+
     /// Scenario (PRD #1666 part 2, G-fix4): a terminal is open on agent `1`
     /// with viewer `v1`, and the deck restarts as the same build, whose own
     /// agent `1` has another client's viewer `v1`. The tile's next resize is
