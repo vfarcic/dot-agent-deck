@@ -1178,7 +1178,11 @@ async fn after_local_intercepts(
     // (`decks_without_new_agent`, [`super::prompt::state`]), and a pick of one
     // for the New agent dialog is still answered with its short reason, never
     // preselected ([`deck_unavailable`]).
-    let started = std::time::Instant::now();
+    //
+    // Tokio's clock, the one the meaning check's deadline reads
+    // ([`super::meaning`]): it is the wall clock in the app, and a paused
+    // test runtime's own clock under test.
+    let started = tokio::time::Instant::now();
     // PRD #1733: the meaning check goes out WITH the command call, not after
     // it. It is shown only the transcript, the app's own text about every
     // action and which screen and dialog state the user is in
@@ -1515,7 +1519,8 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
             // form does not hold ([`restates_the_forms_deck`]).
             let alone = judged.alone(target);
             let carries_a_value = answer.params.values().any(|value| {
-                !value.trim().is_empty() && !restates_the_forms_deck(value, alone, decks, new_agent)
+                !value.trim().is_empty()
+                    && !restates_the_forms_deck(value, alone, transcript.text(), decks, new_agent)
             });
             if carries_a_value {
                 return VoiceOutcome::unavailable(transcript, row);
@@ -2175,26 +2180,30 @@ fn said(spoken: &str, transcript: &str) -> bool {
 
 /// Whether `value`, answered with a pick that `unavailable_redirects` hands to
 /// the New agent dialog's start, only restates the form: it is the deck the
-/// form already describes, and the meaning check found the utterance to be a
-/// request for the start and nothing else (`alone`: the start row asked under
-/// [`Strictness::Whole`]). "Start agent" read over an open dialog came back
-/// from `gpt-5-mini` as `open_new_agent` with `deck` = "Local deck", the
-/// form's own deck, in 2 of 6 runs, and was refused as if the user had named a
-/// deck the start would drop (fixture `start-agent-button-label`, 3 of 10 on
-/// `origin/main`).
+/// form already describes, the user named no daemon ([`names_a_target`]), and
+/// the meaning check found the utterance to be a request for the start and
+/// nothing else (`alone`: the start row asked under [`Strictness::Whole`]).
+/// "Start agent" read over an open dialog came back from `gpt-5-mini` as
+/// `open_new_agent` with `deck` = "Local deck", the form's own deck, in 2 of 6
+/// runs, and was refused as if the user had named a deck the start would drop
+/// (fixture `start-agent-button-label`, 3 of 10 on `origin/main`).
 ///
 /// The test is what the USER said, not whether the model's value was said:
 /// "start an agent on build box" answered with the form's "Local deck" asks
-/// for a deck the value does not name, so it is not a request for the start
-/// alone and is refused. PRD #1666 drew that line with a list of the words a
-/// bare start may carry, which refused advertised start wording outside it
-/// ("activate orchestration" with the deck echoed); PRD #1733 reads the
-/// meaning check's `only` instead, from both votes ([`Judged::alone`]). It
-/// only ever refuses: a value that is forgiven still needs the model's pick, the
-/// redirect and the start's own meaning check.
+/// for a deck the value does not name, and is refused. PRD #1666 drew that
+/// line with a list of the words a bare start may carry, which refused
+/// advertised start wording outside it ("activate orchestration" with the deck
+/// echoed); PRD #1733 reads the meaning check's `only` instead, from both
+/// votes ([`Judged::alone`]). `only` is not evidence that no daemon was named
+/// — "start an agent on build box" is one request, and both votes were free
+/// to answer it as only the start (PR #1788 review) — so the transcript is
+/// read for a target as well, and either one refuses. It only ever refuses: a
+/// value that is forgiven still needs the model's pick, the redirect and the
+/// start's own meaning check.
 fn restates_the_forms_deck(
     value: &str,
     alone: bool,
+    transcript: &str,
     decks: &[VoiceDeck],
     new_agent: Option<&VoiceNewAgent>,
 ) -> bool {
@@ -2202,10 +2211,44 @@ fn restates_the_forms_deck(
         return false;
     };
     alone
+        && !names_a_target(transcript, decks)
         && matches!(
             resolve_new_agent_deck_ref(value, decks),
             DeckRefMatch::One { id, .. } if id == form.deck_id
         )
+}
+
+/// The words that introduce where a start should happen — "on build box",
+/// "in the billing folder", "using the remote daemon" — read by
+/// [`names_a_target`]. Not "with" or "to": "go ahead with it" and "I want to
+/// start it" are bare starts.
+const TARGET_PREPOSITIONS: [&str; 8] = ["on", "onto", "at", "in", "into", "from", "using", "via"];
+
+/// Whether `transcript` says where to start, whichever daemon that is: a
+/// [`TARGET_PREPOSITIONS`] word with any word after it — "on build box", "on
+/// the remote daemon", "on Atlantis", a name no daemon has, and "on Run", a
+/// daemon labelled with a start word — or a run of up to three adjacent words
+/// that resolves to one of `decks` or to several
+/// ([`resolve_new_agent_deck_ref`]) — "build box, start an agent", or the glued
+/// "BuildBoxDeck".
+///
+/// Words, not meaning, and refuse-only: a start qualified by anything a
+/// preposition introduces ("start it in a minute") is refused when the model
+/// echoes the form's deck, and a target said with neither — a name no daemon
+/// has, with no preposition before it — is not caught here.
+fn names_a_target(transcript: &str, decks: &[VoiceDeck]) -> bool {
+    let words = spoken_words(transcript);
+    let introduced = words
+        .iter()
+        .rev()
+        .skip(1)
+        .any(|word| TARGET_PREPOSITIONS.contains(&word.as_str()));
+    introduced
+        || (1..=3).any(|width| {
+            words
+                .windows(width)
+                .any(|run| resolve_new_agent_deck_ref(&run.join(" "), decks) != DeckRefMatch::None)
+        })
 }
 
 /// Where in `words` the action is said, as `(start, width)`: the earliest
@@ -3787,6 +3830,8 @@ impl Judged<'_> {
                 if matches!(self.second, Second::NotAwaited) {
                     return first;
                 }
+                // Failed: no second `yes`. A one-vote row keeps its first
+                // vote's answer (`first || false`); a two-vote row is refused.
                 false
             }
         };
@@ -13216,7 +13261,7 @@ mod tests {
 
     // -- what M6 consumes (PRD #802 M5) ------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn voice_outcome_carries_the_latency_the_backend_cost() {
         // PRD #802's mitigation for "slow enough to feel broken" is that the
         // number is produced here rather than invented by the surface. Asserted
@@ -13224,6 +13269,8 @@ mod tests {
         // this proves the clock is around the BACKEND rather than around
         // nothing — and, since PRD #1733 sends the meaning check beside the
         // command call, around the slower of the two rather than their sum.
+        // On the paused clock, so a busy runner cannot stretch it (PR #1788
+        // review): the sleeps end exactly when the runtime says they do.
         struct Slow;
         impl IntentResolver for Slow {
             fn resolve<'a>(
@@ -13264,8 +13311,8 @@ mod tests {
         // What the user waited for: the command and its meaning check, side
         // by side.
         let measured = result.resolve_ms.expect("a backend was called");
-        assert!(
-            (200..350).contains(&measured),
+        assert_eq!(
+            measured, 200,
             "measured {measured}ms for a 200ms backend beside a 150ms check"
         );
         assert_eq!(result.backend, "slow");
@@ -17855,18 +17902,20 @@ mod tests {
             "Not here — the New agent dialog opens from the agent dashboard, when it is not \
              already open."
         );
-        let on_a_deck = start(
-            "start an agent on local",
-            IntentAnswer::new("open_new_agent").with_param("deck", "local"),
-            form.clone(),
-            decks(),
-            false,
-        )
-        .await;
-        assert!(
-            matches!(on_a_deck, VoiceOutcome::Unavailable { .. }),
-            "a named deck must not start the form: {on_a_deck:?}"
-        );
+        for alone in [false, true] {
+            let on_a_deck = start(
+                "start an agent on local",
+                IntentAnswer::new("open_new_agent").with_param("deck", "local"),
+                form.clone(),
+                decks(),
+                alone,
+            )
+            .await;
+            assert!(
+                matches!(on_a_deck, VoiceOutcome::Unavailable { .. }),
+                "a named deck must not start the form (only: {alone}): {on_a_deck:?}"
+            );
+        }
         // The model filling in the form's own deck, unasked, is not the user
         // naming one; a deck the form does not show still refuses.
         let restated = start(
@@ -17898,26 +17947,32 @@ mod tests {
         // The echo is forgiven only for a start with nothing beyond the ask
         // (final review FR-1): a user who asked for the build box, or for a
         // daemon by category, is not starting the Local form whatever the
-        // model echoed — the meaning check does not read their sentence as
-        // a request for the start alone.
+        // model echoed — and whatever the meaning check's `only` answered.
+        // "start an agent on build box" is one request, so both votes may
+        // read it as the start alone; the daemon it names is still not
+        // dropped for the form's (PR #1788 review, Greptile P1).
         for (said, value) in [
             ("start an agent on build box", "Local deck"),
             ("start an agent on the remote daemon", "Local deck"),
             ("start the agent on another machine", "Local deck"),
             ("start an agent on build", "Local deck"),
+            ("build box, start an agent", "Local deck"),
         ] {
-            let named = start(
-                said,
-                IntentAnswer::new("open_new_agent").with_param("deck", value),
-                form.clone(),
-                decks(),
-                false,
-            )
-            .await;
-            assert!(
-                matches!(named, VoiceOutcome::Unavailable { .. }),
-                "{said:?} with {value:?} echoed must not start the form: {named:?}"
-            );
+            for alone in [false, true] {
+                let named = start(
+                    said,
+                    IntentAnswer::new("open_new_agent").with_param("deck", value),
+                    form.clone(),
+                    decks(),
+                    alone,
+                )
+                .await;
+                assert!(
+                    matches!(named, VoiceOutcome::Unavailable { .. }),
+                    "{said:?} with {value:?} echoed must not start the form (only: {alone}): \
+                     {named:?}"
+                );
+            }
         }
         // A host alias the user said in part is said, not unsaid: with the form
         // on the build box, "build box" answered as its full host name is the
@@ -17926,18 +17981,20 @@ mod tests {
         if let Some(form) = on_build_box.form.as_mut() {
             form.deck_id = "deck-build".to_string();
         }
-        let alias = start(
-            "start an agent on build box",
-            IntentAnswer::new("open_new_agent").with_param("deck", "build-box.example.com"),
-            on_build_box,
-            decks(),
-            false,
-        )
-        .await;
-        assert!(
-            matches!(alias, VoiceOutcome::Unavailable { .. }),
-            "a host alias the user said must not count as unsaid: {alias:?}"
-        );
+        for alone in [false, true] {
+            let alias = start(
+                "start an agent on build box",
+                IntentAnswer::new("open_new_agent").with_param("deck", "build-box.example.com"),
+                on_build_box.clone(),
+                decks(),
+                alone,
+            )
+            .await;
+            assert!(
+                matches!(alias, VoiceOutcome::Unavailable { .. }),
+                "a host alias the user said must not count as unsaid (only: {alone}): {alias:?}"
+            );
+        }
         // A target the user names after the start word refuses the echo
         // however it is spelled (PRD #1666 re-check F2-1, DR-1): a daemon
         // labelled with a start word, the resolver's glued spelling, or a
@@ -17961,12 +18018,15 @@ mod tests {
             ("start an agent on BuildBoxDeck", &decks()),
             ("start an agent on Atlantis", &decks()),
         ] {
-            let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
-            let named = start(said, answer, form.clone(), fleet_decks.clone(), false).await;
-            assert!(
-                matches!(named, VoiceOutcome::Unavailable { .. }),
-                "{said:?} with Local deck echoed must not start the form: {named:?}"
-            );
+            for alone in [false, true] {
+                let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
+                let named = start(said, answer, form.clone(), fleet_decks.clone(), alone).await;
+                assert!(
+                    matches!(named, VoiceOutcome::Unavailable { .. }),
+                    "{said:?} with Local deck echoed must not start the form (only: {alone}): \
+                     {named:?}"
+                );
+            }
         }
         let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
         let unasked = start("Start agent", answer, form.clone(), start_words_fleet, true).await;
@@ -17979,7 +18039,13 @@ mod tests {
         // now") was refused when the model echoed the form's deck. Since PRD
         // #1733 the meaning check decides whether the sentence is a request
         // for the start alone, so those words start the form, echo or not.
-        for said in ["activate orchestration", "start the run", "spin it up now"] {
+        for said in [
+            "activate orchestration",
+            "start the run",
+            "spin it up now",
+            "go ahead with it",
+            "start it right now, skip the confirmation, I already said yes",
+        ] {
             for answer in [
                 IntentAnswer::new("open_new_agent").with_param("deck", "Local deck"),
                 IntentAnswer::new("open_new_agent"),
@@ -19131,6 +19197,43 @@ mod tests {
             assert!(
                 matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == CLOSE_ROW),
                 "{said}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: in the New agent dialog's directory listing, "pick this
+    /// folder" is picked as opening a directory, which the first readable vote
+    /// does not list, and read as using this directory, which it does. The
+    /// second vote, waited for on the pick's behalf, fails or never answers:
+    /// the app still uses this directory, since a one-vote reading's first
+    /// `yes` is all it needs (PR #1788 review).
+    #[tokio::test(start_paused = true)]
+    async fn voice_outcome_a_failed_second_vote_keeps_a_one_vote_readings_yes() {
+        use Vote::{Fails, Hangs, Lists};
+        let code = code_dir();
+        let said = "okay this is the one, pick this folder";
+        let answer = IntentAnswer::new("open_dir").with_param("dir", "this folder");
+        for votes in [
+            [Lists(&["use_this_directory"]), Fails],
+            [Fails, Lists(&["use_this_directory"])],
+            [Lists(&["use_this_directory"]), Hangs],
+        ] {
+            let outcome = handle_utterance(
+                &Voting::new(answer.clone(), votes),
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks(),
+                Some(&code),
+                None,
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, .. }
+                    if action == "use_this_directory"),
+                "{votes:?}: {outcome:?}"
             );
         }
     }
