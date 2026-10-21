@@ -770,6 +770,16 @@ export interface AgentPullRequest {
   url?: string;
   state: import("./lib/bridge").PullRequestState;
   review?: import("./lib/bridge").PullRequestReview;
+  /** Issue #1781 — the PR's CI result and how many checks are in each bucket. */
+  checks?: AgentPullRequestChecks;
+}
+
+export interface AgentPullRequestChecks {
+  state: import("./lib/bridge").PullRequestChecksState;
+  passing: number;
+  failing: number;
+  pending: number;
+  skipped: number;
 }
 
 export interface AgentSession {

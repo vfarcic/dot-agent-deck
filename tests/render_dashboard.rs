@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
 use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::pane::RenameOutcome;
-use dot_agent_deck::pull_request_info::{PullRequestInfo, PullRequestReview, PullRequestState};
+use dot_agent_deck::pull_request_info::{
+    PullRequestChecks, PullRequestChecksState, PullRequestInfo, PullRequestReview, PullRequestState,
+};
 use dot_agent_deck::state::{
     ActiveTool, AppState, BlockedKind, BlockedReason, DashboardStats, SessionSnapshot,
     SessionState, SessionStatus,
@@ -75,6 +77,7 @@ fn pane_016_pull_request_badge_at_roomy_and_narrow_widths() {
         url: "https://github.com/test-org/test-repo/pull/1234".into(),
         state: PullRequestState::Open,
         review: Some(PullRequestReview::ReviewRequired),
+        checks: None,
     });
     for width in [80, 30] {
         let rendered = buffer_to_text(&render_card_to_buffer(
@@ -89,20 +92,20 @@ fn pane_016_pull_request_badge_at_roomy_and_narrow_widths() {
             CardDensityKind::Normal.rendered_height(),
         ));
         assert!(
-            rendered.contains("#1234 ⊙ ◐"),
+            rendered.contains("#1234 ⊙ ◉"),
             "card must show its PR number, state and review at width {width}:\n{rendered}"
         );
         insta::assert_snapshot!(format!("pull_request_badge_width_{width}"), rendered);
     }
     let mut boundaries = String::new();
     for (width, badge, stats) in [
-        (22, "#1234 ⊙ ◐", true),
+        (22, "#1234 ⊙ ◉", true),
         (21, "#1234 ⊙", true),
         (20, "#1234 ⊙", true),
         (19, "#1234", true),
         (18, "#1234", true),
-        (17, "#1234 ⊙ ◐", false),
-        (13, "#1234 ⊙ ◐", false),
+        (17, "#1234 ⊙ ◉", false),
+        (13, "#1234 ⊙ ◉", false),
         (12, "#1234 ⊙", false),
         (11, "#1234 ⊙", false),
         (10, "#1234", false),
@@ -132,8 +135,8 @@ fn pane_016_pull_request_badge_at_roomy_and_narrow_widths() {
             "width {width}: {border}"
         );
         assert_eq!(
-            border.contains('◐'),
-            badge.contains('◐'),
+            border.contains('◉'),
+            badge.contains('◉'),
             "width {width}: {border}"
         );
         assert_eq!(border.contains("1h"), stats, "width {width}: {border}");
@@ -152,8 +155,8 @@ fn pane_016_pull_request_badge_at_roomy_and_narrow_widths() {
         for (review, review_glyph) in [
             (None, ""),
             (Some(PullRequestReview::Approved), " ✓"),
-            (Some(PullRequestReview::ChangesRequested), " ✗"),
-            (Some(PullRequestReview::ReviewRequired), " ◐"),
+            (Some(PullRequestReview::ChangesRequested), " ±"),
+            (Some(PullRequestReview::ReviewRequired), " ◉"),
             (Some(PullRequestReview::Unknown), " ?"),
         ] {
             let pr = session.pull_request.as_mut().unwrap();
@@ -177,6 +180,124 @@ fn pane_016_pull_request_badge_at_roomy_and_narrow_widths() {
         }
     }
     insta::assert_snapshot!("pull_request_badge_states_and_reviews", values);
+}
+
+/// Scenario: Render a card whose pull request has CI checks and a review, for
+/// every CI result, and then at the widths where each glyph stops fitting. The
+/// CI mark sits between the state and the review, and the review alone is a
+/// filled cell, so a passing CI and an approval never look alike.
+#[spec("dashboard/pane/017")]
+#[test]
+fn pane_017_pull_request_badge_shows_ci_beside_the_review() {
+    let mut session = card_stats_session("/home/dev/api-svc");
+    let checks = |state| PullRequestChecks {
+        state,
+        passing: 24,
+        failing: 1,
+        pending: 0,
+        skipped: 0,
+    };
+    session.pull_request = Some(PullRequestInfo {
+        number: 1234,
+        url: "https://github.com/test-org/test-repo/pull/1234".into(),
+        state: PullRequestState::Open,
+        review: Some(PullRequestReview::Approved),
+        checks: Some(checks(PullRequestChecksState::Passing)),
+    });
+    let render = |session: &SessionState, width: u16| {
+        render_card_to_buffer(
+            session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            true,
+            width,
+            CardDensityKind::Normal.rendered_height(),
+        )
+    };
+
+    let mut values = String::new();
+    for (state, glyph, colour) in [
+        (PullRequestChecksState::Passing, "✓", Color::Green),
+        (PullRequestChecksState::Failing, "✗", Color::Red),
+        (PullRequestChecksState::Pending, "●", Color::Yellow),
+        (PullRequestChecksState::Unknown, "?", Color::DarkGray),
+    ] {
+        session.pull_request.as_mut().unwrap().checks = Some(checks(state));
+        let buffer = render(&session, 80);
+        let rendered = buffer_to_text(&buffer);
+        let border = rendered.lines().last().unwrap();
+        assert!(
+            border.contains(&format!(" #1234 ⊙ {glyph} ✓ ")),
+            "{state:?}: {border}"
+        );
+        // `┗ #1234 ⊙ ` puts the CI mark at column 10 and the review at 12.
+        let y = buffer.area().height - 1;
+        let ci = &buffer[(10, y)];
+        let review = &buffer[(12, y)];
+        assert_eq!((ci.symbol(), ci.fg), (glyph, colour), "{state:?}");
+        assert!(
+            !ci.modifier.contains(Modifier::REVERSED),
+            "{state:?}: the CI mark is a bare glyph"
+        );
+        assert_eq!((review.symbol(), review.fg), ("✓", Color::Green));
+        assert!(
+            review.modifier.contains(Modifier::REVERSED),
+            "{state:?}: the review is a filled cell"
+        );
+        values.push_str(&format!("{state:?}\n{border}\n"));
+    }
+    insta::assert_snapshot!("pull_request_badge_ci_states", values);
+
+    // A PR with checks but no review decision shows the CI mark alone.
+    session.pull_request.as_mut().unwrap().review = None;
+    session.pull_request.as_mut().unwrap().checks = Some(checks(PullRequestChecksState::Failing));
+    let border = buffer_to_text(&render(&session, 80));
+    assert!(
+        border.lines().last().unwrap().contains(" #1234 ⊙ ✗ ━"),
+        "{border}"
+    );
+
+    // Narrowing drops the review, then the CI mark, then the state.
+    session.pull_request.as_mut().unwrap().review = Some(PullRequestReview::ReviewRequired);
+    session.pull_request.as_mut().unwrap().checks = Some(checks(PullRequestChecksState::Pending));
+    let mut boundaries = String::new();
+    for (width, badge, stats) in [
+        (24, "#1234 ⊙ ● ◉", true),
+        (23, "#1234 ⊙ ●", true),
+        (22, "#1234 ⊙ ●", true),
+        (21, "#1234 ⊙", true),
+        (19, "#1234", true),
+        (15, "#1234 ⊙ ● ◉", false),
+        (14, "#1234 ⊙ ●", false),
+        (12, "#1234 ⊙", false),
+        (10, "#1234", false),
+        (8, "", false),
+    ] {
+        let rendered = buffer_to_text(&render(&session, width));
+        let border = rendered.lines().last().unwrap();
+        let shown = border
+            .trim_matches(|c| "┗┛━ ".contains(c))
+            .split("  ")
+            .next()
+            .unwrap_or("");
+        let shown = shown.split(" ━").next().unwrap_or("").trim();
+        if badge.is_empty() {
+            assert!(!border.contains("#1234"), "width {width}: {border}");
+        } else {
+            assert!(shown.starts_with(badge), "width {width}: {border}");
+            assert_eq!(
+                shown.chars().count(),
+                badge.chars().count(),
+                "width {width}: {border}"
+            );
+        }
+        assert_eq!(border.contains("1h"), stats, "width {width}: {border}");
+        boundaries.push_str(&format!("width {width}\n{rendered}\n"));
+    }
+    insta::assert_snapshot!("pull_request_badge_ci_boundaries", boundaries);
 }
 
 /// Scenario: Hydrate Idle cards with background commands and subagents, then render wide and narrow cards at a fixed clock. The visible line uses the shared singular/plural and elapsed vocabulary, omits zero kinds and invalid durations, and disappears without background work.

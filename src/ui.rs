@@ -6493,23 +6493,41 @@ fn pull_request_state_glyph(
     }
 }
 
-/// PRD #1401: the glyph a card's pull request badge shows for `review`, and
-/// its colour.
+/// PRD #1401 / issue #1781: the glyph a card's pull request badge shows for
+/// `review`, and its colour — GitHub's (green approved, red changes requested,
+/// amber review required), with its file-diff and eye icons drawn as `±` and
+/// `◉`. The badge draws it as a filled cell so it never reads as the CI mark
+/// beside it, which is a check mark too when the checks pass.
 fn pull_request_review_glyph(
     review: crate::pull_request_info::PullRequestReview,
 ) -> (&'static str, Color) {
     use crate::pull_request_info::PullRequestReview;
     match review {
         PullRequestReview::Approved => ("✓", palette::STATUS_WORKING),
-        PullRequestReview::ChangesRequested => ("✗", palette::STATUS_ERROR),
-        PullRequestReview::ReviewRequired => ("◐", palette::STATUS_THINKING),
+        PullRequestReview::ChangesRequested => ("±", palette::STATUS_ERROR),
+        PullRequestReview::ReviewRequired => ("◉", palette::PR_ATTENTION),
         PullRequestReview::Unknown => ("?", palette::STATUS_IDLE),
     }
 }
 
+/// Issue #1781: the glyph a card's pull request badge shows for its overall CI
+/// result, and its colour — GitHub's green check, red cross and amber dot.
+fn pull_request_checks_glyph(
+    checks: crate::pull_request_info::PullRequestChecksState,
+) -> (&'static str, Color) {
+    use crate::pull_request_info::PullRequestChecksState;
+    match checks {
+        PullRequestChecksState::Passing => ("✓", palette::STATUS_WORKING),
+        PullRequestChecksState::Failing => ("✗", palette::STATUS_ERROR),
+        PullRequestChecksState::Pending => ("●", palette::PR_ATTENTION),
+        PullRequestChecksState::Unknown => ("?", palette::STATUS_IDLE),
+    }
+}
+
 /// PRD #1401: a card's pull request badge in its forms, widest first —
-/// `#<n>` with the state and review glyphs, then without the review glyph,
-/// then the number alone. A PR with no review decision has no first form.
+/// `#<n>` with the state, CI and review glyphs (issue #1781), then dropping
+/// the last glyph one at a time down to the number alone. A PR without a CI
+/// result or a review decision has no glyph, and no form, for it.
 fn pull_request_badge_forms(
     pr: &crate::pull_request_info::PullRequestInfo,
 ) -> Vec<Vec<Span<'static>>> {
@@ -6518,29 +6536,29 @@ fn pull_request_badge_forms(
         text_primary().add_modifier(Modifier::BOLD),
     );
     let (state_glyph, state_color) = pull_request_state_glyph(pr.state);
-    let state = Span::styled(state_glyph, Style::default().fg(state_color));
-    let mut forms = Vec::new();
-    if let Some(review) = pr.review {
-        let (review_glyph, review_color) = pull_request_review_glyph(review);
-        forms.push(vec![
-            Span::raw(" "),
-            number.clone(),
-            Span::raw(" "),
-            state.clone(),
-            Span::raw(" "),
-            Span::styled(review_glyph, Style::default().fg(review_color)),
-            Span::raw(" "),
-        ]);
+    let mut glyphs = vec![Span::styled(state_glyph, Style::default().fg(state_color))];
+    if let Some(checks) = pr.checks {
+        let (glyph, color) = pull_request_checks_glyph(checks.state);
+        glyphs.push(Span::styled(glyph, Style::default().fg(color)));
     }
-    forms.push(vec![
-        Span::raw(" "),
-        number.clone(),
-        Span::raw(" "),
-        state,
-        Span::raw(" "),
-    ]);
-    forms.push(vec![Span::raw(" "), number, Span::raw(" ")]);
-    forms
+    if let Some(review) = pr.review {
+        let (glyph, color) = pull_request_review_glyph(review);
+        glyphs.push(Span::styled(
+            glyph,
+            Style::default().fg(color).add_modifier(Modifier::REVERSED),
+        ));
+    }
+    (0..=glyphs.len())
+        .rev()
+        .map(|shown| {
+            let mut form = vec![Span::raw(" "), number.clone(), Span::raw(" ")];
+            for glyph in &glyphs[..shown] {
+                form.push(glyph.clone());
+                form.push(Span::raw(" "));
+            }
+            form
+        })
+        .collect()
 }
 
 /// PRD #1401: the bottom border's two labels — the pull request badge on the

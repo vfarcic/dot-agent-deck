@@ -19,7 +19,9 @@
 //! (repository, branch), so sessions sharing a worktree share one call, and at
 //! most one `gh` runs per key at a time. An open or draft PR is re-read on a
 //! slow poll ([`DOT_AGENT_DECK_PR_REFRESH_SECS_ENV`]); a merged or closed one is
-//! not read again until the branch changes; a turn ending or an agent stopping
+//! not read again until the branch changes, unless its CI checks were still
+//! pending, which keep it on that poll until they finish or
+//! [`TERMINAL_PENDING_CHECKS_WINDOW`] has passed since it closed; a turn ending or an agent stopping
 //! asks for an early, debounced re-read ([`fetch_due`]).
 //!
 //! No `gh`, no login, no network, a non-GitHub `origin`, the default branch, a
@@ -88,13 +90,21 @@ use crate::untrusted_text::escape_control_and_bidi;
 // The wire types live in their own I/O-free module so the desktop crate can
 // name them without reaching this resolver. Re-exported so code that names
 // them through this module, as the e2e tests do, still resolves.
-pub use crate::pull_request_info::{PullRequestInfo, PullRequestReview, PullRequestState};
+pub use crate::pull_request_info::{
+    PullRequestChecks, PullRequestChecksState, PullRequestInfo, PullRequestReview, PullRequestState,
+};
 
 /// The `--json` fields the badge needs from `gh pr list`.
 /// `isCrossRepository` because `--head` matches a branch NAME, so a fork's
 /// pull request from a branch named like ours is listed too.
+///
+/// `statusCheckRollup` (issue #1781) is the heavy one: every check of the head
+/// commit, with its name, timestamps and URL. Measured against this
+/// repository's own open PR with 28 checks, it took the reply from 461 bytes
+/// to about 20 KB and the call from about 0.55–0.9 s to 0.87–1.4 s. The
+/// worktree reclaimer's lookup asks for its own, smaller list.
 pub(crate) const GH_PR_FIELDS: &str =
-    "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository";
+    "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository,statusCheckRollup";
 
 /// The arguments of `gh pr list` for `branch` of `repo_slug`, asking for
 /// `fields`. Shared with [`crate::worktree_reclaim`]'s PR lookup: `--state all`
@@ -120,6 +130,13 @@ pub const DEFAULT_REFRESH: Duration = Duration::from_secs(60);
 /// A failed lookup is retried this many intervals later, whatever happens in
 /// between.
 const FAILURE_BACKOFF_FACTOR: u32 = 5;
+
+/// How long a merged or closed PR is still re-read while its CI checks are
+/// pending (issue #1781). A check GitHub marked stale, or a commit status
+/// nobody ever reports, stays pending for good, so the re-reads stop after
+/// this and the badge keeps the last answer. Two hours outlasts this
+/// repository's own longest CI job (one hour) with room for a queue.
+const TERMINAL_PENDING_CHECKS_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// The longest gap a turn-end re-read waits for after the previous lookup.
 const MAX_KICK_DEBOUNCE: Duration = Duration::from_secs(10);
@@ -231,6 +248,135 @@ struct GhPr {
     /// The PR's branch lives in a fork. Absent (an older `gh`) reads as not.
     #[serde(default)]
     is_cross_repository: bool,
+    /// Every check of the head commit. Absent (an older `gh`) or null reads
+    /// as no checks.
+    #[serde(default)]
+    status_check_rollup: Option<Vec<GhCheck>>,
+}
+
+/// One entry of `statusCheckRollup`: a check run (`status` and, once it has
+/// finished, `conclusion`) or a commit status (`state`). The names and the
+/// start time only tell repeated runs of one check apart ([`latest_runs`]).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhCheck {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    /// A check run's name.
+    #[serde(default)]
+    name: Option<String>,
+    /// A commit status's name.
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    #[serde(default)]
+    started_at: Option<String>,
+}
+
+/// Where one check counts on the badge.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckBucket {
+    Passing,
+    Failing,
+    Pending,
+    Skipped,
+}
+
+impl GhCheck {
+    /// The bucket GitHub puts this check in, or `None` for a value this build
+    /// does not know, which is left out of the counts rather than guessed.
+    fn bucket(&self) -> Option<CheckBucket> {
+        let field = |value: &Option<String>| value.clone().filter(|v| !v.is_empty());
+        if let Some(state) = field(&self.state) {
+            return match state.as_str() {
+                "SUCCESS" => Some(CheckBucket::Passing),
+                "PENDING" | "EXPECTED" => Some(CheckBucket::Pending),
+                "FAILURE" | "ERROR" => Some(CheckBucket::Failing),
+                _ => None,
+            };
+        }
+        if field(&self.status).is_some_and(|status| status != "COMPLETED") {
+            return Some(CheckBucket::Pending);
+        }
+        match field(&self.conclusion)?.as_str() {
+            "SUCCESS" => Some(CheckBucket::Passing),
+            "NEUTRAL" | "SKIPPED" => Some(CheckBucket::Skipped),
+            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => {
+                Some(CheckBucket::Failing)
+            }
+            // A run GitHub marked stale never finished, so it is not a pass;
+            // `gh pr checks` lists it as pending too.
+            "STALE" => Some(CheckBucket::Pending),
+            _ => None,
+        }
+    }
+}
+
+/// What tells one check from another: its workflow, its name, and a commit
+/// status's context.
+type CheckKey<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>);
+
+/// The newest run of each check in `rollup`. The rollup lists every run of a
+/// check, so one that failed and then passed on a re-run appears twice; like
+/// `gh pr checks`, only the newest counts, one per workflow and check name (or
+/// per commit status context). A run with no start time is queued and so the
+/// newest; GitHub's timestamps are all UTC `…Z`, so they order as text.
+fn latest_runs(rollup: &[GhCheck]) -> Vec<&GhCheck> {
+    let mut latest: HashMap<CheckKey<'_>, &GhCheck> = HashMap::new();
+    for check in rollup {
+        let key = (
+            check.workflow_name.as_deref(),
+            check.name.as_deref(),
+            check.context.as_deref(),
+        );
+        // `None` sorts below `Some`, so flip it: no start time is newest.
+        let newness = |c: &GhCheck| (c.started_at.is_none(), c.started_at.clone());
+        match latest.get(&key) {
+            Some(kept) if newness(kept) >= newness(check) => {}
+            _ => {
+                latest.insert(key, check);
+            }
+        }
+    }
+    latest.into_values().collect()
+}
+
+/// Issue #1781: the badge's CI summary of `rollup`, or `None` when it holds no
+/// check this build can place. Failing wins over pending, and pending over
+/// passing, as GitHub's pull request list decides its one icon.
+fn summarize_checks(rollup: &[GhCheck]) -> Option<PullRequestChecks> {
+    let mut checks = PullRequestChecks {
+        state: PullRequestChecksState::Passing,
+        passing: 0,
+        failing: 0,
+        pending: 0,
+        skipped: 0,
+    };
+    for bucket in latest_runs(rollup).into_iter().filter_map(GhCheck::bucket) {
+        let count = match bucket {
+            CheckBucket::Passing => &mut checks.passing,
+            CheckBucket::Failing => &mut checks.failing,
+            CheckBucket::Pending => &mut checks.pending,
+            CheckBucket::Skipped => &mut checks.skipped,
+        };
+        *count = count.saturating_add(1);
+    }
+    if checks.passing + checks.failing + checks.pending + checks.skipped == 0 {
+        return None;
+    }
+    checks.state = if checks.failing > 0 {
+        PullRequestChecksState::Failing
+    } else if checks.pending > 0 {
+        PullRequestChecksState::Pending
+    } else {
+        PullRequestChecksState::Passing
+    };
+    Some(checks)
 }
 
 impl GhPr {
@@ -252,11 +398,13 @@ impl GhPr {
             Some("REVIEW_REQUIRED") => Some(PullRequestReview::ReviewRequired),
             _ => None,
         };
+        let checks = summarize_checks(self.status_check_rollup.as_deref().unwrap_or_default());
         Some(PullRequestInfo {
             number: self.number,
             url: self.url,
             state,
             review,
+            checks,
         })
     }
 }
@@ -322,13 +470,46 @@ pub(crate) struct KeyEntry {
     pub kicked: bool,
     /// The current run of failures has been logged.
     pub failure_logged: bool,
+    /// When a lookup first answered with this key's PR merged or closed —
+    /// that PR, by number; `None` while it is open, or there is none.
+    pub terminal_since: Option<Instant>,
+}
+
+impl KeyEntry {
+    /// Store a successful lookup's `value`, answered at `now`.
+    pub(crate) fn record(&mut self, value: Option<PullRequestInfo>, now: Instant) {
+        let terminal = value.as_ref().is_some_and(|pr| {
+            matches!(
+                pr.state,
+                PullRequestState::Merged | PullRequestState::Closed
+            )
+        });
+        // The clock belongs to one PR: a different one, as when a branch's
+        // closed PR is replaced by another, starts it again.
+        let same_pr = matches!(
+            (&self.value, &value),
+            (Some(Some(old)), Some(new)) if old.number == new.number
+        );
+        self.terminal_since = match (terminal, self.terminal_since) {
+            (false, _) => None,
+            (true, Some(since)) if same_pr => Some(since),
+            (true, _) => Some(now),
+        };
+        self.value = Some(value);
+        self.failed = false;
+        self.failure_logged = false;
+    }
 }
 
 /// Whether `entry` needs a lookup at `now`. The refresh policy, pure:
 ///
 /// * never two at once, and a key never looked up is due at once;
 /// * after a failure, only once [`FAILURE_BACKOFF_FACTOR`] intervals passed;
-/// * a merged or closed PR, never (a new branch is a new key);
+/// * a merged or closed PR, never (a new branch is a new key) — unless its
+///   CI checks are still pending, which are then re-read as an open PR's
+///   are for [`TERMINAL_PENDING_CHECKS_WINDOW`] after it closed, so the badge
+///   does not keep a pending mark for good, nor poll for good on a check that
+///   never finishes (issue #1781);
 /// * an open or draft PR, every `interval`, or after a turn end once the
 ///   debounce passed;
 /// * no PR, every `interval` too — a PR the user opens while the agent is
@@ -352,7 +533,12 @@ pub(crate) fn fetch_due(entry: &KeyEntry, now: Instant, interval: Duration) -> b
             if matches!(
                 pr.state,
                 PullRequestState::Merged | PullRequestState::Closed
-            ) =>
+            ) && !(pr
+                .checks
+                .is_some_and(|checks| checks.state == PullRequestChecksState::Pending)
+                && entry.terminal_since.is_some_and(|since| {
+                    now.saturating_duration_since(since) < TERMINAL_PENDING_CHECKS_WINDOW
+                })) =>
         {
             false
         }
@@ -601,11 +787,7 @@ pub async fn run_pull_request_monitor(
                 entry.in_flight = false;
                 entry.fetched_at = Some(Instant::now());
                 match result {
-                    Ok(value) => {
-                        entry.value = Some(value);
-                        entry.failed = false;
-                        entry.failure_logged = false;
-                    }
+                    Ok(value) => entry.record(value, Instant::now()),
                     Err(error) => {
                         entry.failed = true;
                         if !entry.failure_logged {
@@ -952,6 +1134,7 @@ mod tests {
             url: "https://github.com/o/r/pull/1".into(),
             state,
             review: None,
+            checks: None,
         }))
     }
 
@@ -965,6 +1148,85 @@ mod tests {
             ..KeyEntry::default()
         };
         assert!(!fetch_due(&in_flight, now, interval));
+    }
+
+    /// Issue #1781 (PR #1783 review): a PR merged or closed while its checks
+    /// still run keeps being re-read until they finish, then stops, so its
+    /// CI mark does not stay pending for good.
+    #[test]
+    fn a_merged_or_closed_pr_with_pending_checks_is_polled_until_they_finish() {
+        let at = Instant::now();
+        let interval = Duration::from_secs(60);
+        let with_checks = |state, checks_state| {
+            let mut value = pr_in(state);
+            value.as_mut().unwrap().as_mut().unwrap().checks = Some(PullRequestChecks {
+                state: checks_state,
+                passing: 1,
+                failing: 0,
+                pending: 1,
+                skipped: 0,
+            });
+            let mut entry = KeyEntry::default();
+            entry.record(value.unwrap(), at);
+            entry.fetched_at = Some(at);
+            entry
+        };
+        for state in [PullRequestState::Merged, PullRequestState::Closed] {
+            let pending = with_checks(state, PullRequestChecksState::Pending);
+            assert!(!fetch_due(&pending, at + Duration::from_secs(59), interval));
+            assert!(fetch_due(&pending, at + interval, interval), "{state:?}");
+            for finished in [
+                PullRequestChecksState::Passing,
+                PullRequestChecksState::Failing,
+            ] {
+                let done = with_checks(state, finished);
+                assert!(!fetch_due(&done, at + interval * 10, interval), "{state:?}");
+            }
+        }
+    }
+
+    /// Issue #1781 (PR #1783 review): a check that never finishes, such as a
+    /// stale run, stops the re-reads of a merged or closed PR once the window
+    /// passed, counted from when it first closed, not from the last re-read.
+    #[test]
+    fn a_closed_pr_whose_checks_never_finish_stops_being_polled() {
+        let at = Instant::now();
+        let interval = Duration::from_secs(60);
+        let pending = PullRequestChecks {
+            state: PullRequestChecksState::Pending,
+            passing: 0,
+            failing: 0,
+            pending: 1,
+            skipped: 0,
+        };
+        let mut closed = pr_in(PullRequestState::Closed).unwrap().unwrap();
+        closed.checks = Some(pending);
+        let mut entry = KeyEntry::default();
+        entry.record(Some(closed.clone()), at);
+        // Every later re-read keeps the first close time.
+        let later = at + TERMINAL_PENDING_CHECKS_WINDOW - interval * 2;
+        entry.record(Some(closed.clone()), later);
+        assert_eq!(entry.terminal_since, Some(at));
+        entry.fetched_at = Some(later);
+        // Inside the window it is still re-read every interval…
+        assert!(fetch_due(&entry, later + interval, interval));
+        // …and once the window has passed, never again.
+        assert!(!fetch_due(
+            &entry,
+            at + TERMINAL_PENDING_CHECKS_WINDOW + interval,
+            interval
+        ));
+        // A different closed PR on the branch has a clock of its own.
+        let mut replacement = closed.clone();
+        replacement.number = 2;
+        let mut other = entry.clone();
+        other.record(Some(replacement), later);
+        assert_eq!(other.terminal_since, Some(later));
+        // Reopened, the PR is open again and the clock starts over.
+        let mut open = closed;
+        open.state = PullRequestState::Open;
+        entry.record(Some(open), later);
+        assert_eq!(entry.terminal_since, None);
     }
 
     #[test]
@@ -1056,9 +1318,197 @@ mod tests {
                 "--repo",
                 "o/r",
                 "--json",
-                "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository",
+                "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository,\
+                 statusCheckRollup",
             ]
         );
+    }
+
+    /// A check run with a name of its own, so no two count as one check.
+    fn check_run(status: &str, conclusion: &str) -> serde_json::Value {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        named_run(
+            &format!("job-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            status,
+            conclusion,
+            None,
+        )
+    }
+
+    fn named_run(
+        name: &str,
+        status: &str,
+        conclusion: &str,
+        started_at: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "__typename": "CheckRun",
+            "name": name,
+            "workflowName": "CI",
+            "status": status,
+            "conclusion": conclusion,
+            "startedAt": started_at,
+        })
+    }
+
+    fn status_context(state: &str) -> serde_json::Value {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        serde_json::json!({
+            "__typename": "StatusContext",
+            "context": format!("ci/{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            "state": state,
+        })
+    }
+
+    fn checks_of(rollup: serde_json::Value) -> Option<PullRequestChecks> {
+        let mut pr = gh_pr(7, "feat/x", "OPEN", false, serde_json::json!(""));
+        pr["statusCheckRollup"] = rollup;
+        parse_pr_list(&gh(serde_json::json!([pr])), "feat/x")
+            .unwrap()
+            .unwrap()
+            .checks
+    }
+
+    /// Issue #1781: check runs and commit statuses land in GitHub's buckets,
+    /// and the overall result is GitHub's: any failure is red, otherwise
+    /// anything unfinished is pending, otherwise green.
+    #[test]
+    fn checks_roll_up_the_way_github_lists_them() {
+        use serde_json::json;
+        let all_kinds = checks_of(json!([
+            check_run("COMPLETED", "SUCCESS"),
+            check_run("COMPLETED", "FAILURE"),
+            check_run("COMPLETED", "TIMED_OUT"),
+            check_run("COMPLETED", "CANCELLED"),
+            check_run("COMPLETED", "ACTION_REQUIRED"),
+            check_run("COMPLETED", "STARTUP_FAILURE"),
+            check_run("COMPLETED", "SKIPPED"),
+            check_run("COMPLETED", "NEUTRAL"),
+            check_run("IN_PROGRESS", ""),
+            check_run("QUEUED", ""),
+            status_context("SUCCESS"),
+            status_context("ERROR"),
+            status_context("FAILURE"),
+            status_context("PENDING"),
+            status_context("EXPECTED"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            all_kinds,
+            PullRequestChecks {
+                state: PullRequestChecksState::Failing,
+                passing: 2,
+                failing: 7,
+                pending: 4,
+                skipped: 2,
+            }
+        );
+        let pending = checks_of(json!([
+            check_run("COMPLETED", "SUCCESS"),
+            check_run("IN_PROGRESS", ""),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (pending.state, pending.passing, pending.pending),
+            (PullRequestChecksState::Pending, 1, 1)
+        );
+        let passing = checks_of(json!([
+            check_run("COMPLETED", "SUCCESS"),
+            check_run("COMPLETED", "SKIPPED"),
+            status_context("SUCCESS"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (passing.state, passing.passing, passing.skipped),
+            (PullRequestChecksState::Passing, 2, 1)
+        );
+    }
+
+    /// Issue #1781 (PR #1783 review): a check that failed and then passed on
+    /// a re-run counts once, as its newest run, and a re-run still queued is
+    /// newer than any finished run of the same check.
+    #[test]
+    fn only_the_newest_run_of_a_check_counts() {
+        use serde_json::json;
+        let rerun_passed = checks_of(json!([
+            named_run("test", "COMPLETED", "FAILURE", Some("2026-10-20T10:00:00Z")),
+            named_run("test", "COMPLETED", "SUCCESS", Some("2026-10-20T11:00:00Z")),
+            named_run(
+                "build",
+                "COMPLETED",
+                "SUCCESS",
+                Some("2026-10-20T10:00:00Z")
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (
+                rerun_passed.state,
+                rerun_passed.passing,
+                rerun_passed.failing
+            ),
+            (PullRequestChecksState::Passing, 2, 0)
+        );
+        let requeued = checks_of(json!([
+            named_run("test", "COMPLETED", "SUCCESS", Some("2026-10-20T11:00:00Z")),
+            named_run("test", "QUEUED", "", None),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (requeued.state, requeued.passing, requeued.pending),
+            (PullRequestChecksState::Pending, 0, 1)
+        );
+        // The same job name in two workflows is two checks.
+        let mut other = named_run("test", "COMPLETED", "FAILURE", Some("2026-10-20T09:00:00Z"));
+        other["workflowName"] = json!("Docs");
+        let two = checks_of(json!([
+            named_run("test", "COMPLETED", "SUCCESS", Some("2026-10-20T11:00:00Z")),
+            other,
+        ]))
+        .unwrap();
+        assert_eq!((two.passing, two.failing), (1, 1));
+    }
+
+    /// Issue #1781 (PR #1783 review): a stale run never finished, so it is
+    /// pending, alone or beside passing checks.
+    #[test]
+    fn a_stale_check_is_pending() {
+        use serde_json::json;
+        let alone = checks_of(json!([check_run("COMPLETED", "STALE")])).unwrap();
+        assert_eq!(
+            (alone.state, alone.pending),
+            (PullRequestChecksState::Pending, 1)
+        );
+        let beside = checks_of(json!([
+            check_run("COMPLETED", "SUCCESS"),
+            check_run("COMPLETED", "STALE"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (beside.state, beside.passing, beside.pending),
+            (PullRequestChecksState::Pending, 1, 1)
+        );
+    }
+
+    /// Issue #1781: a PR with no checks shows no CI icon, whether `gh` sends
+    /// an empty rollup, a null one, none at all, or only values this build
+    /// cannot place.
+    #[test]
+    fn no_checks_means_no_ci_summary() {
+        use serde_json::json;
+        assert_eq!(checks_of(json!([])), None);
+        assert_eq!(checks_of(serde_json::Value::Null), None);
+        assert_eq!(
+            checks_of(json!([check_run("COMPLETED", "SOMETHING_NEW")])),
+            None
+        );
+        let pr = parse_pr_list(
+            &gh(json!([gh_pr(7, "feat/x", "OPEN", false, json!(""))])),
+            "feat/x",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(pr.checks, None);
     }
 
     /// The report a client applies carries the PR as JSON under the key, and
@@ -1077,6 +1527,7 @@ mod tests {
             url: "https://github.com/o/r/pull/1234".into(),
             state: PullRequestState::Open,
             review: Some(PullRequestReview::ReviewRequired),
+            checks: None,
         };
         let open = event(Some(info.clone()));
         assert_eq!(open.event_type, EventType::PullRequest);
@@ -1566,6 +2017,7 @@ mod tests {
             url: "https://github.com/o/r/pull/1401".to_string(),
             state: PullRequestState::Draft,
             review: Some(PullRequestReview::ChangesRequested),
+            checks: None,
         };
         let value = serde_json::to_value(&info).unwrap();
         assert_eq!(value["state"], "draft");
@@ -1581,6 +2033,7 @@ mod tests {
             url: "https://github.com/o/r/pull/7".to_string(),
             state: PullRequestState::Open,
             review: None,
+            checks: None,
         };
         let value = serde_json::to_value(&info).unwrap();
         assert!(value.get("review").is_none(), "None review must be omitted");
@@ -1588,8 +2041,9 @@ mod tests {
         assert_eq!(back, info);
     }
 
-    /// A newer daemon may send a state or review this build has never heard
-    /// of; the record must still deserialize, with the value read as Unknown.
+    /// A newer daemon may send a state, review or check result this build has
+    /// never heard of; the record must still deserialize, with the value read
+    /// as Unknown.
     #[test]
     fn unknown_state_and_review_values_deserialize_as_unknown() {
         let info: PullRequestInfo = serde_json::from_value(serde_json::json!({
@@ -1597,10 +2051,44 @@ mod tests {
             "url": "https://github.com/o/r/pull/9",
             "state": "queued_for_merge",
             "review": "dismissed_by_bot",
+            "checks": { "state": "awaiting_approval", "pending": 2 },
         }))
         .unwrap();
         assert_eq!(info.state, PullRequestState::Unknown);
         assert_eq!(info.review, Some(PullRequestReview::Unknown));
+        let checks = info.checks.unwrap();
+        assert_eq!(checks.state, PullRequestChecksState::Unknown);
+        assert_eq!((checks.pending, checks.passing), (2, 0));
+    }
+
+    /// Issue #1781: the checks summary is snake_case on the wire, and absent
+    /// when there are none, so an older client never sees the key.
+    #[test]
+    fn checks_round_trip_and_are_omitted_when_absent() {
+        let mut info = PullRequestInfo {
+            number: 7,
+            url: "https://github.com/o/r/pull/7".to_string(),
+            state: PullRequestState::Open,
+            review: None,
+            checks: None,
+        };
+        assert!(serde_json::to_value(&info).unwrap().get("checks").is_none());
+        info.checks = Some(PullRequestChecks {
+            state: PullRequestChecksState::Failing,
+            passing: 24,
+            failing: 1,
+            pending: 0,
+            skipped: 2,
+        });
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            value["checks"],
+            serde_json::json!({
+                "state": "failing", "passing": 24, "failing": 1, "pending": 0, "skipped": 2,
+            })
+        );
+        let back: PullRequestInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(back, info);
     }
 
     /// An older daemon's snapshot has no `pull_request` key; a newer client
@@ -1633,6 +2121,7 @@ mod tests {
             url: "https://github.com/o/r/pull/1401".to_string(),
             state: PullRequestState::Merged,
             review: Some(PullRequestReview::Approved),
+            checks: None,
         };
         snap.pull_request = Some(info.clone());
         let json = serde_json::to_string(&snap).unwrap();

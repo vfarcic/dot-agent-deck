@@ -416,11 +416,24 @@ export interface PullRequestInfoDto {
   url: string;
   state: PullRequestState;
   review?: PullRequestReview;
+  /** Issue #1781 — absent when the PR has no checks, and from an older daemon. */
+  checks?: PullRequestChecksDto;
 }
 
 export type PullRequestState = "open" | "draft" | "merged" | "closed" | "unknown";
 
 export type PullRequestReview = "approved" | "changes_requested" | "review_required" | "unknown";
+
+/** Issue #1781 — the daemon's `pull_request_info::PullRequestChecks`: GitHub's rollup of the PR's CI. */
+export interface PullRequestChecksDto {
+  state: PullRequestChecksState;
+  passing?: number;
+  failing?: number;
+  pending?: number;
+  skipped?: number;
+}
+
+export type PullRequestChecksState = "passing" | "failing" | "pending" | "unknown";
 
 /** Result returned after the ordered Tauri output channel is registered. */
 export interface TerminalAttachResult {

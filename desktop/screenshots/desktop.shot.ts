@@ -31,8 +31,9 @@ desktopScenario("pull-request-badge", async (page) => {
   await overview(page, "docs-pr");
   await expect(page.locator(".overview-row")).toHaveCount(1);
   const badge = page.getByTestId("overview-pr-badge");
-  await expect(badge).toHaveAccessibleName("Pull request #1234: open, review required");
+  await expect(badge).toHaveAccessibleName("Pull request #1234: open, review required; CI: 24 passing");
   await expect(badge).toHaveAttribute("data-pr-state", "open");
+  await expect(badge).toHaveAttribute("data-pr-checks", "passing");
   await expect(badge).toHaveAttribute("data-pr-review", "review_required");
 });
 

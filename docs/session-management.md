@@ -107,7 +107,7 @@ When the deck cannot tell whether an OpenCode or Pi agent got a message, the car
 - **`Prmt:`**: the most recent prompt or prompts.
 - **Recent tool calls**: the last commands the agent ran.
 - **`Last:` and `Tools:`**: time since the agent's last activity and its total tool-call count, in the bottom-right border. Narrow cards shorten them to `2m · 14 tools`, then `2m · 14`, and the narrowest omit them.
-- **Pull request**: when the agent's branch has a pull request on GitHub, its number and two glyphs, for its state and its review, in the bottom-left border, for example `#1234 ⊙ ◐`. See [Pull request badge](#pull-request-badge) below.
+- **Pull request**: when the agent's branch has a pull request on GitHub, its number and glyphs for its state, its CI checks and its review, in the bottom-left border, for example `#1234 ⊙ ✓ ◉`. See [Pull request badge](#pull-request-badge) below.
 
 ![Single agent card showing directory, last activity, tool count, recent prompt, and recent tool calls](/img/session-management-card.jpg)
 
@@ -126,7 +126,7 @@ Minimal is used only when there are more cards than fit at Compact. Each card is
 
 ### Pull request badge
 
-When an agent works on a branch that has a pull request on GitHub, its card shows the pull request on the bottom border: the number, a glyph for the pull request's state and a glyph for its review.
+When an agent works on a branch that has a pull request on GitHub, its card shows the pull request on the bottom border, on one line: the number, a glyph for the pull request's state, a glyph for its CI checks and a glyph for its review. The glyphs and their colours follow GitHub's.
 
 | Glyph | State |
 |---|---|
@@ -136,26 +136,37 @@ When an agent works on a branch that has a pull request on GitHub, its card show
 | `⊘` | Closed |
 | `?` | A state this build does not know |
 
+| Glyph | CI checks |
+|---|---|
+| `✓` (green) | All checks passed |
+| `✗` (red) | At least one check failed |
+| `●` (yellow) | Checks are still running, and none has failed |
+| `?` | A result this build does not know |
+
+The CI glyph is the pull request's overall result as GitHub's pull request list shows it, so a failing check that is not required for merging still shows `✗`.
+
 | Glyph | Review |
 |---|---|
 | `✓` | Approved |
-| `✗` | Changes requested |
-| `◐` | Review required |
+| `±` | Changes requested |
+| `◉` | Review required |
 | `?` | A review this build does not know |
 
-A pull request with no review yet shows only the state glyph. On a narrow card the badge drops its glyphs and shows only the number, and the `Last:`/`Tools:` text shortens or goes first.
+The review glyph is drawn on a filled cell in its colour (green, red or yellow), and the CI glyph is not, so you can tell an approval from passing CI though both are a check mark: in `#1234 ⊙ ✓ ✓` the first check is CI and the filled one is the approval.
 
-The badge appears by itself: an agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. It follows the pull request, so a review or a merge shows up on the card within about a minute. Press `o` on the selected card to open the pull request in your system browser (the `open_pull_request` key in [Keyboard Shortcuts](keyboard-shortcuts.md)); if no browser can be opened there, as in a TUI on a remote host, the status line shows the pull request's address so you can copy it. On a card with no badge, `o` says the agent has no pull request. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
+A pull request without CI checks shows no CI glyph, and one with no review yet shows no review glyph. On a narrow card the badge drops its glyphs, the review first, then CI, then the state, and keeps the number; the `Last:`/`Tools:` text shortens or goes first.
+
+The badge appears by itself: an agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. It follows the pull request, so a review, a CI result or a merge shows up on the card within about a minute. Press `o` on the selected card to open the pull request in your system browser (the `open_pull_request` key in [Keyboard Shortcuts](keyboard-shortcuts.md)); if no browser can be opened there, as in a TUI on a remote host, the status line shows the pull request's address so you can copy it. On a card with no badge, `o` says the agent has no pull request. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
 
 The desktop app shows the same pull request as a badge with icons on the agent's row and in its pane, and opens it inside the app when you click it; see [Desktop app → Dashboard → Pull requests](desktop/dashboard.md#pull-requests).
 
 **TUI:**
 
-![TUI implementation agent with #1234 and its open and review-required glyphs on the card's bottom border](/img/pull-request-badge-tui.png)
+![TUI implementation agent with #1234 and its open, CI-passing and review-required glyphs on the card's bottom border](/img/pull-request-badge-tui.png)
 
 **Desktop:**
 
-![Desktop Dashboard implementation agent row with the same open pull request #1234 awaiting review](/img/pull-request-badge-desktop.png)
+![Desktop Dashboard implementation agent row with the same open pull request #1234, its CI passing and awaiting review](/img/pull-request-badge-desktop.png)
 
 ### Diagnostic markers on a card
 
