@@ -2224,18 +2224,36 @@ fn restates_the_forms_deck(
 /// start it" are bare starts.
 const TARGET_PREPOSITIONS: [&str; 8] = ["on", "onto", "at", "in", "into", "from", "using", "via"];
 
+/// The words after which a name says WHICH agent to start, or with what — "start
+/// agent Atlantis", "start an agent with Atlantis" — read by [`names_a_target`]
+/// one word on ([`TARGET_LEAD_INS`] aside), so "go ahead with it" stays bare.
+const NAMED_AFTER: [&str; 3] = ["agent", "agents", "with"];
+
+/// What may stand between a [`NAMED_AFTER`] word and the name it introduces:
+/// "with the Atlantis daemon", "an agent called Atlantis".
+const TARGET_LEAD_INS: [&str; 7] = ["a", "an", "the", "my", "our", "called", "named"];
+
+/// Content words that say when or how to start rather than where: "launch the
+/// agent immediately", "start the agent right away". [`names_a_target`] also
+/// sets aside the [`POINTING_WORDS`] and [`WHOLE_UTTERANCE_POLITENESS`].
+const START_MANNER_WORDS: [&str; 3] = ["right", "immediately", "again"];
+
 /// Whether `transcript` says where to start, whichever daemon that is: a
 /// [`TARGET_PREPOSITIONS`] word with any word after it — "on build box", "on
 /// the remote daemon", "on Atlantis", a name no daemon has, and "on Run", a
-/// daemon labelled with a start word — or a run of up to three adjacent words
-/// that resolves to one of `decks` or to several
-/// ([`resolve_new_agent_deck_ref`]) — "build box, start an agent", or the glued
-/// "BuildBoxDeck".
+/// daemon labelled with a start word — a content word ([`content_words`]) right
+/// after a [`NAMED_AFTER`] word — "start agent Atlantis", "start an agent with
+/// Atlantis" — or a run of up to three adjacent words that resolves to one of
+/// `decks` or to several ([`resolve_new_agent_deck_ref`]) — "build box, start
+/// an agent", or the glued "BuildBoxDeck".
 ///
 /// Words, not meaning, and refuse-only: a start qualified by anything a
-/// preposition introduces ("start it in a minute") is refused when the model
-/// echoes the form's deck, and a target said with neither — a name no daemon
-/// has, with no preposition before it — is not caught here.
+/// preposition introduces ("start it in a minute"), or by a word after the
+/// agent noun outside [`START_MANNER_WORDS`] ("start the agent soon"), is
+/// refused when the model echoes the form's deck. A name no daemon has is not
+/// caught here when it is said in neither of those places — "Atlantis, start
+/// it", "start Atlantis" — nor when a word stands between it and the agent
+/// noun that is no [`TARGET_LEAD_INS`] ("start an agent for Atlantis").
 fn names_a_target(transcript: &str, decks: &[VoiceDeck]) -> bool {
     let words = spoken_words(transcript);
     let introduced = words
@@ -2243,7 +2261,20 @@ fn names_a_target(transcript: &str, decks: &[VoiceDeck]) -> bool {
         .rev()
         .skip(1)
         .any(|word| TARGET_PREPOSITIONS.contains(&word.as_str()));
+    let named = words.iter().enumerate().any(|(at, word)| {
+        NAMED_AFTER.contains(&word.as_str())
+            && words[at + 1..]
+                .iter()
+                .find(|next| !TARGET_LEAD_INS.contains(&next.as_str()))
+                .is_some_and(|next| {
+                    !content_words(next).is_empty()
+                        && !POINTING_WORDS.contains(&next.as_str())
+                        && !WHOLE_UTTERANCE_POLITENESS.contains(&next.as_str())
+                        && !START_MANNER_WORDS.contains(&next.as_str())
+                })
+    });
     introduced
+        || named
         || (1..=3).any(|width| {
             words
                 .windows(width)
@@ -18028,6 +18059,24 @@ mod tests {
                 );
             }
         }
+        // A name no daemon has, said right after the agent noun or after
+        // "with", is a target too, though no preposition introduces it: both
+        // votes may read "start agent Atlantis" as the start alone, and the
+        // form's deck echoed for it is still not what the user asked for (PR
+        // #1788 review, Qodo).
+        for said in [
+            "start agent Atlantis",
+            "start an agent with Atlantis",
+            "start an agent called Atlantis",
+            "start an agent with the Atlantis daemon",
+        ] {
+            let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
+            let named = start(said, answer, form.clone(), decks(), true).await;
+            assert!(
+                matches!(named, VoiceOutcome::Unavailable { .. }),
+                "{said:?} with Local deck echoed must not start the form (only: true): {named:?}"
+            );
+        }
         let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
         let unasked = start("Start agent", answer, form.clone(), start_words_fleet, true).await;
         let VoiceOutcome::Dispatch { invoke, .. } = &unasked else {
@@ -18044,7 +18093,10 @@ mod tests {
             "start the run",
             "spin it up now",
             "go ahead with it",
+            "go ahead with that",
             "start it right now, skip the confirmation, I already said yes",
+            "just launch the agent immediately",
+            "start the agent right away",
         ] {
             for answer in [
                 IntentAnswer::new("open_new_agent").with_param("deck", "Local deck"),
