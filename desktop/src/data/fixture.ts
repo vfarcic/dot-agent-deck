@@ -1251,6 +1251,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
           url: "https://github.com/test-org/test-repo/pull/1234",
           state: "open",
           review: "review_required",
+          checks: { state: "passing", passing: 24, failing: 0, pending: 0, skipped: 0 },
         },
       }],
     };
@@ -2337,7 +2338,8 @@ function fixtureSelfPlan(copy: SelfCopy, label: string, action: SelfUpgradePlan[
  * Issue #1635 — the fixture's stand-in for `desktop_self_upgrade_check`: a Mac
  * whose app was installed from the `.dmg` into `/Applications` (the swap-app
  * plan) and whose `dot-agent-deck` CLI came from Homebrew, both one release
- * behind. Every sentence is the crate's `UpgradePlan` wording for that machine
+ * behind (`selfupgrade=1`), or, with `selfupgrade=cli`, only the CLI behind
+ * an app that is current (issue #1753). Every sentence is the crate's `UpgradePlan` wording for that machine
  * (`src/self_upgrade/plan.rs`), so the `self-upgrade` docs screenshot reads as
  * the app does; the vitest suite does not pin them, the Rust tests do.
  *
@@ -2348,28 +2350,43 @@ function fixtureSelfPlan(copy: SelfCopy, label: string, action: SelfUpgradePlan[
  * outcome the crate reports, and Relaunch does nothing.
  */
 export function fixtureSelfUpgradeApi(search: string = window.location.search): SelfUpgradeApi | undefined {
-  if (new URLSearchParams(search).get("selfupgrade") !== "1") return undefined;
+  const mode = new URLSearchParams(search).get("selfupgrade");
+  if (mode !== "1" && mode !== "cli") return undefined;
   const latest = FIXTURE_SELF_LATEST_VERSION;
-  const app = fixtureSelfPlan("app", "Agent Deck (desktop app)", "swap-app", [
-    `Agent Deck at /Applications/Agent Deck.app. Upgrading downloads \`dot-agent-deck-desktop-alpha-macos-arm64.dmg\` from release v${latest}, checks its checksum, signature and notarization, and replaces the app. Agent Deck then restarts to run v${latest}.`,
-    "Its checksum is checked against the release's checksum file, and that file's build provenance with `gh attestation verify`.",
-  ]);
-  const cli = fixtureSelfPlan("cli", "dot-agent-deck", "brew-upgrade", [
+  const appHeadline = `Agent Deck (desktop app) is up to date (v${latest}).`;
+  const app: SelfUpgradePlan = mode === "cli"
+    ? { copy: "app", label: "Agent Deck (desktop app)", headline: appHeadline, current: latest, latest, action: "up-to-date", actionable: false, confirmQuestion: null, provenance: { checked: true, reason: null }, lines: [line(appHeadline)] }
+    : fixtureSelfPlan("app", "Agent Deck (desktop app)", "swap-app", [
+      `Agent Deck at /Applications/Agent Deck.app. Upgrading downloads \`dot-agent-deck-desktop-alpha-macos-arm64.dmg\` from release v${latest}, checks its checksum, signature and notarization, and replaces the app. Agent Deck then restarts to run v${latest}.`,
+      "Its checksum is checked against the release's checksum file, and that file's build provenance with `gh attestation verify`.",
+    ]);
+  const cli = fixtureSelfPlan("cli", "dot-agent-deck CLI", "brew-upgrade", [
     "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck). Upgrading runs `brew upgrade dot-agent-deck`, which installs the formula's latest release.",
   ]);
-  const check: SelfUpgradeCheck = { checkId: 1, latest, updateAvailable: true, notice: app.headline, installed: null, app, cli, recheckAfterSecs: 6 * 60 * 60 };
+  /* The app-wide notice is about the app alone (issue #1753). */
+  const appBehind = mode === "1";
+  const check: SelfUpgradeCheck = { checkId: 1, latest, updateAvailable: appBehind, notice: appBehind ? app.headline : null, installed: null, app, cli, recheckAfterSecs: 6 * 60 * 60 };
   const results: Record<SelfCopy, SelfUpgradeResult> = {
     app: {
       copy: "app",
       ok: true,
+      installed: true,
       relaunch: true,
       lines: [`Replaced /Applications/Agent Deck.app with v${latest}. Quit and reopen Agent Deck to run it.`, "Build provenance verified with `gh attestation verify`."].map(line),
     },
-    cli: { copy: "cli", ok: true, relaunch: false, lines: [line(`\`brew upgrade dot-agent-deck\` finished; it now reports v${latest}.`)] },
+    cli: { copy: "cli", ok: true, installed: true, relaunch: false, lines: [line(`\`brew upgrade dot-agent-deck\` finished; it now reports v${latest}.`)] },
   };
+  /* Once the CLI is upgraded, the next check finds it current, as the bridge's would. */
+  const cliHeadline = `dot-agent-deck CLI is up to date (v${latest}).`;
+  let cliUpgraded = false;
   return {
-    check: async () => check,
-    run: (copy) => new Promise((resolve) => window.setTimeout(() => resolve(results[copy]), FIXTURE_UPGRADE_STEP_MS)),
+    check: async () => (cliUpgraded
+      ? { ...check, checkId: check.checkId + 1, cli: { ...cli, headline: cliHeadline, current: latest, action: "up-to-date", actionable: false, confirmQuestion: null, lines: [line(cliHeadline)] } }
+      : check),
+    run: (copy) => new Promise((resolve) => window.setTimeout(() => {
+      if (copy === "cli") cliUpgraded = true;
+      resolve(results[copy]);
+    }, FIXTURE_UPGRADE_STEP_MS)),
     relaunch: async () => undefined,
   };
 }

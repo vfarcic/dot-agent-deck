@@ -193,6 +193,7 @@ An issue that is still open after its pull request merged or closed has no open 
 
 - **Closing the TUI or the desktop app does not stop schedules**, and the daemon keeps running while at least one enabled schedule exists.
 - **Nothing runs while the daemon is stopped.** A run whose time passed while the daemon was stopped, or while the machine was asleep for more than a minute, is not made up later.
+- **A reboot or a crash stops schedules until something starts the daemon again.** For schedules that must run without you opening the deck, run the daemon as a service with `dot-agent-deck daemon install`; it then starts at boot or login and after a crash. See [Run the Daemon as a Service](daemon-service.md).
 - **Stopping the daemon stops the agents it runs**, including those schedules started. `dot-agent-deck daemon stop` may refuse while agents are running unless you pass `--force`. After a restart, the next run of each schedule opens a new tab.
 - **A run that comes due while the daemon is restarting** (for example during an upgrade) is not reported as failed. If the restart is called off, the run goes ahead; if it happens, the run is skipped and the schedule's next run happens on the new daemon. An issue-dispatch run leaves the issues it had not reached for that next run.
 - **Your schedules are kept.** A daemon loads the schedules file when it starts. The `schedule` subcommands do not start a daemon; start the TUI (`dot-agent-deck`), or run `dot-agent-deck daemon serve` to run one in the foreground.

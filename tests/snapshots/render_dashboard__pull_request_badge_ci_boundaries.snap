@@ -1,0 +1,103 @@
+---
+source: tests/render_dashboard.rs
+expression: boundaries
+---
+width 24
+┏ ▸ 1 Clau… ● Thinking ┓
+┃Dir:  api-svc         ┃
+┃Prmt: move the stats …┃
+┃                      ┃
+┃                      ┃
+┃                      ┃
+┃                      ┃
+┗ #1234 ⊙ ● ◉  1h · 14 ┛
+
+width 23
+┏ ▸ 1 Cla… ● Thinking ┓
+┃Dir:  api-svc        ┃
+┃Prmt: move the stats…┃
+┃                     ┃
+┃                     ┃
+┃                     ┃
+┃                     ┃
+┗ #1234 ⊙ ● ━ 1h · 14 ┛
+
+width 22
+┏ ▸ 1 Cl… ● Thinking ┓
+┃Dir:  api-svc       ┃
+┃Prmt: move the stat…┃
+┃                    ┃
+┃                    ┃
+┃                    ┃
+┃                    ┃
+┗ #1234 ⊙ ●  1h · 14 ┛
+
+width 21
+┏ ▸ 1 C… ● Thinking ┓
+┃Dir:  api-svc      ┃
+┃Prmt: move the sta…┃
+┃                   ┃
+┃                   ┃
+┃                   ┃
+┃                   ┃
+┗ #1234 ⊙ ━ 1h · 14 ┛
+
+width 19
+┏ ▸ 1… ● Thinking ┓
+┃Dir:  api-svc    ┃
+┃Prmt: move the s…┃
+┃                 ┃
+┃                 ┃
+┃                 ┃
+┃                 ┃
+┗ #1234 ━ 1h · 14 ┛
+
+width 15
+┏… ● Thinking ┓
+┃Dir:  api-svc┃
+┃Prmt: move t…┃
+┃             ┃
+┃             ┃
+┃             ┃
+┃             ┃
+┗ #1234 ⊙ ● ◉ ┛
+
+width 14
+┏ ● Thinking ┓
+┃Dir:  api-s…┃
+┃Prmt: move …┃
+┃            ┃
+┃            ┃
+┃            ┃
+┃            ┃
+┗ #1234 ⊙ ● ━┛
+
+width 12
+┏ Thinking ┓
+┃Dir:  api…┃
+┃Prmt: mov…┃
+┃          ┃
+┃          ┃
+┃          ┃
+┃          ┃
+┗ #1234 ⊙ ━┛
+
+width 10
+┏hinking ┓
+┃Dir:  a…┃
+┃Prmt: m…┃
+┃        ┃
+┃        ┃
+┃        ┃
+┃        ┃
+┗ #1234 ━┛
+
+width 8
+┏nking ┓
+┃Dir:  ┃
+┃Prmt: ┃
+┃      ┃
+┃      ┃
+┃      ┃
+┃      ┃
+┗━━━━━━┛

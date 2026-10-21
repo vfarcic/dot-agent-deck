@@ -684,8 +684,9 @@ fn docs_screenshot_dashboard_empty() {
 }
 
 /// Scenario: Open a stand-in implementation agent on a fixture GitHub branch
-/// whose strict offline gh stub reports open PR #1234 awaiting review. Capture
-/// the dashboard only when its card badge and fixed pane transcript are visible.
+/// whose strict offline gh stub reports open PR #1234 with passing CI awaiting
+/// review. Capture the dashboard only when its card badge and fixed pane
+/// transcript are visible.
 #[test]
 #[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
 fn docs_screenshot_pull_request_badge() {
@@ -709,13 +710,13 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 [ "$head" = feat/pr-badge ] && [ "$repo" = test-org/test-repo ] && [ "$state" = all ] || exit 93
-for field in number state isDraft reviewDecision url headRefName; do
+for field in number state isDraft reviewDecision url headRefName statusCheckRollup; do
     case ",$fields," in
         *",$field,"*) ;;
         *) exit 94 ;;
     esac
 done
-printf '%s\n' '[{"number":1234,"headRefName":"feat/pr-badge","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","url":"https://github.com/test-org/test-repo/pull/1234"}]'
+printf '%s\n' '[{"number":1234,"headRefName":"feat/pr-badge","state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","url":"https://github.com/test-org/test-repo/pull/1234","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS"}]}]'
 "#).unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
     let deck = launch_with(|builder| {
@@ -811,7 +812,7 @@ printf '%s\n' '[{"number":1234,"headRefName":"feat/pr-badge","state":"OPEN","isD
     capture(&deck, "pull-request-badge", |grid| {
         grid.contains(agent.name)
             && grid.contains(agent.prompt)
-            && grid.contains("#1234 ⊙ ◐")
+            && grid.contains("#1234 ⊙ ✓ ◉")
             && grid.contains("Last: 0s ")
             && grid.contains("Working")
             && !grid.contains("Ctrl+D to type")
@@ -1174,7 +1175,7 @@ fn docs_screenshot_self_upgrade() {
         )) && grid.contains(&format!("Upgrade to v{SELF_UPGRADE_LATEST}"))
             && grid.contains("Downloaded binary at")
             && grid.contains(&format!(
-                "Upgrade dot-agent-deck to v{SELF_UPGRADE_LATEST}?"
+                "Upgrade dot-agent-deck CLI to v{SELF_UPGRADE_LATEST}?"
             ))
             && grid.contains("> Cancel"))
         .then(|| render_page(screen, "self-upgrade (TUI)", &RenderOptions::default()))

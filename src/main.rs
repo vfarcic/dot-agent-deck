@@ -596,6 +596,14 @@ enum DaemonCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Run the daemon as a user service (systemd on Linux, launchd on
+    /// macOS), so it starts at login and comes back after a crash or an
+    /// upgrade. Starts it now unless a daemon is already running; never stops
+    /// one (PRD #143).
+    Install,
+    /// Remove the service `install` set up, so the daemon no longer starts at
+    /// login. A daemon it started keeps running until `daemon stop`.
+    Uninstall,
     /// Print the attach endpoint this host's daemon is listening on, and
     /// print it **only** when a live daemon answered there.
     ///
@@ -2356,6 +2364,8 @@ fn main() -> ExitCode {
             DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
             DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
             DaemonCmd::Status { json } => run_daemon_status_cli(json),
+            DaemonCmd::Install => run_daemon_install_cli(),
+            DaemonCmd::Uninstall => run_daemon_uninstall_cli(),
             DaemonCmd::Endpoint => run_daemon_endpoint_cli(),
             DaemonCmd::Probe { json } => run_daemon_probe_cli(json),
             DaemonCmd::RestartInstalled {
@@ -3748,6 +3758,28 @@ async fn run_close_cli(args: dot_agent_deck::close_cli::CloseArgs) -> ExitCode {
     ExitCode::from(output.code)
 }
 
+#[tokio::main]
+async fn run_daemon_install_cli() -> ExitCode {
+    match dot_agent_deck::daemon_service::run_install().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("daemon install: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[tokio::main]
+async fn run_daemon_uninstall_cli() -> ExitCode {
+    match dot_agent_deck::daemon_service::run_uninstall().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("daemon uninstall: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `dot-agent-deck daemon stop [--force]` — PRD #103 Phase 3 (M3.2).
 /// Documented, non-`kill -9` way to recycle the local daemon after a
 /// binary upgrade. Idempotent (no-op exit 0 when no daemon is running)
@@ -3892,11 +3924,6 @@ async fn run_daemon_serve_cli(
         }
     };
 
-    // Issue #1211: and beside it, best-effort, the pre-#1121 spelling on the
-    // fallback arm, so a client from before #1121 still finds this daemon and
-    // gets the mismatch prompt instead of silently spawning a second one. A
-    // failure to bind it is a warning, never a failure to start.
-    //
     // PRD #1487: record this daemon's own binary now, at startup, so a later
     // `restart-daemon` resolves "the build installed at my own path" from where
     // it started rather than from whatever `current_exe()` reports after an
@@ -3906,10 +3933,6 @@ async fn run_daemon_serve_cli(
     ));
     let refresh_state = state.clone();
     let daemon = Daemon::with_attach(state, attach_path.clone())
-        .with_legacy_aliases(
-            dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
-            dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
-        )
         .with_restart_control(restart_control.clone());
     // Issue #1637: re-read the agents' hook configs periodically, so a notice
     // about an older copy the hooks are still set up to call stays, and one

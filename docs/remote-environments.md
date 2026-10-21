@@ -366,7 +366,7 @@ If you registered the remote with `--port` or `--key`, pass the same values to `
 The desktop app shows a remote daemon's agents alongside the local ones, reached through an ssh tunnel from your laptop. It needs the deck installed on the host and a daemon already running there:
 
 1. Install the deck on the host, most simply with `dot-agent-deck remote add my-vm deck@198.51.100.10` from a machine with the CLI.
-2. Keep a daemon running on the host. A daemon with no agents exits about 30 seconds after its last client disconnects, so either leave agents running under it (start them with `connect` and detach), or run a daemon with the idle shutdown off, as [Keep the daemon running](remote-requirements.md#keep-the-daemon-running) shows.
+2. Keep a daemon running on the host. A daemon with no agents exits about 30 seconds after its last client disconnects, so either leave agents running under it (start them with `connect` and detach), or run the daemon as a service with `~/.local/bin/dot-agent-deck daemon install` on the host, as [Run the Daemon as a Service](daemon-service.md) shows.
 3. In the app, open **Settings → Daemons**, press **Add a daemon**, fill in **Host** (and **User**, **Port**, **Key file** or **Jump host** as needed), check the suggested **Deck name**, and press **Add this daemon**. Then press **Test connection**, which also finds the daemon's socket.
 4. Pick the daemon in the **Daemon** selector on the Dashboard, or **All daemons**.
 

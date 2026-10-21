@@ -118,6 +118,40 @@ test.describe("Upgrade a daemon from the dashboard", () => {
   });
 });
 
+test.describe("Upgrade the CLI from the Local daemon section (issue #1753)", () => {
+  /** Scenario: with the app current and this machine's CLI one release behind, no app-wide banner or rail button appears; the Local daemon section offers Upgrade, which shows the CLI's plan, upgrades it on Upgrade, and leaves the daemon running; afterwards the section offers nothing. */
+  test("offers the CLI on the Local daemon section, not in the app-wide notice", async ({ page }) => {
+    await page.goto("/?fixture=1&state=upgrade&selfupgrade=cli");
+    await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+    await page.getByTestId("open-overview").click();
+    await expect(page.getByTestId("daemon-group")).toHaveCount(3);
+
+    const local = card(page, "Local daemon").getByTestId("daemon-upgrade");
+    await expect(local).toBeVisible();
+    await expect(local).toHaveAccessibleName("Upgrade the CLI on this machine");
+    await expect(page.getByTestId("self-upgrade-banner")).toHaveCount(0);
+    await expect(page.getByTestId("self-upgrade-rail")).toHaveCount(0);
+
+    await local.click();
+    const dialog = page.getByTestId("self-upgrade-dialog");
+    await expect(dialog).toHaveAttribute("data-phase", "confirm");
+    await expect(page.getByTestId("self-upgrade-plan-cli")).toContainText("dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)");
+    await expect(page.getByTestId("self-upgrade-plan-app")).toHaveCount(0);
+    await expect(page.getByTestId("self-upgrade-then")).toContainText("does not restart the daemon on this machine");
+    await expect(page.getByTestId("self-upgrade-question")).toHaveText("Upgrade dot-agent-deck CLI to v0.47.0?");
+    await page.getByTestId("self-upgrade-start").click();
+
+    await expect(page.getByTestId("self-upgrade-result-cli")).toContainText("it now reports v0.47.0");
+    await page.getByTestId("self-upgrade-close").click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByTestId("upgrade-dialog")).toHaveCount(0);
+
+    // The app checked again: the CLI is current, and nothing is left to offer here.
+    await expect(local).toHaveCount(0);
+    await expect(card(page, "Local daemon")).toHaveAttribute("data-deck-connected", "yes");
+  });
+});
+
 test.describe("Upgrade from the Daemons screen's banner", () => {
   /** Scenario: use Upgrade in the incompatible-daemon banner and read its success; the remedy disappears once the deck is current. */
   test("offers Upgrade beside the other remedies and runs it", async ({ page }) => {

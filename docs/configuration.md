@@ -235,7 +235,7 @@ dot-agent-deck daemon stop                    # refuses while agents are running
 DOT_AGENT_DECK_LOG=1 dot-agent-deck           # the new TUI starts a new daemon with it
 ```
 
-`daemon stop` refuses while the daemon manages running agents; `--force` stops it anyway and ends those agents. `dot-agent-deck daemon status` lists what it manages. For the desktop app, set the variable in the environment you launch the app from.
+`daemon stop` refuses while the daemon manages running agents; `--force` stops it anyway and ends those agents. `dot-agent-deck daemon status` lists what it manages. For the desktop app, set the variable in the environment you launch the app from. For a daemon that runs as a service, set it in the service and restart the service ([Run the Daemon as a Service](daemon-service.md#credentials-and-other-environment)).
 
 ### Paths and endpoints
 
@@ -247,9 +247,9 @@ DOT_AGENT_DECK_LOG=1 dot-agent-deck           # the new TUI starts a new daemon 
 | `DOT_AGENT_DECK_BIN` | unset | each agent's hooks | The absolute path of a `dot-agent-deck` executable for agents' hooks to run instead of the installed one their hook settings name. Agents started from an environment that has it report through that binary; every other agent keeps using the installed one. Whoever sets it chooses the program those hooks run, so only an absolute path is honoured: an empty value, a bare name such as `dot-agent-deck` or a relative path such as `./dot-agent-deck` counts as unset, and the hooks run the installed binary. It applies once the hooks have been installed by a release that writes the variable into them (see [Troubleshooting › Hooks](troubleshooting.md#hooks)). On Windows, Claude Code and Codex hooks do not honour it and run the installed binary; the OpenCode plugin and the Pi extension do. |
 | `DOT_AGENT_DECK_CONFIG`, `DOT_AGENT_DECK_SESSION`, `DOT_AGENT_DECK_KEYBINDINGS`, `DOT_AGENT_DECK_SCHEDULES`, `DOT_AGENT_DECK_REMOTES`, `DOT_AGENT_DECK_DESKTOP_CONFIG`, `DOT_AGENT_DECK_CONFIG_GEN_STATE`, `DOT_AGENT_DECK_STAR_PROMPT` | see [Where configuration lives](#where-configuration-lives) | the process reading that file | Full path of that file. |
 
-`<temp dir>` is `$TMPDIR` when set, else `/tmp`; on macOS `$TMPDIR` is normally a per-user directory under `/var/folders`. The deck creates `dot-agent-deck-<uid>` with mode `0700`. If another user already owns a directory of that name, the daemon uses a sibling named `dot-agent-deck-<uid>.` followed by 16 random hex digits instead, and clients find it without configuration. A daemon also listens on `/tmp/dot-agent-deck-<uid>.sock` and `/tmp/dot-agent-deck-attach-<uid>.sock` when it can, so clients from older releases find it. On Windows the endpoints are the named pipes `\\.\pipe\dot-agent-deck-<user>-hook` and `\\.\pipe\dot-agent-deck-<user>-attach`.
+`<temp dir>` is `$TMPDIR` when set, else `/tmp`; on macOS `$TMPDIR` is normally a per-user directory under `/var/folders`. The deck creates `dot-agent-deck-<uid>` with mode `0700`. If another user already owns a directory of that name, the daemon uses a sibling named `dot-agent-deck-<uid>.` followed by 16 random hex digits instead, and clients find it without configuration. On Windows the endpoints are the named pipes `\\.\pipe\dot-agent-deck-<user>-hook` and `\\.\pipe\dot-agent-deck-<user>-attach`.
 
-To see where the running daemon is listening, run `dot-agent-deck daemon endpoint`; it prints the attach endpoint only when a live daemon answered there. When you set either socket variable, set it to the same value for every process that should reach the same daemon, and pick a directory only you can write to.
+To see where the running daemon is listening, run `dot-agent-deck daemon endpoint`; it prints the attach endpoint only when a live daemon answered there. When you set either socket variable, set it to the same value for every process that should reach the same daemon, and pick a directory only you can write to. Without them, every such process also needs the same `XDG_RUNTIME_DIR` and `TMPDIR`: a process with a different value looks for a different socket and does not find the running daemon, and a TUI started that way starts a daemon of its own.
 
 ### Logging
 
@@ -323,6 +323,7 @@ level = 1.0
 | `voice.transcription.backend` | string | `"local"` | `"local"` (no key; the endpoint must be on this machine), `"remote"` |
 | `voice.transcription.endpoint` | URL | `http://127.0.0.1:18000/v1/audio/transcriptions` for `local`, `https://api.openai.com/v1/audio/transcriptions` for `remote` | any URL; a `local` backend refuses one that is not a loopback address |
 | `voice.transcription.model` | string | `Systran/faster-whisper-tiny.en` for `local`, `whisper-1` for `remote` | |
+| `voice.transcription.language` | string | `"en"` | `"auto"` (the Speech service detects the language), or the two-letter code of a language the [Language](desktop/voice.md#settings--voice) row offers, such as `"de"` or `"sr"`; an unrecognised value means `"en"` |
 | `voice.intent.backend` | string | `"openai_compatible"` | `"openai_compatible"`, `"anthropic"` |
 | `voice.intent.endpoint` | URL | `https://api.openai.com/v1/chat/completions` for `openai_compatible`, `https://api.anthropic.com/v1/messages` for `anthropic` | |
 | `voice.intent.model` | string | `gpt-5-mini` for `openai_compatible`, `claude-haiku-4-5` for `anthropic` | |

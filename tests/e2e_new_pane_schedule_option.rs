@@ -195,23 +195,21 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     );
 }
 
-/// Scenario: Launch the deck with two long orchestration names, so the
-/// New Agent dialog's Mode field renders a chip row wider
-/// than the capped modal. Open the new-pane form (Ctrl+n → Space confirms the
-/// dir), then cycle the Mode field to the end so the built-in `[schedule]` chip
-/// is the selected option, and assert that the `[schedule]` chip renders FULLY
-/// within the modal's vertical borders — it is not clipped off the right edge.
-/// RED today: the chip row overflows the modal's inner width, so the renderer
-/// breaks the chip loop before drawing the trailing `[schedule]` chip, leaving
-/// it absent from every between-the-borders span. The assertion is
-/// approach-agnostic: it passes whether the coder later WRAPS the chip row to a
-/// second line or WINDOWS/scrolls the cycler, as long as the selected
-/// `[schedule]` chip ends up visible inside the modal.
+/// Scenario: Launch the deck with two long orchestration names and shrink the
+/// terminal to 80×24, so the New Agent dialog's Mode chip row is wider than the
+/// modal's 90%-of-terminal cap. Open the new-pane form (Ctrl+n → Space confirms
+/// the dir), cycle the Mode field onto the built-in `[schedule]` option, and
+/// assert that every chip — `[No mode]`, both `[Orch: …]` chips, `[schedule]`
+/// and `[dispatcher]` — renders whole between the modal's borders, the chips
+/// spread over more than one row (PRD #168: the row wraps instead of clipping).
 #[spec("prompt/new-pane/009")]
 #[test]
 fn new_pane_009_schedule_chip_contained_when_row_overflows() {
-    let deck = TuiDeck::launch_with_fixture("mode-chip-overflow");
+    let mut deck = TuiDeck::launch_with_fixture("mode-chip-overflow");
     deck.wait_for_string("No active agents");
+    // At 80 columns the modal is capped at 72, well short of the ~102 columns
+    // the single-row chip layout would need.
+    deck.resize(80, 24);
 
     // Open the new-pane form: Ctrl+n → directory picker, Space confirms the
     // current dir → the new-pane form.
@@ -237,29 +235,42 @@ fn new_pane_009_schedule_chip_contained_when_row_overflows() {
 
     let grid = deck.snapshot_grid();
 
-    // The selected `[schedule]` chip must render FULLY between the modal's
-    // vertical borders (`│`, U+2502). Scan every row bounded by a left AND a
-    // right `│` and check whether the bracketed chip lands inside that inner
-    // span — a wrap fix puts the chip on a second content line, a window/scroll
-    // fix keeps it on the Mode line, and both still live between the borders.
-    // The top-border title row carries corner glyphs (`┌ … ┐`), not `│ … │`, so
-    // the title's "schedule mode" (no brackets) is excluded; only the bracketed
-    // chip counts.
+    // Every chip must render FULLY between the modal's vertical borders (`│`,
+    // U+2502), on one of the rows bounded by a left AND a right `│`. The
+    // top-border title row carries corner glyphs (`┌ … ┐`), not `│ … │`, so the
+    // title's "schedule mode" (no brackets) is excluded; only bracketed chips
+    // count.
     let bar = '\u{2502}';
-    let contained = grid
+    let inner_rows: Vec<&str> = grid
         .lines()
-        .any(|line| match (line.find(bar), line.rfind(bar)) {
-            (Some(l), Some(r)) if r > l => line[l + bar.len_utf8()..r].contains("[schedule]"),
-            _ => false,
-        });
-
+        .filter_map(|line| match (line.find(bar), line.rfind(bar)) {
+            (Some(l), Some(r)) if r > l => Some(&line[l + bar.len_utf8()..r]),
+            _ => None,
+        })
+        .collect();
+    let chips = [
+        "[No mode]",
+        "[Orch: ci-deployment-alpha]",
+        "[Orch: ci-deployment-bravo]",
+        "[schedule]",
+        "[dispatcher]",
+    ];
+    for chip in chips {
+        assert!(
+            inner_rows.iter().any(|row| row.contains(chip)),
+            "the Mode chip {chip} must render FULLY within the new-pane modal \
+             border at 80 columns: the chip row is wider than the capped modal, \
+             so it must wrap onto further rows instead of clipping.\nGrid:\n{grid}"
+        );
+    }
+    let chip_rows = inner_rows
+        .iter()
+        .filter(|row| chips.iter().any(|chip| row.contains(chip)))
+        .count();
     assert!(
-        contained,
-        "the selected `[schedule]` chip must render FULLY within the new-pane modal border, \
-         but it is clipped off the right edge. The Mode chip row \
-         (two long orchestration chips before `[schedule]`) overflows the modal's \
-         inner width, so the renderer drops the trailing `[schedule]` chip and it never appears \
-         between any row's `│ … │` borders.\nGrid:\n{grid}"
+        chip_rows > 1,
+        "at 80 columns the Mode chips cannot share one modal row, so they must \
+         wrap onto more than one.\nGrid:\n{grid}"
     );
 }
 

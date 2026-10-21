@@ -73,7 +73,7 @@ A test also lists what your ssh config adds to the tunnel (for example port forw
    DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 nohup ~/.local/bin/dot-agent-deck daemon serve >/dev/null 2>&1 &
    ```
 
-   To have it come back after a logout, a crash or a reboot, run it under `systemd --user` or a macOS LaunchAgent as [Remote Environment Requirements](../remote-requirements.md#recommended-for-persistent-and-safe-use) describes.
+   To have it come back after a logout, a crash or a reboot, run it as a service: `dot-agent-deck daemon install` on that machine sets one up ([Run the Daemon as a Service](../daemon-service.md)).
 
 While the desktop app is connected to a daemon, that connection counts as a client, so the daemon does not idle out under it.
 
@@ -118,7 +118,7 @@ When a remote daemon runs an older release than the app, the app offers **Upgrad
 - On the Dashboard, on the daemon's section header, when the daemon is connected. Hovering it shows both versions.
 - In the **Incompatible daemon** note, when the app has refused the daemon because it is older, beside the note's other buttons.
 
-It does not appear when the daemon runs the same release as the app, when the daemon is newer than the app (upgrade the app instead, with its own upgrade button; see [Desktop App → Upgrade the app](index.md#upgrade-the-app)), or when the app could not learn the daemon's version. For the daemon on this machine, **Upgrade** installs nothing: it restarts the daemon onto the app's own version, and the app does that by itself when it finds an older one. See [Upgrade the daemon on this machine](#upgrade-the-daemon-on-this-machine).
+It does not appear when the daemon runs the same release as the app, when the daemon is newer than the app (upgrade the app instead, with its own upgrade button; see [Desktop App → Upgrade the app](index.md#upgrade-the-app)), or when the app could not learn the daemon's version. For the daemon on this machine, **Upgrade** installs nothing: it restarts the daemon onto the app's own version, and the app does that by itself when it finds an older one. See [Upgrade the CLI and the daemon on this machine](#upgrade-the-cli-and-the-daemon-on-this-machine).
 
 **What happens when you press it:**
 
@@ -157,7 +157,28 @@ The app installs over ssh from this computer, the way `remote upgrade` does, so 
 
 When the reason ends with `and it is still the daemon that was asked to restart`, the old daemon agreed to restart but never stopped, and nothing replaced it. Press **Upgrade** again, or run `dot-agent-deck daemon restart` on that machine and press **Reconnect**.
 
-## Upgrade the daemon on this machine
+## Upgrade the CLI and the daemon on this machine
+
+Two things on this machine can fall behind: the `dot-agent-deck` CLI on your `PATH`, which the TUI, your terminal commands and agent hooks run, and the daemon. The **Local daemon** section of the Dashboard offers **Upgrade** whenever either is behind, as a remote daemon's section does for that machine. Hovering it shows what is behind, for example `dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)`. The banner at the top of the Dashboard and the rail's upgrade button are about the app alone ([Desktop App → Upgrade the app](index.md#upgrade-the-app)).
+
+**TUI:**
+
+![The TUI's Upgrade to v0.47.0 dialog, opened with u from the footer notice dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0): the plan for the CLI, a downloaded binary at /home/dev/.local/bin/dot-agent-deck, saying what upgrading downloads and checks and that upgrading does not restart the daemon on this machine, then the question Upgrade dot-agent-deck CLI to v0.47.0? with Cancel selected above Upgrade](/img/self-upgrade-tui.png)
+
+**Desktop:**
+
+![The desktop Dashboard with no update banner, the Local daemon section's Upgrade button, and the Upgrade to v0.47.0 dialog it opened: the plan for the dot-agent-deck CLI installed with Homebrew, saying upgrading runs brew upgrade dot-agent-deck, the line Upgrading the CLI does not restart the daemon on this machine, so its agents keep running, and the question Upgrade dot-agent-deck CLI to v0.47.0? with Cancel and Upgrade buttons](/img/local-cli-upgrade-desktop.png)
+
+**Pressing Upgrade on the Local daemon section:**
+
+1. **When the CLI is behind**, the upgrade dialog shows the CLI's plan: how it was installed and what upgrading it does, upgraded with its own install method (`brew upgrade` for Homebrew, a checked download for a downloaded binary, or the command to run where the app cannot do it). Below the plan it says what follows: `Upgrading the CLI does not restart the daemon on this machine, so its agents keep running.`, or, when the daemon is behind too, that the daemon is restarted next. **Cancel** has the focus; **Cancel**, `Escape` or a click outside before you press **Upgrade** ends everything, having changed nothing. Press **Upgrade**, then **Close** once the result appears. For a CLI the app cannot upgrade, such as one installed with Nix, the dialog says what to do instead and offers only **Close**, which goes on to the daemon, if it is behind; `Escape` or a click outside ends everything. The rows for the CLI in [Desktop App → What you see on each outcome](index.md#what-you-see-on-each-outcome) say what each result means.
+2. **When the daemon runs an older release than the app**, the daemon is restarted onto the app's version, as described below. After an upgraded CLI this starts on its own; after a CLI the app could not upgrade, or when only the daemon is behind, it asks first: `Upgrade the daemon on this machine?`, with **Cancel** and **Upgrade**.
+
+When the CLI is a version behind, a TUI started from it restarts the daemon onto its own older version, asking first when agents are running, and agent hooks may run its older copy, so upgrade it rather than leaving it behind.
+
+**In the TUI**, the CLI and the local daemon are the same binary. Its upgrade dialog (`u`) offers the CLI it runs, and the CLI's plan says that upgrading does not restart the daemon on this machine, so its agents keep running, and that the next time you start the TUI it restarts a daemon running another version onto its own, asking first when agents are running ([Installation → Upgrade from the TUI](../installation.md#upgrade-from-the-tui)).
+
+### Restarting the daemon onto the app's version
 
 When the daemon on this machine runs an older release than the app, for example because you updated the app while the daemon kept running, the app restarts the daemon onto the app's version, as the TUI does when it starts. The daemon it starts is the one that came with the app, the same one **Start daemon** starts, so nothing is downloaded or installed.
 
@@ -171,19 +192,17 @@ When the daemon on this machine runs an older release than the app, for example 
 
 **In the TUI**, the same happens when `dot-agent-deck` starts and finds a daemon from a different build than its own: with nothing running it restarts the daemon without asking, and with agents running it prints `Daemon version mismatch`, the two builds and the agents a restart would stop. Press `S` to restart the daemon, stopping those agents, or any other key to keep the current daemon and attach to it with your agents intact. [Installation → Upgrading](../installation.md#upgrading) covers the TUI's other cases.
 
-The app does this once for each daemon version while it is open, so after **Keep current daemon**, or a restart that failed, it does not ask again until the next time you start the app. If an agent's pane or **New agent** is open when the app finds the older daemon, the dialog waits until you close it. To upgrade sooner, press **Upgrade** on the **Local daemon** section of the Dashboard; hovering it shows both versions. The dialog asks first, then goes on as above.
+The app does this once for each daemon version while it is open, so after **Keep current daemon**, or a restart that failed, it does not ask again until the next time you start the app. If an agent's pane or **New agent** is open when the app finds the older daemon, the dialog waits until you close it. To upgrade sooner, press **Upgrade** on the **Local daemon** section of the Dashboard; hovering it shows both versions.
 
 The restarted daemon sets up the agent hooks again, as every daemon start does.
 
-It applies only while the app is connected to the daemon on this machine, so the **Daemon** selector must show **This machine** or **All daemons**. Nothing happens when the daemon runs the same release as the app or a newer one. A daemon the app cannot work with shows **Incompatible daemon** with **Replace daemon** instead, which restarts it the same way ([Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release)).
+The daemon's restart applies only while the app is connected to the daemon on this machine, and **Upgrade** appears only while the **Local daemon** section is on the Dashboard, so the **Daemon** selector must show **This machine** or **All daemons**. Nothing happens when the daemon runs the same release as the app or a newer one. A daemon the app cannot work with shows **Incompatible daemon** with **Replace daemon** instead, which restarts it the same way ([Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release)).
 
 A daemon from a release before 0.46.0 cannot be asked to restart. The app restarts it only when nothing is running on it; otherwise the dialog ends with **Daemon kept running** and lists what is running. Stop those agents, or let them finish, then press **Upgrade**.
 
 The dialog ends with one of the titles in the [remote table above](#upgrade-a-remote-daemon), without the install: **Daemon upgraded**, **Daemon kept running**, **Another restart is already running**, **Upgrade failed** or **Upgrade stopped unexpectedly**, each with what to do. **No daemon was running** means the daemon stopped before it could be restarted; press **Start daemon** on its section of the Dashboard.
 
-**Check it worked:** the **Local daemon** section of the Dashboard lists its agents (or **No agents are running yet**) and no longer offers **Upgrade**.
-
-**Update the CLI along with the app.** The daemon now runs the app's version, but the `dot-agent-deck` on your `PATH`, which the TUI and your terminal commands run, is whatever you installed last. If that is an older release, the TUI started from it restarts the daemon onto its own older version, asking first when agents are running ([Installation → Upgrading](../installation.md#upgrading)). When a newer release is out, the app's upgrade dialog has a section for the CLI too: it upgrades it where the CLI's install method allows, and otherwise says how to update it ([Desktop App → Upgrade the app](index.md#upgrade-the-app)).
+**Check it worked:** the **Local daemon** section of the Dashboard lists its agents (or **No agents are running yet**) and no longer offers **Upgrade**. If it still does, hover it: what it names is still behind, for example a CLI that Homebrew does not offer the new release for yet.
 
 ## Rename a remote daemon
 

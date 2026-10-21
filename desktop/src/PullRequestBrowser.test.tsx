@@ -193,6 +193,66 @@ describe("PRD #1401 — the pull request badge", () => {
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
+  /**
+   * Scenario: a pull request with CI checks shows GitHub's mark for their
+   * result between the number and the review — a bare check, cross or dot —
+   * while the review sits in a filled circle, and the tooltip says the counts
+   * in words (issue #1781).
+   */
+  it.each([
+    ["passing", { passing: 24 }, "CI: 24 passing"],
+    ["failing", { failing: 1, passing: 24 }, "CI: 1 failing, 24 passing"],
+    ["pending", { pending: 2, passing: 3, skipped: 1 }, "CI: 2 pending, 3 passing, 1 skipped"],
+    ["unknown", { passing: 1 }, "CI: status unknown"],
+  ] as const)("shows %s CI beside the review", (state, counts, words) => {
+    const pullRequest = pullRequestFromDto({ number: 9, url: "https://github.com/o/r/pull/9", state: "open", review: "approved", checks: { state, ...counts } })!;
+    render(<PullRequestBadge pullRequest={pullRequest} testId="badge" />);
+    const badge = screen.getByTestId("badge");
+
+    expect(badge).toHaveAccessibleName(`Pull request #9: open, approved; ${words}`);
+    expect(badge.getAttribute("title")).toBe(`Pull request #9: open, approved; ${words}`);
+    expect(badge).toHaveAttribute("data-pr-checks", state);
+    expect(badge.className).toContain(`pr-checks-${state}`);
+    // State, CI, review — in that order, on the badge's one line.
+    const icons = [...badge.querySelectorAll("svg")];
+    expect(icons).toHaveLength(3);
+    const checks = badge.querySelector(".pr-badge-checks")!;
+    const review = badge.querySelector(".pr-badge-review")!;
+    expect(checks.compareDocumentPosition(review) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(badge.querySelector(".pr-badge-number")!.compareDocumentPosition(checks) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // An approval and passing CI are both a check on GitHub; only the review is filled.
+    expect(checks.tagName.toLowerCase()).toBe("svg");
+    expect(review.tagName.toLowerCase()).toBe("span");
+    expect(review.querySelector("svg")).not.toBeNull();
+  });
+
+  /** Scenario: the CI mark uses a different glyph for each result, so the result never rests on colour alone. */
+  it("draws a distinct CI glyph for each result", () => {
+    const glyphs = (["passing", "failing", "pending", "unknown"] as const).map((state) => {
+      const { unmount } = render(<PullRequestBadge pullRequest={{ number: 9, state: "open", checks: { state, passing: 1, failing: 0, pending: 0, skipped: 0 } }} testId="badge" />);
+      const glyph = screen.getByTestId("badge").querySelector(".pr-badge-checks")!.innerHTML;
+      unmount();
+      return glyph;
+    });
+    expect(new Set(glyphs).size).toBe(4);
+  });
+
+  /** Scenario: a pull request without checks, as an older daemon sends it, shows no CI mark and no CI words. */
+  it("shows no CI mark for a pull request without checks", () => {
+    render(<PullRequestBadge pullRequest={pullRequestFromDto({ number: 9, url: PR_URL, state: "open", review: "review_required" })!} testId="badge" />);
+    const badge = screen.getByTestId("badge");
+    expect(badge.querySelector(".pr-badge-checks")).toBeNull();
+    expect(badge).not.toHaveAttribute("data-pr-checks");
+    expect(badge.getAttribute("aria-label")).not.toContain("CI");
+  });
+
+  /** A CI result or count from a newer or broken daemon is read safely rather than shown as sent. */
+  it("reads a CI result it does not know as unknown and a bad count as none", () => {
+    const pr = pullRequestFromDto({ number: 3, url: PR_URL, state: "open", checks: { state: "awaiting" as never, passing: -1, failing: 2.5, pending: "3" as never } })!;
+    expect(pr.checks).toEqual({ state: "unknown", passing: 0, failing: 0, pending: 0, skipped: 0 });
+    expect(pullRequestFromDto({ number: 3, url: PR_URL, state: "open", checks: null as never })!.checks).toBeUndefined();
+  });
+
   /** A value from a newer daemon reads as unknown rather than failing the record. */
   it("reads a state or review it does not know as unknown, and refuses a URL off github.com", () => {
     const odd = pullRequestFromDto({ number: 3, url: "https://github.com.evil.example/o/r/pull/3", state: "queued" as never, review: "dismissed" as never })!;

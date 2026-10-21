@@ -3,7 +3,7 @@
   "packages": {
     "vals":                         "0.47.0",
     "go-task":                      "3.53.1",
-    "git":                          "2.55.0",
+    "git":                          "2.56.0",
     "upcloud-cli":                  "3.36.0",
     "openstackclient":              "10.3.0",
     "gh":                           "2.102.0",
@@ -16,7 +16,7 @@
     "rustfmt":                      "1.98.1",
     "path:gcloud#google-cloud-sdk": "",
     "asciinema-agg":                "1.9.0",
-    "ffmpeg":                       "9.0.1",
+    "ffmpeg":                       "9.0.2",
     "jq":                           "1.8.2",
     "curl":                         "8.22.0",
     "ripgrep":                      "15.2.0",

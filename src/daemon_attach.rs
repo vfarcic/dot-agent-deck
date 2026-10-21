@@ -97,16 +97,17 @@ pub fn parse_daemon_start_timeout(value: Option<&str>) -> Duration {
         })
 }
 
-/// The bound [`ensure_external_daemon_or_die`] polls with:
+/// The bound [`ensure_external_daemon_or_die`] polls with, and `daemon
+/// install` waits for the service's daemon with:
 /// [`DAEMON_START_POLL_TIMEOUT`], widened by [`DAEMON_START_TIMEOUT_ENV`] in an
 /// `e2e` build only.
 #[cfg(feature = "e2e")]
-fn daemon_start_poll_timeout() -> Duration {
+pub fn daemon_start_poll_timeout() -> Duration {
     parse_daemon_start_timeout(std::env::var(DAEMON_START_TIMEOUT_ENV).ok().as_deref())
 }
 
 #[cfg(not(feature = "e2e"))]
-fn daemon_start_poll_timeout() -> Duration {
+pub fn daemon_start_poll_timeout() -> Duration {
     DAEMON_START_POLL_TIMEOUT
 }
 
