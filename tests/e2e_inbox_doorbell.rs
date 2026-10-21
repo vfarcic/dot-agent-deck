@@ -357,10 +357,20 @@ fn assert_respawn_waits_for_ready(workers: &str) {
     assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
 }
 
-/// Scenario: Seed only the bare hydrated placeholder for a live synthetic pane, with its actual session and process startup timestamps set to the oldest representable value, and queue a task. An Idle placeholder must receive zero automatic bytes before the agent reports its own readiness; after its Idle hook, the fixed line is submitted and the task can be fetched.
+/// Scenario: Queue a task for a synthetic pane with a bare hydrated placeholder at the oldest representable startup, or its own native SessionStart aged to one day and the oldest representable startup in both session and process records. Each pane must receive zero automatic bytes until its own Idle hook permits the fixed line and an in-pane fetch.
 #[spec("inbox/doorbell/008")]
 #[test]
 fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
+    for (session_start, old) in [
+        (false, chrono::DateTime::<chrono::Utc>::MIN_UTC),
+        (true, chrono::Utc::now() - chrono::Duration::days(1)),
+        (true, chrono::DateTime::<chrono::Utc>::MIN_UTC),
+    ] {
+        assert_aged_generation_waits_for_ready(session_start, old);
+    }
+}
+
+fn assert_aged_generation_waits_for_ready(session_start: bool, old: chrono::DateTime<chrono::Utc>) {
     struct Fixture {
         daemon: common::InProcDaemon,
         root: tempfile::TempDir,
@@ -389,13 +399,17 @@ fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
         root: common::harness_tempdir().unwrap(),
     };
     let pane = route::start(&fixture, "placeholder-readiness", json!({}));
+    if session_start {
+        status(&fixture, &pane, "session_start", "claude_code");
+    }
     runtime.block_on(async {
         let mut state = fixture.daemon.state.write().await;
-        state.register_pane(pane.id.clone());
-        state.insert_placeholder_session(pane.id.clone(), None, None, Some(pane.agent.clone()));
+        if !session_start {
+            state.register_pane(pane.id.clone());
+            state.insert_placeholder_session(pane.id.clone(), None, None, Some(pane.agent.clone()));
+        }
         // Age the data the real admission and its independent writer recheck
         // read, rather than only the scheduler's injected decision clock.
-        let old = chrono::DateTime::<chrono::Utc>::MIN_UTC;
         let mut aged = 0;
         for session in state.sessions.values_mut() {
             if session.agent_id.as_deref() == Some(pane.agent.as_str()) {
@@ -407,7 +421,10 @@ fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
                 aged += 1;
             }
         }
-        assert_eq!(aged, 1, "the actual placeholder generation must be aged");
+        assert_eq!(
+            aged, 1,
+            "the actual generation must be aged (SessionStart={session_start})"
+        );
         fixture
             .daemon
             .registry
@@ -427,7 +444,7 @@ fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
     let id = enqueue(&fixture, &pane, BODY);
     assert!(
         !common::wait_until(Duration::from_millis(6500), || !bytes(&pane).is_empty()),
-        "bare placeholder received automatic input before current-generation readiness: {:?}; grid={}",
+        "aged generation received automatic input before current-generation readiness (SessionStart={session_start}, started_at={old}): {:?}; grid={}",
         String::from_utf8_lossy(&bytes(&pane)),
         screen(&fixture, &pane)
     );

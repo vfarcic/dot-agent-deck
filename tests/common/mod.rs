@@ -10629,6 +10629,28 @@ pub fn spawn_daemon_serve_with_env(
     let mut hook_socket = work.join("hook.sock");
     let mut attach_socket = work.join("attach.sock");
     let schedules_path = work.join("schedules.toml");
+    // Create the doorbell seam before socket binding can temporarily mask
+    // the owner's directory search bit with the daemon's process-wide umask.
+    if let Some((_, name)) = extra_env
+        .iter()
+        .rev()
+        .find(|(key, _)| *key == "DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR")
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let name = Path::new(name);
+        assert!(
+            name.components().count() == 1
+                && matches!(
+                    name.components().next(),
+                    Some(std::path::Component::Normal(_))
+                ),
+            "doorbell seam must be a directory directly under fixture HOME"
+        );
+        let controls = home.join(name);
+        std::fs::create_dir(&controls).expect("create doorbell controls before daemon startup");
+        std::fs::set_permissions(&controls, std::fs::Permissions::from_mode(0o700))
+            .expect("make doorbell controls searchable by fixture owner");
+    }
     if let Some(toml) = initial_schedules_toml {
         std::fs::write(&schedules_path, toml).expect("seed schedules.toml");
     }
