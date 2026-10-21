@@ -12,20 +12,32 @@
 # Keep the versions below in step with ci.yml (Renovate does not update this
 # file).
 
-# A push to `rwx` runs this on RWX and `.github/workflows/ci.yml` on GitHub
-# Actions side by side; `rwx run` from a worktree runs local uncommitted
-# changes on top of the pushed HEAD. Push-triggered runs on a public repository
-# can use the tool-cache vault only with its "Allow public repositories" switch
-# on (vault → Access Control).
+# Three triggers:
+# - a pull request: this run replaces the Linux jobs of
+#   `.github/workflows/ci.yml` when `.github/ci-backend` says `rwx`; otherwise
+#   the `backend` task below skips everything and the run passes in seconds, so
+#   RWX's check can stay required whichever system is active. It tests the PR's
+#   head commit (GitHub Actions tests the PR merged with its base).
+# - a push to `rwx`: runs side by side with GitHub Actions, for comparison.
+# - `rwx run` from a worktree: local uncommitted changes on top of the pushed
+#   HEAD.
+# GitHub-triggered runs on a public repository can use the tool-cache vault only
+# with its "Allow public repositories" switch on (vault -> Access Control).
 on:
   github:
+    pull_request:
+      init:
+        commit-sha: ${{ event.git.sha }}
+        trigger: pull_request
     push:
       if: ${{ event.git.branch == 'rwx' }}
       init:
         commit-sha: ${{ event.git.sha }}
+        trigger: push
   cli:
     init:
       commit-sha: ${{ event.git.sha }}
+      trigger: cli
 
 base:
   image: ubuntu:24.04
@@ -61,6 +73,20 @@ tasks:
       # Some fast-tier tests run `git rev-parse --show-toplevel`.
       preserve-git-dir: true
 
+  # Active unless this is a pull request and `.github/ci-backend` does not say
+  # `rwx`. Every task below checks it; when inactive they are skipped and the
+  # run passes, which is what lets GitHub Actions be the active side instead.
+  - key: backend
+    use: code
+    run: |
+      active=true
+      if [ "${{ init.trigger }}" = pull_request ] \
+          && [ "$(tr -d '[:space:]' < .github/ci-backend 2>/dev/null)" != rwx ]; then
+        active=false
+      fi
+      echo "trigger=${{ init.trigger }} active=$active"
+      printf '%s' "$active" > "$RWX_VALUES/active"
+
   - key: rust
     call: rust-lang/install 1.1.1
     with:
@@ -88,10 +114,12 @@ tasks:
       task --version
 
   - key: fmt
+    if: ${{ tasks.backend.values.active == 'true' }}
     use: [code, rust]
     run: cargo fmt --check
 
   - key: clippy
+    if: ${{ tasks.backend.values.active == 'true' }}
     use: [system-packages, code, rust]
     tool-cache: ci-clippy-v2
     env:
@@ -99,15 +127,18 @@ tasks:
     run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
 
   - key: build-release
+    if: ${{ tasks.backend.values.active == 'true' }}
     use: [system-packages, code, rust]
     tool-cache: ci-build-release-v2
     run: cargo build --release
 
   - key: linkage-check
+    if: ${{ tasks.backend.values.active == 'true' }}
     use: build-release
     run: cargo xtask linkage-check
 
   - key: test
+    if: ${{ tasks.backend.values.active == 'true' }}
     use: [system-packages, code, rust, nextest, go-task, node]
     tool-cache: ci-test-v2
     env:
@@ -134,6 +165,7 @@ tasks:
   # archive, so they never build the tier: a cargo build there would rebuild
   # the workspace crates, whose sources get fresh mtimes in every task.
   - key: e2e-build
+    if: ${{ tasks.backend.values.active == 'true' }}
     use: [system-packages, code, rust, nextest, node]
     tool-cache: ci-e2e-build-v2
     # The e2e `target/` plus its archive needs well over the default 50 GB.
@@ -154,6 +186,7 @@ tasks:
   # timing-sensitive e2e tests see the per-runner load they see in ci.yml, and
   # the speed-up comes from partitioning rather than from bigger machines.
   - key: e2e
+    if: ${{ tasks.backend.values.active == 'true' }}
     use: e2e-build
     parallel:
       values:

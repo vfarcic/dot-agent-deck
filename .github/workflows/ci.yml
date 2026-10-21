@@ -2,7 +2,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    # `rwx` too, so the CI-backend switch can be tried with PRs into the
+    # workbench branch instead of `main`.
+    branches: [main, rwx]
     types: [opened, synchronize, reopened]
   # Also verify main AFTER a merge. Without this, CI only ever saw proposed
   # changes, so a broken main stayed invisible until some later PR inherited the
@@ -183,7 +185,29 @@ jobs:
       devbox_only: ${{ steps.detect.outputs.devbox_only }}
       flake_only: ${{ steps.detect.outputs.flake_only }}
       binary: ${{ steps.binary.outputs.binary }}
+      linux_backend: ${{ steps.backend.outputs.linux_backend }}
     steps:
+      # Which system runs the Linux build and e2e jobs for a PULL REQUEST:
+      # `.github/ci-backend` says `rwx` or `gha`, read at the commit under
+      # test. Only pull requests move to RWX; a push to `main` always runs here,
+      # so post-merge verification does not depend on RWX credits or uptime.
+      # Anything other than `rwx` — a missing file, an API error, another word —
+      # means `gha`, the side that needs nothing outside this repository.
+      - id: backend
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          backend=gha
+          if [ "$EVENT" = pull_request ]; then
+            file=$(gh api -H 'Accept: application/vnd.github.raw' \
+              "repos/$REPO/contents/.github/ci-backend?ref=$SHA" 2>/dev/null \
+              | tr -d '[:space:]' || true)
+            [ "$file" = rwx ] && backend=rwx
+          fi
+          echo "linux_backend=$backend" | tee -a "$GITHUB_OUTPUT"
       - id: detect
         env:
           GH_TOKEN: ${{ github.token }}
@@ -588,7 +612,7 @@ jobs:
   # aggregator, so the required context keeps its name and its meaning.
   fmt:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -602,7 +626,7 @@ jobs:
 
   clippy:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -685,7 +709,7 @@ jobs:
 
   build-release:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -716,7 +740,7 @@ jobs:
 
   test:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -816,7 +840,9 @@ jobs:
   # counts as passing, exactly as it counted the single job before the split.
   build:
     needs: [changes, fmt, clippy, build-release, test]
-    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    # Skipped, which the ruleset counts as passing, when `.rwx/ci.yml` runs
+    # these jobs instead; RWX's own check is then the one that must pass.
+    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - env:
@@ -914,7 +940,7 @@ jobs:
   # instead of ~20.
   e2e-build:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     env:
       # NO debug info in the e2e build, unlike the `test` job's line tables.
@@ -975,7 +1001,7 @@ jobs:
 
   e2e:
     needs: [changes, e2e-build]
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     # HOW THIS NUMBER WAS PICKED, and what it is not. It is NOT a measured
     # runner wall clock: nobody has ever run this tier on a GitHub runner, so
@@ -1090,7 +1116,9 @@ jobs:
   # build and every shard are.
   e2e-deterministic:
     needs: [changes, e2e-build, e2e]
-    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    # Skipped, which the ruleset counts as passing, when `.rwx/ci.yml` runs
+    # these jobs instead; RWX's own check is then the one that must pass.
+    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - env:
