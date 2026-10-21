@@ -3637,25 +3637,39 @@ enum Refusal {
     SetsCommand,
 }
 
-/// Rows whose `yes` is taken only from both votes, however the pipeline
-/// reaches them (PRD #1733): each loses something or cannot be taken back.
-/// The send and the interrupt act on the agent at once; clearing the prompt,
+/// Rows whose `yes` is taken only from both votes when [`Judged`] decides
+/// them — a model's pick, a reading or a redirect target (PRD #1733): each
+/// loses something, cannot be taken back or sends something away. The send
+/// and the interrupt act on the agent at once; clearing the prompt,
 /// scratching the last thing typed and discarding the New agent form delete
-/// what the user said or entered; closing an orchestration stops every role
-/// in it. The interrupt, the clear and the scratch are refused as a pick
-/// anyway ([`TYPING_MODE_ROWS`]); they are here so that wall is not the only
-/// one. A row a context reads [`Strictness::Whole`] ([`CommandRow::whole_while`])
-/// is held the same way while that context holds ([`Judged::held`]). A row
-/// read `whole` whose action is switched back by one more utterance — the
-/// typing and reading modes, the hush — is not here: it runs on one readable
-/// vote, which must still answer `only`. Two votes on those bought no safety
-/// and cost false refusals: "capture my speech as text from now on" was
+/// what the user said or entered; reading mode on sends every later
+/// finished-turn reply to the configured Commands service, which may be
+/// remote, and turning it off cannot recall what was sent. Closing an
+/// orchestration stops nothing itself — it opens the confirmation that names
+/// every role it would stop — and is held to both votes all the same, so a
+/// misread sentence does not put that confirmation in front of the user. The
+/// interrupt, the clear and the scratch are refused as a pick anyway
+/// ([`TYPING_MODE_ROWS`]); they are here so that wall is not the only one.
+/// The local fast paths dispatch some of these rows with no vote at all, by
+/// design: typing mode's [`dictation_intercept`] the send, the interrupt, the
+/// clear and the scratch, and [`local_intercept`] the close over the New agent
+/// dialog ([`CLOSE_OVER_DIALOG_PHRASES`]) — fixed phrases compared with the
+/// whole utterance, with no model pick to check. A row a context reads
+/// [`Strictness::Whole`] ([`CommandRow::whole_while`]) is held the same way
+/// while that context holds ([`Judged::held`]). The other rows read `whole`
+/// — typing mode on and off and reading mode off, local switches, and the
+/// hush, which silences the speech playing now without stopping reading and
+/// does not bring that speech back — are not here: each runs on one readable
+/// vote, which must still answer `only`. A second vote on those would refuse
+/// a misreading one vote lets through, and that protection was judged not
+/// worth its false refusals: "capture my speech as text from now on" was
 /// refused on one cautious vote in 1 run of 5 (2026-10-21).
-const TWO_VOTE_ROWS: [&str; 6] = [
+const TWO_VOTE_ROWS: [&str; 7] = [
     SUBMIT_ROW,
     INTERRUPT_ROW,
     CLEAR_PROMPT_ROW,
     SCRATCH_ROW,
+    READING_ON_ROW,
     "discard_new_agent",
     "close_orchestration",
 ];
@@ -18929,8 +18943,8 @@ mod tests {
         (outcome, at.elapsed())
     }
 
-    /// Scenario: a pick that needs two votes — a whole-sentence send,
-    /// discarding the New agent form, closing the dialog over it, closing an
+    /// Scenario: a pick that needs two votes — a whole-sentence send, reading
+    /// mode on, discarding the New agent form, closing the dialog over it, closing an
     /// orchestration, and the form's Start reached as the reading of a
     /// refused stop — runs only when both votes list it. Yes then no, no then
     /// yes, yes beside a failed vote in either order, and yes beside a vote
@@ -18953,6 +18967,15 @@ mod tests {
                 IntentAnswer::new(SUBMIT_ROW),
                 &[SUBMIT_ROW],
                 SUBMIT_ROW,
+            ),
+            (
+                "read the agents' replies out loud to me from now on",
+                Screen::Overview,
+                fleet(),
+                false,
+                IntentAnswer::new(READING_ON_ROW),
+                &[READING_ON_ROW],
+                READING_ON_ROW,
             ),
             (
                 "throw the form away",
@@ -19185,9 +19208,9 @@ mod tests {
         }
     }
 
-    /// Scenario: a row read whole-sentence whose action one more utterance
-    /// switches back — typing mode on, reading mode on, the hush — runs on one
-    /// readable vote that lists it as the whole sentence: at once when the
+    /// Scenario: a row read whole-sentence that is a local switch — typing
+    /// mode on and off, reading mode off — or the hush runs on one readable
+    /// vote that lists it as the whole sentence: at once when the
     /// first does and the other never answers, and on the second when the
     /// first did not list it or failed. Votes that list it only as part of a
     /// longer sentence are a `no`, so two of them refuse it as not said on
@@ -19195,16 +19218,21 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn voice_outcome_a_reversible_whole_row_runs_on_one_readable_vote() {
         use Vote::{Among, Fails, Hangs, Lists};
-        let cases: [(&str, Screen, &'static [&'static str]); 3] = [
+        let cases: [(&str, Screen, &'static [&'static str]); 4] = [
             (
                 "capture my speech as text from now on",
                 Screen::Agent,
                 &[DICTATION_ON_ROW],
             ),
             (
-                "read the agents' replies out loud to me from now on",
-                Screen::Overview,
-                &[READING_ON_ROW],
+                "treat my speech as commands again",
+                Screen::Agent,
+                &[DICTATION_OFF_ROW],
+            ),
+            (
+                "disable spoken agent updates",
+                Screen::Agent,
+                &[READING_OFF_ROW],
             ),
             (
                 "that's enough reading aloud",
