@@ -2239,13 +2239,54 @@ fn restates_the_forms_deck(
 /// `names_target`: the classifier is never shown a daemon's name, so a label
 /// made of ordinary or start words ("Run", "Launch") is, to it, a bare start.
 /// The app knows the names, and refuses the echo when one is said.
+///
+/// A run the resolver reaches a deck by only as a word inside one of its
+/// names written as several words is not that deck said
+/// ([`only_inside_a_phrase`]): "start this agent" does not name the local
+/// deck's "this machine".
 fn names_a_known_deck(transcript: &str, decks: &[VoiceDeck]) -> bool {
     let words = spoken_words(transcript);
     (1..=3).any(|width| {
-        words
-            .windows(width)
-            .any(|run| resolve_new_agent_deck_ref(&run.join(" "), decks) != DeckRefMatch::None)
+        words.windows(width).any(|run| {
+            let run = run.join(" ");
+            let reached = match resolve_new_agent_deck_ref(&run, decks) {
+                DeckRefMatch::None => return false,
+                DeckRefMatch::One { id, .. } => vec![id],
+                DeckRefMatch::Ambiguous(candidates) => {
+                    candidates.into_iter().map(|c| c.value).collect()
+                }
+            };
+            decks
+                .iter()
+                .any(|deck| reached.contains(&deck.id) && !only_inside_a_phrase(&run, deck))
+        })
     })
+}
+
+/// Whether `run`'s words, less [`DECK_CATEGORY_WORDS`], are only part of
+/// `deck`'s names written as several words — "this" of "this machine", "new"
+/// of a label "New gpu box" — and neither a whole name of it nor part of a
+/// name written as one word, which a sentence shortens: "build" of
+/// `build-box`.
+fn only_inside_a_phrase(run: &str, deck: &VoiceDeck) -> bool {
+    let said = words(&deck_reference(run));
+    if said.is_empty() {
+        return false;
+    }
+    let mut inside = false;
+    for name in deck_spoken_names(deck) {
+        let name_words = words(&deck_reference(&name));
+        if name_words.is_subset(&said) {
+            return false;
+        }
+        if said.is_subset(&name_words) {
+            if !name.contains(char::is_whitespace) {
+                return false;
+            }
+            inside = true;
+        }
+    }
+    inside
 }
 
 /// Where in `words` the action is said, as `(start, width)`: the earliest
@@ -18053,6 +18094,7 @@ mod tests {
             ("start an agent on BuildBoxDeck", &decks()),
             ("build box, start an agent", &decks()),
             ("start an agent on build", &decks()),
+            ("start an agent on this machine", &decks()),
         ] {
             for alone in [false, true] {
                 let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
@@ -18098,6 +18140,18 @@ mod tests {
             panic!("Start agent among start-word labels: expected a dispatch, got {unasked:?}");
         };
         assert_eq!(invoke, "startNewAgent");
+        // A word inside one of a deck's names written as several words is
+        // not that deck said: "this" in "start this agent" is not the local
+        // deck's "this machine" (PR #1788 review, Qodo), so a bare start read
+        // that way by both votes starts the form over the echoed local deck.
+        for said in ["start this agent", "start this one"] {
+            let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
+            let outcome = start(said, answer, form.clone(), decks(), true, bare).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { invoke, .. } if invoke == "startNewAgent"),
+                "{said:?} with Local deck echoed: {outcome:?}"
+            );
+        }
         // PRD #1666 review RR-1 pinned that advertised start wording outside a
         // word list ("activate orchestration", "start the run", "spin it up
         // now") was refused when the model echoed the form's deck. Since PRD
