@@ -1332,8 +1332,11 @@ async fn boundary_022_cancel_tells_the_orchestrator_what_it_knows() {
     };
     peer.send(serde_json::json!({"already_handed": revoked}))
         .await;
-    until("the cancel to end it", || {
+    // The state lock is released before the owed notice is posted, so the
+    // notice is waited for, not assumed published with the state.
+    until("the cancel to end it and its notice", || {
         state_of(&hub, "p", handed_task.as_str()) == StateName::Undeliverable
+            && !notices(&hub).is_empty()
     })
     .await;
     let told = notices(&hub);
@@ -1400,8 +1403,9 @@ async fn boundary_022_cancel_tells_the_orchestrator_what_it_knows() {
             break;
         }
     }
-    until("the second cancel", || {
+    until("the second cancel and its notice", || {
         state_of(&hub, "p", queued_task.as_str()) == StateName::Undeliverable
+            && notices(&hub).len() >= 3
     })
     .await;
     let told = notices(&hub);
