@@ -8084,14 +8084,15 @@ start = true
             .expect("stop the agent");
     }
 
-    /// Issue #1472, the success half over a scripted socket so it runs
-    /// everywhere: a deck one declared break behind is refused, Connect anyway
-    /// handshakes it again and lists its agents, and nothing is reported as a
-    /// failure.
+    /// Scenario: a deck one declared break behind is refused while a different deck is selected. Connect anyway handshakes and lists the refused deck, returns its identity and reports no failure; the selected deck receives no protected request.
     #[cfg(unix)]
     #[tokio::test]
     async fn connect_anyway_connects_the_refused_deck_and_reports_no_failure() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let _guard = AllowanceGuard::acquire();
+        let selected = SwappedDeck::start("ca-selected", matching_hello());
+        let _local_deck = crate::local_deck::test_override::point_local_deck_at(&selected.socket);
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
         let (dir, socket) = scratch_socket("ca-ok");
         let listener = bind_trusted(&socket);
         let listing = AttachResponse::agent_records(vec![listed_agent("agent-a", "pane-a")]);
@@ -8110,7 +8111,19 @@ start = true
         assert_eq!(refused.connection.status, ConnectionStatus::Incompatible);
 
         let connected = connect_anyway(&links, &endpoint).await;
+        let sent_to_selected = selected.protected_sent();
+        selected.shutdown();
         assert_eq!(connected.connection.status, ConnectionStatus::Connected);
+        assert_eq!(
+            connected.connection.deck_id,
+            deck_wire_id(&endpoint),
+            "Connect anyway must answer for the refused deck"
+        );
+        assert_eq!(connected.connection.socket_path, endpoint.describe());
+        assert!(
+            sent_to_selected.is_empty(),
+            "Connect anyway sent the selected deck {sent_to_selected:?}"
+        );
         assert_eq!(connected.agents.len(), 1, "the deck's agents are listed");
         assert_eq!(connect_anyway_failure(&connected.connection), None);
         assert_eq!(daemon.await.expect("no panic"), 3);
@@ -8557,6 +8570,7 @@ start = true
         socket: std::path::PathBuf,
         sent_to_replacement: Arc<std::sync::Mutex<Vec<String>>>,
         replacement_hellos: Arc<AtomicUsize>,
+        unchecked_protected: Arc<AtomicUsize>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -8568,10 +8582,12 @@ start = true
             let listener = bind_trusted(&socket);
             let sent_to_replacement = Arc::new(std::sync::Mutex::new(Vec::new()));
             let replacement_hellos = Arc::new(AtomicUsize::new(0));
+            let unchecked_protected = Arc::new(AtomicUsize::new(0));
             let replacement = with_follow_on(replacement);
             let server = {
                 let sent = Arc::clone(&sent_to_replacement);
                 let hellos = Arc::clone(&replacement_hellos);
+                let unchecked = Arc::clone(&unchecked_protected);
                 tokio::spawn(async move {
                     let mut swapped = false;
                     // Held so a subscription or an attach stays open while the
@@ -8580,6 +8596,7 @@ start = true
                     while let Ok((stream, _peer)) = listener.accept().await {
                         let (mut reader, mut writer) = stream.into_split();
                         let mut follow_on = true;
+                        let mut checked = false;
                         while std::mem::take(&mut follow_on) {
                             let Ok(Some((KIND_REQ, payload))) = read_frame(&mut reader).await
                             else {
@@ -8589,6 +8606,7 @@ start = true
                                 serde_json::from_slice(&payload).unwrap_or_default();
                             let op = request["op"].as_str().unwrap_or_default().to_string();
                             let reply = if op == "hello" {
+                                checked = true;
                                 follow_on = request["follow_on"] == true;
                                 if swapped {
                                     hellos.fetch_add(1, Ordering::SeqCst);
@@ -8598,6 +8616,9 @@ start = true
                                 }
                             } else {
                                 if swapped {
+                                    if !checked && PROTECTED_OPS.contains(&op.as_str()) {
+                                        unchecked.fetch_add(1, Ordering::SeqCst);
+                                    }
                                     sent.lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .push(op.clone());
@@ -8628,6 +8649,7 @@ start = true
                 socket,
                 sent_to_replacement,
                 replacement_hellos,
+                unchecked_protected,
                 server,
             }
         }
@@ -8645,6 +8667,10 @@ start = true
                 .filter(|op| PROTECTED_OPS.contains(&op.as_str()))
                 .cloned()
                 .collect()
+        }
+
+        fn unchecked_protected_sent(&self) -> usize {
+            self.unchecked_protected.load(Ordering::SeqCst)
         }
 
         fn shutdown(self) {
@@ -8677,7 +8703,7 @@ start = true
     /// declared contract break behind. The watcher's subscription, on the link
     /// that still holds the first daemon's classification, is refused and the
     /// replacement is sent no subscription; replaced by the same build, the
-    /// subscription goes through.
+    /// subscription goes through on the connection that answered its Hello.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_watcher_subscription_after_a_swap_sends_the_replacement_nothing() {
@@ -8696,8 +8722,13 @@ start = true
                 bounded_reply("SubscribeEvents", daemon.client.subscribe_events()).await;
             let protected = deck.protected_sent();
             let hellos = deck.replacement_hellos.load(Ordering::SeqCst);
+            let unchecked = deck.unchecked_protected_sent();
             deck.shutdown();
 
+            assert_eq!(
+                unchecked, 0,
+                "{name}: subscription on an unchecked connection"
+            );
             assert!(
                 hellos > 0,
                 "{name}: precondition: the subscription went to the replacement"
@@ -8724,7 +8755,7 @@ start = true
     /// next attach protocol, or one a declared contract break behind. The
     /// listing is refused and never sent, the snapshot shows no agents, and the
     /// next snapshot shows the deck refused rather than connected; replaced by
-    /// the same build, the replacement's agent is listed.
+    /// the same build, the replacement's agent is listed on a checked connection.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_snapshot_listing_after_a_swap_sends_the_replacement_nothing() {
@@ -8737,8 +8768,12 @@ start = true
             let first = snapshot_of(&endpoint, &links).await;
             let second = snapshot_of(&endpoint, &links).await;
             let protected = deck.protected_sent();
+            let hellos = deck.replacement_hellos.load(Ordering::SeqCst);
+            let unchecked = deck.unchecked_protected_sent();
             deck.shutdown();
 
+            assert!(hellos > 0, "{name}: the listing checked the replacement");
+            assert_eq!(unchecked, 0, "{name}: listing on an unchecked connection");
             if served {
                 assert_eq!(
                     first.connection.status,
@@ -8774,7 +8809,7 @@ start = true
     /// replaced between that handshake and the start — by one on the next
     /// attach protocol, or one a declared contract break behind. The start is
     /// refused and the replacement starts nothing; replaced by the same build,
-    /// the agent starts there.
+    /// the agent starts there on the connection that answered its Hello.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_new_agent_start_after_a_swap_sends_the_replacement_nothing() {
@@ -8790,8 +8825,10 @@ start = true
             let started = crate::start_agent_action(&state, &wire, plain_start("gf2-new")).await;
             let protected = deck.protected_sent();
             let hellos = deck.replacement_hellos.load(Ordering::SeqCst);
+            let unchecked = deck.unchecked_protected_sent();
             deck.shutdown();
 
+            assert_eq!(unchecked, 0, "{name}: start on an unchecked connection");
             assert!(
                 hellos > 0,
                 "{name}: precondition: the start went to the replacement"
@@ -8813,40 +8850,99 @@ start = true
         }
     }
 
-    /// Scenario: with Connect anyway chosen for the session, a deck one
-    /// declared contract break behind is replaced after the app's handshake by
-    /// another daemon one break behind. The snapshot lists its agents and New
-    /// agent starts on it: the allowance the user chose holds on every request,
-    /// as it does at connect.
+    /// Scenario: with Connect anyway chosen for the session, the snapshot lists agents and New agent starts on a replacement one declared contract break behind, each on a checked connection. A replacement on the next protocol is still refused, and a second deck on that protocol receives no listing, subscription or start under the session allowance.
     #[cfg(unix)]
     #[tokio::test]
     async fn connect_anyway_admits_the_requests_of_a_deck_a_break_behind() {
         let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let _guard = AllowanceGuard::acquire();
         allow_build_mismatch_this_session();
-        let deck = SwappedDeck::start("gf2-allow", hello_from_a_deck_one_declared_break_behind());
-        let _local_deck = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
-        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
-        let state = crate::terminal::DesktopState::default();
-        let endpoint = deck.endpoint();
+        for (name, replacement, _) in replacements() {
+            let protocol_mismatch = replacement.server_version != Some(PROTOCOL_VERSION);
+            let deck = SwappedDeck::start("gf2-allow", replacement);
+            let _local_deck = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = crate::terminal::DesktopState::default();
+            let endpoint = deck.endpoint();
 
-        let snapshot = snapshot_of(&endpoint, &state.daemon).await;
-        let started =
-            crate::start_agent_action(&state, &deck_wire_id(&endpoint), plain_start("gf2-allow"))
-                .await;
-        let protected = deck.protected_sent();
-        deck.shutdown();
+            let snapshot = snapshot_of(&endpoint, &state.daemon).await;
+            let started = crate::start_agent_action(
+                &state,
+                &deck_wire_id(&endpoint),
+                plain_start("gf2-allow"),
+            )
+            .await;
+            let protected = deck.protected_sent();
+            let unchecked = deck.unchecked_protected_sent();
+            deck.shutdown();
 
-        assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
+            assert_eq!(
+                unchecked, 0,
+                "{name}: allowed request on an unchecked connection"
+            );
+            if protocol_mismatch {
+                assert_ne!(snapshot.connection.status, ConnectionStatus::Connected);
+                assert!(snapshot.agents.is_empty());
+                assert!(
+                    started.is_err(),
+                    "Connect anyway must not bypass the replacement protocol"
+                );
+                assert!(
+                    protected.is_empty(),
+                    "the protocol replacement received {protected:?}"
+                );
+                continue;
+            }
+            assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
+            assert_eq!(
+                snapshot.agents.len(),
+                1,
+                "the replacement's agent is listed"
+            );
+            assert!(started.is_ok(), "{:?}", started.err());
+            assert_eq!(
+                protected,
+                vec!["list-agents".to_string(), "start-agent".to_string()]
+            );
+        }
+
+        let mut newer = matching_hello();
+        newer.server_version = Some(PROTOCOL_VERSION + 1);
+        let other = SwappedDeck::start("gf2-other-protocol", newer);
+        let links = DaemonLinks::default();
+        let endpoint = other.endpoint();
+        let daemon = links
+            .trusted(&endpoint)
+            .await
+            .expect("the other deck initially matches");
+        daemon
+            .require_compatible()
+            .expect("the other deck is held as compatible");
+        let listed = daemon.client.list_agents_detailed().await;
+        let subscribed = daemon.client.subscribe_events().await;
+        let started = daemon.client.start_agent(Default::default()).await;
+        let protected = other.protected_sent();
+        let hellos = other.replacement_hellos.load(Ordering::SeqCst);
+        other.shutdown();
         assert_eq!(
-            snapshot.agents.len(),
-            1,
-            "the replacement's agent is listed"
+            hellos, 3,
+            "each request checks the other deck's replacement"
         );
-        assert!(started.is_ok(), "{:?}", started.err());
-        assert_eq!(
-            protected,
-            vec!["list-agents".to_string(), "start-agent".to_string()]
+        assert!(
+            listed.is_err(),
+            "the session allowance leaked to another deck's protocol"
+        );
+        assert!(
+            subscribed.is_err(),
+            "the session allowance let another protocol subscribe"
+        );
+        assert!(
+            started.is_err(),
+            "the session allowance let another protocol start"
+        );
+        assert!(
+            protected.is_empty(),
+            "the other protocol received {protected:?}"
         );
     }
 }

@@ -2538,7 +2538,8 @@ mod tests {
     /// and the tile reopens on another channel before anything distrusts the
     /// deck. The reopen is refused in the connection banner's words and the
     /// replacement is sent no attach. With Connect anyway chosen for the
-    /// session, the same reopen attaches, as it would connect.
+    /// session, the same reopen attaches on its checked connection, while a
+    /// replacement on the next protocol is still refused with no attach.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_reopen_against_a_contract_break_is_refused_as_connect_refuses_it() {
@@ -2548,7 +2549,7 @@ mod tests {
         use std::time::Duration;
 
         let _selection = crate::dto::SELECTION_LOCK.lock().await;
-        for connect_anyway in [false, true] {
+        for (connect_anyway, next_protocol) in [(false, false), (true, false), (true, true)] {
             let _allowance = crate::daemon_bridge::AllowanceGuard::acquire();
             let (_dir, socket) = scratch_socket("dad-held-break");
             let (listener, _local_deck) = bind_local_deck(&socket);
@@ -2582,6 +2583,8 @@ mod tests {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
             let admissions = Arc::new(AtomicUsize::new(0));
             let count = Arc::clone(&admissions);
+            let unchecked = Arc::new(AtomicUsize::new(0));
+            let unchecked_count = Arc::clone(&unchecked);
             let replacement = tokio::spawn(async move {
                 let mut streams = Vec::new();
                 while let Ok((stream, _)) = listener.accept().await {
@@ -2590,6 +2593,7 @@ mod tests {
                         dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
                     let mut writer = TransportWriteHalf::new(writer);
                     let mut follow_on = true;
+                    let mut checked = false;
                     while std::mem::take(&mut follow_on) {
                         let Some((KIND_REQ, payload)) = read_frame(&mut reader).await.unwrap()
                         else {
@@ -2597,15 +2601,23 @@ mod tests {
                         };
                         let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
                         let reply = if request["op"] == "hello" {
+                            checked = true;
                             follow_on = request["follow_on"] == true;
                             let mut hello =
                                 crate::daemon_bridge::hello_from_a_deck_one_declared_break_behind()
                                     .with_capabilities();
                             hello.build_version = matching_hello().build_version;
+                            if next_protocol {
+                                hello.server_version =
+                                    Some(dot_agent_deck::daemon_protocol::PROTOCOL_VERSION + 1);
+                            }
                             hello
                         } else {
                             if request["op"] == "attach-stream" {
                                 count.fetch_add(1, Ordering::SeqCst);
+                                if !checked {
+                                    unchecked_count.fetch_add(1, Ordering::SeqCst);
+                                }
                             }
                             AttachResponse::ok()
                         };
@@ -2624,7 +2636,12 @@ mod tests {
             .expect("bounded reopen");
             replacement.abort();
 
-            if connect_anyway {
+            assert_eq!(
+                unchecked.load(Ordering::SeqCst),
+                0,
+                "reopen attached on an unchecked connection"
+            );
+            if connect_anyway && !next_protocol {
                 assert!(
                     reopened.is_ok(),
                     "Connect anyway admits the deck on every request: {:?}",
@@ -2641,6 +2658,13 @@ mod tests {
             let Err(refusal) = reopened else {
                 panic!("a reopen against a declared contract break must be refused");
             };
+            if next_protocol {
+                assert!(
+                    refusal.contains("Not attaching: the daemon speaks attach protocol"),
+                    "{refusal}"
+                );
+                continue;
+            }
             assert!(
                 refusal.contains("The app has not connected"),
                 "the refusal must be the connection banner's: {refusal}"
