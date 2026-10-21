@@ -109,7 +109,7 @@ function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
   return <AppDeckShell initialView={{ kind: "deck" }} {...props} />;
 }
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
-import { agentKey } from "../lib/agentKey";
+import { agentKey, boundAgentKey } from "../lib/agentKey";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "../lib/bridge";
 import type { AgentTarget, DeckActionResult, DeckRuntimeState } from "../types";
 import { TerminalViewport } from "./TerminalViewport";
@@ -162,7 +162,7 @@ function overlayRuntime(resizeTerminal: DeckRuntimeState["resizeTerminal"]): Dec
     // #1105's security audit. Only the FIXTURE moved: a bare id here would
     // simply never be found, and this test would then assert nothing about the
     // applied geometry it exists to hold xterm at.
-    appliedGeometry: { [agentKey(snapshot.connection.deckId, "planner")]: APPLIED_GRID },
+    appliedGeometry: { [boundAgentKey({ deckId: snapshot.connection.deckId, agentId: "planner", incarnation: undefined })]: APPLIED_GRID },
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),

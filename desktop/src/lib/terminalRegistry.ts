@@ -1,5 +1,5 @@
 import type { Terminal } from "@xterm/xterm";
-import { agentKey } from "./agentKey";
+import { boundAgentKey } from "./agentKey";
 
 /**
  * Live xterm instances by the composite `(deckId, agentId)`. The Reader overlay
@@ -22,22 +22,28 @@ import { agentKey } from "./agentKey";
  * identity check below no longer matched. `registerRefit` had the same shape, so
  * a zoom re-fitted one of the two panes and left the other measuring at the old
  * scale.
+ *
+ * And keyed by the daemon process as well (`boundAgentKey`, PRD #1666 part 2,
+ * G-fix7): a restarted deck reuses agent ids, and the bridge applies an attach's
+ * grid to the instance it finds here, so a lookup by `(deckId, agentId)` alone
+ * reshaped — and the Reader read — the previous process's pane for its
+ * successor. `incarnation` is required so every caller says which process.
  */
 const terminals = new Map<string, Terminal>();
 
-export function registerTerminal(deckId: string | undefined, agentId: string, terminal: Terminal): void {
-  terminals.set(agentKey(deckId, agentId), terminal);
+export function registerTerminal(deckId: string | undefined, agentId: string, terminal: Terminal, incarnation: string | undefined): void {
+  terminals.set(boundAgentKey({ deckId, agentId, incarnation }), terminal);
 }
 
-export function unregisterTerminal(deckId: string | undefined, agentId: string, terminal: Terminal): void {
+export function unregisterTerminal(deckId: string | undefined, agentId: string, terminal: Terminal, incarnation: string | undefined): void {
   // Only forget the exact instance we registered; a remounting viewport may
   // have already replaced it.
-  const key = agentKey(deckId, agentId);
+  const key = boundAgentKey({ deckId, agentId, incarnation });
   if (terminals.get(key) === terminal) terminals.delete(key);
 }
 
-export function getTerminal(deckId: string | undefined, agentId: string): Terminal | undefined {
-  return terminals.get(agentKey(deckId, agentId));
+export function getTerminal(deckId: string | undefined, agentId: string, incarnation: string | undefined): Terminal | undefined {
+  return terminals.get(boundAgentKey({ deckId, agentId, incarnation }));
 }
 
 /**
@@ -58,16 +64,16 @@ export function getTerminal(deckId: string | undefined, agentId: string): Termin
  */
 const refits = new Map<string, () => void>();
 
-export function registerRefit(deckId: string | undefined, agentId: string, refit: () => void): void {
-  refits.set(agentKey(deckId, agentId), refit);
+export function registerRefit(deckId: string | undefined, agentId: string, refit: () => void, incarnation: string | undefined): void {
+  refits.set(boundAgentKey({ deckId, agentId, incarnation }), refit);
 }
 
-export function unregisterRefit(deckId: string | undefined, agentId: string, refit: () => void): void {
+export function unregisterRefit(deckId: string | undefined, agentId: string, refit: () => void, incarnation: string | undefined): void {
   // Same identity check as `unregisterTerminal`, and for the same reason: a
   // remounting viewport has already replaced this entry by the time the old
   // effect's cleanup runs, and forgetting the new pane's refit would leave it
   // out of every subsequent zoom.
-  const key = agentKey(deckId, agentId);
+  const key = boundAgentKey({ deckId, agentId, incarnation });
   if (refits.get(key) === refit) refits.delete(key);
 }
 

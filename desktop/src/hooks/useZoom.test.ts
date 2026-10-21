@@ -193,9 +193,9 @@ describe("useZoom", () => {
     renderHook(() => useZoom(runtimeState(), settings));
 
     const refit = vi.fn();
-    registerRefit(DECK, "agent-1", refit);
+    registerRefit(DECK, "agent-1", refit, undefined);
     const second = vi.fn();
-    registerRefit(DECK, "agent-2", second);
+    registerRefit(DECK, "agent-2", second, undefined);
 
     try {
       act(() => press("="));
@@ -205,8 +205,8 @@ describe("useZoom", () => {
       expect(refit).toHaveBeenCalledTimes(1);
       expect(second).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit(DECK, "agent-1", refit);
-      unregisterRefit(DECK, "agent-2", second);
+      unregisterRefit(DECK, "agent-1", refit, undefined);
+      unregisterRefit(DECK, "agent-2", second, undefined);
     }
   });
 
@@ -215,7 +215,7 @@ describe("useZoom", () => {
     renderHook(() => useZoom(runtimeState(), settings));
 
     const refit = vi.fn();
-    registerRefit(DECK, "agent-1", refit);
+    registerRefit(DECK, "agent-1", refit, undefined);
     try {
       // Five steps in one frame — what a held key produces. Every one of them
       // must reach the webview, but the layout must only be measured once.
@@ -223,7 +223,7 @@ describe("useZoom", () => {
       act(() => { vi.advanceTimersByTime(20); });
       expect(refit).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit(DECK, "agent-1", refit);
+      unregisterRefit(DECK, "agent-1", refit, undefined);
     }
   });
 

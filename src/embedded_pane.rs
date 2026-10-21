@@ -280,20 +280,70 @@ fn bound_to_held(base: &DaemonClient, incarnation: &Incarnation) -> DaemonClient
 type CardIncarnations = Arc<Mutex<HashMap<String, Incarnation>>>;
 
 /// The daemon process every request about `card`'s pane goes to (PRD #1666
-/// part 2, G-fix6): the one this controller attached the pane on, live or
-/// since detached, when it did; otherwise the one the card was learned from.
-/// The controller's own record wins because it is the attach that produced the
-/// pane here, and for a card learned from the same daemon it names the same
-/// process; neither is ever re-read from a newer reply.
+/// part 2, G-fix6, G-fix7). A card learned from a named process is bound to
+/// that process, whatever this controller holds under the same pane id: a
+/// local pane attached on another process is another agent's, which the card
+/// may not reach. A controller reference ([`BoundPane::held_by_controller`])
+/// or a card learned from no named process is bound by the controller's own
+/// record of the attach that produced the pane here, live or since detached,
+/// when it has one. Neither is ever re-read from a newer reply.
 fn held_incarnation(
     panes: &PaneRegistry,
     cards: &CardIncarnations,
     card: &BoundPane,
 ) -> Incarnation {
-    pane_attachment_in(panes, &card.pane_id)
+    if !card.incarnation.is_unnamed() {
+        return card.incarnation.clone();
+    }
+    controller_record(panes, cards, &card.pane_id).unwrap_or_else(|| card.incarnation.clone())
+}
+
+/// The process this controller attached `pane_id` on, live or since
+/// detached, if it did (PRD #1666 part 2, G-fix6).
+fn controller_record(
+    panes: &PaneRegistry,
+    cards: &CardIncarnations,
+    pane_id: &str,
+) -> Option<Incarnation> {
+    pane_attachment_in(panes, pane_id)
         .and_then(|attachment| attachment.incarnation)
-        .or_else(|| cards.lock().unwrap().get(&card.pane_id).cloned())
-        .unwrap_or_else(|| card.incarnation.clone())
+        .or_else(|| cards.lock().unwrap().get(pane_id).cloned())
+}
+
+/// PRD #1666 part 2 (G-fix7): a pane's name to go back to while renames of it
+/// are unanswered — see [`EmbeddedPaneController::rename_baselines`].
+#[derive(Debug, Clone)]
+struct RenameBaseline {
+    name: String,
+    unanswered: u32,
+}
+
+/// PRD #1666 part 2 (G-fix7): the deck's answer to one rename, for the render
+/// loop to bring the dashboard's names in line with the pane's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameSettled {
+    pub pane_id: String,
+    /// The label the pane keeps — empty for a cleared one — or `None` when the
+    /// deck refused the rename for a deck restart or an unnamed deck.
+    pub label: Option<String>,
+    /// Whether no other rename of the pane is left unanswered. A refusal is
+    /// taken back only then, to the last confirmed name.
+    pub last: bool,
+}
+
+/// PRD #1666 part 2 (G-fix7): how a card's pane id relates to this
+/// controller's local pane under the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalPaneFor {
+    /// No local pane under the card's pane id.
+    None,
+    /// The local pane is the card's: attached on the card's process, or the
+    /// card names none and defers to the controller's record.
+    Card,
+    /// The local pane was attached on another process than the card's — a
+    /// restarted deck's agent under a reused pane id, or the replaced deck's
+    /// pane under a card of the new one.
+    Other,
 }
 
 /// Whether `error` refuses an action because the daemon process it was bound
@@ -725,13 +775,19 @@ pub struct EmbeddedPaneController {
     /// which the call carries ([`BoundPane`], G-fix6), and a gated controller
     /// sends nothing for a card learned from no named process.
     card_incarnations: CardIncarnations,
-    /// PRD #1666 part 2 (G-fix6): panes whose rename the deck refused after
-    /// [`PaneController::rename_pane`] had returned — the daemon process the
-    /// pane was attached on is gone, or named none. The pane's own name is put
-    /// back here; the render loop drains this ([`Self::take_rename_refusals`])
-    /// and puts the dashboard's names back too, so the card keeps the name it
-    /// had, as the desktop's does.
-    rename_refusals: Arc<Mutex<Vec<String>>>,
+    /// PRD #1666 part 2 (G-fix6, G-fix7): the deck's answers to renames
+    /// [`PaneController::rename_pane`] had already applied. One refused because
+    /// the daemon process the pane was attached on is gone, or named none, has
+    /// the pane's own name put back here; the render loop drains these
+    /// ([`Self::take_rename_answers`]) and puts the dashboard's names back too,
+    /// so the card keeps the name it had, as the desktop's does.
+    rename_refusals: Arc<Mutex<Vec<RenameSettled>>>,
+    /// PRD #1666 part 2 (G-fix7): per pane with a rename the deck has not
+    /// answered yet, the name to go back to if the deck refuses — the one it
+    /// last confirmed, or the pane's name before the first unanswered rename —
+    /// and how many renames are unanswered. A refused optimistic name is never
+    /// a later rename's way back, however the answers interleave.
+    rename_baselines: Arc<Mutex<HashMap<String, RenameBaseline>>>,
     /// PRD #611 M2 (review finding 4b): "is ANY pane's cannot-scroll notice
     /// armed?", so the dismissal that runs on every single keystroke can answer
     /// "no" without taking the pane-registry mutex and walking every pane.
@@ -1088,6 +1144,7 @@ impl EmbeddedPaneController {
             close_warnings: Arc::new(Mutex::new(Vec::new())),
             card_incarnations: Arc::new(Mutex::new(HashMap::new())),
             rename_refusals: Arc::new(Mutex::new(Vec::new())),
+            rename_baselines: Arc::new(Mutex::new(HashMap::new())),
             any_scroll_notice_armed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1196,9 +1253,21 @@ impl EmbeddedPaneController {
         std::mem::take(&mut *self.close_warnings.lock().unwrap())
     }
 
-    /// PRD #1666 part 2 (G-fix6): drain the panes whose rename the deck refused
-    /// after the call returned — see [`Self::rename_refusals`].
+    /// PRD #1666 part 2 (G-fix6): drain the panes whose renames the deck
+    /// refused after the call returned and that have none left unanswered —
+    /// see [`Self::rename_refusals`]. Drops the other answers; the render loop
+    /// reads them all through [`Self::take_rename_answers`].
     pub fn take_rename_refusals(&self) -> Vec<String> {
+        self.take_rename_answers()
+            .into_iter()
+            .filter(|answer| answer.label.is_none() && answer.last)
+            .map(|answer| answer.pane_id)
+            .collect()
+    }
+
+    /// PRD #1666 part 2 (G-fix7): drain the deck's answers to renames
+    /// ([`RenameSettled`]), refused and kept alike.
+    pub fn take_rename_answers(&self) -> Vec<RenameSettled> {
         std::mem::take(&mut *self.rename_refusals.lock().unwrap())
     }
 
@@ -1210,6 +1279,35 @@ impl EmbeddedPaneController {
             &self.client,
             &held_incarnation(&self.panes, &self.card_incarnations, card),
         )
+    }
+
+    /// PRD #1666 part 2 (G-fix7): whether the local pane under `card`'s pane
+    /// id is the card's ([`LocalPaneFor`]).
+    fn local_pane_for(&self, card: &BoundPane) -> LocalPaneFor {
+        let Some(attachment) = self.pane_attachment(&card.pane_id) else {
+            return LocalPaneFor::None;
+        };
+        if card.incarnation.is_unnamed() {
+            return LocalPaneFor::Card;
+        }
+        match attachment.incarnation {
+            Some(local) if local == card.incarnation => LocalPaneFor::Card,
+            _ => LocalPaneFor::Other,
+        }
+    }
+
+    /// PRD #1666 part 2 (G-fix7): the local pane under `card`'s pane id belongs
+    /// to another process than the card. When that pane has lost its agent —
+    /// the deck that ran it was replaced — it is dropped here, so the card's
+    /// own agent can be attached in its place, and this answers `true`. A pane
+    /// still attached is someone else's live agent: it is kept, and the card's
+    /// action is refused.
+    fn drop_replaced_local_pane(&self, card: &BoundPane) -> bool {
+        if self.pane_lost_reason(&card.pane_id).is_none() {
+            return false;
+        }
+        self.panes.lock().unwrap().remove(&card.pane_id);
+        true
     }
 
     /// Drop `pane_id`'s card from [`Self::card_incarnations`]: its close is
@@ -4548,11 +4646,40 @@ impl PaneController for EmbeddedPaneController {
     /// PRD #1666 part 2 (G-fix6): a card with a local pane closes it exactly as
     /// [`Self::close_pane`] does, bound to the process it was attached on; one
     /// without stops its agent only on the process the card was learned from.
+    ///
+    /// G-fix7: a local pane under the same pane id that was attached on another
+    /// process is not the card's. A live one is someone else's agent, and the
+    /// close is refused with [`crate::daemon_client::AGENT_GONE_AFTER_RESTART`];
+    /// one that lost its agent is dropped, and the card's own agent is stopped
+    /// on its own process.
     fn close_card(&self, card: &BoundPane) -> Result<(), PaneError> {
-        if self.panes.lock().unwrap().contains_key(&card.pane_id) {
-            return self.close_pane(&card.pane_id);
+        match self.local_pane_for(card) {
+            LocalPaneFor::Card => self.close_pane(&card.pane_id),
+            LocalPaneFor::Other if !self.drop_replaced_local_pane(card) => Err(PaneError::Refused(
+                crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string(),
+            )),
+            LocalPaneFor::Other | LocalPaneFor::None => self.stop_unattached_pane(card),
         }
-        self.stop_unattached_pane(card)
+    }
+
+    /// PRD #1666 part 2 (G-fix7): focus the local pane behind `card` only when
+    /// it is the card's. A live pane attached on another process is refused
+    /// with [`crate::daemon_client::AGENT_GONE_AFTER_RESTART`]; one that lost
+    /// its agent is dropped and reads as no local pane, so the caller's attach
+    /// of the card's own agent takes its place.
+    fn focus_card(&self, card: &BoundPane) -> Result<(), PaneError> {
+        match self.local_pane_for(card) {
+            LocalPaneFor::Card => self.focus_pane(&card.pane_id),
+            LocalPaneFor::Other if !self.drop_replaced_local_pane(card) => Err(PaneError::Refused(
+                crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string(),
+            )),
+            LocalPaneFor::Other | LocalPaneFor::None => self.focus_pane(&card.pane_id),
+        }
+    }
+
+    fn pane_incarnation(&self, pane_id: &str) -> Option<Incarnation> {
+        self.pane_attachment(pane_id)
+            .and_then(|attachment| attachment.incarnation)
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
@@ -4879,7 +5006,7 @@ impl PaneController for EmbeddedPaneController {
         // than restoring a stale pre-clear name (PRD #76 M2.11 reviewer
         // P1 clear-rename case).
         let local_name = new_label.clone().unwrap_or_default();
-        let (attachment, cwd, previous) = {
+        let (attachment, cwd) = {
             let mut panes = self.panes.lock().unwrap();
             let pane = panes
                 .get_mut(pane_id)
@@ -4897,12 +5024,20 @@ impl PaneController for EmbeddedPaneController {
                 return Err(PaneError::CommandFailed(refusal.to_string()));
             }
             let previous = std::mem::replace(&mut pane.name, local_name.clone());
+            self.rename_baselines
+                .lock()
+                .unwrap()
+                .entry(pane_id.to_string())
+                .or_insert(RenameBaseline {
+                    name: previous,
+                    unanswered: 0,
+                })
+                .unanswered += 1;
             // Snapshot the currently-bound agent (PRD #92 F12 can swap this
             // to a respawned id over the life of the pane).
             (
                 pane.backend.attached.lock().unwrap().clone(),
                 pane.cwd.clone(),
-                previous,
             )
         };
         // Daemon RPC is fire-and-forget on the controller's runtime.
@@ -4923,30 +5058,56 @@ impl PaneController for EmbeddedPaneController {
         let daemon_label = new_label.clone();
         let notices = Arc::clone(&self.close_warnings);
         let refusals = Arc::clone(&self.rename_refusals);
+        let baselines = Arc::clone(&self.rename_baselines);
         let panes = Arc::clone(&self.panes);
         let pane_id_for_revert = pane_id.to_string();
         self.runtime.spawn(async move {
-            if let Err(e) = client.set_agent_label(&agent_id, daemon_label, cwd).await {
-                // G-fix5: a relabel refused because the deck restarted is said
-                // on the status line, as the desktop says it; any other failure
-                // resyncs quietly, as before. G-fix6: the refused name is also
-                // taken back — here, unless a later rename replaced it, and on
-                // the dashboard through `rename_refusals` — as the desktop
-                // keeps the daemon's name when it refuses.
-                if notice_identity_refusal(&notices, &e) {
-                    if let Some(pane) = panes.lock().unwrap().get_mut(&pane_id_for_revert)
-                        && pane.name == local_name
-                    {
-                        pane.name = previous;
-                    }
-                    push_notice(&refusals, pane_id_for_revert);
-                }
+            let result = client.set_agent_label(&agent_id, daemon_label, cwd).await;
+            // G-fix5: a relabel refused because the deck restarted is said on
+            // the status line, as the desktop says it; any other failure
+            // resyncs quietly, as before. G-fix6: the refused name is also
+            // taken back — here, and on the dashboard through
+            // `rename_refusals` — as the desktop keeps the daemon's name when
+            // it refuses. G-fix7: taken back to the name the deck last
+            // confirmed, once no rename of the pane is left unanswered, so
+            // overlapping renames never restore a refused one.
+            let refused = match &result {
+                Ok(()) => false,
+                Err(e) => notice_identity_refusal(&notices, e),
+            };
+            if let Err(e) = &result {
                 tracing::debug!(
                     agent_id = %agent_id_for_log,
                     error = %e,
                     "rename_pane: set_agent_label failed — local rename kept, daemon will resync on next reconnect"
                 );
             }
+            let mut baselines = baselines.lock().unwrap();
+            let Some(baseline) = baselines.get_mut(&pane_id_for_revert) else {
+                return;
+            };
+            baseline.unanswered = baseline.unanswered.saturating_sub(1);
+            let last = baseline.unanswered == 0;
+            // Any other failure keeps the local name, as before.
+            if !refused {
+                baseline.name = local_name.clone();
+            }
+            let restore = baseline.name.clone();
+            if last {
+                baselines.remove(&pane_id_for_revert);
+            }
+            drop(baselines);
+            if refused
+                && last
+                && let Some(pane) = panes.lock().unwrap().get_mut(&pane_id_for_revert)
+            {
+                pane.name = restore;
+            }
+            refusals.lock().unwrap().push(RenameSettled {
+                pane_id: pane_id_for_revert,
+                label: (!refused).then_some(local_name),
+                last,
+            });
         });
         Ok(outcome)
     }
@@ -7416,6 +7577,121 @@ mod incarnation_binding_tests {
                     daemon
                         .received_by("a")
                         .contains(&"post-message".to_string())
+                );
+            }
+        }
+    }
+
+    /// Scenario: the TUI opens a pane on deck process `a`, the deck restarts as the same build, and the user renames the pane twice before the deck answers either. Both renames are refused, and the pane goes back to the name it had before the first one — never to the first rename's name — and the dashboard is told once, when no rename is left unanswered. Without the restart the pane keeps the second name and nothing is taken back (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_overlapping_refused_renames_go_back_to_the_last_confirmed_name() {
+        let runtime = runtime();
+        for restarted in [false, true] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller =
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate();
+            let pane = controller
+                .create_pane(Some("cat"), None)
+                .expect("a pane on the first process");
+            let before = controller.panes.lock().unwrap()[&pane].name.clone();
+            if restarted {
+                daemon.restart_as("b");
+            }
+            controller
+                .rename_pane(&pane, "first")
+                .expect("taken locally");
+            controller
+                .rename_pane(&pane, "second")
+                .expect("taken locally");
+            let answers = std::cell::RefCell::new(Vec::new());
+            wait_for("both renames to be answered", || {
+                answers
+                    .borrow_mut()
+                    .extend(controller.take_rename_answers());
+                answers.borrow().len() == 2
+            });
+            let answers = answers.into_inner();
+            assert!(answers.iter().all(|answer| answer.pane_id == pane));
+            assert_eq!(answers.iter().filter(|answer| answer.last).count(), 1);
+            let name = controller.panes.lock().unwrap()[&pane].name.clone();
+            if restarted {
+                assert!(
+                    answers.iter().all(|answer| answer.label.is_none()),
+                    "{answers:?}"
+                );
+                assert_eq!(name, before, "a refused rename's name was restored");
+            } else {
+                assert!(
+                    answers.iter().all(|answer| answer.label.is_some()),
+                    "{answers:?}"
+                );
+                assert_eq!(name, "second", "control");
+            }
+        }
+    }
+
+    /// Scenario: two TUIs share a deck. This one holds a dashboard card learned from deck process `a` for pane `1`; the deck restarts as the same build, and this TUI starts its own first pane on `b`, also numbered `1`. Focusing, closing and posting through the old card refuse with "that agent is gone (the deck restarted)", and `b`'s agent is sent nothing and keeps its pane. A card learned from `b` itself focuses, posts to and closes that pane (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_card_never_reaches_another_processs_pane_under_its_id() {
+        let runtime = runtime();
+        for stale in [false, true] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("b") });
+            let controller =
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate();
+            let pane = controller
+                .create_pane(Some("cat"), None)
+                .expect("this TUI's own pane on b");
+            let card = BoundPane::new(
+                pane.clone(),
+                Incarnation::from(Some(if stale { "a" } else { "b" }.to_string())),
+            );
+            let before = daemon.received_by("b");
+
+            let focused = controller.focus_card(&card);
+            let posted = controller.post_message(
+                &card,
+                "configuration request",
+                "body",
+                crate::inbox_hub::PostOrigin::ConfigGen,
+            );
+            let closed = controller.close_card(&card);
+
+            if stale {
+                let gone = crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string();
+                assert!(
+                    matches!(&focused, Err(PaneError::Refused(m)) if *m == gone),
+                    "{focused:?}"
+                );
+                assert!(posted.is_err(), "{posted:?}");
+                assert!(
+                    matches!(&closed, Err(PaneError::Refused(m)) if *m == gone),
+                    "{closed:?}"
+                );
+                assert_eq!(
+                    daemon.received_by("b"),
+                    before,
+                    "b's agent was sent something"
+                );
+                assert!(
+                    controller.panes.lock().unwrap().contains_key(&pane),
+                    "b's pane was taken from it"
+                );
+            } else {
+                assert!(focused.is_ok(), "control: {focused:?}");
+                assert!(posted.is_ok(), "control: {posted:?}");
+                assert!(closed.is_ok(), "control: {closed:?}");
+                let sent = daemon.received_by("b");
+                assert!(
+                    sent.contains(&"post-message".to_string()),
+                    "control: {sent:?}"
+                );
+                assert!(
+                    sent.contains(&"stop-agent".to_string()),
+                    "control: {sent:?}"
                 );
             }
         }

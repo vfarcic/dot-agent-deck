@@ -1471,6 +1471,14 @@ pub struct DesktopActionResult {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// PRD #1666 part 2 (G-fix7): for a start, the daemon process that
+    /// answered it — the incarnation [`Self::agent_id`] (and every id in
+    /// [`Self::agent_ids`]) was minted by. Absent for an action that started
+    /// nothing; `null` for a start answered by a daemon that named no process.
+    /// The webview waits for, and opens, the agent with this pair, so a
+    /// restarted deck's agent under the same id is not taken for this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_incarnation: Option<Incarnation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

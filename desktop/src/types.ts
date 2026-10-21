@@ -1317,6 +1317,16 @@ export interface DeckActionResult {
    * consumer keys it as `(deckId, agentId)`, never alone.
    */
   agentId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7): for a start, the daemon process that answered
+   * it — the one that minted {@link agentId}. The key is present on every
+   * start's result (holding `undefined` for a deck that named no process) and
+   * absent on every other action's. A consumer waiting for the started agent
+   * to be listed, or opening it, matches `(deckId, agentId, agentIncarnation)`:
+   * a restarted deck lists an unrelated agent under the same id, and that one
+   * is not the agent this start made.
+   */
+  agentIncarnation?: string;
 }
 
 /** Operator-facing explanation of a non-delivered outcome. */
@@ -1395,6 +1405,15 @@ export interface TerminalChunk {
    * producer implicitly meant.
    */
   deckId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7): the daemon process whose attach produced these
+   * bytes — the incarnation of the session's target, stamped by the bridge
+   * with the deck. A restarted deck reuses agent ids, so the runtime files
+   * the chunk under the bound pair, and a viewport for a successor with the
+   * same id never reads the previous process's output. Absent is a deck that
+   * named no process, which is its own key.
+   */
+  incarnation?: string;
   data: Uint8Array;
   stream: "output" | "end" | "error";
   operation: "append" | "replace";
@@ -1418,8 +1437,14 @@ export interface TerminalBuffer {
  * xterm, under B's correctly resolved heading. See {@link agentKey}.
  */
 export interface TerminalFeed {
-  get(deckId: string | undefined, agentId: string): TerminalBuffer | undefined;
-  subscribe(deckId: string | undefined, agentId: string, listener: (buffer: TerminalBuffer) => void): () => void;
+  /**
+   * `incarnation` (PRD #1666 part 2, G-fix7) is the daemon process the agent
+   * was listed by: buffers are keyed by `boundAgentKey`, so a restarted deck's
+   * agent with the same id has a backlog of its own and never the previous
+   * process's. Required, so every reader says which process it is reading.
+   */
+  get(deckId: string | undefined, agentId: string, incarnation: string | undefined): TerminalBuffer | undefined;
+  subscribe(deckId: string | undefined, agentId: string, incarnation: string | undefined, listener: (buffer: TerminalBuffer) => void): () => void;
 }
 
 /**
@@ -1543,7 +1568,10 @@ export interface DeckRuntimeState {
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**
    * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by
-   * `agentKey(deckId, agentId)`.
+   * `boundAgentKey({ deckId, agentId, incarnation })`: the deck since PRD
+   * #1105's security audit, and the daemon process since PRD #1666 part 2
+   * (G-fix7), so a restarted deck's agent under the same id never inherits the
+   * previous process's grid.
    *
    * **The deck is part of that key since PRD #1105's security audit.** Nothing
    * evicts an entry per agent, so a pane opened for deck B's `planner` applied

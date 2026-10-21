@@ -145,3 +145,36 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     expect(confirmation()).toBeNull();
   });
 });
+
+describe("a spoken stop holds to the daemon process it named (PRD #1666 part 2, G-fix7)", () => {
+  /**
+   * Scenario: voice hands the overview a stop (and a close) for the planner
+   * role as daemon process A listed it, but the deck now lists an unrelated
+   * agent under that id from process B. No confirmation opens and the answer
+   * says the agent is gone with its deck's restart. The same targets naming
+   * the process that lists them now (control) open their confirmations.
+   */
+  it.each([
+    ["successor-process-b", false],
+    ["listed-process-a", true],
+  ] as const)("opens a spoken stop only for the process it named (deck lists %s)", async (listedBy, opens) => {
+    const { STOP_TARGET_RESTARTED } = await import("./AgentOverview");
+    const channel: { current: Record<string, unknown> | undefined } = { current: undefined };
+    const fleet = fleetWithOrchestration().map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: listedBy })) }));
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    render(<AgentOverview runtime={runtime(runAction, fleet)} onNavigate={vi.fn()} voiceChannel={channel as never} />);
+    const voice = channel.current as { confirmStopAgent: (target: object) => string | undefined; confirmCloseOrchestration: (target: object) => string | undefined };
+    const target = { deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41", from: "overview" };
+
+    let answer: string | undefined;
+    act(() => { answer = voice.confirmStopAgent({ ...target, incarnation: "listed-process-a" }); });
+    expect(answer).toBe(opens ? undefined : STOP_TARGET_RESTARTED);
+    expect(confirmation() !== null).toBe(opens);
+    if (opens) fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
+
+    act(() => { answer = voice.confirmCloseOrchestration({ ...target, orchestrationAgentId: "41", orchestrationIncarnation: "listed-process-a" }); });
+    expect(answer).toBe(opens ? undefined : STOP_TARGET_RESTARTED);
+    expect(confirmation() !== null).toBe(opens);
+    expect(runAction).not.toHaveBeenCalled();
+  });
+});

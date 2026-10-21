@@ -3858,7 +3858,9 @@ pub struct AttachResponse {
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
 /// — 16 bytes of OS randomness, hex-encoded, minted on first use and fixed for
-/// the life of the process (an `exec` into a successor mints a new one).
+/// the life of the process. An `exec` into a successor mints a new random one;
+/// the kernel fallback below does not (G-fix7: it keeps its pid and start time
+/// across an `exec`).
 ///
 /// PRD #1666 part 2 (G-fix6): when OS randomness is unavailable, the identity
 /// is the kernel's own name for this process ([`process_identity`]), and where
@@ -3904,15 +3906,23 @@ fn mint_instance_id(
 ///
 /// On Linux it is the kernel's boot id (`/proc/sys/kernel/random/boot_id`, new
 /// on every boot), this process's pid, and its start time in clock ticks since
-/// boot (field 22 of `/proc/self/stat`) — [`process_identity_of`]. Within a
-/// boot, a pid names one live process, and a process given a recycled pid
-/// starts at a later tick unless the whole pid space is reused within one tick;
+/// boot (field 22 of `/proc/self/stat`) — [`process_identity_of`]. It tells a
+/// daemon from a successor started as a new process in the same pid namespace:
+/// within a boot a live pid names one process, and a process given a recycled
+/// pid starts at a later tick unless the pid space wraps within one tick;
 /// across boots the boot id differs. No wall clock is read, so a clock step
 /// cannot repeat it.
 ///
-/// Elsewhere this build reads no such source, and answers why: the daemon then
-/// refuses to start rather than name itself with a value a successor could
-/// repeat.
+/// G-fix7, what it does not tell apart: an `exec` keeps the pid and the start
+/// time, so a daemon that execs into a successor names the same identity; and
+/// two pid namespaces on one boot can hold equal local pids started at the
+/// same tick. The daemon does not re-exec itself; a daemon replaced across pid
+/// namespaces behind one socket is not covered by this fallback.
+///
+/// Elsewhere (macOS, Windows) this build reads no such source, and answers
+/// why. That is reached only when OS randomness itself has failed: the daemon
+/// then refuses to start rather than name itself with a value a successor
+/// could repeat, since every client would refuse its unnamed agents anyway.
 fn process_identity() -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {

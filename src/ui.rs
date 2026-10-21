@@ -4284,16 +4284,21 @@ fn surface_one_orchestration(
                 // simply hasn't yet) would otherwise stay invisible even
                 // though its pane is live and hydrated.
                 let agent_id = embedded.pane_agent_id(&role.pane_id);
+                // PRD #1666 part 2 (G-fix7): stamped from the attach that
+                // produced the pane, not the stream open now.
+                let attached_on = embedded.pane_incarnation(&role.pane_id);
                 let mut st = state.blocking_write();
                 if let Some(dead) = replaced_dead_slot.as_deref() {
                     st.remove_sessions_for_pane(dead);
                 }
                 st.register_pane(role.pane_id.clone());
-                st.insert_placeholder_session(
+                let learned_from = attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
+                st.insert_placeholder_session_learned(
                     role.pane_id.clone(),
                     Some(surface.cwd.clone()),
                     None,
                     agent_id,
+                    learned_from,
                 );
                 // Issue #462 — the reference note for all five TUI-side
                 // registrations of these maps; the other four cite it.
@@ -6930,14 +6935,14 @@ fn focus_deck(
             // this path — see the trait method's docs.
             // PRD #1666 part 2 (G-fix6): on the daemon process the card was
             // learned from only.
-            let mut focus_result = pane.focus_pane(pane_id);
+            // G-fix7: and a local pane under the same id focuses only when it
+            // is the card's own.
+            let card = crate::pane::BoundPane::new(pane_id.clone(), session.incarnation.clone());
+            let mut focus_result = pane.focus_card(&card);
             if let Err(PaneError::CommandFailed(_)) = focus_result
-                && pane.try_hydrate_pane(&crate::pane::BoundPane::new(
-                    pane_id.clone(),
-                    session.incarnation.clone(),
-                ))
+                && pane.try_hydrate_pane(&card)
             {
-                focus_result = pane.focus_pane(pane_id);
+                focus_result = pane.focus_card(&card);
             }
             match focus_result {
                 Ok(()) => {
@@ -6957,6 +6962,9 @@ fn focus_deck(
                     // `saturating_sub(3)` math that used to live here diverged
                     // from the real layout and produced off-by-one-column PTYs.
                 }
+                Err(PaneError::Refused(msg)) => {
+                    ui.status_message = Some((msg, std::time::Instant::now()));
+                }
                 Err(PaneError::CommandFailed(ref msg)) => {
                     state.blocking_write().sessions.remove(*sid);
                     ui.status_message = Some((
@@ -6970,13 +6978,39 @@ fn focus_deck(
                 }
             }
         } else {
-            ui.status_message = Some((
-                format!("No pane linked to agent {sid}"),
-                std::time::Instant::now(),
-            ));
+            ui.status_message = Some((no_pane_feedback(snapshot, sid), std::time::Instant::now()));
         }
     }
     true
+}
+
+/// What a focus says about a card with no pane: the gone sentence for a card
+/// whose agent the deck no longer runs (PRD #1666 part 2, G-fix7), otherwise
+/// that no pane is linked to it.
+fn no_pane_feedback(snapshot: &AppState, sid: &str) -> String {
+    if snapshot.is_retired_card(sid) {
+        crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string()
+    } else {
+        format!("No pane linked to agent {sid}")
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7): the selected dashboard card's key when it is a
+/// retired card ([`AppState::retired_cards`]), whose agent the deck no longer
+/// runs. `None` while an orchestration tab is active.
+fn selected_retired_card<'a>(
+    ui: &UiState,
+    tab_manager: &TabManager,
+    snapshot: &AppState,
+    filtered: &[(&'a String, &SessionState)],
+) -> Option<&'a String> {
+    if tab_id_of(tab_manager.active_tab()).is_some() {
+        return None;
+    }
+    ui.selected_index
+        .and_then(|i| filtered.get(i))
+        .map(|(id, _)| *id)
+        .filter(|id| snapshot.is_retired_card(id))
 }
 
 /// PRD #68: mirror a selection move made by `handle_normal_key`
@@ -6996,9 +7030,11 @@ fn mirror_selection_into_focus(
     if ui.selected_index != prev_selected_index
         && let Some(idx) = ui.selected_index
         && let Some((_, session)) = filtered.get(idx)
-        && let Some(pane_id) = session.pane_id.as_ref()
+        && let Some(card) = session.bound_pane()
     {
-        let _ = pane.focus_pane(pane_id);
+        // PRD #1666 part 2 (G-fix7): a local pane under the card's pane id
+        // that another process's agent runs in is not the card's.
+        let _ = pane.focus_card(&card);
     }
 }
 
@@ -8075,6 +8111,30 @@ fn rename_commit_value(key: KeyEvent, rename_text: &str) -> Option<String> {
 
 /// PRD #1666 part 2 (G-fix6): put back the dashboard names `pane_id` had
 /// before its last rename, which the deck refused after the rename was shown.
+/// PRD #1666 part 2 (G-fix7): bring the dashboard's names for a pane in line
+/// with the deck's answer to one of its renames. A refusal with no rename of
+/// the pane left unanswered takes the names back; one with a rename still
+/// unanswered waits for it. A confirmation while another is unanswered makes
+/// its label the one a later refusal goes back to; [`commit_rename`] keeps the
+/// way back across overlapping renames rather than recording each optimistic
+/// name as the next one's.
+fn settle_rename(ui: &mut UiState, answer: crate::embedded_pane::RenameSettled) {
+    match answer.label {
+        None if answer.last => take_back_rename(ui, &answer.pane_id),
+        None => {}
+        Some(_) if answer.last => {
+            ui.renamed_from.remove(&answer.pane_id);
+        }
+        Some(label) => {
+            if let Some(entry) = ui.renamed_from.get_mut(&answer.pane_id) {
+                let label = (!label.is_empty()).then_some(label);
+                entry.1 = label.clone();
+                entry.2 = label;
+            }
+        }
+    }
+}
+
 fn take_back_rename(ui: &mut UiState, pane_id: &str) {
     let Some((sid, display, pane_display)) = ui.renamed_from.remove(pane_id) else {
         return;
@@ -9410,14 +9470,14 @@ fn commit_rename(
     {
         match pane.rename_pane(pane_id, new_name) {
             Ok(outcome) => {
-                ui.renamed_from.insert(
-                    pane_id.clone(),
-                    (
-                        sid.to_string(),
-                        ui.display_names.get(sid).cloned(),
-                        ui.pane_display_names.get(pane_id).cloned(),
-                    ),
+                // G-fix7: the names from before the first rename the deck has
+                // not answered yet, not the optimistic name of that rename.
+                let previous = (
+                    sid.to_string(),
+                    ui.display_names.get(sid).cloned(),
+                    ui.pane_display_names.get(pane_id).cloned(),
                 );
+                ui.renamed_from.entry(pane_id.clone()).or_insert(previous);
                 apply_rename_outcome(
                     &mut ui.display_names,
                     &mut ui.pane_display_names,
@@ -9611,6 +9671,26 @@ fn dispatch_action(
         // which is why the modal lives on the action rather than on the key
         // handler; the tab strip's `×` is the third door and arms the identical
         // transition from `Action::CloseTab`.
+        // PRD #1666 part 2 (G-fix7): a retired card's agent is gone, so
+        // closing it stops nothing and needs no confirmation: it is dropped
+        // here, with the sentence that says why.
+        Action::CloseSelected
+            if let Some(sid) = selected_retired_card(ui, tab_manager, snapshot, filtered) =>
+        {
+            state.blocking_write().dismiss_retired_card(sid);
+            ui.status_message = Some((
+                format!(
+                    "Closed the card: {}",
+                    crate::daemon_client::AGENT_GONE_AFTER_RESTART
+                ),
+                std::time::Instant::now(),
+            ));
+            if let Some(idx) = ui.selected_index
+                && idx > 0
+            {
+                ui.selected_index = Some(idx - 1);
+            }
+        }
         Action::CloseSelected => {
             let target = resolve_close_target(ui, tab_manager, snapshot, filtered);
             // `close_confirmation_for_action` stays the seam that decides whether
@@ -9726,6 +9806,11 @@ fn dispatch_action(
                                 format!("Closed agent {pane_id}"),
                                 std::time::Instant::now(),
                             ));
+                        }
+                        // G-fix7: the local pane under this id is another
+                        // process's agent; the card stays, and says why.
+                        Err(PaneError::Refused(msg)) => {
+                            ui.status_message = Some((msg, std::time::Instant::now()));
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -9862,6 +9947,16 @@ fn dispatch_action(
         }
         // PRD #80 M4: `r` key or [Rename r] button → rename mode for the
         // selected card. No-op with no cards, matching the `r` key's guard.
+        // PRD #1666 part 2 (G-fix7): a retired card's agent is gone, so there
+        // is nothing to rename.
+        Action::EnterRename
+            if selected_retired_card(ui, tab_manager, snapshot, filtered).is_some() =>
+        {
+            ui.status_message = Some((
+                crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string(),
+                std::time::Instant::now(),
+            ));
+        }
         Action::EnterRename => {
             if !filtered.is_empty() {
                 ui.mode = UiMode::Rename;
@@ -9968,14 +10063,15 @@ fn dispatch_action(
                     //
                     // PRD #1666 part 2 (G-fix6): on the daemon process the card
                     // was learned from only.
-                    let mut focus_result = pane.focus_pane(pane_id);
+                    // G-fix7: and a local pane under the same id focuses
+                    // only when it is the card's own.
+                    let card =
+                        crate::pane::BoundPane::new(pane_id.clone(), session.incarnation.clone());
+                    let mut focus_result = pane.focus_card(&card);
                     if let Err(PaneError::CommandFailed(_)) = focus_result
-                        && pane.try_hydrate_pane(&crate::pane::BoundPane::new(
-                            pane_id.clone(),
-                            session.incarnation.clone(),
-                        ))
+                        && pane.try_hydrate_pane(&card)
                     {
-                        focus_result = pane.focus_pane(pane_id);
+                        focus_result = pane.focus_card(&card);
                     }
                     match focus_result {
                         Ok(()) => {
@@ -9987,6 +10083,9 @@ fn dispatch_action(
                                 ),
                                 std::time::Instant::now(),
                             ));
+                        }
+                        Err(PaneError::Refused(msg)) => {
+                            ui.status_message = Some((msg, std::time::Instant::now()));
                         }
                         Err(PaneError::CommandFailed(ref msg)) => {
                             state.blocking_write().sessions.remove(sid);
@@ -10003,12 +10102,19 @@ fn dispatch_action(
                         }
                     }
                 } else {
-                    ui.status_message = Some((
-                        format!("No pane linked to agent {sid}"),
-                        std::time::Instant::now(),
-                    ));
+                    ui.status_message =
+                        Some((no_pane_feedback(snapshot, sid), std::time::Instant::now()));
                 }
             }
+        }
+        // PRD #1666 part 2 (G-fix7): a retired card's agent is gone.
+        Action::RequestConfigGen
+            if selected_id.is_some_and(|sid| snapshot.is_retired_card(sid)) =>
+        {
+            ui.status_message = Some((
+                crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string(),
+                std::time::Instant::now(),
+            ));
         }
         Action::RequestConfigGen => {
             if let Some(sid) = selected_id
@@ -10189,6 +10295,12 @@ fn dispatch_action(
                                 .iter()
                                 .map(|id| pane.pane_agent_id(id))
                                 .collect();
+                            // PRD #1666 part 2 (G-fix7): each card stamped
+                            // from the attach that produced its pane.
+                            let role_attached_on: Vec<_> = role_pane_ids
+                                .iter()
+                                .map(|id| pane.pane_incarnation(id))
+                                .collect();
                             {
                                 let mut st = state.blocking_write();
                                 // PRD #76 M2.13: `open_orchestration_tab`
@@ -10198,15 +10310,20 @@ fn dispatch_action(
                                 // right type. The local placeholder stays
                                 // at `None` until each role's first
                                 // `SessionStart` hook fires.
-                                for (id, agent_id) in
-                                    role_pane_ids.iter().zip(role_agent_ids.iter())
+                                for ((id, agent_id), attached_on) in role_pane_ids
+                                    .iter()
+                                    .zip(role_agent_ids.iter())
+                                    .zip(role_attached_on)
                                 {
                                     st.register_pane(id.clone());
-                                    st.insert_placeholder_session(
+                                    let learned_from = attached_on
+                                        .unwrap_or_else(|| st.stream_incarnation.clone());
+                                    st.insert_placeholder_session_learned(
                                         id.clone(),
                                         Some(dir_str.clone()),
                                         None,
                                         agent_id.clone(),
+                                        learned_from,
                                     );
                                 }
                                 // Register pane-to-role and pane-to-cwd
@@ -10447,14 +10564,20 @@ fn dispatch_action(
                             // freshly-spawned agent's first
                             // `SessionStart`.
                             let new_agent_id = pane.pane_agent_id(&new_id);
+                            // PRD #1666 part 2 (G-fix7): stamped from the
+                            // attach that produced the pane.
+                            let attached_on = pane.pane_incarnation(&new_id);
                             {
                                 let mut st = state.blocking_write();
                                 st.register_pane(new_id.clone());
-                                st.insert_placeholder_session(
+                                let learned_from =
+                                    attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
+                                st.insert_placeholder_session_learned(
                                     new_id.clone(),
                                     Some(dir_str.clone()),
                                     None,
                                     new_agent_id,
+                                    learned_from,
                                 );
                             }
                             ui.pane_display_names
@@ -12504,17 +12627,28 @@ pub fn run_tui(
                                     .iter()
                                     .map(|id| pane.pane_agent_id(id))
                                     .collect();
+                                // PRD #1666 part 2 (G-fix7): each card stamped
+                                // from the attach that produced its pane.
+                                let role_attached_on: Vec<_> = role_pane_ids
+                                    .iter()
+                                    .map(|id| pane.pane_incarnation(id))
+                                    .collect();
                                 {
                                     let mut st = state.blocking_write();
-                                    for (id, agent_id) in
-                                        role_pane_ids.iter().zip(role_agent_ids.iter())
+                                    for ((id, agent_id), attached_on) in role_pane_ids
+                                        .iter()
+                                        .zip(role_agent_ids.iter())
+                                        .zip(role_attached_on)
                                     {
                                         st.register_pane(id.clone());
-                                        st.insert_placeholder_session(
+                                        let learned_from = attached_on
+                                            .unwrap_or_else(|| st.stream_incarnation.clone());
+                                        st.insert_placeholder_session_learned(
                                             id.clone(),
                                             Some(saved_pane.dir.clone()),
                                             None,
                                             agent_id.clone(),
+                                            learned_from,
                                         );
                                     }
                                     // Issue #462: `pane_orchestration_map` is
@@ -12638,14 +12772,20 @@ pub fn run_tui(
                     // `pane_agent_id` only touches the controller's panes
                     // mutex.
                     let new_agent_id = pane.pane_agent_id(&new_id);
+                    // PRD #1666 part 2 (G-fix7): stamped from the attach that
+                    // produced the pane.
+                    let attached_on = pane.pane_incarnation(&new_id);
                     {
                         let mut st = state.blocking_write();
                         st.register_pane(new_id.clone());
-                        st.insert_placeholder_session(
+                        let learned_from =
+                            attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
+                        st.insert_placeholder_session_learned(
                             new_id.clone(),
                             Some(saved_pane.dir.clone()),
                             agent_type,
                             new_agent_id,
+                            learned_from,
                         );
                     }
                     if !saved_pane.name.is_empty() {
@@ -13540,8 +13680,8 @@ pub fn run_tui(
             // PRD #1666 part 2 (G-fix6): a rename the deck refused after it
             // was applied here is taken back, so the card keeps the name it
             // had — as the desktop keeps the daemon's name when it refuses.
-            for pane_id in embedded.take_rename_refusals() {
-                take_back_rename(&mut ui, &pane_id);
+            for answer in embedded.take_rename_answers() {
+                settle_rename(&mut ui, answer);
             }
         }
 
@@ -15273,6 +15413,9 @@ fn render_card_grid(
     tick: u64,
     // Issue #413: handed to every card's `Last:` field — see `format_elapsed`.
     now: DateTime<Utc>,
+    // PRD #1666 part 2 (G-fix7): the keys of retired cards
+    // ([`AppState::retired_cards`]), each drawn as gone.
+    retired: &HashSet<String>,
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
@@ -15406,6 +15549,7 @@ fn render_card_grid(
                 .pane_id
                 .as_deref()
                 .and_then(|pane_id| ui.pane_declared_agent.get(pane_id));
+            let gone = ids.get(col_idx).is_some_and(|id| retired.contains(*id));
             render_session_card(
                 frame,
                 card_area,
@@ -15420,6 +15564,7 @@ fn render_card_grid(
                 ui.mode,
                 declared_agent_type,
                 now,
+                gone,
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -15708,6 +15853,7 @@ fn render_frame(
             total_sessions,
             tick,
             wall_now,
+            &state.retired_cards,
         );
         render_stats_bar(frame, &state.aggregate_stats(), stats_area);
     }
@@ -20156,6 +20302,11 @@ fn render_session_card(
     // against. Passed in, never read here, so a card renders as a pure function
     // of its inputs — see `format_elapsed`.
     now: DateTime<Utc>,
+    // PRD #1666 part 2 (G-fix7): a retired card, whose agent the deck no longer
+    // runs ([`AppState::retired_cards`]). Its badge reads `Gone`, its title
+    // carries a `gone` marker, and its body says why, so nothing on it looks
+    // like a live agent.
+    gone: bool,
 ) {
     // The type the card SHOWS. A launcher command (`devbox run -- codex`)
     // identifies nothing, so without the declaration this stays
@@ -20170,7 +20321,9 @@ fn render_session_card(
         session.agent_type.clone()
     };
     let is_placeholder = shown_agent_type == crate::event::AgentType::None;
-    let (status_label, status_style) = if is_placeholder {
+    let (status_label, status_style) = if gone {
+        ("Gone", text_dim())
+    } else if is_placeholder {
         ("No agent", text_primary())
     } else {
         status_style(&session.status)
@@ -20245,6 +20398,9 @@ fn render_session_card(
         if !is_live {
             segs.push((liveness_marker.to_string(), text_dim()));
         }
+        if gone {
+            segs.push((" gone ".to_string(), text_dim()));
+        }
         if is_orphaned {
             segs.push((
                 " orphaned ".to_string(),
@@ -20256,7 +20412,11 @@ fn render_session_card(
         segs
     };
 
-    let dot = flash_dot(&session.status, tick);
+    let dot = if gone {
+        "○"
+    } else {
+        flash_dot(&session.status, tick)
+    };
     let status_text = format!(" {} {} ", dot, status_label);
     // PRD #1666 §2.8: the inbox line rides the status badge — `✉2 queued` /
     // `✉ delivered` where the title keeps room, the pending count alone on a
@@ -20393,6 +20553,12 @@ fn render_session_card(
     // The attention rows' text is kept whole until the background line below
     // has decided whether it shares their row (Minimal density).
     let mut attention: Vec<(String, Style)> = Vec::new();
+    if gone {
+        attention.push((
+            crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string(),
+            text_dim(),
+        ));
+    }
     if is_orphaned {
         attention.push((
             "Orphaned — delegation unavailable".to_string(),
@@ -21435,6 +21601,7 @@ pub fn render_card_with_declared_agent_to_buffer(
                 mode,
                 declared_agent_type,
                 now,
+                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -21509,6 +21676,7 @@ pub fn render_dashboard_cards_to_buffer(
                     UiMode::Normal,
                     None,
                     now,
+                    false,
                 );
             }
         })
@@ -21597,6 +21765,7 @@ pub fn render_card_grid_to_buffer(
                 sessions.len(),
                 0,
                 now,
+                &HashSet::new(),
             );
         })
         .expect("TestBackend draw should succeed");
@@ -39449,6 +39618,159 @@ mod tests {
             Some("No pane linked to agent s0")
         );
         insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  No pane linked to agent s0");
+    }
+
+    /// Scenario: the user renames a dashboard card twice before the deck answers; then the deck refuses both. The card's names go back to the ones it had before the first rename, not to the first rename's. When the deck confirms the first and refuses the second, they go back to the first (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_overlapping_refused_renames_restore_the_card_name_before_them() {
+        use crate::embedded_pane::RenameSettled;
+        for first_confirmed in [true, false] {
+            let snapshot = dashboard_snapshot(1);
+            let pc = stale_card_pc();
+            let mut ui = default_ui();
+            ui.display_names.insert("s0".into(), "orig".into());
+            ui.pane_display_names.insert("p0".into(), "orig".into());
+            commit_rename("first", &mut ui, &pc, &snapshot, Some("s0"));
+            commit_rename("second", &mut ui, &pc, &snapshot, Some("s0"));
+            assert_eq!(ui.display_names["s0"], "second");
+
+            settle_rename(
+                &mut ui,
+                RenameSettled {
+                    pane_id: "p0".into(),
+                    label: first_confirmed.then(|| "first".to_string()),
+                    last: false,
+                },
+            );
+            settle_rename(
+                &mut ui,
+                RenameSettled {
+                    pane_id: "p0".into(),
+                    label: None,
+                    last: true,
+                },
+            );
+
+            let expected = if first_confirmed { "first" } else { "orig" };
+            assert_eq!(
+                ui.display_names.get("s0").map(String::as_str),
+                Some(expected)
+            );
+            assert_eq!(
+                ui.pane_display_names.get("p0").map(String::as_str),
+                Some(expected)
+            );
+            assert!(ui.renamed_from.is_empty());
+        }
+    }
+
+    /// Scenario: a dashboard card learned from deck process `a` is on screen, and the TUI's event stream reopens on `b` — the deck restarted as the same build. The card is drawn as gone, with "that agent is gone (the deck restarted)" on it; Enter, rename and the config request say that sentence and reach no pane, and Ctrl+W drops the card with no confirmation and nothing sent. When the stream reopens on `a` itself, the card draws and acts as before (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_retired_card_says_it_is_gone_and_refuses_actions() {
+        use crate::daemon_client::{AGENT_GONE_AFTER_RESTART, Incarnation};
+        use tokio::sync::RwLock;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        for restarted in [false, true] {
+            let mut snapshot = dashboard_snapshot(1);
+            snapshot.sessions.get_mut("s0").unwrap().incarnation = named("a");
+            snapshot.sessions.get_mut("s0").unwrap().cwd = Some("/tmp/project".into());
+            snapshot.learn_stream_incarnation(named(if restarted { "b" } else { "a" }));
+            assert_eq!(snapshot.is_retired_card("s0"), restarted);
+
+            // Drawn as gone, or as the live card it is.
+            let mut ui = default_ui();
+            let backend = ratatui::backend::TestBackend::new(70, 12);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let sessions: Vec<&SessionState> = snapshot.sessions.values().collect();
+            let ids: Vec<&String> = snapshot.sessions.keys().collect();
+            terminal
+                .draw(|frame| {
+                    render_card_grid(
+                        frame,
+                        frame.area(),
+                        &mut ui,
+                        &sessions,
+                        &ids,
+                        1,
+                        0,
+                        Utc::now(),
+                        &snapshot.retired_cards,
+                    );
+                })
+                .unwrap();
+            let drawn = buffer_to_string(terminal.backend().buffer());
+            assert_eq!(drawn.contains(" Gone "), restarted, "{drawn}");
+            assert_eq!(
+                drawn.contains(AGENT_GONE_AFTER_RESTART),
+                restarted,
+                "{drawn}"
+            );
+
+            // Enter.
+            let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+            let pc = Arc::new(stale_card_pc());
+            let mut ui = default_ui();
+            glossary_enter_on_card(&snapshot, &state, pc.clone(), &mut ui);
+            assert_eq!(
+                glossary_status_text(&ui) == Some(AGENT_GONE_AFTER_RESTART),
+                restarted,
+                "{:?}",
+                glossary_status_text(&ui)
+            );
+            assert_eq!(*pc.hydrate_calls.lock().unwrap(), usize::from(!restarted));
+
+            // Rename, the config request, and Ctrl+W.
+            for action in [
+                Action::EnterRename,
+                Action::RequestConfigGen,
+                Action::CloseSelected,
+            ] {
+                let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+                let pc = Arc::new(stale_card_pc());
+                let mut tab_manager = TabManager::new(pc.clone());
+                let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+                let mut ui = default_ui();
+                ui.selected_index = Some(0);
+                let closing = matches!(action, Action::CloseSelected);
+                let action_name = format!("{action:?}");
+                dispatch_action(
+                    action,
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &filtered,
+                    Some("s0"),
+                    Rect::new(0, 0, 100, 24),
+                );
+                if !restarted {
+                    assert!(state.blocking_read().sessions.contains_key("s0"), "control");
+                    assert!(
+                        ui.mode != UiMode::Normal || ui.close_confirm_target.is_some(),
+                        "control: {action_name} opened its prompt; {:?}",
+                        glossary_status_text(&ui)
+                    );
+                    continue;
+                }
+                assert_eq!(ui.mode, UiMode::Normal, "a gone card opened a prompt");
+                assert!(ui.close_confirm_target.is_none());
+                assert_eq!(*pc.hydrate_calls.lock().unwrap(), 0);
+                let expected = if closing {
+                    format!("Closed the card: {AGENT_GONE_AFTER_RESTART}")
+                } else {
+                    AGENT_GONE_AFTER_RESTART.to_string()
+                };
+                assert_eq!(glossary_status_text(&ui), Some(expected.as_str()));
+                assert_eq!(
+                    state.blocking_read().sessions.contains_key("s0"),
+                    !closing,
+                    "Ctrl+W drops the gone card, and nothing else does"
+                );
+            }
+        }
     }
 
     /// Scenario: Ask for the config-generation prompt with no card selected.

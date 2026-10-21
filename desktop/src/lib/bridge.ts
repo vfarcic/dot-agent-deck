@@ -490,6 +490,11 @@ export interface DesktopActionResultDto {
   message?: string;
   /** The agent the action acted on; for `start_agent`, the id the target deck minted. */
   agentId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7): for a start, the daemon process that answered
+   * it — `null` for one that named none; absent for every other action.
+   */
+  agentIncarnation?: string | null;
 }
 
 /**
@@ -1095,6 +1100,16 @@ export interface VoiceResolvedParamDto {
    * Rust.
    */
   deckId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7) — on an `agent_ref` or `orchestration_ref`: the
+   * daemon process that listed the agent `value` names when the utterance was
+   * declared, `undefined` for a deck that named none. Never sent by Rust: the
+   * voice panel binds it before dispatching (`bindAgentParams`), so the action
+   * reaches that process's agent or refuses, never a restarted deck's agent
+   * with the same id. The key is absent where the declaration did not list
+   * the agent.
+   */
+  incarnation?: string;
 }
 
 /**
@@ -1767,6 +1782,15 @@ export type DesktopRunActionDto =
  */
 type FleetListener = (fleet: DeckFleet) => void;
 type TerminalListener = (event: TerminalChunk) => void;
+
+/**
+ * PRD #882 — one applied-geometry push: the agent, its grid, the deck its
+ * session was created against, and (PRD #1666 part 2, G-fix7) the daemon
+ * process that session was attached to. The runtime caches the grid under the
+ * bound pair, so a restarted deck's agent with the same id never inherits the
+ * previous process's grid.
+ */
+export type TerminalGeometryListener = (agentId: string, rows: number, cols: number, deckId?: string, incarnation?: string) => void;
 type Unsubscribe = () => void;
 
 interface PendingTerminalAttachment {
@@ -1845,7 +1869,7 @@ export interface DeckBridge {
    * grid to another's namesake, and a stamp read from mutable current selection
    * defeats a composite cache with a confidently wrong producer.
    */
-  onTerminalGeometry(listener: (agentId: string, rows: number, cols: number, deckId?: string) => void): () => void;
+  onTerminalGeometry(listener: TerminalGeometryListener): () => void;
   /**
    * Scale the whole window, terminals included (PRD #744).
    *
@@ -3027,7 +3051,7 @@ class FixtureDeckBridge implements DeckBridge {
     // authoring start records its (resolved) command too.
     if (action.command?.trim()) this.lastCommands.set(action.deckId, action.command);
     this.emitSnapshot();
-    return { ok: true, agentId };
+    return { ok: true, agentId, agentIncarnation: deck.agents.find((agent) => agent.id === agentId)?.incarnation };
   }
 
   /**
@@ -3091,7 +3115,7 @@ class FixtureDeckBridge implements DeckBridge {
       ];
     });
     this.emitSnapshot();
-    return { ok: true, agentId: startAgentId };
+    return { ok: true, agentId: startAgentId, agentIncarnation: deck.agents.find((agent) => agent.id === startAgentId)?.incarnation };
   }
 
   /**
@@ -3107,7 +3131,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void> {
     if (precondition && !precondition()) throw new TerminalInputCancelled();
-    this.terminalListeners.forEach((listener) => listener({ agentId: target.agentId, deckId: target.deckId, data: new TextEncoder().encode(data), stream: "output", operation: "append" }));
+    this.terminalListeners.forEach((listener) => listener({ agentId: target.agentId, deckId: target.deckId, ...(target.incarnation === undefined ? {} : { incarnation: target.incarnation }), data: new TextEncoder().encode(data), stream: "output", operation: "append" }));
     await Promise.resolve();
   }
 
@@ -3911,7 +3935,7 @@ export class TauriDeckBridge implements DeckBridge {
    * nothing left for a clear to protect against.
    */
   private appliedGeometry = new Map<string, { target: AgentTarget; rows: number; cols: number }>();
-  private geometryListeners = new Set<(agentId: string, rows: number, cols: number, deckId?: string) => void>();
+  private geometryListeners = new Set<TerminalGeometryListener>();
   private invoke?: typeof import("@tauri-apps/api/core")["invoke"];
   private lifecycle = 0;
   /**
@@ -4262,6 +4286,23 @@ export class TauriDeckBridge implements DeckBridge {
              restart opens nothing on the successor's agent with the same id. */
           incarnation: target.incarnation ?? null,
         });
+        /*
+          PRD #1666 part 2 (G-fix7): the stale-attempt guard runs FIRST, before
+          anything below touches a terminal. It used to run after the applied
+          grid had been written into the cache, onto the live xterm through
+          `getTerminal` and out to every geometry listener — so a late result
+          for an attempt that had been evicted (its target superseded by a
+          restarted deck's agent with the same id, or the lifecycle moved on)
+          reshaped whatever pane was current before being detached as stale.
+        */
+        if (
+          lifecycle !== this.lifecycle
+          || this.terminalChannels.get(key) !== onOutput
+          || this.pendingAttachments.get(key) !== attempt
+        ) {
+          await invoke("desktop_terminal_detach", { sessionId: session.sessionId }).catch(() => undefined);
+          return;
+        }
         const appliedRows = session.appliedRows;
         const appliedCols = session.appliedCols;
         if (appliedRows && appliedCols) {
@@ -4280,22 +4321,14 @@ export class TauriDeckBridge implements DeckBridge {
           // live instance first closes that window; the listener below still
           // fires so React state and any later re-render agree with it.
           try {
-            const terminal = getTerminal(target.deckId, target.agentId);
+            const terminal = getTerminal(target.deckId, target.agentId, target.incarnation);
             if (terminal && (terminal.cols !== appliedCols || terminal.rows !== appliedRows)) {
               terminal.resize(appliedCols, appliedRows);
             }
           } catch {
             // A tile mid-mount can reject a resize; the effect reconciles it.
           }
-          this.geometryListeners.forEach((listener) => listener(target.agentId, appliedRows, appliedCols, target.deckId));
-        }
-        if (
-          lifecycle !== this.lifecycle
-          || this.terminalChannels.get(key) !== onOutput
-          || this.pendingAttachments.get(key) !== attempt
-        ) {
-          await invoke("desktop_terminal_detach", { sessionId: session.sessionId }).catch(() => undefined);
-          return;
+          this.geometryListeners.forEach((listener) => listener(target.agentId, appliedRows, appliedCols, target.deckId, target.incarnation));
         }
         attempt.session = session;
         /*
@@ -4391,7 +4424,11 @@ export class TauriDeckBridge implements DeckBridge {
    * the listener installs, potentially long after a switch.
    */
   private deliverTerminal(target: AgentTarget, event: TerminalChunk): void {
-    const stamped: TerminalChunk = { ...event, deckId: target.deckId };
+    // PRD #1666 part 2 (G-fix7): the process as well as the deck. The runtime
+    // keys its replay buffers by the bound pair, so bytes from a session
+    // attached to one daemon process are never replayed under a restarted
+    // deck's agent with the same id.
+    const stamped: TerminalChunk = { ...event, deckId: target.deckId, ...(target.incarnation === undefined ? {} : { incarnation: target.incarnation }) };
     if (this.terminalListener) {
       this.terminalListener(stamped);
       return;
@@ -4820,14 +4857,14 @@ export class TauriDeckBridge implements DeckBridge {
       // because output keeps arriving while a React state update waits for its
       // commit, and those bytes were drawn for the new geometry.
       try {
-        const terminal = getTerminal(target.deckId, target.agentId);
+        const terminal = getTerminal(target.deckId, target.agentId, target.incarnation);
         if (terminal && (terminal.cols !== event.payload.cols || terminal.rows !== event.payload.rows)) {
           terminal.resize(event.payload.cols, event.payload.rows);
         }
       } catch {
         // A tile mid-mount can reject a resize; the effect reconciles it.
       }
-      this.geometryListeners.forEach((listener) => listener(target.agentId, event.payload.rows, event.payload.cols, target.deckId));
+      this.geometryListeners.forEach((listener) => listener(target.agentId, event.payload.rows, event.payload.cols, target.deckId, target.incarnation));
     });
     return () => {
       stopSnapshot();
@@ -4875,7 +4912,13 @@ export class TauriDeckBridge implements DeckBridge {
       // this dropped it, which left a started agent's id — the one thing the
       // caller needs to open its pane — unreadable (#1041).
       const agentId = typeof result?.agentId === "string" ? result.agentId : undefined;
-      return { ok: result?.ok !== false, message: result?.message, ...(agentId === undefined ? {} : { agentId }) };
+      // G-fix7: a start's answering process travels with the id it minted, so
+      // the caller waits for and opens THAT agent, not whichever process lists
+      // the id by the time it looks. Present (possibly `undefined`) on a start
+      // only; `null` is a deck that named no process.
+      const started = action.type === "start_agent" || action.type === "start_orchestration" || action.type === "activate_orchestration";
+      const agentIncarnation = typeof result?.agentIncarnation === "string" ? result.agentIncarnation : undefined;
+      return { ok: result?.ok !== false, message: result?.message, ...(agentId === undefined ? {} : { agentId }), ...(started && agentId !== undefined ? { agentIncarnation } : {}) };
     }
     if (action.type === "start_daemon") {
       // Issue #1490: one command for every deck, local or remote. It resolves
@@ -5284,7 +5327,7 @@ export class TauriDeckBridge implements DeckBridge {
     return write;
   }
 
-  onTerminalGeometry(listener: (agentId: string, rows: number, cols: number, deckId?: string) => void): () => void {
+  onTerminalGeometry(listener: TerminalGeometryListener): () => void {
     this.geometryListeners.add(listener);
     // Replay what is already known: an agent can have been constrained by
     // another client long before this tile mounted, and the push that said so

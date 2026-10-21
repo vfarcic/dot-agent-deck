@@ -823,3 +823,134 @@ async fn handshake_013_a_voice_question_after_a_restart_reads_nothing() {
         Some(dot_agent_deck::daemon_client::AGENT_IDENTITY_UNKNOWN)
     );
 }
+
+/// Scenario: reading is switched on and its notice shown, and the webview asks the real `desktop_voice_reading_start` command, over IPC on Tauri's mock runtime, to read agent `1` as listed by deck process `a`. After the same-build deck restarted, it answers that the agent is gone and asks the successor for nothing but its listing; a row held with no process is gone too. Without the restart the same request is not answered gone (control).
+#[test]
+fn handshake_013_a_reading_start_after_a_restart_reads_nothing() {
+    use tauri::ipc::{CallbackFn, InvokeBody};
+    use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
+    use tauri::webview::InvokeRequest;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime for the scripted deck");
+    let _selection = runtime.block_on(crate::dto::SELECTION_LOCK.lock());
+    let _settings = crate::settings::IsolatedSettingsEnv::new();
+    let mut settings = crate::settings::DesktopSettings::default();
+    settings.voice = Some(crate::settings::VoiceSettings {
+        reading: crate::settings::ReadingConsent::On,
+        reading_notice: crate::settings::ReadingNotice::Shown,
+        ..Default::default()
+    });
+    crate::settings::save_to(&crate::settings::settings_path(), None, &settings)
+        .expect("reading switched on");
+    for (restarted, held) in [(false, Some("a")), (true, Some("a")), (false, None)] {
+        let deck = {
+            let _entered = runtime.enter();
+            RestartingDeck::start("g7-reading", "a")
+        };
+        let _local = select(&deck);
+        if restarted {
+            deck.restart_as("b");
+        }
+        let app = mock_builder()
+            .manage(DesktopState::default())
+            .manage(crate::VoiceState::default())
+            .invoke_handler(tauri::generate_handler![crate::desktop_voice_reading_start])
+            .build(crate::app_context())
+            .expect("a mock app");
+        let main = tauri::WebviewWindowBuilder::new(
+            &app,
+            crate::pr_browser::MAIN_WEBVIEW_LABEL,
+            tauri::WebviewUrl::default(),
+        )
+        .build()
+        .expect("the main webview");
+        let answer = get_ipc_response(
+            &main,
+            InvokeRequest {
+                cmd: "desktop_voice_reading_start".into(),
+                callback: CallbackFn(0),
+                error: CallbackFn(1),
+                url: "tauri://localhost".parse().expect("the app origin"),
+                body: InvokeBody::Json(serde_json::json!({
+                    "deckId": crate::dto::deck_wire_id(&deck.endpoint()),
+                    "agentId": "1",
+                    "agentLabel": "planner",
+                    "onSentence": "__CHANNEL__:1",
+                    "incarnation": held,
+                })),
+                headers: Default::default(),
+                invoke_key: INVOKE_KEY.to_string(),
+            },
+        )
+        .map(|body| {
+            body.deserialize::<serde_json::Value>()
+                .expect("a JSON answer")
+        });
+        let kind = answer
+            .as_ref()
+            .ok()
+            .and_then(|answer| answer["kind"].as_str().map(str::to_string));
+        let gone = kind.as_deref() == Some("gone");
+        if restarted || held.is_none() {
+            assert!(gone, "restarted={restarted} held={held:?}: {answer:?}");
+            assert_eq!(
+                deck.received_by("b")
+                    .into_iter()
+                    .filter(|op| op != "list-agents")
+                    .collect::<Vec<_>>(),
+                Vec::<String>::new(),
+                "only the successor's listing is read"
+            );
+        } else {
+            assert!(answer.is_ok() && !gone, "control: {answer:?}");
+        }
+    }
+}
+
+/// Scenario: the New agent dialog starts a plain agent on deck process `a`, and the deck restarts as the same build right after answering the start. The start's result names `a` — the process that minted the id the dialog then waits for and opens — not the restarted deck answering now; with no restart it names `a` too (control). An orchestration launch's result names the process its run's handle is bound to.
+#[tokio::test]
+async fn handshake_013_a_start_result_names_the_process_that_answered_it() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    for restarted in [false, true] {
+        let deck = RestartingDeck::start("g7-start", "a");
+        let _local = select(&deck);
+        let state = DesktopState::default();
+        let wire = crate::dto::deck_wire_id(&deck.endpoint());
+        if restarted {
+            deck.restart_after("start-agent", "b");
+        }
+        let started = crate::start_agent_action(
+            &state,
+            &wire,
+            crate::StartAgentRequest {
+                command: Some("cat".into()),
+                cwd: Some("/project".into()),
+                display_name: None,
+                rows: Some(24),
+                cols: Some(80),
+                authoring_kind: None,
+            },
+        )
+        .await
+        .expect("the start is accepted");
+        assert_eq!(started.agent_id, "1");
+        assert_eq!(
+            started.incarnation.as_deref(),
+            Some("a"),
+            "restarted={restarted}: the start's result does not name the process that answered it"
+        );
+    }
+
+    // An orchestration launch's result takes the process its run's handle is
+    // bound to, which minted every role id it learned.
+    use crate::OrchestrationDaemon;
+    let deck = RestartingDeck::start("g7-launch", "a");
+    let client = dot_agent_deck::daemon_client::DaemonClient::new(deck.socket.clone());
+    let bound = client.bound_to(Some("a".to_string()).into());
+    assert_eq!(bound.launch_incarnation().as_deref(), Some("a"));
+    assert!(client.launch_incarnation().is_unnamed());
+}

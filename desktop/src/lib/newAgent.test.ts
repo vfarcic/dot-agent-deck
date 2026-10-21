@@ -212,10 +212,27 @@ describe("New agent rules (PRD #1223 M4)", () => {
       agents: ids.map((id) => createFixtureStartedAgent({ id, daemonId: deckId })),
     });
     const fleet: DeckFleet = [withAgents(FIXTURE_DAEMON_ID, ["7"]), withAgents(FIXTURE_REMOTE_DAEMON_ID, ["1"])];
-    expect(fleetLists(fleet, FIXTURE_DAEMON_ID, "7")).toBe(true);
-    expect(fleetLists(fleet, FIXTURE_REMOTE_DAEMON_ID, "7")).toBe(false);
-    expect(fleetLists(fleet, FIXTURE_DAEMON_ID, "1")).toBe(false);
-    expect(fleetLists(fleet, "deck-unknown", "7")).toBe(false);
+    expect(fleetLists(fleet, FIXTURE_DAEMON_ID, "7", undefined)).toBe(true);
+    expect(fleetLists(fleet, FIXTURE_REMOTE_DAEMON_ID, "7", undefined)).toBe(false);
+    expect(fleetLists(fleet, FIXTURE_DAEMON_ID, "1", undefined)).toBe(false);
+    expect(fleetLists(fleet, "deck-unknown", "7", undefined)).toBe(false);
+  });
+
+  /**
+   * Scenario: a start answered by daemon process A minted agent 7, and before
+   * the wait sees it the deck restarts as process B, which lists an unrelated
+   * agent 7. B's row is not the started agent, and neither is a row that names
+   * no process; A's own row is (control).
+   */
+  it("finds a started agent only as the daemon process that started it", () => {
+    const listing = (incarnation: string | undefined): DeckFleet => [{
+      ...createFixtureSnapshot("connected"),
+      connection: { status: "connected" as const, deckId: FIXTURE_DAEMON_ID },
+      agents: [{ ...createFixtureStartedAgent({ id: "7", daemonId: FIXTURE_DAEMON_ID }), incarnation }],
+    }];
+    expect(fleetLists(listing("process-b"), FIXTURE_DAEMON_ID, "7", "process-a")).toBe(false);
+    expect(fleetLists(listing(undefined), FIXTURE_DAEMON_ID, "7", "process-a")).toBe(false);
+    expect(fleetLists(listing("process-a"), FIXTURE_DAEMON_ID, "7", "process-a")).toBe(true);
   });
 
   /** Scenario: the filter keeps names containing the query, whatever its case, and an empty filter keeps all. */

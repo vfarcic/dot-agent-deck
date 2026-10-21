@@ -699,6 +699,10 @@ export function AgentTile({
                   /* The agent's OWN deck, never the selected one: the feed is keyed
                      by the composite identity because ids collide across decks. */
                   deckId={agent.daemonId}
+                  /* And its daemon process (PRD #1666 part 2, G-fix7): a
+                     restarted deck's agent with the same id has a feed and an
+                     xterm of its own. */
+                  incarnation={agent.incarnation}
                   label={agent.role}
                   transcript={agent.transcript}
                   terminalFeed={terminalFeed}

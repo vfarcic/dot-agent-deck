@@ -45,14 +45,16 @@ export function OutputReader({ agent, onClose }: OutputReaderProps) {
     const snapshot = () => {
       /* By the composite identity: two decks' same-id agents can both have a
          live xterm since PRD #1105's cross-deck pane, and a bare-id lookup
-         would snapshot whichever mounted last under either agent's heading. */
-      const terminal = getTerminal(agent.daemonId, agent.id);
+         would snapshot whichever mounted last under either agent's heading.
+         And by its daemon process (G-fix7), so a restarted deck's agent with
+         the same id is never read from the previous process's xterm. */
+      const terminal = getTerminal(agent.daemonId, agent.id, agent.incarnation);
       setText(terminal ? terminalSnapshotText(terminal) : stripAnsi(transcriptRef.current));
     };
     snapshot();
     const timer = window.setInterval(snapshot, REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [agent.daemonId, agent.id]);
+  }, [agent.daemonId, agent.id, agent.incarnation]);
 
   // Follow new output only while the reader is pinned to the bottom.
   useEffect(() => {

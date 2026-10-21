@@ -1423,6 +1423,13 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    */
   orchestrationAgentId?: string;
   /**
+   * PRD #1666 part 2 (G-fix7) — the daemon process that listed
+   * {@link orchestrationAgentId} when the utterance was declared. A close
+   * confirms only the card whose member that process still lists; absent
+   * where the declaration did not list it.
+   */
+  orchestrationIncarnation?: string;
+  /**
    * The words to type into the open agent's prompt, for the dictation row
    * (PRD #802 D6, rebuilt).
    *

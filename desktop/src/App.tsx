@@ -42,7 +42,7 @@ import { HandoffRail } from "./components/HandoffRail";
 import { SelectDeckNote } from "./components/SelectDeckNote";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
-import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPanel";
+import { VoiceControlPanel, type AgentIncarnation, type VoicePane } from "./components/VoiceControlPanel";
 import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
 import { OpenPullRequest, PrBrowserHostContext } from "./lib/prBrowser";
 import { SelfUpgradeDialog } from "./components/SelfUpgradeDialog";
@@ -74,7 +74,7 @@ import { DialogNumbered, useNumberedList, useNumbersShown, VoiceChoiceOpen, Voic
 import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoicePages";
 import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
-import { agentKey } from "./lib/agentKey";
+import { agentKey, boundAgentKey } from "./lib/agentKey";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
 import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
 import { agentGoneTerminalState, terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
@@ -335,7 +335,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const panelVoiceContext = useRef<VoicePanelContext | undefined>(undefined);
   /** PRD #1541 — where the voice panel listens for keyboard writes ({@link KeyboardInput}). */
-  const panelKeyboard = useRef<((target: Pick<AgentTarget, "deckId" | "agentId">, data: string, sent: Promise<void>) => void) | undefined>(undefined);
+  const panelKeyboard = useRef<((target: AgentTarget, data: string, sent: Promise<void>) => void) | undefined>(undefined);
   const noteKeyboard = useCallback((target: AgentTarget, data: string, sent: Promise<void>) => panelKeyboard.current?.(target, data, sent), []);
   /**
    * PRD #1223 U5 — the OVERVIEW's half, published while it is mounted:
@@ -1070,9 +1070,12 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       deckId: agent ? (agent.deckId ?? selectedDeckId ?? "") : (agentView?.deckId ?? selectedDeckId ?? ""),
       agentId: agent?.value ?? agentView?.agentId ?? "",
       /* PRD #1666 part 2 (G-fix6): the open pane's own target keeps the
-         incarnation the view was opened on; a resolved `agent_ref` is bound
-         when it is acted on. */
-      ...(!agent && agentView && viewBound(agentView) ? { incarnation: agentView.incarnation } : {}),
+         incarnation the view was opened on. G-fix7: a resolved `agent_ref`
+         carries the process the voice panel bound it to when the utterance
+         was declared (`bindAgentParams`), so the view it opens, the stop it
+         confirms and the pane it types into refuse a restarted deck's agent
+         under the same id. */
+      ...(agent ? ("incarnation" in agent ? { incarnation: agent.incarnation } : {}) : agentView && viewBound(agentView) ? { incarnation: agentView.incarnation } : {}),
       from: base === "overview" ? "overview" : "deck",
       /* What the DECK calls it, which is what Rust resolved the spoken words
          against — never the spoken words themselves. A surface that named the
@@ -1101,7 +1104,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(namedMode ? { modeId: namedMode.value } : {}),
       ...(namedAgentType ? { agentTypeId: namedAgentType.value } : {}),
       ...(declaredForm ? { declaredForm: { deckId: declaredForm.deckId, path: declaredForm.path } } : {}),
-      ...(namedOrchestration ? { orchestrationAgentId: namedOrchestration.value } : {}),
+      ...(namedOrchestration ? { orchestrationAgentId: namedOrchestration.value, ...("incarnation" in namedOrchestration ? { orchestrationIncarnation: namedOrchestration.incarnation } : {}) } : {}),
       ...(outcome.invoke === FILTER_DASHBOARD_INVOKE ? { dashboardFilter: dashboardFilterFromParams(outcome.params) } : {}),
     };
     let moved = false;
@@ -1201,12 +1204,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /* PRD #1195 — the Deck selector's section as it renders, not as it is on
      disk: `save` applies an edit at once and writes it behind. */
   const readEndpoints = useCallback(() => latestSettings.current.settings.endpoints, []);
-  /* PRD #1261 review, round 4 — every agent's incarnation on the selected
-     deck, read when an utterance is declared and again when a chosen entry
-     runs, so an entry whose agent was replaced under its id is refused. */
-  const latestAgents = useRef(runtime.snapshot.agents);
-  latestAgents.current = runtime.snapshot.agents;
-  const readAgentIncarnations = useCallback(() => Object.fromEntries(latestAgents.current.map((agent) => [agent.id, agent.spawnedAtMs])), []);
+  /* PRD #1261 review, round 4 — every agent's incarnation, read when an
+     utterance is declared and again when a chosen entry runs, so an entry
+     whose agent was replaced under its id is refused. PRD #1666 part 2
+     (G-fix7): across the fleet, by the composite key, with the daemon process
+     that listed it beside the spawn time — so a deck restart that reuses the
+     id is refused even where no spawn time is reported, and the voice panel
+     binds every agent a dispatch names to that process. */
+  const latestFleet = useRef(runtime.fleet);
+  latestFleet.current = runtime.fleet;
+  const readAgentIncarnations = useCallback(() => Object.fromEntries(latestFleet.current.flatMap((deck) => deck.agents.map((agent): [string, AgentIncarnation] => [agentKey(agent.daemonId, agent.id), { spawnedAtMs: agent.spawnedAtMs, process: agent.incarnation }]))), []);
   /**
    * PR #1451 round 3, change 3 — the numbered list on screen: the New agent
    * dialog's while it declares one, the screen's otherwise (see
@@ -1470,7 +1477,7 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, gone = 
       onTabChange={setTab}
       onTerminalInput={keyboardInput}
       onTerminalResize={runtime.resizeTerminal}
-      appliedGeometry={runtime.appliedGeometry?.[agentKey(view.deckId, agent.id)]}
+      appliedGeometry={runtime.appliedGeometry?.[boundAgentKey({ deckId: view.deckId, agentId: agent.id, incarnation: agent.incarnation })]}
       /* The evidence drawer is the deck's, and no screen is mounted here that
          could open it — so the handoffs tab lists evidence and selecting one
          does nothing, rather than pretending at a drawer that is not there.
@@ -2545,7 +2552,11 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               */}
               {snapshot.agents.map((agent, index) => (
                 <AgentPaneFrame
-                  key={agent.id}
+                  /* With the daemon process (PRD #1666 part 2, G-fix7): a
+                     restarted deck's agent under the same id is a different
+                     agent, so it gets a fresh frame and terminal rather than
+                     inheriting the previous process's. */
+                  key={`${agent.id}\u0000${agent.incarnation ?? ""}`}
                   open={agent.id === paneAgentId}
                   panePresent={paneAgentId !== undefined}
                   agent={agent}
@@ -2563,7 +2574,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={keyboardInput}
                   onTerminalResize={runtime.resizeTerminal}
-                  appliedGeometry={runtime.appliedGeometry?.[agentKey(agent.daemonId, agent.id)]}
+                  appliedGeometry={runtime.appliedGeometry?.[boundAgentKey({ deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation })]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext, { open: true }); }}
                   onRename={mode === "live" ? renameAgent : undefined}
                   onInboxAction={runtime.inboxAction}

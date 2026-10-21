@@ -1440,6 +1440,13 @@ impl LastCommandKeeper {
 pub struct FormStart {
     pub agent_id: String,
     pub last_command: LastCommandKeeper,
+    /// PRD #1666 part 2 (G-fix7): the daemon process that answered the start —
+    /// the `Hello` of the connection that carried it, or
+    /// [`Incarnation::UNNAMED`] from an ungated handle, which sends none. A
+    /// caller that later looks for the agent, or opens it, matches the id
+    /// together with this, so a restarted deck's agent under the same id is
+    /// not taken for the one this start made.
+    pub incarnation: Incarnation,
 }
 
 /// PRD #1105 — a fresh client identity for [`DaemonClient::with_client_id`]:
@@ -1726,6 +1733,14 @@ impl DaemonClient {
         }
         let (_, _, _, incarnation) = self.protocol_hello(false).await?;
         Ok(self.bound_to(incarnation))
+    }
+
+    /// PRD #1666 part 2 (G-fix7): the daemon process this handle is bound to
+    /// ([`Self::bound_to`]), or `None` for an unbound one. Every id a bound
+    /// handle learns comes from this process, so a caller that hands such an
+    /// id on hands this beside it.
+    pub fn binding(&self) -> Option<&Incarnation> {
+        self.bound.as_ref()
     }
 
     /// PRD #1666 part 2 (G-fix6): whether this handle checks the protocol on
@@ -2084,8 +2099,8 @@ impl DaemonClient {
         kind: Option<crate::authoring_seeds::AuthoringKind>,
     ) -> Result<FormStart, ClientError> {
         let keeper = LastCommandKeeper::from_capabilities(&self.capabilities().await?);
-        let agent_id = self
-            .send_start_agent(
+        let (agent_id, incarnation) = self
+            .send_start_agent_learning(
                 opts,
                 StartKind {
                     authoring_kind: None,
@@ -2097,6 +2112,7 @@ impl DaemonClient {
         Ok(FormStart {
             agent_id,
             last_command: keeper,
+            incarnation,
         })
     }
 
@@ -2114,8 +2130,8 @@ impl DaemonClient {
             return Ok(GatedQuery::Unsupported);
         }
         let keeper = LastCommandKeeper::from_capabilities(&capabilities);
-        let agent_id = self
-            .send_start_agent(
+        let (agent_id, incarnation) = self
+            .send_start_agent_learning(
                 opts,
                 StartKind::daemon_seeded(kind),
                 keeper == LastCommandKeeper::Daemon,
@@ -2124,6 +2140,7 @@ impl DaemonClient {
         Ok(GatedQuery::Answered(FormStart {
             agent_id,
             last_command: keeper,
+            incarnation,
         }))
     }
 
@@ -2381,11 +2398,26 @@ impl DaemonClient {
         kind: StartKind,
         remember_command: bool,
     ) -> Result<String, ClientError> {
+        self.send_start_agent_learning(opts, kind, remember_command)
+            .await
+            .map(|(agent_id, _)| agent_id)
+    }
+
+    /// [`Self::send_start_agent`], also answering which daemon process the
+    /// start reached (PRD #1666 part 2, G-fix7): the `Hello` of the connection
+    /// that carried it, or [`Incarnation::UNNAMED`] on an ungated, unbound
+    /// handle, which sends none.
+    async fn send_start_agent_learning(
+        &self,
+        opts: StartAgentOptions,
+        kind: StartKind,
+        remember_command: bool,
+    ) -> Result<(String, Incarnation), ClientError> {
         let StartKind {
             authoring_kind,
             client_seeded_kind,
         } = kind;
-        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let (mut rd, mut wr, incarnation) = self.admitted_connect_learning().await?;
         let req = AttachRequest::StartAgent {
             command: opts.command,
             cwd: opts.cwd,
@@ -2406,8 +2438,10 @@ impl DaemonClient {
                 resp.error.unwrap_or_else(|| "start-agent failed".into()),
             ));
         }
-        resp.id
-            .ok_or_else(|| ClientError::Malformed("start-agent ok but no id in response".into()))
+        let agent_id = resp
+            .id
+            .ok_or_else(|| ClientError::Malformed("start-agent ok but no id in response".into()))?;
+        Ok((agent_id, incarnation.unwrap_or_default()))
     }
 
     /// Issue #1637: the daemon's hook-binary notices, from one `Hello`
@@ -6402,6 +6436,7 @@ mod tests {
             FormStart {
                 agent_id: "agent-1540".into(),
                 last_command: expected,
+                incarnation: Incarnation::UNNAMED,
             },
             "advertised {advertised:?}"
         );
@@ -8800,6 +8835,8 @@ pub(crate) mod restart_fixture {
         /// accepted afterwards are served by `next`.
         restart_after: Option<(&'static str, &'static str)>,
         hellos: HashMap<&'static str, usize>,
+        /// Capabilities every process leaves out of its `Hello`.
+        withheld: Vec<&'static str>,
     }
 
     pub(crate) struct RestartingDaemon {
@@ -8885,6 +8922,11 @@ pub(crate) mod restart_fixture {
                                     *script.lock().unwrap().hellos.entry(process).or_default() += 1;
                                     let mut reply =
                                         AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+                                    let withheld = script.lock().unwrap().withheld.clone();
+                                    if let Some(capabilities) = reply.capabilities.as_mut() {
+                                        capabilities
+                                            .retain(|cap| !withheld.contains(&cap.as_str()));
+                                    }
                                     reply.instance_id = (!process.starts_with("unnamed-"))
                                         .then(|| process.to_string());
                                     let _ = write_resp(&mut stream, &reply).await;
@@ -8939,6 +8981,12 @@ pub(crate) mod restart_fixture {
         /// serves `op`.
         pub(crate) fn restart_after(&self, op: &'static str, next: &'static str) {
             self.script.lock().unwrap().restart_after = Some((op, next));
+        }
+
+        /// Every process leaves `capability` out of its `Hello` from now on,
+        /// as a daemon from before it would.
+        pub(crate) fn withhold(&self, capability: &'static str) {
+            self.script.lock().unwrap().withheld.push(capability);
         }
 
         /// The ops `process` received, in order.

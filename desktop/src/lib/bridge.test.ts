@@ -758,6 +758,30 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (PRD #1666 part 2, G-fix7): a start answered by daemon process A
+   * hands back the id AND process A, so the caller can wait for that agent
+   * rather than any agent the id names; a start from a deck that named no
+   * process carries the key holding `undefined`, and a stop carries no key.
+   */
+  it("returns the daemon process that answered a start beside the id it minted", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValueOnce({ ok: true, agentId: "7", agentIncarnation: "process-a", snapshot: {} });
+    invoke.mockResolvedValueOnce({ ok: true, agentId: "8", agentIncarnation: null, snapshot: {} });
+    invoke.mockResolvedValueOnce({ ok: true, agentId: "7", snapshot: {} });
+
+    const named = await bridge.runAction({ type: "start_agent", deckId: "deck-00000000000b0x01" });
+    const unnamed = await bridge.runAction({ type: "start_orchestration", deckId: "deck-00000000000b0x01", path: "/srv/repo", orchestration: "tdd" });
+    const stopped = await bridge.runAction({ type: "stop_agent", deckId: "deck-00000000000b0x01", agentId: "7", incarnation: "process-a" });
+
+    expect(named).toEqual({ ok: true, agentId: "7", agentIncarnation: "process-a" });
+    expect(unnamed.agentId).toBe("8");
+    expect("agentIncarnation" in unnamed && unnamed.agentIncarnation === undefined).toBe(true);
+    expect("agentIncarnation" in stopped).toBe(false);
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario (PRD #1223 M7): start a `schedule` authoring agent through the
    * live bridge. `authoringKind` reaches `desktop_run_action` exactly as sent,
    * beside the daemon, the directory and the resolved command.
@@ -2511,7 +2535,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     await bridge.dispose();
 
     expect.soft(live).toMatchObject({ agentId: "agent-4", deckId: remoteDeckId, operation: "append" });
-    expect.soft(geometry).toHaveBeenCalledWith("agent-4", 48, 160, remoteDeckId);
+    expect.soft(geometry).toHaveBeenCalledWith("agent-4", 48, 160, remoteDeckId, undefined);
   });
 
   /**

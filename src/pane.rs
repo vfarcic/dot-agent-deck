@@ -16,6 +16,10 @@ pub enum PaneError {
     ParseError(String),
     #[error("Pane control not available")]
     NotAvailable,
+    /// PRD #1666 part 2 (G-fix7): the action was refused, and the card it was
+    /// aimed at stays as it is. The message is the sentence to show.
+    #[error("{0}")]
+    Refused(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,6 +482,20 @@ pub trait PaneController: Send + Sync {
     /// is `close_pane`, for controllers with no daemon behind them.
     fn close_card(&self, card: &BoundPane) -> Result<(), PaneError> {
         self.close_pane(&card.pane_id)
+    }
+    /// PRD #1666 part 2 (G-fix7): focus the local pane behind a dashboard
+    /// card, only when it is the card's — attached on the daemon process the
+    /// card was learned from. The default is [`Self::focus_pane`], for
+    /// controllers with no daemon behind them.
+    fn focus_card(&self, card: &BoundPane) -> Result<(), PaneError> {
+        self.focus_pane(&card.pane_id)
+    }
+    /// PRD #1666 part 2 (G-fix7): the daemon process this controller attached
+    /// `pane_id` on, for a card it draws for a pane it started or attached
+    /// itself. `None` when it holds no such pane or learned no process — the
+    /// default, for controllers with no daemon behind them.
+    fn pane_incarnation(&self, _pane_id: &str) -> Option<crate::daemon_client::Incarnation> {
+        None
     }
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError>;
     fn resize_pane(

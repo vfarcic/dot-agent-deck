@@ -221,13 +221,16 @@ async fn subscribe(
     match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.subscribe_events_with_snapshot()).await {
         Ok(Ok(GatedQuery::Answered((sub, records)))) => {
             let mut state = state.write().await;
-            state.stream_incarnation = learned_from(&sub);
+            state.learn_stream_incarnation(learned_from(&sub));
             state.take_inbox_snapshot(&records);
             Ok(sub)
         }
         Ok(Ok(GatedQuery::Unsupported)) => match client.subscribe_events().await {
             Ok(sub) => {
-                state.write().await.stream_incarnation = learned_from(&sub);
+                state
+                    .write()
+                    .await
+                    .learn_stream_incarnation(learned_from(&sub));
                 Ok(sub)
             }
             Err(ClientError::ProtocolMismatch { daemon, local }) => {
@@ -314,9 +317,12 @@ async fn resubscribe(
         Ok((sub, records)) => {
             let mut state = state.write().await;
             // PRD #1666 part 2 (G-fix6): before the snapshot, which repaints
-            // only the cards learned from the process that answered.
-            state.stream_incarnation = learned_from(&sub);
+            // only the cards learned from the process that answered. G-fix7:
+            // a card of another process is retired here, and the agent the
+            // answering process runs on its pane gets a card of its own.
+            let retired = state.learn_stream_incarnation(learned_from(&sub));
             state.resync_after_event_gap(&records);
+            state.seed_successor_cards(&retired, &records);
             Ok(sub)
         }
         Err(ResyncFailure::Protocol(refusal)) => Err(Some(refusal)),
@@ -374,17 +380,27 @@ async fn subscribe_with_snapshot(
     match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.subscribe_events_with_snapshot()).await {
         Ok(Ok(GatedQuery::Answered(answer))) => Ok(answer),
         Ok(Ok(GatedQuery::Unsupported)) => {
-            // A gated client's fallback requests check the protocol on their
-            // own connections, and a daemon replaced in between is refused as
-            // the ordered request would have been.
+            // Two requests on two connections, so a daemon replaced between
+            // them — the same build included, which the protocol check admits —
+            // could answer the listing. PRD #1666 part 2 (G-fix7): the listing
+            // is bound to the process that opened the stream, and is taken
+            // only when it names that process too; any other listing is a
+            // snapshot that could not be read, and the resync is tried again.
             let sub = client.subscribe_events().await.map_err(|e| match e {
                 ClientError::ProtocolMismatch { daemon, local } => {
                     ResyncFailure::Protocol(ProtocolRefusal { daemon, local })
                 }
                 e => ResyncFailure::Subscribe(e),
             })?;
-            match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.list_agents()).await {
-                Ok(Ok(records)) => Ok((sub, records)),
+            let lister = match sub.incarnation() {
+                Some(process) if !process.is_unnamed() => client.bound_to(process.clone()),
+                _ => client.clone(),
+            };
+            match tokio::time::timeout(RESYNC_LIST_TIMEOUT, lister.list_agents_detailed()).await {
+                Ok(Ok(listing)) if listing.incarnation.as_ref() == sub.incarnation() => {
+                    Ok((sub, listing.records))
+                }
+                Ok(Ok(_)) => Err(ResyncFailure::Snapshot(ClientError::DaemonRestarted)),
                 Ok(Err(ClientError::ProtocolMismatch { daemon, local })) => {
                     Err(ResyncFailure::Protocol(ProtocolRefusal { daemon, local }))
                 }
@@ -1249,46 +1265,175 @@ mod tests {
         );
     }
 
-    /// Scenario: the TUI's event subscriber opens its stream on the daemon process `a` and a hook event paints a card from it; the daemon then restarts as the same build and the subscriber resubscribes, now on `b`. The state records each stream's process as it opens, and the card keeps `a` — the process it was learned from — so every action on it is bound there, not to the stream that answers now.
+    /// Scenario: the TUI's event subscriber opens its stream on the daemon process `a` and a hook event paints a card for agent `1` on `pane-1`; the daemon restarts as the same build, the subscriber resubscribes on `b`, and `b` sends a Thinking frame for its own agent `1` on `pane-1` under the card's key. The old card is retired — it leaves the pane, keeps `a` and its last status, and shows as gone — and `b`'s agent has a card of its own from the resync's snapshot, bound to `b`, which the frame turns to Thinking. Without the restart the same frame updates the card in place (control).
     #[spec("lifecycle/handshake/013")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn handshake_013_a_card_keeps_the_process_of_the_stream_that_painted_it() {
+    async fn handshake_013_a_new_processs_frame_never_updates_an_old_card() {
         use crate::daemon_client::Incarnation;
         use crate::daemon_client::restart_fixture::RestartingDaemon;
         let named = |process: &str| Incarnation::from(Some(process.to_string()));
-        let daemon = RestartingDaemon::spawn("a");
-        let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
-        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        for restarted in [false, true] {
+            let daemon = RestartingDaemon::spawn("a");
+            let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
 
-        let first = subscribe(&client, &state).await.expect("the first stream");
-        assert_eq!(state.read().await.stream_incarnation, named("a"));
-        state.write().await.apply_event(event_on(
-            "pane-1",
-            "1",
-            "card",
-            EventType::SessionStart,
-            1,
-        ));
-        drop(first);
+            let first = subscribe(&client, &state).await.expect("the first stream");
+            assert_eq!(state.read().await.stream_incarnation, named("a"));
+            state.write().await.apply_event(event_on(
+                "pane-1",
+                "1",
+                "card",
+                EventType::SessionStart,
+                1,
+            ));
+            drop(first);
 
-        daemon.restart_as("b");
-        let _second = resubscribe(&client, &state)
-            .await
-            .expect("the resubscription");
-        // A frame the restarted deck sends under the card's key updates it,
-        // and does not make it the restarted deck's card.
-        state
-            .write()
-            .await
-            .apply_event(event_on("pane-1", "1", "card", EventType::Idle, 2));
-        let state = state.read().await;
-        assert_eq!(state.stream_incarnation, named("b"));
-        let card = state.sessions.get("card").expect("the painted card");
-        assert_eq!(
-            card.bound_pane(),
-            Some(crate::pane::BoundPane::new("pane-1", named("a"))),
-            "the card took the process of a stream that did not paint it"
-        );
+            if restarted {
+                daemon.restart_as("b");
+            }
+            let _second = resubscribe(&client, &state)
+                .await
+                .expect("the resubscription");
+            if restarted {
+                // From the restarted deck's snapshot, before it reports.
+                let state = state.read().await;
+                let seeded: Vec<_> = state
+                    .sessions
+                    .values()
+                    .filter(|session| session.pane_id.as_deref() == Some("pane-1"))
+                    .map(|session| session.incarnation.clone())
+                    .collect();
+                assert_eq!(
+                    seeded,
+                    vec![named("b")],
+                    "the restarted deck's agent has no card"
+                );
+            }
+            state.write().await.apply_event(event_on(
+                "pane-1",
+                "1",
+                "card",
+                EventType::Thinking,
+                2,
+            ));
+            let state = state.read().await;
+            let card = state.sessions.get("card").expect("the painted card");
+            if !restarted {
+                assert!(!state.is_retired_card("card"), "control");
+                assert_eq!(card.status, SessionStatus::Thinking, "control");
+                assert_eq!(
+                    card.bound_pane(),
+                    Some(crate::pane::BoundPane::new("pane-1", named("a"))),
+                    "control"
+                );
+                continue;
+            }
+            assert_eq!(state.stream_incarnation, named("b"));
+            assert!(
+                state.is_retired_card("card"),
+                "the old card was not retired"
+            );
+            assert_eq!(card.incarnation, named("a"));
+            assert_eq!(card.pane_id, None, "a retired card left its pane");
+            assert_ne!(
+                card.status,
+                SessionStatus::Thinking,
+                "the restarted deck's frame updated the old card"
+            );
+            let successors: Vec<_> = state
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.pane_id.as_deref() == Some("pane-1"))
+                .collect();
+            assert_eq!(successors.len(), 1, "one card of its own: {successors:?}");
+            let (key, successor) = successors[0];
+            assert!(!state.is_retired_card(key));
+            assert_eq!(successor.status, SessionStatus::Thinking);
+            assert_eq!(
+                successor.bound_pane(),
+                Some(crate::pane::BoundPane::new("pane-1", named("b")))
+            );
+        }
+    }
+
+    /// Scenario: the TUI holds a card for agent `1` on `pane-1` learned from deck process `a`, and then draws the placeholder card for a pane it attached on `b` with the same pane and agent id — the deck restarted as the same build. The placeholder is not the old card: the old one is retired and the new one is bound to `b`. A placeholder learned from `a` itself is the card already there (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_placeholder_never_adopts_another_processs_card() {
+        use crate::daemon_client::Incarnation;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        for restarted in [false, true] {
+            let mut tui = AppState::default();
+            tui.learn_stream_incarnation(named("a"));
+            tui.apply_event(event_on("pane-1", "1", "card", EventType::SessionStart, 1));
+            let attached_on = named(if restarted { "b" } else { "a" });
+
+            let key = tui.insert_placeholder_session_learned(
+                "pane-1".into(),
+                None,
+                None,
+                Some("1".into()),
+                attached_on.clone(),
+            );
+
+            if !restarted {
+                assert_eq!(key, "card", "control: the card already there");
+                assert!(!tui.is_retired_card("card"));
+                continue;
+            }
+            assert_ne!(
+                key, "card",
+                "the placeholder adopted the old process's card"
+            );
+            assert!(tui.is_retired_card("card"));
+            assert_eq!(
+                tui.sessions[&key].bound_pane(),
+                Some(crate::pane::BoundPane::new("pane-1", attached_on))
+            );
+        }
+    }
+
+    /// Scenario: a TUI resynchronizes against a deck that predates the ordered subscribe-with-snapshot request, so it subscribes and then lists on a second connection; the deck restarts as the same build between the two. From a stream on the named process `a`, the restarted process is sent no listing and the resync fails; from a stream on a deck that named no process, the restarted deck's listing names `b` and is not taken either. With no restart, the listing is taken in both cases (control).
+    #[spec("lifecycle/handshake/013")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handshake_013_a_fallback_snapshot_comes_from_the_streams_own_process() {
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        for first in ["a", "unnamed-a"] {
+            for restarted in [false, true] {
+                let daemon = RestartingDaemon::spawn(first);
+                daemon.withhold(crate::daemon_protocol::CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT);
+                if restarted {
+                    daemon.restart_after("subscribe-events", "b");
+                }
+                let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+
+                let answer = subscribe_with_snapshot(&client).await;
+
+                let case = format!("first={first} restarted={restarted}");
+                let lister = if restarted { "b" } else { first };
+                let listed = daemon
+                    .received_by(lister)
+                    .contains(&"list-agents".to_string());
+                // A named stream binds the listing, so the successor is sent
+                // none; an unnamed one cannot, and refuses what answers.
+                assert_eq!(listed, !restarted || first != "a", "{case}");
+                match answer {
+                    Ok((sub, records)) => {
+                        assert!(!restarted, "{case}: another process's listing was taken");
+                        let process = sub.incarnation().and_then(|i| i.as_deref());
+                        assert_eq!(process, (first == "a").then_some("a"), "{case}");
+                        assert_eq!(records.len(), 1, "{case}");
+                    }
+                    Err(ResyncFailure::Snapshot(_)) => {
+                        assert!(
+                            restarted,
+                            "{case}: the stream's own process's listing was refused"
+                        );
+                    }
+                    Err(_) => panic!("{case}: not a snapshot failure"),
+                }
+            }
+        }
     }
 
     /// Scenario: a card painted while the TUI's stream came from the daemon process `a` is managed by the TUI, and the daemon restarts as the same build; the resync after the reconnect brings a snapshot from `b` whose record has the same pane and agent id and a different status. The old card is not repainted as `b`'s agent and keeps `a`; resynchronizing from `a` itself repaints it (control).

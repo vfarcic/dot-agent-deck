@@ -416,9 +416,19 @@ trait OrchestrationDaemon {
         expected_agent_id: &str,
         timeout: Duration,
     ) -> Result<String, String>;
+    /// PRD #1666 part 2 (G-fix7): the daemon process this launch's handle is
+    /// bound to ([`bind_launch`]), which mints every role id it learns — or
+    /// [`Incarnation::UNNAMED`] for a handle bound to none.
+    fn launch_incarnation(&self) -> Incarnation {
+        Incarnation::UNNAMED
+    }
 }
 
 impl OrchestrationDaemon for DaemonClient {
+    fn launch_incarnation(&self) -> Incarnation {
+        self.binding().cloned().unwrap_or_default()
+    }
+
     async fn prepare_orchestration(
         &self,
         cwd: &str,
@@ -550,6 +560,10 @@ async fn bind_launch(client: &DaemonClient) -> Result<DaemonClient, String> {
 struct OrchestrationLaunchResult {
     start_agent_id: String,
     agent_ids: Vec<String>,
+    /// The daemon process the launch ran on (PRD #1666 part 2, G-fix7): its
+    /// handle's binding ([`bind_launch`]), which minted every id above.
+    /// [`Incarnation::UNNAMED`] from an ungated handle.
+    incarnation: Incarnation,
 }
 
 /// PRD #1223 audit F4: how long one role's start may take — the whole
@@ -976,6 +990,7 @@ async fn launch_orchestration<D: OrchestrationDaemon + Sync>(
     Ok(OrchestrationLaunchResult {
         start_agent_id,
         agent_ids: started.into_iter().map(|role| role.agent_id).collect(),
+        incarnation: daemon.launch_incarnation(),
     })
 }
 
@@ -1253,6 +1268,7 @@ async fn launch_configured_orchestration<D: OrchestrationDaemon + Sync>(
     Ok(OrchestrationLaunchResult {
         start_agent_id,
         agent_ids: started.into_iter().map(|role| role.agent_id).collect(),
+        incarnation: daemon.launch_incarnation(),
     })
 }
 
@@ -4378,10 +4394,14 @@ async fn desktop_voice_speech_audio(
 /// Summaries are made Rust-side ([`voice::reading::read_turns`]) through the
 /// Commands connection, read per turn, so the agent's final reply never
 /// crosses into the webview — only the finished sentence does.
+///
+/// Generic over the runtime (PRD #1666 part 2, G-fix7) so a test registers this
+/// command on [`tauri::test::MockRuntime`] and invokes it over IPC, so the pin
+/// on its row check runs this body rather than a copy of it.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-async fn desktop_voice_reading_start(
-    webview: Webview,
+async fn desktop_voice_reading_start<R: tauri::Runtime>(
+    webview: Webview<R>,
     state: State<'_, DesktopState>,
     voice_state: State<'_, VoiceState>,
     deck_id: String,
@@ -5167,6 +5187,9 @@ struct StartedAgent {
     /// The deck the agent was started on — captured once, before the first
     /// await, and the only deck any later step of the action may name.
     scope: crate::dto::DeckScope,
+    /// The daemon process that answered the start (PRD #1666 part 2, G-fix7):
+    /// [`Self::agent_id`] names an agent of that process only.
+    incarnation: Incarnation,
 }
 
 /// Start one plain agent on the deck `deck_id` names (PRD #1223 M3).
@@ -5307,6 +5330,7 @@ async fn start_agent_action(
     Ok(StartedAgent {
         agent_id: started.agent_id,
         scope,
+        incarnation: started.incarnation,
     })
 }
 
@@ -5345,6 +5369,9 @@ struct StartedOrchestration {
     agent_ids: Vec<String>,
     /// The deck, captured once before the first await.
     scope: crate::dto::DeckScope,
+    /// The daemon process the launch was bound to (PRD #1666 part 2, G-fix7),
+    /// which minted every id above.
+    incarnation: Incarnation,
 }
 
 /// [`DesktopAction::ActivateOrchestration`]'s fields, unpacked for
@@ -5565,6 +5592,7 @@ async fn start_orchestration_action(
         start_agent_id: launched.start_agent_id,
         agent_ids: launched.agent_ids,
         scope,
+        incarnation: launched.incarnation,
     })
 }
 
@@ -6179,6 +6207,7 @@ async fn desktop_run_action(
 ) -> Result<DesktopActionResult, DesktopActionError> {
     ensure_main_webview(&webview)?;
     let mut result_agent_id = None;
+    let mut result_agent_incarnation = None;
     let mut result_agent_ids = Vec::new();
     let mut result_terminal = None;
     let mut result_message = None;
@@ -6193,6 +6222,7 @@ async fn desktop_run_action(
             return Ok(DesktopActionResult {
                 ok: snapshot.connection.status == ConnectionStatus::Connected,
                 agent_id: None,
+                agent_incarnation: None,
                 agent_ids: Vec::new(),
                 terminal: None,
                 message: None,
@@ -6230,6 +6260,7 @@ async fn desktop_run_action(
             }
             state.request_refetch(&started.scope.identity());
             result_agent_id = Some(started.agent_id);
+            result_agent_incarnation = Some(started.incarnation);
         }
         DesktopAction::StartOrchestration {
             deck_id,
@@ -6259,6 +6290,7 @@ async fn desktop_run_action(
             }
             state.request_refetch(&started.scope.identity());
             result_agent_id = Some(started.start_agent_id);
+            result_agent_incarnation = Some(started.incarnation);
             result_agent_ids = started.agent_ids;
         }
         DesktopAction::ActivateOrchestration {
@@ -6286,6 +6318,7 @@ async fn desktop_run_action(
             )
             .await?;
             result_agent_id = Some(launched.start_agent_id);
+            result_agent_incarnation = Some(launched.incarnation);
             result_agent_ids = launched.agent_ids;
             result_message = Some(
                 "Orchestration activated from its configuration. Commands were applied for this activation only; profile/model command write-back is not implemented."
@@ -6381,6 +6414,7 @@ async fn desktop_run_action(
             return Ok(DesktopActionResult {
                 ok: true,
                 agent_id: None,
+                agent_incarnation: None,
                 agent_ids: Vec::new(),
                 terminal: None,
                 message: Some(
@@ -6439,6 +6473,7 @@ async fn desktop_run_action(
     Ok(DesktopActionResult {
         ok: true,
         agent_id: result_agent_id,
+        agent_incarnation: result_agent_incarnation,
         agent_ids: result_agent_ids,
         terminal: result_terminal,
         message: result_message,

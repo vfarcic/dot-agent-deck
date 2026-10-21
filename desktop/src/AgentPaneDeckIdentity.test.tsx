@@ -25,7 +25,7 @@ vi.mock("./components/TerminalViewport", () => ({
 }));
 
 import { DeckShell, DeckSurface } from "./App";
-import { agentKey } from "./lib/agentKey";
+import { agentKey, boundAgentKey } from "./lib/agentKey";
 import type { DesktopSettingsState } from "./hooks/useDesktopSettings";
 
 /**
@@ -240,8 +240,8 @@ describe("agent pane deck identity", () => {
       {
         appliedGeometry: {
           planner: { rows: 24, cols: 80 },
-          [agentKey(FIXTURE_DAEMON_ID, "planner")]: { rows: 24, cols: 80 },
-          [agentKey(REMOTE_DECK_ID, "planner")]: { rows: 48, cols: 160 },
+          [boundAgentKey({ deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: undefined })]: { rows: 24, cols: 80 },
+          [boundAgentKey({ deckId: REMOTE_DECK_ID, agentId: "planner", incarnation: undefined })]: { rows: 48, cols: 160 },
         },
       },
       (agent) => (agent.id === "planner" ? { ...agent, status: "running", writeLease: "write" } : agent),
@@ -326,7 +326,7 @@ describe("agent pane deck identity", () => {
       {
         appliedGeometry: {
           planner: { rows: 24, cols: 80 },
-          [agentKey(FIXTURE_DAEMON_ID, "planner")]: { rows: 24, cols: 80 },
+          [boundAgentKey({ deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: undefined })]: { rows: 24, cols: 80 },
         },
       },
       // Writable and running on BOTH decks, so the pane shows no input notice.
