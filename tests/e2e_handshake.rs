@@ -704,6 +704,141 @@ fn handshake_013_ctrl_w_after_a_same_build_restart_preserves_the_successor() {
     );
 }
 
+/// Scenario: start with an empty TUI, let a daemon-spawned card arrive without attaching its terminal, then restart the daemon as the same build reusing both ids. Ctrl+W, digit focus and Enter on separate stale cards must show the gone sentence, attach nothing and leave the successor alive; without a restart those same actions close or attach the original agent (controls).
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_restart() {
+    use inbox::*;
+    for action in ["close", "digit", "enter"] {
+        for restarted in [false, true] {
+            let mut original = spawn_daemon_at_build(NEW_BUILD);
+            let proxy = reconnect::AttachProxy::new(&original.attach_socket);
+            let deck = TuiDeck::builder()
+                .with_env(
+                    "DOT_AGENT_DECK_ATTACH_SOCKET",
+                    proxy.socket.to_string_lossy().to_string(),
+                )
+                .with_env(
+                    "DOT_AGENT_DECK_SOCKET",
+                    original.hook_socket.to_string_lossy().to_string(),
+                )
+                .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+                .launch_with_fixture("minimal");
+            deck.wait_for_string("No active agents");
+            let old = pane_with(
+                &original,
+                "never-attached-card",
+                serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "ORIGINAL-NEVER-ATTACHED-1666"]]}),
+            );
+            deck.wait_for_string("never-attached-card");
+            // Select the surfaced card without entering its terminal.
+            deck.send_keys(b"\x1b[B");
+            assert_eq!(
+                proxy.attach_count(),
+                0,
+                "precondition: the TUI never attached this card"
+            );
+            let old_id = old.agent.clone();
+            let successor = if restarted {
+                assert!(
+                    original
+                        .send_attach_request(&AttachRequest::StopDaemon { force: true })
+                        .unwrap()
+                        .ok
+                );
+                assert!(original.wait_for_exit(Duration::from_secs(10)));
+                drop(old);
+                Some(spawn_daemon_serve_with_env(
+                    None,
+                    "0",
+                    &[
+                        ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+                        (
+                            "DOT_AGENT_DECK_ATTACH_SOCKET",
+                            original.attach_socket.to_str().unwrap(),
+                        ),
+                        (
+                            "DOT_AGENT_DECK_SOCKET",
+                            original.hook_socket.to_str().unwrap(),
+                        ),
+                    ],
+                ))
+            } else {
+                None
+            };
+            let new = successor.as_ref().map(|daemon| {
+                let pane = pane_with(
+                    daemon,
+                    "never-attached-card",
+                    serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "SUCCESSOR-NEVER-ATTACHED-1666"]]}),
+                );
+                assert_eq!(pane.agent, old_id, "precondition: both ids are reused");
+                pane
+            });
+            match action {
+                "close" => {
+                    deck.send_keys(b"\x17");
+                    deck.wait_for_string("Close selected agent?");
+                    deck.send_keys(b"\x1b[B\r");
+                }
+                "digit" => deck.send_keys(b"1"),
+                "enter" => deck.send_keys(b"\r"),
+                _ => unreachable!(),
+            }
+            if let Some(ref successor) = successor {
+                deck.wait_for_string(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART);
+                let grid = deck.snapshot_grid();
+                assert_eq!(
+                    proxy.attach_count(),
+                    0,
+                    "{action}: a stale card attached the successor; grid=\n{grid}"
+                );
+                assert!(
+                    !grid.contains("SUCCESSOR-NEVER-ATTACHED-1666"),
+                    "{action}: successor output appeared in the stale card; grid=\n{grid}"
+                );
+                assert!(
+                    wait_for_agent_display_name(
+                        &successor.attach_socket,
+                        "never-attached-card",
+                        true,
+                        Duration::from_secs(5)
+                    ),
+                    "{action}: the successor must stay alive"
+                );
+                assert!(
+                    std::fs::read(&new.as_ref().unwrap().capture)
+                        .unwrap()
+                        .is_empty(),
+                    "{action}: the successor must receive no terminal input"
+                );
+            } else if action == "close" {
+                deck.wait_for_string("No active agents");
+                assert!(
+                    wait_for_agent_display_name(
+                        &original.attach_socket,
+                        "never-attached-card",
+                        false,
+                        Duration::from_secs(5)
+                    ),
+                    "control: close stops the original agent"
+                );
+                assert_eq!(
+                    proxy.attach_count(),
+                    0,
+                    "control: close needs no terminal attach"
+                );
+            } else {
+                deck.wait_for_string("ORIGINAL-NEVER-ATTACHED-1666");
+                assert!(
+                    proxy.attach_count() > 0,
+                    "control: {action} attaches the original agent"
+                );
+            }
+        }
+    }
+}
+
 /// Scenario: keep a terminal open while the daemon restarts as the same build and reuses both the agent id and pane id. Input typed during the disconnect must not migrate, the successor's terminal output must never appear in the old pane, and Ctrl+W must show the gone sentence while leaving the successor running.
 #[spec("lifecycle/handshake/013")]
 #[test]

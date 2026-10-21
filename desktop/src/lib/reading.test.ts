@@ -130,15 +130,33 @@ describe("DeckReader (PRD #1497, decisions 1–3 of 2026-10-09)", () => {
     expect(h.reader.on).toBe(true);
   });
 
-  /** Scenario: an agent is replaced under the same id (a new incarnation); the old session is stopped and the new one read. */
+  /** Scenario: the same agent and daemon process keep one reading session across a refresh (control). Replacing either the agent generation or the daemon process under the same id stops the old session and starts reading afresh, so its next finished turn is spoken. */
   it("reads a replaced agent afresh", async () => {
-    const h = harness();
-    h.reader.update(true, [TESTER], false);
-    await flush();
-    h.reader.update(true, [{ ...TESTER, incarnation: 9 }]);
-    await flush();
-    expect(h.stop).toHaveBeenCalledWith(1);
-    expect(h.started()).toEqual(["tester", "tester"]);
+    for (const replacement of [{ incarnation: 9 }, { deckProcess: "process-b" }]) {
+      let daemonProcess = "process-a";
+      let session = 0;
+      // The real backend refuses an unnamed or mismatched process as gone.
+      const h = harness((target) => target.deckProcess === daemonProcess
+        ? { kind: "started", session: ++session }
+        : { kind: "gone" });
+      const original = { ...TESTER, deckProcess: "process-a" };
+      h.reader.update(true, [original], false);
+      await flush();
+      h.reader.update(true, [{ ...original }]);
+      await flush();
+      expect(h.stop).not.toHaveBeenCalled();
+      expect(h.started()).toEqual(["tester"]);
+      expect(h.reader.reading).toEqual([readingKey(original)]);
+      const next = { ...original, ...replacement };
+      daemonProcess = next.deckProcess;
+      h.reader.update(true, [next]);
+      await flush();
+      expect(h.stop).toHaveBeenCalledWith(1);
+      expect(h.started()).toEqual(["tester", "tester"]);
+      expect(h.reader.reading).toEqual([readingKey(next)]);
+      h.sinks.get("tester")!({ kind: "turn", text: "Tester: reading after replacement." });
+      expect(h.said.at(-1)).toEqual([readingKey(next), "Tester: reading after replacement."]);
+    }
   });
 
   /** Scenario: Reading is turned off; what is being said is cut off, the queue dropped, "Reading off." said, and every session stopped. A late sentence from a stopped session is never spoken. */
@@ -864,4 +882,3 @@ describe("the one-time notice (decision 5 of 2026-10-09)", () => {
     for (const { endpoint, notice } of noticeCases) expect(readingNotice(endpoint), endpoint).toBe(notice);
   });
 });
-
