@@ -51,7 +51,7 @@ import { tauriSelfUpgradeApi } from "./lib/selfUpgrade";
 import { fixtureSelfUpgradeApi } from "./data/fixture";
 import { useSelfUpgradeCheck } from "./hooks/useSelfUpgradeCheck";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
-import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
+import { DISPLAY_LIMITS, deckName, displayActivity, displayText, sanitizeText } from "./lib/displayText";
 import { voicePaneAgent } from "./lib/promptKeys";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, disconnectedRemedy, incompatibleRemedy, startDaemonConfirmCopy } from "./lib/connectionRemedy";
 import { upgradeKindOf, upgradeOffered } from "./lib/upgrade";
@@ -558,7 +558,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * PRD #1666 part 2 (G-fix7c) — the one notice naming the agents a deck
    * restart stopped, on whichever screen is up. Their rows are gone with the
    * restarted deck's listing, and an open pane of one closes
-   * (`paneAgentRetired`); this says why, and sends nothing to any deck.
+   * (`paneAgentRetired`); this says why. It asks no deck to stop or close
+   * anything (G-fix7d); a closed pane's terminal is withdrawn from the shown
+   * set, which detaches that terminal's own connection only.
    */
   const restart = useRestartNotice(runtime.fleet);
   /** The record the pane RENDERS: the deck's current answer, else its last one. */
@@ -2663,13 +2665,14 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
       {/* PRD #1666 part 2 (G-fix7c): the agents a deck restart stopped, in a
           slot of its own so an action's sentence never replaces it unseen. */}
       {restart && (
-        <div className="toast" data-testid="restart-toast" role="status">
+        <div className="toast toast-restart" data-testid="restart-toast" role="status">
           <AlertTriangle size={15} />
           <div className="toast-body">
-            {/* `detail`'s budget, not `message`'s: it names every agent the
-                restart stopped, and the last ones are as much the point as the
-                first. */}
-            <span>{displayText(restart, DISPLAY_LIMITS.detail)}</span>
+            {/* G-fix7d: every agent the notice names, unclamped — the last
+                ones are as much the point as the first — in a body that
+                scrolls when the list is long. `useRestartNotice` clamps each
+                name it takes. */}
+            <span>{sanitizeText(restart)}</span>
           </div>
           <button aria-label="Dismiss restart notice" onClick={onDismissRestart}><X size={14} /></button>
         </div>

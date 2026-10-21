@@ -126,6 +126,7 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 | `o` | Open the selected agent's pull request in your system browser (uses `$BROWSER` when set; a `$BROWSER` that puts the address into a shell command, such as `sh -c %s`, is refused); when no browser can be opened, for example in a TUI on a remote host, the status line shows the pull request's address so you can copy it. On a card with no [pull request badge](session-management.md#pull-request-badge) it says the agent has none. The desktop app has no `o`: click the badge or say "open the PR", and it opens inside the app ([Dashboard → Pull requests](desktop/dashboard.md#pull-requests)) |
 | `m` | Open the **Host of this deck** overlay: disk, load and memory of the machine the deck runs on (see [Session Management](session-management.md#check-the-machine-a-deck-runs-on)); `Esc` closes it |
 | `u` | Open the upgrade dialog while the footer shows an update notice (see [Upgrade from the TUI](installation.md#upgrade-from-the-tui)) |
+| `a` / `c` | While the footer says the deck restarted: `a` lists every agent the restart stopped, `c` dismisses the notice (see [The deck restarted and its agents disappeared](troubleshooting.md#the-deck-restarted-and-its-agents-disappeared)) |
 | `y` / `n` | Approve / deny a pending permission request; only when the selected card shows **Needs Input**. Otherwise `n` starts a new agent (see [Plain letters in command mode](#plain-letters-in-command-mode)). |
 | `d`, `n`, `w`, `t`, `z`, `e` | The same as `Ctrl+` with that letter (see [Plain letters in command mode](#plain-letters-in-command-mode)) |
 | `Ctrl+M`, `Ctrl+S`, `Ctrl+G`, `Ctrl+U`, `Ctrl+R` | The same as the letter alone (see [Plain letters in command mode](#plain-letters-in-command-mode)) |
@@ -221,6 +222,7 @@ While filtering: `Enter` stops editing and keeps the filter, `Backspace` deletes
 | **Star prompt** | Shown at startup about once every 10 launches, until dismissed | `s` opens the repository to star it · `l` or `Esc` asks again later · `d` never asks again |
 | **Help overlay** | `?` | `?`, `Esc` or `q` closes it |
 | **Host of this deck** | `m` (or `Ctrl+M`) | `Esc`, `q`, `m` or `Ctrl+M` closes it |
+| **Restart notice** | `a`, or `[Agents]` in the footer, while the footer says the deck restarted | `Up` / `Down` (or `k` / `j`) and `PageUp` / `PageDown` scroll the list · `c` dismisses the notice · `Esc`, `q` or `a` closes the list and keeps the notice |
 
 ## Customizing Keybindings
 
@@ -296,6 +298,8 @@ Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Ent
 | `scroll_pane_up` | `PageUp` | Scroll the focused pane back |
 | `scroll_pane_down` | `PageDown` | Scroll the focused pane forward |
 | `host_metrics` | `m` | Open the Host of this deck overlay |
+| `restart_notice` | `a` | List the agents a deck restart stopped |
+| `dismiss_restart_notice` | `c` | Dismiss the restart notice |
 
 Not remappable, and they work alongside your bindings: `Down` / `Up` for card selection, `Tab` / `Shift+Tab` / `Left` / `Right` for tabs, `Ctrl+PageUp` / `Ctrl+PageDown`, `S` for the Schedules manager, and `Ctrl+C`, which always opens the quit dialog from command mode. There is no `quit` action.
 

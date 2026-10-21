@@ -1078,6 +1078,12 @@ type VoiceContext = {
   deck: string | undefined;
   confirmation: boolean;
   incarnations: Readonly<Record<string, AgentIncarnation>>;
+  /**
+   * PRD #1666 part 2 (G-fix7d): the daemon process each connected deck in the
+   * fleet is, by deck id — so an agent no longer listed by a deck that has
+   * become another process is told apart as gone with its deck's restart.
+   */
+  deckProcesses?: Readonly<Record<string, string | undefined>>;
 };
 
 /**
@@ -1156,7 +1162,13 @@ export function contextLost(was: VoiceContext, now: VoiceContext, touches: Touch
     const key = agentKey(touches.agent.deckId, touches.agent.agentId);
     const before = was.incarnations[key];
     const after = now.incarnations[key];
-    if (before !== undefined && after === undefined) return { code: "gone", why: "the agent is gone" };
+    if (before !== undefined && after === undefined) {
+      /* G-fix7d: its deck is another process now — a restart stopped it, and
+         the sentence is the one every other restart refusal says. */
+      const deckNow = touches.agent.deckId === undefined ? undefined : now.deckProcesses?.[touches.agent.deckId];
+      if (before.process !== undefined && deckNow !== undefined && deckNow !== before.process) return { code: "restarted", why: AGENT_GONE_AFTER_RESTART };
+      return { code: "gone", why: "the agent is gone" };
+    }
     if (before !== undefined && after !== undefined) return agentReplaced(before, after);
   }
   return undefined;
@@ -1601,6 +1613,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   endpointsRef.current = endpoints;
   const agentIncarnationsRef = useRef(agentIncarnations);
   agentIncarnationsRef.current = agentIncarnations;
+  const fleetRef = useRef(fleet);
+  fleetRef.current = fleet;
   const numberedRef = useRef(numbered);
   numberedRef.current = numbered;
   const pagesRef = useRef(pages);
@@ -2079,6 +2093,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     deck: selectedDeckRef.current,
     confirmation: confirmationRef.current,
     incarnations: agentIncarnationsRef.current?.() ?? {},
+    deckProcesses: Object.fromEntries((fleetRef.current ?? [])
+      .filter(({ connection }) => connection.deckId !== undefined && connection.status === "connected")
+      .map(({ connection }) => [connection.deckId as string, connection.incarnation])),
   }), []);
   /** Take the numbered list on screen as the one heard, with the context it stands in. */
   const hearNumbers = useCallback(() => {

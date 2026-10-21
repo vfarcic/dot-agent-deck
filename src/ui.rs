@@ -377,6 +377,10 @@ pub enum UiMode {
     /// wait on the user's Retry or Cancel, opened by the `inbox_attention` key
     /// (default `i`). Its state lives in `UiState::inbox_attention`.
     InboxAttention,
+    /// PRD #1666 part 2 (G-fix7d): the list of every agent the restart notice
+    /// names, opened by the `restart_notice` key (default `a`) or the footer's
+    /// `[Agents]` button. Its state lives in `UiState::restart_notice`.
+    RestartNotice,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1786,11 +1790,11 @@ struct UiState {
     /// Without this, switching away and back re-armed the
     /// highlight a tab switch had cleared (violating SC1).
     last_focused_pane_id: Option<String>,
-    /// PRD #1666 part 2 (G-fix7c): the agents the notice on the status line
-    /// names as stopped by a deck restart, with the notice's text — so agents a
-    /// later frame drops for the same restart join that one notice while it is
-    /// still showing ([`process_restart_drops`]).
-    restart_notice: Option<(Vec<crate::daemon_client::StoppedAgent>, String)>,
+    /// PRD #1666 part 2 (G-fix7c): the notice naming the agents deck restarts
+    /// stopped ([`process_restart_drops`]). G-fix7d: in a footer row of its own
+    /// rather than the expiring status line, in every mode, until the user
+    /// dismisses it — agents later drops take join it meanwhile.
+    restart_notice: Option<RestartNotice>,
     /// PRD #341 M6: which pane the user was typing into as of the previous
     /// [`reconcile_pane_input_scrollback`] frame — `Some(pane_id)` while `mode ==
     /// PaneInput` with a focused pane, `None` otherwise. A change in this value is
@@ -2222,6 +2226,77 @@ struct InboxAttentionDialog {
     items: Vec<crate::inbox_hub::InboxAttentionItem>,
     selected: usize,
     answer: Option<String>,
+}
+
+/// PRD #1666 part 2 (G-fix7d) — the one notice naming the agents deck restarts
+/// stopped, held until the user dismisses it, as the desktop app's restart
+/// toast is (CLAUDE.md rule 22). Agents a later drop takes join it while it is
+/// held, each once ([`StoppedIdentity`]). The footer shows its first names
+/// ([`crate::daemon_client::agents_stopped_by_restart_summary`]); the overlay
+/// lists every one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RestartNotice {
+    agents: Vec<(StoppedIdentity, crate::daemon_client::StoppedAgent)>,
+    /// The first line of the list the overlay shows.
+    scroll: usize,
+}
+
+impl RestartNotice {
+    /// The notice's full sentence, naming every agent.
+    #[cfg(test)]
+    fn text(&self) -> String {
+        crate::daemon_client::agents_stopped_by_restart_notice(&self.agent_names())
+    }
+
+    /// What the footer shows: the first names, and how many more there are.
+    fn summary(&self) -> String {
+        crate::daemon_client::agents_stopped_by_restart_summary(&self.agent_names())
+    }
+
+    fn agent_names(&self) -> Vec<crate::daemon_client::StoppedAgent> {
+        self.agents.iter().map(|(_, agent)| agent.clone()).collect()
+    }
+
+    /// Add `agent` unless the notice already names the agent `identity` is.
+    fn join(&mut self, identity: StoppedIdentity, agent: crate::daemon_client::StoppedAgent) {
+        if !self
+            .agents
+            .iter()
+            .any(|(held, _)| held.same_agent(&identity))
+        {
+            self.agents.push((identity, agent));
+        }
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7d): which agent a [`RestartNotice`] entry is — its
+/// pane, its registry id and the daemon process it ran under, or, for a card
+/// with no pane, its card key — so the several cards and the local pane one
+/// agent leaves behind are named once, and two agents sharing a label are both
+/// named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoppedIdentity {
+    pane: Option<String>,
+    key: Option<String>,
+    agent: Option<String>,
+    process: crate::daemon_client::Incarnation,
+}
+
+impl StoppedIdentity {
+    fn same_agent(&self, other: &Self) -> bool {
+        if self.process != other.process {
+            return false;
+        }
+        match (&self.pane, &other.pane) {
+            // An id one side never learned does not make them two agents.
+            (Some(a), Some(b)) => {
+                a == b
+                    && (self.agent.is_none() || other.agent.is_none() || self.agent == other.agent)
+            }
+            (None, None) => self.key == other.key,
+            _ => false,
+        }
+    }
 }
 
 /// PRD #1258 M3 — the host overlay's content.
@@ -4029,17 +4104,17 @@ fn apply_pane_closure(
 /// The event subscriber has already removed every card learned from the
 /// replaced daemon process ([`AppState::pending_restart_drops`]); the pane
 /// controller marks each local pane whose reattach found another process
-/// answering ([`PaneController::panes_lost_to_restart`]). This drops, locally
-/// and with nothing sent to the daemon, each such pane's attachment, its slot
-/// in an orchestration tab — and the tab, once no live pane is left in it,
-/// with [`apply_pane_closure`]'s focus rule — and the dashboard names and
-/// selection that would otherwise pass to an agent the restarted deck runs
-/// under a reused pane id or card key. No unit or orchestration cleanup runs,
-/// so a dispatched unit's worktree and branch stay on disk.
+/// answering ([`PaneController::panes_lost_to_restart`]). This drops, locally,
+/// each such pane's attachment — closing this client's own connection for it,
+/// which reaches no other agent — its slot in an orchestration tab — and the
+/// tab, once no live pane is left in it, with [`apply_pane_closure`]'s focus
+/// rule — and the dashboard names and selection that would otherwise pass to
+/// an agent the restarted deck runs under a reused pane id or card key. No
+/// stop or close is asked of either daemon, and no unit or orchestration
+/// cleanup runs, so a dispatched unit's worktree and branch stay on disk.
 ///
-/// The agents dropped are named in one notice
-/// ([`crate::daemon_client::agents_stopped_by_restart_notice`]); drops that
-/// arrive while it is still on the status line join it.
+/// The agents dropped are named in one notice ([`RestartNotice`]), each agent
+/// once; drops that arrive before the user dismisses it join it.
 fn process_restart_drops(
     state: &SharedState,
     pane: &dyn PaneController,
@@ -4076,7 +4151,9 @@ fn process_restart_drops(
             if let Some(card) = st.sessions.remove(&key) {
                 dropped.push(crate::state::RestartDroppedCard {
                     key,
+                    held: true,
                     pane_id: card.pane_id,
+                    agent_id: card.agent_id,
                     display_name: card.display_name,
                     agent_type: card.agent_type,
                     incarnation: card.incarnation,
@@ -4095,15 +4172,31 @@ fn process_restart_drops(
         }
     }
 
-    // Name each agent before its tab slot and names go.
-    let mut stopped: Vec<crate::daemon_client::StoppedAgent> = Vec::new();
+    // Name each agent before its tab slot and names go — once, however many
+    // cards and panes it leaves behind.
+    let mut stopped = RestartNotice::default();
     let mut named_panes: HashSet<String> = HashSet::new();
     for card in &dropped {
         let pane_id = card.pane_id.as_deref();
-        let label = ui
-            .display_names
-            .get(&card.key)
-            .cloned()
+        // A card drawn before any stream named a process goes with the lost
+        // attachment it was on, and is that attachment's agent.
+        let process = if card.incarnation.is_unnamed() {
+            pane_id
+                .and_then(|p| pane.pane_incarnation(p))
+                .unwrap_or_default()
+        } else {
+            card.incarnation.clone()
+        };
+        let identity = StoppedIdentity {
+            pane: card.pane_id.clone(),
+            key: card.pane_id.is_none().then(|| card.key.clone()),
+            agent: card.agent_id.clone(),
+            process,
+        };
+        let label = card
+            .held
+            .then(|| ui.display_names.get(&card.key).cloned())
+            .flatten()
             .or_else(|| card.display_name.clone())
             .or_else(|| pane_id.and_then(|p| ui.pane_display_names.get(p).cloned()))
             .unwrap_or_else(|| {
@@ -4117,25 +4210,36 @@ fn process_restart_drops(
             .and_then(|p| tab_manager.role_of_pane(p))
             .map_or((None, None), |(role, name)| (Some(role), Some(name)));
         named_panes.extend(pane_id.map(str::to_string));
-        stopped.push(crate::daemon_client::StoppedAgent {
-            label,
-            role,
-            orchestration,
-        });
+        stopped.join(
+            identity,
+            crate::daemon_client::StoppedAgent {
+                label,
+                role,
+                orchestration,
+            },
+        );
     }
     for pane_id in panes.iter().filter(|p| !named_panes.contains(*p)) {
         let (role, orchestration) = tab_manager
             .role_of_pane(pane_id)
             .map_or((None, None), |(role, name)| (Some(role), Some(name)));
-        stopped.push(crate::daemon_client::StoppedAgent {
-            label: ui
-                .pane_display_names
-                .get(pane_id)
-                .cloned()
-                .unwrap_or_else(|| format!("pane {pane_id}")),
-            role,
-            orchestration,
-        });
+        stopped.join(
+            StoppedIdentity {
+                pane: Some(pane_id.clone()),
+                key: None,
+                agent: pane.pane_agent_id(pane_id),
+                process: pane.pane_incarnation(pane_id).unwrap_or_default(),
+            },
+            crate::daemon_client::StoppedAgent {
+                label: ui
+                    .pane_display_names
+                    .get(pane_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("pane {pane_id}")),
+                role,
+                orchestration,
+            },
+        );
     }
 
     let focused = pane.focused_pane_id();
@@ -4164,8 +4268,9 @@ fn process_restart_drops(
     }
     // The names and selection the dropped cards held: a key or pane id the
     // restarted deck reuses must not hand them to its agent. The Dashboard
-    // remembers its selection while another tab is active too.
-    for card in &dropped {
+    // remembers its selection while another tab is active too. A stale
+    // placeholder held none, and its key may be a live card's.
+    for card in dropped.iter().filter(|card| card.held) {
         ui.display_names.remove(&card.key);
         for tab in tab_manager.tabs_mut() {
             if let Tab::Dashboard {
@@ -4197,22 +4302,11 @@ fn process_restart_drops(
     if ui.mode == UiMode::PaneInput && (left_active_tab || left_focused_pane) {
         ui.mode = UiMode::Normal;
     }
-    if !stopped.is_empty() {
-        let mut named = match ui.restart_notice.take() {
-            Some((named, text))
-                if ui
-                    .status_message
-                    .as_ref()
-                    .is_some_and(|(shown, _)| *shown == text) =>
-            {
-                named
-            }
-            _ => Vec::new(),
-        };
-        named.extend(stopped);
-        let text = crate::daemon_client::agents_stopped_by_restart_notice(&named);
-        ui.status_message = Some((text.clone(), std::time::Instant::now()));
-        ui.restart_notice = Some((named, text));
+    if !stopped.agents.is_empty() {
+        let notice = ui.restart_notice.get_or_insert_with(RestartNotice::default);
+        for (identity, agent) in stopped.agents {
+            notice.join(identity, agent);
+        }
     }
     ui.mark_session_dirty();
 }
@@ -5073,6 +5167,16 @@ pub enum Action {
     InboxAttentionMove(bool),
     /// PRD #1666 §6.4: Retry (`true`) or Cancel the row under the cursor.
     InboxAttentionAct(bool),
+    /// PRD #1666 part 2 (G-fix7d): open the list of every agent the restart
+    /// notice names — its key (default `a`) and its footer `[Agents]` button.
+    OpenRestartNotice,
+    /// PRD #1666 part 2 (G-fix7d): close that list; the notice stays.
+    CloseRestartNotice,
+    /// PRD #1666 part 2 (G-fix7d): dismiss the restart notice — its key
+    /// (default `c`) and its `[Dismiss]` buttons.
+    DismissRestartNotice,
+    /// PRD #1666 part 2 (G-fix7d): scroll the list by this many lines.
+    RestartNoticeScroll(isize),
     /// Issue #1635: open the upgrade dialog. Shared by the `open_upgrade` key
     /// (default `u`) and a click on the footer's update badge.
     OpenUpgrade,
@@ -7861,6 +7965,16 @@ fn handle_normal_key(
     if kb.matches(KbAction::InboxAttention, &key) && total > 0 {
         return Action::OpenInboxAttention;
     }
+    // PRD #1666 part 2 (G-fix7d): the restart notice's list (default `a`) and
+    // its dismissal (default `c`), only while the footer shows the notice.
+    if ui.restart_notice.is_some() {
+        if kb.matches(KbAction::RestartNotice, &key) {
+            return Action::OpenRestartNotice;
+        }
+        if kb.matches(KbAction::DismissRestartNotice, &key) {
+            return Action::DismissRestartNotice;
+        }
+    }
     // Issue #1635: open the upgrade dialog the footer badge names (default
     // `u`), shared with a click on the badge.
     if pressed(KbAction::OpenUpgrade) {
@@ -8027,6 +8141,31 @@ fn handle_inbox_attention_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingCo
     }
 }
 
+/// PRD #1666 part 2 (G-fix7d): keys while the restart notice's list is up —
+/// `j`/`k` (or the arrows) and PageUp/PageDown scroll it, the dismiss key
+/// dismisses the notice, and Escape, `q` or the list's own key close the list
+/// and leave the notice; Ctrl+C keeps its PRD #40 safety net.
+fn handle_restart_notice_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig) -> Action {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
+        ui.mode = UiMode::QuitConfirm;
+        return Action::Continue;
+    }
+    match key.code {
+        _ if kb.matches(KbAction::DismissRestartNotice, &key) => Action::DismissRestartNotice,
+        KeyCode::Esc | KeyCode::Char('q') => Action::CloseRestartNotice,
+        _ if kb.matches(KbAction::RestartNotice, &key) => Action::CloseRestartNotice,
+        KeyCode::Down | KeyCode::Char('j') => Action::RestartNoticeScroll(1),
+        KeyCode::Up | KeyCode::Char('k') => Action::RestartNoticeScroll(-1),
+        KeyCode::PageDown => Action::RestartNoticeScroll(RESTART_NOTICE_PAGE),
+        KeyCode::PageUp => Action::RestartNoticeScroll(-RESTART_NOTICE_PAGE),
+        _ => Action::Continue,
+    }
+}
+
+/// How far PageUp/PageDown move the restart notice's list.
+const RESTART_NOTICE_PAGE: isize = 10;
+
 /// PRD #1666 §6.4: one Retry or Cancel the picker sends: the row's message at
 /// the revision it showed.
 #[doc(hidden)]
@@ -8078,6 +8217,20 @@ fn poll_inbox_attention(ui: &mut UiState, snapshot: &AppState) {
     let Some(dialog) = ui.inbox_attention.as_mut() else {
         return;
     };
+    // PRD #1666 part 2 (G-fix7d): the rows the state holds come from the
+    // stream's daemon process. From another one than the card the picker was
+    // opened on — a restarted deck reusing its pane and agent ids — they are
+    // another agent's, so the picker closes rather than show them; between
+    // two streams there are none to read, so it keeps the rows it has.
+    if dialog.incarnation != snapshot.stream_incarnation {
+        if !snapshot.stream_incarnation.is_unnamed() {
+            ui.inbox_attention = None;
+            if ui.mode == UiMode::InboxAttention {
+                ui.mode = UiMode::Normal;
+            }
+        }
+        return;
+    }
     // An answer for another pane or agent than the open picker's is not its
     // own (PR #1735 review 4301453654).
     if let Some(answer) = answer
@@ -9450,7 +9603,9 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         // Issue #1635: the upgrade dialog is a topmost modal.
         | UiMode::Upgrade
         // PRD #1666 §6.4: the deck-messages picker is a topmost modal too.
-        | UiMode::InboxAttention => true,
+        | UiMode::InboxAttention
+        // PRD #1666 part 2 (G-fix7d): so is the restart notice's list.
+        | UiMode::RestartNotice => true,
         UiMode::Normal | UiMode::Filter | UiMode::Rename | UiMode::PaneInput => false,
     }
 }
@@ -11193,6 +11348,29 @@ fn dispatch_action(
                 );
             }
         }
+        Action::OpenRestartNotice => {
+            if let Some(notice) = ui.restart_notice.as_mut() {
+                notice.scroll = 0;
+                ui.mode = UiMode::RestartNotice;
+            }
+        }
+        Action::CloseRestartNotice => {
+            if ui.mode == UiMode::RestartNotice {
+                ui.mode = UiMode::Normal;
+            }
+        }
+        Action::DismissRestartNotice => {
+            ui.restart_notice = None;
+            if ui.mode == UiMode::RestartNotice {
+                ui.mode = UiMode::Normal;
+            }
+        }
+        Action::RestartNoticeScroll(by) => {
+            if let Some(notice) = ui.restart_notice.as_mut() {
+                // The overlay clamps it to the last screenful when it draws.
+                notice.scroll = notice.scroll.saturating_add_signed(by);
+            }
+        }
         Action::OpenUpgrade => open_upgrade_dialog(ui),
         Action::UpgradeChoose(choice) => {
             if let Some(dialog) = ui.upgrade_dialog.as_mut() {
@@ -12094,6 +12272,7 @@ fn handle_key_event(
             UiMode::ScheduledTasks => handle_scheduled_tasks_key(key, ui),
             UiMode::HostMetrics => handle_host_metrics_key(key, ui, &kb),
             UiMode::InboxAttention => handle_inbox_attention_key(key, ui, &kb),
+            UiMode::RestartNotice => handle_restart_notice_key(key, ui, &kb),
             // Issue #1635: `Ctrl+C` keeps its PRD #40 safety net here too, even
             // while an upgrade runs; the running upgrade's dialog is kept so the
             // upgrade key reopens it on the same run.
@@ -14224,6 +14403,9 @@ pub fn run_tui(
                         | UiMode::HostMetrics
                         // PRD #1666 §6.4: so do the deck-messages picker's.
                         | UiMode::InboxAttention
+                        // PRD #1666 part 2 (G-fix7d): and the restart
+                        // notice list's.
+                        | UiMode::RestartNotice
                         // PRD #127 finding #4: the Schedules dialog is a
                         // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
                         // buttons live in `modal_button_rects` and any miss is
@@ -16093,6 +16275,11 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     {
         ui.modal_button_rects = render_inbox_attention_overlay(frame, dialog);
     }
+    if ui.mode == UiMode::RestartNotice
+        && let Some(notice) = ui.restart_notice.as_mut()
+    {
+        ui.modal_button_rects = render_restart_notice_overlay(frame, notice, &ui.keybindings);
+    }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
         // ends so they can be stored back on `ui`.
@@ -17589,11 +17776,50 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
             rows.max(1)
         }
     };
+    // PRD #1666 part 2 (G-fix7d): the restart notice's own rows, above the bar
+    // in every mode.
+    let rows = rows
+        + ui.restart_notice.as_ref().map_or(0, |notice| {
+            restart_notice_rows(notice, &ui.keybindings, width)
+        });
     // Reserve at most `frame_height - 1` rows so the content region keeps ≥1 row.
     rows.min(frame_height.saturating_sub(1))
 }
 
 fn render_bottom_bar(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    area: Rect,
+    has_pane_control: bool,
+    extra_buttons: &[Button],
+) {
+    // PRD #1666 part 2 (G-fix7d): the restart notice takes the top row in every
+    // mode — a text field's included, which would otherwise hide it — and its
+    // buttons stay clickable beside whatever the bar below records.
+    let notice_rows = ui.restart_notice.as_ref().map_or(0, |notice| {
+        restart_notice_rows(notice, &ui.keybindings, area.width)
+    });
+    let (area, notice_rects) = match ui.restart_notice.as_ref() {
+        Some(notice) if notice_rows > 0 && area.height > notice_rows => {
+            let rows = Rect {
+                height: notice_rows,
+                ..area
+            };
+            let rects = render_restart_notice_row(frame, notice, &ui.keybindings, rows);
+            let rest = Rect {
+                y: area.y + notice_rows,
+                height: area.height - notice_rows,
+                ..area
+            };
+            (rest, rects)
+        }
+        _ => (area, Vec::new()),
+    };
+    render_bottom_bar_below_notice(frame, ui, area, has_pane_control, extra_buttons);
+    ui.button_rects.extend(notice_rects);
+}
+
+fn render_bottom_bar_below_notice(
     frame: &mut Frame,
     ui: &mut UiState,
     area: Rect,
@@ -18548,6 +18774,16 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
         // Issue #1635: opens the upgrade dialog while the footer's update
         // badge shows.
         help_key_line(&lettered(KbAction::OpenUpgrade), "Upgrade (update badge)"),
+        // PRD #1666 part 2 (G-fix7d): while the footer shows the restart
+        // notice.
+        help_key_line(
+            &format!(
+                "{} / {}",
+                n(KbAction::RestartNotice),
+                n(KbAction::DismissRestartNotice)
+            ),
+            "Restart notice: list / dismiss",
+        ),
         // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
         // and these keys scroll the focused pane's own scrollback without ever
         // reaching the agent.
@@ -19208,6 +19444,194 @@ fn render_host_metrics_overlay(frame: &mut Frame, view: &HostMetricsView) -> Vec
         height: 1,
     };
     render_modal_button_row(frame, &close_button, btn_row, 2)
+}
+
+/// PRD #1666 part 2 (G-fix7d): the list of every agent the restart notice
+/// names, one per line under the notice's opening words, scrolled from
+/// `notice.scroll` — clamped here to the last screenful — with `[Dismiss]` and
+/// `[Close]`.
+fn render_restart_notice_overlay(
+    frame: &mut Frame,
+    notice: &mut RestartNotice,
+    keybindings: &KeybindingConfig,
+) -> Vec<(Action, Rect)> {
+    let area = frame.area();
+    let popup_width = 72u16.min(area.width.saturating_sub(2));
+    let names: Vec<String> = notice
+        .agents
+        .iter()
+        .map(|(_, agent)| format!("  {agent}"))
+        .collect();
+    // The opening words and a blank row, the names, then a blank row, the
+    // button row and the hint: plus the border. Counted in `usize` and clamped
+    // before narrowing.
+    let popup_height = names
+        .len()
+        .saturating_add(2 + 3 + 2)
+        .min(usize::from(area.height.saturating_sub(2))) as u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+    let footer_height: u16 = 2;
+    let inner_height = popup_height.saturating_sub(2);
+    let rows = usize::from(inner_height.saturating_sub(footer_height + 2));
+    notice.scroll = notice.scroll.min(names.len().saturating_sub(rows));
+    let last = (notice.scroll + rows).min(names.len());
+    let title = if last - notice.scroll < names.len() {
+        format!(
+            " Restart notice · {}–{} of {} ",
+            notice.scroll + 1,
+            last,
+            names.len()
+        )
+    } else {
+        " Restart notice ".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut lines = vec![
+        Line::styled(
+            format!("  {}:", crate::daemon_client::AGENTS_STOPPED_BY_RESTART),
+            Style::default().fg(Color::Yellow),
+        ),
+        Line::from(""),
+    ];
+    lines.extend(
+        names[notice.scroll..last]
+            .iter()
+            .map(|name| Line::styled(name.clone(), text_primary())),
+    );
+    let body_height = inner.height.saturating_sub(footer_height);
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(inner.x, inner.y, inner.width, body_height),
+    );
+    let footer_area = Rect::new(
+        inner.x,
+        inner.y + body_height,
+        inner.width,
+        footer_height.min(inner.height),
+    );
+    if footer_area.height == 0 {
+        return Vec::new();
+    }
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::styled(
+                format!(
+                    "  j/k scroll · {} dismiss · Esc to close",
+                    display_notation(keybindings, KbAction::DismissRestartNotice)
+                ),
+                text_primary(),
+            ),
+        ]),
+        footer_area,
+    );
+    let buttons = [
+        Button::new(
+            "Dismiss",
+            button_shortcut_label(keybindings, KbAction::DismissRestartNotice),
+            Action::DismissRestartNotice,
+            true,
+        ),
+        Button::new("Close", "", Action::CloseRestartNotice, true),
+    ];
+    let btn_row = Rect {
+        x: footer_area.x,
+        y: footer_area.y,
+        width: footer_area.width,
+        height: 1,
+    };
+    render_modal_button_row(frame, &buttons, btn_row, 2)
+}
+
+/// PRD #1666 part 2 (G-fix7d): the restart notice's two buttons, naming
+/// their keys.
+fn restart_notice_buttons(keybindings: &KeybindingConfig) -> [Button; 2] {
+    [
+        Button::new(
+            "Agents",
+            button_shortcut_label(keybindings, KbAction::RestartNotice),
+            Action::OpenRestartNotice,
+            true,
+        ),
+        Button::new(
+            "Dismiss",
+            button_shortcut_label(keybindings, KbAction::DismissRestartNotice),
+            Action::DismissRestartNotice,
+            true,
+        ),
+    ]
+}
+
+/// The columns [`restart_notice_buttons`] take, with the gap before them.
+fn restart_notice_buttons_width(keybindings: &KeybindingConfig) -> u16 {
+    let buttons = restart_notice_buttons(keybindings);
+    buttons
+        .iter()
+        .map(|b| b.display_label().chars().count() as u16)
+        .sum::<u16>()
+        + buttons.len() as u16
+}
+
+/// How many footer rows the restart notice takes at `width`: one, or two when
+/// its summary and buttons do not fit side by side, so the buttons never cut
+/// the summary short.
+fn restart_notice_rows(notice: &RestartNotice, keybindings: &KeybindingConfig, width: u16) -> u16 {
+    let summary = unicode_width::UnicodeWidthStr::width(notice.summary().as_str());
+    let buttons = usize::from(restart_notice_buttons_width(keybindings));
+    if summary + buttons <= usize::from(width) {
+        1
+    } else {
+        2
+    }
+}
+
+/// PRD #1666 part 2 (G-fix7d): the restart notice's footer rows — its first
+/// names ([`RestartNotice::summary`]) and the `[Agents]` and `[Dismiss]`
+/// buttons naming their keys, beside it or on a row of their own — drawn in
+/// every mode until the notice is dismissed.
+fn render_restart_notice_row(
+    frame: &mut Frame,
+    notice: &RestartNotice,
+    keybindings: &KeybindingConfig,
+    area: Rect,
+) -> Vec<(Action, Rect)> {
+    frame.render_widget(Clear, area);
+    let buttons = restart_notice_buttons(keybindings);
+    let text_area = if area.height >= 2 {
+        Rect { height: 1, ..area }
+    } else {
+        Rect {
+            width: area
+                .width
+                .saturating_sub(restart_notice_buttons_width(keybindings)),
+            ..area
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            notice.summary(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        text_area,
+    );
+    let button_row = Rect {
+        y: area.y + area.height.saturating_sub(1),
+        height: 1,
+        ..area
+    };
+    render_right_aligned_buttons(frame, &buttons, button_row)
 }
 
 /// PRD #80 M7: clickable geometry returned by [`render_dir_picker`] — the row
@@ -23958,6 +24382,114 @@ pub fn render_host_metrics_key_sequence_to_buffers(
     let state = AppState::default();
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     ui.host_metrics = HostMetricsView::Report(report.clone());
+    // A fixed instant: the dashboard has no cards, so nothing measures against it.
+    let wall_now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("fixed instant");
+    let frame_area = Rect::new(0, 0, width, height);
+    let tab_view = ActiveTabView::Dashboard {
+        exclude_pane_ids: vec![],
+        zoomed: false,
+    };
+    let tab_bar = TabBarInfo {
+        show: false,
+        labels: vec!["Dashboard".into()],
+        active_index: 0,
+        orchestration_statuses: vec![],
+    };
+    let pane_ids: Vec<String> = Vec::new();
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
+
+    let mut draw = |ui: &mut UiState| {
+        let bar_rows = bottom_bar_rows(ui, width, height);
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &pane_ids,
+            PaneLayout::Stacked,
+            None,
+            bar_rows,
+        );
+        let filtered = filter_sessions(&state, ui);
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame, &state, ui, &filtered, 0, true, &*ctrl, &tab_view, &tab_bar, &layout,
+                    wall_now,
+                );
+            })
+            .expect("TestBackend draw should succeed");
+        terminal.backend().buffer().clone()
+    };
+
+    let mut frames = Vec::with_capacity(keys.len() + 1);
+    frames.push(draw(&mut ui));
+    for key in keys {
+        let filtered = filter_sessions(&state, &ui);
+        let _ = handle_key_event(
+            *key,
+            &mut ui,
+            &*ctrl,
+            &shared,
+            &mut tab_manager,
+            &state,
+            &filtered,
+            frame_area,
+        );
+        frames.push(draw(&mut ui));
+    }
+    frames
+}
+
+/// PRD #1666 part 2 (G-fix7d) L1 seam: start on an empty dashboard in `mode`
+/// whose restart notice names one agent per entry of `labels` (each on a pane
+/// of its own), with `status` on the status line, press `keys` one at a time
+/// through the production [`handle_key_event`] and draw each frame with the
+/// production [`render_frame`]. Returns the frame before the first key and one
+/// after each.
+#[doc(hidden)]
+pub fn render_restart_notice_key_sequence_to_buffers(
+    labels: &[&str],
+    mode: UiMode,
+    status: Option<&str>,
+    keys: &[KeyEvent],
+    width: u16,
+    height: u16,
+) -> Vec<ratatui::buffer::Buffer> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::Arc;
+
+    let ctrl: Arc<EmbeddedPaneController> =
+        Arc::new(EmbeddedPaneController::for_render_seam_with_focused_pane(
+            BURST_SEAM_PANE_ID,
+            SCROLL_SEAM_ROWS,
+            SCROLL_SEAM_COLS,
+            b"",
+        ));
+    let mut tab_manager = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+    let shared: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let state = AppState::default();
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    let mut notice = RestartNotice::default();
+    for (i, label) in labels.iter().enumerate() {
+        notice.join(
+            StoppedIdentity {
+                pane: Some(format!("restart-seam-{i}")),
+                key: None,
+                agent: Some(i.to_string()),
+                process: crate::daemon_client::Incarnation::from(Some("replaced".to_string())),
+            },
+            crate::daemon_client::StoppedAgent {
+                label: (*label).to_string(),
+                role: None,
+                orchestration: None,
+            },
+        );
+    }
+    ui.restart_notice = Some(notice);
+    ui.mode = mode;
+    ui.status_message = status.map(|s| (s.to_string(), std::time::Instant::now()));
     // A fixed instant: the dashboard has no cards, so nothing measures against it.
     let wall_now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("fixed instant");
     let frame_area = Rect::new(0, 0, width, height);
@@ -37857,7 +38389,8 @@ mod tests {
             | UiMode::CloseConfirm
             | UiMode::HostMetrics
             | UiMode::Upgrade
-            | UiMode::InboxAttention => mode,
+            | UiMode::InboxAttention
+            | UiMode::RestartNotice => mode,
         }
     }
 
@@ -37881,6 +38414,7 @@ mod tests {
             UiMode::HostMetrics,
             UiMode::Upgrade,
             UiMode::InboxAttention,
+            UiMode::RestartNotice,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)
@@ -39234,6 +39768,12 @@ mod tests {
         ui.status_message.as_ref().map(|(msg, _)| msg.as_str())
     }
 
+    /// PRD #1666 part 2 (G-fix7d): the full sentence of the restart notice the
+    /// TUI holds, naming every agent.
+    fn restart_notice_text(ui: &UiState) -> Option<String> {
+        ui.restart_notice.as_ref().map(RestartNotice::text)
+    }
+
     /// Scenario: Put two agents on the dashboard, apply a filter that matches
     /// neither, and draw the frame. The sidebar must say "No agents match
     /// filter." under a title counting `0/2 agent(s)` — the glossary's word,
@@ -40022,7 +40562,7 @@ mod tests {
                 for pane in [&solo, &lead, &coder, &quiet] {
                     assert!(pc.pane_agent_id(pane).is_some(), "control: {pane} stays");
                 }
-                assert!(glossary_status_text(&ui).is_none(), "control: no notice");
+                assert!(restart_notice_text(&ui).is_none(), "control: no notice");
                 continue;
             }
             for key in ["s-solo", "s-lead", "s-coder", "s-quiet"] {
@@ -40052,7 +40592,7 @@ mod tests {
                 "the stopped unit's tab was kept or another tab was removed"
             );
             assert_eq!(
-                glossary_status_text(&ui),
+                restart_notice_text(&ui).as_deref(),
                 Some(
                     "The deck restarted; these agents were stopped: coder (worker in team), \
                      far-away, lead (orchestrator in team), solo, quiet."
@@ -40185,14 +40725,91 @@ mod tests {
         }
     }
 
-    /// Scenario: a deck restart is noticed in two frames — first one pane's reattach, then the event stream. The second frame's agents join the notice the first frame showed, so one notice names both; a notice that already left the status line is not extended (control).
+    /// Draw one full dashboard frame for `state` / `ui` into a 100x24
+    /// `TestBackend`, with the bottom bar as tall as the production loop makes
+    /// it, and return every row, right-trimmed.
+    fn restart_frame_rows(state: &AppState, ui: &mut UiState) -> Vec<String> {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let filtered = filter_sessions(state, ui);
+        let bar_rows = bottom_bar_rows(ui, 100, 24);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                    zoomed: false,
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                    orchestration_statuses: vec![],
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    bar_rows,
+                );
+                render_frame(
+                    frame,
+                    state,
+                    ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                )
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+            .lines()
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    /// Press `key` through the production key funnel.
+    fn restart_press(
+        key: KeyEvent,
+        ui: &mut UiState,
+        pane: &dyn PaneController,
+        state: &SharedState,
+        tab_manager: &mut TabManager,
+    ) {
+        let snapshot = state.blocking_read().clone();
+        let filtered = filter_sessions(&snapshot, ui);
+        let _ = handle_key_event(
+            key,
+            ui,
+            pane,
+            state,
+            tab_manager,
+            &snapshot,
+            &filtered,
+            Rect::new(0, 0, 100, 24),
+        );
+    }
+
+    fn plain(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    /// Scenario: a deck restart is noticed in two frames — first one pane's reattach, then the event stream — and another status message is shown between them. The second frame's agents join the notice the first frame raised, so one notice names both, in a footer row of its own beside the other message. A notice the user dismissed with its key (`c`) is not extended: the second frame raises a new one naming only its agents (control).
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_restart_noticed_in_two_frames_shows_one_notice() {
         use crate::daemon_client::Incarnation;
         use tokio::sync::RwLock;
         let named = |process: &str| Incarnation::from(Some(process.to_string()));
-        for expired in [false, true] {
+        for dismissed in [false, true] {
             let state: SharedState = Arc::new(RwLock::new(AppState::default()));
             {
                 let mut st = state.blocking_write();
@@ -40209,20 +40826,268 @@ mod tests {
             state.blocking_write().learn_stream_incarnation(named("x"));
             process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
             assert_eq!(
-                glossary_status_text(&ui),
+                restart_notice_text(&ui).as_deref(),
                 Some("The deck restarted; these agents were stopped: first.")
             );
-            if expired {
-                ui.status_message = Some(("something else".into(), std::time::Instant::now()));
+            ui.status_message = Some(("something else".into(), std::time::Instant::now()));
+            if dismissed {
+                restart_press(plain('c'), &mut ui, &*pc, &state, &mut tab_manager);
+                assert!(ui.restart_notice.is_none(), "the dismiss key kept it");
             }
             state.blocking_write().learn_stream_incarnation(named("b"));
             process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
-            let expected = if expired {
+            let expected = if dismissed {
                 "The deck restarted; these agents were stopped: second."
             } else {
                 "The deck restarted; these agents were stopped: first, second."
             };
-            assert_eq!(glossary_status_text(&ui), Some(expected));
+            assert_eq!(restart_notice_text(&ui).as_deref(), Some(expected));
+            let rows = restart_frame_rows(&state.blocking_read(), &mut ui);
+            assert!(
+                rows.iter().any(|row| row.contains(expected)),
+                "the notice is not on screen: {rows:#?}"
+            );
+            assert!(
+                rows.iter().any(|row| row.contains("something else")),
+                "the other message is not on screen: {rows:#?}"
+            );
+        }
+    }
+
+    /// Scenario: a deck restart stops thirty agents while the user is typing a filter, and again while the user renames a card. The notice shows in its own footer row while the field is open — its first three names and "and 27 more" — and is still there after Escape leaves the field, and after another status message is shown. Its key (`a`) opens the list of every agent it names, which scrolls to the last one; Escape closes the list and keeps the notice, and its dismiss key (`c`) removes it from the footer. Before any restart there is no notice (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_the_restart_notice_stays_until_the_user_dismisses_it() {
+        use crate::daemon_client::Incarnation;
+        use tokio::sync::RwLock;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let summary = "The deck restarted; these agents were stopped: agent-00, agent-01, agent-02 and 27 more.";
+        for mode in [UiMode::Filter, UiMode::Rename] {
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            {
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named("a"));
+                for i in 0..30 {
+                    let key = format!("k{i:02}");
+                    st.sessions.insert(
+                        key.clone(),
+                        restart_card(&key, None, &format!("agent-{i:02}"), "a"),
+                    );
+                }
+            }
+            let pc: Arc<dyn PaneController> = Arc::new(CapturingPaneController::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            ui.mode = mode;
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            let rows = restart_frame_rows(&state.blocking_read(), &mut ui);
+            assert!(
+                !rows.iter().any(|row| row.contains("The deck restarted")),
+                "control: a notice before any restart: {rows:#?}"
+            );
+
+            state.blocking_write().learn_stream_incarnation(named("b"));
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            assert_eq!(ui.mode, mode, "the restart left the field");
+            let shown = |ui: &mut UiState| {
+                restart_frame_rows(&state.blocking_read(), ui)
+                    .iter()
+                    .any(|row| row.contains(summary))
+            };
+            assert!(
+                shown(&mut ui),
+                "{mode:?}: the notice is hidden by the field"
+            );
+            restart_press(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+            );
+            assert_eq!(ui.mode, UiMode::Normal);
+            assert!(shown(&mut ui), "{mode:?}: the notice went with the field");
+            ui.status_message = Some(("Created agent".into(), std::time::Instant::now()));
+            assert!(shown(&mut ui), "another status message erased the notice");
+            ui.status_message = None;
+
+            restart_press(plain('a'), &mut ui, &*pc, &state, &mut tab_manager);
+            assert_eq!(ui.mode, UiMode::RestartNotice, "the key opened no list");
+            let list = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+            assert!(list.contains("agent-00"), "{list}");
+            assert!(
+                !list.contains("agent-29"),
+                "thirty names fit one screen: {list}"
+            );
+            for _ in 0..3 {
+                restart_press(
+                    KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                );
+            }
+            let list = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+            assert!(
+                list.contains("agent-29"),
+                "the last agent is unreachable: {list}"
+            );
+            restart_press(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+            );
+            assert_eq!(ui.mode, UiMode::Normal);
+            assert!(shown(&mut ui), "closing the list dismissed the notice");
+
+            restart_press(plain('c'), &mut ui, &*pc, &state, &mut tab_manager);
+            assert!(ui.restart_notice.is_none());
+            let rows = restart_frame_rows(&state.blocking_read(), &mut ui);
+            assert!(
+                !rows.iter().any(|row| row.contains("The deck restarted")),
+                "dismissed, but still on screen: {rows:#?}"
+            );
+        }
+    }
+
+    /// Scenario: a TUI attaches a pane on deck process `a`, and the deck restarts as the same build before that attach's placeholder card is drawn: the event stream has already moved to `b`, whose agent reuses the pane and agent ids and has a card on the pane. The late placeholder from `a` is stale: it is not `b`'s card, `b`'s card stays, `b` is sent nothing, the attachment on `a` is dropped and the notice names only `a`'s agent — once, when `a`'s agent also had a card before the restart, and by its pane's name when the late placeholder was its only card. With no restart, the placeholder is the card already there (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_late_placeholder_never_evicts_the_restarted_decks_card() {
+        use crate::daemon_client::Incarnation;
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::EmbeddedPaneController;
+        use tokio::sync::RwLock;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        for (restarted, old_card) in [(false, true), (true, true), (true, false)] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller = Arc::new(
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate(),
+            );
+            let pane = controller
+                .create_pane(Some("cat"), None)
+                .expect("a pane on a");
+            let agent_id = controller.pane_agent_id(&pane);
+            let attached_on = controller.pane_incarnation(&pane).expect("attached on a");
+            assert_eq!(attached_on, named("a"));
+            let pc: Arc<dyn PaneController> = controller.clone();
+            let mut tab_manager = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            {
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named("a"));
+                st.register_pane(pane.clone());
+                if old_card {
+                    let mut old = restart_card("s-old", Some(&pane), "old", "a");
+                    old.agent_id = agent_id.clone();
+                    st.sessions.insert("s-old".into(), old);
+                }
+            }
+            let mut ui = default_ui();
+            ui.pane_display_names.insert(pane.clone(), "old".into());
+            if restarted {
+                daemon.restart_as("b");
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named("b"));
+                let mut new = restart_card("s-new", Some(&pane), "new", "b");
+                new.agent_id = agent_id.clone();
+                st.sessions.insert("s-new".into(), new);
+            }
+            let sent = (daemon.received_by("b"), daemon.hellos("b"));
+
+            let key = state.blocking_write().insert_placeholder_session_learned(
+                pane.clone(),
+                None,
+                None,
+                agent_id.clone(),
+                attached_on.clone(),
+            );
+            process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+
+            let st = state.blocking_read();
+            if !restarted {
+                assert_eq!(key, "s-old", "control: the card already there");
+                assert!(st.sessions.contains_key("s-old"));
+                assert!(ui.restart_notice.is_none(), "control: no notice");
+                continue;
+            }
+            assert_ne!(key, "s-new", "the late placeholder adopted b's card");
+            assert_eq!(
+                st.sessions
+                    .get("s-new")
+                    .map(|card| card.incarnation.clone()),
+                Some(named("b")),
+                "the late placeholder evicted the restarted deck's card"
+            );
+            assert!(
+                !st.sessions
+                    .values()
+                    .any(|card| card.incarnation.same_process(&named("a"))),
+                "a card of the replaced process was drawn"
+            );
+            assert_eq!(
+                (daemon.received_by("b"), daemon.hellos("b")),
+                sent,
+                "the drop sent the restarted deck something"
+            );
+            assert_eq!(
+                restart_notice_text(&ui).as_deref(),
+                Some("The deck restarted; these agents were stopped: old."),
+                "the notice named the wrong agents, or one twice"
+            );
+            assert!(
+                pc.pane_agent_id(&pane).is_none(),
+                "the replaced process's attachment was kept"
+            );
+        }
+    }
+
+    /// Scenario: the deck-messages picker is open on a card learned from deck process `a` when the event stream moves to `b`, a restarted deck reusing the card's pane and agent ids. The picker closes rather than show `b`'s rows; while the stream is between two processes it keeps the rows it has; while the stream is still `a` it stays open and refreshes (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_the_inbox_picker_never_shows_another_processs_rows() {
+        use crate::daemon_client::Incarnation;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        for stream in [named("a"), Incarnation::UNNAMED, named("b")] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::InboxAttention;
+            ui.inbox_attention = Some(InboxAttentionDialog {
+                pane_id: "pane-1".into(),
+                agent_id: "1".into(),
+                incarnation: named("a"),
+                items: vec![crate::inbox_hub::InboxAttentionItem {
+                    message_id: "m-a".into(),
+                    revision: 1,
+                    kind: crate::inbox_display::AttentionKind::Uncertain,
+                    from_label: "lead".into(),
+                    subject: "a's message".into(),
+                    task_id: None,
+                }],
+                selected: 0,
+                answer: None,
+            });
+            let mut snapshot = AppState::default();
+            snapshot.stream_incarnation = stream.clone();
+            poll_inbox_attention(&mut ui, &snapshot);
+            let items = ui.inbox_attention.as_ref().map(|dialog| dialog.items.len());
+            if stream == named("a") {
+                assert_eq!(items, Some(0), "control: the picker refreshes");
+                assert_eq!(ui.mode, UiMode::InboxAttention);
+            } else if stream.is_unnamed() {
+                assert_eq!(items, Some(1), "between streams it keeps its rows");
+            } else {
+                assert_eq!(items, None, "the picker showed another process's rows");
+                assert_eq!(ui.mode, UiMode::Normal);
+            }
         }
     }
 

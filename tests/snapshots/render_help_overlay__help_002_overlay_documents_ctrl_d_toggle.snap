@@ -46,6 +46,7 @@ expression: buf
    │  i                  deck messages: retry or cancel                                                  │    
    │  o                  open pull request                                                               │    
    │  u / ctrl+u         upgrade (update badge)                                                          │    
+   │  a / c              restart notice: list / dismiss                                                  │    
    │  pageup / pagedown  scroll focused pane                                                             │    
    │  ?                  toggle this help                                                                │    
    │  [close]                                                                                            │    

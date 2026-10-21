@@ -141,6 +141,30 @@ pub fn agents_stopped_by_restart_notice(agents: &[StoppedAgent]) -> String {
     format!("{AGENTS_STOPPED_BY_RESTART}: {}.", names.join(", "))
 }
 
+/// PRD #1666 part 2 (G-fix7d): how many agents the TUI's one-row restart
+/// notice names before it says how many more there are
+/// ([`agents_stopped_by_restart_summary`]).
+pub const RESTART_NOTICE_NAMES_SHOWN: usize = 3;
+
+/// The restart notice in one row: the whole sentence for up to
+/// [`RESTART_NOTICE_NAMES_SHOWN`] agents, otherwise the first of them and how
+/// many more — "The deck restarted; these agents were stopped: a, b, c and 2
+/// more." The TUI's restart-notice list names every one.
+pub fn agents_stopped_by_restart_summary(agents: &[StoppedAgent]) -> String {
+    if agents.len() <= RESTART_NOTICE_NAMES_SHOWN {
+        return agents_stopped_by_restart_notice(agents);
+    }
+    let names: Vec<String> = agents[..RESTART_NOTICE_NAMES_SHOWN]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    format!(
+        "{AGENTS_STOPPED_BY_RESTART}: {} and {} more.",
+        names.join(", "),
+        agents.len() - RESTART_NOTICE_NAMES_SHOWN
+    )
+}
+
 /// PRD #1666 part 2 (G-fix4): which daemon process an agent id or viewer token
 /// was learned from — the [`AttachResponse::instance_id`] of the `Hello` on the
 /// connection that carried the listing, start or attach that named it.
@@ -9355,6 +9379,27 @@ mod incarnation_binding_tests {
             ]),
             "The deck restarted; these agents were stopped: coder (worker in team), \
              lead (orchestrator), scout (in team), api-fix."
+        );
+    }
+
+    /// Scenario: the TUI's one-row restart notice names up to three agents in
+    /// the whole sentence, and past that the first three and how many more.
+    #[test]
+    fn the_restart_notice_summary_names_the_first_agents_and_counts_the_rest() {
+        let agents: Vec<StoppedAgent> = ["a", "b", "c", "d", "e"]
+            .map(|label| StoppedAgent {
+                label: label.into(),
+                role: None,
+                orchestration: None,
+            })
+            .to_vec();
+        assert_eq!(
+            agents_stopped_by_restart_summary(&agents[..3]),
+            agents_stopped_by_restart_notice(&agents[..3])
+        );
+        assert_eq!(
+            agents_stopped_by_restart_summary(&agents),
+            "The deck restarted; these agents were stopped: a, b, c and 2 more."
         );
     }
 }

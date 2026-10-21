@@ -1218,6 +1218,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .toast-stack { max-width: min(470px, calc(100vw - 30px)); max-height: calc(100vh - var(--voice-reserved) - 32px); position: fixed; z-index: 120; right: 18px; bottom: calc(var(--voice-reserved) + 16px); display: flex; flex-direction: column; align-items: flex-end; gap: 6px; overflow-y: auto; }
 .toast { max-width: 100%; min-height: 42px; padding: 8px 9px; flex: 0 0 auto; display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
 .toast-body { display: grid; gap: 3px; min-width: 0; }
+/* PRD #1666 part 2 (G-fix7d): the restart notice names every agent it holds, so a long list scrolls inside the toast rather than run off it. */
+.toast-restart .toast-body { max-height: 40vh; overflow-y: auto; overflow-wrap: anywhere; }
 .toast button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; }
 
 @media (min-width: 1450px) {

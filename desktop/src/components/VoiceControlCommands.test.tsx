@@ -4562,7 +4562,7 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
       expect(screen.getByTestId("restart-toast")).toHaveTextContent(target.displayName);
       expect(confirmation(), "no confirmation may open for a restarted deck's agent").toBeNull();
       expect(runAction).not.toHaveBeenCalled();
-      expect(screen.getByTestId("voice-report")).toHaveTextContent(empty ? "Nothing ran — the agent is gone. Say it again." : "Nothing ran — that agent is gone (the deck restarted). Say it again.");
+      expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing ran — that agent is gone (the deck restarted). Say it again.");
       return;
     }
     expect(screen.queryByTestId("restart-toast")).toBeNull();

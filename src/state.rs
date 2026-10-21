@@ -409,6 +409,11 @@ pub fn placeholder_session_id(pane_id: &str) -> String {
 /// `max_per_run` issue dispatches is single/low-double digits).
 const MAX_PENDING_ORCHESTRATION_SURFACES: usize = 64;
 
+/// PRD #1666 part 2 (G-fix7d): cap on [`AppState::replaced_processes`]. Each
+/// entry is one deck restart this client saw, so a handful covers any real
+/// session; past it the oldest is forgotten, whose cards are long gone.
+const MAX_REPLACED_PROCESSES: usize = 16;
+
 /// PRD #1223: cap on [`AppState::pending_pane_closures`], for the same reason
 /// and with the same drop-oldest policy as the surface queue above. Closures are
 /// drained all at once each frame, so this is only reached by a burst larger
@@ -447,7 +452,15 @@ pub struct RestartDroppedCard {
     /// The card's key in [`AppState::sessions`], which the render loop's
     /// display names are keyed by.
     pub key: String,
+    /// G-fix7d: whether the card was in [`AppState::sessions`] under
+    /// [`Self::key`]. A stale placeholder never was
+    /// ([`AppState::insert_placeholder_session_learned`]), so its key may be a
+    /// live card's, whose name and selection must stay.
+    pub held: bool,
     pub pane_id: Option<String>,
+    /// G-fix7d: the registry id of the card's agent, which with the pane and
+    /// the process tells one agent's cards from another's in the notice.
+    pub agent_id: Option<String>,
     pub display_name: Option<String>,
     pub agent_type: AgentType,
     /// The daemon process the card was learned from, which the deck replaced.
@@ -1841,9 +1854,23 @@ pub struct AppState {
     /// replaced is removed from [`Self::sessions`] as soon as this state learns
     /// of the replacement ([`Self::learn_stream_incarnation`]): its agent is
     /// gone, and an agent the new process lists under the same pane or agent id
-    /// is an unrelated one, which gets a card of its own. Nothing is sent to the
-    /// daemon for a dropped card. Drained by [`Self::take_restart_drops`].
+    /// is an unrelated one, which gets a card of its own. No stop, close or
+    /// unit cleanup is asked of either daemon for a dropped card. Drained by
+    /// [`Self::take_restart_drops`].
     pub pending_restart_drops: Vec<RestartDroppedCard>,
+    /// PRD #1666 part 2 (G-fix7d): the named daemon process the event stream
+    /// last came from. Unlike [`Self::stream_incarnation`] it outlives the gap
+    /// between two subscriptions, so the next one can tell that the process
+    /// before the gap was replaced ([`Self::replaced_processes`]).
+    pub last_stream_process: Incarnation,
+    /// PRD #1666 part 2 (G-fix7d): the named daemon processes this state knows
+    /// the deck replaced — the stream's previous process once the stream comes
+    /// from another, and the process of every card a newer one's evidence
+    /// dropped. A placeholder learned from one of them is stale: it drops no
+    /// card and is reported rather than drawn
+    /// ([`Self::insert_placeholder_session_learned`]). The oldest is forgotten
+    /// past [`MAX_REPLACED_PROCESSES`].
+    pub replaced_processes: Vec<String>,
     /// Issue #717: dispatched worktrees a close LEFT ON DISK, waiting to be
     /// reported on the status line. Filled by the event subscriber (which has no
     /// `UiState`) from [`crate::event::BroadcastMsg::WorktreeKept`] and drained
@@ -8046,24 +8073,62 @@ impl AppState {
     /// before any stream is open — for a pane it started or attached itself,
     /// whose own attach record binds it — and a gated client sends nothing for
     /// one that has none.
+    ///
+    /// G-fix7d: the stream's previous named process — the one before a gap
+    /// included — is recorded as replaced ([`Self::replaced_processes`]), and a
+    /// process a stream opened on is live, so it is not.
     pub fn learn_stream_incarnation(&mut self, incarnation: Incarnation) -> Vec<String> {
+        if let Some(process) = incarnation.as_deref() {
+            if let Some(previous) = self.last_stream_process.as_deref()
+                && previous != process
+            {
+                let previous = previous.to_string();
+                self.note_process_replaced(previous);
+            }
+            self.replaced_processes
+                .retain(|replaced| replaced != process);
+            self.last_stream_process = incarnation.clone();
+        }
         self.stream_incarnation = incarnation;
         let stream = self.stream_incarnation.clone();
         self.drop_cards_replaced_by(&stream, None, None)
     }
 
+    /// PRD #1666 part 2 (G-fix7d): whether the deck is known to have replaced
+    /// the daemon process `process` ([`Self::replaced_processes`]). Never for
+    /// an unnamed one.
+    pub fn process_replaced(&self, process: &Incarnation) -> bool {
+        process
+            .as_deref()
+            .is_some_and(|process| self.replaced_processes.iter().any(|p| p == process))
+    }
+
+    fn note_process_replaced(&mut self, process: String) {
+        if self.replaced_processes.contains(&process) {
+            return;
+        }
+        if self.replaced_processes.len() >= MAX_REPLACED_PROCESSES {
+            self.replaced_processes.remove(0);
+        }
+        self.replaced_processes.push(process);
+    }
+
     /// Drop every card learned from a named process other than `process` — on
     /// `pane` only, or under `key` only, when either is given — queue each for
     /// the render loop ([`Self::pending_restart_drops`]), and answer the panes
-    /// they were on. Nothing is sent to the daemon, and nothing is dropped
-    /// while `process` names none.
+    /// they were on. No stop, close or cleanup is asked of the daemon. Nothing
+    /// is dropped while `process` names none, or names one the deck is known
+    /// to have replaced: a late answer from a replaced process is no evidence
+    /// that anything newer is gone (G-fix7d). Each dropped card's process is
+    /// recorded as replaced.
     fn drop_cards_replaced_by(
         &mut self,
         process: &Incarnation,
         pane: Option<&str>,
         key: Option<&str>,
     ) -> Vec<String> {
-        if self.agent_ownership.is_some() || process.is_unnamed() {
+        if self.agent_ownership.is_some() || process.is_unnamed() || self.process_replaced(process)
+        {
             return Vec::new();
         }
         let mut replaced: Vec<String> = self
@@ -8088,9 +8153,14 @@ impl AppState {
             };
             self.forget_unproven_journal_count(&id);
             panes.extend(card.pane_id.clone());
+            if let Some(replaced) = card.incarnation.as_deref() {
+                self.note_process_replaced(replaced.to_string());
+            }
             self.pending_restart_drops.push(RestartDroppedCard {
                 key: id,
+                held: true,
                 pane_id: card.pane_id,
+                agent_id: card.agent_id,
                 display_name: card.display_name,
                 agent_type: card.agent_type,
                 incarnation: card.incarnation,
@@ -8391,6 +8461,15 @@ impl AppState {
     /// A card on the pane learned from another named process is dropped first
     /// ([`Self::pending_restart_drops`]), so it is never returned as this one's
     /// card.
+    ///
+    /// G-fix7d: unless `learned_from` is a process the deck is known to have
+    /// replaced ([`Self::process_replaced`]) — an attach answered just before
+    /// the restart, whose card arrives after this state learned of it. That
+    /// placeholder is stale: it is not drawn and drops no card, so the card of
+    /// the agent the deck runs now on the pane stays; it is queued for the
+    /// render loop instead, which drops the local attachment it came from and
+    /// names its agent in the restart notice. Its key is answered all the same,
+    /// and is not in [`Self::sessions`].
     pub fn insert_placeholder_session_learned(
         &mut self,
         pane_id: String,
@@ -8399,8 +8478,20 @@ impl AppState {
         agent_id: Option<String>,
         learned_from: Incarnation,
     ) -> String {
-        self.drop_cards_replaced_by(&learned_from, Some(&pane_id), None);
         let session_id = placeholder_session_id(&pane_id);
+        if self.agent_ownership.is_none() && self.process_replaced(&learned_from) {
+            self.pending_restart_drops.push(RestartDroppedCard {
+                key: session_id.clone(),
+                held: false,
+                pane_id: Some(pane_id),
+                agent_id,
+                display_name: None,
+                agent_type: agent_type.unwrap_or(AgentType::None),
+                incarnation: learned_from,
+            });
+            return session_id;
+        }
+        self.drop_cards_replaced_by(&learned_from, Some(&pane_id), None);
         if agent_id.is_some()
             && let Some(existing) = self.sessions.iter().find_map(|(id, session)| {
                 (*id != session_id
