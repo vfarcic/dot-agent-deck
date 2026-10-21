@@ -68,6 +68,13 @@ pub enum ClientError {
     /// ([`crate::build_version_handshake::HandshakeError::ProtocolMismatch`]).
     #[error("{}", crate::build_version_handshake::HandshakeError::ProtocolMismatch { daemon: *daemon, local: *local })]
     ProtocolMismatch { daemon: Option<u32>, local: u32 },
+    /// PRD #1666 part 2: the daemon answered a gated request's `Hello` on this
+    /// binary's protocol, and the handle's own admission
+    /// ([`DaemonClient::with_protocol_gate_admitting`]) refused it anyway — the
+    /// desktop's, for a declared contract break it has not been told to
+    /// connect across. The text is that admission's own sentence.
+    #[error("{0}")]
+    NotAdmitted(String),
 }
 
 /// PRD #1589: why [`DaemonClient::close_agents`] could not get a report.
@@ -1405,10 +1412,24 @@ pub struct DaemonClient {
     /// lists, starts or subscribes goes on a connection whose own `Hello`
     /// (with `follow_on`) answered this binary's
     /// [`crate::daemon_protocol::PROTOCOL_VERSION`] — see
-    /// [`Self::admitted_connect`]. `false` (every constructor's default) is the
-    /// one-shot CLI's policy: one command, after its own startup check.
+    /// [`Self::admitted_connect`]. `false` (every constructor's default) leaves
+    /// those requests unchecked, which is the one-shot CLI's deliberate policy:
+    /// `daemon status`, `schedule run-now` and the like send their request
+    /// straight to whatever daemon answers, with no protocol check before it,
+    /// so that a user can still reach a daemon of another build to inspect it
+    /// or recover from it.
     protocol_gate: bool,
+    /// PRD #1666 part 2: what a gated `Hello` must also satisfy, beyond this
+    /// binary's protocol — set by [`Self::with_protocol_gate_admitting`].
+    /// `None` is the TUI's policy, protocol equality alone (issue #405).
+    admission: Option<HelloAdmission>,
 }
+
+/// A client's own verdict on a `Hello` reply that already names this binary's
+/// protocol: `Err` carries the sentence the refusal is reported with. A plain
+/// function rather than a closure so the handle stays `Clone + Debug` and every
+/// clone applies the same verdict.
+pub type HelloAdmission = fn(&AttachResponse) -> Result<(), String>;
 
 impl DaemonClient {
     /// A client for a daemon on **this** machine, at `socket_path`.
@@ -1425,6 +1446,7 @@ impl DaemonClient {
             capabilities: Arc::new(Mutex::new(None)),
             client_id: None,
             protocol_gate: false,
+            admission: None,
         }
     }
 
@@ -1444,6 +1466,7 @@ impl DaemonClient {
             capabilities: Arc::new(Mutex::new(None)),
             client_id: None,
             protocol_gate: false,
+            admission: None,
         })
     }
 
@@ -1475,6 +1498,7 @@ impl DaemonClient {
             capabilities: Arc::new(Mutex::new(None)),
             client_id: None,
             protocol_gate: false,
+            admission: None,
         }
     }
 
@@ -1509,6 +1533,20 @@ impl DaemonClient {
     /// the request unchecked.
     pub fn with_protocol_gate(mut self) -> Self {
         self.protocol_gate = true;
+        self
+    }
+
+    /// [`Self::with_protocol_gate`], with `admission` applied to the same
+    /// `Hello` once its protocol matches: a reply it refuses sends the request
+    /// nowhere, as [`ClientError::NotAdmitted`].
+    ///
+    /// For a client whose connect-time classification refuses more than a
+    /// protocol difference — the desktop's, which also refuses a declared
+    /// contract break — so that a daemon refused at connect is refused on every
+    /// gated request, whichever connection carries it.
+    pub fn with_protocol_gate_admitting(mut self, admission: HelloAdmission) -> Self {
+        self.protocol_gate = true;
+        self.admission = Some(admission);
         self
     }
 
@@ -1577,9 +1615,11 @@ impl DaemonClient {
 
     /// Issue #405's protocol check on a fresh connection: one `Hello`, `Ok`
     /// only when the reply is `ok` and its `server_version` equals this
-    /// binary's [`crate::daemon_protocol::PROTOCOL_VERSION`]. The capabilities
-    /// it advertised replace the cached set; a check that fails in any way
-    /// drops it, since it may describe the daemon this one replaced.
+    /// binary's [`crate::daemon_protocol::PROTOCOL_VERSION`] — and, on a
+    /// handle built by [`Self::with_protocol_gate_admitting`], when its
+    /// admission accepts the reply too. The capabilities it advertised replace
+    /// the cached set; a check that fails in any way drops it, since it may
+    /// describe the daemon this one replaced.
     ///
     /// With `follow_on`, the connection is returned for one more request, and
     /// the reply must also advertise
@@ -1613,6 +1653,9 @@ impl DaemonClient {
                     daemon: resp.server_version,
                     local,
                 });
+            }
+            if let Some(admission) = self.admission {
+                admission(&resp).map_err(ClientError::NotAdmitted)?;
             }
             Ok((rd, wr, resp))
         };
@@ -4201,6 +4244,7 @@ mod tests {
             capabilities: Arc::new(Mutex::new(None)),
             client_id: None,
             protocol_gate: false,
+            admission: None,
         };
         assert!(
             pipe_client.ensure_socket_exists().is_ok(),
@@ -4215,6 +4259,7 @@ mod tests {
             capabilities: Arc::new(Mutex::new(None)),
             client_id: None,
             protocol_gate: false,
+            admission: None,
         };
         assert!(
             remote_client.ensure_socket_exists().is_ok(),
@@ -8238,8 +8283,9 @@ mod protocol_gate_tests {
     }
 
     /// Scenario: the one-shot CLI's client is not gated: a listing goes to a
-    /// daemon on another protocol as it always did, after the CLI's own
-    /// startup check — the deliberate exception, pinned so it stays a choice.
+    /// daemon on another protocol as it always did, with no protocol check
+    /// before it — the deliberate exception that lets `daemon status` and its
+    /// siblings reach a daemon of another build, pinned so it stays a choice.
     #[tokio::test]
     async fn an_ungated_client_keeps_the_one_shot_policy() {
         let newer = GateDaemon::spawn(|_| GateHello::Newer);

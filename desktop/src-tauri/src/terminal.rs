@@ -830,16 +830,20 @@ async fn establish(
     // difference between joining the policy and overriding it.
     //
     // PRD #1666 part 2 (`lifecycle/handshake/011`): and only on a connection
-    // whose own `Hello` names this build's attach protocol
-    // (`DaemonClient::with_protocol_gate`). The classification above may be up
-    // to `HANDSHAKE_REVALIDATE_INTERVAL` old and may describe a daemon that has
-    // since been replaced at this socket by another build, which would
-    // otherwise be handed a terminal on the strength of its predecessor's reply.
-    let client =
-        dot_agent_deck::daemon_client::DaemonClient::clone(&daemon.client).with_protocol_gate();
+    // whose own `Hello` the desktop's classification accepts — the held client
+    // is gated with it (`daemon_bridge::establish`). The classification above
+    // may be up to `HANDSHAKE_REVALIDATE_INTERVAL` old and may describe a
+    // daemon that has since been replaced at this socket by another build,
+    // which would otherwise be handed a terminal on the strength of its
+    // predecessor's reply.
     let connection = match viewport {
-        Some(viewport) => client.attach_as_viewer(&agent_id, Some(viewport)).await,
-        None => client.attach_pending_viewport(&agent_id).await,
+        Some(viewport) => {
+            daemon
+                .client
+                .attach_as_viewer(&agent_id, Some(viewport))
+                .await
+        }
+        None => daemon.client.attach_pending_viewport(&agent_id).await,
     }
     .map_err(|error| match error {
         // In the words `TrustedDaemon::require_compatible` refuses with, so the
@@ -850,6 +854,9 @@ async fn establish(
         } => format!(
             "Not attaching: the daemon speaks attach protocol v{server}, but this app speaks v{local}."
         ),
+        // The classification's own sentence, which is already safe for the
+        // webview (`classify_handshake` composes it through `safe_message`).
+        dot_agent_deck::daemon_client::ClientError::NotAdmitted(reason) => reason,
         error => safe_message(error.to_string()),
     })?;
     let viewer = connection.viewer().map(|v| v.to_string());
@@ -2523,6 +2530,122 @@ mod tests {
             )),
             "the refusal must name both protocols in the app's words: {refusal}"
         );
+    }
+
+    /// Scenario: a terminal is open on a trusted deck when the daemon behind
+    /// its socket is replaced by one on the same attach protocol but one
+    /// declared contract break behind — a pairing the app refuses at connect —
+    /// and the tile reopens on another channel before anything distrusts the
+    /// deck. The reopen is refused in the connection banner's words and the
+    /// replacement is sent no attach. With Connect anyway chosen for the
+    /// session, the same reopen attaches, as it would connect.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reopen_against_a_contract_break_is_refused_as_connect_refuses_it() {
+        use dot_agent_deck::daemon_protocol::{AttachResponse, KIND_REQ, KIND_RESP};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for connect_anyway in [false, true] {
+            let _allowance = crate::daemon_bridge::AllowanceGuard::acquire();
+            let (_dir, socket) = scratch_socket("dad-held-break");
+            let (listener, _local_deck) = bind_local_deck(&socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            state.daemon.pin_cache_age_for_test(Duration::ZERO);
+            let original = tokio::spawn(async move {
+                let _hello = answer_one(&listener, matching_hello(), None, None).await;
+                let (_, writer) = answer_one(&listener, AttachResponse::ok(), None, None).await;
+                writer
+            });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(&state, None, "planner".into(), &fixture_channel(), None),
+            )
+            .await
+            .expect("bounded attach")
+            .expect("a compatible terminal");
+            let _old_writer = original.await.expect("original scripted daemon");
+            assert_eq!(
+                state.daemon.held().await,
+                1,
+                "precondition: the deck is trusted"
+            );
+            if connect_anyway {
+                crate::daemon_bridge::allow_build_mismatch_this_session();
+            }
+
+            std::fs::remove_file(&socket).unwrap();
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let admissions = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&admissions);
+            let replacement = tokio::spawn(async move {
+                let mut streams = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (reader, writer) = stream.into_split();
+                    let mut reader =
+                        dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
+                    let mut writer = TransportWriteHalf::new(writer);
+                    let mut follow_on = true;
+                    while std::mem::take(&mut follow_on) {
+                        let Some((KIND_REQ, payload)) = read_frame(&mut reader).await.unwrap()
+                        else {
+                            break;
+                        };
+                        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        let reply = if request["op"] == "hello" {
+                            follow_on = request["follow_on"] == true;
+                            let mut hello =
+                                crate::daemon_bridge::hello_from_a_deck_one_declared_break_behind()
+                                    .with_capabilities();
+                            hello.build_version = matching_hello().build_version;
+                            hello
+                        } else {
+                            if request["op"] == "attach-stream" {
+                                count.fetch_add(1, Ordering::SeqCst);
+                            }
+                            AttachResponse::ok()
+                        };
+                        write_frame(&mut writer, KIND_RESP, &serde_json::to_vec(&reply).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    streams.push(writer);
+                }
+            });
+            let reopened = tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(&state, None, "planner".into(), &fixture_channel(), None),
+            )
+            .await
+            .expect("bounded reopen");
+            replacement.abort();
+
+            if connect_anyway {
+                assert!(
+                    reopened.is_ok(),
+                    "Connect anyway admits the deck on every request: {:?}",
+                    reopened.err()
+                );
+                assert_eq!(admissions.load(Ordering::SeqCst), 1);
+                continue;
+            }
+            assert_eq!(
+                admissions.load(Ordering::SeqCst),
+                0,
+                "a reopen on held trust attached to a daemon the app refuses at connect"
+            );
+            let Err(refusal) = reopened else {
+                panic!("a reopen against a declared contract break must be refused");
+            };
+            assert!(
+                refusal.contains("The app has not connected"),
+                "the refusal must be the connection banner's: {refusal}"
+            );
+        }
     }
 
     /// Scenario: With cached-handshake age pinned to zero at its actual lookup, a terminal reaches EOF and its daemon socket is replaced before watcher invalidation. Reopening must refuse a different protocol with zero attach requests; the same-protocol control must really reopen a terminal stream, and cache expiry cannot satisfy either case.
