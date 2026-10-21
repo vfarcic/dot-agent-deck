@@ -72,7 +72,7 @@
 
 use std::time::Duration;
 
-use dot_agent_deck::daemon_client::{AgentListing, AgentRecord};
+use dot_agent_deck::daemon_client::{AgentListing, AgentRecord, Incarnation};
 use dot_agent_deck::event::{BroadcastMsg, EventType};
 use dot_agent_deck::state::AppState;
 use tokio::time::Instant;
@@ -185,6 +185,12 @@ pub(crate) struct AgentView {
     /// never pairs a fresh revision with a stale list. `None` from a daemon that
     /// reports none.
     schedule_revision: Option<u64>,
+    /// PRD #1666 part 2 (G-fix4): the daemon process the same reply came from,
+    /// stamped on every row rendered from `records` so an action on one of
+    /// them reaches that process or nothing. Rows an event fold changes keep
+    /// it: a fold names no new process, and an event from a successor would
+    /// only make an action on the row refuse, never retarget it.
+    incarnation: Option<Incarnation>,
     /// The daemon's `AppState`, run here over the same broadcast the daemon
     /// applies to its own.
     fold: AppState,
@@ -212,6 +218,7 @@ impl Default for AgentView {
         Self {
             records: Vec::new(),
             schedule_revision: None,
+            incarnation: None,
             fold: AppState::default(),
             due: Some(FetchReason::Initial),
             handshake_due: false,
@@ -243,6 +250,7 @@ impl AgentView {
         // across a subscription gap would let the picker conclude "unchanged"
         // from a number this view is no longer entitled to report.
         self.schedule_revision = None;
+        self.incarnation = None;
         // PRD #1258 M4: a new subscription may be a different daemon process.
         self.host_metrics = None;
         self.due = Some(FetchReason::Resubscribed);
@@ -397,6 +405,7 @@ impl AgentView {
         let AgentListing {
             records,
             schedule_revision,
+            incarnation,
         } = listing;
         let mut fold = AppState::default();
         for record in &records {
@@ -420,6 +429,7 @@ impl AgentView {
         self.fold = fold;
         self.records = records;
         self.schedule_revision = schedule_revision;
+        self.incarnation = incarnation;
         self.due = None;
         self.fetched_at = Some(now);
         self.fetches += 1;
@@ -458,6 +468,12 @@ impl AgentView {
         self.schedule_revision
     }
 
+    /// PRD #1666 part 2 (G-fix4): the daemon process the reply that installed
+    /// the current list came from — see the field.
+    pub(crate) fn incarnation(&self) -> Option<&Incarnation> {
+        self.incarnation.as_ref()
+    }
+
     fn mark(&mut self, reason: FetchReason) {
         if self.due.is_none() {
             self.due = Some(reason);
@@ -489,6 +505,7 @@ mod tests {
         AgentListing {
             records,
             schedule_revision: None,
+            incarnation: None,
         }
     }
 
@@ -1061,6 +1078,7 @@ mod tests {
             AgentListing {
                 records: vec![record("7", "pane-7")],
                 schedule_revision: Some(4),
+                incarnation: None,
             },
             now,
         );
@@ -1085,6 +1103,7 @@ mod tests {
             AgentListing {
                 records: vec![record("7", "pane-7")],
                 schedule_revision: Some(9),
+                incarnation: None,
             },
             now,
         );

@@ -125,6 +125,13 @@ struct TerminalSession {
     /// show the same agent, so the token is what tells them apart — the process
     /// identity behind the connection cannot.
     viewer: Option<String>,
+    /// PRD #1666 part 2 (G-fix4): the daemon process that accepted the attach
+    /// and issued [`Self::viewer`], from the `Hello` on the attach's own
+    /// connection. Viewer tokens and agent ids are per-process counters, so
+    /// [`resize`] is bound to it: a successor that issued the same token to
+    /// another client's viewer of an unrelated agent is sent nothing. `None`
+    /// only for a session no gated attach produced (test fixtures).
+    incarnation: Option<dot_agent_deck::daemon_client::Incarnation>,
     /// PRD #741 M9 — a lease of this session's own on the transport it streams
     /// over.
     ///
@@ -860,6 +867,7 @@ async fn establish(
         error => safe_message(error.to_string()),
     })?;
     let viewer = connection.viewer().map(|v| v.to_string());
+    let incarnation = connection.incarnation().cloned();
     let applied = connection.applied();
     let (reader, writer) = connection.into_split();
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed);
@@ -873,6 +881,7 @@ async fn establish(
         generation,
         writer: Arc::new(AsyncMutex::new(writer)),
         viewer,
+        incarnation,
         _transport: transport,
     };
     match state.publish_scoped_session(session_id.clone(), session, &scope) {
@@ -1321,7 +1330,7 @@ pub(crate) async fn resize(
     rows: u16,
 ) -> Result<(), String> {
     let (rows, cols) = validate_dimensions(rows, cols)?;
-    let (agent_id, viewer, endpoint) = state
+    let (agent_id, viewer, endpoint, incarnation) = state
         .sessions()?
         .get(session_id)
         .map(|session| {
@@ -1329,6 +1338,7 @@ pub(crate) async fn resize(
                 session.agent_id.clone(),
                 session.viewer.clone(),
                 session.endpoint.clone(),
+                session.incarnation.clone(),
             )
         })
         .ok_or_else(|| format!("terminal session not found: {}", safe_message(session_id)))?;
@@ -1339,8 +1349,16 @@ pub(crate) async fn resize(
     // it actually applied; the frontend learns that number from the
     // `desktop://terminal-geometry` event the daemon pushes to every viewer,
     // including this one, so nothing is returned here.
-    daemon
-        .client
+    //
+    // PRD #1666 part 2 (G-fix4): bound to the process that issued the token.
+    // The fields above were copied before the awaits, so a restart since — the
+    // same build included — would otherwise put this geometry on whichever
+    // viewer and agent the successor numbered the same.
+    let client = match incarnation {
+        Some(incarnation) => daemon.client.bound_to(incarnation),
+        None => (*daemon.client).clone(),
+    };
+    client
         .resize_agent_as_viewer(&agent_id, rows, cols, viewer.as_deref())
         .await
         .map(|_| ())
@@ -1542,6 +1560,7 @@ mod tests {
             writer: Arc::new(AsyncMutex::new(writer)),
             // Test seam: no attach happened, so there is no viewer token.
             viewer: None,
+            incarnation: None,
             _transport: transport,
         }
     }
@@ -2959,7 +2978,14 @@ mod tests {
         // selection move below is then doubly irrelevant to which deck is
         // stopped, and this test still pins which deck's session is detached.
         let wire_a = crate::dto::deck_wire_id(&deck_a);
-        let stopping = crate::stop_agent_action(&state, &wire_a, "planner");
+        // The scripted deck names no process, so the row it listed carried
+        // none either (PRD #1666 part 2, G-fix4).
+        let stopping = crate::stop_agent_action(
+            &state,
+            &wire_a,
+            "planner",
+            &dot_agent_deck::daemon_client::Incarnation::UNNAMED,
+        );
         let moving = async {
             stop_arrived_rx
                 .await
@@ -3717,5 +3743,55 @@ mod tests {
             .expect("a pane opened in a focused window claims focus on its deck");
         assert_eq!(claim.await.expect("claim task"), Ok(FocusReport::Recorded));
         assert_eq!(deck.registry.focused_client().as_deref(), Some(desktop));
+    }
+
+    /// Scenario (PRD #1666 part 2, G-fix4): a terminal is open on agent `1`
+    /// with viewer `v1`, and the deck restarts as the same build, whose own
+    /// agent `1` has another client's viewer `v1`. The tile's next resize is
+    /// sent to nobody and fails as "that agent is gone (the deck restarted)";
+    /// a terminal on a deck that did not restart resizes its agent (control).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_013_a_resize_after_a_restart_moves_no_recycled_viewer() {
+        use crate::restart_binding_tests::RestartingDeck;
+        use dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART;
+        use std::time::Duration;
+
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        for restarted in [true, false] {
+            let deck = RestartingDeck::start("g4-resize", "a");
+            let _local = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let state = DesktopState::default();
+            let established = tokio::time::timeout(
+                Duration::from_secs(5),
+                establish(&state, None, "1".into(), &fixture_channel(), Some((24, 80))),
+            )
+            .await
+            .expect("bounded attach")
+            .expect("a terminal on the first process");
+            let session_id = established.result.session_id.clone();
+            if restarted {
+                deck.restart_as("b");
+            }
+            let resized = resize(&state, &session_id, 100, 30).await;
+            if restarted {
+                assert_eq!(resized.err().as_deref(), Some(AGENT_GONE_AFTER_RESTART));
+                assert!(deck.hellos("b") > 0, "precondition: the resize asked b");
+                assert_eq!(
+                    deck.received_by("b"),
+                    Vec::<String>::new(),
+                    "the restarted daemon was sent the tile's geometry"
+                );
+            } else {
+                resized.expect("control: the resize lands");
+                assert_eq!(
+                    deck.received_by("a"),
+                    vec!["attach-stream".to_string(), "resize".to_string()],
+                    "control"
+                );
+            }
+            drop(established);
+        }
     }
 }

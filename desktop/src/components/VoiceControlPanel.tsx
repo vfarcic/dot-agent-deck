@@ -1171,7 +1171,7 @@ function choiceRefusal(lost: Lost): string {
  * `questionLabel`: what a sentence about `question` calls the agent
  * ({@link questionAgentName}, issue #1668); `label` when absent.
  */
-export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean; question?: PendingQuestionDto; questionLabel?: string } & VoicePaneAgent;
+export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean; question?: PendingQuestionDto; questionLabel?: string; incarnation?: string } & VoicePaneAgent;
 
 /**
  * PRD #1260 — the voice panel's state, the one model #1260, #1261 and #1184
@@ -2279,7 +2279,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setProblem(QUESTION_SAY_CONFIRM);
       return true;
     }
-    const target: VoiceQuestionTarget = { deckId: shown.deckId, agentId: shown.agentId, agent: shown.questionLabel ?? shown.label, questionId: question.id, revision: question.revision };
+    const target: VoiceQuestionTarget = { deckId: shown.deckId, agentId: shown.agentId, agent: shown.questionLabel ?? shown.label, questionId: question.id, revision: question.revision, ...(shown.incarnation ? { incarnation: shown.incarnation } : {}) };
     const spawnedAtMs = shown.spawnedAtMs;
     const inputBlocked = shown.inputBlocked;
     const deck = selectedDeckRef.current;

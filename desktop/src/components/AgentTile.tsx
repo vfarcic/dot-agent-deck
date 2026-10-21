@@ -234,7 +234,7 @@ export interface AgentTileProps {
   /** PRD #882 — the geometry the daemon has applied for this agent, if known. */
   appliedGeometry?: { rows: number; cols: number };
   onEvidenceSelect: (id: string) => void;
-  onRename?: (agentId: string, displayName: string) => Promise<void>;
+  onRename?: (agentId: string, displayName: string, incarnation?: string) => Promise<void>;
   /**
    * PRD #1105 M5 — enlarge this agent, supplied only by a parent that owns the
    * view. A capability rather than a `presentation` branch, for the reason
@@ -293,7 +293,7 @@ function InboxAttentionRow({ agent, item, onInboxAction }: {
     setBusy(true);
     try {
       const result = await onInboxAction(
-        { deckId: agent.daemonId, agentId: agent.id },
+        { deckId: agent.daemonId, agentId: agent.id, ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) },
         { paneId, messageId: item.messageId, revision: item.revision },
         verb,
       );
@@ -413,7 +413,9 @@ export function AgentTile({
   const readerSuppressed = overlay || Boolean(panePresent);
   const [renameDraft, setRenameDraft] = useState<string>();
   const [readerOpen, setReaderOpen] = useState(false);
-  useEffect(() => { setRenameDraft(undefined); setReaderOpen(false); }, [agent.id]);
+  /* A deck restart can hand this tile another agent under the same id (PRD
+     #1666 part 2): the draft goes with the agent it was opened on. */
+  useEffect(() => { setRenameDraft(undefined); setReaderOpen(false); }, [agent.id, agent.incarnation]);
   // Dismissed, not merely hidden: a Reader that came back when the pane closed
   // would answer the NEXT `Escape` instead of the deck, which is the same
   // surprise one step later.
@@ -423,7 +425,7 @@ export function AgentTile({
     const next = renameDraft?.trim();
     setRenameDraft(undefined);
     if (!onRename || !next || next === agent.displayName) return;
-    void onRename(agent.id, next);
+    void onRename(agent.id, next, agent.incarnation);
   };
 
   // The daemon's `error` is merged into `failed` for grouping; the card says

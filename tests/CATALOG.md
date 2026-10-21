@@ -3171,6 +3171,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the one-shot CLI's deliberately ungated policy (unit-pinned by `an_ungated_client_keeps_the_one_shot_policy`), or compatibility with a real previous-release binary.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/handshake/013 — An action aimed at an agent or viewer reaches the daemon process that issued its id, never a same-build restart that reuses it.
+- **Layer:** unit/in-process (scripted daemons restarted at the same socket under a new process identity, the same build, so every compatibility check passes): `daemon_client::incarnation_binding_tests`, `embedded_pane::incarnation_binding_tests` (the TUI's pane controller) and the desktop crate's `restart_binding_tests` (the card's pending Stop, rename, inbox action, orchestration rollback and terminal resize).
+- **Agent:** none (scripted daemons; no agent executable or credential).
+- **Asserts:** after the restart, a stop, rename (including one whose listing preceded the restart), post, inbox Retry, answer, orchestrator-context record, resize with a recycled viewer token, attach, hydration attach and an orchestration launch's start and rollback stop, each bound to the process that issued the id, send the restarted daemon nothing and fail as `that agent is gone (the deck restarted)` (a TUI close completes and says so); each one bound to the restarted daemon's own listing reaches it (control). Auto-reattach's lookup re-learns the restarted daemon's agent for the pane (as `lifecycle/handshake/011` requires), but attaches it only on the process that listed it.
+- **Does not assert:** a real daemon restart under a PTY-attached TUI or the desktop webview's capture of the row's incarnation (TypeScript-typed, not driven here); an inbox press on a TUI card with no attached pane, which carries no recorded process.
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/login-path
 
 ##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).

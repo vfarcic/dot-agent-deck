@@ -675,6 +675,7 @@ pub mod test_support {
             pending_question: None,
             tab: DesktopTab::Dashboard,
             pull_request: None,
+            incarnation: Default::default(),
         }
     }
 

@@ -34,6 +34,10 @@ mod secrets;
 // (PRD #1666 part 2).
 #[cfg(all(test, unix))]
 mod request_admission_tests;
+// Tests only: an action on an agent reaches the daemon process that listed it,
+// never a same-build restart that reuses the id (PRD #1666 part 2).
+#[cfg(all(test, unix))]
+mod restart_binding_tests;
 #[cfg(test)]
 mod selection_capture;
 mod selection_saves;
@@ -66,8 +70,8 @@ use dot_agent_deck::agent_pty::{
 };
 use dot_agent_deck::authoring_seeds::AuthoringKind;
 use dot_agent_deck::daemon_client::{
-    ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, LastCommandKeeper,
-    StartAgentOptions,
+    ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, Incarnation,
+    LastCommandKeeper, StartAgentOptions,
 };
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{AgentType, BroadcastMsg, PreparedOrchestration, ProjectRole};
@@ -528,6 +532,20 @@ impl OrchestrationDaemon for DaemonClient {
     }
 }
 
+/// PRD #1666 part 2 (G-fix4): the handle an orchestration launch runs on —
+/// `client` bound to the daemon process answering now, before anything is
+/// prepared or started.
+///
+/// Every role id the launch learns then comes from that process, and every
+/// request it makes with one — the coordinator's post, a rollback's stop —
+/// reaches that process or nothing. Without it, a daemon restarted mid-launch
+/// (the same build included, which every compatibility check admits) would
+/// number unrelated agents with the role ids the rollback still holds, and the
+/// rollback would stop them.
+async fn bind_launch(client: &DaemonClient) -> Result<DaemonClient, String> {
+    crate::daemon_bridge::bounded_reply("Hello", client.bound_to_current()).await
+}
+
 #[derive(Debug)]
 struct OrchestrationLaunchResult {
     start_agent_id: String,
@@ -646,20 +664,22 @@ async fn bounded_role_stop<D: OrchestrationDaemon + Sync>(
 }
 
 /// PRD #1223 U4 — stop every one of `roles` at once, each under its own
-/// [`ORCHESTRATION_ROLE_STOP_TIMEOUT`], and return one outcome per role, aligned
-/// with `roles`: `None` for a confirmed stop, otherwise why it is not.
+/// [`ORCHESTRATION_ROLE_STOP_TIMEOUT`] and through its own daemon handle, and
+/// return one outcome per role, aligned with `roles`: `None` for a confirmed
+/// stop, otherwise why it is not.
 ///
 /// Concurrent, as the TUI's Ctrl+W closes a tab's panes
 /// (`close_panes_concurrently`): the stops are independent, so a wedged one
 /// costs one bound for the whole close rather than one per role behind it.
+/// A handle per role because each is bound to the daemon process that listed
+/// that role (PRD #1666 part 2, G-fix4).
 async fn stop_roles_concurrently<D: OrchestrationDaemon + Sync>(
-    daemon: &D,
-    roles: &[StartedRole],
+    roles: &[(&D, &StartedRole)],
 ) -> Vec<Option<UnconfirmedStop>> {
     join_ordered(
         roles
             .iter()
-            .map(|role| bounded_role_stop(daemon, role))
+            .map(|(daemon, role)| bounded_role_stop(*daemon, role))
             .collect(),
     )
     .await
@@ -1869,6 +1889,7 @@ async fn desktop_inbox_action(
     message_id: String,
     revision: u64,
     verb: String,
+    incarnation: Option<String>,
 ) -> Result<DesktopInboxActionResult, String> {
     ensure_main_webview(&webview)?;
     inbox_action_on(
@@ -1879,11 +1900,17 @@ async fn desktop_inbox_action(
         &message_id,
         revision,
         &verb,
+        &Incarnation::from(incarnation),
     )
     .await
 }
 
 /// [`desktop_inbox_action`] minus the webview.
+///
+/// Bound to `incarnation`, the daemon process that listed the tile (PRD #1666
+/// part 2, G-fix4): a successor that numbered an unrelated agent with this id
+/// is sent nothing.
+#[allow(clippy::too_many_arguments)]
 async fn inbox_action_on(
     state: &DesktopState,
     deck_id: &str,
@@ -1892,6 +1919,7 @@ async fn inbox_action_on(
     message_id: &str,
     revision: u64,
     verb: &str,
+    incarnation: &Incarnation,
 ) -> Result<DesktopInboxActionResult, String> {
     let retry = match verb {
         "retry" => true,
@@ -1904,6 +1932,7 @@ async fn inbox_action_on(
     let request_id = dot_agent_deck::daemon_client::generate_client_id();
     let answer = daemon
         .client
+        .bound_to(incarnation.clone())
         .inbox_action(pane_id, agent_id, message_id, revision, retry, &request_id)
         .await
         .map_err(|error| safe_message(error.to_string()))?;
@@ -3798,6 +3827,7 @@ async fn desktop_voice_answer_question(
     confirmed_always: bool,
     lease: String,
     revision: Option<u64>,
+    incarnation: Option<String>,
 ) -> Result<voice::question::AnswerOutcome, String> {
     ensure_main_webview(&webview)?;
     validate_voice_question_form(&deck_id, &agent_id, &question_id, &form)?;
@@ -3832,7 +3862,13 @@ async fn desktop_voice_answer_question(
         let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
         let daemon = state.daemon.trusted(scope.endpoint()).await?;
         daemon.require_compatible()?;
-        let sent = daemon.client.answer_question_while(
+        // PRD #1666 part 2 (G-fix4): bound to the daemon process that listed
+        // the agent the panel shows, so a successor that numbered an unrelated
+        // agent with this id is not answered.
+        let client = daemon
+            .client
+            .bound_to(Incarnation::from(incarnation.clone()));
+        let sent = client.answer_question_while(
             still_wanted,
             &agent_id,
             &question_id,
@@ -4793,15 +4829,21 @@ async fn apply_selection(app: &AppHandle, state: &DesktopState) {
 /// own connection: a daemon replaced between the listing and the relabel is
 /// classified again before it is sent `SetAgentLabel`, so a refused
 /// replacement that reuses the agent's id is not relabelled.
+///
+/// Both are also bound to `incarnation`, the daemon process that listed the
+/// row the user renamed (G-fix4): a replacement of any build, the same one
+/// included, is sent neither, so it can neither lend the old agent's cwd nor
+/// receive the label on an unrelated agent of its own with the same id.
 async fn rename_agent_action(
     links: &DaemonLinks,
     agent_id: &str,
     display_name: String,
+    incarnation: &Incarnation,
 ) -> Result<(), String> {
     let daemon = trusted_daemon(links).await?;
     daemon.require_compatible()?;
-    let existing_cwd = daemon
-        .client
+    let client = daemon.client.bound_to(incarnation.clone());
+    let existing_cwd = client
         .list_agents()
         .await
         .map_err(|error| safe_message(error.to_string()))?
@@ -4809,8 +4851,7 @@ async fn rename_agent_action(
         .find(|record| record.id == agent_id)
         .ok_or_else(|| format!("agent not found: {agent_id}"))?
         .cwd;
-    daemon
-        .client
+    client
         .set_agent_label(agent_id, Some(display_name), existing_cwd)
         .await
         .map_err(|error| safe_message(error.to_string()))
@@ -4862,14 +4903,21 @@ async fn stop_agent_action(
     state: &DesktopState,
     deck_id: &str,
     agent_id: &str,
+    incarnation: &Incarnation,
 ) -> Result<crate::dto::DeckScope, String> {
     validate_agent_id(agent_id)?;
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
+    // PRD #1666 part 2 (G-fix4): bound to the daemon process that listed the
+    // row, which may be long gone by the time a confirmation is accepted. A
+    // successor that numbered an unrelated agent with this id is sent nothing.
     match tokio::time::timeout(
         ORCHESTRATION_ROLE_STOP_TIMEOUT,
-        daemon.client.stop_agent(agent_id),
+        daemon
+            .client
+            .bound_to(incarnation.clone())
+            .stop_agent(agent_id),
     )
     .await
     {
@@ -4935,6 +4983,13 @@ async fn stop_orchestration_action(
     if let Err(error) = daemon.require_compatible() {
         return (Some(scope), Err(error.into()));
     }
+    // PRD #1666 part 2 (G-fix4): each stop bound to the daemon process that
+    // listed its role, so a role listed before a restart is not stopped on a
+    // successor that numbered an unrelated agent the same.
+    let clients: Vec<DaemonClient> = roles
+        .iter()
+        .map(|role| daemon.client.bound_to(role.incarnation.clone()))
+        .collect();
     let started: Vec<StartedRole> = roles
         .iter()
         .map(|role| StartedRole {
@@ -4942,7 +4997,8 @@ async fn stop_orchestration_action(
             role: role.name.clone(),
         })
         .collect();
-    let outcomes = stop_roles_concurrently(&*daemon.client, &started).await;
+    let stops: Vec<(&DaemonClient, &StartedRole)> = clients.iter().zip(&started).collect();
+    let outcomes = stop_roles_concurrently(&stops).await;
     let mut unconfirmed = Vec::new();
     for (role, outcome) in started.iter().zip(outcomes) {
         match outcome {
@@ -5250,8 +5306,9 @@ async fn activate_orchestration_action(
     let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
+    let launch_client = bind_launch(&daemon.client).await?;
     let (roles, prepared) = prepare_orchestration_launch(
-        daemon.client.as_ref(),
+        &launch_client,
         &name,
         &cwd,
         &task_prompt,
@@ -5261,7 +5318,7 @@ async fn activate_orchestration_action(
     .await?;
     let orchestration_id = mint_orchestration_id();
     launch_orchestration(
-        daemon.client.as_ref(),
+        &launch_client,
         &name,
         display_title.as_deref(),
         // The daemon's CANONICAL spelling, not the one that was sent.
@@ -5343,6 +5400,7 @@ async fn start_orchestration_action(
         return Err(reason.into());
     }
     ensure_one_orchestration_of_that_name(&daemon, &path, &orchestration).await?;
+    let launch_client = bind_launch(&daemon.client).await?;
     // Against a deck older than issue #1233, deliberately NOT under a
     // client-side deadline, unlike every other call this launch makes (PRD
     // #1223 audit V1). Such a deck resolves, composes, issues the token and
@@ -5365,8 +5423,7 @@ async fn start_orchestration_action(
     // preparation has neither: dropping it neither finds out what happened nor
     // says anything useful, so it is waited out instead.
     let prepare = async {
-        daemon
-            .client
+        launch_client
             .prepare_orchestration(&path, &orchestration, "", config_revision.as_deref())
             .await
             .map_err(|error| prepare_refusal_message(&error, &orchestration))
@@ -5391,7 +5448,7 @@ async fn start_orchestration_action(
         );
     }
     let launched = launch_configured_orchestration(
-        daemon.client.as_ref(),
+        &launch_client,
         &orchestration,
         display_title.as_deref(),
         &prepared,
@@ -6132,8 +6189,12 @@ async fn desktop_run_action(
                     .into(),
             );
         }
-        DesktopAction::StopAgent { deck_id, agent_id } => {
-            let scope = stop_agent_action(&state, &deck_id, &agent_id).await?;
+        DesktopAction::StopAgent {
+            deck_id,
+            agent_id,
+            incarnation,
+        } => {
+            let scope = stop_agent_action(&state, &deck_id, &agent_id, &incarnation).await?;
             // PRD #1223 U4: the TARGET deck, directly, for the StartAgent
             // arm's reason — the tail below refreshes only the selected one.
             if let Some(snapshot) = target_deck_snapshot(&state.daemon, &scope).await {
@@ -6228,6 +6289,7 @@ async fn desktop_run_action(
         DesktopAction::RenameAgent {
             agent_id,
             display_name,
+            incarnation,
         } => {
             validate_agent_id(&agent_id)?;
             if !is_valid_display_name(&display_name) {
@@ -6236,7 +6298,7 @@ async fn desktop_run_action(
                         .into(),
                 );
             }
-            rename_agent_action(&state.daemon, &agent_id, display_name).await?;
+            rename_agent_action(&state.daemon, &agent_id, display_name, &incarnation).await?;
             result_agent_id = Some(agent_id);
         }
         DesktopAction::AttachTerminal {
@@ -10551,7 +10613,8 @@ command = "configured-planner"
             .collect();
         let began = tokio::time::Instant::now();
 
-        let outcomes = stop_roles_concurrently(&daemon, &roles).await;
+        let stops: Vec<_> = roles.iter().map(|role| (&daemon, role)).collect();
+        let outcomes = stop_roles_concurrently(&stops).await;
 
         let mut attempts = daemon.stop_attempts.lock().unwrap().clone();
         attempts.sort();
@@ -10603,7 +10666,7 @@ command = "configured-planner"
         }
         assert!(matches!(
             serde_json::from_value::<DesktopAction>(serde_json::json!({"type": "stop_agent", "deckId": "deck-000000000000dec1", "agentId": "7"})),
-            Ok(DesktopAction::StopAgent { deck_id, agent_id }) if deck_id == "deck-000000000000dec1" && agent_id == "7"
+            Ok(DesktopAction::StopAgent { deck_id, agent_id, .. }) if deck_id == "deck-000000000000dec1" && agent_id == "7"
         ));
     }
 

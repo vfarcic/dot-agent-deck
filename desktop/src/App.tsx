@@ -821,6 +821,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* Issue #1668 — sentences about that question name the agent as
          Reading does: an orchestration agent by its run's title too. */
       questionLabel: questionAgentName(paneShownAgent),
+      /* PRD #1666 part 2 — the daemon process that listed the agent, so an
+         answer reaches that process or nothing. */
+      ...(paneShownAgent.incarnation ? { incarnation: paneShownAgent.incarnation } : {}),
     }
     : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab, prBrowser]);
   /**
@@ -1940,8 +1943,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     }
   };
 
-  const renameAgent = async (agentId: string, displayName: string) => {
-    await perform({ type: "rename_agent", agentId, displayName }, `Agent renamed to ${displayName}.`);
+  const renameAgent = async (agentId: string, displayName: string, incarnation?: string) => {
+    await perform({ type: "rename_agent", agentId, displayName, incarnation }, `Agent renamed to ${displayName}.`);
   };
 
   /**
@@ -2101,7 +2104,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
       label: "Close agent",
       busyLabel: "Stopping…",
-      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id }, `${selectedAgent.role} close requested.`); },
+      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
     });
   };
 

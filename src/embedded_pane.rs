@@ -10,7 +10,8 @@ use std::any::Any;
 
 use crate::agent_pty::{self, DOT_AGENT_DECK_PANE_ID, PTY_RESIZE_DIM_MAX, TabMembership};
 use crate::daemon_client::{
-    AttachConnection, DaemonClient, GatedQuery, StartAgentOptions, generate_client_id,
+    AgentListing, AttachConnection, ClientError, DaemonClient, GatedQuery, Incarnation,
+    StartAgentOptions, generate_client_id,
 };
 use crate::event::AgentType;
 use crate::focus_report::FocusReporter;
@@ -130,14 +131,15 @@ impl SeamChildInput {
 /// deck locally or over `dot-agent-deck connect`. `Pane.backend` is
 /// just a `StreamBackend`.
 struct StreamBackend {
-    /// Daemon-side agent id used for `stop-agent` on close and
-    /// `resize-agent` from the per-pane resize worker. Shared with the
-    /// per-pane I/O task so that PRD #92 F12's auto-renew-on-respawn path
-    /// can swap in the NEW agent's id after the daemon respawns the agent
-    /// behind this pane (clear=true delegate flow). All readers take a
-    /// brief lock + clone before issuing the RPC — never held across
-    /// `.await`.
-    agent_id: Arc<Mutex<String>>,
+    /// What this pane is attached to: the daemon-side agent id used for
+    /// `stop-agent` on close and `resize-agent` from the per-pane resize
+    /// worker, this pane's viewer token, and the daemon process that issued
+    /// both. Shared with the per-pane I/O task so that PRD #92 F12's
+    /// auto-renew-on-respawn path can swap in the NEW agent's attachment after
+    /// the daemon respawns the agent behind this pane (clear=true delegate
+    /// flow). All readers take a brief lock + clone before issuing the RPC —
+    /// never held across `.await`.
+    attached: Arc<Mutex<PaneAttachment>>,
     /// Channel drained by the per-pane I/O task. `Input` becomes one
     /// `KIND_STREAM_IN` frame on the wire; `Detach` becomes one
     /// `KIND_DETACH` frame and ends the writer. Unbounded because the TUI
@@ -195,16 +197,6 @@ struct StreamBackend {
     /// an internal detail. Recording the reason lets the pane say what actually
     /// happened.
     lost: Arc<Mutex<Option<PaneLostReason>>>,
-    /// PRD #882 — this pane's viewer token, shared with the I/O task the same
-    /// way `agent_id` is and for the same reason: PRD #92 F12's
-    /// auto-renew-on-respawn path re-attaches to a NEW agent, which mints a new
-    /// token, and the resize worker must send whichever one is current.
-    ///
-    /// `None` until the first attach answers, and again for a daemon that
-    /// predates the policy (it echoes no token). A resize sent without one takes
-    /// the daemon's unattributed path — the pre-#882 behaviour — which is the
-    /// correct fallback in both cases: there is no viewer registered to update.
-    viewer: Arc<Mutex<Option<String>>>,
     /// PRD #882 — the last geometry the DAEMON said it applied for this pane.
     ///
     /// This, not the local parser, is what the per-frame sweep compares its
@@ -215,6 +207,57 @@ struct StreamBackend {
     /// can move without this client asking at all, so the client tracks what it
     /// last REQUESTED here and reconciles against what the daemon answers.
     requested: Arc<Mutex<Option<(u16, u16)>>>,
+}
+
+/// What a pane is attached to, read and replaced as ONE value (PRD #1666 part
+/// 2, G-fix4).
+///
+/// The agent id and the viewer token are per-process counters, so each means
+/// something only beside the daemon process that issued it: a restarted
+/// daemon — the same build included — numbers unrelated agents and other
+/// clients' viewers the same. Every request aimed at the pane's agent or viewer
+/// is therefore bound to [`Self::incarnation`] ([`Self::client`]). Held under
+/// one lock because a reattach replaces all three: a reader that could pair an
+/// old id with a new daemon's process would send that id to the new daemon.
+#[derive(Debug, Clone, Default)]
+struct PaneAttachment {
+    agent_id: String,
+    /// PRD #882 — this pane's viewer token. `None` until the first attach
+    /// answers, and again for a daemon that predates the policy (it echoes no
+    /// token). A resize sent without one takes the daemon's unattributed path
+    /// — the pre-#882 behaviour — which is the correct fallback in both cases:
+    /// there is no viewer registered to update.
+    viewer: Option<String>,
+    /// The daemon process that accepted the attach, from the `Hello` on its
+    /// own connection. `None` from an ungated controller, whose attach sends
+    /// no `Hello`; its requests then stay unbound, as they always were.
+    incarnation: Option<Incarnation>,
+}
+
+impl PaneAttachment {
+    /// The attachment `conn` made to `agent_id`.
+    fn of(agent_id: String, conn: &AttachConnection) -> Self {
+        Self {
+            agent_id,
+            viewer: conn.viewer().map(str::to_string),
+            incarnation: conn.incarnation().cloned(),
+        }
+    }
+
+    /// `base`, bound to the daemon process this attachment came from, so a
+    /// request naming its agent or viewer reaches that process or nothing.
+    fn client(&self, base: &DaemonClient) -> DaemonClient {
+        bound_to_known(base, self.incarnation.as_ref())
+    }
+}
+
+/// `base` bound to `incarnation` when one is known, and `base` as it is when
+/// none is — an ungated handle, which learns none (PRD #1666 part 2, G-fix4).
+fn bound_to_known(base: &DaemonClient, incarnation: Option<&Incarnation>) -> DaemonClient {
+    match incarnation {
+        Some(incarnation) => base.bound_to(incarnation.clone()),
+        None => base.clone(),
+    }
 }
 
 /// Why a pane's attach I/O task stopped trying to reach its agent.
@@ -347,6 +390,15 @@ struct Pane {
 
 /// Thread-safe pane registry.
 type PaneRegistry = Arc<Mutex<HashMap<String, Pane>>>;
+
+/// What `pane_id`'s pane in `panes` is attached to, or `None` when there is no
+/// such pane (PRD #1666 part 2, G-fix4).
+fn pane_attachment_in(panes: &PaneRegistry, pane_id: &str) -> Option<PaneAttachment> {
+    let panes = panes.lock().unwrap();
+    panes
+        .get(pane_id)
+        .map(|pane| pane.backend.attached.lock().unwrap().clone())
+}
 
 /// PRD #611 M2 — the facts a scroll attempt needs about one pane, sampled
 /// together by [`EmbeddedPaneController::scroll_facts`].
@@ -776,6 +828,9 @@ enum InboxActionTarget {
     Daemon {
         client: DaemonClient,
         runtime: tokio::runtime::Handle,
+        /// The controller's panes, to bind a press to the daemon process its
+        /// agent was attached from (PRD #1666 part 2, G-fix4).
+        panes: PaneRegistry,
     },
     /// The TUI's L1 seam: each press is recorded, nothing is sent.
     Recorder(Arc<Mutex<Vec<RecordedPress>>>),
@@ -794,7 +849,24 @@ impl InboxActionSender {
         timeout: Duration,
     ) {
         let (client, runtime) = match &self.to {
-            InboxActionTarget::Daemon { client, runtime } => (client.clone(), runtime.clone()),
+            // PRD #1666 part 2 (G-fix4): when this TUI has the pane attached to
+            // this very agent, the press is bound to the daemon process that
+            // attachment came from, so a restarted daemon's namesake is sent
+            // nothing. A card with no attached pane has no recorded process,
+            // and the message id and revision still have to match.
+            InboxActionTarget::Daemon {
+                client,
+                runtime,
+                panes,
+            } => {
+                let incarnation = pane_attachment_in(panes, pane_id)
+                    .filter(|attachment| attachment.agent_id == agent_id)
+                    .and_then(|attachment| attachment.incarnation);
+                (
+                    bound_to_known(client, incarnation.as_ref()),
+                    runtime.clone(),
+                )
+            }
             InboxActionTarget::Recorder(sent) => {
                 sent.lock().unwrap_or_else(|p| p.into_inner()).push((
                     pane_id.to_string(),
@@ -941,9 +1013,16 @@ impl EmbeddedPaneController {
             to: InboxActionTarget::Daemon {
                 client: self.client.clone(),
                 runtime: self.runtime.clone(),
+                panes: Arc::clone(&self.panes),
             },
             slot: Arc::default(),
         }
+    }
+
+    /// PRD #1666 part 2 (G-fix4): what `pane_id`'s pane is attached to, read
+    /// as one value, or `None` when this TUI has no pane for it.
+    fn pane_attachment(&self, pane_id: &str) -> Option<PaneAttachment> {
+        pane_attachment_in(&self.panes, pane_id)
     }
 
     pub fn host_metrics_reader(&self) -> HostMetricsReader {
@@ -1184,7 +1263,8 @@ impl EmbeddedPaneController {
 
         let pane = Pane {
             backend: StreamBackend {
-                agent_id: Arc::new(Mutex::new(String::new())),
+                // Render-only seam: no attach, so no agent, viewer or process.
+                attached: Arc::new(Mutex::new(PaneAttachment::default())),
                 input_tx,
                 io_task: None,
                 io_state: Arc::new(AtomicU8::new(IO_FINISHED)),
@@ -1193,9 +1273,7 @@ impl EmbeddedPaneController {
                 resize_tx,
                 resize_task: None,
                 lost: Arc::new(Mutex::new(None)),
-                // Render-only seam: no attach, so no viewer and nothing
-                // requested. Both stay `None` for the pane's life.
-                viewer: Arc::new(Mutex::new(None)),
+                // Render-only seam: nothing requested, for the pane's life.
                 requested: Arc::new(Mutex::new(None)),
             },
             screen: Arc::new(Mutex::new(parser)),
@@ -1383,7 +1461,14 @@ impl EmbeddedPaneController {
     /// the two are indistinguishable from the outside without it.
     pub fn viewer_token(&self, pane_id: &str) -> Option<String> {
         let panes = self.panes.lock().unwrap();
-        panes.get(pane_id)?.backend.viewer.lock().ok()?.clone()
+        panes
+            .get(pane_id)?
+            .backend
+            .attached
+            .lock()
+            .ok()?
+            .viewer
+            .clone()
     }
 
     /// PRD #882 — the geometry this pane last ASKED the daemon for, or `None`
@@ -1608,24 +1693,33 @@ impl EmbeddedPaneController {
         // Cleanup on `attach` error OR `attach` timeout is best-effort
         // and bounded by `CREATE_PANE_STOP_TIMEOUT`; the original attach
         // error (or synthesized timeout error) is what propagates.
-        let client_for_calls = client.clone();
         let (agent_id, conn) = runtime
             .block_on(async move {
-                use crate::daemon_client::ClientError;
-
+                // PRD #1666 part 2 (G-fix4): the start, the attach and the
+                // cleanup stop all reach the daemon process answering now, so
+                // the agent this pane attaches to, or stops, is the one it
+                // started — never a restarted daemon's agent with the same id.
+                // On the TUI's gated client this costs one `Hello`, under the
+                // start's bound.
                 let start = async {
-                    if remember_command {
+                    let client_for_calls = client.bound_to_current().await?;
+                    let id = if remember_command {
                         client_for_calls
                             .start_client_seeded_form_agent(opts, authoring_kind)
                             .await
-                            .map(|form| form.agent_id)
+                            .map(|form| form.agent_id)?
                     } else {
-                        client_for_calls.start_agent(opts).await
-                    }
+                        client_for_calls.start_agent(opts).await?
+                    };
+                    Ok::<_, ClientError>((id, client_for_calls))
                 };
-                let id = match tokio::time::timeout(CREATE_PANE_START_TIMEOUT, start).await
+                let (id, client_for_calls) = match tokio::time::timeout(
+                    CREATE_PANE_START_TIMEOUT,
+                    start,
+                )
+                .await
                 {
-                    Ok(Ok(id)) => id,
+                    Ok(Ok(started)) => started,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
                         return Err(ClientError::Io(std::io::Error::new(
@@ -1770,32 +1864,32 @@ impl EmbeddedPaneController {
         let (resize_tx, resize_rx) = tokio::sync::watch::channel::<Option<(u16, u16)>>(None);
 
         // PRD #92 F12: the per-pane subscriber and the resize worker both
-        // need to follow `agent_id` across daemon-side respawns (F9
+        // need to follow the agent across daemon-side respawns (F9
         // clear=true delegate flow kills + replaces the agent under the
-        // same pane_id_env). Share one `Arc<Mutex<String>>` between them
-        // and `StreamBackend` so a single update in the io_task is visible
-        // to the next `stop-agent` / `resize-agent` call without rewiring.
-        let shared_agent_id = Arc::new(Mutex::new(agent_id));
+        // same pane_id_env). Share one `Arc<Mutex<PaneAttachment>>` between
+        // them and `StreamBackend` so a single update in the io_task is
+        // visible to the next `stop-agent` / `resize-agent` call without
+        // rewiring.
+        //
+        // PRD #882: the viewer token rides in it for the same reason — a
+        // respawn re-attaches and mints a new one, and the resize worker must
+        // send whichever is current. Seeded from the attach that produced
+        // `conn`, so the very first resize already names this viewer rather
+        // than falling through to the daemon's unattributed path. PRD #1666
+        // part 2 (G-fix4): and so does the daemon process both came from.
+        let shared_attached = Arc::new(Mutex::new(PaneAttachment::of(agent_id, &conn)));
 
         // Per-pane resize worker: at-most-one in-flight daemon Resize per
         // pane, with intermediate values coalesced via the watch channel.
         // Survives until either `resize_tx` drops (pane removed) or the
         // worker is aborted by `StreamBackend::drop`. See the comment on
         // `resize_pane_pty` for the full rationale.
-        // PRD #882: the viewer token follows the same sharing pattern as
-        // `agent_id` and for the same reason — a respawn re-attaches and mints a
-        // new one, and the resize worker must send whichever is current.
-        // Seeded from the attach that produced `conn`, so the very first resize
-        // already names this viewer rather than falling through to the daemon's
-        // unattributed path.
-        let shared_viewer = Arc::new(Mutex::new(conn.viewer().map(|v| v.to_string())));
         let requested = Arc::new(Mutex::new(None));
 
         let resize_task = runtime.spawn(resize_worker(
             resize_rx,
             self.client.clone(),
-            Arc::clone(&shared_agent_id),
-            Arc::clone(&shared_viewer),
+            Arc::clone(&shared_attached),
             Arc::clone(&parser),
         ));
 
@@ -1803,8 +1897,7 @@ impl EmbeddedPaneController {
         let mouse_mode_for_task = Arc::clone(&mouse_mode);
         let hyperlinks_for_task = Arc::clone(&hyperlinks);
         let bytes_for_task = Arc::clone(&bytes_since_spawn);
-        let agent_id_for_task = Arc::clone(&shared_agent_id);
-        let viewer_for_task = Arc::clone(&shared_viewer);
+        let attached_for_task = Arc::clone(&shared_attached);
         let client_for_task = self.client.clone();
         let pane_id_for_task = pane_id.clone();
         let rejections_for_task = Arc::clone(&self.stream_rejections);
@@ -1831,8 +1924,7 @@ impl EmbeddedPaneController {
                 pane_id_for_task,
                 client_for_task,
                 conn,
-                agent_id_for_task,
-                viewer_for_task,
+                attached_for_task,
                 input_rx,
                 parser_for_task,
                 mouse_mode_for_task,
@@ -1854,7 +1946,7 @@ impl EmbeddedPaneController {
 
         let pane = Pane {
             backend: StreamBackend {
-                agent_id: shared_agent_id,
+                attached: shared_attached,
                 input_tx,
                 io_task: Some(io_task),
                 io_state,
@@ -1863,7 +1955,6 @@ impl EmbeddedPaneController {
                 resize_tx,
                 resize_task: Some(resize_task),
                 lost,
-                viewer: shared_viewer,
                 requested,
             },
             screen: parser,
@@ -1913,10 +2004,10 @@ impl EmbeddedPaneController {
         // timeout we treat the result as empty (the user can reconnect)
         // and emit a debug line so the cause is observable.
         let list_client = client.clone();
-        let records = match runtime.block_on(async move {
-            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents()).await
+        let (records, incarnation) = match runtime.block_on(async move {
+            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents_detailed()).await
         }) {
-            Ok(Ok(a)) => a,
+            Ok(Ok(listing)) => (listing.records, listing.incarnation),
             Ok(Err(e)) => {
                 tracing::debug!(
                     error = %e,
@@ -1955,9 +2046,13 @@ impl EmbeddedPaneController {
         // we already allocated this pass) cannot HashMap::insert-overwrite
         // an earlier pane in `wire_stream_pane`.
         let mut used_ids: HashSet<String> = HashSet::new();
+        // PRD #1666 part 2 (G-fix4): each attach is bound to the daemon process
+        // that listed the agent, so a daemon restarted in between is not
+        // attached under the listed id.
+        let attach_client = bound_to_known(&client, incarnation.as_ref());
         for record in records {
             let agent_id = record.id.clone();
-            let client_for_attach = client.clone();
+            let client_for_attach = attach_client.clone();
             let id_for_attach = agent_id.clone();
             // Bounded per-agent attach: same rationale as the list-agents
             // timeout above, scaled down because there can be up to
@@ -2131,10 +2226,10 @@ impl EmbeddedPaneController {
     /// rather than preserve an unclosable one.
     fn stop_unattached_pane(&self, pane_id: &str) -> Result<(), PaneError> {
         let list_client = self.client.clone();
-        let records = match self.runtime.block_on(async move {
-            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents()).await
+        let (records, incarnation) = match self.runtime.block_on(async move {
+            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents_detailed()).await
         }) {
-            Ok(Ok(records)) => records,
+            Ok(Ok(listing)) => (listing.records, listing.incarnation),
             Ok(Err(e)) => {
                 return Err(PaneError::CommandFailed(format!(
                     "Pane {pane_id} is not attached here and the daemon could not be \
@@ -2161,7 +2256,9 @@ impl EmbeddedPaneController {
             );
             return Ok(());
         };
-        let stop_client = self.client.clone();
+        // PRD #1666 part 2 (G-fix4): stop the agent the listing named, on the
+        // daemon process that listed it, never a successor's namesake.
+        let stop_client = bound_to_known(&self.client, incarnation.as_ref());
         let stop_id = agent_id.clone();
         match self.runtime.block_on(async move {
             tokio::time::timeout(CTRL_W_STOP_TIMEOUT, stop_client.stop_agent(&stop_id)).await
@@ -2176,6 +2273,12 @@ impl EmbeddedPaneController {
             }
             // Already gone between the list and the stop — the close is done.
             Ok(Err(e)) if is_agent_not_found(&e, &agent_id) => Ok(()),
+            // So is an agent whose daemon restarted between the two: the
+            // restart stopped it. Said, as an attached pane's close says it.
+            Ok(Err(e @ ClientError::DaemonRestarted)) => {
+                self.close_warnings.lock().unwrap().push(e.to_string());
+                Ok(())
+            }
             Ok(Err(e)) => Err(PaneError::CommandFailed(format!(
                 "Failed to stop agent {agent_id} behind pane {pane_id}: {e}"
             ))),
@@ -2195,10 +2298,10 @@ impl EmbeddedPaneController {
         let runtime = self.runtime.clone();
 
         let list_client = client.clone();
-        let records = match runtime.block_on(async move {
-            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents()).await
+        let (records, incarnation) = match runtime.block_on(async move {
+            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents_detailed()).await
         }) {
-            Ok(Ok(a)) => a,
+            Ok(Ok(listing)) => (listing.records, listing.incarnation),
             Ok(Err(e)) => {
                 tracing::debug!(
                     pane_id,
@@ -2229,7 +2332,8 @@ impl EmbeddedPaneController {
 
         let agent_id = record.id.clone();
         let id_for_attach = agent_id.clone();
-        let client_for_attach = client.clone();
+        // PRD #1666 part 2 (G-fix4): on the daemon process that listed it.
+        let client_for_attach = bound_to_known(&client, incarnation.as_ref());
         // PRD #882: the viewport this attach declares. `record.rows/cols`
         // is the daemon's own current geometry (PRD #104 plumbed it through
         // `list_agents`), so declaring it registers this viewer without
@@ -2651,6 +2755,11 @@ enum StopClass {
     Failed(String),
     /// The RPC did not answer within [`CTRL_W_STOP_TIMEOUT`].
     TimedOut,
+    /// PRD #1666 part 2 (G-fix4): the daemon process the pane's agent ran
+    /// under has been replaced, so nothing was sent. A restart stops every
+    /// agent, so this one is not running; the successor's agent with the same
+    /// id is somebody else's.
+    Restarted,
 }
 
 impl StopClass {
@@ -2670,6 +2779,12 @@ impl StopClass {
             StopClass::NotFound => None,
             StopClass::Failed(msg) => Some(StopOutcome::Failed(msg)),
             StopClass::TimedOut => Some(StopOutcome::TimedOut),
+            // The close completes — the agent went with the daemon that ran
+            // it — and says why nothing was stopped here, in the words the
+            // desktop's Stop uses.
+            StopClass::Restarted => Some(StopOutcome::DoneUnverified(
+                crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string(),
+            )),
         }
     }
 }
@@ -2684,6 +2799,7 @@ fn classify_stop(
     match result {
         Ok(Ok(())) => StopClass::Stopped,
         Ok(Err(e)) if is_agent_not_found(&e, agent_id) => StopClass::NotFound,
+        Ok(Err(ClientError::DaemonRestarted)) => StopClass::Restarted,
         Ok(Err(e)) => StopClass::Failed(e.to_string()),
         Err(_) => StopClass::TimedOut,
     }
@@ -3101,10 +3217,11 @@ async fn run_pane_io_task(
     pane_id: String,
     client: DaemonClient,
     initial_conn: AttachConnection,
-    agent_id: Arc<Mutex<String>>,
-    // PRD #882 — this pane's viewer token, refreshed on every re-attach so the
-    // resize worker always names the viewer the daemon currently has.
-    viewer: Arc<Mutex<Option<String>>>,
+    // What the pane is attached to, replaced on every re-attach so the resize
+    // worker always names the viewer the daemon currently has (PRD #882) and
+    // every request is bound to the daemon process that issued it (PRD #1666
+    // part 2, G-fix4).
+    attached: Arc<Mutex<PaneAttachment>>,
     mut input_rx: tokio::sync::mpsc::UnboundedReceiver<StreamCmd>,
     parser: Arc<Mutex<vt100::Parser>>,
     mouse_mode: Arc<AtomicBool>,
@@ -3322,6 +3439,12 @@ async fn run_pane_io_task(
             .ok()
             .map(|p| crate::vt_grid::size(p.screen()))
             .filter(|(rows, cols)| *rows > 0 && *cols > 0);
+        // PRD #1666 part 2 (G-fix4): the lookup is not bound to the process
+        // this pane's agent came from. It LEARNS the agent the daemon now has
+        // for the pane — after a respawn, or from a replacement daemon
+        // (`lifecycle/handshake/011`) — and the pane then records that agent
+        // with the process that issued it, so later actions follow what the
+        // pane shows. Inside the lookup, the attach is bound to the listing.
         match resolve_and_reattach(&client, &pane_id, viewport).await {
             Ok((new_agent_id, new_conn)) => {
                 tracing::debug!(
@@ -3329,13 +3452,6 @@ async fn run_pane_io_task(
                     new_agent_id = %new_agent_id,
                     "auto-reattach: subscribed to new agent for pane"
                 );
-                // PRD #882: the fresh attach minted a new viewer token (or
-                // none, against a daemon predating the policy). Publish it
-                // before the resize worker can fire again — a worker still
-                // holding the previous agent's token would fall through to the
-                // daemon's unattributed path and override every other client
-                // instead of updating this pane's constraint.
-                *viewer.lock().unwrap() = new_conn.viewer().map(|v| v.to_string());
                 // The attach answered with the geometry now in force for the new
                 // child. Adopt it, for the same reason the resize worker adopts
                 // the answer rather than its request: the replayed snapshot that
@@ -3344,16 +3460,23 @@ async fn run_pane_io_task(
                     set_parser_size_if_changed(&parser, rows, cols);
                 }
                 {
-                    let mut held = agent_id.lock().unwrap();
+                    let mut held = attached.lock().unwrap();
                     // PRD #611: the mouse flag describes a CHILD's requested
                     // reporting state, and this loop covers two situations the
                     // flag must be treated differently in. See
                     // `reattach_replaces_the_child`.
-                    if reattach_replaces_the_child(&held, &new_agent_id) {
+                    if reattach_replaces_the_child(&held.agent_id, &new_agent_id) {
                         mouse_mode.store(false, Ordering::Relaxed);
                         forget_replaced_childs_cursor_mode(&parser);
                     }
-                    *held = new_agent_id;
+                    // PRD #882: the fresh attach minted a new viewer token (or
+                    // none, against a daemon predating the policy). Published
+                    // with the id, before the resize worker can fire again — a
+                    // worker still holding the previous agent's token would fall
+                    // through to the daemon's unattributed path and override
+                    // every other client instead of updating this pane's
+                    // constraint.
+                    *held = PaneAttachment::of(new_agent_id, &new_conn);
                 }
                 conn_opt = Some(new_conn);
                 io_state.store(IO_ATTACHED, Ordering::SeqCst);
@@ -3623,8 +3746,13 @@ async fn resolve_and_reattach(
             continue;
         }
         protocol_mismatch = None;
-        match client.list_agents().await {
-            Ok(records) => {
+        match client.list_agents_detailed().await {
+            Ok(listing) => {
+                let AgentListing {
+                    records,
+                    incarnation,
+                    ..
+                } = listing;
                 // The daemon answered, so it is reachable AS OF NOW. Anything it
                 // failed to answer earlier is history and must not outrank the
                 // current state when the reason is chosen — the error string goes
@@ -3644,7 +3772,14 @@ async fn resolve_and_reattach(
                         trailing_attach_errors = 0;
                         last_attach_error = None;
                     }
-                    Some(new_id) => match client.attach_as_viewer(&new_id, viewport).await {
+                    // PRD #1666 part 2 (G-fix4): attached on the daemon process
+                    // that listed the id. One that restarted in between is
+                    // sent nothing (`DaemonRestarted`, counted as a failed
+                    // attach below), and the next round lists it afresh.
+                    Some(new_id) => match bound_to_known(client, incarnation.as_ref())
+                        .attach_as_viewer(&new_id, viewport)
+                        .await
+                    {
                         Ok(conn) => return Ok((new_id, conn)),
                         Err(crate::daemon_client::ClientError::ProtocolMismatch {
                             daemon,
@@ -3713,8 +3848,7 @@ async fn resize_worker(
     // PRD #1105 M11: the controller's own handle, so a resize connection is
     // made under the same client identity as the attach it resizes.
     client: DaemonClient,
-    agent_id: Arc<Mutex<String>>,
-    viewer: Arc<Mutex<Option<String>>>,
+    attached: Arc<Mutex<PaneAttachment>>,
     parser: Arc<Mutex<vt100::Parser>>,
 ) {
     // Mark the initial `None` value as seen so the first `changed()` call
@@ -3729,15 +3863,19 @@ async fn resize_worker(
         // resize ops when the io_task auto-renews the per-pane subscription
         // to a freshly-respawned agent; the next resize naturally targets
         // the new agent.
-        let id = agent_id.lock().unwrap().clone();
-        // PRD #882: name which VIEWER is asking, so the request updates this
-        // pane's constraint instead of overriding every other client's. Cloned
-        // under a brief lock, never held across the await below.
-        let token = viewer.lock().unwrap().clone();
+        //
+        // PRD #882: and name which VIEWER is asking, so the request updates
+        // this pane's constraint instead of overriding every other client's.
+        // PRD #1666 part 2 (G-fix4): bound to the process that issued both, so
+        // a restarted daemon that numbered another client's viewer the same is
+        // sent nothing. One read, so the three always belong together.
+        let held = attached.lock().unwrap().clone();
+        let (id, token) = (held.agent_id.clone(), held.viewer.clone());
+        let bound = held.client(&client);
 
         match tokio::time::timeout(
             RESIZE_DAEMON_TIMEOUT,
-            client.resize_agent_as_viewer(&id, rows, cols, token.as_deref()),
+            bound.resize_agent_as_viewer(&id, rows, cols, token.as_deref()),
         )
         .await
         {
@@ -4116,10 +4254,8 @@ impl PaneController for EmbeddedPaneController {
     /// #92 F12 rotates it on F9 clear=true respawns; we clone the latest
     /// value while the lock is held and never await across it.
     fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
-        let panes = self.panes.lock().unwrap();
-        panes
-            .get(pane_id)
-            .map(|p| p.backend.agent_id.lock().unwrap().clone())
+        self.pane_attachment(pane_id)
+            .map(|attachment| attachment.agent_id)
     }
 
     fn forget_pane(&self, pane_id: &str) -> bool {
@@ -4207,14 +4343,20 @@ impl PaneController for EmbeddedPaneController {
         // task. If we aborted first, the daemon would treat the
         // dropped attach connection as a detach and the agent would
         // survive.
-        let client = DaemonClient::new(s.daemon_path.clone());
         // Snapshot the latest agent id under the shared mutex; PRD #92 F12
         // can swap this to the respawned id while the pane is alive, and
         // Ctrl+W must target the currently-bound agent, not the one we
         // first attached to. Keep the Arc around so the retry below can
         // re-read the id after a mid-reattach swap.
-        let shared_agent_id = Arc::clone(&s.agent_id);
-        let initial_agent_id = shared_agent_id.lock().unwrap().clone();
+        //
+        // PRD #1666 part 2 (G-fix4): every request below is bound to the
+        // daemon process the pane is attached to. A respawn stays inside it;
+        // a restart does not, and its successor's agent with the same id or
+        // pane slot is not this pane's.
+        let shared_attached = Arc::clone(&s.attached);
+        let attachment = shared_attached.lock().unwrap().clone();
+        let client = attachment.client(&DaemonClient::new(s.daemon_path.clone()));
+        let initial_agent_id = attachment.agent_id;
         // PRD #241 F3b: the pane slot's identity (`pane_id` IS the
         // `DOT_AGENT_DECK_PANE_ID` the daemon records as `pane_id_env`) plus the
         // I/O task's liveness, so the not-found path below can ask the daemon
@@ -4264,7 +4406,7 @@ impl PaneController for EmbeddedPaneController {
             // Unconditional even when the id is unchanged: for a ghost card
             // this second identical answer is what proves the id is dead
             // rather than merely stale.
-            let retry_id = shared_agent_id.lock().unwrap().clone();
+            let retry_id = shared_attached.lock().unwrap().agent_id.clone();
             tracing::debug!(
                 first_agent_id = %initial_agent_id,
                 retry_agent_id = %retry_id,
@@ -4477,16 +4619,16 @@ impl PaneController for EmbeddedPaneController {
         // than restoring a stale pre-clear name (PRD #76 M2.11 reviewer
         // P1 clear-rename case).
         let local_name = new_label.clone().unwrap_or_default();
-        let (agent_id, cwd) = {
+        let (attachment, cwd) = {
             let mut panes = self.panes.lock().unwrap();
             let pane = panes
                 .get_mut(pane_id)
                 .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
             pane.name = local_name;
-            // Snapshot the currently-bound agent id (PRD #92 F12 can
-            // swap this to a respawned id over the life of the pane).
+            // Snapshot the currently-bound agent (PRD #92 F12 can swap this
+            // to a respawned id over the life of the pane).
             (
-                pane.backend.agent_id.lock().unwrap().clone(),
+                pane.backend.attached.lock().unwrap().clone(),
                 pane.cwd.clone(),
             )
         };
@@ -4498,7 +4640,12 @@ impl PaneController for EmbeddedPaneController {
         // non-blocking rename). The local pane name has already been
         // updated above, which is the user-visible effect; a transient
         // daemon failure resyncs on the next reconnect.
-        let client = self.client.clone();
+        //
+        // PRD #1666 part 2 (G-fix4): bound to the daemon process the pane is
+        // attached to, so a restarted daemon's agent with the same id is not
+        // given this label and this pane's cwd.
+        let client = attachment.client(&self.client);
+        let agent_id = attachment.agent_id;
         let agent_id_for_log = agent_id.clone();
         let daemon_label = new_label.clone();
         self.runtime.spawn(async move {
@@ -4559,8 +4706,14 @@ impl PaneController for EmbeddedPaneController {
         body: &str,
         origin: crate::inbox_hub::PostOrigin,
     ) -> Result<String, PaneError> {
-        let agent_id = self.pane_agent_id(pane_id);
-        let client = self.client.clone();
+        // PRD #1666 part 2 (G-fix4): addressed to the pane's agent on the
+        // daemon process that agent runs under, and to nobody on a successor.
+        let attachment = self.pane_attachment(pane_id);
+        let client = bound_to_known(
+            &self.client,
+            attachment.as_ref().and_then(|a| a.incarnation.as_ref()),
+        );
+        let agent_id = attachment.map(|a| a.agent_id);
         let reply = self.runtime.block_on(async move {
             tokio::time::timeout(
                 POST_MESSAGE_TIMEOUT,
@@ -4582,7 +4735,13 @@ impl PaneController for EmbeddedPaneController {
     }
 
     fn report_orchestrator_context(&self, pane_id: &str, context_path: &std::path::Path) {
-        let client = self.client.clone();
+        // PRD #1666 part 2 (G-fix4): recorded for the pane's agent on the
+        // daemon process it runs under. A pane this TUI has not attached has
+        // no process to bind to, and is reported as before.
+        let incarnation = self
+            .pane_attachment(pane_id)
+            .and_then(|attachment| attachment.incarnation);
+        let client = bound_to_known(&self.client, incarnation.as_ref());
         let pane_id = pane_id.to_string();
         let context_path = context_path.to_path_buf();
         self.runtime.spawn(async move {
@@ -6484,6 +6643,161 @@ mod protocol_gate_tests {
                 "control: {op} must reach a matching daemon: {reached:?}"
             );
         }
+        drop(controller);
+        drop(runtime);
+    }
+}
+
+/// PRD #1666 part 2 (G-fix4): the TUI's pane controller acts on a pane's agent
+/// only on the daemon process it attached to, against the scripted same-build
+/// restarts of [`crate::daemon_client::restart_fixture`].
+#[cfg(all(test, unix))]
+mod incarnation_binding_tests {
+    use super::*;
+    use crate::daemon_client::restart_fixture::RestartingDaemon;
+    use crate::pane::PaneController;
+    use spec::spec;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build the test runtime")
+    }
+
+    /// Wait (bounded) until `done` holds; the controller sends its renames
+    /// and resizes from spawned tasks.
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    const ACTIONS: [&str; 4] = ["set-agent-label", "post-message", "resize", "stop-agent"];
+
+    /// Rename, message, resize and close the pane, in that order.
+    fn act_on(controller: &EmbeddedPaneController, pane: &str) -> Result<(), PaneError> {
+        let _ = controller.rename_pane(pane, "renamed");
+        let _ = controller.post_message(
+            pane,
+            "subject",
+            "body",
+            crate::inbox_hub::PostOrigin::OrchestratorRemit,
+        );
+        controller.resize_pane_pty(pane, 30, 100)?;
+        controller.close_pane(pane)
+    }
+
+    /// Scenario: the TUI opens a pane on a daemon, the daemon restarts as the
+    /// same build and numbers an unrelated agent `1` and viewer `v1` again, and
+    /// the user then renames the pane, messages its agent, resizes it and
+    /// closes it with Ctrl+W. The restarted daemon is sent none of those; the
+    /// close still removes the pane and says "that agent is gone (the deck
+    /// restarted)". Without the restart, each one reaches the daemon (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_pane_acts_only_on_the_daemon_process_it_attached_to() {
+        let runtime = runtime();
+        let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+        let controller = EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+            .with_protocol_gate();
+        let pane = controller
+            .create_pane(Some("cat"), None)
+            .expect("a pane on the first process");
+        daemon.restart_as("b");
+
+        let closed = act_on(&controller, &pane);
+        wait_for("every action to ask the restarted daemon", || {
+            daemon.hellos("b") >= ACTIONS.len()
+        });
+        assert!(closed.is_ok(), "the close completes: {closed:?}");
+        assert!(
+            !controller.pane_ids().contains(&pane),
+            "the closed pane is gone"
+        );
+        assert_eq!(
+            controller.take_close_warnings(),
+            vec![crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string()],
+            "the close says why nothing was stopped"
+        );
+        assert_eq!(
+            daemon.received_by("b"),
+            Vec::<String>::new(),
+            "the restarted daemon was sent an action aimed at the pane's agent"
+        );
+
+        let control = runtime.block_on(async { RestartingDaemon::spawn("a") });
+        let controller =
+            EmbeddedPaneController::new(control.path.clone(), runtime.handle().clone())
+                .with_protocol_gate();
+        let pane = controller
+            .create_pane(Some("cat"), None)
+            .expect("a pane on the control daemon");
+        act_on(&controller, &pane).expect("control: the close stops the agent");
+        wait_for("control: every action to reach the daemon", || {
+            let reached = control.received_by("a");
+            ACTIONS.iter().all(|op| reached.iter().any(|r| r == op))
+        });
+        drop(controller);
+        drop(runtime);
+    }
+
+    /// Scenario: a pane's stream ended and auto-reattach looks its agent up
+    /// on a daemon that restarts as the same build right after answering the
+    /// lookup. The restarted daemon is never attached under the id the old one
+    /// listed: it is sent an attach only after a listing of its own, and the
+    /// pane ends up attached on the restarted daemon's process.
+    #[spec("lifecycle/handshake/013")]
+    #[tokio::test]
+    async fn handshake_013_reattach_attaches_only_on_the_process_that_listed() {
+        let daemon = RestartingDaemon::spawn("a");
+        daemon.restart_after("list-agents", "b");
+        let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+        let Ok(Ok((_, conn))) = tokio::time::timeout(
+            Duration::from_secs(5),
+            resolve_and_reattach(&client, "pane-1", None),
+        )
+        .await
+        else {
+            panic!("the restarted daemon's agent is attached once it has listed it");
+        };
+        assert_eq!(daemon.received_by("a"), vec!["list-agents".to_string()]);
+        assert_eq!(
+            daemon.received_by("b"),
+            vec!["list-agents".to_string(), "attach-stream".to_string()],
+            "the restarted daemon was attached under an id it never listed"
+        );
+        assert_eq!(
+            conn.incarnation().and_then(Incarnation::as_deref),
+            Some("b"),
+            "the pane records the process it attached on"
+        );
+    }
+
+    /// Scenario: the TUI hydrates its panes from the daemon, and the daemon
+    /// restarts as the same build right after answering the listing. The
+    /// restarted daemon is attached under none of the listed ids; with no
+    /// restart, the listed agent is hydrated (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_hydration_attaches_only_on_the_daemon_process_that_listed() {
+        let runtime = runtime();
+        let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+        daemon.restart_after("list-agents", "b");
+        let controller = EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+            .with_protocol_gate();
+        assert!(controller.hydrate_from_daemon().is_empty());
+        assert!(daemon.hellos("b") > 0, "precondition: the attach asked b");
+        assert_eq!(daemon.received_by("b"), Vec::<String>::new());
+
+        let control = runtime.block_on(async { RestartingDaemon::spawn("a") });
+        let controller =
+            EmbeddedPaneController::new(control.path.clone(), runtime.handle().clone())
+                .with_protocol_gate();
+        assert_eq!(controller.hydrate_from_daemon().len(), 1, "control");
         drop(controller);
         drop(runtime);
     }

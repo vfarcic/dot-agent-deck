@@ -89,6 +89,12 @@ fn capable(mut reply: AttachResponse) -> AttachResponse {
     reply
 }
 
+/// The daemon process the rows these fixtures list were learned from: the
+/// fixtures' `Hello` names none, so an action on one of their agents is bound
+/// to a daemon that names none (PRD #1666 part 2, G-fix4).
+const UNNAMED: dot_agent_deck::daemon_client::Incarnation =
+    dot_agent_deck::daemon_client::Incarnation::UNNAMED;
+
 fn matching_hello() -> AttachResponse {
     let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
         .with_running_agents(RunningAgentsSummary::default());
@@ -394,7 +400,8 @@ async fn an_inbox_retry_or_cancel_after_a_swap_sends_the_replacement_nothing() {
             let state = crate::terminal::DesktopState::default();
             let wire = crate::dto::deck_wire_id(&deck.endpoint());
             let acted =
-                crate::inbox_action_on(&state, &wire, REUSED_ID, PANE, "m-1", 1, verb).await;
+                crate::inbox_action_on(&state, &wire, REUSED_ID, PANE, "m-1", 1, verb, &UNNAMED)
+                    .await;
             let outcome = deck.finish();
             assert_admitted(name, verb, &outcome, served, acted.is_ok(), &[op]);
         }
@@ -485,9 +492,9 @@ async fn a_stop_after_a_swap_cannot_hit_the_replacements_reused_id() {
         crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
         let state = crate::terminal::DesktopState::default();
         let wire = crate::dto::deck_wire_id(&deck.endpoint());
-        let stopped = crate::stop_agent_action(&state, &wire, REUSED_ID).await;
+        let stopped = crate::stop_agent_action(&state, &wire, REUSED_ID, &UNNAMED).await;
         if served {
-            crate::stop_agent_action(&state, &wire, REUSED_ID)
+            crate::stop_agent_action(&state, &wire, REUSED_ID, &UNNAMED)
                 .await
                 .expect("a repeated card stop against the same build");
         }
@@ -538,7 +545,8 @@ async fn a_rename_after_its_listing_cannot_relabel_the_replacements_reused_id() 
         let _local_deck = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
         crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
         let state = crate::terminal::DesktopState::default();
-        let renamed = crate::rename_agent_action(&state.daemon, REUSED_ID, "renamed".into()).await;
+        let renamed =
+            crate::rename_agent_action(&state.daemon, REUSED_ID, "renamed".into(), &UNNAMED).await;
         let outcome = deck.finish();
         assert_admitted(
             name,
@@ -735,9 +743,10 @@ async fn connect_anyway_admits_acting_requests_a_break_behind_but_not_another_pr
         )
         .await
         .is_ok();
-        let retried = crate::inbox_action_on(&state, &wire, REUSED_ID, PANE, "m-1", 1, "retry")
-            .await
-            .is_ok();
+        let retried =
+            crate::inbox_action_on(&state, &wire, REUSED_ID, PANE, "m-1", 1, "retry", &UNNAMED)
+                .await
+                .is_ok();
         let answered = matches!(
             daemon
                 .client
@@ -745,7 +754,7 @@ async fn connect_anyway_admits_acting_requests_a_break_behind_but_not_another_pr
                 .await,
             Ok(AnswerReport::Answered)
         );
-        let stopped = crate::stop_agent_action(&state, &wire, REUSED_ID)
+        let stopped = crate::stop_agent_action(&state, &wire, REUSED_ID, &UNNAMED)
             .await
             .is_ok();
         let outcome = deck.finish();

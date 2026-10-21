@@ -8,7 +8,7 @@ use dot_agent_deck::agent_pty::{
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
 use dot_agent_deck::authoring_seeds::AuthoringKind;
-use dot_agent_deck::daemon_client::Endpoint;
+use dot_agent_deck::daemon_client::{Endpoint, Incarnation};
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{
     AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, Writable,
@@ -786,6 +786,17 @@ pub struct DesktopAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<dot_agent_deck::pull_request_info::PullRequestInfo>,
     pub tab: DesktopTab,
+    /// PRD #1666 part 2 (G-fix4): the daemon process this row was listed by,
+    /// which the webview sends back with every action on the agent
+    /// (`StopAgent`, `StopOrchestration`, `RenameAgent`, an inbox action, a
+    /// voice answer). The action is then sent only to that process: after a
+    /// restart, a successor that numbered an unrelated agent with this id is
+    /// sent nothing, and the action fails with
+    /// [`dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART`]. Absent
+    /// from a daemon that names no process; an action sent without one is
+    /// bound to such a daemon, which no current daemon is.
+    #[serde(skip_serializing_if = "Incarnation::is_unnamed")]
+    pub incarnation: Incarnation,
 }
 
 /// PRD #1666 §2.8: the webview's view of an `InboxSummary`.
@@ -1263,6 +1274,10 @@ pub enum DesktopAction {
         /// decode rather than defaulted.
         deck_id: String,
         agent_id: String,
+        /// PRD #1666 part 2 (G-fix4): the row's
+        /// [`DesktopAgent::incarnation`], which the stop is bound to.
+        #[serde(default)]
+        incarnation: Incarnation,
     },
     /// PRD #1223 U4 — close a whole orchestration: stop every role the
     /// webview's fleet entry lists for it, on the deck `deck_id` names,
@@ -1296,6 +1311,11 @@ pub enum DesktopAction {
         agent_id: String,
         #[serde(alias = "name")]
         display_name: String,
+        /// PRD #1666 part 2 (G-fix4): the row's
+        /// [`DesktopAgent::incarnation`]. Both the listing that reads the
+        /// agent's cwd and the relabel are bound to it.
+        #[serde(default)]
+        incarnation: Incarnation,
     },
     AttachTerminal {
         agent_id: String,
@@ -1315,6 +1335,10 @@ pub enum DesktopAction {
 pub struct StopOrchestrationRole {
     pub agent_id: String,
     pub name: String,
+    /// PRD #1666 part 2 (G-fix4): the row's [`DesktopAgent::incarnation`],
+    /// which this role's stop is bound to.
+    #[serde(default)]
+    pub incarnation: Incarnation,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2306,6 +2330,9 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         pending_question,
         pull_request,
         tab,
+        // Stamped by the snapshot that lists this record, which knows which
+        // daemon process answered (`daemon_bridge::connected_snapshot`).
+        incarnation: Incarnation::default(),
     }
 }
 

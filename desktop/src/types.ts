@@ -1011,6 +1011,13 @@ export interface AgentSession {
   inOrchestration?: boolean;
   /** HONEST. True for the orchestration's start role — the coordinator an operator should message. */
   isStartRole?: boolean;
+  /**
+   * HONEST. The daemon process that listed this agent (PRD #1666 part 2). A
+   * restarted deck numbers its agents from 1 again, so an action on this agent
+   * carries this value, captured when the action was offered, and the desktop
+   * sends the action only to that process. Absent from a deck that names none.
+   */
+  incarnation?: string;
 }
 
 export interface EvidenceItem {
@@ -1262,7 +1269,7 @@ export type DeckAction =
    * resolves as it resolves a start's: never from the selection, so an agent on
    * another deck can be stopped from the overview under All Decks.
    */
-  | { type: "stop_agent"; deckId: string; agentId: string }
+  | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string }
   /**
    * PRD #1223 U4 — close a whole orchestration: stop every one of `roles` on the
    * deck `deckId` names, concurrently. There is no orchestration-wide daemon
@@ -1271,8 +1278,8 @@ export type DeckAction =
    * rejection, which arrives as a `LaunchCleanupError`; `name` is what it is
    * named as.
    */
-  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string }[] }
-  | { type: "rename_agent"; agentId: string; displayName: string };
+  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[] }
+  | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string };
 
 /**
  * Whether an agent's pane takes input. The terminal reads `history-only` and
@@ -1432,6 +1439,11 @@ export interface TerminalFeed {
 export interface AgentTarget {
   deckId: string;
   agentId: string;
+  /**
+   * PRD #1666 part 2: the daemon process the agent was listed by, for an
+   * action that must not reach a restarted deck's agent with the same id.
+   */
+  incarnation?: string;
 }
 
 /**

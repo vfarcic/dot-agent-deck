@@ -405,6 +405,13 @@ export interface DesktopAgentDto {
    * ever diverges from the model, this is where the mapping function goes.
    */
   tab: AgentTab;
+  /**
+   * PRD #1666 part 2: the daemon process that listed this agent. Agent ids
+   * restart at 1 when a deck restarts, so every action on the agent sends this
+   * back, and the desktop sends the action only to that process. Absent from a
+   * deck that names no process.
+   */
+  incarnation?: string;
 }
 
 /**
@@ -1737,9 +1744,9 @@ export type DesktopRunActionDto =
   | { type: "bootstrap"; startIfMissing?: boolean }
   | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number; authoringKind?: "schedule" | "schedule-issues" | "dispatcher" }
   | { type: "start_orchestration"; deckId: string; path: string; orchestration: string; displayTitle?: string; configRevision?: string; rows?: number; cols?: number }
-  | { type: "stop_agent"; deckId: string; agentId: string }
-  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string }[] }
-  | { type: "rename_agent"; agentId: string; displayName: string }
+  | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string }
+  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[] }
+  | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
   | { type: "detach_terminal"; sessionId: string }
   | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
@@ -2526,6 +2533,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     lastActivityMs: agent.lastActivityMs,
     spawnedAtMs: agent.spawnedAtMs,
     authoringKind: agent.authoringKind,
+    ...(agent.incarnation ? { incarnation: agent.incarnation } : {}),
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
     ...(agent.inbox ? { inbox: inboxFromDto(agent.inbox) } : {}),
     ...(agent.status === "error" && agent.deliveryNotice
@@ -5074,7 +5082,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string): Promise<AnswerOutcomeDto> {
     const invoke = await this.getInvoke();
-    return invoke<AnswerOutcomeDto>("desktop_voice_answer_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, form, confirmedAlways, lease, revision: target.revision ?? null });
+    return invoke<AnswerOutcomeDto>("desktop_voice_answer_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, form, confirmedAlways, lease, revision: target.revision ?? null, incarnation: target.incarnation ?? null });
   }
 
   async cancelVoiceAnswer(lease: string): Promise<void> {
@@ -5320,6 +5328,7 @@ export class TauriDeckBridge implements DeckBridge {
       messageId: item.messageId,
       revision: item.revision,
       verb,
+      incarnation: target.incarnation ?? null,
     });
   }
 

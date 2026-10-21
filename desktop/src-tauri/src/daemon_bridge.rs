@@ -20,9 +20,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent_view::AgentView;
 use crate::dto::{
-    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, HostMetricsReportDto,
-    deck_path_text, deck_wire_id, disconnected_snapshot_because, map_agent, observed_fleet,
-    observed_fleet_decks, safe_message, selection_fields, unconfigured_fleet,
+    BootstrapOptions, ConnectionStatus, DesktopAgent, DesktopConnection, DesktopSnapshot,
+    HostMetricsReportDto, deck_path_text, deck_wire_id, disconnected_snapshot_because, map_agent,
+    observed_fleet, observed_fleet_decks, safe_message, selection_fields, unconfigured_fleet,
 };
 use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
@@ -1770,7 +1770,13 @@ pub(crate) async fn snapshot_with(
         if view.needs_fetch(tokio::time::Instant::now()).is_none() {
             let records = view.records();
             let host = held_host_metrics(view);
-            return connected_snapshot(connection, records, view.schedule_revision(), host);
+            return connected_snapshot(
+                connection,
+                records,
+                view.schedule_revision(),
+                host,
+                view.incarnation().cloned(),
+            );
         }
         // PRD #1258 M4: the host sample rides the same refreshes the list does —
         // the first one, every reconcile tick and every refetch — and is asked
@@ -1789,7 +1795,13 @@ pub(crate) async fn snapshot_with(
                 view.install(listing, now);
                 view.install_host_metrics(host, now);
                 let host = held_host_metrics(view);
-                connected_snapshot(connection, view.records(), view.schedule_revision(), host)
+                connected_snapshot(
+                    connection,
+                    view.records(),
+                    view.schedule_revision(),
+                    host,
+                    view.incarnation().cloned(),
+                )
             }
             Err(error) => {
                 // The fetch failed, so the view's demand stands: it was never
@@ -1814,6 +1826,7 @@ pub(crate) async fn snapshot_with(
             listing.records,
             listing.schedule_revision,
             host.map(|report| HostMetricsReportDto::from_report(&report, Duration::ZERO)),
+            listing.incarnation,
         ),
         Err(error) => {
             // The held link just failed to carry a request. Whatever is at the
@@ -1888,18 +1901,33 @@ fn held_host_metrics(view: &AgentView) -> Option<HostMetricsReportDto> {
     })
 }
 
+///
+/// PRD #1666 part 2 (G-fix4): every row is stamped with `incarnation`, the
+/// daemon process whose reply `records` is, so an action the webview sends
+/// back for one of them is bound to that process. `None` — a listing over an
+/// unbound, ungated handle, which the held client never is — stamps a daemon
+/// that named no process, and an action bound to that is refused by every
+/// daemon that names one.
 fn connected_snapshot(
     connection: DesktopConnection,
     records: Vec<dot_agent_deck::daemon_client::AgentRecord>,
     schedule_revision: Option<u64>,
     host_metrics: Option<HostMetricsReportDto>,
+    incarnation: Option<dot_agent_deck::daemon_client::Incarnation>,
 ) -> DesktopSnapshot {
+    let incarnation = incarnation.unwrap_or_default();
     DesktopSnapshot {
         connection: DesktopConnection {
             running_agent_count: Some(records.len()),
             ..connection
         },
-        agents: records.into_iter().map(map_agent).collect(),
+        agents: records
+            .into_iter()
+            .map(|record| DesktopAgent {
+                incarnation: incarnation.clone(),
+                ..map_agent(record)
+            })
+            .collect(),
         // Issue #887: carried beside the records it arrived with — including on
         // the cached path, where the view replays the revision from the reply
         // that installed those records. A fresh revision beside a cached list
@@ -5290,6 +5318,16 @@ mod tests {
             }
         }
 
+        /// The daemon process this deck's `Hello` names (PRD #1666 part 2,
+        /// G-fix4) — what a snapshot of it stamps on its rows, and so what an
+        /// action on one of its agents is bound to. Every `RealDeck` serves
+        /// from this test process, so they all name the same one.
+        fn incarnation(&self) -> dot_agent_deck::daemon_client::Incarnation {
+            dot_agent_deck::daemon_client::Incarnation::from(
+                dot_agent_deck::daemon_protocol::daemon_instance_id().map(str::to_string),
+            )
+        }
+
         /// A real PTY child under this daemon's registry, and the **registry's**
         /// own id for it.
         ///
@@ -6277,10 +6315,13 @@ mod tests {
             .await;
         let remote_wire = deck_wire_id(&remote_endpoint);
 
+        let incarnation = remote.incarnation();
         let unknown =
-            crate::stop_agent_action(&state, "deck-ffffffffffffffff", &remote_agent).await;
+            crate::stop_agent_action(&state, "deck-ffffffffffffffff", &remote_agent, &incarnation)
+                .await;
         let after_unknown = (live_ids(&local), live_ids(&remote));
-        let stopped = crate::stop_agent_action(&state, &remote_wire, &remote_agent).await;
+        let stopped =
+            crate::stop_agent_action(&state, &remote_wire, &remote_agent, &incarnation).await;
         let on_local = live_ids(&local);
         let on_remote = live_ids(&remote);
         local.shutdown();
@@ -6341,10 +6382,12 @@ mod tests {
             crate::dto::StopOrchestrationRole {
                 agent_id: planner.clone(),
                 name: "planner".into(),
+                incarnation: remote.incarnation(),
             },
             crate::dto::StopOrchestrationRole {
                 agent_id: builder.clone(),
                 name: "builder".into(),
+                incarnation: remote.incarnation(),
             },
         ];
 

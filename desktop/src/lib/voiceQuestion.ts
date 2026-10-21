@@ -104,7 +104,7 @@ export function questionAgentName(agent: Pick<AgentSession, "displayName" | "tab
 }
 
 /** Which question an utterance or a send is about: the agent by its composite identity, the name its pane shows, and the question id — and revision, audit A4 — it saw. */
-export type VoiceQuestionTarget = { deckId: string; agentId: string; agent: string; questionId: string; revision?: number };
+export type VoiceQuestionTarget = { deckId: string; agentId: string; agent: string; questionId: string; revision?: number; incarnation?: string };
 
 /**
  * PR #1698 — the options of `question` voice can pick, with the numbers the

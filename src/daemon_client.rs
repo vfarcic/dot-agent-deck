@@ -75,6 +75,67 @@ pub enum ClientError {
     /// connect across. The text is that admission's own sentence.
     #[error("{0}")]
     NotAdmitted(String),
+    /// PRD #1666 part 2 (G-fix4): a request from a handle bound to a daemon
+    /// incarnation ([`DaemonClient::bound_to`]) reached a daemon process other
+    /// than the one the handle was bound to, so nothing was sent. A restart
+    /// stops every agent and the new daemon numbers its agents and viewers
+    /// from 1 again, so the id the request names may now be an unrelated
+    /// agent's. Both clients show [`AGENT_GONE_AFTER_RESTART`].
+    #[error("{AGENT_GONE_AFTER_RESTART}")]
+    DaemonRestarted,
+}
+
+/// PRD #1666 part 2 (G-fix4): what both clients say when an action aimed at an
+/// agent is refused because the deck restarted since the agent was listed
+/// ([`ClientError::DaemonRestarted`]). One sentence, so the TUI and the
+/// desktop say the same thing (CLAUDE.md rule 22).
+pub const AGENT_GONE_AFTER_RESTART: &str = "that agent is gone (the deck restarted)";
+
+/// PRD #1666 part 2 (G-fix4): which daemon process an agent id or viewer token
+/// was learned from — the [`AttachResponse::instance_id`] of the `Hello` on the
+/// connection that carried the listing, start or attach that named it.
+///
+/// Agent ids and viewer tokens are per-process counters, so a daemon that
+/// replaced the one a client listed — the same build included, which passes
+/// every compatibility check — hands the same ids to unrelated agents. A client
+/// records this beside every id it holds and binds each action aimed at that
+/// id to it ([`DaemonClient::bound_to`]), so the action reaches the process
+/// that issued the id or nothing.
+///
+/// `None` inside is a daemon that named no process: one that could not read OS
+/// randomness, or a test fixture. Two of those compare equal, so a client
+/// cannot tell such a daemon from its same-build replacement; every daemon on
+/// this protocol names itself otherwise. Serialized as the string or `null`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Incarnation(Option<String>);
+
+impl Incarnation {
+    /// A daemon that named no process.
+    pub const UNNAMED: Self = Self(None);
+
+    /// The incarnation a `Hello` reply names.
+    pub fn of_hello(resp: &AttachResponse) -> Self {
+        Self(resp.instance_id.clone())
+    }
+
+    /// The process identity, or `None` for a daemon that named none.
+    pub fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// Whether this is a daemon that named no process — for a
+    /// `skip_serializing_if` that keeps the key off a payload rather than
+    /// writing `null`.
+    pub fn is_unnamed(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl From<Option<String>> for Incarnation {
+    fn from(id: Option<String>) -> Self {
+        Self(id)
+    }
 }
 
 /// PRD #1589: why [`DaemonClient::close_agents`] could not get a report.
@@ -947,6 +1008,11 @@ pub struct AgentListing {
     /// client may read it — and, in particular, that it is comparable only
     /// against earlier values from the same connection.
     pub schedule_revision: Option<u64>,
+    /// PRD #1666 part 2 (G-fix4): the daemon process that answered, from the
+    /// `Hello` on the listing's own connection — what a client binds an action
+    /// on one of these records to ([`DaemonClient::bound_to`]). `None` from an
+    /// ungated, unbound handle, which sends no `Hello` and so learns none.
+    pub incarnation: Option<Incarnation>,
 }
 
 /// Sanitize a single `AgentRecord` echoed by the daemon before it reaches the
@@ -1429,28 +1495,39 @@ pub struct DaemonClient {
     /// [`Self::inbox_action`], [`Self::answer_question_while`],
     /// [`Self::stop_agent`], [`Self::set_agent_label`],
     /// [`Self::seed_last_command`] and [`Self::record_orchestrator_context`].
-    /// Stop and rename are gated rather than bound to a daemon identity: an
-    /// agent id is a per-daemon counter, so a replacement reuses it, and a
-    /// refused replacement now receives neither request at all.
+    /// The gate answers "is this daemon compatible?", not "is this the daemon
+    /// the agent id came from?": an agent id is a per-daemon counter, so a
+    /// compatible replacement reuses it. A caller acting on an id it learned
+    /// earlier also binds the request to that daemon's process
+    /// ([`Self::bound_to`]).
     ///
     /// **Not gated, each with its reason at the call:** what reads `Hello`
     /// itself, which is the gate's own input ([`Self::capabilities`],
     /// [`Self::hook_binary_notices`], [`Self::probe_running`]); read-only
-    /// discovery whose results only lead to a gated start
-    /// ([`Self::list_projects`], [`Self::resolve_project`],
-    /// [`Self::list_directories`], [`Self::new_agent_options`],
-    /// [`Self::host_metrics`]); two best-effort session controls that change
-    /// state but name only this client's own focus or viewer
-    /// ([`Self::focus_gained_while`], [`Self::resize_agent_as_viewer`]); and the
-    /// verbs that exist to reach a daemon of another build, sent by the CLI or
-    /// the TUI's daemon Stop only ([`Self::reload_schedules`],
+    /// discovery and observation ([`Self::list_projects`],
+    /// [`Self::resolve_project`], [`Self::list_directories`],
+    /// [`Self::new_agent_options`], [`Self::host_metrics`]), whose results a
+    /// start uses only through a gated start; two best-effort geometry controls
+    /// ([`Self::focus_gained_while`], [`Self::resize_agent_as_viewer`]), the
+    /// second of which a client binds to the daemon that issued its viewer
+    /// token; and the recovery and upgrade verbs, deliberately left able to
+    /// reach a daemon of another build ([`Self::reload_schedules`],
     /// [`Self::run_now`], [`Self::close_agents`], [`Self::send_shutdown`],
-    /// [`Self::stop_daemon`], [`Self::restart_daemon`]).
+    /// [`Self::stop_daemon`], [`Self::restart_daemon`]). Their senders include
+    /// the desktop as well as the CLI and the TUI: its **Replace daemon**
+    /// reaches [`Self::restart_daemon`] through the upgrade procedure, and its
+    /// local Stop reaches [`Self::send_shutdown`] on Windows.
     protocol_gate: bool,
     /// PRD #1666 part 2: what a gated `Hello` must also satisfy, beyond this
     /// binary's protocol — set by [`Self::with_protocol_gate_admitting`].
     /// `None` is the TUI's policy, protocol equality alone (issue #405).
     admission: Option<HelloAdmission>,
+    /// PRD #1666 part 2 (G-fix4): set by [`Self::bound_to`]. When `Some`, every
+    /// request [`Self::with_protocol_gate`] covers also requires its own
+    /// connection's `Hello` to name this daemon process, and sends nothing
+    /// otherwise ([`ClientError::DaemonRestarted`]) — even on a handle that is
+    /// not otherwise gated.
+    bound: Option<Incarnation>,
 }
 
 /// A client's own verdict on a `Hello` reply that already names this binary's
@@ -1475,6 +1552,7 @@ impl DaemonClient {
             client_id: None,
             protocol_gate: false,
             admission: None,
+            bound: None,
         }
     }
 
@@ -1495,6 +1573,7 @@ impl DaemonClient {
             client_id: None,
             protocol_gate: false,
             admission: None,
+            bound: None,
         })
     }
 
@@ -1527,6 +1606,7 @@ impl DaemonClient {
             client_id: None,
             protocol_gate: false,
             admission: None,
+            bound: None,
         }
     }
 
@@ -1578,6 +1658,43 @@ impl DaemonClient {
         self.protocol_gate = true;
         self.admission = Some(admission);
         self
+    }
+
+    /// PRD #1666 part 2 (G-fix4): a clone of this handle whose requests reach
+    /// only the daemon process `incarnation` names.
+    ///
+    /// For an action aimed at an agent id or viewer token learned earlier: pass
+    /// the [`Incarnation`] recorded with the id. Each request the gate covers
+    /// then checks it on the `Hello` of the connection that carries it, so a
+    /// daemon that replaced that process since — whatever its build, the same
+    /// one included — is sent nothing, and the call fails with
+    /// [`ClientError::DaemonRestarted`]. A request whose connection's `Hello`
+    /// names the same process goes ahead exactly as on the unbound handle.
+    ///
+    /// Every id a bound handle learns — a start's, a listing's, an attach's —
+    /// therefore comes from that process too, which is how an orchestration
+    /// launch binds its whole run before its first start.
+    pub fn bound_to(&self, incarnation: Incarnation) -> Self {
+        let mut bound = self.clone();
+        bound.bound = Some(incarnation);
+        bound
+    }
+
+    /// PRD #1666 part 2 (G-fix4): this handle bound to the daemon process
+    /// answering right now, for a caller about to make a run of requests —
+    /// start an agent and attach to it, prepare and launch an orchestration —
+    /// before it has learned any id. The process is read from a `Hello` of its
+    /// own, and each request then checks it again on its own connection.
+    ///
+    /// A handle that is already bound is returned as it is. So is an ungated
+    /// one ([`Self::with_protocol_gate`]), with no I/O: its requests carry no
+    /// `Hello` to check a binding on, which is the one-shot CLI's policy.
+    pub async fn bound_to_current(&self) -> Result<Self, ClientError> {
+        if self.bound.is_some() || !self.protocol_gate {
+            return Ok(self.clone());
+        }
+        let (_, _, _, incarnation) = self.protocol_hello(false).await?;
+        Ok(self.bound_to(incarnation))
     }
 
     /// The identity set by [`Self::with_client_id`], if any.
@@ -1636,11 +1753,23 @@ impl DaemonClient {
     async fn admitted_connect(
         &self,
     ) -> Result<(TransportReadHalf, TransportWriteHalf), ClientError> {
-        if !self.protocol_gate {
-            return Ok(self.connect().await?);
-        }
-        let (rd, wr, _) = self.protocol_hello(true).await?;
+        let (rd, wr, _) = self.admitted_connect_learning().await?;
         Ok((rd, wr))
+    }
+
+    /// [`Self::admitted_connect`], also answering which daemon process the
+    /// connection reached (PRD #1666 part 2, G-fix4) — `None` on an ungated,
+    /// unbound handle, which sends no `Hello`. A bound handle is checked even
+    /// when it is not otherwise gated: the binding is the caller's question.
+    async fn admitted_connect_learning(
+        &self,
+    ) -> Result<(TransportReadHalf, TransportWriteHalf, Option<Incarnation>), ClientError> {
+        if !self.protocol_gate && self.bound.is_none() {
+            let (rd, wr) = self.connect().await?;
+            return Ok((rd, wr, None));
+        }
+        let (rd, wr, _, incarnation) = self.protocol_hello(true).await?;
+        Ok((rd, wr, Some(incarnation)))
     }
 
     /// Issue #405's protocol check on a fresh connection: one `Hello`, `Ok`
@@ -1656,10 +1785,23 @@ impl DaemonClient {
     /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`]: a daemon that does not
     /// closes the connection after the reply, and the request must not go
     /// anywhere else.
+    ///
+    /// On a handle bound by [`Self::bound_to`], the reply must also name the
+    /// bound daemon process, or the check fails with
+    /// [`ClientError::DaemonRestarted`]. The process it names is returned
+    /// either way, for a caller that records it beside the ids it learns.
     async fn protocol_hello(
         &self,
         follow_on: bool,
-    ) -> Result<(TransportReadHalf, TransportWriteHalf, DaemonCapabilities), ClientError> {
+    ) -> Result<
+        (
+            TransportReadHalf,
+            TransportWriteHalf,
+            DaemonCapabilities,
+            Incarnation,
+        ),
+        ClientError,
+    > {
         let local = crate::daemon_protocol::PROTOCOL_VERSION;
         let checked = async {
             let (mut rd, mut wr) = self.connect().await?;
@@ -1697,13 +1839,24 @@ impl DaemonClient {
             }
         };
         let capabilities = self.store_capabilities_from_hello(&resp);
+        let incarnation = Incarnation::of_hello(&resp);
+        // After the capabilities are stored: the reply is this endpoint's
+        // current daemon, which is all the cache describes. What a mismatch
+        // refuses is this request, aimed at the process before it.
+        if self
+            .bound
+            .as_ref()
+            .is_some_and(|bound| *bound != incarnation)
+        {
+            return Err(ClientError::DaemonRestarted);
+        }
         if follow_on && !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON) {
             return Err(ClientError::Server(
                 "the daemon cannot serve a request on the connection that checked its protocol"
                     .into(),
             ));
         }
-        Ok((rd, wr, capabilities))
+        Ok((rd, wr, capabilities, incarnation))
     }
 
     /// List daemon-side agents. Returns one [`AgentRecord`] per agent,
@@ -1734,7 +1887,7 @@ impl DaemonClient {
     /// the rest. Both go down one code path, so the sanitisation and the
     /// older-daemon fallback below cannot differ between them.
     pub async fn list_agents_detailed(&self) -> Result<AgentListing, ClientError> {
-        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let (mut rd, mut wr, incarnation) = self.admitted_connect_learning().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents).await?;
         if !resp.ok {
             return Err(ClientError::Server(
@@ -1749,6 +1902,7 @@ impl DaemonClient {
             return Ok(AgentListing {
                 records,
                 schedule_revision,
+                incarnation,
             });
         }
         Ok(AgentListing {
@@ -1785,6 +1939,7 @@ impl DaemonClient {
                 })
                 .collect(),
             schedule_revision,
+            incarnation,
         })
     }
 
@@ -2345,7 +2500,7 @@ impl DaemonClient {
     /// is not covered by it; [`Self::with_protocol_gate`] is what binds the
     /// check to the request.
     pub async fn check_protocol(&self) -> Result<DaemonCapabilities, ClientError> {
-        let (_, _, capabilities) = self.protocol_hello(false).await?;
+        let (_, _, capabilities, _) = self.protocol_hello(false).await?;
         Ok(capabilities)
     }
 
@@ -2666,11 +2821,20 @@ impl DaemonClient {
         cols: u16,
         viewer: Option<&str>,
     ) -> Result<Option<(u16, u16)>, ClientError> {
-        // Ungated, deliberately: a best-effort, idempotent geometry update the next
-        // resize reconciles; the desktop sends its viewer token, which a daemon
-        // that did not issue it ignores. It does change state, so it is an
-        // exception, not a read — see `protocol_gate`.
-        let (mut rd, mut wr) = self.connect().await?;
+        // Not compatibility-gated, deliberately: a best-effort, idempotent
+        // geometry update the next resize reconciles. It does change state, so
+        // it is an exception, not a read — see `protocol_gate`. A daemon
+        // ignores a token it does not recognise, but viewer tokens are
+        // per-process counters too, so a replacement may recognise one as
+        // another client's viewer: a caller resizing with a token binds the
+        // handle to the daemon that issued it (`bound_to`, PRD #1666 part 2),
+        // and then the request rides a connection whose `Hello` named that
+        // process.
+        let (mut rd, mut wr) = if self.bound.is_some() {
+            self.admitted_connect().await?
+        } else {
+            self.connect().await?
+        };
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -3272,8 +3436,8 @@ impl DaemonClient {
         // A gated handle sends the request on the connection whose `Hello` it
         // checked; an ungated one checks on its own connection first, as it
         // did before the gate existed.
-        let (capabilities, connection) = if self.protocol_gate {
-            let (rd, wr, capabilities) = self.protocol_hello(true).await?;
+        let (capabilities, connection) = if self.protocol_gate || self.bound.is_some() {
+            let (rd, wr, capabilities, _) = self.protocol_hello(true).await?;
             (capabilities, Some((rd, wr)))
         } else {
             (self.check_protocol().await?, None)
@@ -3339,7 +3503,9 @@ impl DaemonClient {
     /// the user's commit has been acknowledged.
     pub async fn send_shutdown(&self) -> Result<(), ClientError> {
         // Ungated by design: stopping the daemon is how a user recovers from one of
-        // another build, so it must reach that daemon. The desktop does not send it.
+        // another build, so it must reach that daemon. A deliberate recovery
+        // exception: the TUI's daemon Stop sends it, and so does the desktop's
+        // local Stop daemon on Windows (`run_daemon_stop`).
         let (mut rd, mut wr) = self.connect().await?;
         write_frame(&mut wr, KIND_SHUTDOWN, &[]).await?;
         // Bound the wait at 1s — the daemon writes the ack BEFORE
@@ -3439,7 +3605,9 @@ impl DaemonClient {
             successor: req.successor,
         };
         // Ungated by design: restarting the daemon is how a user moves off one of
-        // another build, so it must reach that daemon. Sent by the CLI only.
+        // another build, so it must reach that daemon. A deliberate recovery
+        // exception, not a CLI-only verb: the desktop's Replace daemon reaches it
+        // through the upgrade procedure's `WireDaemonPort`.
         let (mut rd, mut wr) = tokio::time::timeout_at(deadline, self.connect())
             .await
             .map_err(|_| ClientError::TimedOut(limit))??;
@@ -3607,7 +3775,7 @@ impl DaemonClient {
         viewport: Option<(u16, u16)>,
         geometry_updates: bool,
     ) -> Result<AttachConnection, ClientError> {
-        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let (mut rd, mut wr, incarnation) = self.admitted_connect_learning().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -3634,6 +3802,7 @@ impl DaemonClient {
             wr,
             viewer: resp.viewer,
             applied,
+            incarnation,
         })
     }
 }
@@ -3813,6 +3982,12 @@ pub struct AttachConnection {
     /// `KIND_GEOMETRY` frame, so a caller polling this after each read always
     /// has the grid the bytes it just received were written for.
     applied: Option<(u16, u16)>,
+    /// PRD #1666 part 2 (G-fix4): the daemon process that accepted this attach
+    /// and issued [`Self::viewer`], from the `Hello` on its connection — what a
+    /// later resize with that token, or an action on the attached agent, is
+    /// bound to ([`DaemonClient::bound_to`]). `None` from an ungated, unbound
+    /// handle.
+    incarnation: Option<Incarnation>,
 }
 
 impl AttachConnection {
@@ -3857,6 +4032,12 @@ impl AttachConnection {
     /// last frame read through [`AttachConnection::next_output`].
     pub fn applied(&self) -> Option<(u16, u16)> {
         self.applied
+    }
+
+    /// PRD #1666 part 2 (G-fix4): the daemon process that accepted this attach
+    /// — see the field.
+    pub fn incarnation(&self) -> Option<&Incarnation> {
+        self.incarnation.as_ref()
     }
 
     /// Forward a chunk of keystrokes to the daemon's PTY writer.
@@ -3904,6 +4085,7 @@ impl AttachConnection {
                 wr,
                 viewer: None,
                 applied: None,
+                incarnation: None,
             },
             peer,
         )
@@ -4315,6 +4497,7 @@ mod tests {
             client_id: None,
             protocol_gate: false,
             admission: None,
+            bound: None,
         };
         assert!(
             pipe_client.ensure_socket_exists().is_ok(),
@@ -4330,6 +4513,7 @@ mod tests {
             client_id: None,
             protocol_gate: false,
             admission: None,
+            bound: None,
         };
         assert!(
             remote_client.ensure_socket_exists().is_ok(),
@@ -8517,5 +8701,382 @@ mod protocol_gate_tests {
                 "relabel={relabel}: the replacement received the request"
             );
         }
+    }
+}
+
+/// PRD #1666 part 2 (G-fix4): a scripted daemon that is restarted at its socket
+/// by the same build — every compatibility check passes, and only the process
+/// its `Hello` names changes. Each connection is served by the process current
+/// when it was accepted, and every request that is not a `Hello` is recorded as
+/// `"<process>:<op>"`. Both processes answer for the agent `"1"` in pane
+/// `"pane-1"` with viewer `"v1"`, as two daemons counting from 1 would.
+#[cfg(all(test, unix))]
+pub(crate) mod restart_fixture {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use crate::daemon_protocol::{
+        AttachResponse, InboxActionOutcome, InboxActionReply, KIND_REQ, PROTOCOL_VERSION,
+        bind_attach_listener, read_frame, write_resp,
+    };
+
+    #[derive(Default)]
+    struct Script {
+        current: &'static str,
+        /// `(op, next)`: once the current process serves `op`, connections
+        /// accepted afterwards are served by `next`.
+        restart_after: Option<(&'static str, &'static str)>,
+        hellos: HashMap<&'static str, usize>,
+    }
+
+    pub(crate) struct RestartingDaemon {
+        _dir: tempfile::TempDir,
+        pub(crate) path: PathBuf,
+        recorded: Arc<Mutex<Vec<String>>>,
+        script: Arc<Mutex<Script>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    fn serve(op: &str) -> AttachResponse {
+        match op {
+            "list-agents" => AttachResponse::agent_records(vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "1",
+                    "pane_id_env": "pane-1",
+                    "rows": 24,
+                    "cols": 80,
+                }))
+                .expect("a minimal agent record"),
+            ]),
+            "start-agent" => AttachResponse::with_id("1".into()),
+            "post-message" => AttachResponse::with_id("m-1".into()),
+            "attach-stream" | "resize" => {
+                let mut reply = AttachResponse::ok();
+                reply.viewer = Some("v1".into());
+                reply.applied_rows = Some(24);
+                reply.applied_cols = Some(80);
+                reply
+            }
+            "inbox-retry" | "inbox-cancel" => {
+                let mut reply = AttachResponse::ok();
+                reply.inbox_action = Some(InboxActionReply {
+                    outcome: InboxActionOutcome::Applied,
+                    revision: Some(2),
+                });
+                reply
+            }
+            _ => AttachResponse::ok(),
+        }
+    }
+
+    impl RestartingDaemon {
+        /// Serve as the process `first` until told to restart. Call inside a
+        /// tokio runtime.
+        pub(crate) fn spawn(first: &'static str) -> Self {
+            let (dir, path, listener) = {
+                let _g = super::tests::BIND_LOCK
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("restart.sock");
+                let listener = bind_attach_listener(&path).expect("bind the scripted daemon");
+                (dir, path, listener)
+            };
+            let recorded = Arc::new(Mutex::new(Vec::new()));
+            let script = Arc::new(Mutex::new(Script {
+                current: first,
+                ..Script::default()
+            }));
+            let server = {
+                let recorded = Arc::clone(&recorded);
+                let script = Arc::clone(&script);
+                tokio::spawn(async move {
+                    while let Ok(mut stream) = listener.accept().await {
+                        let process = script.lock().unwrap().current;
+                        let recorded = Arc::clone(&recorded);
+                        let script = Arc::clone(&script);
+                        tokio::spawn(async move {
+                            let mut follow_on = true;
+                            while std::mem::take(&mut follow_on) {
+                                let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await
+                                else {
+                                    return;
+                                };
+                                let request: serde_json::Value =
+                                    serde_json::from_slice(&payload).expect("a JSON request");
+                                let op = request["op"].as_str().unwrap_or("?").to_string();
+                                if op == "hello" {
+                                    *script.lock().unwrap().hellos.entry(process).or_default() += 1;
+                                    let mut reply =
+                                        AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+                                    reply.instance_id = Some(process.to_string());
+                                    let _ = write_resp(&mut stream, &reply).await;
+                                    follow_on = request["follow_on"] == true;
+                                    continue;
+                                }
+                                recorded.lock().unwrap().push(format!("{process}:{op}"));
+                                let _ = write_resp(&mut stream, &serve(&op)).await;
+                                {
+                                    let mut script = script.lock().unwrap();
+                                    if script.current == process
+                                        && let Some((after, next)) = script.restart_after
+                                        && after == op
+                                    {
+                                        script.current = next;
+                                        script.restart_after = None;
+                                    }
+                                }
+                                // Hold an attach or subscription open, as a
+                                // daemon would, until the client leaves.
+                                while let Ok(Some(_)) = read_frame(&mut stream).await {}
+                            }
+                        });
+                    }
+                })
+            };
+            Self {
+                _dir: dir,
+                path,
+                recorded,
+                script,
+                server,
+            }
+        }
+
+        /// The daemon restarts now: every connection accepted from here on is
+        /// served by the process `next`.
+        pub(crate) fn restart_as(&self, next: &'static str) {
+            self.script.lock().unwrap().current = next;
+        }
+
+        /// The daemon restarts as `next` right after the current process
+        /// serves `op`.
+        pub(crate) fn restart_after(&self, op: &'static str, next: &'static str) {
+            self.script.lock().unwrap().restart_after = Some((op, next));
+        }
+
+        /// The ops `process` received, in order.
+        pub(crate) fn received_by(&self, process: &str) -> Vec<String> {
+            let prefix = format!("{process}:");
+            self.recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| entry.strip_prefix(&prefix).map(str::to_string))
+                .collect()
+        }
+
+        /// How many `Hello`s `process` answered.
+        pub(crate) fn hellos(&self, process: &str) -> usize {
+            self.script
+                .lock()
+                .unwrap()
+                .hellos
+                .get(process)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl Drop for RestartingDaemon {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+}
+
+/// PRD #1666 part 2 (G-fix4): a request aimed at an agent id or viewer token
+/// reaches the daemon process that issued it, or nothing — against a
+/// same-build restart, which every compatibility check admits.
+#[cfg(all(test, unix))]
+mod incarnation_binding_tests {
+    use super::restart_fixture::RestartingDaemon;
+    use super::*;
+    use spec::spec;
+
+    /// Every request aimed at agent `"1"` (or its viewer `"v1"`), called once
+    /// on `client`; what each returned is kept, the daemon's record is the
+    /// evidence of what reached it.
+    async fn every_agent_action(
+        client: &DaemonClient,
+    ) -> Vec<(&'static str, Result<(), ClientError>)> {
+        vec![
+            ("stop-agent", client.stop_agent("1").await),
+            (
+                "set-agent-label",
+                client
+                    .set_agent_label("1", Some("renamed".into()), Some("/project".into()))
+                    .await,
+            ),
+            (
+                "post-message",
+                client
+                    .post_message(
+                        "pane-1",
+                        Some("1"),
+                        "subject",
+                        "body",
+                        None,
+                        crate::inbox_hub::PostOrigin::OrchestratorRemit,
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "inbox-retry",
+                client
+                    .inbox_action("pane-1", "1", "m-1", 1, true, "request-1")
+                    .await
+                    .map(drop),
+            ),
+            (
+                "answer-question",
+                client
+                    .answer_question_while(|| true, "1", "q-1", Some(1), Vec::new(), false)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "record-orchestrator-context",
+                client
+                    .record_orchestrator_context("pane-1", std::path::Path::new("/project/c.md"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "resize",
+                client
+                    .resize_agent_as_viewer("1", 30, 100, Some("v1"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "attach-stream",
+                client.attach_as_viewer("1", Some((24, 80))).await.map(drop),
+            ),
+            ("list-agents", client.list_agents().await.map(drop)),
+        ]
+    }
+
+    /// Scenario: a client lists agent `1` on a daemon, the daemon restarts as
+    /// the same build and numbers an unrelated agent `1`, and the client then
+    /// stops, renames, messages, retries, answers, records the orchestrator
+    /// context for, resizes, attaches to and lists that agent through a handle
+    /// bound to what it listed. Every request fails as "that agent is gone (the
+    /// deck restarted)" and the restarted daemon receives none of them; bound
+    /// to the restarted daemon's own listing, each one reaches it (control).
+    #[spec("lifecycle/handshake/013")]
+    #[tokio::test]
+    async fn handshake_013_a_bound_action_reaches_only_the_daemon_process_its_id_came_from() {
+        let daemon = RestartingDaemon::spawn("a");
+        let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+        let listed = client
+            .list_agents_detailed()
+            .await
+            .expect("the first process lists its agent");
+        let learned = listed
+            .incarnation
+            .clone()
+            .expect("a gated listing learns which process answered");
+        assert_eq!(learned.as_deref(), Some("a"));
+
+        daemon.restart_as("b");
+        let stale = client.bound_to(learned);
+        for (verb, result) in every_agent_action(&stale).await {
+            assert!(
+                matches!(result, Err(ClientError::DaemonRestarted)),
+                "{verb} bound to the process before the restart must be refused: {result:?}"
+            );
+        }
+        assert_eq!(
+            daemon.received_by("b"),
+            Vec::<String>::new(),
+            "the restarted daemon was sent an action aimed at the agent before it"
+        );
+        assert!(daemon.hellos("b") > 0, "precondition: the actions asked b");
+
+        let relisted = client
+            .list_agents_detailed()
+            .await
+            .expect("the restarted process lists its own agent");
+        let fresh = client.bound_to(relisted.incarnation.expect("learned"));
+        let _ = every_agent_action(&fresh).await;
+        let reached = daemon.received_by("b");
+        for op in [
+            "stop-agent",
+            "set-agent-label",
+            "post-message",
+            "inbox-retry",
+            "answer-question",
+            "record-orchestrator-context",
+            "resize",
+            "attach-stream",
+            "list-agents",
+        ] {
+            assert!(
+                reached.iter().any(|reached| reached == op),
+                "control: {op} bound to the process that listed the agent must reach it: {reached:?}"
+            );
+        }
+    }
+
+    /// Scenario: a run of requests is bound before it learns any id — an
+    /// orchestration launch, a new TUI pane — and the daemon restarts as the
+    /// same build before the run's first start. The start is refused as the
+    /// restart and the restarted daemon starts nothing; bound after the
+    /// restart, the start reaches it (control). An ungated handle has no
+    /// `Hello` to check a binding on, so binding it costs no connection.
+    #[spec("lifecycle/handshake/013")]
+    #[tokio::test]
+    async fn handshake_013_a_run_bound_before_its_first_start_never_starts_on_a_restarted_daemon() {
+        let daemon = RestartingDaemon::spawn("a");
+        let client = DaemonClient::new(daemon.path.clone()).with_protocol_gate();
+        let run = client.bound_to_current().await.expect("bind the run");
+        daemon.restart_as("b");
+        let started = run
+            .start_agent(StartAgentOptions {
+                command: Some("cat".into()),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(started, Err(ClientError::DaemonRestarted)),
+            "a run bound before the restart must not start on its successor: {started:?}"
+        );
+        assert_eq!(daemon.received_by("b"), Vec::<String>::new());
+
+        let rebound = client.bound_to_current().await.expect("bind again");
+        rebound
+            .start_agent(StartAgentOptions {
+                command: Some("cat".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("control: a run bound to the current process starts");
+        assert_eq!(daemon.received_by("b"), vec!["start-agent".to_string()]);
+
+        let hellos = daemon.hellos("b");
+        let ungated = DaemonClient::new(daemon.path.clone());
+        let _ = ungated.bound_to_current().await.expect("an ungated handle");
+        assert_eq!(
+            daemon.hellos("b"),
+            hellos,
+            "binding an ungated handle asked the daemon something"
+        );
+    }
+
+    /// Scenario: the sentence a refused action shows is the one both clients
+    /// share, so the TUI and the desktop app word it identically.
+    #[test]
+    fn a_restart_refusal_reads_as_the_shared_sentence() {
+        assert_eq!(
+            ClientError::DaemonRestarted.to_string(),
+            AGENT_GONE_AFTER_RESTART
+        );
+        assert_eq!(
+            AGENT_GONE_AFTER_RESTART,
+            "that agent is gone (the deck restarted)"
+        );
     }
 }

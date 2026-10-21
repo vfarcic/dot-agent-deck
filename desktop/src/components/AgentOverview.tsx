@@ -55,6 +55,8 @@ export type OverviewAgent = Pick<
   | "agentType" | "daemonStatus" | "authoringKind"
   /* PRD #1401 — the badge beside the agent's name. */
   | "pullRequest"
+  /* PRD #1666 part 2 — sent back with a stop, so it reaches the daemon process that listed the agent. */
+  | "incarnation"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -81,7 +83,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation } = agent;
   return {
     id,
     daemonId,
@@ -101,6 +103,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     spawnedAtMs,
     writeLease: writeLease === "unknown" ? undefined : writeLease,
     ...(pullRequest ? { pullRequest } : {}),
+    ...(incarnation ? { incarnation } : {}),
   };
 }
 
@@ -1389,14 +1392,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.`,
           label: "Close agent",
           busyLabel: "Stopping…",
-          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id }),
+          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }),
         });
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
         const deck = deckId === undefined ? undefined : deckOf(deckId);
         if (deckId === undefined || !deck) return;
-        const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent) }));
+        const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent), ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }));
         const title = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
         const count = roles.length === 1 ? "its 1 role" : `all ${roles.length} of its roles`;
         setConfirm({
