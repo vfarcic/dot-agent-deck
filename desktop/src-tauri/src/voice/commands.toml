@@ -309,7 +309,16 @@ screens     = ["deck", "overview"]
 requires    = ["new_agent_dialog_closed"]
 unavailable_hint = "the agent dashboard can be filtered once the agent's pane and the New agent dialog are closed"
 report      = "Filtering the agent dashboard."
-asks_to     = "filter the agent dashboard"
+# PRD #1733: the meaning check reads this, and "filter the agent dashboard"
+# was a yes for "see only the tester" in 18 of 108 votes against `gpt-5-mini`,
+# although the description names that sentence as `open_agent`'s. One `yes`
+# runs this row, so a rare command pick of it for that sentence filtered the
+# dashboard instead of opening the tester (final gate, 1 run in 2). Saying
+# the number, as the description does: 1 in 48, with every positive
+# `dashboard-filter-*` sentence, "restrict the dashboard to dispatchers",
+# "filter the dashboard by billing" and "filter by tester" 12 of 12
+# (2026-10-21). Only the meaning check and a refusal read `asks_to`.
+asks_to     = "filter the agent dashboard to several agents rather than open one"
 try_saying  = "show only the dispatchers"
 
   [[commands.params]]

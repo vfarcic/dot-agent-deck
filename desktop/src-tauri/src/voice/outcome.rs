@@ -3638,9 +3638,27 @@ enum Refusal {
 }
 
 /// Rows whose `yes` is taken only from both votes, however the pipeline
-/// reaches them (PRD #1733): closing an orchestration stops every role in it.
-/// Every row read [`Strictness::Whole`] is held the same way ([`Judged`]).
-const TWO_VOTE_ROWS: [&str; 1] = ["close_orchestration"];
+/// reaches them (PRD #1733): each loses something or cannot be taken back.
+/// The send and the interrupt act on the agent at once; clearing the prompt,
+/// scratching the last thing typed and discarding the New agent form delete
+/// what the user said or entered; closing an orchestration stops every role
+/// in it. The interrupt, the clear and the scratch are refused as a pick
+/// anyway ([`TYPING_MODE_ROWS`]); they are here so that wall is not the only
+/// one. A row a context reads [`Strictness::Whole`] ([`CommandRow::whole_while`])
+/// is held the same way while that context holds ([`Judged::held`]). A row
+/// read `whole` whose action is switched back by one more utterance — the
+/// typing and reading modes, the hush — is not here: it runs on one readable
+/// vote, which must still answer `only`. Two votes on those bought no safety
+/// and cost false refusals: "capture my speech as text from now on" was
+/// refused on one cautious vote in 1 run of 5 (2026-10-21).
+const TWO_VOTE_ROWS: [&str; 6] = [
+    SUBMIT_ROW,
+    INTERRUPT_ROW,
+    CLEAR_PROMPT_ROW,
+    SCRATCH_ROW,
+    "discard_new_agent",
+    "close_orchestration",
+];
 
 /// Rows whose `yes` is taken only from both votes when it is reached IN PLACE
 /// of the pick — as a reading ([`UNGROUNDED_READS_AS`]) or a redirect target —
@@ -3675,10 +3693,12 @@ enum Second {
 /// ordinary row runs on one readable `yes`, from either vote. It acts on the
 /// first readable vote's `yes` without waiting for the other — when the first
 /// vote to answer was unreadable, that is the second to answer — and waits
-/// for the other vote only after a first `no`. A pick
-/// read [`Strictness::Whole`], a [`TWO_VOTE_ROWS`] row, and a
-/// [`TWO_VOTES_IN_PLACE_OF_THE_PICK`] row reached in place of the pick need
-/// BOTH votes' `yes`, so after a first `yes` they wait for the second. A row
+/// for the other vote only after a first `no`. A row read
+/// [`Strictness::Whole`] is the same: one readable vote decides it, and that
+/// vote must also answer `only`. A [`TWO_VOTE_ROWS`] row, a row a declared
+/// context reads whole, and a [`TWO_VOTES_IN_PLACE_OF_THE_PICK`] row reached
+/// in place of the pick need BOTH votes' `yes`, so after a first `yes` they
+/// wait for the second. A row
 /// is refused when the `yes` votes it needs cannot be had: a `no` refuses it
 /// as not asked for, and a vote that failed, timed out or was unreadable where
 /// a `yes` was still needed refuses it as unchecked.
@@ -3719,13 +3739,15 @@ impl Judged<'_> {
         self.answered(&row.id, Strictness::Whole, true)
     }
 
+    /// A row a declared context makes whole-sentence needs both votes there:
+    /// the context is the one in which its action loses something — `close`
+    /// and `open_deck` over the New agent dialog, which leave the form only a
+    /// draft or none ([`CommandRow::meaning_for`]).
     fn held(&self, row: &CommandRow, two_votes: bool) -> bool {
         let meant = || match row.meaning_for(self.directories, self.new_agent) {
-            Some((strictness, _)) => self.answered(
-                &row.id,
-                strictness,
-                two_votes || strictness == Strictness::Whole,
-            ),
+            Some((strictness, context)) => {
+                self.answered(&row.id, strictness, two_votes || context.is_some())
+            }
             None => true,
         };
         // The guards first: a row they refuse is refused whatever the votes
@@ -18809,6 +18831,9 @@ mod tests {
     enum Vote {
         /// A readable reply listing these actions, under every strictness.
         Lists(&'static [&'static str]),
+        /// A readable reply listing these actions as part of a longer
+        /// sentence: a `yes` to every strictness but [`Strictness::Whole`].
+        Among(&'static [&'static str]),
         Fails,
         Hangs,
     }
@@ -18848,24 +18873,28 @@ mod tests {
                 .expect("votes")
                 .pop_front()
                 .expect("two votes an utterance");
-            match vote {
-                Vote::Lists(listed) => {
-                    let verdict = MeaningVerdict::yes_to(
-                        request
-                            .action_ids()
-                            .filter(|action| listed.contains(action))
-                            .flat_map(|action| {
-                                [Strictness::Asks, Strictness::Whole, Strictness::Write]
-                                    .map(|strictness| (action, strictness))
-                            }),
-                    );
-                    Box::pin(async move { Ok(verdict) })
-                }
+            let (listed, strictnesses): (_, &[Strictness]) = match vote {
+                Vote::Lists(listed) => (
+                    listed,
+                    &[Strictness::Asks, Strictness::Whole, Strictness::Write],
+                ),
+                Vote::Among(listed) => (listed, &[Strictness::Asks, Strictness::Write]),
                 Vote::Fails => {
-                    Box::pin(async { Err(IntentError::Backend("the vote failed".into())) })
+                    return Box::pin(async { Err(IntentError::Backend("the vote failed".into())) });
                 }
-                Vote::Hangs => Box::pin(std::future::pending()),
-            }
+                Vote::Hangs => return Box::pin(std::future::pending()),
+            };
+            let verdict = MeaningVerdict::yes_to(
+                request
+                    .action_ids()
+                    .filter(|action| listed.contains(action))
+                    .flat_map(|action| {
+                        strictnesses
+                            .iter()
+                            .map(move |strictness| (action, *strictness))
+                    }),
+            );
+            Box::pin(async move { Ok(verdict) })
         }
 
         fn backend_name(&self) -> &'static str {
@@ -18900,8 +18929,9 @@ mod tests {
         (outcome, at.elapsed())
     }
 
-    /// Scenario: a pick that needs two votes — a whole-sentence send, closing
-    /// an orchestration, and the form's Start reached as the reading of a
+    /// Scenario: a pick that needs two votes — a whole-sentence send,
+    /// discarding the New agent form, closing the dialog over it, closing an
+    /// orchestration, and the form's Start reached as the reading of a
     /// refused stop — runs only when both votes list it. Yes then no, no then
     /// yes, yes beside a failed vote in either order, and yes beside a vote
     /// that never answers (refused at the bound) all dispatch nothing; yes
@@ -18923,6 +18953,24 @@ mod tests {
                 IntentAnswer::new(SUBMIT_ROW),
                 &[SUBMIT_ROW],
                 SUBMIT_ROW,
+            ),
+            (
+                "throw the form away",
+                Screen::Overview,
+                fleet(),
+                true,
+                IntentAnswer::new("discard_new_agent"),
+                &["discard_new_agent"],
+                "discard_new_agent",
+            ),
+            (
+                "put this dialog away",
+                Screen::Overview,
+                fleet(),
+                true,
+                IntentAnswer::new(CLOSE_ROW),
+                &[CLOSE_ROW],
+                CLOSE_ROW,
             ),
             (
                 "Stop the orchestration 1.",
@@ -19133,6 +19181,68 @@ mod tests {
                     if sentence.contains("could not check that this asks to open settings")
                         && sentence.ends_with("so nothing was done.")),
                 "{outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: a row read whole-sentence whose action one more utterance
+    /// switches back — typing mode on, reading mode on, the hush — runs on one
+    /// readable vote that lists it as the whole sentence: at once when the
+    /// first does and the other never answers, and on the second when the
+    /// first did not list it or failed. Votes that list it only as part of a
+    /// longer sentence are a `no`, so two of them refuse it as not said on
+    /// its own.
+    #[tokio::test(start_paused = true)]
+    async fn voice_outcome_a_reversible_whole_row_runs_on_one_readable_vote() {
+        use Vote::{Among, Fails, Hangs, Lists};
+        let cases: [(&str, Screen, &'static [&'static str]); 3] = [
+            (
+                "capture my speech as text from now on",
+                Screen::Agent,
+                &[DICTATION_ON_ROW],
+            ),
+            (
+                "read the agents' replies out loud to me from now on",
+                Screen::Overview,
+                &[READING_ON_ROW],
+            ),
+            (
+                "that's enough reading aloud",
+                Screen::Overview,
+                &[QUIET_ROW],
+            ),
+        ];
+        for (said, screen, listed) in cases {
+            let row = listed[0];
+            for (votes, waits) in [
+                ([Lists(listed), Hangs], false),
+                ([Fails, Lists(listed)], false),
+                ([Lists(&[]), Lists(listed)], true),
+                ([Among(listed), Lists(listed)], true),
+            ] {
+                let (outcome, waited) =
+                    voted(said, screen, &fleet(), false, IntentAnswer::new(row), votes).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == row),
+                    "{said}: {votes:?}: {outcome:?}"
+                );
+                if !waits {
+                    assert_eq!(waited, std::time::Duration::ZERO, "{said}: {votes:?}");
+                }
+            }
+            let (outcome, _) = voted(
+                said,
+                screen,
+                &fleet(),
+                false,
+                IntentAnswer::new(row),
+                [Among(listed), Among(listed)],
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ActionUngrounded { action, sentence, .. }
+                    if action == row && sentence.contains("needs to be said on its own")),
+                "{said}: {outcome:?}"
             );
         }
     }
