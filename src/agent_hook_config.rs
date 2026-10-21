@@ -1656,13 +1656,13 @@ pub(crate) fn consolidate_deck_handlers_in_place(
     'scan: for (rule_idx, rule) in rules.iter().enumerate() {
         if let Some(handlers) = rule.get("hooks").and_then(Value::as_array) {
             for (handler_idx, handler) in handlers.iter().enumerate() {
-                if handler.get("command").is_some_and(&own) {
+                if handler.get("command").is_some_and(own) {
                     claim = Some((rule_idx, handler_idx));
                     break 'scan;
                 }
             }
         }
-        if rule.get("command").is_some_and(&own) {
+        if rule.get("command").is_some_and(own) {
             return None;
         }
     }
@@ -1674,14 +1674,14 @@ pub(crate) fn consolidate_deck_handlers_in_place(
         if let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) {
             while let Some(last_idx) = handlers.len().checked_sub(1) {
                 if (rule_idx, last_idx) == (claimed_rule, claimed_handler)
-                    || !handlers[last_idx].get("command").is_some_and(&own)
+                    || !handlers[last_idx].get("command").is_some_and(own)
                 {
                     break;
                 }
                 handlers.pop();
             }
         }
-        if rule.get("command").is_some_and(&own)
+        if rule.get("command").is_some_and(own)
             && let Some(object) = rule.as_object_mut()
         {
             object.remove("command");
@@ -1694,7 +1694,7 @@ pub(crate) fn consolidate_deck_handlers_in_place(
             continue;
         };
         for handler in handlers.iter_mut() {
-            if !handler.get("command").is_some_and(&own) {
+            if !handler.get("command").is_some_and(own) {
                 continue;
             }
             let Some(object) = handler.as_object_mut() else {
