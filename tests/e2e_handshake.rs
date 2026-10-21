@@ -600,6 +600,81 @@ fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
     }
 }
 
+/// Scenario: Attach a pane in the real TUI, restart its isolated daemon with the same binary, and create a successor agent with the recycled id in a different pane. Ctrl+W on the old pane must display "that agent is gone (the deck restarted)" and leave the successor agent alive and named as before; closing a freshly listed successor card is the control.
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_ctrl_w_after_a_same_build_restart_preserves_the_successor() {
+    use inbox::*;
+    let mut original = spawn_daemon_at_build(NEW_BUILD);
+    let old = pane_with(
+        &original,
+        "old-restart-pane",
+        serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "OLD-ATTACHED-PTY-1666"]]}),
+    );
+    let old_agent = old.agent.clone();
+    let deck = launch_tui_against(&original, NEW_BUILD);
+    deck.wait_for_string("OLD-ATTACHED-PTY-1666");
+
+    let stopped = original
+        .send_attach_request(&AttachRequest::StopDaemon { force: true })
+        .expect("stop the fixture-owned daemon");
+    assert!(stopped.ok, "{stopped:?}");
+    assert!(original.wait_for_exit(Duration::from_secs(10)));
+    // The old fixture's Drop carries an unbound cleanup stop; finish it before
+    // placing a successor at this socket so cleanup cannot stop a recycled id.
+    drop(old);
+    let successor = spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+            (
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                original.attach_socket.to_str().unwrap(),
+            ),
+            (
+                "DOT_AGENT_DECK_SOCKET",
+                original.hook_socket.to_str().unwrap(),
+            ),
+        ],
+    );
+    let new = pane(&successor, "successor-other-pane");
+    assert_eq!(
+        new.agent, old_agent,
+        "precondition: daemon recycles the agent id"
+    );
+    deck.send_keys(b"\x17");
+    deck.wait_for_string("Close selected agent?");
+    deck.send_keys(b"\x1b[B");
+    deck.send_keys(b"\r");
+    deck.wait_for_string(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART);
+    assert!(
+        wait_for_agent_display_name(
+            &successor.attach_socket,
+            "successor-other-pane",
+            true,
+            Duration::from_secs(5),
+        ),
+        "closing the old pane must leave the successor agent alive and unrenamed"
+    );
+    let fresh = launch_tui_against(&successor, NEW_BUILD);
+    fresh.wait_for_string("successor-other-pane");
+    fresh.send_keys(b"\x17");
+    fresh.wait_for_string("Close selected agent?");
+    fresh.send_keys(b"\x1b[B");
+    fresh.send_keys(b"\r");
+    fresh.wait_for_string("No active agents");
+    assert!(
+        wait_for_agent_display_name(
+            &successor.attach_socket,
+            "successor-other-pane",
+            false,
+            Duration::from_secs(5),
+        ),
+        "control: a fresh card closes the successor agent"
+    );
+}
+
 /// Scenario: Replace the daemon under an open TUI with one on the next attach protocol and wait for the TUI's refusal, then open the New Agent form and submit it. The replacement must receive no start, listing, attach or subscription from the TUI at any point — the form's own hints included — and no new pane may open.
 #[spec("lifecycle/handshake/012")]
 #[test]

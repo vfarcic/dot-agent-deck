@@ -20,7 +20,7 @@ function item(messageId: string, kind: string, revision = 4) {
 
 function snapshot(inbox: Record<string, unknown>): DesktopSnapshotDto {
   const agent = {
-    id: "7", paneId: "worker", displayName: "Coder", agentType: "open_code" as const,
+    id: "7", paneId: "worker", displayName: "Coder", agentType: "open_code" as const, incarnation: "listed-inbox-process-a",
     rows: 24, cols: 80, status: "working" as const, toolCount: 3,
     lastUserPrompt: "inspect the fixture",
     tab: { kind: "orchestration" as const, name: "test", roleIndex: 1, roleName: "coder", isStartRole: false },
@@ -139,7 +139,7 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     const card = tile(agent, onInboxAction);
     fireEvent.click(within(card.getByTestId(`inbox-attention-${first}`)).getByRole("button", { name: words.retry }));
     await waitFor(() => expect(onInboxAction).toHaveBeenCalledWith(
-      { deckId: agent.daemonId, agentId: "7" },
+      { deckId: agent.daemonId, agentId: "7", incarnation: "listed-inbox-process-a" },
       { paneId: "worker", messageId: first, revision: 6 },
       "retry",
     ));
@@ -158,7 +158,7 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     const card = tile(agent, onInboxAction);
     fireEvent.click(within(card.getByTestId(`inbox-attention-${first}`)).getByRole("button", { name: words.retry }));
     await waitFor(() => expect(onInboxAction).toHaveBeenCalledWith(
-      { deckId: agent.daemonId, agentId: "7" },
+      { deckId: agent.daemonId, agentId: "7", incarnation: "listed-inbox-process-a" },
       { paneId: "worker", messageId: first, revision: 9 },
       "retry",
     ));
@@ -172,7 +172,7 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     const card = tile(agent, onInboxAction);
     fireEvent.click(within(card.getByTestId(`inbox-attention-${first}`)).getByRole("button", { name: words.cancel }));
     await waitFor(() => expect(onInboxAction).toHaveBeenCalledWith(
-      { deckId: agent.daemonId, agentId: "7" },
+      { deckId: agent.daemonId, agentId: "7", incarnation: "listed-inbox-process-a" },
       { paneId: "worker", messageId: first, revision: 4 },
       "cancel",
     ));
@@ -196,7 +196,7 @@ describe("deck messages that need a decision (PRD #1666 §6)", () => {
     }
     fireEvent.click(within(card.getByTestId(`inbox-attention-${ids[8]}`)).getByRole("button", { name: words.cancel }));
     await waitFor(() => expect(onInboxAction).toHaveBeenCalledWith(
-      { deckId: agent.daemonId, agentId: "7" },
+      { deckId: agent.daemonId, agentId: "7", incarnation: "listed-inbox-process-a" },
       { paneId: "worker", messageId: ids[8], revision: 18 },
       "cancel",
     ));

@@ -8813,6 +8813,15 @@ pub(crate) mod restart_fixture {
                                     reply.instance_id = Some(process.to_string());
                                     let _ = write_resp(&mut stream, &reply).await;
                                     follow_on = request["follow_on"] == true;
+                                    {
+                                        let mut script = script.lock().unwrap();
+                                        if script.current == process
+                                            && let Some(("hello", next)) = script.restart_after
+                                        {
+                                            script.current = next;
+                                            script.restart_after = None;
+                                        }
+                                    }
                                     continue;
                                 }
                                 recorded.lock().unwrap().push(format!("{process}:{op}"));
@@ -8964,8 +8973,8 @@ mod incarnation_binding_tests {
     /// stops, renames, messages, retries, answers, records the orchestrator
     /// context for, resizes, attaches to and lists that agent through a handle
     /// bound to what it listed. Every request fails as "that agent is gone (the
-    /// deck restarted)" and the restarted daemon receives none of them; bound
-    /// to the restarted daemon's own listing, each one reaches it (control).
+    /// deck restarted)" and the restarted daemon receives none of them, including after a successful action on the bound handle; bound
+    /// to the restarted daemon's own listing, each one reaches it (control), and a restart between Hello and the action keeps the action on Hello's connection.
     #[spec("lifecycle/handshake/013")]
     #[tokio::test]
     async fn handshake_013_a_bound_action_reaches_only_the_daemon_process_its_id_came_from() {
@@ -8981,8 +8990,12 @@ mod incarnation_binding_tests {
             .expect("a gated listing learns which process answered");
         assert_eq!(learned.as_deref(), Some("a"));
 
-        daemon.restart_as("b");
         let stale = client.bound_to(learned);
+        stale
+            .stop_agent("1")
+            .await
+            .expect("the bound handle works before the restart");
+        daemon.restart_as("b");
         for (verb, result) in every_agent_action(&stale).await {
             assert!(
                 matches!(result, Err(ClientError::DaemonRestarted)),
@@ -9019,6 +9032,30 @@ mod incarnation_binding_tests {
                 "control: {op} bound to the process that listed the agent must reach it: {reached:?}"
             );
         }
+
+        // A passing Hello may never authorize a different connection: the
+        // socket's next accept belongs to c, but this connection still names b.
+        daemon.restart_after("hello", "c");
+        fresh
+            .stop_agent("1")
+            .await
+            .expect("the checked connection still belongs to b");
+        assert_eq!(
+            daemon.received_by("c"),
+            Vec::<String>::new(),
+            "the action must ride the connection whose Hello named b"
+        );
+        assert_eq!(
+            daemon.received_by("b").last().map(String::as_str),
+            Some("stop-agent")
+        );
+        assert!(
+            matches!(
+                fresh.stop_agent("1").await,
+                Err(ClientError::DaemonRestarted)
+            ),
+            "a later action must check the incarnation again"
+        );
     }
 
     /// Scenario: a run of requests is bound before it learns any id — an

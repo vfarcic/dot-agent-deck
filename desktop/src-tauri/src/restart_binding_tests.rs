@@ -59,6 +59,14 @@ fn serve(op: &str) -> AttachResponse {
                 "cols": 80,
             }))
             .expect("a minimal agent record"),
+            serde_json::from_value(serde_json::json!({
+                "id": "2",
+                "pane_id_env": "pane-2",
+                "cwd": "/project",
+                "rows": 24,
+                "cols": 80,
+            }))
+            .expect("the second role's record"),
         ]),
         "start-agent" | "start-prepared-agent" => AttachResponse::with_id("1".into()),
         "attach-stream" | "resize" => {
@@ -281,15 +289,22 @@ async fn handshake_013_an_orchestration_close_after_a_restart_stops_nothing() {
     let wire = crate::dto::deck_wire_id(&deck.endpoint());
     let role = |card: &DesktopAgent| crate::dto::StopOrchestrationRole {
         agent_id: card.id.clone(),
-        name: "planner".into(),
+        name: if card.id == "1" { "planner" } else { "builder" }.into(),
         incarnation: card.incarnation.clone(),
     };
 
-    let card = listed_row(&deck, &state).await;
+    let cards = crate::daemon_bridge::snapshot_of(&deck.endpoint(), &state.daemon)
+        .await
+        .agents;
+    assert_eq!(cards.len(), 2, "precondition: two roles were listed");
+    let roles: Vec<_> = cards.iter().map(role).collect();
     deck.restart_as("b");
-    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &[role(&card)]).await;
+    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &roles).await;
     let failure = closed.expect_err("a stale role's stop is not confirmed");
-    assert_eq!(failure.unconfirmed_stops, vec!["planner".to_string()]);
+    assert_eq!(
+        failure.unconfirmed_stops,
+        vec!["planner".to_string(), "builder".to_string()]
+    );
     assert!(
         failure.message.contains(AGENT_GONE_AFTER_RESTART),
         "{}",
@@ -297,12 +312,19 @@ async fn handshake_013_an_orchestration_close_after_a_restart_stops_nothing() {
     );
     assert_eq!(deck.received_by("b"), Vec::<String>::new());
 
-    let card = listed_row(&deck, &state).await;
-    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &[role(&card)]).await;
+    let cards = crate::daemon_bridge::snapshot_of(&deck.endpoint(), &state.daemon)
+        .await
+        .agents;
+    let roles: Vec<_> = cards.iter().map(role).collect();
+    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &roles).await;
     closed.expect("control: the restarted deck's own role is stopped");
     assert_eq!(
         deck.received_by("b"),
-        vec!["list-agents".to_string(), "stop-agent".to_string()]
+        vec![
+            "list-agents".to_string(),
+            "stop-agent".to_string(),
+            "stop-agent".to_string()
+        ]
     );
 }
 

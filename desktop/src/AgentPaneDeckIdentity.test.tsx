@@ -161,6 +161,17 @@ describe("agent pane deck identity", () => {
     viewportProps.length = 0;
   });
 
+  /// Scenario: Rename a listed card from the live deck screen. The action leaving the app carries the card's daemon incarnation with its agent id and new name.
+  it("keeps the listed incarnation when the deck screen forwards a rename", async () => {
+    const runAction = vi.fn(async () => ({ ok: true }));
+    const deck = harness(documentSelectingOneDeck(), { runAction }, (agent) => ({ ...agent, incarnation: "listed-process-a" }));
+    render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "deck" }} />);
+    fireEvent.click(screen.getByRole("button", { name: "Rename Planner" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Rename Planner" }), { target: { value: "Pinned name" } });
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Rename Planner" }), { key: "Enter" });
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "rename_agent", agentId: "planner", displayName: "Pinned name", incarnation: "listed-process-a" }));
+  });
+
   /**
    * Scenario: open an agent's pane from the overview and close it again. The
    * settings document is never written — opening a pane is navigation, and a

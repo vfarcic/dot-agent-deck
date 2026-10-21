@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DesktopAgentDto, DesktopSnapshotDto, ObservedDeckDto, TerminalAttachResult } from "./bridge";
-import type { AgentTarget, DeckFleet, SendResult } from "../types";
+import type { AgentTarget, DeckAction, DeckFleet, SendResult } from "../types";
 
 const invoke = vi.fn();
 const listeners = new Map<string, (event: { payload: unknown }) => void>();
@@ -664,13 +664,36 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
-  it("sends stop_daemon through the live bridge", async () => {
-    const { TauriDeckBridge } = await import("./bridge");
+  /// Scenario: Stop a daemon, then send Stop, Rename, orchestration close, inbox Retry/Cancel and a voice answer from a listed card through the live bridge. Agent-directed IPC retains the incarnation that the snapshot row carried.
+  it("sends stop_daemon and preserves the listed incarnation on card actions through the live bridge", async () => {
+    const { TauriDeckBridge, mapDesktopSnapshot } = await import("./bridge");
     const bridge = new TauriDeckBridge();
 
     await bridge.runAction({ type: "stop_daemon" });
 
     expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "stop_daemon" } });
+    const listed = mapDesktopSnapshot({ ...snapshot, agents: [{ ...snapshot.agents[0], incarnation: "listed-process-a" }] }).agents[0];
+    expect(listed.incarnation).toBe("listed-process-a");
+    for (const action of [
+      { type: "stop_agent", deckId: listed.daemonId, agentId: listed.id, incarnation: listed.incarnation },
+      { type: "rename_agent", agentId: listed.id, displayName: "Renamed", incarnation: listed.incarnation },
+      { type: "stop_orchestration", deckId: listed.daemonId, roles: [{ agentId: listed.id, name: listed.role, incarnation: listed.incarnation }] },
+    ] satisfies DeckAction[]) {
+      await bridge.runAction(action);
+      expect(invoke).toHaveBeenLastCalledWith("desktop_run_action", { action });
+    }
+    for (const verb of ["retry", "cancel"] as const) {
+      await bridge.inboxAction({ deckId: listed.daemonId, agentId: listed.id, incarnation: listed.incarnation }, { paneId: "pane-1", messageId: "m-1", revision: 7 }, verb);
+      expect(invoke).toHaveBeenLastCalledWith("desktop_inbox_action", {
+        deckId: listed.daemonId, agentId: listed.id, incarnation: "listed-process-a",
+        paneId: "pane-1", messageId: "m-1", revision: 7, verb,
+      });
+    }
+    await bridge.sendVoiceAnswer({ deckId: listed.daemonId, agentId: listed.id, agent: listed.role, questionId: "q-1", incarnation: listed.incarnation }, [], false, "lease-test");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_answer_question", {
+      deckId: listed.daemonId, agentId: listed.id, agent: listed.role, questionId: "q-1", incarnation: "listed-process-a",
+      form: [], confirmedAlways: false, lease: "lease-test", revision: null,
+    });
     await bridge.dispose();
   });
 

@@ -140,12 +140,12 @@ describe("answering an agent's question by voice", () => {
    * user says "always". The panel shows a confirmation naming what "always"
    * covers and starts no countdown; Cancel sends nothing. Said again and
    * confirmed — by the button, and then by saying "confirm" — the five-second
-   * countdown runs and the answer goes out asserting the confirmation.
+   * countdown runs and the answer goes out asserting the confirmation and the incarnation of the pane the utterance answered.
    */
   it("question/desktop/005: always allow is sent only after a confirmation naming its scope", async () => {
     const voice = microphone();
     const { rt, sendVoiceAnswer, resolveVoiceQuestion } = runtime(voice, (_form, confirmed) => ({ kind: "answered", sentence: confirmed ? "Always allowed: commands matching `touch *`" : "unconfirmed" }));
-    render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={{ ...pane(), incarnation: "voice-process-a" }} selectedDeckId="local" />);
     await turnOnVoice();
 
     await speak(voice, "always");
@@ -170,7 +170,7 @@ describe("answering an agent's question by voice", () => {
     await waitOut(VOICE_DICTATION_SEND_MS);
     expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
     expect(sendVoiceAnswer).toHaveBeenCalledWith(
-      { deckId: "local", agentId: "a1", agent: "tester", questionId: "q-1" },
+      { deckId: "local", agentId: "a1", agent: "tester", questionId: "q-1", incarnation: "voice-process-a" },
       [{ questionIndex: 0, optionIndices: [2] }],
       true,
       expect.any(String),
