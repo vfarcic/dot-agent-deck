@@ -105,7 +105,7 @@ describe("useHeldAgentRecord", () => {
 
   /** Scenario: the same process reports a pane and then stops answering, so its last record remains available (control). Changing the agent or daemon incarnation, including dropping that identity, must not show the held record under the new pane. */
   it("never hands a record back under another agent or incarnation on the same deck", () => {
-    const original = { ...target, incarnation: "process-a" };
+    const original: { deckId: string; agentId: string; incarnation: string | undefined } = { ...target, incarnation: "process-a" };
     for (const replacement of [
       { ...original, agentId: "reviewer" },
       { ...original, incarnation: "process-b" },

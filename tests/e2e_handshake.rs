@@ -704,12 +704,12 @@ fn handshake_013_ctrl_w_after_a_same_build_restart_preserves_the_successor() {
     );
 }
 
-/// Scenario: start with an empty TUI, let a daemon-spawned card arrive without attaching its terminal, then restart the daemon as the same build reusing both ids. Ctrl+W, digit focus and Enter on separate stale cards must show the gone sentence, attach nothing and leave the successor alive; without a restart those same actions close or attach the original agent (controls).
+/// Scenario: start with an empty TUI, let a daemon-spawned card arrive without attaching its terminal, then restart the daemon as the same build reusing both ids. Ctrl+W, digit focus and Enter on separate stale cards must show the gone sentence, attach nothing and leave the successor alive; without a restart those same actions close or attach the original agent (controls). After the subscriber learns the restart and the successor reports, the selected old card stays visibly Gone beside the successor's own card, refuses Enter, rename and config, and closes locally without a confirmation.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_restart() {
     use inbox::*;
-    for action in ["close", "digit", "enter"] {
+    for action in ["close", "digit", "enter", "retired"] {
         for restarted in [false, true] {
             let mut original = spawn_daemon_at_build(NEW_BUILD);
             let proxy = reconnect::AttachProxy::new(&original.attach_socket);
@@ -733,6 +733,10 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
             deck.wait_for_string("never-attached-card");
             // Select the surfaced card without entering its terminal.
             deck.send_keys(b"\x1b[B");
+            deck.wait_until_grid("old never-attached card selected before restart", |grid| {
+                grid.lines()
+                    .any(|line| line.contains('▸') && line.contains("never-attached-card"))
+            });
             assert_eq!(
                 proxy.attach_count(),
                 0,
@@ -770,11 +774,72 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                 let pane = pane_with(
                     daemon,
                     "never-attached-card",
-                    serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "SUCCESSOR-NEVER-ATTACHED-1666"]]}),
+                    serde_json::json!({"display_name":"successor-own-card", "env":[["DOORBELL_STANDIN_LABEL", "SUCCESSOR-NEVER-ATTACHED-1666"]]}),
                 );
                 assert_eq!(pane.agent, old_id, "precondition: both ids are reused");
                 pane
             });
+            if action == "retired"
+                && let Some(ref successor) = successor
+            {
+                let gone = dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART;
+                // The pane was learned after initial hydration and is not
+                // managed by this TUI. Its successor surfaces when it reports.
+                status(successor, new.as_ref().unwrap(), "thinking", "claude_code");
+                deck.wait_until_grid("old Gone card beside the successor's own card", |grid| {
+                    grid.contains(" Gone ")
+                        && grid.contains(gone)
+                        && grid.contains("never-attached-card")
+                        && grid.contains("Thinking")
+                        && grid.contains("2 agent(s)")
+                });
+                // Selection must stay on the old card through retirement.
+                let grid = deck.snapshot_grid();
+                assert!(
+                    grid.lines().any(|line| {
+                        line.split(['┌', '┏']).any(|card| {
+                            card.contains('▸')
+                                && card.contains("never-attached-card")
+                                && card.contains("Gone")
+                        })
+                    }),
+                    "selection moved off the retired card onto its successor; grid=\n{grid}"
+                );
+                for keys in [b"\r".as_slice(), b"r", b"g"] {
+                    deck.send_keys(keys);
+                    deck.wait_for_string(gone);
+                    let grid = deck.snapshot_grid();
+                    assert!(
+                        !grid.contains("Rename:")
+                            && !grid.contains("Generate Config")
+                            && !grid.contains("SUCCESSOR-NEVER-ATTACHED-1666"),
+                        "a retired card accepted an action; grid=\n{grid}"
+                    );
+                    assert_eq!(
+                        proxy.attach_count(),
+                        0,
+                        "a retired card attached a terminal"
+                    );
+                }
+                deck.send_keys(b"\x17");
+                deck.wait_for_absence("never-attached-card");
+                let grid = deck.snapshot_grid();
+                assert!(!grid.contains("Close selected agent?"), "{grid}");
+                assert!(grid.contains("Thinking"), "{grid}");
+                assert!(grid.contains(&format!("Closed the card: {gone}")), "{grid}");
+                assert!(wait_for_agent_display_name(
+                    &successor.attach_socket,
+                    "successor-own-card",
+                    true,
+                    Duration::from_secs(5)
+                ));
+                assert!(
+                    std::fs::read(&new.as_ref().unwrap().capture)
+                        .unwrap()
+                        .is_empty()
+                );
+                continue;
+            }
             match action {
                 "close" => {
                     deck.send_keys(b"\x17");
@@ -782,7 +847,7 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                     deck.send_keys(b"\x1b[B\r");
                 }
                 "digit" => deck.send_keys(b"1"),
-                "enter" => deck.send_keys(b"\r"),
+                "enter" | "retired" => deck.send_keys(b"\r"),
                 _ => unreachable!(),
             }
             if let Some(ref successor) = successor {
@@ -800,7 +865,7 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                 assert!(
                     wait_for_agent_display_name(
                         &successor.attach_socket,
-                        "never-attached-card",
+                        "successor-own-card",
                         true,
                         Duration::from_secs(5)
                     ),

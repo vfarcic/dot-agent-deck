@@ -79,24 +79,27 @@ describe("a voice dispatch holds to the daemon process its agent was listed by",
   /**
    * Scenario: "stop the tester" is declared while daemon process A lists the
    * tester. While it resolves, the deck restarts as process B and lists an
-   * unrelated agent under the same id, with no spawn time to tell them apart.
+   * unrelated agent under the same id, with either no spawn time or the same
+   * reported spawn time to tell them apart.
    * Nothing is dispatched and the report says the agent is gone. When A still
    * lists it (control), the stop is dispatched naming process A.
    */
   it.each([
-    ["process-b", false],
-    ["process-a", true],
-  ] as const)("binds a resolved agent to its process, and refuses it once %s lists the id", async (listedBy, dispatched) => {
+    ["process-b", false, undefined],
+    ["process-a", true, undefined],
+    ["process-b", false, 1_000],
+    ["process-a", true, 1_000],
+  ] as const)("binds a resolved agent to its process, and refuses it once %s lists the id (dispatch %s, spawn %s)", async (listedBy, dispatched, spawnedAtMs) => {
     const voice = microphone();
     let release!: (answer: VoiceResultDto) => void;
     const rt = runtime(voice, () => new Promise<VoiceResultDto>((resolve) => { release = resolve; }));
-    let listed: Record<string, AgentIncarnation> = { [agentKey("local", "a1")]: { process: "process-a" } };
+    let listed: Record<string, AgentIncarnation> = { [agentKey("local", "a1")]: { process: "process-a", spawnedAtMs } };
     const onDispatch = vi.fn((_outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>) => undefined);
     render(<VoiceControlPanel runtime={rt} screen="overview" onDispatch={onDispatch} selectedDeckId="local" agentIncarnations={() => listed} />);
     await turnOnVoice();
     await speak(voice, "stop the tester");
 
-    listed = { [agentKey("local", "a1")]: { process: listedBy } };
+    listed = { [agentKey("local", "a1")]: { process: listedBy, spawnedAtMs } };
     await act(async () => { release(STOP); });
     await flush();
 

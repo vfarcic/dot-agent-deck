@@ -228,17 +228,18 @@ describe("the overview after a New agent start (PRD #1223 M5)", () => {
    * Scenario (PRD #1666 part 2, G-fix7): daemon process A answers the start
    * with agent `9`; before the overview sees it the deck restarts as process B
    * and lists an unrelated `9`. Nothing opens. Once A's `9` is listed
-   * (control), its pane opens bound to process A.
+   * (control), its pane opens bound to process A. An unnamed start waits for
+   * an unnamed row and opens with that identity explicitly held too.
    */
-  it("opens the started agent bound to the process that started it, never a restarted deck's namesake", async () => {
+  it.each(["process-a", undefined])("opens the started agent bound to the process that started it, never a restarted deck's namesake (%s)", async (startedBy) => {
     const onNavigate = vi.fn();
-    const first = runtime({ fleet: [createFixtureSnapshot("empty")], runAction: vi.fn(async (): Promise<DeckActionResult> => ({ ok: true, agentId: "9", agentIncarnation: "process-a" })) });
+    const first = runtime({ fleet: [createFixtureSnapshot("empty")], runAction: vi.fn(async (): Promise<DeckActionResult> => ({ ok: true, agentId: "9", agentIncarnation: startedBy })) });
     const { rerender } = render(<AgentOverview runtime={first} onNavigate={onNavigate} />);
     fireEvent.click(screen.getByTestId("overview-new-agent"));
     await startFromDialog();
     expect(await screen.findByTestId("new-agent-waiting")).toBeVisible();
 
-    const listing = (incarnation: string): DeckFleet => [{ ...first.fleet[0], agents: [{ ...createFixtureStartedAgent({ id: "9", daemonId: FIXTURE_DAEMON_ID, cwd: "/home/dev" }), incarnation }] }];
+    const listing = (incarnation: string | undefined): DeckFleet => [{ ...first.fleet[0], agents: [{ ...createFixtureStartedAgent({ id: "9", daemonId: FIXTURE_DAEMON_ID, cwd: "/home/dev" }), incarnation }] }];
     const successor = listing("process-b");
     await act(async () => {
       rerender(<AgentOverview runtime={{ ...first, fleet: successor, snapshot: successor[0] }} onNavigate={onNavigate} />);
@@ -246,9 +247,9 @@ describe("the overview after a New agent start (PRD #1223 M5)", () => {
     expect(onNavigate).not.toHaveBeenCalled();
     expect(screen.getByTestId("new-agent-waiting")).toBeVisible();
 
-    const started = listing("process-a");
+    const started = listing(startedBy);
     rerender(<AgentOverview runtime={{ ...first, fleet: started, snapshot: started[0] }} onNavigate={onNavigate} />);
-    await waitFor(() => expect(onNavigate).toHaveBeenCalledWith({ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "9", from: "overview", incarnation: "process-a" }));
+    await waitFor(() => expect(onNavigate).toHaveBeenCalledWith({ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "9", from: "overview", incarnation: startedBy }));
     expect(onNavigate).toHaveBeenCalledTimes(1);
   });
 

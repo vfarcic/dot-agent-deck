@@ -130,8 +130,9 @@ describe("terminal state keyed by the daemon process", () => {
   /**
    * Scenario: the old process's Planner streams output; the deck restarts and
    * a pane is opened for the successor Planner, under the same deck and id.
-   * Its attach fails. The pane shows the failure and none of the old
-   * process's bytes; a pane for the old process (control) still replays them.
+   * Its attach fails while a late old-process chunk arrives. The pane shows
+   * the failure and none of the old process's bytes; a pane for the old
+   * process (control) still replays them.
    */
   it("never replays the previous process's output under its successor", async () => {
     let feedTerminal: ((event: TerminalChunk) => void) | undefined;
@@ -156,6 +157,9 @@ describe("terminal state keyed by the daemon process", () => {
       <TerminalViewport agentId="planner" deckId={FIXTURE_DAEMON_ID} incarnation="process-b" label="Planner" transcript="" terminalFeed={result.current.terminalFeed} onInput={() => {}} onResize={() => {}} />,
     );
     expect(writes.join("")).not.toContain(OLD_OUTPUT);
+
+    act(() => feedTerminal?.({ agentId: "planner", deckId: FIXTURE_DAEMON_ID, incarnation: "process-a", data: new TextEncoder().encode(OLD_OUTPUT), stream: "output", operation: "append", generation: 1 }));
+    expect(writes.join(""), "a late old-process chunk must not notify the successor's listener").not.toContain(OLD_OUTPUT);
 
     // The successor's attach fails: the sentence lands on the successor's own
     // buffer, and it carries no part of the old process's backlog.

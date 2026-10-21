@@ -1214,10 +1214,11 @@ describe("New agent dialog — after the start (PRD #1223 M5)", () => {
    * Scenario: daemon process A accepts the start and returns agent `7`. Before
    * the wait sees it, the deck restarts as process B and lists an unrelated
    * agent `7`: the dialog keeps waiting and opens nothing. When the deck lists
-   * A's `7` (control), the pane is asked for once, bound to process A.
+   * A's `7` (control), the pane is asked for once, bound to process A; a start
+   * that named no process must likewise wait for an unnamed row.
    */
-  it("never takes a restarted deck's agent with the same id for the one it started", async () => {
-    const runtime = fakeRuntime({ runAction: vi.fn(async () => ({ ok: true, agentId: "7", agentIncarnation: "process-a" })) });
+  it.each(["process-a", undefined])("never takes a restarted deck's agent with the same id for the one it started (%s)", async (startedBy) => {
+    const runtime = fakeRuntime({ runAction: vi.fn(async () => ({ ok: true, agentId: "7", agentIncarnation: startedBy })) });
     const { onAppeared, rerenderWith } = renderDialog(runtime, { initialDeckId: LOCAL });
     await reachForm();
 
@@ -1231,9 +1232,9 @@ describe("New agent dialog — after the start (PRD #1223 M5)", () => {
     expect(onAppeared).not.toHaveBeenCalled();
     expect(screen.getByTestId("new-agent-waiting")).toBeVisible();
 
-    rerenderWith({ ...runtime, fleet: listing("process-a") });
+    rerenderWith({ ...runtime, fleet: listing(startedBy) });
     await waitFor(() => expect(onAppeared).toHaveBeenCalledTimes(1));
-    expect(onAppeared).toHaveBeenCalledWith({ deckId: LOCAL, agentId: "7", incarnation: "process-a" });
+    expect(onAppeared).toHaveBeenCalledWith({ deckId: LOCAL, agentId: "7", incarnation: startedBy });
   });
 
   /**
