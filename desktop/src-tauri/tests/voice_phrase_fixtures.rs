@@ -446,7 +446,7 @@ async fn voice_paraphrase_fixtures_match_the_default_backend() {
 }
 
 /// Scenario: Classify start sentences over the open New agent form, bypassing command selection, and read only whether each says where to start or names what to start.
-/// Every sentence naming a target — a daemon, a machine or the agent, known to the app or not — must be judged to name one in at least nine of ten samples, since forgiving the form's echoed deck takes both votes' no; each bare start must be judged to name none in most of them.
+/// Measure ten pairs per sentence because production refuses the form's echoed deck when either classifier vote names a target: named targets must refuse in at least nine pairs, while bare starts may refuse in at most one.
 #[tokio::test]
 async fn voice_a_named_start_target_is_read_by_the_real_judge() {
     let Some(resolver) = live_api_resolver() else {
@@ -466,7 +466,7 @@ async fn voice_a_named_start_target_is_read_by_the_real_judge() {
         selected += 1;
         let resolver = resolver.clone();
         tasks.spawn(async move { run_target_judge_fixture(resolver.as_ref(), said, named).await });
-        // One case's samples run in turn, so this bounds requests in flight.
+        // Each case's pairs and their two votes run in turn, bounding requests in flight.
         if tasks.len() == MAX_CONCURRENT_UTTERANCES {
             failures.extend(
                 tasks
@@ -518,7 +518,8 @@ async fn run_target_judge_fixture(
     said: &'static str,
     named: bool,
 ) -> Vec<String> {
-    const REPETITIONS: usize = 10;
+    const PAIRS: usize = 10;
+    const VOTES_PER_PAIR: usize = 2;
     let form = VoiceNewAgent {
         form: Some(VoiceNewAgentForm {
             deck_id: "deck-local".into(),
@@ -532,67 +533,76 @@ async fn run_target_judge_fixture(
     let transcript = Transcript::new(said);
     let actions = every_action(table());
     let mut failures = Vec::new();
-    let mut names = 0;
+    let mut refusing_pairs = 0;
     let mut completed = 0;
-    for repetition in 1..=REPETITIONS {
-        let request = MeaningRequest::new(&transcript, table(), &actions).at(Place::of(
-            Screen::Overview,
-            None,
-            Some(&form),
-        ));
-        match tokio::time::timeout(
-            REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
-            resolver.judge_meaning(request),
-        )
-        .await
-        {
-            Ok(Ok(verdict)) => {
-                let yes = !verdict.names_no_target();
-                completed += 1;
-                names += usize::from(yes);
-                eprintln!(
-                    "names-target: {said} | run {repetition}/{REPETITIONS} | {}",
-                    if yes { "yes" } else { "no" }
-                );
-            }
-            // A vote that fails forgives nothing (`MeaningVerdict::names_no_target`
-            // is never read off it), so it is reported, not counted as either
-            // answer; too few readable votes fails the case below.
-            Ok(Err(error)) => {
-                eprintln!("names-target: {said} | run {repetition}/{REPETITIONS} | {error:?}")
-            }
-            Err(_) => {
-                eprintln!("names-target: {said} | run {repetition}/{REPETITIONS} | timed out")
+    for pair in 1..=PAIRS {
+        let mut names_target = false;
+        for vote in 1..=VOTES_PER_PAIR {
+            let request = MeaningRequest::new(&transcript, table(), &actions).at(Place::of(
+                Screen::Overview,
+                None,
+                Some(&form),
+            ));
+            match tokio::time::timeout(
+                REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
+                resolver.judge_meaning(request),
+            )
+            .await
+            {
+                Ok(Ok(verdict)) => {
+                    let yes = !verdict.names_no_target();
+                    completed += 1;
+                    names_target |= yes;
+                    eprintln!(
+                        "names-target: {said} | pair {pair}/{PAIRS} vote {vote}/{VOTES_PER_PAIR} | {}",
+                        if yes { "yes" } else { "no" }
+                    );
+                }
+                // Failed votes count as neither answer; too few readable votes
+                // still fails the case rather than looking like a correct refusal.
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "names-target: {said} | pair {pair}/{PAIRS} vote {vote}/{VOTES_PER_PAIR} | {error:?}"
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "names-target: {said} | pair {pair}/{PAIRS} vote {vote}/{VOTES_PER_PAIR} | timed out"
+                    );
+                }
             }
         }
+        refusing_pairs += usize::from(names_target);
     }
-    if completed <= REPETITIONS / 2 {
+    let total_votes = PAIRS * VOTES_PER_PAIR;
+    if completed <= total_votes / 2 {
         failures.push(format!(
-            "{said}: only {completed}/{REPETITIONS} readable votes"
+            "{said}: only {completed}/{total_votes} readable votes"
         ));
     }
     eprintln!(
-        "names-target rate: {said} | yes {names}/{completed} | errors {} | expected {}",
-        REPETITIONS - completed,
-        if named { "yes" } else { "no" }
+        "names-target pair rate: {said} | refuses {refusing_pairs}/{PAIRS} | readable votes {completed}/{total_votes} | errors {} | expected {}",
+        total_votes - completed,
+        if named {
+            "at least 9/10"
+        } else {
+            "at most 1/10"
+        }
     );
-    // A named target read as none is the unsafe answer: with the form's deck
-    // echoed, it would start the form on the wrong daemon — but only when
-    // BOTH votes read it so (`Judged::names_no_target`), so one `no` in ten
-    // samples is tolerated and two are not. A bare start read as naming one
-    // costs a refusal, so a minority of those is tolerated.
+    // Production forgives the form's echoed deck only when both votes say no.
+    // Measure that pair decision, tolerating at most one wrong pair per case.
     let accepted = if named {
-        completed - names <= 1
+        refusing_pairs >= PAIRS - 1
     } else {
-        names < REPETITIONS / 2
+        refusing_pairs <= 1
     };
     if !accepted {
         failures.push(format!(
-            "{said}: names_target yes {names}/{completed}, expected {}",
+            "{said}: refusing pairs {refusing_pairs}/{PAIRS}, expected {}",
             if named {
-                format!("at least {}/{completed}", completed.saturating_sub(1))
+                "at least 9/10"
             } else {
-                format!("under {}/{REPETITIONS}", REPETITIONS / 2)
+                "at most 1/10"
             }
         ));
     }
