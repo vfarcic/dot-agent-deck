@@ -47,7 +47,7 @@ fn handshake_013_the_restart_notice_has_a_footer_row_of_its_own() {
     );
 }
 
-/// Scenario: A deck restart stopped five agents while the user types a filter. The filter's field and the notice are both in the footer: the notice names the first three agents and says there are two more, and at ninety columns its buttons take a row of their own below it rather than cut it short. Typing `ac` into Filter or Rename edits the field and keeps the notice; Help and confirmation dialogs also retain their keyboard ownership and leave the notice visible.
+/// Scenario: A deck restart stopped five agents while the user types a filter. The filter's field and the notice are both in the footer: the notice names the first three agents and says there are two more, and at ninety columns its buttons take a row of their own below it rather than cut it short. Typing `ac` into Filter or Rename edits the field and keeps the notice without command-mode key hints; Help and confirmation dialogs also retain their keyboard ownership and leave the notice visible.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_the_restart_notice_shows_beside_a_text_field() {
@@ -80,6 +80,11 @@ fn handshake_013_the_restart_notice_shows_beside_a_text_field() {
         assert!(last.contains(&format!("{field} ac")), "{mode:?}: {last}");
         assert!(last.contains("and 2 more."), "{mode:?}: {last}");
         assert!(!last.contains("Agents stopped by"), "{mode:?}: {last}");
+        assert!(last.contains("[Agents] [Dismiss]"), "{mode:?}: {last}");
+        assert!(
+            !last.contains("[Agents a]") && !last.contains("[Dismiss c]"),
+            "{mode:?}: the field offers keys that belong to typing: {last}"
+        );
     }
     for mode in [
         UiMode::Help,

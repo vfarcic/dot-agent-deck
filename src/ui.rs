@@ -41118,13 +41118,13 @@ mod tests {
         }
     }
 
-    /// Scenario: a TUI attaches a pane on deck process `a`, and the deck restarts as the same build before that attach's placeholder card is drawn: the event stream has already moved to `b`, whose agent reuses the pane and agent ids and has a card on the pane. The late placeholder from `a` is stale: it is not `b`'s card, `b`'s card stays, `b` is sent nothing, the attachment on `a` is dropped and the notice names only `a`'s agent — once, when `a`'s agent also had a card before the restart, and by its pane's name when the late placeholder was its only card. With no restart, the placeholder is the card already there (control).
+    /// Scenario: A TUI attaches a pane on deck process `a`, then receives its placeholder after the stream is on `b`, whose agent reuses its ids. If the stream previously knew `a`, the stale placeholder drops that attachment and names it once; if the stream never knew `a`, the placeholder waits, but the attachment's own reattach-loss signal still removes the pane and visibly names its agent before another stream opens, without evicting `b`'s card or sending it anything. Opening the stream later preserves that one notice, and without a restart the placeholder is the existing card (controls).
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_late_placeholder_never_evicts_the_restarted_decks_card() {
         use crate::daemon_client::Incarnation;
         use crate::daemon_client::restart_fixture::RestartingDaemon;
-        use crate::embedded_pane::EmbeddedPaneController;
+        use crate::embedded_pane::{EmbeddedPaneController, PaneLostReason};
         use tokio::sync::RwLock;
         let named = |process: &str| Incarnation::from(Some(process.to_string()));
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -41132,7 +41132,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        for (restarted, old_card) in [(false, true), (true, true), (true, false)] {
+        for (restarted, old_card, stream_never_knew_a) in [
+            (false, true, false),
+            (true, true, false),
+            (true, false, false),
+            (true, false, true),
+        ] {
             let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
             let controller = Arc::new(
                 EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
@@ -41149,7 +41154,7 @@ mod tests {
             let state: SharedState = Arc::new(RwLock::new(AppState::default()));
             {
                 let mut st = state.blocking_write();
-                st.learn_stream_incarnation(named("a"));
+                st.learn_stream_incarnation(named(if stream_never_knew_a { "b" } else { "a" }));
                 st.register_pane(pane.clone());
                 if old_card {
                     let mut old = restart_card("s-old", Some(&pane), "old", "a");
@@ -41177,6 +41182,24 @@ mod tests {
                 attached_on.clone(),
             );
             process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+
+            if stream_never_knew_a {
+                let rows = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+                assert!(
+                    !rows.contains("The deck restarted"),
+                    "the held placeholder alone reported a restart: {rows}"
+                );
+                assert!(
+                    pc.pane_agent_id(&pane).is_some(),
+                    "the held placeholder alone dropped the attachment"
+                );
+                // The L2 auto-reattach pin exercises the transport that emits
+                // this signal. Here it arrives with no drawn card for `a` and
+                // with the stream staying on `b`, so it must explain the loss
+                // independently of held-placeholder settlement.
+                controller.mark_pane_lost_for_test(&pane, PaneLostReason::DeckRestarted);
+                process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+            }
 
             let st = state.blocking_read();
             if !restarted {
@@ -41213,6 +41236,22 @@ mod tests {
                 pc.pane_agent_id(&pane).is_none(),
                 "the replaced process's attachment was kept"
             );
+            drop(st);
+            let expected = "The deck restarted; these agents were stopped: old.";
+            let rows = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+            assert!(
+                rows.contains(expected),
+                "the lost attachment has no visible explanation: {rows}"
+            );
+            if stream_never_knew_a {
+                state.blocking_write().learn_stream_incarnation(named("b"));
+                process_restart_drops(&state, &*pc, &mut tab_manager, &mut ui);
+                let rows = restart_frame_rows(&state.blocking_read(), &mut ui).join("\n");
+                assert!(
+                    rows.contains(expected) && !rows.contains("old, old"),
+                    "settling the held placeholder changed its explanation: {rows}"
+                );
+            }
         }
     }
 
