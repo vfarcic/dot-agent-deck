@@ -66,7 +66,7 @@ impl LaunchSlots {
     /// A slot, or `None` when `max` are already claimed.
     pub fn claim(&self) -> Option<LaunchSlot<'_>> {
         self.in_use
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < self.max).then_some(n + 1)
             })
             .ok()
