@@ -629,12 +629,32 @@ fn handshake_011_reconnect_rechecks_protocol_before_reattaching() {
     }
 }
 
-/// Scenario: Attach a pane in the real TUI, restart its isolated daemon with the same binary, and create a successor agent with the recycled id in a different pane. Ctrl+W on the old pane must display "that agent is gone (the deck restarted)" and leave the successor agent alive and named as before; closing a freshly listed successor card is the control.
+/// Scenario: Attach an agent in the real TUI and restart its isolated daemon with the same binary, recycling the agent id in a different pane. Its card and a genuinely dispatched unit disappear with one notice while the unit’s git worktree, committed files and branch survive, and the successor stays alive, unrenamed and receives no input; a fresh TUI can still close that successor (control).
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_ctrl_w_after_a_same_build_restart_preserves_the_successor() {
     use inbox::*;
     let mut original = spawn_daemon_at_build(NEW_BUILD);
+    // The daemon and every checkout below belong to this test's private root.
+    assert!(
+        common::fixture_git(&original.home, &original.home)
+            .arg("init")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    std::fs::write(
+        original.home.join(".gitignore"),
+        "*\n!.gitignore\n!restart-worktree.txt\n",
+    )
+    .unwrap();
+    std::fs::write(
+        original.home.join("restart-worktree.txt"),
+        "committed unit work\n",
+    )
+    .unwrap();
+    common::commit_fixture_repo(&original.home);
     let old = pane_with(
         &original,
         "old-restart-pane",
@@ -644,13 +664,59 @@ fn handshake_013_ctrl_w_after_a_same_build_restart_preserves_the_successor() {
     let deck = launch_tui_against(&original, NEW_BUILD);
     deck.wait_for_string("OLD-ATTACHED-PTY-1666");
 
-    let stopped = original
-        .send_attach_request(&AttachRequest::StopDaemon { force: true })
-        .expect("stop the fixture-owned daemon");
-    assert!(stopped.ok, "{stopped:?}");
+    struct OwnedWorktree(std::path::PathBuf);
+    impl Drop for OwnedWorktree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let worktree = OwnedWorktree(
+        original
+            .home
+            .parent()
+            .unwrap()
+            .join("home-dispatch-restart-kept-unit"),
+    );
+    let admitted = hook(
+        &original,
+        serde_json::json!({
+            "message_type": "dispatch", "pane_id": old.id, "token": old.token,
+            "name": "restart-kept-unit", "task": "Wait for the test to stop this stand-in.",
+            "shape": { "kind": "single_agent" }, "timestamp": chrono::Utc::now(),
+        }),
+    );
+    assert_eq!(
+        admitted["accepted"], true,
+        "fixture dispatch admission: {admitted}"
+    );
+    deck.wait_for_string("restart-kept-unit");
+    deck.wait_for_string("2 agent(s)");
+    assert!(
+        worktree.0.join(".git").is_file(),
+        "dispatch must make a real git worktree"
+    );
+    let source_repo = original.home.clone();
+    let branch = || {
+        let output = common::fixture_git(&source_repo, &source_repo)
+            .args(["rev-parse", "refs/heads/agent/dispatch-restart-kept-unit"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the dispatched unit's branch disappeared"
+        );
+        output.stdout
+    };
+    let branch_before = branch();
+
+    assert!(
+        original
+            .send_attach_request(&AttachRequest::StopDaemon { force: true })
+            .unwrap()
+            .ok
+    );
     assert!(original.wait_for_exit(Duration::from_secs(10)));
-    // The old fixture's Drop carries an unbound cleanup stop; finish it before
-    // placing a successor at this socket so cleanup cannot stop a recycled id.
+    // Finish old fixture cleanup before its unbound stop could hit a reused id.
     drop(old);
     let successor = spawn_daemon_serve_with_env(
         None,
@@ -672,46 +738,84 @@ fn handshake_013_ctrl_w_after_a_same_build_restart_preserves_the_successor() {
         new.agent, old_agent,
         "precondition: daemon recycles the agent id"
     );
-    deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected agent?");
-    deck.send_keys(b"\x1b[B");
-    deck.send_keys(b"\r");
-    deck.wait_for_string(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART);
+    deck.wait_until_grid(
+        "one restart notice names the attached agent and dispatched unit",
+        |grid| {
+            grid.contains("The deck restarted; these agents were stopped:")
+                && grid.contains("old-restart-pane")
+                && grid.contains("restart-kept-unit")
+        },
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.0.join("restart-worktree.txt")).unwrap(),
+        "committed unit work\n",
+        "restart drop removed the unit's worktree contents"
+    );
+    assert!(
+        worktree.0.join(".git").is_file(),
+        "restart drop removed the unit's git worktree"
+    );
+    assert_eq!(
+        branch(),
+        branch_before,
+        "restart drop changed the unit's branch"
+    );
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("OLD-ATTACHED-PTY-1666"),
+        "old pane stayed open: {grid}"
+    );
+    assert!(
+        !grid.contains("Close selected agent?"),
+        "drop prompted a daemon close: {grid}"
+    );
+    assert!(
+        !grid.contains(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART),
+        "{grid}"
+    );
     assert!(
         wait_for_agent_display_name(
             &successor.attach_socket,
             "successor-other-pane",
             true,
-            Duration::from_secs(5),
+            Duration::from_secs(5)
         ),
-        "closing the old pane must leave the successor agent alive and unrenamed"
+        "dropping the old pane must leave the successor alive and unrenamed"
+    );
+    assert!(
+        std::fs::read(&new.capture).unwrap().is_empty(),
+        "drop sent successor input"
     );
     let fresh = launch_tui_against(&successor, NEW_BUILD);
     fresh.wait_for_string("successor-other-pane");
     fresh.send_keys(b"\x17");
     fresh.wait_for_string("Close selected agent?");
-    fresh.send_keys(b"\x1b[B");
-    fresh.send_keys(b"\r");
+    fresh.send_keys(b"\x1b[B\r");
     fresh.wait_for_string("No active agents");
     assert!(
         wait_for_agent_display_name(
             &successor.attach_socket,
             "successor-other-pane",
             false,
-            Duration::from_secs(5),
+            Duration::from_secs(5)
         ),
         "control: a fresh card closes the successor agent"
     );
 }
 
-/// Scenario: start with an empty TUI, let a daemon-spawned card arrive without attaching its terminal, then restart the daemon as the same build reusing both ids. Ctrl+W, digit focus and Enter on separate stale cards must show the gone sentence, attach nothing and leave the successor alive; without a restart those same actions close or attach the original agent (controls). After the subscriber learns the restart and the successor reports, the selected old card stays visibly Gone beside the successor's own card, refuses Enter, rename and config, and closes locally without a confirmation.
+/// Scenario: Start an empty TUI and surface a card without attaching it, then restart its private daemon reusing its ids. With event subscriptions held, stale close, digit and Enter refuse visibly and leave the successor alive with no input; the same-process actions still work (controls). Once subscriptions resume, the old card disappears with one notice, selection falls back to an earlier fresh card rather than the same-pane successor, and Enter opens only that earlier card.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_restart() {
     use inbox::*;
-    for action in ["close", "digit", "enter", "retired"] {
+    for action in ["close", "digit", "enter", "drop"] {
         for restarted in [false, true] {
             let mut original = spawn_daemon_at_build(NEW_BUILD);
+            // Reserve agent 1 so the replacement can list a card before the
+            // same-pane, same-agent-id successor in the selection case.
+            if action == "drop" {
+                drop(pane(&original, "reserve-earlier-id"));
+            }
             let proxy = reconnect::AttachProxy::new(&original.attach_socket);
             let deck = TuiDeck::builder()
                 .with_env(
@@ -731,7 +835,6 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
                 serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "ORIGINAL-NEVER-ATTACHED-1666"]]}),
             );
             deck.wait_for_string("never-attached-card");
-            // Select the surfaced card without entering its terminal.
             deck.send_keys(b"\x1b[B");
             deck.wait_until_grid("old never-attached card selected before restart", |grid| {
                 grid.lines()
@@ -740,171 +843,156 @@ fn handshake_013_a_never_attached_card_refuses_close_digit_and_enter_after_resta
             assert_eq!(
                 proxy.attach_count(),
                 0,
-                "precondition: the TUI never attached this card"
+                "precondition: this TUI never attached the card"
             );
             let old_id = old.agent.clone();
-            let successor = if restarted {
-                assert!(
-                    original
-                        .send_attach_request(&AttachRequest::StopDaemon { force: true })
-                        .unwrap()
-                        .ok
-                );
-                assert!(original.wait_for_exit(Duration::from_secs(10)));
-                drop(old);
-                Some(spawn_daemon_serve_with_env(
-                    None,
-                    "0",
-                    &[
-                        ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
-                        (
-                            "DOT_AGENT_DECK_ATTACH_SOCKET",
-                            original.attach_socket.to_str().unwrap(),
-                        ),
-                        (
-                            "DOT_AGENT_DECK_SOCKET",
-                            original.hook_socket.to_str().unwrap(),
-                        ),
-                    ],
-                ))
-            } else {
-                None
-            };
-            let new = successor.as_ref().map(|daemon| {
-                let pane = pane_with(
-                    daemon,
-                    "never-attached-card",
-                    serde_json::json!({"display_name":"successor-own-card", "env":[["DOORBELL_STANDIN_LABEL", "SUCCESSOR-NEVER-ATTACHED-1666"]]}),
-                );
-                assert_eq!(pane.agent, old_id, "precondition: both ids are reused");
-                pane
-            });
-            if action == "retired"
-                && let Some(ref successor) = successor
-            {
-                let gone = dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART;
-                // The pane was learned after initial hydration and is not
-                // managed by this TUI. Its successor surfaces when it reports.
-                status(successor, new.as_ref().unwrap(), "thinking", "claude_code");
-                deck.wait_until_grid("old Gone card beside the successor's own card", |grid| {
-                    grid.contains(" Gone ")
-                        && grid.contains(gone)
-                        && grid.contains("never-attached-card")
-                        && grid.contains("Thinking")
-                        && grid.contains("2 agent(s)")
-                });
-                // Selection must stay on the old card through retirement.
-                let grid = deck.snapshot_grid();
-                assert!(
-                    grid.lines().any(|line| {
-                        line.split(['┌', '┏']).any(|card| {
-                            card.contains('▸')
-                                && card.contains("never-attached-card")
-                                && card.contains("Gone")
-                        })
-                    }),
-                    "selection moved off the retired card onto its successor; grid=\n{grid}"
-                );
-                for keys in [b"\r".as_slice(), b"r", b"g"] {
-                    deck.send_keys(keys);
-                    deck.wait_for_string(gone);
-                    let grid = deck.snapshot_grid();
-                    assert!(
-                        !grid.contains("Rename:")
-                            && !grid.contains("Generate Config")
-                            && !grid.contains("SUCCESSOR-NEVER-ATTACHED-1666"),
-                        "a retired card accepted an action; grid=\n{grid}"
-                    );
-                    assert_eq!(
-                        proxy.attach_count(),
-                        0,
-                        "a retired card attached a terminal"
-                    );
+            if !restarted {
+                match action {
+                    "close" => {
+                        deck.send_keys(b"\x17");
+                        deck.wait_for_string("Close selected agent?");
+                        deck.send_keys(b"\x1b[B\r");
+                        deck.wait_for_string("No active agents");
+                        assert!(wait_for_agent_display_name(
+                            &original.attach_socket,
+                            "never-attached-card",
+                            false,
+                            Duration::from_secs(5)
+                        ));
+                        assert_eq!(proxy.attach_count(), 0, "control: close needs no attach");
+                    }
+                    "digit" | "enter" | "drop" => {
+                        deck.send_keys(if action == "digit" { b"1" } else { b"\r" });
+                        deck.wait_for_string("ORIGINAL-NEVER-ATTACHED-1666");
+                        assert!(
+                            proxy.attach_count() > 0,
+                            "control: {action} attaches the original agent"
+                        );
+                    }
+                    _ => unreachable!(),
                 }
-                deck.send_keys(b"\x17");
-                deck.wait_for_absence("never-attached-card");
+                continue;
+            }
+
+            proxy.hold_events(true);
+            assert!(
+                original
+                    .send_attach_request(&AttachRequest::StopDaemon { force: true })
+                    .unwrap()
+                    .ok
+            );
+            assert!(original.wait_for_exit(Duration::from_secs(10)));
+            drop(old);
+            let successor = spawn_daemon_serve_with_env(
+                None,
+                "0",
+                &[
+                    ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD),
+                    (
+                        "DOT_AGENT_DECK_ATTACH_SOCKET",
+                        original.attach_socket.to_str().unwrap(),
+                    ),
+                    (
+                        "DOT_AGENT_DECK_SOCKET",
+                        original.hook_socket.to_str().unwrap(),
+                    ),
+                ],
+            );
+            let earlier = (action == "drop").then(|| pane_with(
+                &successor, "first",
+                serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "EARLIER-FRESH-PTY-1666"]]}),
+            ));
+            let new = pane_with(
+                &successor,
+                "never-attached-card",
+                serde_json::json!({"display_name":"successor-own-card", "env":[["DOORBELL_STANDIN_LABEL", "SUCCESSOR-NEVER-ATTACHED-1666"]]}),
+            );
+            assert_eq!(new.agent, old_id, "precondition: both ids are reused");
+            if let Some(earlier) = earlier.as_ref() {
+                proxy.hold_events(false);
+                deck.wait_for_string(
+                    "The deck restarted; these agents were stopped: never-attached-card.",
+                );
+                // Neither fresh pane was managed by this TUI. Report after
+                // the notice proves the subscriber reads the new stream.
+                status(&successor, earlier, "session_start", "claude_code");
+                status(&successor, earlier, "idle", "claude_code");
+                status(&successor, &new, "thinking", "claude_code");
+                let earlier_title = format!("doorbell-{}", earlier.agent);
+                deck.wait_until_grid("drop notice and two fresh cards", |grid| {
+                    grid.contains(
+                        "The deck restarted; these agents were stopped: never-attached-card.",
+                    ) && grid.contains("2 agent(s)")
+                        && grid.contains("Thinking")
+                        && grid.contains(&earlier_title)
+                });
                 let grid = deck.snapshot_grid();
-                assert!(!grid.contains("Close selected agent?"), "{grid}");
-                assert!(grid.contains("Thinking"), "{grid}");
-                assert!(grid.contains(&format!("Closed the card: {gone}")), "{grid}");
-                assert!(wait_for_agent_display_name(
+                // The old label is allowed in the notice, never in a card.
+                assert!(
+                    !grid
+                        .lines()
+                        .any(|line| (line.contains('┌') || line.contains('┏'))
+                            && line.contains("never-attached-card")),
+                    "old card was kept: {grid}"
+                );
+                assert!(
+                    grid.lines().any(|line| line
+                        .split(['┌', '┏'])
+                        .any(|card| { card.contains('▸') && card.contains(&earlier_title) })),
+                    "selection inherited the same-pane successor instead of falling back: {grid}"
+                );
+                assert!(!grid.contains(" Gone "), "retired card was kept: {grid}");
+                assert_eq!(proxy.attach_count(), 0, "drop attached an agent");
+                deck.send_keys(b"\r");
+                deck.wait_for_string("EARLIER-FRESH-PTY-1666");
+                assert_eq!(
+                    proxy.attach_count(),
+                    1,
+                    "Enter must attach only the earlier fresh card"
+                );
+            } else {
+                match action {
+                    "close" => {
+                        deck.send_keys(b"\x17");
+                        deck.wait_for_string("Close selected agent?");
+                        deck.send_keys(b"\x1b[B\r");
+                    }
+                    "digit" => deck.send_keys(b"1"),
+                    "enter" => deck.send_keys(b"\r"),
+                    _ => unreachable!(),
+                }
+                deck.wait_for_string(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART);
+                assert_eq!(
+                    proxy.attach_count(),
+                    0,
+                    "{action}: stale action attached a terminal"
+                );
+                proxy.hold_events(false);
+            }
+            let grid = deck.snapshot_grid();
+            assert!(
+                !grid.contains("SUCCESSOR-NEVER-ATTACHED-1666"),
+                "{action}: successor output appeared in old pane: {grid}"
+            );
+            assert!(
+                wait_for_agent_display_name(
                     &successor.attach_socket,
                     "successor-own-card",
                     true,
                     Duration::from_secs(5)
-                ));
-                assert!(
-                    std::fs::read(&new.as_ref().unwrap().capture)
-                        .unwrap()
-                        .is_empty()
-                );
-                continue;
-            }
-            match action {
-                "close" => {
-                    deck.send_keys(b"\x17");
-                    deck.wait_for_string("Close selected agent?");
-                    deck.send_keys(b"\x1b[B\r");
-                }
-                "digit" => deck.send_keys(b"1"),
-                "enter" | "retired" => deck.send_keys(b"\r"),
-                _ => unreachable!(),
-            }
-            if let Some(ref successor) = successor {
-                deck.wait_for_string(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART);
-                let grid = deck.snapshot_grid();
-                assert_eq!(
-                    proxy.attach_count(),
-                    0,
-                    "{action}: a stale card attached the successor; grid=\n{grid}"
-                );
-                assert!(
-                    !grid.contains("SUCCESSOR-NEVER-ATTACHED-1666"),
-                    "{action}: successor output appeared in the stale card; grid=\n{grid}"
-                );
-                assert!(
-                    wait_for_agent_display_name(
-                        &successor.attach_socket,
-                        "successor-own-card",
-                        true,
-                        Duration::from_secs(5)
-                    ),
-                    "{action}: the successor must stay alive"
-                );
-                assert!(
-                    std::fs::read(&new.as_ref().unwrap().capture)
-                        .unwrap()
-                        .is_empty(),
-                    "{action}: the successor must receive no terminal input"
-                );
-            } else if action == "close" {
-                deck.wait_for_string("No active agents");
-                assert!(
-                    wait_for_agent_display_name(
-                        &original.attach_socket,
-                        "never-attached-card",
-                        false,
-                        Duration::from_secs(5)
-                    ),
-                    "control: close stops the original agent"
-                );
-                assert_eq!(
-                    proxy.attach_count(),
-                    0,
-                    "control: close needs no terminal attach"
-                );
-            } else {
-                deck.wait_for_string("ORIGINAL-NEVER-ATTACHED-1666");
-                assert!(
-                    proxy.attach_count() > 0,
-                    "control: {action} attaches the original agent"
-                );
-            }
+                ),
+                "{action}: successor must stay alive and unrenamed"
+            );
+            drained(&new);
+            assert!(
+                std::fs::read(&new.capture).unwrap().is_empty(),
+                "{action}: successor must receive no terminal input"
+            );
         }
     }
 }
 
-/// Scenario: keep a terminal open while the daemon restarts as the same build and reuses both the agent id and pane id. Input typed during the disconnect must not migrate, the successor's terminal output must never appear in the old pane, and Ctrl+W must show the gone sentence while leaving the successor running.
+/// Scenario: Keep a terminal open while its private daemon restarts using both recycled ids, and type during the disconnect. The old pane closes with the single restart notice, without a per-pane gone sentence, successor output or migrated input; holding event subscriptions makes the reattach refusal itself drive this visible outcome.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_auto_reattach_never_adopts_a_same_pane_successor() {
@@ -916,10 +1004,26 @@ fn handshake_013_auto_reattach_never_adopts_a_same_pane_successor() {
         serde_json::json!({"env":[["DOORBELL_STANDIN_LABEL", "ORIGINAL-PTY-1666"]]}),
     );
     let old_id = old.agent.clone();
-    let deck = launch_tui_against(&original, NEW_BUILD);
+    let proxy = reconnect::AttachProxy::new(&original.attach_socket);
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            proxy.socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            original.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+        .launch_with_fixture("minimal");
     deck.wait_for_string("ORIGINAL-PTY-1666");
     deck.send_keys(b"\r");
     deck.wait_for_string("[Command Mode Ctrl+D]");
+    assert!(common::wait_until(Duration::from_secs(10), || proxy
+        .subscription_count()
+        > 0));
+    let subscriptions = proxy.subscription_count();
+    proxy.hold_events(true);
     assert!(
         original
             .send_attach_request(&AttachRequest::StopDaemon { force: true })
@@ -928,7 +1032,6 @@ fn handshake_013_auto_reattach_never_adopts_a_same_pane_successor() {
     );
     assert!(original.wait_for_exit(Duration::from_secs(10)));
     drop(old);
-    // These keystrokes belong to the old pane, before any successor exists.
     deck.send_keys(b"QUEUED-FOR-ORIGINAL-1666\r");
     let successor = spawn_daemon_serve_with_env(
         None,
@@ -954,20 +1057,52 @@ fn handshake_013_auto_reattach_never_adopts_a_same_pane_successor() {
         new.agent, old_id,
         "precondition: agent and pane ids are reused"
     );
-    let gone = dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART;
-    let observed = deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| {
-        grid.contains(gone) || grid.contains("SUCCESSOR-PTY-1666")
-    });
-    let grid = deck.snapshot_grid();
-    let bytes = std::fs::read(&new.capture).unwrap_or_default();
-    assert!(
-        observed && grid.contains(gone) && !grid.contains("SUCCESSOR-PTY-1666") && bytes.is_empty(),
-        "old pane adopted the replacement or migrated buffered input; successor_input={bytes:?}; grid=\n{grid}"
+    let notice = "The deck restarted; these agents were stopped: reused-pane.";
+    deck.wait_until_grid(
+        "reattach drops old pane with only the restart notice",
+        |grid| {
+            assert!(
+                !grid.contains(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART),
+                "reattach leaked its per-pane gone sentence: {grid}"
+            );
+            assert!(
+                !grid.contains("SUCCESSOR-PTY-1666"),
+                "old pane adopted successor: {grid}"
+            );
+            grid.contains(notice)
+        },
     );
-    deck.send_keys(b"\x04\x17");
-    deck.wait_for_string("Close selected agent?");
-    deck.send_keys(b"\x1b[B\r");
-    deck.wait_for_string(gone);
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("ORIGINAL-PTY-1666"),
+        "old pane stayed open: {grid}"
+    );
+    assert!(
+        !grid.contains("[Command Mode Ctrl+D]"),
+        "input mode survived its lost pane: {grid}"
+    );
+    proxy.hold_events(false);
+    assert!(common::wait_until(Duration::from_secs(10), || proxy
+        .subscription_count()
+        > subscriptions));
+    // A fresh event makes the next rendered frame an observable barrier:
+    // a warning queued after the first notice must not replace it later.
+    status(&successor, &new, "session_start", "claude_code");
+    status(&successor, &new, "thinking", "claude_code");
+    deck.wait_for_string("Thinking");
+    let grid = deck.snapshot_grid();
+    assert!(
+        grid.contains(notice),
+        "the restart notice was replaced: {grid}"
+    );
+    assert!(
+        !grid.contains(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART),
+        "reattach leaked a later per-pane gone sentence: {grid}"
+    );
+    assert!(
+        !grid.contains("SUCCESSOR-PTY-1666"),
+        "old pane adopted successor: {grid}"
+    );
     assert!(
         wait_for_agent_display_name(
             &successor.attach_socket,
@@ -975,18 +1110,35 @@ fn handshake_013_auto_reattach_never_adopts_a_same_pane_successor() {
             true,
             Duration::from_secs(5)
         ),
-        "later close must leave the successor alive"
+        "drop must leave successor alive and unrenamed"
+    );
+    drained(&new);
+    assert!(
+        std::fs::read(&new.capture).unwrap().is_empty(),
+        "buffered input migrated"
     );
 }
 
-/// Scenario: rename an attached agent successfully, then restart its daemon as the same build and try another rename on its stale card. The refusal must be visible in the TUI as the shared gone sentence, and the successor's name must stay unchanged.
+/// Scenario: Rename an attached agent successfully, then restart its private daemon as the same build. Hold its original terminal transport and event subscriptions so a stale rename can be refused visibly before the restart is learned, then release them: the old card and pane disappear with a notice naming the confirmed label, and the successor remains alive, unrenamed and receives no input.
 #[spec("lifecycle/handshake/013")]
 #[test]
 fn handshake_013_a_stale_rename_shows_the_gone_sentence() {
     use inbox::*;
     let mut original = spawn_daemon_at_build(NEW_BUILD);
     let old = pane(&original, "rename-original");
-    let deck = launch_tui_against(&original, NEW_BUILD);
+    let old_agent = old.agent.clone();
+    let proxy = reconnect::AttachProxy::new(&original.attach_socket);
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            proxy.socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            original.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", NEW_BUILD)
+        .launch_with_fixture("minimal");
     deck.wait_for_string("rename-original");
     deck.send_keys(b"r");
     deck.wait_for_string("Rename:");
@@ -1001,6 +1153,8 @@ fn handshake_013_a_stale_rename_shows_the_gone_sentence() {
         ),
         "same-incarnation rename control"
     );
+    proxy.hold_events(true);
+    proxy.hold_terminal_eof(true);
     assert!(
         original
             .send_attach_request(&AttachRequest::StopDaemon { force: true })
@@ -1024,11 +1178,32 @@ fn handshake_013_a_stale_rename_shows_the_gone_sentence() {
             ),
         ],
     );
-    let _new = pane(&successor, "rename-successor");
+    let new = pane(&successor, "rename-successor");
+    assert_eq!(new.agent, old_agent, "precondition: agent id reused");
     deck.send_keys(b"r");
     deck.wait_for_string("Rename:");
     deck.send_keys(b"stale-rename\r");
     deck.wait_for_string(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART);
+    proxy.hold_events(false);
+    proxy.hold_terminal_eof(false);
+    deck.wait_for_string("The deck restarted; these agents were stopped: rename-control.");
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"r");
+    // A subsequent key opens a known form, proving r was processed without
+    // leaving a stale rename editor accepting the user's next keystrokes.
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("Rename:"),
+        "stale rename editor stayed open: {grid}"
+    );
+    assert!(
+        !grid
+            .lines()
+            .any(|line| line.contains('│') && line.contains("rename-control")),
+        "old card was kept: {grid}"
+    );
     assert!(
         wait_for_agent_display_name(
             &successor.attach_socket,
@@ -1037,6 +1212,11 @@ fn handshake_013_a_stale_rename_shows_the_gone_sentence() {
             Duration::from_secs(5)
         ),
         "stale rename must not relabel successor"
+    );
+    drained(&new);
+    assert!(
+        std::fs::read(&new.capture).unwrap().is_empty(),
+        "rename sent successor input"
     );
 }
 

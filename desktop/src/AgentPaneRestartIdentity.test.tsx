@@ -152,19 +152,30 @@ describe("an open pane across a deck restart that reuses its agent id", () => {
     expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-b" }, "typed");
   });
 
-  /** Scenario: a Planner pane opened over the Daemons screen, then the deck restarts and lists an unrelated Planner under the same id. The pane closes rather than promoting the newcomer's tile, and the one restart notice names the agents the restart stopped. */
-  it("closes a deck-origin pane over a reused id and says why", async () => {
+  /** Scenario: open Planner using only its deck and agent ids over either screen, immediately or before its first listing arrives. The first named listing opens its own terminal (control); after a restart reuses that id, the old pane closes without becoming the successor's, and one notice names the stopped agents. */
+  it.each([
+    ["deck", false], ["overview", false], ["deck", true], ["overview", true],
+  ] as const)("closes an ids-only %s pane over a reused id and says why (late first listing: %s)", async (from, late) => {
     const deck = harness();
-    const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "deck" as const };
-    const { rerender } = render(<DeckShell runtime={deck.runtime("process-a")} initialView={view} />);
+    const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", from };
+    const first = deck.runtime("process-a");
+    const unseen = { ...first.snapshot, agents: [], connection: { ...first.snapshot.connection, status: "disconnected" as const, incarnation: undefined } };
+    const { rerender } = render(<DeckShell runtime={late ? { ...first, snapshot: unseen, fleet: [unseen] } : first} initialView={view} />);
+    if (late) {
+      expect(deck.declared()).toEqual([]);
+      await act(async () => { rerender(<DeckShell runtime={first} initialView={view} />); });
+    }
     expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("heading", { name: "Planner" })).toBeVisible();
+    expect(deck.declared()).toContainEqual(expect.objectContaining({ agentId: "planner", incarnation: "process-a" }));
 
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-b")} initialView={view} />); });
 
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
-    expect(screen.getByTestId("agent-tile-successor")).toHaveAttribute("data-presentation", "tile");
+    if (from === "deck") expect(screen.getByTestId("agent-tile-successor")).toHaveAttribute("data-presentation", "tile");
     expect(screen.getAllByTestId("restart-toast")).toHaveLength(1);
     expectRestartNotice();
+    if (from === "overview") expect(deck.declared().filter((target) => target.incarnation === "process-b")).toEqual([]);
+    expect(deck.sendTerminalInput).not.toHaveBeenCalled();
     expect(screen.queryByTestId("toast"), "the restart notice is the one sentence about the pane").not.toBeInTheDocument();
     expect(deck.runAction).not.toHaveBeenCalled();
   });

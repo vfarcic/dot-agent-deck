@@ -39853,7 +39853,7 @@ mod tests {
         card
     }
 
-    /// Scenario: this TUI holds a standalone pane, an orchestration tab "team" whose two role panes run in a dispatched unit's worktree, and a card for an agent it never attached, all on deck process `a`, plus a pane whose card was drawn before any stream named a process. The deck restarts as the same build and its new agent takes the standalone pane's id. The TUI drops every card, local pane and the orchestration tab of process `a`, and the pane whose reattach found the new process, sends nothing to the deck, leaves the worktree on disk, gives the new agents their own cards — one under the selected card's key gets neither its name nor its selection — and shows one notice: "The deck restarted; these agents were stopped: coder (worker in team), far-away, lead (orchestrator in team), solo, quiet." When the stream reopens on `a` itself, nothing is dropped and no notice shows (control).
+    /// Scenario: A same-build restart drops this TUI's stopped cards, panes and emptied unit tab locally, keeps a new-process tab active, leaves the worktree files intact and shows one notice naming the stopped agents, while a same-process reconnect keeps them (control). The remembered Dashboard key is cleared even while another tab stays active, so a reused key inherits neither name nor selection. A queued orchestration attaches only on its originating process, and a placeholder learned from that actual attach can post to its process but refuses a successor that reuses its ids.
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_restart_drops_its_agents_locally_with_one_notice() {
@@ -39882,7 +39882,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        for restarted in [false, true] {
+        for (restarted, keep_other_active) in [(false, false), (true, false), (true, true)] {
             let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
             let controller = Arc::new(
                 EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
@@ -39973,6 +39973,27 @@ mod tests {
                         .insert("s-far".into(), restart_card("s-far", None, "far-new", "b"));
                 }
             }
+            // Keep another, new-process tab active while the old unit's tab
+            // goes. Returning to Dashboard before clearing its key would mask
+            // an active-tab-only implementation.
+            let surviving_pane = keep_other_active.then(|| {
+                let survivor = controller.create_pane(Some("cat"), None).unwrap();
+                let other = OrchestrationConfig {
+                    default: false,
+                    name: "unaffected".into(),
+                    roles: vec![role("orchestrator", true)],
+                };
+                tab_manager
+                    .open_orchestration_tab_with_existing_role_panes(
+                        &other,
+                        worktree.path().to_str().unwrap(),
+                        vec![Some(survivor.clone())],
+                        None,
+                        Some("other-unit"),
+                    )
+                    .unwrap();
+                survivor
+            });
             let sent = (
                 daemon.received_by("a"),
                 daemon.received_by("b"),
@@ -40025,7 +40046,11 @@ mod tests {
                     "{pane}'s local pane was kept"
                 );
             }
-            assert_eq!(tab_manager.tab_count(), 1, "the unit's tab was kept");
+            assert_eq!(
+                tab_manager.tab_count(),
+                if keep_other_active { 2 } else { 1 },
+                "the stopped unit's tab was kept or another tab was removed"
+            );
             assert_eq!(
                 glossary_status_text(&ui),
                 Some(
@@ -40044,7 +40069,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    tab_manager.active_tab(),
+                    &tab_manager.tabs()[0],
                     Tab::Dashboard {
                         selected_session_id: None,
                         ..
@@ -40052,6 +40077,111 @@ mod tests {
                 ),
                 "the new agent under the key would take the old one's selection"
             );
+            if let Some(survivor) = surviving_pane {
+                assert!(
+                    matches!(tab_manager.active_tab(), Tab::Orchestration { name, .. } if name == "unaffected")
+                );
+                assert!(
+                    pc.pane_agent_id(&survivor).is_some(),
+                    "the unrelated pane was dropped"
+                );
+            }
+        }
+
+        // A queue stamp must also survive CONSUMPTION, not just storage.
+        // Drive the real render-thread consumer against a named fake deck.
+        for restarted in [false, true] {
+            let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
+            let controller = Arc::new(
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                    .with_protocol_gate(),
+            );
+            let pc: Arc<dyn PaneController> = controller.clone();
+            let mut tabs = TabManager::new(pc.clone());
+            let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+            let cwd = tempfile::tempdir().unwrap();
+            {
+                let mut st = state.blocking_write();
+                st.learn_stream_incarnation(named("a"));
+                st.queue_orchestration_surface(crate::event::OrchestrationSurface {
+                    name: "queued-team".into(),
+                    cwd: cwd.path().to_string_lossy().into_owned(),
+                    display_title: None,
+                    orchestration_id: Some("queued-unit".into()),
+                    roles: vec![crate::event::OrchestrationSurfaceRole {
+                        pane_id: "pane-1".into(),
+                        role_index: 0,
+                        role_name: "orchestrator".into(),
+                        is_start_role: true,
+                    }],
+                    context_path: None,
+                });
+                if restarted {
+                    daemon.restart_as("b");
+                    st.learn_stream_incarnation(named("b"));
+                }
+            }
+            let mut ui = default_ui();
+            process_pending_orchestration_surfaces(&state, &pc, &mut tabs, &mut ui);
+            if restarted {
+                assert!(
+                    controller.pane_ids().is_empty(),
+                    "queued surface attached the successor"
+                );
+                assert_eq!(tabs.tab_count(), 1, "queued surface opened a successor tab");
+                assert!(
+                    daemon.received_by("b").is_empty(),
+                    "queued surface sent the successor an operation"
+                );
+            } else {
+                assert!(
+                    controller.pane_ids().contains(&"pane-1".to_string()),
+                    "control: queued surface attaches its own process"
+                );
+                assert_eq!(tabs.tab_count(), 2, "control: queued surface opens its tab");
+                // The first tab build waits for live roles' own hooks. Drive
+                // the placeholder seam used by own-spawn UI paths with the
+                // process the real controller just attached, then act on it.
+                state.blocking_write().insert_placeholder_session_learned(
+                    "pane-1".into(),
+                    None,
+                    None,
+                    controller.pane_agent_id("pane-1"),
+                    controller.pane_incarnation("pane-1").unwrap(),
+                );
+                let card = state
+                    .blocking_read()
+                    .sessions
+                    .values()
+                    .find(|card| card.pane_id.as_deref() == Some("pane-1"))
+                    .and_then(SessionState::bound_pane)
+                    .expect("the surfaced placeholder");
+                assert!(
+                    controller
+                        .post_message(
+                            &card,
+                            "same-process",
+                            "body",
+                            crate::inbox_hub::PostOrigin::ConfigGen
+                        )
+                        .is_ok()
+                );
+                daemon.restart_as("b");
+                assert!(
+                    controller
+                        .post_message(
+                            &card,
+                            "stale",
+                            "body",
+                            crate::inbox_hub::PostOrigin::ConfigGen
+                        )
+                        .is_err()
+                );
+                assert!(
+                    daemon.received_by("b").is_empty(),
+                    "placeholder action sent the successor an operation"
+                );
+            }
         }
     }
 

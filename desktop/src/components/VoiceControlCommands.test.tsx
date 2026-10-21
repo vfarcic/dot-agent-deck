@@ -4534,8 +4534,8 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     expect(JSON.stringify(runAction.mock.calls[0][0])).toContain("process-a");
   });
 
-  /** Scenario (PRD #1666 part 2, G-fix7c): a spoken stop is still resolving when the deck restarts as another process, whose listing names its process and drops the agent from the screen. The app shows the one restart notice naming the stopped agent, and the voice report still says that agent is gone; nothing is sent. When the same process lists it again (control), there is no notice and the confirmation opens. */
-  it.each(["process-b", "process-a"] as const)("says a voice stop on an agent the restart dropped is gone, beside the restart notice (listed again by %s)", async (process) => {
+  /** Scenario (PRD #1666 part 2, G-fix7c): a spoken stop is still resolving when the deck restarts as another process, whose listing either reuses its agent id or lists nobody. The app shows the one restart notice naming the stopped agent, and the voice report still says that agent is gone; nothing is sent. When the same process lists it again (control), there is no notice and the confirmation opens. */
+  it.each([["process-b", false], ["process-b", true], ["process-a", false]] as const)("says a voice stop on an agent the restart dropped is gone, beside the restart notice (listed again by %s; empty: %s)", async (process, empty) => {
     const voice = microphone([]);
     const { deck, runAction, snapshot } = d5Deck(voice);
     const listed = (incarnation: string, agents = snapshot.agents) => ({ ...snapshot, connection: { ...snapshot.connection, incarnation }, agents: agents.map((agent) => ({ ...agent, spawnedAtMs: undefined, incarnation })) });
@@ -4552,7 +4552,7 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     voice.deliver(utterance);
     await completeUtterance();
 
-    const next = listed(process);
+    const next = listed(process, empty ? [] : snapshot.agents);
     rerender(<DeckShell runtime={{ ...pendingDeck, snapshot: next, fleet: [next] }} initialView={{ kind: "overview" }} />);
     await act(async () => { settle(answer); await Promise.resolve(); });
     await flush();
@@ -4562,7 +4562,7 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
       expect(screen.getByTestId("restart-toast")).toHaveTextContent(target.displayName);
       expect(confirmation(), "no confirmation may open for a restarted deck's agent").toBeNull();
       expect(runAction).not.toHaveBeenCalled();
-      expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing ran — that agent is gone (the deck restarted). Say it again.");
+      expect(screen.getByTestId("voice-report")).toHaveTextContent(empty ? "Nothing ran — the agent is gone. Say it again." : "Nothing ran — that agent is gone (the deck restarted). Say it again.");
       return;
     }
     expect(screen.queryByTestId("restart-toast")).toBeNull();
