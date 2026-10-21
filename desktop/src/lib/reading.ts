@@ -92,6 +92,13 @@ export interface ReadingTarget {
    * bounded to {@link READING_LABEL_MAX_CHARS}.
    */
   label: string;
+  /**
+   * PRD #1666 part 2 (G-fix6): the daemon process that listed the agent (the
+   * row's `incarnation`). Replies are read only from that process: a deck
+   * restarted since, which numbers an unrelated agent with the same id, reads
+   * as the agent being gone.
+   */
+  deckProcess?: string;
 }
 
 /**
@@ -239,7 +246,7 @@ export interface OpenPane {
 
 /** The key one agent incarnation is read under, and speaks under. */
 export function readingKey(agent: ReadingAgent): string {
-  return `${agent.deckId}\u0000${agent.agentId}\u0000${agent.incarnation ?? ""}`;
+  return `${agent.deckId}\u0000${agent.agentId}\u0000${agent.incarnation ?? ""}\u0000${agent.deckProcess ?? ""}`;
 }
 
 interface Session {

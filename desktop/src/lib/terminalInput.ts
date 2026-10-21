@@ -1,5 +1,6 @@
 import { sendResultReason } from "../types";
 import type { AgentSession, SendResult } from "../types";
+import { AGENT_GONE_AFTER_RESTART } from "./agentIdentity";
 import type { ActivityDisplay } from "./displayText";
 
 /**
@@ -115,7 +116,7 @@ export function terminalInputState(agent: AgentSession): TerminalInputState {
  * mounted, so there is nothing to type into and nothing a lease could say about
  * it. One sentence, and it is this one.
  */
-export type NoTerminalReason = "unreachable-deck";
+export type NoTerminalReason = "unreachable-deck" | "agent-gone";
 
 export interface NoTerminalState {
   /** Rendered as `data-terminal-state`. `"attached"` is the absence of this. */
@@ -202,5 +203,19 @@ export function unreachableDeckTerminalState(deckLabel: string, reason?: string,
     reason: "unreachable-deck",
     notice: `No terminal here: the desktop has no live connection to ${deckLabel}, so there is nothing to attach to.${detail} The terminal appears on its own once that daemon answers again.${held}`,
     noticeTitle: heldAge?.title,
+  };
+}
+
+/**
+ * PRD #1666 part 2 (G-fix6) — the pane's agent is gone: its deck restarted and
+ * lists an unrelated agent under the same id. Nothing is attached and nothing
+ * is sent to the newcomer; the sentence is the one the TUI shows on a pane in
+ * the same state (CLAUDE.md rule 22), and the newcomer's own row is how to
+ * open it.
+ */
+export function agentGoneTerminalState(): NoTerminalState {
+  return {
+    reason: "agent-gone",
+    notice: `${AGENT_GONE_AFTER_RESTART} — pane is disconnected. Close it to start over.`,
   };
 }

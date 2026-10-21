@@ -7,6 +7,7 @@ use tracing::warn;
 
 use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::{escape_id_for_log, sanitize_role_name};
+use crate::daemon_client::Incarnation;
 pub use crate::event::BackgroundWork;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
@@ -845,6 +846,17 @@ pub struct SessionState {
     /// [`crate::event::PULL_REQUEST_REVISION_METADATA_KEY`]. Not an activity
     /// clock: it orders the pull request alone and moves nothing else.
     pub pull_request_revision: u64,
+    /// PRD #1666 part 2 (G-fix6): on a client, the daemon process this card was
+    /// learned from — the incarnation of the event stream whose frame created
+    /// it ([`AppState::stream_incarnation`]). Stamped once, when the card is
+    /// created, and never re-read from a later frame or snapshot: a restarted
+    /// daemon can hold an unrelated agent under this card's pane id, and a card
+    /// it updates is still the old process's card. Every action that turns the
+    /// card's pane id into a daemon request carries it
+    /// ([`SessionState::bound_pane`]). [`Incarnation::UNNAMED`] on the daemon,
+    /// and for a card learned while no named stream was open — which a gated
+    /// client sends nothing for.
+    pub incarnation: Incarnation,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -990,6 +1002,15 @@ fn release_subagent_wait(session: &mut SessionState, ended: &str) -> bool {
 }
 
 impl SessionState {
+    /// PRD #1666 part 2 (G-fix6): this card's pane id together with the daemon
+    /// process the card was learned from — what every action on the card hands
+    /// the pane controller. `None` for a card with no pane.
+    pub fn bound_pane(&self) -> Option<crate::pane::BoundPane> {
+        self.pane_id
+            .as_ref()
+            .map(|pane_id| crate::pane::BoundPane::new(pane_id.clone(), self.incarnation.clone()))
+    }
+
     /// PRD #162: build the wire [`SessionSnapshot`] from this live session.
     /// The snapshot's `agent_type` is the EVENT-DERIVED value, so a
     /// reconnecting TUI can override a `None` spawn-time
@@ -1785,7 +1806,18 @@ pub struct AppState {
     /// the existing `open_orchestration_tab_with_existing_role_panes` machinery.
     /// Empty in the common case; bounded by `MAX_PENDING_ORCHESTRATION_SURFACES`
     /// (L1) so a flood can't grow it unbounded.
-    pub pending_orchestration_surfaces: Vec<OrchestrationSurface>,
+    ///
+    /// PRD #1666 part 2 (G-fix6): each with the daemon process whose stream
+    /// carried it, which every role pane's attach is bound to.
+    pub pending_orchestration_surfaces: Vec<(OrchestrationSurface, Incarnation)>,
+    /// PRD #1666 part 2 (G-fix6): the daemon process the event stream now
+    /// feeding this state comes from, from the `Hello` on its own connection —
+    /// set by the event subscriber when a subscription opens, before its
+    /// snapshot or first frame is applied, and [`Incarnation::UNNAMED`] while
+    /// none is open. Every card created from a frame is stamped with it
+    /// ([`SessionState::incarnation`]), and so is every queued orchestration
+    /// surface.
+    pub stream_incarnation: Incarnation,
     /// Issue #717: dispatched worktrees a close LEFT ON DISK, waiting to be
     /// reported on the status line. Filled by the event subscriber (which has no
     /// `UiState`) from [`crate::event::BroadcastMsg::WorktreeKept`] and drained
@@ -7981,19 +8013,22 @@ impl AppState {
     /// the [`BroadcastMsg::OrchestrationSurface`] but cannot touch the
     /// `TabManager` / pane controller (those live on the TUI render thread).
     pub fn queue_orchestration_surface(&mut self, surface: OrchestrationSurface) {
+        // PRD #1666 part 2 (G-fix6): the surface came on the stream open now.
+        let learned_from = self.stream_incarnation.clone();
         // PRD #120 L1: bound the queue. If it's already at the cap, drop the
         // OLDEST entry to make room — a flood can't grow it unbounded, and the
         // freshest dispatch is the one most worth surfacing. Log the drop so it
         // stays observable.
         if self.pending_orchestration_surfaces.len() >= MAX_PENDING_ORCHESTRATION_SURFACES {
-            let dropped = self.pending_orchestration_surfaces.remove(0);
+            let (dropped, _) = self.pending_orchestration_surfaces.remove(0);
             tracing::warn!(
                 orchestration = %dropped.name,
                 cap = MAX_PENDING_ORCHESTRATION_SURFACES,
                 "queue_orchestration_surface: pending queue at cap; dropping oldest surface"
             );
         }
-        self.pending_orchestration_surfaces.push(surface);
+        self.pending_orchestration_surfaces
+            .push((surface, learned_from));
     }
 
     /// Issue #717: record a worktree a close left on disk, for the render loop
@@ -8265,6 +8300,10 @@ impl AppState {
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                // G-fix6: a placeholder is learned from the stream open now. One
+                // the TUI drew for a pane it started or attached is bound by
+                // the controller's own record of that attach instead.
+                incarnation: self.stream_incarnation.clone(),
             },
         );
         if let Some((background, revision)) = held
@@ -8633,6 +8672,15 @@ impl AppState {
                 .filter(|s| {
                     s.pane_id.as_deref() == Some(pane_id)
                         && s.agent_id.as_deref() == Some(record.id.as_str())
+                        // PRD #1666 part 2 (G-fix6): only a card learned from
+                        // the process that answered. A restarted daemon numbers
+                        // its agents again, so its record for this pane and id
+                        // can be an unrelated agent's; the old card is not
+                        // repainted as that agent. Unnamed on both sides is the
+                        // ungated client, whose stream names no process.
+                        && (s.incarnation.same_process(&self.stream_incarnation)
+                            || (s.incarnation.is_unnamed()
+                                && self.stream_incarnation.is_unnamed()))
                 })
                 .max_by(|a, b| {
                     a.last_activity
@@ -13230,6 +13278,7 @@ impl AppState {
             .and_then(|pid| self.pane_started_at.get(pid))
             .copied();
 
+        let learned_from = self.stream_incarnation.clone();
         let session = self
             .sessions
             .entry(event.session_id.clone())
@@ -13264,6 +13313,8 @@ impl AppState {
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                // G-fix6: stamped once, from the stream this frame came on.
+                incarnation: learned_from,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -18571,6 +18622,7 @@ mod tests {
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                incarnation: Default::default(),
             },
         );
 

@@ -118,9 +118,11 @@ pub const AGENT_IDENTITY_UNKNOWN: &str =
 /// id to it ([`DaemonClient::bound_to`]), so the action reaches the process
 /// that issued the id or nothing.
 ///
-/// `None` inside is a daemon that named no process: a test fixture, or a build
-/// whose daemon could not read OS randomness (this one falls back to its pid
-/// and start time, [`crate::daemon_protocol::daemon_instance_id`]). Such a
+/// `None` inside is a daemon that named no process: a test fixture, or an
+/// older build whose daemon could not read OS randomness (this one names itself
+/// from the kernel, or refuses to start,
+/// [`crate::daemon_protocol::try_daemon_instance_id`]), or an id a client
+/// learned while no named stream was open. Such a
 /// daemon cannot be told from its same-build replacement, so it is never the
 /// same process as anything ([`Self::same_process`]), and a handle bound to it,
 /// or answered by it, sends no action ([`ClientError::DaemonUnnamed`]).
@@ -1724,6 +1726,15 @@ impl DaemonClient {
         }
         let (_, _, _, incarnation) = self.protocol_hello(false).await?;
         Ok(self.bound_to(incarnation))
+    }
+
+    /// PRD #1666 part 2 (G-fix6): whether this handle checks the protocol on
+    /// every request ([`Self::with_protocol_gate`]), and so learns the daemon
+    /// process each reply came from. A client holding an id learned from such
+    /// a handle binds every action on it ([`Self::bound_to`]), an id learned
+    /// from no named process included, which then sends nothing.
+    pub fn is_gated(&self) -> bool {
+        self.protocol_gate
     }
 
     /// The identity set by [`Self::with_client_id`], if any.
@@ -3382,7 +3393,7 @@ impl DaemonClient {
     /// closes the stream (`KIND_STREAM_END` carrying the reason) or
     /// either side drops the socket.
     pub async fn subscribe_events(&self) -> Result<EventSubscription, ClientError> {
-        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let (mut rd, mut wr, incarnation) = self.admitted_connect_learning().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::SubscribeEvents).await?;
         if !resp.ok {
             return Err(ClientError::Server(
@@ -3397,7 +3408,11 @@ impl DaemonClient {
         // subscription down before any events flow. Letting wr live until
         // EventSubscription drops means the daemon sees EOF exactly when
         // the client actually goes away.
-        Ok(EventSubscription { rd, _wr: wr })
+        Ok(EventSubscription {
+            rd,
+            _wr: wr,
+            incarnation,
+        })
     }
 
     /// PRD #1497: open a subscription to the finished-turn replies of the agent
@@ -3469,11 +3484,12 @@ impl DaemonClient {
         // A gated handle sends the request on the connection whose `Hello` it
         // checked; an ungated one checks on its own connection first, as it
         // did before the gate existed.
-        let (capabilities, connection) = if self.protocol_gate || self.bound.is_some() {
-            let (rd, wr, capabilities, _) = self.protocol_hello(true).await?;
-            (capabilities, Some((rd, wr)))
+        let (capabilities, connection, incarnation) = if self.protocol_gate || self.bound.is_some()
+        {
+            let (rd, wr, capabilities, incarnation) = self.protocol_hello(true).await?;
+            (capabilities, Some((rd, wr)), Some(incarnation))
         } else {
-            (self.check_protocol().await?, None)
+            (self.check_protocol().await?, None, None)
         };
         if !capabilities.supports(crate::daemon_protocol::CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT) {
             return Ok(GatedQuery::Unsupported);
@@ -3505,7 +3521,11 @@ impl DaemonClient {
         // The write half stays alive with the subscription, for the reason
         // `subscribe_events` gives.
         Ok(GatedQuery::Answered((
-            EventSubscription { rd, _wr: wr },
+            EventSubscription {
+                rd,
+                _wr: wr,
+                incarnation,
+            },
             records,
         )))
     }
@@ -3863,9 +3883,20 @@ pub struct EventSubscription {
     /// than an `AsyncWrite`. `transport::tests::
     /// dropping_the_write_half_alone_gives_the_server_eof` is the proof.
     _wr: TransportWriteHalf,
+    /// PRD #1666 part 2 (G-fix6): the daemon process this stream comes from,
+    /// from the `Hello` on its own connection — what every card painted from
+    /// it, and every id its events and snapshot name, is recorded with. `None`
+    /// from an ungated, unbound handle, which sends no `Hello`.
+    incarnation: Option<Incarnation>,
 }
 
 impl EventSubscription {
+    /// PRD #1666 part 2 (G-fix6): the daemon process this stream comes from —
+    /// see the field.
+    pub fn incarnation(&self) -> Option<&Incarnation> {
+        self.incarnation.as_ref()
+    }
+
     /// Read the next [`BroadcastMsg`] from the subscription. Returns
     /// `Ok(None)` on `KIND_STREAM_END`, peer EOF, or an unexpected
     /// frame kind (logged via `tracing::warn!`) — the caller should
@@ -8244,6 +8275,10 @@ pub(crate) mod gate_fixture {
         NoFollowOn,
     }
 
+    /// The daemon process every [`GateDaemon`] `Hello` names — what a card
+    /// learned from one carries (PRD #1666 part 2, G-fix6).
+    pub(crate) const GATE_FIXTURE_PROCESS: &str = "gate-fixture";
+
     pub(crate) struct GateDaemon {
         _dir: tempfile::TempDir,
         pub(crate) path: PathBuf,
@@ -8322,7 +8357,7 @@ pub(crate) mod gate_fixture {
                             // One process for the fixture's life, as a running
                             // daemon names itself: a client that binds to it
                             // (G-fix5) is refused only by the protocol.
-                            reply.instance_id = Some("gate-fixture".into());
+                            reply.instance_id = Some(GATE_FIXTURE_PROCESS.into());
                             match hello {
                                 GateHello::Matching => {}
                                 GateHello::Newer => {
@@ -8777,15 +8812,18 @@ pub(crate) mod restart_fixture {
 
     fn serve(op: &str) -> AttachResponse {
         match op {
-            "list-agents" => AttachResponse::agent_records(vec![
-                serde_json::from_value(serde_json::json!({
-                    "id": "1",
-                    "pane_id_env": "pane-1",
-                    "rows": 24,
-                    "cols": 80,
-                }))
-                .expect("a minimal agent record"),
-            ]),
+            // A subscription's snapshot lists what a listing does (G-fix6).
+            "list-agents" | "subscribe-events-with-snapshot" => {
+                AttachResponse::agent_records(vec![
+                    serde_json::from_value(serde_json::json!({
+                        "id": "1",
+                        "pane_id_env": "pane-1",
+                        "rows": 24,
+                        "cols": 80,
+                    }))
+                    .expect("a minimal agent record"),
+                ])
+            }
             "start-agent" => AttachResponse::with_id("1".into()),
             "post-message" => AttachResponse::with_id("m-1".into()),
             "attach-stream" | "resize" => {

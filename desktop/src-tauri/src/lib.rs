@@ -3710,18 +3710,42 @@ fn validate_voice_question_form(
 
 /// PRD #1631: the question `agent_id` on `deck_id` is waiting on, as the
 /// deck's snapshot has it now — never the webview's copy.
+///
+/// PRD #1666 part 2 (G-fix6): only the agent the daemon process `incarnation`
+/// listed. A row under the same id from another process — a restarted daemon
+/// numbers its agents again — is someone else's: the inner `Err` is the
+/// sentence that says so ([`listed_by`]), and its question is not read as this
+/// agent's.
 async fn pending_question_on(
     state: &DesktopState,
     deck_id: &str,
     agent_id: &str,
-) -> Result<Option<crate::dto::DesktopPendingQuestion>, String> {
+    incarnation: &Incarnation,
+) -> Result<Result<Option<crate::dto::DesktopPendingQuestion>, &'static str>, String> {
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let snapshot = crate::daemon_bridge::snapshot_of(scope.endpoint(), &state.daemon).await;
-    Ok(snapshot
+    let Some(agent) = snapshot
         .agents
         .into_iter()
         .find(|agent| agent.id == agent_id)
-        .and_then(|agent| agent.pending_question))
+    else {
+        return Ok(Ok(None));
+    };
+    Ok(listed_by(&agent.incarnation, incarnation).map(|()| agent.pending_question))
+}
+
+/// PRD #1666 part 2 (G-fix6): whether a row the daemon lists now, from process
+/// `listed`, is the agent the webview holds from process `held` — `Err` with
+/// the sentence both clients say when it is not: the gone sentence for another
+/// process, the identity sentence when either names none.
+fn listed_by(listed: &Incarnation, held: &Incarnation) -> Result<(), &'static str> {
+    if listed.is_unnamed() || held.is_unnamed() {
+        Err(dot_agent_deck::daemon_client::AGENT_IDENTITY_UNKNOWN)
+    } else if !listed.same_process(held) {
+        Err(dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART)
+    } else {
+        Ok(())
+    }
 }
 
 /// PRD #1631: one utterance said on an agent's own screen while that agent
@@ -3754,8 +3778,13 @@ async fn desktop_voice_question(
     form: Vec<voice::question::Selection>,
     awaiting_text: Option<voice::question::TextSlot>,
     local_only: Option<bool>,
+    incarnation: Option<String>,
 ) -> Result<voice::question::QuestionResult, String> {
     ensure_main_webview(&webview)?;
+    // PRD #1666 part 2 (G-fix6): the daemon process that listed the agent the
+    // pane shows. Absent, from an older webview or a deck that named none, is
+    // unnamed, and no row is then this agent's.
+    let incarnation = Incarnation::from(incarnation);
     if utterance.len() > MAX_UTTERANCE_BYTES {
         return Err(format!(
             "that answer is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
@@ -3774,7 +3803,19 @@ async fn desktop_voice_question(
     .await
     .map_err(|error| safe_message(format!("reading the voice settings failed: {error}")))?;
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
-    let Some(question) = pending_question_on(&state, &deck_id, &agent_id).await? else {
+    let question = match pending_question_on(&state, &deck_id, &agent_id, &incarnation).await? {
+        Ok(question) => question,
+        Err(sentence) => {
+            return Ok(voice::question::QuestionResult {
+                verdict: voice::question::QuestionVerdict::Refused {
+                    sentence: sentence.to_string(),
+                },
+                resolve_ms: None,
+                backend: resolver.backend_name(),
+            });
+        }
+    };
+    let Some(question) = question else {
         // Nothing is waiting any more: the utterance is the user's next
         // command, not an answer to a question that is gone.
         return Ok(voice::question::QuestionResult {
@@ -3857,7 +3898,14 @@ async fn desktop_voice_answer_question<R: tauri::Runtime>(
     }
     let lease = state.voice_answer_leases.begin(&lease);
     let agent = voice_agent_name(&agent);
-    let Some(question) = pending_question_on(&state, &deck_id, &agent_id).await? else {
+    // PRD #1666 part 2 (G-fix6): the question of the agent that process
+    // listed; a successor's row under the same id is refused before anything
+    // is sent, with the sentence that says why.
+    let held = Incarnation::from(incarnation.clone());
+    let question = pending_question_on(&state, &deck_id, &agent_id, &held)
+        .await?
+        .map_err(str::to_string)?;
+    let Some(question) = question else {
         return Ok(voice::question::AnswerOutcome {
             kind: "refused",
             code: Some("no_pending_question"),
@@ -4331,6 +4379,7 @@ async fn desktop_voice_speech_audio(
 /// Commands connection, read per turn, so the agent's final reply never
 /// crosses into the webview — only the finished sentence does.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn desktop_voice_reading_start(
     webview: Webview,
     state: State<'_, DesktopState>,
@@ -4339,8 +4388,11 @@ async fn desktop_voice_reading_start(
     agent_id: String,
     agent_label: String,
     on_sentence: Channel<voice::reading::ReadingSentence>,
+    incarnation: Option<String>,
 ) -> Result<ReadingStart, String> {
     ensure_main_webview(&webview)?;
+    // PRD #1666 part 2 (G-fix6): the daemon process that listed the agent.
+    let incarnation = Incarnation::from(incarnation);
     let bad = |value: &str| value.is_empty() || value.len() > MAX_VOICE_DECK_ID_BYTES;
     if bad(&deck_id) || bad(&agent_id) || agent_label.len() > MAX_VOICE_DECK_ID_BYTES {
         return Err("the agent sent with that command is not one a pane shows".to_string());
@@ -4356,11 +4408,14 @@ async fn desktop_voice_reading_start(
     }
     let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
     let snapshot = daemon_bridge::snapshot_of(scope.endpoint(), &state.daemon).await;
-    let agent_type = snapshot
-        .agents
-        .iter()
-        .find(|agent| agent.id == agent_id)
-        .map(|agent| agent.agent_type.clone());
+    // G-fix6: only the row that process listed. A row under the same id from
+    // a successor is an unrelated agent, whose replies are not this one's: the
+    // agent the webview holds is gone, and nothing is subscribed to.
+    let listed = snapshot.agents.iter().find(|agent| agent.id == agent_id);
+    if listed.is_some_and(|agent| listed_by(&agent.incarnation, &incarnation).is_err()) {
+        return Ok(ReadingStart::Gone);
+    }
+    let agent_type = listed.map(|agent| agent.agent_type.clone());
     if let Some(gap) = agent_type.as_deref().and_then(voice::reading::agent_gap) {
         return Ok(ReadingStart::Unavailable {
             sentence: voice::reading::unavailable_sentence(&gap),
@@ -4380,7 +4435,10 @@ async fn desktop_voice_reading_start(
         agent_id,
         agent_type,
     };
-    let source = voice::reading::DaemonTurnEvents::new(daemon.client.clone());
+    // Bound to that process too, so a deck restarted after the listing serves
+    // its replies to nobody here.
+    let source =
+        voice::reading::DaemonTurnEvents::new(Arc::new(daemon.client.bound_to(incarnation)));
     let events = match voice::reading::TurnEventSource::subscribe(&source, &target).await {
         Ok(events) => events,
         // The agent exited between being listed and being subscribed.
@@ -4975,7 +5033,7 @@ async fn stop_agent_action(
     //
     // The deck is the SCOPE's — the one this operation authenticated against
     // and stopped the agent on — and never a fresh read of the selection.
-    terminal::detach_agent_on(state, &scope.identity(), agent_id).await;
+    terminal::detach_agent_on(state, &scope.identity(), agent_id, incarnation).await;
     Ok(scope)
 }
 
@@ -5037,12 +5095,20 @@ async fn stop_orchestration_action(
     let stops: Vec<(&DaemonClient, &StartedRole)> = clients.iter().zip(&started).collect();
     let outcomes = stop_roles_concurrently(&stops).await;
     let mut unconfirmed = Vec::new();
-    for (role, outcome) in started.iter().zip(outcomes) {
+    for ((role, listed), outcome) in started.iter().zip(roles).zip(outcomes) {
         match outcome {
             // A refused or unanswered stop leaves its terminal alone, as
             // `stop_agent_action` does: the agent may still be running.
             Some(stop) => unconfirmed.push(stop),
-            None => terminal::detach_agent_on(state, &scope.identity(), &role.agent_id).await,
+            None => {
+                terminal::detach_agent_on(
+                    state,
+                    &scope.identity(),
+                    &role.agent_id,
+                    &listed.incarnation,
+                )
+                .await
+            }
         }
     }
     if unconfirmed.is_empty() {

@@ -93,7 +93,7 @@ import { useReadingMode } from "../hooks/useReadingMode";
 import type { VoicePaneAgent } from "../lib/promptKeys";
 import { QUESTION_ALWAYS_DECLINED, QUESTION_ANSWER_CANCELLED, QUESTION_CANCEL_FAILED, QUESTION_COUNTDOWN_STOPPED, QUESTION_MOVED_ON, QUESTION_SAY_CONFIRM, questionLost, questionLostSentence, questionOptionsToSay, saysCancel, saysConfirm, type PendingQuestionDto, type QuestionSelectionDto, type QuestionTextSlotDto, type VoiceQuestionTarget } from "../lib/voiceQuestion";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { desktopFeaturesOf, type DeckFleet, type DeckRuntimeState } from "../types";
+import { desktopFeaturesOf, type AgentTarget, type DeckFleet, type DeckRuntimeState } from "../types";
 
 /**
  * How long an Undo stays on offer, in milliseconds.
@@ -1746,6 +1746,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     return shows(shown, aim) ? shown.spawnedAtMs : undefined;
   }, []);
   /**
+   * PRD #1666 part 2 (G-fix6) — `aim` as a terminal target, bound to the
+   * daemon process the pane on screen was listed by (`VoicePane.incarnation`,
+   * which the host takes from the record the open view was opened on, never
+   * from a newer snapshot). A write is bound when it is accepted, so a pane
+   * that is no longer `aim`, or a deck that restarted under it, finds no
+   * session for the target and the write rejects as not attached: nothing
+   * reaches a restarted deck's agent with the same id.
+   */
+  const boundTarget = useCallback((aim: AgentAddress): AgentTarget => {
+    const shown = paneRef.current;
+    return { deckId: aim.deckId, agentId: aim.agentId, incarnation: shows(shown, aim) ? shown.incarnation : undefined };
+  }, []);
+  /**
    * PRD #1631 — the question `aim`'s agent waits on, when `aim` is the pane on
    * screen: its label and whether voice can take the answer
    * ({@link questionReach}), or `undefined` with no question waiting. Every
@@ -1845,7 +1858,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    */
   const guardedSend = useCallback((aim: AgentAddress, data: string, check: () => string | undefined): { sent: PaneWrite; done: Promise<void> } => {
     let why: string | undefined;
-    const write = sendTerminalInput(aim, data, () => {
+    const write = sendTerminalInput(boundTarget(aim), data, () => {
       why = check();
       return why === undefined;
     });
@@ -1855,7 +1868,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       throw cause;
     });
     return { sent, done };
-  }, [notePaneWrite, sendTerminalInput]);
+  }, [boundTarget, notePaneWrite, sendTerminalInput]);
   /** PRD #1541 — every agent's {@link PromptRecord}, by {@link paneKey}. */
   const prompts = useRef(new Map<string, PromptRecord>());
   /** The record for `aim` as it is now: a fresh one when the agent was replaced since. */
@@ -2593,7 +2606,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       return;
     }
     try {
-      const target = { deckId: aim.deckId, agentId: aim.agentId };
+      const target = boundTarget(aim);
       const sent = sendTerminalInput(target, VOICE_DICTATION_SUBMIT);
       notePaneWrite(target, VOICE_DICTATION_SUBMIT.length, sent);
       await sent;
@@ -2605,7 +2618,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (sendEpoch.current !== epoch || modeGeneration.current !== generation) return;
       setProblem(sentenceOf(cause));
     }
-  }, [notePaneWrite, noteSent, questionWaiting, resetPrompt, sendTerminalInput]);
+  }, [boundTarget, notePaneWrite, noteSent, questionWaiting, resetPrompt, sendTerminalInput]);
   /**
    * Press Enter once every typed write since the last send has landed — the
    * guarded half of a spoken send, shared by "send it" and a trailing send
@@ -3764,7 +3777,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (asked) throw new QuestionWaits(voiceQuestionWaitingNoTyping(asked.label, asked.reach, asked.options));
       const record = promptFor(aim, incarnationOf(aim));
       if (sends) emptyRecord(record, false, PROMPT_EMPTIED.sent);
-      const target = { deckId: aim.deckId, agentId: aim.agentId };
+      const target = boundTarget(aim);
       const written = sendTerminalInput(target, typed);
       const write: PromptWrite = { text: typed, sent: notePaneWrite(target, typed.length, written) };
       if (!sends) record.writes.push(write);
@@ -3775,7 +3788,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         throw cause;
       }
     });
-  }, [incarnationOf, notePaneWrite, onPane, paneLost, promptFor, questionWaiting, resetPrompt, sendTerminalInput]);
+  }, [boundTarget, incarnationOf, notePaneWrite, onPane, paneLost, promptFor, questionWaiting, resetPrompt, sendTerminalInput]);
   const typeIntoAgent = useCallback((target: VoiceDispatchTarget) => {
     const mode = panelStateRef.current;
     /* PRD #1260 — while dictating, the words go to the mode's own target and

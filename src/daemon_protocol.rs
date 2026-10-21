@@ -3860,43 +3860,96 @@ pub struct AttachResponse {
 /// — 16 bytes of OS randomness, hex-encoded, minted on first use and fixed for
 /// the life of the process (an `exec` into a successor mints a new one).
 ///
-/// PRD #1666 part 2 (G-fix5): every daemon on this build names itself. When
-/// OS randomness is unavailable the identity falls back to
-/// [`fallback_instance_id`], the process id and the time it was minted, so a
-/// client never has to compare two daemons that named nothing — which it now
-/// refuses to act on at all ([`crate::daemon_client::Incarnation`]).
+/// PRD #1666 part 2 (G-fix6): when OS randomness is unavailable, the identity
+/// is the kernel's own name for this process ([`process_identity`]), and where
+/// there is none the process has no identity at all. The daemon checks this at
+/// startup ([`try_daemon_instance_id`]) and refuses to start without one, so a
+/// running daemon always names itself. This accessor is for code that runs
+/// after that check, or in a test, and panics in a process that has none.
 pub fn daemon_instance_id() -> &'static str {
-    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ID.get_or_init(|| {
-        let mut bytes = [0u8; 16];
-        mint_instance_id(getrandom::fill(&mut bytes).ok().map(|()| bytes), || {
-            fallback_instance_id(
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_nanos())
-                    .unwrap_or_default(),
-            )
-        })
-    })
+    try_daemon_instance_id()
+        .unwrap_or_else(|reason| panic!("this process has no daemon identity: {reason}"))
 }
 
-/// [`daemon_instance_id`]'s choice: the random bytes hex-encoded when there
+/// PRD #1666 part 2 (G-fix6): [`daemon_instance_id`], or why this process
+/// cannot have one — OS randomness failed, and so did the platform's process
+/// identity. Minted once; every call answers the same.
+pub fn try_daemon_instance_id() -> Result<&'static str, &'static str> {
+    static ID: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let mut bytes = [0u8; 16];
+        mint_instance_id(
+            getrandom::fill(&mut bytes).ok().map(|()| bytes),
+            process_identity,
+        )
+    })
+    .as_ref()
+    .map(String::as_str)
+    .map_err(String::as_str)
+}
+
+/// [`try_daemon_instance_id`]'s choice: the random bytes hex-encoded when there
 /// are some, and `fallback` otherwise.
-fn mint_instance_id(random: Option<[u8; 16]>, fallback: impl FnOnce() -> String) -> String {
+fn mint_instance_id(
+    random: Option<[u8; 16]>,
+    fallback: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
     match random {
-        Some(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Some(bytes) => Ok(bytes.iter().map(|b| format!("{b:02x}")).collect()),
         None => fallback(),
     }
 }
 
-/// The identity of a daemon process that could not read OS randomness: its
-/// pid and the wall-clock nanoseconds at which it minted the identity. Two
-/// processes alive at once differ by pid, and a later process given a recycled
-/// pid differs by time. The `pid-` prefix keeps it apart from the 32 hex
-/// characters of a random identity.
-fn fallback_instance_id(pid: u32, minted_at_nanos: u128) -> String {
-    format!("pid-{pid}-{minted_at_nanos}")
+/// PRD #1666 part 2 (G-fix6): this process's identity without randomness.
+///
+/// On Linux it is the kernel's boot id (`/proc/sys/kernel/random/boot_id`, new
+/// on every boot), this process's pid, and its start time in clock ticks since
+/// boot (field 22 of `/proc/self/stat`) — [`process_identity_of`]. Within a
+/// boot, a pid names one live process, and a process given a recycled pid
+/// starts at a later tick unless the whole pid space is reused within one tick;
+/// across boots the boot id differs. No wall clock is read, so a clock step
+/// cannot repeat it.
+///
+/// Elsewhere this build reads no such source, and answers why: the daemon then
+/// refuses to start rather than name itself with a value a successor could
+/// repeat.
+fn process_identity() -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|e| format!("OS randomness failed and the boot id is unreadable: {e}"))?;
+        let stat = std::fs::read_to_string("/proc/self/stat")
+            .map_err(|e| format!("OS randomness failed and /proc/self/stat is unreadable: {e}"))?;
+        process_identity_of(&boot_id, std::process::id(), &stat)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(
+            "OS randomness failed, and this platform offers this build no other \
+             process identity"
+                .to_string(),
+        )
+    }
+}
+
+/// [`process_identity`] from its inputs: the boot id, the pid, and the text of
+/// `/proc/<pid>/stat`, whose start time is the 20th field after the
+/// parenthesised command name (which may itself hold spaces and parentheses,
+/// so the fields are counted from its last `)`). The `boot-` prefix keeps it
+/// apart from the 32 hex characters of a random identity.
+fn process_identity_of(boot_id: &str, pid: u32, stat: &str) -> Result<String, String> {
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty() {
+        return Err("OS randomness failed and the boot id is empty".to_string());
+    }
+    let start_ticks = stat
+        .rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .and_then(|ticks| ticks.parse::<u64>().ok())
+        .ok_or_else(|| {
+            "OS randomness failed and this process's start time is unreadable".to_string()
+        })?;
+    Ok(format!("boot-{boot_id}-pid-{pid}-start-{start_ticks}"))
 }
 
 /// Issue #1045: which spelling of the prepare verb a request used, or a client
@@ -4085,9 +4138,11 @@ impl AttachResponse {
 
     /// PRD #1487: name this daemon process on a handshake reply
     /// ([`Self::instance_id`]). Only the live daemon's `Hello` handler calls
-    /// it.
+    /// it. A process with no identity, which the daemon refuses to start as
+    /// ([`try_daemon_instance_id`]), names none, and a client then sends no
+    /// action aimed at an agent it listed.
     pub fn with_instance_id(mut self) -> Self {
-        self.instance_id = Some(daemon_instance_id().to_string());
+        self.instance_id = try_daemon_instance_id().ok().map(str::to_string);
         self
     }
 }
@@ -11195,6 +11250,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
         let snap = session.live_snapshot();
         assert_eq!(
@@ -12250,22 +12306,55 @@ mod tests {
         assert_eq!(serde_json::to_value(back).unwrap(), value);
     }
 
-    /// PRD #1666 part 2 (G-fix5): a daemon that cannot read OS randomness
-    /// still names its process, and two such processes are told apart.
+    /// Scenario: a daemon that cannot read OS randomness names itself from the kernel's boot id, its pid and its start tick, so two processes, a recycled pid starting later, and a later boot are all told apart; a boot id or start time it cannot read gives it no identity, which the daemon refuses to start without.
+    #[spec("lifecycle/handshake/013")]
     #[test]
-    fn instance_id_without_randomness_still_names_the_process() {
-        let random = mint_instance_id(Some([0xab; 16]), || unreachable!());
+    fn handshake_013_instance_id_without_randomness_is_the_kernels_process_identity() {
+        let random = mint_instance_id(Some([0xab; 16]), || unreachable!()).unwrap();
         assert_eq!(random, "ab".repeat(16));
-        let a = mint_instance_id(None, || fallback_instance_id(41, 1_000));
-        let b = mint_instance_id(None, || fallback_instance_id(42, 1_000));
-        let recycled = mint_instance_id(None, || fallback_instance_id(41, 2_000));
-        assert!(!a.is_empty(), "a daemon without randomness names itself");
-        assert_ne!(a, b, "two live processes differ by pid");
-        assert_ne!(a, recycled, "a recycled pid differs by time");
+        // `/proc/<pid>/stat`: pid, `(comm)` with a space and a `)` in it, then
+        // fields 3.. with the start time (field 22) set to `ticks`.
+        let stat = |pid: u32, ticks: u64| {
+            let mut fields = vec!["S".to_string()];
+            fields.extend((4..=21).map(|n| n.to_string()));
+            fields.push(ticks.to_string());
+            fields.extend((23..=30).map(|n| n.to_string()));
+            format!("{pid} (dot agent) deck) {}", fields.join(" "))
+        };
+        let boot = "6a1f0c2e-1111-4222-8333-944455556666\n";
+        let id = |boot: &str, pid, ticks| {
+            mint_instance_id(None, || process_identity_of(boot, pid, &stat(pid, ticks))).unwrap()
+        };
+        let a = id(boot, 41, 1_000);
+        assert_eq!(
+            a,
+            "boot-6a1f0c2e-1111-4222-8333-944455556666-pid-41-start-1000"
+        );
+        assert_ne!(a, id(boot, 42, 1_000), "two live processes differ by pid");
+        assert_ne!(
+            a,
+            id(boot, 41, 2_000),
+            "a recycled pid starts at a later tick"
+        );
+        assert_ne!(
+            a,
+            id("0f0f0f0f-2222-4333-8444-955566667777", 41, 1_000),
+            "a later boot differs by boot id"
+        );
         assert_ne!(
             a.len(),
             random.len(),
             "never mistaken for a random identity"
+        );
+        assert!(process_identity_of(" \n", 41, &stat(41, 1_000)).is_err());
+        assert!(process_identity_of(boot, 41, "41 (deck) S 1 2").is_err());
+        assert!(process_identity_of(boot, 41, "garbled").is_err());
+        #[cfg(target_os = "linux")]
+        assert!(
+            process_identity()
+                .unwrap()
+                .contains(&format!("-pid-{}-start-", std::process::id())),
+            "this process reads its own identity"
         );
     }
 
@@ -12285,8 +12374,7 @@ mod tests {
             .instance_id
             .clone()
             .expect("this process has an identity");
-        assert_eq!(id.len(), 32);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        assert!(!id.is_empty());
         assert_eq!(daemon_instance_id(), id.as_str());
         let back: AttachResponse =
             serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();

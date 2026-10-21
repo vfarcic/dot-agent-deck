@@ -1848,6 +1848,12 @@ struct UiState {
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
+    /// PRD #1666 part 2 (G-fix6): what the dashboard's names for a pane were
+    /// before its last rename — the card's session id and its
+    /// `display_names` / `pane_display_names` entries — so a rename the deck
+    /// refuses after the call returned can be taken back
+    /// ([`EmbeddedPaneController::take_rename_refusals`]).
+    renamed_from: HashMap<String, (String, Option<String>, Option<String>)>,
     /// Issue #308: maps pane_id → the agent type its config DECLARED
     /// (`agent = "…"` on the role), for panes that made a declaration.
     ///
@@ -2014,8 +2020,10 @@ struct UiState {
     star_prompt_state: config::StarPromptState,
     /// Config generation state — tracks directories where user chose "Never".
     config_gen_state: config::ConfigGenState,
-    /// Pane ID + cwd for the pending config-gen modal prompt.
-    config_gen_target: Option<(String, String)>,
+    /// Pane ID + cwd for the pending config-gen modal prompt. PRD #1666 part 2
+    /// (G-fix6): the pane id with the daemon process its card was learned
+    /// from, so the request is posted there or nowhere.
+    config_gen_target: Option<(crate::pane::BoundPane, String)>,
     /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Detach, 1=Stop, 2=Cancel).
@@ -2203,6 +2211,9 @@ struct UiState {
 struct InboxAttentionDialog {
     pane_id: String,
     agent_id: String,
+    /// PRD #1666 part 2 (G-fix6): the daemon process the card the picker was
+    /// opened on was learned from — what every press it makes is bound to.
+    incarnation: crate::daemon_client::Incarnation,
     items: Vec<crate::inbox_hub::InboxAttentionItem>,
     selected: usize,
     answer: Option<String>,
@@ -2316,6 +2327,7 @@ impl UiState {
             submitted_orchestration_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
+            renamed_from: HashMap::new(),
             pane_declared_agent: HashMap::new(),
             pane_metadata: HashMap::new(),
             config,
@@ -3786,8 +3798,10 @@ fn post_orchestrator_prompt(
     let Some(prompt) = orchestrator_prompt.clone() else {
         return;
     };
+    // PRD #1666 part 2 (G-fix6): the start role's pane is one this controller
+    // started or attached, and its record of that attach binds the post.
     match pane.post_message(
-        &start_pane_id,
+        &crate::pane::BoundPane::held_by_controller(start_pane_id.clone()),
         "your role as orchestrator",
         &prompt,
         crate::inbox_hub::PostOrigin::OrchestratorRemit,
@@ -3877,7 +3891,8 @@ fn process_pending_orchestration_surfaces(
         }
         st.pending_orchestration_surfaces.remove(0)
     };
-    surface_one_orchestration(state, embedded, tab_manager, surface, ui);
+    let (surface, learned_from) = surface;
+    surface_one_orchestration(state, embedded, tab_manager, surface, &learned_from, ui);
 }
 
 /// PRD #1223: the render-thread half of a daemon pane-closed announcement —
@@ -4060,11 +4075,17 @@ fn adopt_context_path_into_owning_tab(
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
 /// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
 /// reconnect that already hydrated the tab) doesn't double-build.
+///
+/// PRD #1666 part 2 (G-fix6): `learned_from` is the daemon process whose stream
+/// carried the surface. Each role pane is attached on that process only, so a
+/// surface queued before a restart attaches nothing on a successor that reuses
+/// its pane ids.
 fn surface_one_orchestration(
     state: &SharedState,
     embedded: &EmbeddedPaneController,
     tab_manager: &mut TabManager,
     surface: OrchestrationSurface,
+    learned_from: &crate::daemon_client::Incarnation,
     ui: &mut UiState,
 ) {
     // Idempotency: skip if an existing tab already owns any of this surface's
@@ -4219,7 +4240,10 @@ fn surface_one_orchestration(
                 continue;
             }
             let role_config = &orch_config.roles[role.role_index];
-            if !embedded.hydrate_pane(&role.pane_id) {
+            if !embedded.hydrate_pane(&crate::pane::BoundPane::new(
+                role.pane_id.clone(),
+                learned_from.clone(),
+            )) {
                 // This used to be silently dropped — no tab slot, no card,
                 // no dead-slot placeholder, and no log line — while the
                 // daemon holds a live, registered agent that `delegate --to
@@ -4457,7 +4481,10 @@ fn surface_one_orchestration(
         // `hydrate_pane` attaches the daemon agent carrying this pane id and
         // wires its PTY locally — the same attach + scrollback-replay path as
         // reconnect hydration, so the live agent renders in the tab.
-        if embedded.hydrate_pane(&role.pane_id) {
+        if embedded.hydrate_pane(&crate::pane::BoundPane::new(
+            role.pane_id.clone(),
+            learned_from.clone(),
+        )) {
             role_pane_ids[role.role_index] = Some(role.pane_id.clone());
         } else {
             tracing::debug!(
@@ -4787,7 +4814,7 @@ pub enum Action {
     /// inline would bloat every `Action` value (`clippy::large_enum_variant`).
     SpawnPane(Box<NewPaneRequest>),
     SendConfigGenPrompt {
-        pane_id: String,
+        pane: crate::pane::BoundPane,
         cwd: String,
     },
     RequestConfigGen,
@@ -6425,8 +6452,8 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
             0 => {
                 // Yes — send prompt and focus pane.
                 ui.mode = UiMode::Normal;
-                if let Some((pane_id, cwd)) = ui.config_gen_target.take() {
-                    return Action::SendConfigGenPrompt { pane_id, cwd };
+                if let Some((pane, cwd)) = ui.config_gen_target.take() {
+                    return Action::SendConfigGenPrompt { pane, cwd };
                 }
                 Action::Continue
             }
@@ -6901,9 +6928,14 @@ fn focus_deck(
             // attach below always operates on it. Routed through the trait's
             // `try_hydrate_pane` rather than a downcast so a mock can exercise
             // this path — see the trait method's docs.
+            // PRD #1666 part 2 (G-fix6): on the daemon process the card was
+            // learned from only.
             let mut focus_result = pane.focus_pane(pane_id);
             if let Err(PaneError::CommandFailed(_)) = focus_result
-                && pane.try_hydrate_pane(pane_id)
+                && pane.try_hydrate_pane(&crate::pane::BoundPane::new(
+                    pane_id.clone(),
+                    session.incarnation.clone(),
+                ))
             {
                 focus_result = pane.focus_pane(pane_id);
             }
@@ -8039,6 +8071,22 @@ fn cancel_new_pane_form(ui: &mut UiState) {
 /// M2.11 reviewer P1 & P2.4).
 fn rename_commit_value(key: KeyEvent, rename_text: &str) -> Option<String> {
     matches!(key.code, KeyCode::Enter).then(|| rename_text.to_string())
+}
+
+/// PRD #1666 part 2 (G-fix6): put back the dashboard names `pane_id` had
+/// before its last rename, which the deck refused after the rename was shown.
+fn take_back_rename(ui: &mut UiState, pane_id: &str) {
+    let Some((sid, display, pane_display)) = ui.renamed_from.remove(pane_id) else {
+        return;
+    };
+    match display {
+        Some(name) => ui.display_names.insert(sid, name),
+        None => ui.display_names.remove(&sid),
+    };
+    match pane_display {
+        Some(name) => ui.pane_display_names.insert(pane_id.to_string(), name),
+        None => ui.pane_display_names.remove(pane_id),
+    };
 }
 
 /// Apply a [`RenameOutcome`] returned by `PaneController::rename_pane`
@@ -9292,17 +9340,21 @@ fn perform_stop_and_quit(ui: &mut UiState, pane: &dyn PaneController) -> Flow {
 /// (Enter-on-Yes via the key handler) and `Action::ConfigGenConfirm` (the
 /// `[Yes]` button).
 fn send_config_gen_prompt(
-    pane_id: &str,
+    card: &crate::pane::BoundPane,
     cwd: &str,
     ui: &mut UiState,
     pane: &dyn PaneController,
     tab_manager: &mut TabManager,
 ) {
+    let pane_id = card.pane_id.as_str();
     let prompt = crate::config_gen::config_gen_prompt(cwd);
     // PRD #1666 S5: the request is a message in the agent's inbox, not text
     // typed into its pane; the agent takes it the way it takes any other.
+    // PRD #1666 part 2 (G-fix6): posted on the daemon process the selected
+    // card was learned from, so a detached or never-attached card posts nothing
+    // to a restarted daemon's agent under the same pane id.
     match pane.post_message(
-        pane_id,
+        card,
         "configuration request",
         &prompt,
         crate::inbox_hub::PostOrigin::ConfigGen,
@@ -9357,13 +9409,23 @@ fn commit_rename(
         && let Some(ref pane_id) = session.pane_id
     {
         match pane.rename_pane(pane_id, new_name) {
-            Ok(outcome) => apply_rename_outcome(
-                &mut ui.display_names,
-                &mut ui.pane_display_names,
-                sid,
-                pane_id,
-                outcome,
-            ),
+            Ok(outcome) => {
+                ui.renamed_from.insert(
+                    pane_id.clone(),
+                    (
+                        sid.to_string(),
+                        ui.display_names.get(sid).cloned(),
+                        ui.pane_display_names.get(pane_id).cloned(),
+                    ),
+                );
+                apply_rename_outcome(
+                    &mut ui.display_names,
+                    &mut ui.pane_display_names,
+                    sid,
+                    pane_id,
+                    outcome,
+                )
+            }
             Err(e) => {
                 tracing::debug!(
                     pane_id = %pane_id,
@@ -9635,7 +9697,19 @@ fn dispatch_action(
                     session_id,
                     pane_id,
                 }) => {
-                    match pane.close_pane(&pane_id) {
+                    // PRD #1666 part 2 (G-fix6): the close carries the daemon
+                    // process the armed card was learned from, so a card with
+                    // no local pane stops nothing on a restarted daemon that
+                    // reuses its pane id.
+                    let card = crate::pane::BoundPane::new(
+                        pane_id.clone(),
+                        snapshot
+                            .sessions
+                            .get(&session_id)
+                            .map(|card| card.incarnation.clone())
+                            .unwrap_or_default(),
+                    );
+                    match pane.close_card(&card) {
                         Ok(()) => {
                             let mut st = state.blocking_write();
                             st.sessions.remove(&session_id);
@@ -9891,9 +9965,15 @@ fn dispatch_action(
                     // bare delete, so pressing Enter on a live-but-unwired card
                     // destroyed it. Attach the daemon's pane first and retry, so
                     // the delete arm is reached only by genuinely dead cards.
+                    //
+                    // PRD #1666 part 2 (G-fix6): on the daemon process the card
+                    // was learned from only.
                     let mut focus_result = pane.focus_pane(pane_id);
                     if let Err(PaneError::CommandFailed(_)) = focus_result
-                        && pane.try_hydrate_pane(pane_id)
+                        && pane.try_hydrate_pane(&crate::pane::BoundPane::new(
+                            pane_id.clone(),
+                            session.incarnation.clone(),
+                        ))
                     {
                         focus_result = pane.focus_pane(pane_id);
                     }
@@ -9933,10 +10013,10 @@ fn dispatch_action(
         Action::RequestConfigGen => {
             if let Some(sid) = selected_id
                 && let Some(session) = snapshot.sessions.get(sid)
-                && let Some(ref pane_id) = session.pane_id
+                && let Some(card) = session.bound_pane()
                 && let Some(ref cwd) = session.cwd
             {
-                ui.config_gen_target = Some((pane_id.clone(), cwd.clone()));
+                ui.config_gen_target = Some((card, cwd.clone()));
                 ui.config_gen_selected = 0;
                 ui.mode = UiMode::ConfigGenPrompt;
             } else {
@@ -10445,8 +10525,8 @@ fn dispatch_action(
                 } // close else (non-orchestration path)
             }
         }
-        Action::SendConfigGenPrompt { pane_id, cwd } => {
-            send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager);
+        Action::SendConfigGenPrompt { pane: card, cwd } => {
+            send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
         }
         // ===== PRD #80 M5: modal button actions =====
         // quit-confirm [Stop]: resolve like Enter-on-Stop — straight to
@@ -10476,8 +10556,8 @@ fn dispatch_action(
         // config-gen [Yes]: send the prompt to the pending target pane.
         Action::ConfigGenConfirm => {
             ui.mode = UiMode::Normal;
-            if let Some((pane_id, cwd)) = ui.config_gen_target.take() {
-                send_config_gen_prompt(&pane_id, &cwd, ui, pane, tab_manager);
+            if let Some((card, cwd)) = ui.config_gen_target.take() {
+                send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
             }
         }
         // config-gen [No]: dismiss for now (hint stays on the card).
@@ -10699,16 +10779,17 @@ fn dispatch_action(
         Action::OpenInboxAttention => {
             let card = selected_id
                 .and_then(|sid| snapshot.sessions.get(sid))
-                .and_then(|session| session.pane_id.clone());
-            let found = card.and_then(|pane_id| {
-                let (agent, items) = snapshot.inbox_attention(&pane_id)?;
-                Some((pane_id, agent?.to_string(), items.to_vec()))
+                .and_then(SessionState::bound_pane);
+            let found = card.and_then(|card| {
+                let (agent, items) = snapshot.inbox_attention(&card.pane_id)?;
+                Some((card, agent?.to_string(), items.to_vec()))
             });
             match found {
-                Some((pane_id, agent_id, items)) => {
+                Some((card, agent_id, items)) => {
                     ui.inbox_attention = Some(InboxAttentionDialog {
-                        pane_id,
+                        pane_id: card.pane_id,
                         agent_id,
+                        incarnation: card.incarnation,
                         items,
                         selected: 0,
                         answer: None,
@@ -10746,13 +10827,17 @@ fn dispatch_action(
                 dialog.answer = Some(inbox_attention_retry_needs(dialog, frame_area).to_string());
                 return Flow::Continue;
             }
-            let press = ui
-                .inbox_attention
-                .as_ref()
-                .and_then(|dialog| inbox_attention_press(dialog, retry));
-            if let (Some(press), Some(sender)) = (press, ui.inbox_action_sender.as_ref()) {
+            let press = ui.inbox_attention.as_ref().and_then(|dialog| {
+                inbox_attention_press(dialog, retry)
+                    .map(|press| (press, dialog.incarnation.clone()))
+            });
+            if let (Some((press, incarnation)), Some(sender)) =
+                (press, ui.inbox_action_sender.as_ref())
+            {
+                // PRD #1666 part 2 (G-fix6): bound to the process the picker's
+                // card was learned from.
                 sender.send(
-                    &press.pane_id,
+                    &crate::pane::BoundPane::new(press.pane_id.clone(), incarnation),
                     &press.agent_id,
                     &press.message_id,
                     press.revision,
@@ -13451,6 +13536,12 @@ pub fn run_tui(
             // is also logged at WARN by `close_pane`.
             for warning in embedded.take_close_warnings() {
                 ui.status_message = Some((warning, std::time::Instant::now()));
+            }
+            // PRD #1666 part 2 (G-fix6): a rename the deck refused after it
+            // was applied here is taken back, so the card keeps the name it
+            // had — as the desktop keeps the daemon's name when it refuses.
+            for pane_id in embedded.take_rename_refusals() {
+                take_back_rename(&mut ui, &pane_id);
             }
         }
 
@@ -21712,6 +21803,7 @@ pub fn render_orchestration_frame_to_buffer(
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                incarnation: Default::default(),
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -22509,6 +22601,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                incarnation: Default::default(),
             },
         );
     }
@@ -23323,6 +23416,7 @@ pub fn render_inbox_attention_overlay_to_buffer(
     let dialog = InboxAttentionDialog {
         pane_id: "pane".into(),
         agent_id: "agent".into(),
+        incarnation: Default::default(),
         items: items.to_vec(),
         selected,
         answer: answer.map(str::to_string),
@@ -23916,6 +24010,7 @@ mod tests {
         ui.inbox_attention = Some(InboxAttentionDialog {
             pane_id: "p".to_string(),
             agent_id: "a".to_string(),
+            incarnation: Default::default(),
             items: Vec::new(),
             selected: 0,
             answer: None,
@@ -25132,6 +25227,7 @@ mod tests {
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: 0,
+                incarnation: Default::default(),
             },
         );
         state
@@ -28671,6 +28767,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -31192,7 +31289,7 @@ mod tests {
                 ))
             }
         }
-        fn try_hydrate_pane(&self, _id: &str) -> bool {
+        fn try_hydrate_pane(&self, _card: &crate::pane::BoundPane) -> bool {
             *self.hydrate_calls.lock().unwrap() += 1;
             if self.hydratable {
                 *self.wired.lock().unwrap() = true;
@@ -31716,6 +31813,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -32512,6 +32610,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         }
     }
 
@@ -32950,6 +33049,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
 
         // Spacious: get all 3
@@ -32993,6 +33093,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -33027,6 +33128,7 @@ mod tests {
             pending_question: None,
             pull_request: None,
             pull_request_revision: 0,
+            incarnation: Default::default(),
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -36022,7 +36124,10 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 0; // Yes
-        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+        ui.config_gen_target = Some((
+            crate::pane::BoundPane::held_by_controller("pane-1"),
+            "/my/project".to_string(),
+        ));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -36030,8 +36135,8 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(
-            matches!(result, Action::SendConfigGenPrompt { ref pane_id, ref cwd }
-                if pane_id == "pane-1" && cwd == "/my/project")
+            matches!(result, Action::SendConfigGenPrompt { ref pane, ref cwd }
+                if pane.pane_id == "pane-1" && cwd == "/my/project")
         );
     }
 
@@ -36040,7 +36145,10 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 1; // No
-        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+        ui.config_gen_target = Some((
+            crate::pane::BoundPane::held_by_controller("pane-1"),
+            "/my/project".to_string(),
+        ));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -36067,7 +36175,10 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 2; // Never
-        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+        ui.config_gen_target = Some((
+            crate::pane::BoundPane::held_by_controller("pane-1"),
+            "/my/project".to_string(),
+        ));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -36105,7 +36216,10 @@ mod tests {
     fn config_gen_prompt_esc_dismisses() {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
-        ui.config_gen_target = Some(("pane-1".to_string(), "/my/project".to_string()));
+        ui.config_gen_target = Some((
+            crate::pane::BoundPane::held_by_controller("pane-1"),
+            "/my/project".to_string(),
+        ));
 
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(esc, &mut ui);

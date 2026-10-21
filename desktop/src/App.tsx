@@ -77,7 +77,9 @@ import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal,
 import { agentKey } from "./lib/agentKey";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
 import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
-import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
+import { agentGoneTerminalState, terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
+import { AGENT_GONE_AFTER_RESTART } from "./lib/agentIdentity";
+import { bindViewIncarnation, viewAgent, viewAgentReplaced, viewBound } from "./lib/viewIdentity";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
 import { selectsAllDecks } from "./lib/endpoints";
@@ -240,7 +242,17 @@ function useKeyboardInput(send: DeckRuntimeState["sendTerminalInput"]): DeckRunt
 }
 
 export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = { kind: "overview" } }: { runtime: DeckRuntimeState; orchestrationPlatformIssue?: string; initialView?: DeckView }) {
-  const [requestedView, setView] = useState<DeckView>(initialView);
+  /* PRD #1666 part 2 (G-fix6): the latest fleet, for binding a view to the
+     incarnation of the record it opens at the moment it is asked for. */
+  const fleetNow = useRef(runtime.fleet);
+  fleetNow.current = runtime.fleet;
+  // voice-registry-exempt: the store behind `setView`, the registry-owned setter every navigation writes through; nothing else writes it
+  const [requestedView, setRequestedView] = useState<DeckView>(() => bindViewIncarnation(initialView, runtime.fleet));
+  /* Every navigation goes through here, so no agent view is ever held without
+     the incarnation of the record it was opened on (`bindViewIncarnation`). */
+  const setView = useCallback((next: DeckView | ((current: DeckView) => DeckView)) => {
+    setRequestedView((current) => bindViewIncarnation(typeof next === "function" ? next(current) : next, fleetNow.current));
+  }, []);
   /**
    * Issue #1198 — the app's experimental surfaces, read once at startup. The
    * deck is one of them, so while it is hidden a view that names it — an
@@ -323,7 +335,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const panelVoiceContext = useRef<VoicePanelContext | undefined>(undefined);
   /** PRD #1541 — where the voice panel listens for keyboard writes ({@link KeyboardInput}). */
-  const panelKeyboard = useRef<((target: AgentTarget, data: string, sent: Promise<void>) => void) | undefined>(undefined);
+  const panelKeyboard = useRef<((target: Pick<AgentTarget, "deckId" | "agentId">, data: string, sent: Promise<void>) => void) | undefined>(undefined);
   const noteKeyboard = useCallback((target: AgentTarget, data: string, sent: Promise<void>) => panelKeyboard.current?.(target, data, sent), []);
   /**
    * PRD #1223 U5 — the OVERVIEW's half, published while it is mounted:
@@ -480,7 +492,22 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * pane resolved the agent and rendered nothing when it failed, while the
    * declaration never asked and went on naming it.
    */
-  const paneAgent = agentView && paneDeck ? paneDeck.agents.find((candidate) => candidate.id === agentView.agentId) : undefined;
+  const paneAgent = agentView && paneDeck ? viewAgent(paneDeck.agents, agentView) : undefined;
+  /**
+   * PRD #1666 part 2 (G-fix6) — the open view's deck now lists its agent id
+   * under ANOTHER incarnation: the deck restarted and reused the id for an
+   * unrelated agent. The view's agent is gone. `paneAgent` above does not
+   * resolve to the newcomer, so nothing below renders it, declares its
+   * terminal or routes input to it; the pane says the agent is gone instead.
+   * Only a fresh selection of the newcomer's own row opens it.
+   */
+  const paneAgentReplaced = agentView !== undefined && paneDeck !== undefined && paneDeck.connection.status === "connected" && viewAgentReplaced(paneDeck.agents, agentView);
+  /* A view nothing bound yet — its agent was not listed when it was asked
+     for — is bound by the first record that lists it. */
+  useEffect(() => {
+    // voice-registry-exempt: an invariant, not a control — it binds the view already open to the incarnation of the record it shows, and opens nothing
+    if (agentView && !viewBound(agentView) && paneAgent) setView(() => ({ ...agentView, incarnation: paneAgent.incarnation }));
+  }, [agentView, paneAgent, setView]);
   /**
    * Issue #1143 — the last record this pane's deck gave, so the pane can still
    * be a pane while that deck is not answering.
@@ -524,6 +551,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * with its remedy reachable`.
    */
   const heldPaneAgent = useHeldAgentRecord(agentView, paneAgent);
+  /* The overview's pane stays open over a replaced agent, saying it is gone,
+     as long as there is a record of the agent it was opened on to say it
+     about. */
+  const paneAgentGone = paneAgentReplaced && base === "overview" && heldPaneAgent !== undefined;
   /** The record the pane RENDERS: the deck's current answer, else its last one. */
   const paneAgentShown = paneAgent ?? heldPaneAgent?.agent;
   /**
@@ -550,7 +581,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * of panes that do.
    */
   const overviewShown = base === "overview"
-    ? (agentView && paneAgent && paneDeckAttachable ? [{ deckId: agentView.deckId, agentId: agentView.agentId, ...(paneAgent.incarnation ? { incarnation: paneAgent.incarnation } : {}) }] : [])
+    ? (agentView && paneAgent && paneDeckAttachable ? [{ deckId: agentView.deckId, agentId: agentView.agentId, incarnation: paneAgent.incarnation }] : [])
     : undefined;
   useShownTerminals(runtime.setShownTerminals, overviewShown);
   /**
@@ -643,7 +674,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * with the overview was precisely this stale view, so the condition is written
    * for `agentView` rather than for `base === "overview"`.
    */
-  const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined;
+  const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined && !paneAgentGone;
   useEffect(() => {
     if (paneAgentRetired) closeAgent();
   }, [paneAgentRetired, closeAgent]);
@@ -806,9 +837,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* The agent's incarnation: a daemon can replace an agent under the same
          deck and agent id, and the mode must not survive that (#1260 review). */
       spawnedAtMs: paneShownAgent.spawnedAtMs,
-      inputBlocked: paneInput.readOnly
-        ? (paneInput.notice ?? "its terminal cannot take input.")
-        : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
+      inputBlocked: paneAgentGone
+        ? `${AGENT_GONE_AFTER_RESTART}.`
+        : paneInput.readOnly
+          ? (paneInput.notice ?? "its terminal cannot take input.")
+          : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
       /* The pull request browser is drawn over the pane, so its prompt is
          not on screen either (PRD #1401). */
       terminalHidden: paneTab !== "terminal" || prBrowser !== undefined || undefined,
@@ -825,7 +858,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          answer reaches that process or nothing. */
       ...(paneShownAgent.incarnation ? { incarnation: paneShownAgent.incarnation } : {}),
     }
-    : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab, prBrowser]);
+    : undefined), [agentView, heldPaneAgent, paneAgentGone, paneDeckAttachable, paneInput, paneShownAgent, paneTab, prBrowser]);
   /**
    * PRD #1260 — a D5 confirmation open on whichever screen is mounted, which
    * outranks dictation. Both the overview and the deck report theirs here
@@ -866,7 +899,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     .flatMap((deck) => {
       const deckId = deck.connection.deckId;
       if (deckId === undefined) return [];
-      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agentSpokenName(agent, READING_LABEL_MAX_CHARS), incarnation: agent.spawnedAtMs }));
+      return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agentSpokenName(agent, READING_LABEL_MAX_CHARS), incarnation: agent.spawnedAtMs, ...(agent.incarnation ? { deckProcess: agent.incarnation } : {}) }));
     }), [allDecksSelected, runtime.fleet, selectedDeckId]);
   /* Audit A7 — the decks being viewed, so what was still to be said about a
      deck the user moved away from is dropped. Joined into one string so the
@@ -1036,6 +1069,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          rows span every deck, where a resolved agent is the selected deck's. */
       deckId: agent ? (agent.deckId ?? selectedDeckId ?? "") : (agentView?.deckId ?? selectedDeckId ?? ""),
       agentId: agent?.value ?? agentView?.agentId ?? "",
+      /* PRD #1666 part 2 (G-fix6): the open pane's own target keeps the
+         incarnation the view was opened on; a resolved `agent_ref` is bound
+         when it is acted on. */
+      ...(!agent && agentView && viewBound(agentView) ? { incarnation: agentView.incarnation } : {}),
       from: base === "overview" ? "overview" : "deck",
       /* What the DECK calls it, which is what Rust resolved the spoken words
          against — never the spoken words themselves. A surface that named the
@@ -1211,7 +1248,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   }, []);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
-  const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
+  const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId, ...(viewBound(agentView) ? { incarnation: agentView.incarnation } : {}) } : undefined;
   const screenNode = base === "overview"
     ? (
       <>
@@ -1224,7 +1261,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && paneDeck && paneAgentShown && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} onTabShown={setPaneTab} />}
+        {agentView && paneDeck && paneAgentShown && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} gone={paneAgentGone} onClose={closeAgentView} onTabShown={setPaneTab} />}
         {/*
           PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
 
@@ -1377,7 +1414,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
  * attributed to another. The pane reaching its own deck is what made that
  * unnecessary rather than merely unwise.
  */
-function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void; onTabShown?: (tab: PanelTab) => void }) {
+function OverviewAgentPane({ runtime, view, deck, agent, held, attached, gone = false, onClose, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; gone?: boolean; onClose: () => void; onTabShown?: (tab: PanelTab) => void }) {
   const [tab, setTab] = useState<PanelTab>("terminal"); // voice-registry-exempt: the pane-over-the-overview's own tab strip, a control inside one pane
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   /* PR #1451 — the voice panel's view of which tab is shown (see `paneTab`). */
@@ -1410,7 +1447,9 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
          order of magnitude more often than `OVERVIEW_CLOCK_TICK_MS` would tick
          it. The `title` needs none of that argument: an absolute instant
          cannot decay. */
-      noTerminal={attached ? undefined : unreachableDeckTerminalState(deckName(deck.connection), deck.connection.message, displayActivity(held?.confirmedAt))}
+      /* PRD #1666 part 2 (G-fix6): an agent gone with its deck's restart has
+         no terminal anywhere, and the sentence says so in the TUI's words. */
+      noTerminal={gone ? agentGoneTerminalState() : attached ? undefined : unreachableDeckTerminalState(deckName(deck.connection), deck.connection.message, displayActivity(held?.confirmedAt))}
       /* Issue #1143 — `held` is set only where the live lookup found nothing,
          so its presence IS the claim that what the header shows is older than
          now. One prop, read by the two colour cues and the wording together. */
@@ -1559,7 +1598,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
   );
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
@@ -1597,9 +1636,15 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    * the comparison `DeckShell` makes — expressed per tile, at the seam that
    * decides what the user sees, rather than trusted from the caller.
    */
-  const paneAgentId = openAgent && snapshot.agents.some((agent) => agent.id === openAgent.agentId && agent.daemonId === openAgent.deckId)
+  const paneAgentId = openAgent && snapshot.agents.some((agent) => agent.daemonId === openAgent.deckId && viewAgent([agent], { kind: "agent", from: "deck", ...openAgent }) !== undefined)
     ? openAgent.agentId
     : undefined;
+  /* PRD #1666 part 2 (G-fix6): the open pane's agent id is now listed under
+     another incarnation — the deck restarted and the id is an unrelated
+     agent's. Nothing above promotes it, `DeckShell` closes the view, and the
+     toast says why the pane went. */
+  const paneAgentReplaced = openAgent !== undefined && snapshot.connection.status === "connected" && snapshot.connection.deckId === openAgent.deckId
+    && viewAgentReplaced(snapshot.agents, { kind: "agent", from: "deck", ...openAgent });
   /*
     PR #1451 round 3, change 3 — the tiles, numbered in grid order while voice
     is on: the same order the 1–4 keys focus, so a tile's number and its key
@@ -1671,6 +1716,12 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
      recorded as `runtime.error` and `dismissToast` can match the two. */
   const notice = noticeState?.message;
   const setNotice = (message: string | undefined, detail?: string) => setNoticeState(message === undefined ? undefined : { message, ...(detail === undefined ? {} : { detail }) });
+  /* PRD #1666 part 2 (G-fix6): the pane over this deck closed because its
+     agent is gone with the deck's restart; the toast says so in the TUI's
+     words rather than letting the pane vanish unexplained. */
+  useEffect(() => {
+    if (paneAgentReplaced) setNoticeState({ message: AGENT_GONE_AFTER_RESTART });
+  }, [paneAgentReplaced]);
   const [confirm, setConfirm] = useState<ConfirmState>(); // voice-registry-exempt: the confirmation an action that starts or stops agents asks first — opened by the action it guards, never on its own
   const [upgrade, setUpgrade] = useState<UpgradeTarget>(); // voice-registry-exempt: the Upgrade / Replace daemon dialog (PRD #1487) — opened only by those two buttons, and it asks before stopping anything
   /* PRD #1260 review, round 5 — told whenever this screen's confirmation opens
@@ -1863,7 +1914,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
        declaration cannot drift from what the tile actually mounted. */
     /* PRD #1666 part 2 (G-fix5): with the daemon process that listed the row,
        so the terminal opened for it is bound to that process. */
-    .map((agent) => ({ deckId: agent.daemonId, agentId: agent.id, ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }));
+    .map((agent) => ({ deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }));
 
   /**
    * ONE call per render commit carrying ALL the shown ids, never one call per
@@ -2524,7 +2575,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                     `.agent-tile:not(.is-selected) { display: none }` for the
                     promoted tile without relying on a specificity race.
                   */
-                  onOpen={onNavigate && (() => VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "deck" }))}
+                  onOpen={onNavigate && (() => VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "deck", incarnation: agent.incarnation }))}
                   onClose={onCloseAgent && (() => VOICE_ACTIONS.closeAgentView.run(voiceContext))}
                 />
               ))}

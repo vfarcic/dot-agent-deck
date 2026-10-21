@@ -2,7 +2,8 @@ import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTUR
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
-import { agentKey } from "./agentKey";
+import { agentKey, boundAgentKey } from "./agentKey";
+import { AGENT_GONE_AFTER_RESTART, AGENT_IDENTITY_UNKNOWN } from "./agentIdentity";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, metadataOf, MAX_LIVE_EVIDENCE, type DaemonHookEvent } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
@@ -3710,25 +3711,32 @@ interface InstalledTerminalSession {
   result: TerminalAttachResult;
 }
 
-/**
- * PRD #1666 part 2 (G-fix5): what a terminal tile says when its attach fails.
- * A refusal because the deck restarted since the card was listed means the
- * card's agent is gone, so the tile says exactly that, in the words the TUI
- * uses; anything else is a failed attach to an agent that is still running.
- */
-export const AGENT_GONE_AFTER_RESTART = "that agent is gone (the deck restarted)";
+export { AGENT_GONE_AFTER_RESTART, AGENT_IDENTITY_UNKNOWN };
 
-function terminalAttachFailure(cause: unknown): string {
+/** What a tile says for an attach that failed for any other reason: it asserts nothing about the agent. */
+export const TERMINAL_ATTACH_FAILED = "Terminal attach failed; reconnect to retry its terminal.";
+
+/**
+ * What a terminal tile says when its attach fails. The two identity refusals
+ * keep their own sentences, the words the TUI uses (CLAUDE.md rule 22); any
+ * other failure says only that the attach failed, since a failed attach is no
+ * evidence either way about whether the agent is running.
+ */
+export function terminalAttachFailure(cause: unknown): string {
   const text = cause instanceof Error ? cause.message : String(cause);
-  return text === AGENT_GONE_AFTER_RESTART
-    ? AGENT_GONE_AFTER_RESTART
-    : "Terminal attach failed. The agent is still running; reconnect to retry its terminal.";
+  return text === AGENT_GONE_AFTER_RESTART || text === AGENT_IDENTITY_UNKNOWN ? text : TERMINAL_ATTACH_FAILED;
 }
 
 export class TauriDeckBridge implements DeckBridge {
   readonly mode = "live" as const;
   /*
-   * # Every per-agent map below is keyed by `agentKey(deckId, agentId)`
+   * # Every per-agent map below is keyed by `boundAgentKey(target)`
+   *
+   * PRD #1666 part 2 (G-fix6): that is `agentKey(deckId, agentId)` plus the
+   * incarnation the target was listed with, because a restarted deck reuses
+   * the ids too. A session is found only for the incarnation it was attached
+   * for, so a stale card's input, resize or shown declaration never selects a
+   * successor's session, and a successor's never selects the stale one's.
    *
    * PRD #1105's cross-deck pane, and issue
    * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116). Agent ids
@@ -4047,7 +4055,21 @@ export class TauriDeckBridge implements DeckBridge {
    * five of them, which is the same broken deck the bound exists to avoid.
    */
   async setShownTerminals(targets: AgentTarget[]): Promise<void> {
-    const next = new Map(targets.map((target) => [agentKey(target.deckId, target.agentId), target] as const));
+    const next = new Map(targets.map((target) => [boundAgentKey(target), target] as const));
+    /*
+      PRD #1666 part 2 (G-fix6): a declared `(deck, agent)` whose held entry
+      is another incarnation's is a restarted deck reusing the id. That entry
+      is the old process's terminal and nothing can reach it any more, so it
+      is dropped now rather than kept warm: an attach still in flight for it is
+      cancelled (its completion fails the guard and detaches), and nothing
+      keyed by the bare pair can hand it to the new target.
+    */
+    const declared = new Set(targets.map((target) => agentKey(target.deckId, target.agentId)));
+    const superseded = new Set<string>();
+    for (const [key, target] of [...this.shown, ...this.warm]) {
+      if (!next.has(key) && declared.has(agentKey(target.deckId, target.agentId))) superseded.add(key);
+    }
+    const replaced = Array.from(superseded, (key) => this.evictTerminal(key));
 
     // Leaving a terminal does not detach it. It moves to the warm set, delete-
     // then-add so the tail is the most recently left and the head is the LRU.
@@ -4079,7 +4101,7 @@ export class TauriDeckBridge implements DeckBridge {
     // no-op except where a shown terminal lost its session to a daemon
     // `end`/`error` state event and has to be brought back.
     const attaching = this.shown.size ? this.attachAgents(Array.from(this.shown.values())) : Promise.resolve();
-    await Promise.all([...evictions, attaching]);
+    await Promise.all([...replaced, ...evictions, attaching]);
   }
 
   /**
@@ -4177,7 +4199,7 @@ export class TauriDeckBridge implements DeckBridge {
     // resolved, and attaching it then would leave a live PTY behind a screen
     // that shows no terminal at all.
     await Promise.allSettled(targets.filter((target) => {
-      const key = agentKey(target.deckId, target.agentId);
+      const key = boundAgentKey(target);
       if (this.attached.has(key) || !(this.shown.has(key) || this.warm.has(key))) return false;
       // One outstanding invocation per agent, whatever the frontend has since
       // forgotten about it. Queue the declaration instead of starting a second
@@ -4197,7 +4219,7 @@ export class TauriDeckBridge implements DeckBridge {
         and never `this.selectedDeckId`, so a frame that arrives after the
         selection has moved is still attributed to the deck that produced it.
       */
-      const key = agentKey(target.deckId, target.agentId);
+      const key = boundAgentKey(target);
       this.attached.add(key);
       const onOutput = new Channel<ArrayBuffer>();
       const attempt: PendingTerminalAttachment = {
@@ -4374,7 +4396,7 @@ export class TauriDeckBridge implements DeckBridge {
       this.terminalListener(stamped);
       return;
     }
-    const key = agentKey(target.deckId, target.agentId);
+    const key = boundAgentKey(target);
     const pending = this.pendingTerminal.get(key) ?? [];
     pending.push(stamped);
     this.pendingTerminal.set(key, pending);
@@ -5096,7 +5118,9 @@ export class TauriDeckBridge implements DeckBridge {
 
   async resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto, localOnly = false): Promise<QuestionResultDto> {
     const invoke = await this.getInvoke();
-    return invoke<QuestionResultDto>("desktop_voice_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, utterance, form, awaitingText: awaitingText ?? null, localOnly });
+    /* PRD #1666 part 2 (G-fix6): the daemon process that listed the agent, so
+       a restarted deck's agent under the same id is not read as this one. */
+    return invoke<QuestionResultDto>("desktop_voice_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, utterance, form, awaitingText: awaitingText ?? null, localOnly, incarnation: target.incarnation ?? null });
   }
 
   async sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string): Promise<AnswerOutcomeDto> {
@@ -5179,6 +5203,8 @@ export class TauriDeckBridge implements DeckBridge {
       agentId: target.agentId,
       agentLabel: target.label,
       onSentence: channel,
+      /* PRD #1666 part 2 (G-fix6): see `resolveVoiceQuestion`. */
+      incarnation: target.deckProcess ?? null,
     });
   }
 
@@ -5235,7 +5261,10 @@ export class TauriDeckBridge implements DeckBridge {
    * writes nothing, and the chunks behind it go on as usual.
    */
   async sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void> {
-    const key = agentKey(target.deckId, target.agentId);
+    /* PRD #1666 part 2 (G-fix6): the session installed for THIS target's
+       incarnation, or none — a session attached for a restarted deck's
+       successor under the same id is not this agent's terminal. */
+    const key = boundAgentKey(target);
     const accepted = this.sessions.get(key);
     const notAttached = () => new Error(`Terminal for ${target.agentId} is not attached.`);
     if (!accepted) throw notAttached();
@@ -5279,7 +5308,10 @@ export class TauriDeckBridge implements DeckBridge {
 
   async resizeTerminal(target: AgentTarget, cols: number, rows: number): Promise<void> {
     if (cols < 1 || rows < 1) return;
-    const key = agentKey(target.deckId, target.agentId);
+    /* Keyed by the target's incarnation, so a stale card's size is flushed
+       only to a session attached for that incarnation — which a restarted deck
+       never has — and never to its successor's (G-fix6). */
+    const key = boundAgentKey(target);
     this.pendingResizes.set(key, { cols, rows });
     this.scheduleResize(key);
     await Promise.resolve();

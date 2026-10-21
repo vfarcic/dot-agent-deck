@@ -55,7 +55,7 @@ const snapshot: DesktopSnapshotDto = {
  * scattering the fixture's deck id through a hundred calls; the tests that are
  * ABOUT crossing decks build their targets explicitly.
  */
-const on = (agentId: string): AgentTarget => ({ deckId: snapshot.connection.deckId!, agentId });
+const on = (agentId: string): AgentTarget => ({ deckId: snapshot.connection.deckId!, agentId, incarnation: undefined });
 
 describe("TauriDeckBridge", () => {
   beforeEach(() => {
@@ -329,7 +329,9 @@ describe("TauriDeckBridge", () => {
       data: new Uint8Array(),
       stream: "error",
       operation: "append",
-      message: "Terminal attach failed. The agent is still running; reconnect to retry its terminal.",
+      // PRD #1666 part 2 (G-fix6): a failed attach asserts nothing about
+      // whether the agent is running.
+      message: "Terminal attach failed; reconnect to retry its terminal.",
     });
     expect(JSON.stringify(terminal.mock.calls)).not.toContain("secret token");
     expect(JSON.stringify(terminal.mock.calls)).not.toContain("/Users/private");

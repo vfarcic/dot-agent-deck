@@ -615,6 +615,19 @@ mod removed_delivery_settings_tests {
 /// is spawned alongside the hook-ingestion loop and aborted when this
 /// function returns.
 pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), DaemonError> {
+    // PRD #1666 part 2 (G-fix6): a daemon names its process on every `Hello`,
+    // and a client binds each action on an agent to that name. A process that
+    // can mint no name a successor could not repeat refuses to start, and says
+    // why, rather than serve agents no client could safely act on.
+    if let Err(reason) = crate::daemon_protocol::try_daemon_instance_id() {
+        tracing::error!(
+            reason,
+            "the daemon cannot identify its process; not starting"
+        );
+        return Err(DaemonError::Io(std::io::Error::other(format!(
+            "the daemon cannot identify its process, so it is not starting: {reason}"
+        ))));
+    }
     // PRD #1666 (decision D-7): settings of the typed delivery the inbox
     // replaced do nothing now; say so once rather than ignore them silently.
     warn_removed_delivery_settings(|name| std::env::var_os(name).is_some());

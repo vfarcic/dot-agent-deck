@@ -120,6 +120,13 @@ export type AgentViewTarget = {
   deckId: string;
   agentId: string;
   from: "deck" | "overview";
+  /**
+   * PRD #1666 part 2 (G-fix6): the daemon process that listed the agent, from
+   * an opener that holds its record. Absent where only the ids are known (a
+   * row resolved by number); the shell then binds the view to the record
+   * listed when it is opened.
+   */
+  incarnation?: string;
 };
 
 /** One agent, named the way every caller here names one. */
@@ -584,7 +591,7 @@ export const VOICE_ACTIONS = {
          carries `agentLabel` as well, which belongs to the dictation row and
          not in a `DeckView` — a spread would put it in the app's view state,
          where nothing reads it and everything compares it. */
-      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from });
+      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from, ...("incarnation" in target ? { incarnation: target.incarnation } : {}) });
     },
   },
 

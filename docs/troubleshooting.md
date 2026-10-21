@@ -519,9 +519,11 @@ If neither fits, capture a log ([Enabling Debug Logs](#enabling-debug-logs); the
 
 *Applies to the TUI and the desktop app.*
 
-You opened, closed, renamed or messaged an agent, retried or cancelled one of its messages, or answered its question by voice, and the deck restarted after you last saw that agent. That agent can no longer be reached through the deck, and the restarted deck may be running a different agent under the same name or in the same pane. Your action was not sent, so it did nothing to that other agent. Refresh the dashboard and act on the agents the restarted deck lists.
+You acted on an agent the deck showed you before it restarted: you opened or focused it, typed into it, closed, renamed or messaged it, sent it the configuration request, retried or cancelled one of its messages, or answered its question or had its replies read aloud by voice. That agent can no longer be reached through the deck, and the restarted deck may be running a different agent under the same name or in the same pane. The action was not sent to the restarted deck. Act on the agents the restarted deck lists instead.
 
-In the TUI, a pane whose deck restarted while it was reconnecting is marked `disconnected` and the status line shows this message. Anything you typed into it while it was reconnecting is discarded rather than sent to the new agent. Closing the pane removes it. A pane that only lost its connection for a moment, while the deck kept running, reconnects to its own agent as before. In the desktop app, opening the terminal of such an agent shows this message instead of a terminal.
+In the TUI, a pane whose deck restarted while it was reconnecting is marked `disconnected` and the status line shows this message. Anything you typed into it while it was reconnecting is discarded rather than sent to the new agent. A dashboard card stays tied to the deck that showed it, even when the restarted deck starts an agent in the same pane: focusing, closing or messaging it does not reach the new agent, and closing it removes the card. The restarted deck's agent gets a card of its own when it next reports activity. A rename refused this way is taken back, so the card keeps its old name, as it does in the desktop app. A pane that only lost its connection for a moment, while the deck kept running, reconnects to its own agent as before.
+
+In the desktop app, an agent pane open on the overview shows this message in place of its terminal and takes no input; one opened from a deck's grid closes, and the message appears as a notice. Opening the restarted deck's agent from the dashboard opens it normally.
 
 An orchestration whose cleanup meets a restart names its roles in the cleanup warning with this message.
 

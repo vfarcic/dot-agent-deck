@@ -781,3 +781,45 @@ fn handshake_013_a_voice_answer_after_a_restart_answers_nothing() {
         }
     }
 }
+
+/// Scenario: agent `1` waits on a permission question on deck process `a`, and the voice panel holds its row. The deck restarts as the same build and lists an unrelated agent `1` waiting on a question of its own. Reading the question for the held row — what resolving and answering a spoken answer both do first — refuses with "that agent is gone (the deck restarted)", and a row held with no process refuses with the identity sentence; before the restart, the held row's question is read (control).
+#[tokio::test]
+async fn handshake_013_a_voice_question_after_a_restart_reads_nothing() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("g6-voice-question", "a");
+    deck.ask(&permission_question());
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    let card = listed_row(&deck, &state).await;
+
+    let read = crate::pending_question_on(&state, &wire, &card.id, &card.incarnation)
+        .await
+        .expect("the deck answers");
+    assert!(
+        matches!(read, Ok(Some(_))),
+        "control: the held row's own question is read: {read:?}"
+    );
+
+    deck.restart_as("b");
+    let read = crate::pending_question_on(&state, &wire, &card.id, &card.incarnation)
+        .await
+        .expect("the deck answers");
+    assert_eq!(
+        read.err(),
+        Some(AGENT_GONE_AFTER_RESTART),
+        "the successor's question was read as the held agent's"
+    );
+    let read = crate::pending_question_on(
+        &state,
+        &wire,
+        &card.id,
+        &dot_agent_deck::daemon_client::Incarnation::UNNAMED,
+    )
+    .await
+    .expect("the deck answers");
+    assert_eq!(
+        read.err(),
+        Some(dot_agent_deck::daemon_client::AGENT_IDENTITY_UNKNOWN)
+    );
+}

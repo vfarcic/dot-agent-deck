@@ -293,7 +293,7 @@ function InboxAttentionRow({ agent, item, onInboxAction }: {
     setBusy(true);
     try {
       const result = await onInboxAction(
-        { deckId: agent.daemonId, agentId: agent.id, ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) },
+        { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation },
         { paneId, messageId: item.messageId, revision: item.revision },
         verb,
       );
@@ -354,12 +354,16 @@ export function AgentTile({
 }: AgentTileProps) {
   /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
   const openPullRequest = useContext(OpenPullRequest);
+  /* PRD #1666 part 2 (G-fix6): keystrokes and sizes carry the incarnation of
+     the record this tile renders, so they reach the session attached for that
+     process and never one attached for a restarted deck's agent of the same
+     id. */
   const handleInput = useCallback((data: string) => {
-    void onTerminalInput({ deckId: agent.daemonId, agentId: agent.id }, data);
-  }, [agent.daemonId, agent.id, onTerminalInput]);
+    void onTerminalInput({ deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }, data);
+  }, [agent.daemonId, agent.id, agent.incarnation, onTerminalInput]);
   const handleResize = useCallback((cols: number, rows: number) => {
-    void onTerminalResize({ deckId: agent.daemonId, agentId: agent.id }, cols, rows);
-  }, [agent.daemonId, agent.id, onTerminalResize]);
+    void onTerminalResize({ deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }, cols, rows);
+  }, [agent.daemonId, agent.id, agent.incarnation, onTerminalResize]);
   const agentEvidence = evidence.filter((item) => agent.handoffIds.includes(item.id) || item.agentId === agent.id);
   // Issue #1042: one derivation for the terminal's state, its read-only gate
   // and the sentence beside it, so the three cannot disagree the way the tile's

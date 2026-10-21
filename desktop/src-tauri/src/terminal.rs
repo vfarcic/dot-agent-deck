@@ -828,8 +828,9 @@ async fn establish(
             focus_claim: None,
         });
     }
-    // This deck's earlier session for this agent, never another deck's.
-    detach_agent_on(state, &deck, &agent_id).await;
+    // This deck's earlier session for this agent, never another deck's, and
+    // never one attached on another daemon process (G-fix6).
+    detach_agent_on(state, &deck, &agent_id, &incarnation).await;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
     // PRD #882: a half-measured tile (one axis zero) declares nothing rather
@@ -1389,15 +1390,32 @@ pub(crate) async fn detach(state: &DesktopState, session_id: &str) -> Result<boo
     Ok(true)
 }
 
-/// Every session for one agent **on one deck**.
+/// Every session for one agent **on one deck**, attached on the daemon process
+/// `incarnation` names.
 ///
 /// The deck term is PRD #1105's: without it this tore down another machine's
 /// live pane whenever its agent happened to share an id, which is the ordinary
-/// case rather than a contrived one.
-pub(crate) async fn detach_agent_on(state: &DesktopState, deck: &EndpointIdentity, agent_id: &str) {
+/// case rather than a contrived one. The process term is PRD #1666 part 2's
+/// (G-fix6), for the same reason one level down: a restarted daemon numbers an
+/// unrelated agent with the same id, and stopping, or opening a stale card of,
+/// the old one must not end the new one's terminal. A session that recorded no
+/// process is matched as before.
+pub(crate) async fn detach_agent_on(
+    state: &DesktopState,
+    deck: &EndpointIdentity,
+    agent_id: &str,
+    incarnation: &Incarnation,
+) {
     detach_matching(
         state,
-        |session| session.agent_id == agent_id && session.endpoint.identity() == *deck,
+        |session| {
+            session.agent_id == agent_id
+                && session.endpoint.identity() == *deck
+                && session
+                    .incarnation
+                    .as_ref()
+                    .is_none_or(|attached| attached.same_process(incarnation))
+        },
         || false,
     )
     .await;
@@ -1892,11 +1910,36 @@ mod tests {
             )
             .unwrap();
 
-        detach_agent_on(&state, &deck_a.identity(), "planner").await;
+        detach_agent_on(&state, &deck_a.identity(), "planner", &Incarnation::UNNAMED).await;
 
         let sessions = state.sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(sessions.contains_key("terminal-b"));
+    }
+
+    /// Scenario: one deck holds two terminal sessions for agent `planner` — one attached on the daemon process `a` before a same-build restart, one on its successor `b`. Detaching `a`'s agent, as a stop on it or a stale card's open does, ends only `a`'s session and leaves `b`'s terminal open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_013_detaching_an_agent_leaves_a_successors_namesake() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let lease = fixture_lease().await;
+        let state = DesktopState::default();
+        let deck = fixture_deck("/tmp/dot-agent-deck-detach-incarnation.sock");
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        for (id, process) in [("terminal-a", "a"), ("terminal-b", "b")] {
+            let mut session = fixture_session_on(deck.clone(), "planner", 1, Arc::clone(&lease));
+            session.incarnation = Some(named(process));
+            state.insert_unique_session(id.into(), session).unwrap();
+        }
+
+        detach_agent_on(&state, &deck.identity(), "planner", &named("a")).await;
+
+        let sessions = state.sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions.contains_key("terminal-b"),
+            "the successor's terminal was ended"
+        );
     }
 
     /// PRD #1105's `detach_all` decision, as a test rather than a comment: a

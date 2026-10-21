@@ -70,6 +70,7 @@ fn fixture_session() -> SessionState {
         pending_question: None,
         pull_request: None,
         pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
