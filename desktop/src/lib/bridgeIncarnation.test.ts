@@ -136,6 +136,28 @@ describe("TauriDeckBridge terminal caches carry the incarnation (G-fix6)", () =>
     await bridge.dispose();
   });
 
+  /** Scenario: the successor's attach answers with an applied geometry, and only afterwards does a tile subscribe to geometry. The replay of the cached geometry names the process the session was attached on, as a live push does; the subscription made before the attach (control) received the same five values live. */
+  it("replays a cached geometry with the process its session was attached on", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_bootstrap") return snapshot;
+      if (command === "desktop_terminal_attach") return { sessionId: "session-b", agentId: "agent-1", generation: 2, reused: false, appliedRows: 48, appliedCols: 160 };
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    const live = vi.fn();
+    bridge.onTerminalGeometry(live);
+    await bridge.setShownTerminals([B]);
+    await vi.waitFor(() => expect(live).toHaveBeenCalledWith("agent-1", 48, 160, DECK, "process-b"));
+
+    const late = vi.fn();
+    bridge.onTerminalGeometry(late);
+    expect(late.mock.calls).toEqual([["agent-1", 48, 160, DECK, "process-b"]]);
+    await bridge.dispose();
+  });
+
   /** Scenario: terminal attaches fail three ways. A restart refusal and an unidentified-deck refusal each keep their own sentence, in the TUI's words; any other failure says only that the attach failed and asserts nothing about whether the agent is running. */
   it("words an attach failure without claiming the agent is running", async () => {
     const { terminalAttachFailure, AGENT_GONE_AFTER_RESTART, AGENT_IDENTITY_UNKNOWN } = await import("./bridge");

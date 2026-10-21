@@ -126,6 +126,8 @@ export interface DesktopSnapshotDto {
     disconnectedReason?: DisconnectedReason;
     /** Issue #1637 — the daemon's hook-binary notices; omitted by the crate when there are none. */
     hookBinaryNotices?: HookBinaryNotice[];
+    /** PRD #1666 part 2 (G-fix7c) — the daemon process whose listing a connected snapshot carries; omitted when it named none. */
+    incarnation?: string;
   };
   agents: DesktopAgentDto[];
   /*
@@ -2811,6 +2813,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       // Issue #1637: without this the live app never shows a notice, whatever
       // the daemon reported — only the fixture, which skips this mapping, did.
       ...(dto.connection.hookBinaryNotices?.length ? { hookBinaryNotices: dto.connection.hookBinaryNotices } : {}),
+      // PRD #1666 part 2 (G-fix7c): which process this listing is, so a
+      // restart that leaves no agent behind is still seen as one.
+      ...(dto.connection.status === "connected" && dto.connection.incarnation ? { incarnation: dto.connection.incarnation } : {}),
     },
     // Issue #714: a blocked agent needs a person, so it is `attention` — below
     // `failed`, since nothing has crashed.
@@ -5332,8 +5337,11 @@ export class TauriDeckBridge implements DeckBridge {
     // Replay what is already known: an agent can have been constrained by
     // another client long before this tile mounted, and the push that said so
     // is not repeated. Each entry carries the deck its session was created
-    // against, so the replay names the producer rather than the selection.
-    this.appliedGeometry.forEach((geometry) => listener(geometry.target.agentId, geometry.rows, geometry.cols, geometry.target.deckId));
+    // against, and the daemon process that session was attached on, so the
+    // replay names the producer rather than the selection, as a live push does.
+    this.appliedGeometry.forEach((geometry) =>
+      listener(geometry.target.agentId, geometry.rows, geometry.cols, geometry.target.deckId, geometry.target.incarnation),
+    );
     return () => {
       this.geometryListeners.delete(listener);
     };

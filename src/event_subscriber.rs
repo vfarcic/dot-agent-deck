@@ -317,12 +317,13 @@ async fn resubscribe(
         Ok((sub, records)) => {
             let mut state = state.write().await;
             // PRD #1666 part 2 (G-fix6): before the snapshot, which repaints
-            // only the cards learned from the process that answered. G-fix7:
-            // a card of another process is retired here, and the agent the
-            // answering process runs on its pane gets a card of its own.
-            let retired = state.learn_stream_incarnation(learned_from(&sub));
+            // only the cards learned from the process that answered. G-fix7c:
+            // a card of another process is dropped here, for the render loop
+            // to name in the restart notice, and the agent the answering
+            // process runs on its pane gets a card of its own.
+            let dropped = state.learn_stream_incarnation(learned_from(&sub));
             state.resync_after_event_gap(&records);
-            state.seed_successor_cards(&retired, &records);
+            state.seed_successor_cards(&dropped, &records);
             Ok(sub)
         }
         Err(ResyncFailure::Protocol(refusal)) => Err(Some(refusal)),
@@ -1265,7 +1266,7 @@ mod tests {
         );
     }
 
-    /// Scenario: the TUI's event subscriber opens its stream on the daemon process `a` and a hook event paints a card for agent `1` on `pane-1`; the daemon restarts as the same build, the subscriber resubscribes on `b`, and `b` sends a Thinking frame for its own agent `1` on `pane-1` under the card's key. The old card is retired — it leaves the pane, keeps `a` and its last status, and shows as gone — and `b`'s agent has a card of its own from the resync's snapshot, bound to `b`, which the frame turns to Thinking. Without the restart the same frame updates the card in place (control).
+    /// Scenario: the TUI's event subscriber opens its stream on the daemon process `a` and a hook event paints a card for agent `1` on `pane-1`; the daemon restarts as the same build, the subscriber resubscribes on `b`, and `b` sends a Thinking frame for its own agent `1` on `pane-1` under the card's key. The old card is dropped and queued for the restart notice, and `b`'s agent has a card of its own from the resync's snapshot, bound to `b`, which the frame turns to Thinking; nothing of `a` is updated. Without the restart the same frame updates the card in place (control).
     #[spec("lifecycle/handshake/013")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handshake_013_a_new_processs_frame_never_updates_an_old_card() {
@@ -1317,9 +1318,9 @@ mod tests {
                 2,
             ));
             let state = state.read().await;
-            let card = state.sessions.get("card").expect("the painted card");
             if !restarted {
-                assert!(!state.is_retired_card("card"), "control");
+                let card = state.sessions.get("card").expect("the painted card");
+                assert!(state.pending_restart_drops.is_empty(), "control");
                 assert_eq!(card.status, SessionStatus::Thinking, "control");
                 assert_eq!(
                     card.bound_pane(),
@@ -1329,16 +1330,28 @@ mod tests {
                 continue;
             }
             assert_eq!(state.stream_incarnation, named("b"));
-            assert!(
-                state.is_retired_card("card"),
-                "the old card was not retired"
+            let dropped: Vec<_> = state
+                .pending_restart_drops
+                .iter()
+                .map(|card| {
+                    (
+                        card.key.as_str(),
+                        card.pane_id.as_deref(),
+                        &card.incarnation,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                dropped,
+                vec![("card", Some("pane-1"), &named("a"))],
+                "the old card was not dropped for the notice"
             );
-            assert_eq!(card.incarnation, named("a"));
-            assert_eq!(card.pane_id, None, "a retired card left its pane");
-            assert_ne!(
-                card.status,
-                SessionStatus::Thinking,
-                "the restarted deck's frame updated the old card"
+            assert!(
+                state
+                    .sessions
+                    .values()
+                    .all(|card| !card.incarnation.same_process(&named("a"))),
+                "a card of `a` was kept"
             );
             let successors: Vec<_> = state
                 .sessions
@@ -1346,8 +1359,7 @@ mod tests {
                 .filter(|(_, session)| session.pane_id.as_deref() == Some("pane-1"))
                 .collect();
             assert_eq!(successors.len(), 1, "one card of its own: {successors:?}");
-            let (key, successor) = successors[0];
-            assert!(!state.is_retired_card(key));
+            let (_, successor) = successors[0];
             assert_eq!(successor.status, SessionStatus::Thinking);
             assert_eq!(
                 successor.bound_pane(),
@@ -1356,7 +1368,7 @@ mod tests {
         }
     }
 
-    /// Scenario: the TUI holds a card for agent `1` on `pane-1` learned from deck process `a`, and then draws the placeholder card for a pane it attached on `b` with the same pane and agent id — the deck restarted as the same build. The placeholder is not the old card: the old one is retired and the new one is bound to `b`. A placeholder learned from `a` itself is the card already there (control).
+    /// Scenario: the TUI holds a card for agent `1` on `pane-1` learned from deck process `a`, and then draws the placeholder card for a pane it attached on `b` with the same pane and agent id — the deck restarted as the same build. The placeholder is not the old card: the old one is dropped and queued for the restart notice, and the new one is bound to `b`. A placeholder learned from `a` itself is the card already there (control).
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_placeholder_never_adopts_another_processs_card() {
@@ -1378,17 +1390,64 @@ mod tests {
 
             if !restarted {
                 assert_eq!(key, "card", "control: the card already there");
-                assert!(!tui.is_retired_card("card"));
+                assert!(tui.pending_restart_drops.is_empty());
                 continue;
             }
             assert_ne!(
                 key, "card",
                 "the placeholder adopted the old process's card"
             );
-            assert!(tui.is_retired_card("card"));
+            assert!(!tui.sessions.contains_key("card"), "the old card was kept");
+            assert_eq!(
+                tui.pending_restart_drops
+                    .iter()
+                    .map(|card| card.key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["card"]
+            );
             assert_eq!(
                 tui.sessions[&key].bound_pane(),
                 Some(crate::pane::BoundPane::new("pane-1", attached_on))
+            );
+        }
+    }
+
+    /// Scenario: the TUI's stream is on deck process `b` when it draws a card for `pane-1` from an attach the replaced process `a` answered. The next frame from `b` for `pane-1`, its agent's start, drops that card and queues it for the restart notice, and `b`'s agent gets a card of its own. A card on the pane learned from `b` itself is updated by the frame (control).
+    #[spec("lifecycle/handshake/013")]
+    #[test]
+    fn handshake_013_a_frame_drops_another_processs_card_on_its_pane() {
+        use crate::daemon_client::Incarnation;
+        let named = |process: &str| Incarnation::from(Some(process.to_string()));
+        for restarted in [false, true] {
+            let mut tui = AppState::default();
+            tui.learn_stream_incarnation(named("b"));
+            let key = tui.insert_placeholder_session_learned(
+                "pane-1".into(),
+                None,
+                None,
+                None,
+                named(if restarted { "a" } else { "b" }),
+            );
+            tui.apply_event(event_on("pane-1", "1", "card", EventType::SessionStart, 1));
+            let on_pane: Vec<_> = tui
+                .sessions
+                .values()
+                .filter(|card| card.pane_id.as_deref() == Some("pane-1"))
+                .map(|card| card.incarnation.clone())
+                .collect();
+            assert_eq!(on_pane, vec![named("b")], "one card of b's on the pane");
+            if !restarted {
+                assert!(tui.pending_restart_drops.is_empty(), "control");
+                continue;
+            }
+            assert!(!tui.sessions.contains_key(&key), "a's card was kept");
+            assert_eq!(
+                tui.pending_restart_drops
+                    .iter()
+                    .map(|card| card.key.as_str())
+                    .collect::<Vec<_>>(),
+                vec![key.as_str()],
+                "a's card was not queued for the notice"
             );
         }
     }

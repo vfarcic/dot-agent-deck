@@ -1323,6 +1323,20 @@ impl EmbeddedPaneController {
         notice_identity_refusal(&self.close_warnings, error)
     }
 
+    /// Test-only: record that `pane_id`'s agent was lost for `reason`, as
+    /// the pane's reattach does, without waiting out a reattach.
+    #[cfg(test)]
+    pub(crate) fn mark_pane_lost_for_test(&self, pane_id: &str, reason: PaneLostReason) {
+        let panes = self.panes.lock().unwrap();
+        *panes
+            .get(pane_id)
+            .expect("the pane")
+            .backend
+            .lost
+            .lock()
+            .unwrap() = Some(reason);
+    }
+
     /// Test-only constructor for code paths that need a `PaneController`
     /// value but never actually exercise pane I/O — e.g. render-frame
     /// tests that build an empty controller just to satisfy a function
@@ -3790,7 +3804,12 @@ async fn run_pane_io_task(
                     "auto-reattach: the daemon is not the process this pane's agent ran under; \
                      not adopting its agent, dropping queued input"
                 );
-                notice_identity_refusal(&notices, &refusal);
+                // G-fix7c: a restart is named by the one notice the render
+                // loop shows when it drops this pane with the restart's other
+                // agents, not by a sentence per pane.
+                if !matches!(refusal, ClientError::DaemonRestarted) {
+                    notice_identity_refusal(&notices, &refusal);
+                }
                 *lost.lock().unwrap() = Some(match refusal {
                     ClientError::DaemonRestarted => PaneLostReason::DeckRestarted,
                     _ => PaneLostReason::DeckUnidentified,
@@ -4677,9 +4696,27 @@ impl PaneController for EmbeddedPaneController {
         }
     }
 
+    fn local_pane_is_cards(&self, card: &BoundPane) -> bool {
+        matches!(self.local_pane_for(card), LocalPaneFor::Card)
+    }
+
     fn pane_incarnation(&self, pane_id: &str) -> Option<Incarnation> {
         self.pane_attachment(pane_id)
             .and_then(|attachment| attachment.incarnation)
+    }
+
+    fn panes_lost_to_restart(&self) -> Vec<(String, Option<Incarnation>)> {
+        let panes = self.panes.lock().unwrap();
+        panes
+            .iter()
+            .filter(|(_, pane)| {
+                *pane.backend.lost.lock().unwrap() == Some(PaneLostReason::DeckRestarted)
+            })
+            .map(|(id, pane)| {
+                let attached_on = pane.backend.attached.lock().unwrap().incarnation.clone();
+                (id.clone(), attached_on)
+            })
+            .collect()
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {

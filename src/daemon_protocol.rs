@@ -3922,7 +3922,8 @@ fn mint_instance_id(
 /// Elsewhere (macOS, Windows) this build reads no such source, and answers
 /// why. That is reached only when OS randomness itself has failed: the daemon
 /// then refuses to start rather than name itself with a value a successor
-/// could repeat, since every client would refuse its unnamed agents anyway.
+/// could repeat, since the gated interactive clients, the TUI and the desktop
+/// app, would refuse to act on its unnamed agents anyway.
 fn process_identity() -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {

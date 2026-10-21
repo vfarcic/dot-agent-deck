@@ -1413,6 +1413,9 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         // A daemon answered the handshake, so this is no disconnected deck.
         disconnected_reason: None,
         hook_binary_notices: handshake.hook_binary_notices,
+        // A handshake lists nothing; `connected_snapshot` names the process
+        // whose listing the snapshot carries.
+        incarnation: dot_agent_deck::daemon_client::Incarnation::default(),
     }
 }
 
@@ -1919,6 +1922,8 @@ fn connected_snapshot(
     DesktopSnapshot {
         connection: DesktopConnection {
             running_agent_count: Some(records.len()),
+            // G-fix7c: the deck's process, stated even when it lists no agent.
+            incarnation: incarnation.clone(),
             ..connection
         },
         agents: records
@@ -5363,6 +5368,37 @@ mod tests {
             self.kill_server();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// Scenario: a real deck with no agents is snapshotted. Its connection
+    /// still names the daemon process that answered, so a restarted deck that
+    /// lists nobody is told apart from the process before it; a deck that is
+    /// not answering names none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_connected_snapshot_names_its_process_even_with_no_agents() {
+        let deck = RealDeck::start("g7c-process");
+        let links = DaemonLinks::default();
+        let snapshot = snapshot_of(&deck.endpoint, &links).await;
+        let expected = deck.incarnation();
+        let endpoint = deck.endpoint.clone();
+        deck.shutdown();
+
+        assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
+        assert!(snapshot.agents.is_empty());
+        assert_eq!(snapshot.connection.incarnation, expected);
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap()["connection"]["incarnation"],
+            serde_json::json!(expected.as_deref().expect("a named process"))
+        );
+
+        let gone = crate::dto::disconnected_snapshot(&endpoint, "not answering");
+        assert!(gone.connection.incarnation.is_unnamed());
+        assert!(
+            serde_json::to_value(&gone).unwrap()["connection"]
+                .get("incarnation")
+                .is_none()
+        );
     }
 
     /// The real-daemon sibling of

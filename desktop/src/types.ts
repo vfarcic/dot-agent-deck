@@ -204,6 +204,15 @@ export interface ConnectionView {
   pending?: boolean;
   message?: string;
   /**
+   * PRD #1666 part 2 (G-fix7c) — on a connected deck, the daemon process whose
+   * listing this snapshot carries; the same value its agents' `incarnation`
+   * holds, stated for the deck so that one listing nobody still names it.
+   * Another process than the last one seen means the deck restarted
+   * (`lib/restartDrop.ts`). Absent from a deck that names none, and from a
+   * snapshot that is not connected.
+   */
+  incarnation?: string;
+  /**
    * The technical half of an incompatible daemon's `message`: the declared
    * compatibility breaks by name, the protocol number on each side and the two
    * builds. A user cannot act on any of it, so it is shown only behind a

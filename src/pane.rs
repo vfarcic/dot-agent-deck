@@ -490,12 +490,27 @@ pub trait PaneController: Send + Sync {
     fn focus_card(&self, card: &BoundPane) -> Result<(), PaneError> {
         self.focus_pane(&card.pane_id)
     }
+    /// PRD #1666 part 2 (G-fix7c): whether the local pane under `card`'s pane
+    /// id is the card's, so a focus on that pane may select the card: attached
+    /// on the daemon process the card was learned from. The default is `true`,
+    /// for controllers with no daemon behind them, where a pane id names one
+    /// pane.
+    fn local_pane_is_cards(&self, _card: &BoundPane) -> bool {
+        true
+    }
     /// PRD #1666 part 2 (G-fix7): the daemon process this controller attached
     /// `pane_id` on, for a card it draws for a pane it started or attached
     /// itself. `None` when it holds no such pane or learned no process — the
     /// default, for controllers with no daemon behind them.
     fn pane_incarnation(&self, _pane_id: &str) -> Option<crate::daemon_client::Incarnation> {
         None
+    }
+    /// PRD #1666 part 2 (G-fix7c): the local panes whose agent a deck restart
+    /// took — the reattach found another daemon process answering — each with
+    /// the process it was attached on, for the render loop to drop with the
+    /// restart's notice. The default holds none.
+    fn panes_lost_to_restart(&self) -> Vec<(String, Option<crate::daemon_client::Incarnation>)> {
+        Vec::new()
     }
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError>;
     fn resize_pane(

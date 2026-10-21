@@ -461,6 +461,16 @@ pub struct DesktopConnection {
     /// this app and the TUI show the same words. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hook_binary_notices: Vec<HookBinaryNoticeDto>,
+    /// PRD #1666 part 2 (G-fix7c): on a connected snapshot, the daemon process
+    /// whose `ListAgents` reply its agents are — the same value each
+    /// [`DesktopAgent::incarnation`] carries, stated once for the deck so that
+    /// a restarted deck listing no agents still names its process. The webview
+    /// compares it with the one it last saw for the deck: another process is a
+    /// deck restart, and the agents listed before it are named in one notice.
+    /// Absent when the deck named none, and on a snapshot that is not
+    /// connected.
+    #[serde(skip_serializing_if = "Incarnation::is_unnamed")]
+    pub incarnation: Incarnation,
 }
 
 /// One hook-binary notice as the webview reads it (issue #1637). Every string
@@ -3152,6 +3162,7 @@ pub(crate) fn disconnected_snapshot(
             upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer::Unknown,
             disconnected_reason: None,
             hook_binary_notices: Vec::new(),
+            incarnation: Incarnation::default(),
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.

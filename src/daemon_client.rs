@@ -107,6 +107,40 @@ pub const AGENT_GONE_AFTER_RESTART: &str = "that agent is gone (the deck restart
 pub const AGENT_IDENTITY_UNKNOWN: &str =
     "the deck did not identify itself, so the action on that agent was not sent";
 
+/// PRD #1666 part 2 (G-fix7c): how both clients open the one notice that names
+/// the agents a deck restart stopped, after dropping their cards, panes and
+/// tabs ([`agents_stopped_by_restart_notice`]). The desktop's
+/// `AGENTS_STOPPED_BY_RESTART`, word for word (CLAUDE.md rule 22).
+pub const AGENTS_STOPPED_BY_RESTART: &str = "The deck restarted; these agents were stopped";
+
+/// One agent a deck restart stopped, as the notice names it: the label its
+/// card showed, and the role and orchestration it had when it was one's role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoppedAgent {
+    pub label: String,
+    pub role: Option<String>,
+    pub orchestration: Option<String>,
+}
+
+impl std::fmt::Display for StoppedAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label)?;
+        match (self.role.as_deref(), self.orchestration.as_deref()) {
+            (Some(role), Some(orchestration)) => write!(f, " ({role} in {orchestration})"),
+            (Some(role), None) => write!(f, " ({role})"),
+            (None, Some(orchestration)) => write!(f, " (in {orchestration})"),
+            (None, None) => Ok(()),
+        }
+    }
+}
+
+/// The notice naming `agents`, in both clients' words: "The deck restarted;
+/// these agents were stopped: coder (worker in team), api-fix."
+pub fn agents_stopped_by_restart_notice(agents: &[StoppedAgent]) -> String {
+    let names: Vec<String> = agents.iter().map(ToString::to_string).collect();
+    format!("{AGENTS_STOPPED_BY_RESTART}: {}.", names.join(", "))
+}
+
 /// PRD #1666 part 2 (G-fix4): which daemon process an agent id or viewer token
 /// was learned from — the [`AttachResponse::instance_id`] of the `Hello` on the
 /// connection that carried the listing, start or attach that named it.
@@ -9299,6 +9333,28 @@ mod incarnation_binding_tests {
         assert_eq!(
             AGENT_GONE_AFTER_RESTART,
             "that agent is gone (the deck restarted)"
+        );
+    }
+
+    /// Scenario: the notice naming the agents a deck restart stopped reads the
+    /// same in both clients: each agent's label, with its role and
+    /// orchestration when it had them.
+    #[test]
+    fn the_restart_notice_names_each_stopped_agent_in_the_shared_words() {
+        let agent = |label: &str, role: Option<&str>, orchestration: Option<&str>| StoppedAgent {
+            label: label.into(),
+            role: role.map(Into::into),
+            orchestration: orchestration.map(Into::into),
+        };
+        assert_eq!(
+            agents_stopped_by_restart_notice(&[
+                agent("coder", Some("worker"), Some("team")),
+                agent("lead", Some("orchestrator"), None),
+                agent("scout", None, Some("team")),
+                agent("api-fix", None, None),
+            ]),
+            "The deck restarted; these agents were stopped: coder (worker in team), \
+             lead (orchestrator), scout (in team), api-fix."
         );
     }
 }

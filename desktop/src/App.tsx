@@ -77,8 +77,8 @@ import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal,
 import { agentKey, boundAgentKey } from "./lib/agentKey";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
 import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
-import { agentGoneTerminalState, terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
-import { AGENT_GONE_AFTER_RESTART } from "./lib/agentIdentity";
+import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
+import { useRestartNotice } from "./hooks/useRestartNotice";
 import { bindViewIncarnation, viewAgent, viewAgentReplaced, viewBound } from "./lib/viewIdentity";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
@@ -498,8 +498,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * under ANOTHER incarnation: the deck restarted and reused the id for an
    * unrelated agent. The view's agent is gone. `paneAgent` above does not
    * resolve to the newcomer, so nothing below renders it, declares its
-   * terminal or routes input to it; the pane says the agent is gone instead.
-   * Only a fresh selection of the newcomer's own row opens it.
+   * terminal or routes input to it, and the pane is not drawn at all, not even
+   * from a held record, for the commit before `paneAgentRetired` closes it
+   * (G-fix7c: the user's decision is that a pane of an agent a restart stopped
+   * closes, and the restart notice says which agents went). Only a fresh
+   * selection of the newcomer's own row opens it.
    */
   const paneAgentReplaced = agentView !== undefined && paneDeck !== undefined && paneDeck.connection.status === "connected" && viewAgentReplaced(paneDeck.agents, agentView);
   /* A view nothing bound yet — its agent was not listed when it was asked
@@ -551,10 +554,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * with its remedy reachable`.
    */
   const heldPaneAgent = useHeldAgentRecord(agentView, paneAgent);
-  /* The overview's pane stays open over a replaced agent, saying it is gone,
-     as long as there is a record of the agent it was opened on to say it
-     about. */
-  const paneAgentGone = paneAgentReplaced && base === "overview" && heldPaneAgent !== undefined;
+  /**
+   * PRD #1666 part 2 (G-fix7c) — the one notice naming the agents a deck
+   * restart stopped, on whichever screen is up. Their rows are gone with the
+   * restarted deck's listing, and an open pane of one closes
+   * (`paneAgentRetired`); this says why, and sends nothing to any deck.
+   */
+  const restart = useRestartNotice(runtime.fleet);
   /** The record the pane RENDERS: the deck's current answer, else its last one. */
   const paneAgentShown = paneAgent ?? heldPaneAgent?.agent;
   /**
@@ -674,7 +680,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * with the overview was precisely this stale view, so the condition is written
    * for `agentView` rather than for `base === "overview"`.
    */
-  const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined && !paneAgentGone;
+  const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined;
   useEffect(() => {
     if (paneAgentRetired) closeAgent();
   }, [paneAgentRetired, closeAgent]);
@@ -827,7 +833,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   // voice-registry-exempt: a mirror of the open pane's own tab, written only by the screen's report so the voice panel can see it; it switches nothing
   const [paneTab, setPaneTab] = useState<PanelTab>("terminal");
-  const paneShownAgent = base === "overview" ? (paneDeck ? paneAgentShown : undefined) : paneAgent;
+  const paneShownAgent = base === "overview" ? (paneDeck && !paneAgentReplaced ? paneAgentShown : undefined) : paneAgent;
   const paneInput = agentView && paneShownAgent ? terminalInputState(paneShownAgent) : undefined;
   const voicePane = useMemo<VoicePane | undefined>(() => (agentView && paneShownAgent && paneInput
     ? {
@@ -837,11 +843,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* The agent's incarnation: a daemon can replace an agent under the same
          deck and agent id, and the mode must not survive that (#1260 review). */
       spawnedAtMs: paneShownAgent.spawnedAtMs,
-      inputBlocked: paneAgentGone
-        ? `${AGENT_GONE_AFTER_RESTART}.`
-        : paneInput.readOnly
-          ? (paneInput.notice ?? "its terminal cannot take input.")
-          : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
+      inputBlocked: paneInput.readOnly
+        ? (paneInput.notice ?? "its terminal cannot take input.")
+        : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
       /* The pull request browser is drawn over the pane, so its prompt is
          not on screen either (PRD #1401). */
       terminalHidden: paneTab !== "terminal" || prBrowser !== undefined || undefined,
@@ -858,7 +862,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          answer reaches that process or nothing. */
       ...(paneShownAgent.incarnation ? { incarnation: paneShownAgent.incarnation } : {}),
     }
-    : undefined), [agentView, heldPaneAgent, paneAgentGone, paneDeckAttachable, paneInput, paneShownAgent, paneTab, prBrowser]);
+    : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab, prBrowser]);
   /**
    * PRD #1260 — a D5 confirmation open on whichever screen is mounted, which
    * outranks dictation. Both the overview and the deck report theirs here
@@ -1268,7 +1272,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && paneDeck && paneAgentShown && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} gone={paneAgentGone} onClose={closeAgentView} onTabShown={setPaneTab} />}
+        {agentView && paneDeck && paneAgentShown && !paneAgentReplaced && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} onTabShown={setPaneTab} />}
         {/*
           PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
 
@@ -1285,11 +1289,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           mounted together, so there is at most one toast. The cleanup
           warnings ride with it but outlive it (issue #1234).
         */}
-        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} />
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
-    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -1421,7 +1425,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
  * attributed to another. The pane reaching its own deck is what made that
  * unnecessary rather than merely unwise.
  */
-function OverviewAgentPane({ runtime, view, deck, agent, held, attached, gone = false, onClose, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; gone?: boolean; onClose: () => void; onTabShown?: (tab: PanelTab) => void }) {
+function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void; onTabShown?: (tab: PanelTab) => void }) {
   const [tab, setTab] = useState<PanelTab>("terminal"); // voice-registry-exempt: the pane-over-the-overview's own tab strip, a control inside one pane
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   /* PR #1451 — the voice panel's view of which tab is shown (see `paneTab`). */
@@ -1454,9 +1458,7 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, gone = 
          order of magnitude more often than `OVERVIEW_CLOCK_TICK_MS` would tick
          it. The `title` needs none of that argument: an absolute instant
          cannot decay. */
-      /* PRD #1666 part 2 (G-fix6): an agent gone with its deck's restart has
-         no terminal anywhere, and the sentence says so in the TUI's words. */
-      noTerminal={gone ? agentGoneTerminalState() : attached ? undefined : unreachableDeckTerminalState(deckName(deck.connection), deck.connection.message, displayActivity(held?.confirmedAt))}
+      noTerminal={attached ? undefined : unreachableDeckTerminalState(deckName(deck.connection), deck.connection.message, displayActivity(held?.confirmedAt))}
       /* Issue #1143 — `held` is set only where the live lookup found nothing,
          so its presence IS the claim that what the header shows is older than
          now. One prop, read by the two colour cues and the wording together. */
@@ -1605,7 +1607,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
   );
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
@@ -1646,12 +1648,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const paneAgentId = openAgent && snapshot.agents.some((agent) => agent.daemonId === openAgent.deckId && viewAgent([agent], { kind: "agent", from: "deck", ...openAgent }) !== undefined)
     ? openAgent.agentId
     : undefined;
-  /* PRD #1666 part 2 (G-fix6): the open pane's agent id is now listed under
-     another incarnation — the deck restarted and the id is an unrelated
-     agent's. Nothing above promotes it, `DeckShell` closes the view, and the
-     toast says why the pane went. */
-  const paneAgentReplaced = openAgent !== undefined && snapshot.connection.status === "connected" && snapshot.connection.deckId === openAgent.deckId
-    && viewAgentReplaced(snapshot.agents, { kind: "agent", from: "deck", ...openAgent });
   /*
     PR #1451 round 3, change 3 — the tiles, numbered in grid order while voice
     is on: the same order the 1–4 keys focus, so a tile's number and its key
@@ -1723,12 +1719,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
      recorded as `runtime.error` and `dismissToast` can match the two. */
   const notice = noticeState?.message;
   const setNotice = (message: string | undefined, detail?: string) => setNoticeState(message === undefined ? undefined : { message, ...(detail === undefined ? {} : { detail }) });
-  /* PRD #1666 part 2 (G-fix6): the pane over this deck closed because its
-     agent is gone with the deck's restart; the toast says so in the TUI's
-     words rather than letting the pane vanish unexplained. */
-  useEffect(() => {
-    if (paneAgentReplaced) setNoticeState({ message: AGENT_GONE_AFTER_RESTART });
-  }, [paneAgentReplaced]);
   const [confirm, setConfirm] = useState<ConfirmState>(); // voice-registry-exempt: the confirmation an action that starts or stops agents asks first — opened by the action it guards, never on its own
   const [upgrade, setUpgrade] = useState<UpgradeTarget>(); // voice-registry-exempt: the Upgrade / Replace daemon dialog (PRD #1487) — opened only by those two buttons, and it asks before stopping anything
   /* PRD #1260 review, round 5 — told whenever this screen's confirmation opens
@@ -2626,7 +2616,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} />
     </div>
   );
 }
@@ -2652,15 +2642,15 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, detail, onDismiss, warnings, onDismissWarning }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void }) {
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
   const newestWarning = warnings?.at(-1)?.id;
   useEffect(() => {
     if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
-  }, [newestWarning, message]);
-  if (!message && !warnings?.length) return null;
+  }, [newestWarning, message, restart]);
+  if (!message && !warnings?.length && !restart) return null;
   return (
     <div className="toast-stack" ref={stack}>
       {warnings?.map((warning) => (
@@ -2670,6 +2660,20 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning }: { mes
           <button aria-label="Dismiss cleanup warning" onClick={() => onDismissWarning?.(warning.id)}><X size={14} /></button>
         </div>
       ))}
+      {/* PRD #1666 part 2 (G-fix7c): the agents a deck restart stopped, in a
+          slot of its own so an action's sentence never replaces it unseen. */}
+      {restart && (
+        <div className="toast" data-testid="restart-toast" role="status">
+          <AlertTriangle size={15} />
+          <div className="toast-body">
+            {/* `detail`'s budget, not `message`'s: it names every agent the
+                restart stopped, and the last ones are as much the point as the
+                first. */}
+            <span>{displayText(restart, DISPLAY_LIMITS.detail)}</span>
+          </div>
+          <button aria-label="Dismiss restart notice" onClick={onDismissRestart}><X size={14} /></button>
+        </div>
+      )}
       {message && (
         <div className="toast" data-testid="toast" role="status">
           <AlertTriangle size={15} />
