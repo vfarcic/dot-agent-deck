@@ -26,12 +26,28 @@ Flipping the switch is a one-line pull request, and it takes effect on that pull
 - **A pull request from a fork needs someone to start its RWX run by hand** in the RWX UI.
 - **Tool caches live in the vault `dot_agent_deck_rwx_eval`**, whose "Allow public repositories" setting must stay on for GitHub-triggered runs on this public repository.
 
-## Sandboxed test runs for agents
+## Sandboxed runs for agents
 
-With `DAD_REMOTE_EXEC=rwx`, `cargo xtask affected-checks --run` runs its **test commands** (`cargo test-fast` and other `cargo nextest` invocations) through `rwx sandbox exec --`, in the sandbox `.rwx/sandbox.yml` defines, and stops the sandbox afterwards. `fmt` and `clippy` stay local, since they are fast warm and gate the commit.
+The point is twofold: the checks finish sooner, and the machine the agents run on stays free for them. With `DAD_REMOTE_EXEC=rwx`, `cargo xtask affected-checks --run` runs **every `cargo` command except `cargo fmt`** (so clippy and the test tiers, every compile) through `rwx sandbox exec --`, in the sandbox `.rwx/sandbox.yml` defines. `cargo fmt` stays local because it compiles nothing.
+
+Measured on 2026-10-21, the full gates for a one-line Rust change, from an M-series Mac:
+
+| | wall | CPU used locally |
+| --- | --- | --- |
+| all local | 512 s | 1,168 s |
+| sandbox, cold (new sandbox) | 270 s | 15 s |
+| sandbox, warm (kept from the previous run) | 143 s | 15 s |
+
+The local run also failed ten tests that pass serially and on Linux, which is the machine being contended rather than the code.
 
 It runs locally instead, and prints a note saying why, when the `rwx` CLI is missing, `rwx whoami` fails, `.rwx/sandbox.yml` is absent, or the variable names anything other than `rwx`. An unset variable prints nothing and changes nothing.
 
-`DAD_REMOTE_EXEC_KEEP=1` leaves the sandbox running after the checks, for a follow-up `rwx sandbox exec`; it stops on its own after 15 minutes without activity. Check `rwx sandbox list` when you are done: `rwx sandbox stop` can time out and leave the sandbox active, which is why `--run` checks the listing and stops it a second time.
+### For agents
 
-The sandbox sees uncommitted changes in the worktree, so it can stand in for a local run before a commit. It is not a lane-2 runner: no agent credential is placed in it, and CLAUDE.md rule 5's reasons for keeping credentials out of remote runners apply to it as much as to CI.
+When `DAD_REMOTE_EXEC=rwx` is set, run the commit gates through `cargo xtask affected-checks --run` rather than command by command, and run any other heavy `cargo` command (a filtered `cargo test-e2e`, a build) as `rwx sandbox exec -- <command>`. **Never run lane 2 (`cargo test-e2e-live`) or anything that reaches a real agent in the sandbox**: no agent credential is placed there, and CLAUDE.md rule 5's reasons for keeping credentials off remote runners apply to it as much as to CI.
+
+### Stopping
+
+By default `--run` stops the sandbox when it finishes, because a sandbox is billed per second while active, idle included. `DAD_REMOTE_EXEC_KEEP=1` leaves it running so the next run starts warm (the table's last row); it then stops on its own after 15 minutes without activity. Check `rwx sandbox list` when you are done: `rwx sandbox stop` can time out and leave the sandbox active, which is why `--run` checks the listing and stops it a second time.
+
+The sandbox sees uncommitted changes in the worktree, so it stands in for a local run before a commit.

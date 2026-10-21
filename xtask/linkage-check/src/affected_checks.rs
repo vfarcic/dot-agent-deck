@@ -515,10 +515,11 @@ fn execute(root: &Path, plan: &[Vec<String>]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Opt-in for running the test commands in an RWX sandbox instead of locally.
-/// Unset or empty keeps everything local; `rwx` sends `cargo test-fast` and
-/// `cargo nextest` commands to the sandbox while fmt and clippy stay local
-/// (they are faster locally: every sandbox command pays a sync).
+/// Opt-in for running the heavy commands in an RWX sandbox instead of locally.
+/// Unset or empty keeps everything local; `rwx` sends every `cargo` command but
+/// `cargo fmt` (clippy, the test tiers) to the sandbox, so the compiles happen
+/// there rather than on this machine. `cargo fmt` stays local: it compiles
+/// nothing, and a sandbox command pays a sync.
 pub(crate) const REMOTE_ENV: &str = "DAD_REMOTE_EXEC";
 
 /// `1` leaves the sandbox running after `--run`, for several runs in a row. By
@@ -529,7 +530,7 @@ pub(crate) const REMOTE_KEEP_ENV: &str = "DAD_REMOTE_EXEC_KEEP";
 /// The sandbox definition `rwx sandbox exec` uses, relative to the root.
 pub(crate) const SANDBOX_CONFIG: &str = ".rwx/sandbox.yml";
 
-/// Where the test commands of a plan run.
+/// Where the compiling commands of a plan run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Runner {
     Local,
@@ -544,7 +545,7 @@ pub(crate) struct Readiness {
     pub(crate) config: bool,
 }
 
-/// Where the test commands run, and a note for the report whenever a remote
+/// Where the compiling commands run, and a note for the report whenever a remote
 /// runner was asked for — including when it could not be used and the run
 /// falls back to local, so the fallback is never silent.
 pub(crate) fn choose_runner(opt_in: Option<&str>, ready: Readiness) -> (Runner, Option<String>) {
@@ -563,7 +564,7 @@ pub(crate) fn choose_runner(opt_in: Option<&str>, ready: Readiness) -> (Runner, 
                 (
                     Runner::Rwx,
                     Some(format!(
-                        "{REMOTE_ENV}=rwx: the test commands run in an RWX sandbox"
+                        "{REMOTE_ENV}=rwx: every cargo command but `cargo fmt` runs in an RWX sandbox"
                     )),
                 )
             } else {
@@ -585,20 +586,20 @@ pub(crate) fn choose_runner(opt_in: Option<&str>, ready: Readiness) -> (Runner, 
     }
 }
 
-/// A test command: `cargo test-fast` or any `cargo nextest` invocation.
-fn is_test_command(command: &[String]) -> bool {
-    matches!(command, [cargo, sub, ..] if cargo == "cargo" && (sub == "test-fast" || sub == "nextest"))
+/// A command that compiles: any `cargo` invocation except `cargo fmt`.
+fn runs_remotely(command: &[String]) -> bool {
+    matches!(command, [cargo, sub, ..] if cargo == "cargo" && sub != "fmt")
 }
 
-/// The plan as `runner` executes it: for RWX, each test command is prefixed
-/// with `rwx sandbox exec --`; every other command is unchanged.
+/// The plan as `runner` executes it: for RWX, each command that compiles is
+/// prefixed with `rwx sandbox exec --`; every other command is unchanged.
 pub(crate) fn for_runner(runner: Runner, plan: Vec<Vec<String>>) -> Vec<Vec<String>> {
     match runner {
         Runner::Local => plan,
         Runner::Rwx => plan
             .into_iter()
             .map(|command| {
-                if is_test_command(&command) {
+                if runs_remotely(&command) {
                     let mut wrapped = argv(&["rwx", "sandbox", "exec", "--"]);
                     wrapped.extend(command);
                     wrapped
@@ -1564,11 +1565,15 @@ mod tests {
     }
 
     #[test]
-    fn rwx_wraps_the_test_commands_and_leaves_fmt_and_clippy_local() {
+    fn rwx_wraps_every_cargo_command_but_fmt() {
         let full = for_runner(Runner::Rwx, FULL_GATES.iter().map(|c| argv(c)).collect());
         let lines: Vec<String> = full.iter().map(|c| shell_line(c)).collect();
         assert_eq!(lines[0], "cargo fmt --check");
-        assert!(lines[1].starts_with("cargo clippy "), "{}", lines[1]);
+        assert!(
+            lines[1].starts_with("rwx sandbox exec -- cargo clippy "),
+            "{}",
+            lines[1]
+        );
         assert_eq!(lines[2], "rwx sandbox exec -- cargo test-fast");
 
         let prefix = argv(&["rwx", "sandbox", "exec", "--"]);

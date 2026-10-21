@@ -2,9 +2,7 @@ name: CI
 
 on:
   pull_request:
-    # `rwx` too, so the CI-backend switch can be tried with PRs into the
-    # workbench branch instead of `main`.
-    branches: [main, rwx]
+    branches: [main]
     types: [opened, synchronize, reopened]
   # Also verify main AFTER a merge. Without this, CI only ever saw proposed
   # changes, so a broken main stayed invisible until some later PR inherited the
@@ -24,9 +22,7 @@ on:
   # `notify-main-red` job at the bottom of this file is the missing half —
   # detection was never the gap.
   push:
-    # `rwx`: the RWX workbench branch, which never merges. Pushes to it run
-    # this workflow and `.rwx/ci.yml` side by side, as a team using both would.
-    branches: [main, rwx]
+    branches: [main]
   # Issue #1088 — the merge queue's event. A queued PR is tested on a temporary
   # `refs/heads/gh-readonly-queue/main/...` branch carrying main plus every PR
   # ahead of it in the queue: the PROJECTED main, which a PR's own `pull_request`

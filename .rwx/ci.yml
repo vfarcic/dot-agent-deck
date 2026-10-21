@@ -1,24 +1,23 @@
 # RWX port of the Linux `build` and `e2e-deterministic` jobs in
-# .github/workflows/ci.yml — first measured on branch `rwx-eval` (kept as
-# `rwx-eval-archive`), not a replacement. Same commands, split into a DAG so
-# fmt, clippy, the release build, the fast tier and the e2e tier run in
-# parallel.
+# .github/workflows/ci.yml: the same commands, split into a DAG so fmt, clippy,
+# the release build, the fast tier and the e2e tier run in parallel. Which of
+# the two runs a pull request is `.github/ci-backend`'s call
+# (docs/develop/rwx.md); pushes to `main` always run on GitHub Actions.
 #
-# Every task runs on 4 CPU / 16 GB, the size of GitHub's `ubuntu-latest`, so a
-# push compares the two on comparable hardware. Raising `cpus:` on a task buys
-# speed per task (measured 2026-10-18: compile tasks on 16 CPUs took the run
-# from 6.3 to 5.0 minutes, at roughly twice the cost).
+# Every task runs on 4 CPU / 16 GB, the size of GitHub's `ubuntu-latest`.
+# Raising `cpus:` on a task buys speed per task (measured 2026-10-18: compile
+# tasks on 16 CPUs took the run from 6.3 to 5.0 minutes, at roughly twice the
+# cost).
 #
 # Keep the versions below in step with ci.yml (Renovate does not update this
 # file).
 
-# Three triggers:
+# Two triggers:
 # - a pull request: this run replaces the Linux jobs of
 #   `.github/workflows/ci.yml` when `.github/ci-backend` says `rwx`; otherwise
 #   the `backend` task below skips everything and the run passes in seconds, so
 #   RWX's check can stay required whichever system is active. It tests the PR's
 #   head commit (GitHub Actions tests the PR merged with its base).
-# - a push to `rwx`: runs side by side with GitHub Actions, for comparison.
 # - `rwx run` from a worktree: local uncommitted changes on top of the pushed
 #   HEAD.
 # GitHub-triggered runs on a public repository can use the tool-cache vault only
@@ -29,11 +28,6 @@ on:
       init:
         commit-sha: ${{ event.git.sha }}
         trigger: pull_request
-    push:
-      if: ${{ event.git.branch == 'rwx' }}
-      init:
-        commit-sha: ${{ event.git.sha }}
-        trigger: push
   cli:
     init:
       commit-sha: ${{ event.git.sha }}
