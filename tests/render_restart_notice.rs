@@ -144,3 +144,93 @@ fn handshake_013_the_restart_notice_lists_every_agent() {
         "closing the list dismissed the notice: {closed}"
     );
 }
+
+/// The text inside the restart list's border on every row of `shown`, with all
+/// whitespace removed, so an entry wrapped over several rows reads as one.
+fn list_text(shown: &str) -> String {
+    let rows: Vec<Vec<char>> = shown.lines().map(|line| line.chars().collect()).collect();
+    let Some((top, left)) = rows.iter().enumerate().find_map(|(y, row)| {
+        let x = row.iter().position(|c| *c == '┌')?;
+        row[x..]
+            .iter()
+            .collect::<String>()
+            .starts_with("┌ Restart notice")
+            .then_some((y, x))
+    }) else {
+        return String::new();
+    };
+    let right = rows[top].iter().rposition(|c| *c == '┐').unwrap();
+    rows[top + 1..]
+        .iter()
+        .take_while(|row| row.get(left) == Some(&'│'))
+        .map(|row| row[left + 1..right].iter().collect::<String>())
+        .collect::<String>()
+        .split_whitespace()
+        .collect()
+}
+
+/// Scenario: A deck restart stopped two agents whose 80-character labels share their first 68 characters, each with a long role and orchestration. Press `a` to open the list at 80 columns and at 40: each entry wraps onto rows of its own, so both labels' differing endings, roles and orchestrations can be read in full; at 40 columns and 14 rows, scrolling down with `j` reaches the end of the last entry.
+#[spec("lifecycle/handshake/013")]
+#[test]
+fn handshake_013_the_restart_list_wraps_long_names() {
+    use dot_agent_deck::daemon_client::StoppedAgent;
+    use dot_agent_deck::ui::render_restart_notice_agents_key_sequence_to_buffers;
+    let prefix = "nightly-dependency-upgrade-for-the-payments-service-and-its-workers-";
+    assert_eq!(prefix.len(), 68);
+    let agents: Vec<StoppedAgent> = ["first-alpha", "second-omega"]
+        .iter()
+        .map(|suffix| {
+            let label = format!("{prefix}{suffix:->12}");
+            assert_eq!(label.len(), 80);
+            StoppedAgent {
+                label,
+                role: Some("integration-reviewer-of-release-candidates".into()),
+                orchestration: Some("quarterly-platform-upgrade-orchestration".into()),
+            }
+        })
+        .collect();
+    let squash = |text: &str| text.split_whitespace().collect::<String>();
+    for (width, height) in [(80, 24), (40, 30)] {
+        let frames = render_restart_notice_agents_key_sequence_to_buffers(
+            &agents,
+            UiMode::Normal,
+            None,
+            &[key(KeyCode::Char('a'))],
+            width,
+            height,
+        );
+        let shown = text(&frames[1]);
+        let list = list_text(&shown);
+        for agent in &agents {
+            assert!(
+                list.contains(&squash(&agent.to_string())),
+                "{width} columns: {agent} cannot be read in full:\n{shown}"
+            );
+        }
+        if width == 80 {
+            insta::assert_snapshot!(shown);
+        }
+    }
+    let mut keys = vec![key(KeyCode::Char('a'))];
+    keys.extend(std::iter::repeat_n(key(KeyCode::Char('j')), 12));
+    let frames = render_restart_notice_agents_key_sequence_to_buffers(
+        &agents,
+        UiMode::Normal,
+        None,
+        &keys,
+        40,
+        14,
+    );
+    let opened = list_text(&text(&frames[1]));
+    assert!(
+        !opened.contains("second-omega"),
+        "the short list fit without scrolling"
+    );
+    let end = text(frames.last().unwrap());
+    assert!(
+        list_text(&end).contains(&squash(
+            "in quarterly-platform-upgrade-orchestration) [Dismiss c]"
+        )),
+        "scrolling never reached the last entry's end:\n{end}"
+    );
+}

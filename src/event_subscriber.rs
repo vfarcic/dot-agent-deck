@@ -1368,7 +1368,7 @@ mod tests {
         }
     }
 
-    /// Scenario: the TUI holds a card for agent `1` on `pane-1` learned from deck process `a`, and then draws the placeholder card for a pane it attached on `b` with the same pane and agent id — the deck restarted as the same build. The placeholder is not the old card: the old one is dropped and queued for the restart notice, and the new one is bound to `b`. A placeholder learned from `a` itself is the card already there (control).
+    /// Scenario: the TUI holds a card for agent `1` on `pane-1` learned from deck process `a`, its stream's process, and then gets the placeholder card for a pane it attached on `b` with the same pane and agent id — the deck restarted as the same build, and the stream has not noticed yet. The placeholder is not the old card and does not replace it: it waits, and the old card stays, until the stream itself moves to `b`; then the old card is dropped and queued for the restart notice, and the placeholder is drawn bound to `b`. A placeholder learned from `a` itself is the card already there (control).
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_placeholder_never_adopts_another_processs_card() {
@@ -1397,6 +1397,17 @@ mod tests {
                 key, "card",
                 "the placeholder adopted the old process's card"
             );
+            assert!(
+                tui.sessions.contains_key("card"),
+                "the placeholder dropped a card before the stream moved"
+            );
+            assert!(
+                !tui.sessions.contains_key(&key),
+                "drawn before the stream moved"
+            );
+            assert!(tui.pending_restart_drops.is_empty());
+
+            tui.learn_stream_incarnation(attached_on.clone());
             assert!(!tui.sessions.contains_key("card"), "the old card was kept");
             assert_eq!(
                 tui.pending_restart_drops
@@ -1412,7 +1423,7 @@ mod tests {
         }
     }
 
-    /// Scenario: the TUI's stream is on deck process `b` when it draws a card for `pane-1` from an attach the replaced process `a` answered. The next frame from `b` for `pane-1`, its agent's start, drops that card and queues it for the restart notice, and `b`'s agent gets a card of its own. A card on the pane learned from `b` itself is updated by the frame (control).
+    /// Scenario: the TUI's stream is on deck process `b` when an attach the stream never named, `a`, hands in a placeholder for `pane-1`. It is not drawn, so the next frame from `b` for `pane-1`, its agent's start, gives `b`'s agent the pane's only card; the held placeholder is queued for the restart notice once the stream next opens on a process other than `a`. A placeholder learned from `b` itself is updated by the frame (control).
     #[spec("lifecycle/handshake/013")]
     #[test]
     fn handshake_013_a_frame_drops_another_processs_card_on_its_pane() {
@@ -1440,15 +1451,21 @@ mod tests {
                 assert!(tui.pending_restart_drops.is_empty(), "control");
                 continue;
             }
-            assert!(!tui.sessions.contains_key(&key), "a's card was kept");
+            assert!(!tui.sessions.contains_key(&key), "a's card was drawn");
+            assert!(
+                tui.pending_restart_drops.is_empty(),
+                "reported before the stream said"
+            );
+            tui.learn_stream_incarnation(named("b"));
             assert_eq!(
                 tui.pending_restart_drops
                     .iter()
                     .map(|card| card.key.as_str())
                     .collect::<Vec<_>>(),
                 vec![key.as_str()],
-                "a's card was not queued for the notice"
+                "a's placeholder was not queued for the notice"
             );
+            assert!(tui.sessions.contains_key("card"), "b's card was dropped");
         }
     }
 

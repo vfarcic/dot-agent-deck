@@ -826,8 +826,11 @@ fn text_rect(block: &Block, popup: Rect) -> Rect {
 /// narrower than [`MIN_TEXT_WIDTH`] or has no row left for the plan, the
 /// dialog asks for a larger terminal instead ([`render_too_small`]), and
 /// nothing counts as seen.
-pub fn render(frame: &mut Frame, dialog: &mut UpgradeDialog) -> Vec<(UpgradeChoice, Rect)> {
-    let area = frame.area();
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &mut UpgradeDialog,
+) -> Vec<(UpgradeChoice, Rect)> {
     let width = area.width.saturating_sub(4).min(MAX_WIDTH);
     let max_height = area.height.saturating_sub(2);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
