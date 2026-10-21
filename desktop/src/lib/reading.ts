@@ -96,7 +96,9 @@ export interface ReadingTarget {
    * PRD #1666 part 2 (G-fix6): the daemon process that listed the agent (the
    * row's `incarnation`). Replies are read only from that process: a deck
    * restarted since, which numbers an unrelated agent with the same id, reads
-   * as the agent being gone.
+   * as the agent being gone. Every target rebuilt from an agent carries it
+   * on: one without it asks as an unnamed process, which is refused even for
+   * a healthy agent (G-fix7).
    */
   deckProcess?: string;
 }
@@ -569,7 +571,7 @@ export class DeckReader {
     const consents = this.consents;
     let answer: ReadingStartDto;
     try {
-      answer = await this.deps.start({ deckId: agent.deckId, agentId: agent.agentId, label: agent.label }, (sentence) => {
+      answer = await this.deps.start({ deckId: agent.deckId, agentId: agent.agentId, label: agent.label, deckProcess: agent.deckProcess }, (sentence) => {
         if (current()) this.heard(key, record, sentence);
       });
     } catch {
