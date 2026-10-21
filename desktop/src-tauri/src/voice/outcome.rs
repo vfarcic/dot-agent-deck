@@ -38,7 +38,7 @@
 //! `invoke` target and the resolved params; the frontend dispatches it where a
 //! click dispatches one (M2/M6).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -1279,6 +1279,7 @@ async fn after_local_intercepts(
         first,
         second: Second::NotAwaited,
         open: RefCell::default(),
+        target_open: Cell::default(),
         transcript: transcript.text().to_string(),
         directories,
         new_agent,
@@ -1295,6 +1296,7 @@ async fn after_local_intercepts(
                 Err(error) => Second::Failed(error),
             },
             open: RefCell::default(),
+            target_open: Cell::default(),
             ..judged
         };
         outcome = decide(&picked, &judged);
@@ -1515,12 +1517,21 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
             // local" over an open dialog names a deck the form may not show,
             // and starting the form would drop what the user asked for. A
             // value naming the deck the form already describes, answered to a
-            // request for the start and nothing more, asks for nothing the
-            // form does not hold ([`restates_the_forms_deck`]).
+            // request for the start that says nothing more and names no
+            // target, asks for nothing the form does not hold
+            // ([`restates_the_forms_deck`]). `names_target` is asked only
+            // when there is a value to forgive, so a start with none never
+            // waits on it.
             let alone = judged.alone(target);
             let carries_a_value = answer.params.values().any(|value| {
                 !value.trim().is_empty()
-                    && !restates_the_forms_deck(value, alone, transcript.text(), decks, new_agent)
+                    && !restates_the_forms_deck(
+                        value,
+                        alone && judged.names_no_target(),
+                        transcript.text(),
+                        decks,
+                        new_agent,
+                    )
             });
             if carries_a_value {
                 return VoiceOutcome::unavailable(transcript, row);
@@ -2180,29 +2191,31 @@ fn said(spoken: &str, transcript: &str) -> bool {
 
 /// Whether `value`, answered with a pick that `unavailable_redirects` hands to
 /// the New agent dialog's start, only restates the form: it is the deck the
-/// form already describes, the user named no daemon ([`names_a_target`]), and
-/// the meaning check found the utterance to be a request for the start and
-/// nothing else (`alone`: the start row asked under [`Strictness::Whole`]).
-/// "Start agent" read over an open dialog came back from `gpt-5-mini` as
-/// `open_new_agent` with `deck` = "Local deck", the form's own deck, in 2 of 6
-/// runs, and was refused as if the user had named a deck the start would drop
-/// (fixture `start-agent-button-label`, 3 of 10 on `origin/main`).
+/// form already describes, the meaning check found the utterance to be a
+/// request for the start and nothing else that names no target (`bare`:
+/// [`Judged::alone`] and [`Judged::names_no_target`], each from both votes),
+/// and the transcript names no daemon the app knows
+/// ([`names_a_known_deck`]). "Start agent" read over an open dialog came back
+/// from `gpt-5-mini` as `open_new_agent` with `deck` = "Local deck", the
+/// form's own deck, in 2 of 6 runs, and was refused as if the user had named
+/// a deck the start would drop (fixture `start-agent-button-label`, 3 of 10
+/// on `origin/main`).
 ///
 /// The test is what the USER said, not whether the model's value was said:
 /// "start an agent on build box" answered with the form's "Local deck" asks
 /// for a deck the value does not name, and is refused. PRD #1666 drew that
-/// line with a list of the words a bare start may carry, which refused
-/// advertised start wording outside it ("activate orchestration" with the deck
-/// echoed); PRD #1733 reads the meaning check's `only` instead, from both
-/// votes ([`Judged::alone`]). `only` is not evidence that no daemon was named
-/// — "start an agent on build box" is one request, and both votes were free
-/// to answer it as only the start (PR #1788 review) — so the transcript is
-/// read for a target as well, and either one refuses. It only ever refuses: a
-/// value that is forgiven still needs the model's pick, the redirect and the
-/// start's own meaning check.
+/// line with a list of the words a bare start may carry; PRD #1733 reads the
+/// meaning check's `only` instead. `only` is not evidence that no daemon was
+/// named — a start on a named daemon is one request — and three PR #1788
+/// review rounds each found a phrasing a word heuristic for "names a target"
+/// missed, so whether the sentence says where to start, or names what to
+/// start, is the classifier's `names_target` too, judged from the user's
+/// words alone. Missing, unreadable or `yes` on either vote forgives nothing.
+/// It only ever refuses: a value that is forgiven still needs the model's
+/// pick, the redirect and the start's own meaning check.
 fn restates_the_forms_deck(
     value: &str,
-    alone: bool,
+    bare: bool,
     transcript: &str,
     decks: &[VoiceDeck],
     new_agent: Option<&VoiceNewAgent>,
@@ -2210,76 +2223,29 @@ fn restates_the_forms_deck(
     let Some(form) = new_agent.and_then(|dialog| dialog.form.as_ref()) else {
         return false;
     };
-    alone
-        && !names_a_target(transcript, decks)
+    bare && !names_a_known_deck(transcript, decks)
         && matches!(
             resolve_new_agent_deck_ref(value, decks),
             DeckRefMatch::One { id, .. } if id == form.deck_id
         )
 }
 
-/// The words that introduce where a start should happen — "on build box",
-/// "in the billing folder", "using the remote daemon" — read by
-/// [`names_a_target`]. Not "with" or "to": "go ahead with it" and "I want to
-/// start it" are bare starts.
-const TARGET_PREPOSITIONS: [&str; 8] = ["on", "onto", "at", "in", "into", "from", "using", "via"];
-
-/// The words after which a name says WHICH agent to start, or with what — "start
-/// agent Atlantis", "start an agent with Atlantis" — read by [`names_a_target`]
-/// one word on ([`TARGET_LEAD_INS`] aside), so "go ahead with it" stays bare.
-const NAMED_AFTER: [&str; 3] = ["agent", "agents", "with"];
-
-/// What may stand between a [`NAMED_AFTER`] word and the name it introduces:
-/// "with the Atlantis daemon", "an agent called Atlantis".
-const TARGET_LEAD_INS: [&str; 7] = ["a", "an", "the", "my", "our", "called", "named"];
-
-/// Content words that say when or how to start rather than where: "launch the
-/// agent immediately", "start the agent right away". [`names_a_target`] also
-/// sets aside the [`POINTING_WORDS`] and [`WHOLE_UTTERANCE_POLITENESS`].
-const START_MANNER_WORDS: [&str; 3] = ["right", "immediately", "again"];
-
-/// Whether `transcript` says where to start, whichever daemon that is: a
-/// [`TARGET_PREPOSITIONS`] word with any word after it — "on build box", "on
-/// the remote daemon", "on Atlantis", a name no daemon has, and "on Run", a
-/// daemon labelled with a start word — a content word ([`content_words`]) right
-/// after a [`NAMED_AFTER`] word — "start agent Atlantis", "start an agent with
-/// Atlantis" — or a run of up to three adjacent words that resolves to one of
-/// `decks` or to several ([`resolve_new_agent_deck_ref`]) — "build box, start
-/// an agent", or the glued "BuildBoxDeck".
+/// Whether a run of up to three adjacent words of `transcript` resolves to one
+/// of `decks` or to several ([`resolve_new_agent_deck_ref`]) — "build box,
+/// start an agent", the glued "BuildBoxDeck", or "start the run" in a fleet
+/// with a daemon labelled "Run".
 ///
-/// Words, not meaning, and refuse-only: a start qualified by anything a
-/// preposition introduces ("start it in a minute"), or by a word after the
-/// agent noun outside [`START_MANNER_WORDS`] ("start the agent soon"), is
-/// refused when the model echoes the form's deck. A name no daemon has is not
-/// caught here when it is said in neither of those places — "Atlantis, start
-/// it", "start Atlantis" — nor when a word stands between it and the agent
-/// noun that is no [`TARGET_LEAD_INS`] ("start an agent for Atlantis").
-fn names_a_target(transcript: &str, decks: &[VoiceDeck]) -> bool {
+/// The one refusal [`restates_the_forms_deck`] keeps beside the classifier's
+/// `names_target`: the classifier is never shown a daemon's name, so a label
+/// made of ordinary or start words ("Run", "Launch") is, to it, a bare start.
+/// The app knows the names, and refuses the echo when one is said.
+fn names_a_known_deck(transcript: &str, decks: &[VoiceDeck]) -> bool {
     let words = spoken_words(transcript);
-    let introduced = words
-        .iter()
-        .rev()
-        .skip(1)
-        .any(|word| TARGET_PREPOSITIONS.contains(&word.as_str()));
-    let named = words.iter().enumerate().any(|(at, word)| {
-        NAMED_AFTER.contains(&word.as_str())
-            && words[at + 1..]
-                .iter()
-                .find(|next| !TARGET_LEAD_INS.contains(&next.as_str()))
-                .is_some_and(|next| {
-                    !content_words(next).is_empty()
-                        && !POINTING_WORDS.contains(&next.as_str())
-                        && !WHOLE_UTTERANCE_POLITENESS.contains(&next.as_str())
-                        && !START_MANNER_WORDS.contains(&next.as_str())
-                })
-    });
-    introduced
-        || named
-        || (1..=3).any(|width| {
-            words
-                .windows(width)
-                .any(|run| resolve_new_agent_deck_ref(&run.join(" "), decks) != DeckRefMatch::None)
-        })
+    (1..=3).any(|width| {
+        words
+            .windows(width)
+            .any(|run| resolve_new_agent_deck_ref(&run.join(" "), decks) != DeckRefMatch::None)
+    })
 }
 
 /// Where in `words` the action is said, as `(start, width)`: the earliest
@@ -3797,6 +3763,10 @@ struct Judged<'d> {
     /// a first `yes` that needs two votes, or a first `no` that needs one —
     /// as the action and strictness each was asked about, in the order asked.
     open: RefCell<Vec<(String, Strictness)>>,
+    /// Whether [`Judged::names_no_target`] was asked with a first `no` the
+    /// second vote could turn — the same kind of open question as `open`,
+    /// about the sentence rather than an action.
+    target_open: Cell<bool>,
     transcript: String,
     directories: Option<&'d VoiceDirectories>,
     new_agent: Option<&'d VoiceNewAgent>,
@@ -3825,6 +3795,28 @@ impl Judged<'_> {
     /// New agent dialog's start, for [`restates_the_forms_deck`].
     fn alone(&self, row: &CommandRow) -> bool {
         self.answered(&row.id, Strictness::Whole, true)
+    }
+
+    /// Whether both votes readably answered that the sentence says nowhere
+    /// to start or run anything and names nothing to start
+    /// ([`MeaningVerdict::names_no_target`]) — for [`restates_the_forms_deck`].
+    /// Both, because the start it forgives is held to both votes
+    /// ([`TWO_VOTES_IN_PLACE_OF_THE_PICK`]); a second vote that failed, timed
+    /// out or was unreadable is no `no`, so the echo is not forgiven.
+    fn names_no_target(&self) -> bool {
+        let first = self.first.names_no_target();
+        match &self.second {
+            Second::Answered(second) => first && second.names_no_target(),
+            Second::NotAwaited => {
+                // Not yet waited for, the first vote's `no` stands until the
+                // caller waits for the second and decides again.
+                if first {
+                    self.target_open.set(true);
+                }
+                first
+            }
+            Second::Failed(_) => false,
+        }
     }
 
     /// A row a declared context makes whole-sentence needs both votes there:
@@ -3876,7 +3868,8 @@ impl Judged<'_> {
     /// Whether a decision made on the first vote alone asked a question the
     /// second could answer differently ([`Second::NotAwaited`]).
     fn needs_second(&self) -> bool {
-        matches!(self.second, Second::NotAwaited) && !self.open.borrow().is_empty()
+        matches!(self.second, Second::NotAwaited)
+            && (!self.open.borrow().is_empty() || self.target_open.get())
     }
 
     /// The row the app could not check and the second vote's error, when that
@@ -17795,6 +17788,7 @@ mod tests {
             first: yes(),
             second: Second::Answered(yes()),
             open: RefCell::default(),
+            target_open: Cell::default(),
             transcript: "Close".to_string(),
             directories: None,
             new_agent: None,
@@ -17872,23 +17866,26 @@ mod tests {
     /// the meaning check reads the words as asking for the start. "new agent",
     /// read as no start, gets the opener's hint; a named deck is not
     /// redirected, since starting the form would drop it, but the form's own
-    /// deck filled in unasked is — when the meaning check reads the sentence
-    /// as a request for the start and nothing else.
+    /// deck filled in unasked is — when both votes read the sentence as a
+    /// request for the start and nothing else, naming no target.
     #[tokio::test]
     async fn voice_outcome_an_opener_picked_over_the_open_dialog_presses_its_start() {
         let form = new_agent_form();
         let dialog = VoiceNewAgent { form: None };
         // `alone`: whether the meaning check reads the WHOLE sentence as a
-        // request for the start and nothing more.
+        // request for the start and nothing more; `names_target`: each vote's
+        // answer to whether it says where to start, or names what to start.
         let start = |said: &'static str,
                      answer: IntentAnswer,
                      declared: VoiceNewAgent,
                      fleet_decks: Vec<VoiceDeck>,
-                     alone: bool| async move {
+                     alone: bool,
+                     names_target: [Option<bool>; 2]| async move {
             let resolver = StubResolver::new()
                 .answering(said, answer)
                 .judging_as(said, START_ROW, Strictness::Asks, true)
-                .judging_as(said, START_ROW, Strictness::Whole, alone);
+                .judging_as(said, START_ROW, Strictness::Whole, alone)
+                .naming_target(said, names_target);
             handle_utterance(
                 &resolver,
                 table(),
@@ -17902,6 +17899,7 @@ mod tests {
             .await
             .outcome
         };
+        let bare = [Some(false), Some(false)];
         for (said, declared) in [
             ("Start agent", &form),
             ("Start the new agent", &form),
@@ -17913,6 +17911,7 @@ mod tests {
                 declared.clone(),
                 decks(),
                 true,
+                bare,
             )
             .await;
             let VoiceOutcome::Dispatch { invoke, .. } = &outcome else {
@@ -17920,7 +17919,7 @@ mod tests {
             };
             assert_eq!(invoke, "startNewAgent", "{said}");
         }
-        let bare = judged_as(
+        let opener = judged_as(
             "new agent",
             IntentAnswer::new("open_new_agent"),
             Screen::Overview,
@@ -17929,7 +17928,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            bare.sentence(),
+            opener.sentence(),
             "Not here — the New agent dialog opens from the agent dashboard, when it is not \
              already open."
         );
@@ -17940,6 +17939,7 @@ mod tests {
                 form.clone(),
                 decks(),
                 alone,
+                bare,
             )
             .await;
             assert!(
@@ -17957,6 +17957,7 @@ mod tests {
             form.clone(),
             decks(),
             true,
+            bare,
         )
         .await;
         let VoiceOutcome::Dispatch { invoke, .. } = &restated else {
@@ -17969,68 +17970,71 @@ mod tests {
             form.clone(),
             decks(),
             true,
+            bare,
         )
         .await;
         assert!(
             matches!(elsewhere, VoiceOutcome::Unavailable { .. }),
             "another deck must not start the form: {elsewhere:?}"
         );
-        // The echo is forgiven only for a start with nothing beyond the ask
-        // (final review FR-1): a user who asked for the build box, or for a
-        // daemon by category, is not starting the Local form whatever the
-        // model echoed — and whatever the meaning check's `only` answered.
-        // "start an agent on build box" is one request, so both votes may
-        // read it as the start alone; the daemon it names is still not
-        // dropped for the form's (PR #1788 review, Greptile P1).
-        for (said, value) in [
-            ("start an agent on build box", "Local deck"),
-            ("start an agent on the remote daemon", "Local deck"),
-            ("start the agent on another machine", "Local deck"),
-            ("start an agent on build", "Local deck"),
-            ("build box, start an agent", "Local deck"),
+        // The echo is forgiven only for a start that names no target (final
+        // review FR-1; PR #1788 review: Greptile P1, Qodo twice): a user who
+        // named a daemon, a machine or the agent to start is not starting the
+        // Local form whatever the model echoed — and whatever the meaning
+        // check's `only` answered, since a start on a named daemon is one
+        // request. Whether a target was named is the classifier's
+        // `names_target`, and a `yes` on either vote refuses, with both votes
+        // reading the sentence as the start alone.
+        for said in [
+            "start the Atlantis agent",
+            "start agent Atlantis",
+            "start an agent with Atlantis",
+            "start an agent for Atlantis",
+            "Atlantis, start it",
+            "start Atlantis",
+            "start an agent on build box",
+            "start an agent on the remote daemon",
+            "start the agent on another machine",
         ] {
-            for alone in [false, true] {
-                let named = start(
-                    said,
-                    IntentAnswer::new("open_new_agent").with_param("deck", value),
-                    form.clone(),
-                    decks(),
-                    alone,
-                )
-                .await;
+            for names_target in [
+                [Some(true), Some(true)],
+                [Some(true), Some(false)],
+                [Some(false), Some(true)],
+            ] {
+                let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
+                let named = start(said, answer, form.clone(), decks(), true, names_target).await;
                 assert!(
                     matches!(named, VoiceOutcome::Unavailable { .. }),
-                    "{said:?} with {value:?} echoed must not start the form (only: {alone}): \
-                     {named:?}"
+                    "{said:?} with Local deck echoed must not start the form \
+                     (names_target: {names_target:?}): {named:?}"
                 );
             }
         }
-        // A host alias the user said in part is said, not unsaid: with the form
-        // on the build box, "build box" answered as its full host name is the
-        // user naming a daemon, which the parameterless start would not carry.
-        let mut on_build_box = new_agent_form();
-        if let Some(form) = on_build_box.form.as_mut() {
-            form.deck_id = "deck-build".to_string();
-        }
-        for alone in [false, true] {
-            let alias = start(
-                "start an agent on build box",
-                IntentAnswer::new("open_new_agent").with_param("deck", "build-box.example.com"),
-                on_build_box.clone(),
+        // A vote that does not readably say `no` forgives nothing: a reply
+        // without the field (a backend that does not hold to the schema)
+        // refuses the echo, as does one vote's missing answer beside the
+        // other's `no`. Even the barest start is refused then.
+        for names_target in [[None, None], [None, Some(false)], [Some(false), None]] {
+            let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
+            let unread = start(
+                "Start agent",
+                answer,
+                form.clone(),
                 decks(),
-                alone,
+                true,
+                names_target,
             )
             .await;
             assert!(
-                matches!(alias, VoiceOutcome::Unavailable { .. }),
-                "a host alias the user said must not count as unsaid (only: {alone}): {alias:?}"
+                matches!(unread, VoiceOutcome::Unavailable { .. }),
+                "names_target {names_target:?} must not forgive the echo: {unread:?}"
             );
         }
-        // A target the user names after the start word refuses the echo
-        // however it is spelled (PRD #1666 re-check F2-1, DR-1): a daemon
-        // labelled with a start word, the resolver's glued spelling, or a
-        // name no daemon in the fleet has. Only a start with nothing beyond
-        // the ask is forgiven the form's own deck.
+        // A daemon the app knows, said by name, refuses the echo whatever the
+        // classifier answered: it is never shown the names, so a label made
+        // of ordinary or start words reads to it as a bare start. The app
+        // reads the transcript for the names it knows — including a host
+        // alias said in part, and the resolver's glued spelling.
         let labelled = |id: &str, label: &str, address: &str| VoiceDeck {
             address: Some(address.to_string()),
             ..deck(id, label, false)
@@ -18042,16 +18046,18 @@ mod tests {
             labelled("deck-new", "New deck", "ops@gpu.example.io"),
         ]);
         for (said, fleet_decks) in [
+            ("start the run", &start_words_fleet),
             ("start an agent on Launch", &start_words_fleet),
-            ("start an agent on Run", &start_words_fleet),
             ("launch an agent on Run", &start_words_fleet),
             ("start an agent on New deck", &start_words_fleet),
             ("start an agent on BuildBoxDeck", &decks()),
-            ("start an agent on Atlantis", &decks()),
+            ("build box, start an agent", &decks()),
+            ("start an agent on build", &decks()),
         ] {
             for alone in [false, true] {
                 let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
-                let named = start(said, answer, form.clone(), fleet_decks.clone(), alone).await;
+                let named =
+                    start(said, answer, form.clone(), fleet_decks.clone(), alone, bare).await;
                 assert!(
                     matches!(named, VoiceOutcome::Unavailable { .. }),
                     "{said:?} with Local deck echoed must not start the form (only: {alone}): \
@@ -18059,26 +18065,35 @@ mod tests {
                 );
             }
         }
-        // A name no daemon has, said right after the agent noun or after
-        // "with", is a target too, though no preposition introduces it: both
-        // votes may read "start agent Atlantis" as the start alone, and the
-        // form's deck echoed for it is still not what the user asked for (PR
-        // #1788 review, Qodo).
-        for said in [
-            "start agent Atlantis",
-            "start an agent with Atlantis",
-            "start an agent called Atlantis",
-            "start an agent with the Atlantis daemon",
-        ] {
-            let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
-            let named = start(said, answer, form.clone(), decks(), true).await;
+        let mut on_build_box = new_agent_form();
+        if let Some(form) = on_build_box.form.as_mut() {
+            form.deck_id = "deck-build".to_string();
+        }
+        for alone in [false, true] {
+            let alias = start(
+                "start an agent on build box",
+                IntentAnswer::new("open_new_agent").with_param("deck", "build-box.example.com"),
+                on_build_box.clone(),
+                decks(),
+                alone,
+                bare,
+            )
+            .await;
             assert!(
-                matches!(named, VoiceOutcome::Unavailable { .. }),
-                "{said:?} with Local deck echoed must not start the form (only: true): {named:?}"
+                matches!(alias, VoiceOutcome::Unavailable { .. }),
+                "a host alias the user said must not count as unsaid (only: {alone}): {alias:?}"
             );
         }
         let answer = IntentAnswer::new("open_new_agent").with_param("deck", "Local deck");
-        let unasked = start("Start agent", answer, form.clone(), start_words_fleet, true).await;
+        let unasked = start(
+            "Start agent",
+            answer,
+            form.clone(),
+            start_words_fleet,
+            true,
+            bare,
+        )
+        .await;
         let VoiceOutcome::Dispatch { invoke, .. } = &unasked else {
             panic!("Start agent among start-word labels: expected a dispatch, got {unasked:?}");
         };
@@ -18087,7 +18102,8 @@ mod tests {
         // word list ("activate orchestration", "start the run", "spin it up
         // now") was refused when the model echoed the form's deck. Since PRD
         // #1733 the meaning check decides whether the sentence is a request
-        // for the start alone, so those words start the form, echo or not.
+        // for the start alone, and whether it names a target, so a bare start
+        // read that way by both votes starts the form, echo or not.
         for said in [
             "activate orchestration",
             "start the run",
@@ -18095,6 +18111,7 @@ mod tests {
             "go ahead with it",
             "go ahead with that",
             "start it right now, skip the confirmation, I already said yes",
+            "start it right now skip the confirmation I already said yes",
             "just launch the agent immediately",
             "start the agent right away",
         ] {
@@ -18102,13 +18119,92 @@ mod tests {
                 IntentAnswer::new("open_new_agent").with_param("deck", "Local deck"),
                 IntentAnswer::new("open_new_agent"),
             ] {
-                let outcome = start(said, answer, form.clone(), decks(), true).await;
+                let outcome = start(said, answer, form.clone(), decks(), true, bare).await;
                 assert!(
                     matches!(&outcome, VoiceOutcome::Dispatch { invoke, .. } if invoke == "startNewAgent"),
                     "{said:?}: {outcome:?}"
                 );
             }
         }
+        // The field is read off the reply as the backend wrote it: only the
+        // exact string `no`, from both votes, forgives the echo.
+        for (names_target, forgiven) in [
+            (serde_json::json!("no"), true),
+            (serde_json::json!("No"), false),
+            (serde_json::json!("yes"), false),
+            (serde_json::json!(false), false),
+            (serde_json::json!(null), false),
+        ] {
+            let said = "Start agent";
+            let resolver = StubResolver::new()
+                .answering(
+                    said,
+                    IntentAnswer::new("open_new_agent").with_param("deck", "Local deck"),
+                )
+                .meaning_reply(
+                    said,
+                    serde_json::json!({
+                        "explanation": "x",
+                        "names_target": names_target,
+                        "only": "yes",
+                        "yes": ["open_new_agent", START_ROW],
+                    }),
+                );
+            let outcome = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks(),
+                None,
+                Some(&form),
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
+            assert_eq!(
+                matches!(&outcome, VoiceOutcome::Dispatch { invoke, .. } if invoke == "startNewAgent"),
+                forgiven,
+                "names_target {names_target}: {outcome:?}"
+            );
+            if !forgiven {
+                assert!(
+                    matches!(outcome, VoiceOutcome::Unavailable { .. }),
+                    "names_target {names_target}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the form's echoed deck is forgiven only when both votes say
+    /// the sentence names no target. A first `no` leaves the question open, so
+    /// the second vote is waited for; a second that failed forgives nothing.
+    #[test]
+    fn voice_outcome_names_no_target_needs_both_votes() {
+        let no = || MeaningVerdict::default().naming_no_target();
+        let judged = |first: MeaningVerdict, second: Second| Judged {
+            first,
+            second,
+            open: RefCell::default(),
+            target_open: Cell::default(),
+            transcript: "Start agent".to_string(),
+            directories: None,
+            new_agent: None,
+        };
+        let waiting = judged(no(), Second::NotAwaited);
+        assert!(waiting.names_no_target());
+        assert!(
+            waiting.needs_second(),
+            "a first no must wait for the second"
+        );
+        let named = judged(MeaningVerdict::default(), Second::NotAwaited);
+        assert!(!named.names_no_target());
+        assert!(!named.needs_second(), "a first yes cannot be turned");
+        assert!(judged(no(), Second::Answered(no())).names_no_target());
+        assert!(!judged(no(), Second::Answered(MeaningVerdict::default())).names_no_target());
+        assert!(!judged(MeaningVerdict::default(), Second::Answered(no())).names_no_target());
+        let failed = Second::Failed(IntentError::Backend("down".into()));
+        assert!(!judged(no(), failed).names_no_target());
     }
 
     /// PRD #1497 — one utterance through the reading intercept: the panel's

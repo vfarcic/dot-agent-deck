@@ -27,9 +27,10 @@
 //! pipeline sends it at the same moment as the command call
 //! (`outcome::after_local_intercepts`), and the user waits for the slower of
 //! the two rather than for both in turn. It answers which actions the sentence
-//! asks for — any number, possibly none — and whether the sentence is one
-//! request and nothing else, which is what a `whole` row needs
-//! ([`MeaningVerdict::read`]).
+//! asks for — any number, possibly none — whether the sentence is one request
+//! and nothing else, which is what a `whole` row needs, and whether it says
+//! where to start or run something, which is what forgiving a start the form's
+//! own deck was echoed for needs ([`MeaningVerdict::read`]).
 //!
 //! It is sent **twice**, both at once ([`Ballot`]). A pick whose wrong `yes`
 //! costs the most — a `whole` row, closing an orchestration, a close or a
@@ -300,10 +301,15 @@ impl<'a> MeaningRequest<'a> {
 /// The answers to one [`MeaningRequest`]: each action and strictness the
 /// sentence was judged to ask for. Everything else — not listed, listed in a
 /// sentence that says more than the one request where the row needs it said
-/// alone, or not asked at all — is absent, and so refuses.
+/// alone, or not asked at all — is absent, and so refuses. Beside them,
+/// whether the sentence was judged to name no target ([`NAMES_TARGET`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MeaningVerdict {
     yes: BTreeSet<(String, Strictness)>,
+    /// `true` only when the reply's [`NAMES_TARGET`] is exactly the string
+    /// `no`: a missing, misspelt or `yes` answer leaves it `false`, which is
+    /// the answer that forgives nothing.
+    no_target: bool,
 }
 
 impl MeaningVerdict {
@@ -312,24 +318,49 @@ impl MeaningVerdict {
         self.yes.contains(&(action.to_string(), strictness))
     }
 
-    /// A verdict answering `yes` to exactly `pairs` — for a scripted backend.
+    /// Whether the sentence was readably judged to say nowhere to start or
+    /// run anything and to name nothing to start. Read only to forgive the
+    /// New agent form's own deck echoed for a start
+    /// (`outcome::restates_the_forms_deck`), so every answer but a readable
+    /// `no` is `false`.
+    pub fn names_no_target(&self) -> bool {
+        self.no_target
+    }
+
+    /// A verdict answering `yes` to exactly `pairs`, and not answering that
+    /// the sentence names no target — for a scripted backend.
     pub fn yes_to<'p>(pairs: impl IntoIterator<Item = (&'p str, Strictness)>) -> Self {
         Self {
             yes: pairs
                 .into_iter()
                 .map(|(action, strictness)| (action.to_string(), strictness))
                 .collect(),
+            no_target: false,
         }
     }
 
-    /// Read a reply object — `{"explanation": "…", "only": "yes", "yes":
-    /// ["close"]}` — against the request it answers. Each listed action the
-    /// request asked about is asked for under [`Strictness::Asks`] and, for
-    /// the one row whose line says so, [`Strictness::Write`]; and under
-    /// [`Strictness::Whole`] too only when `only` is exactly the string
-    /// `yes`. A listed id the request did not ask about is ignored. A reply
-    /// that is not an object, whose `yes` is not a list of strings, or that
-    /// lists one action twice is unreadable, which the caller refuses on.
+    /// The same verdict, answering that the sentence names no target — for a
+    /// scripted backend.
+    pub fn naming_no_target(self) -> Self {
+        Self {
+            no_target: true,
+            ..self
+        }
+    }
+
+    /// Read a reply object — `{"explanation": "…", "names_target": "no",
+    /// "only": "yes", "yes": ["close"]}` — against the request it answers.
+    /// Each listed action the request asked about is asked for under
+    /// [`Strictness::Asks`] and, for the one row whose line says so,
+    /// [`Strictness::Write`]; and under [`Strictness::Whole`] too only when
+    /// `only` is exactly the string `yes`. The sentence names no target only
+    /// when `names_target` is exactly the string `no`: a missing field, `yes`
+    /// or any other value or spelling reads as naming one, which forgives
+    /// nothing, and leaves the rest of the reply readable. A listed id the
+    /// request did not ask about is ignored. A reply that is not an object,
+    /// whose `yes` is not a list of strings, or that lists one action twice is
+    /// unreadable, which the caller refuses on; so is a reply that writes a
+    /// key twice, `names_target` included ([`parse_reply`], [`parse_openai`]).
     pub fn read(request: &MeaningRequest<'_>, answers: &Value) -> Result<Self, IntentError> {
         let answers = answers.as_object().ok_or_else(unreadable)?;
         let listed = answers
@@ -344,6 +375,7 @@ impl MeaningVerdict {
             }
         }
         let only = answers.get(ONLY).and_then(Value::as_str) == Some("yes");
+        let no_target = answers.get(NAMES_TARGET).and_then(Value::as_str) == Some("no");
         let mut yes = BTreeSet::new();
         for action in request
             .actions
@@ -360,7 +392,7 @@ impl MeaningVerdict {
                 yes.insert((action.id.clone(), Strictness::Whole));
             }
         }
-        Ok(Self { yes })
+        Ok(Self { yes, no_target })
     }
 }
 
@@ -514,7 +546,17 @@ genuinely cannot tell, leave the action off.\n\
 \n\
 First write `explanation`: one short sentence saying what the sentence asks the app for, if \
 anything, and quoting whatever else it says besides that request (or saying it says nothing \
-else). Then `only`: `yes` when the sentence is one request to the app and nothing else — \
+else) — and, when it asks to start or run something, any place or name it gives for that (or \
+saying it gives none). Then `names_target`: `yes` when the sentence says anything about where something is to \
+start or run — on, in or at any daemon, deck, machine, host, server or other place, whether it \
+names that place or only describes it (some other one, a different one, a remote one), since \
+what matters is that a place is mentioned, not whether you can tell which one — or when it \
+contains any name at all: a word naming one particular thing rather than an ordinary word, \
+wherever it stands, even first in the sentence as if addressing someone, and whether or not you \
+know it. `no` only when the sentence is a bare \
+request to start, launch or go ahead, with at most words about when or how and words that only \
+point at what is already there (it, this, that). When you cannot tell, answer `yes`. Then \
+`only`: `yes` when the sentence is one request to the app and nothing else — \
 politeness (\"okay\", \"please\", \"now\") and words that only describe the request (\"from now \
 on\", \"again\") allowed — and `no` when it also says or asks anything else: a second request, a \
 statement, a question, a time, words meant for someone else, or something to tell or ask the \
@@ -551,15 +593,20 @@ pub fn system_turn(request: &MeaningRequest<'_>) -> String {
 /// The property the classifier writes its one sentence into, ahead of its
 /// answers.
 const EXPLANATION: &str = "explanation";
+/// Whether the sentence says where to start or run something, or names what
+/// to start — whether or not the name is one the app knows, which the
+/// classifier is never shown. Judged from the user's words alone, like every
+/// other answer here.
+const NAMES_TARGET: &str = "names_target";
 /// Whether the sentence is one request and nothing else — the half of a
 /// [`Strictness::Whole`] answer that is about the sentence, not the action.
 const ONLY: &str = "only";
 /// The actions the sentence asks for.
 const LISTED: &str = "yes";
 
-/// A short `explanation`, then `only`, then the list of actions asked for —
-/// ids from the request, so an action outside the table is not representable
-/// under a strict schema.
+/// A short `explanation`, then `names_target`, then `only`, then the list of
+/// actions asked for — ids from the request, so an action outside the table
+/// is not representable under a strict schema.
 ///
 /// **The `explanation` comes first on purpose, and is never read.** Measured on
 /// `gpt-5-mini` with minimal reasoning (2026-10-20), a judge asked for its
@@ -569,7 +616,7 @@ const LISTED: &str = "yes";
 /// in 86 forced cases, and with it, never. Strict structured outputs generate
 /// the properties in the order the schema lists them, and this crate's
 /// `serde_json` serializes an object's keys sorted (no `preserve_order`), so
-/// the three names sort in the order they are to be written —
+/// the four names sort in the order they are to be written —
 /// `meaning_schema_puts_the_explanation_first` pins the wire order. A list
 /// of yes ids rather than a yes/no per action keeps the reply to a few dozen
 /// tokens whatever the size of the table: a reply's length is most of what
@@ -581,10 +628,11 @@ pub fn answer_schema(request: &MeaningRequest<'_>) -> Value {
         "type": "object",
         "properties": {
             EXPLANATION: { "type": "string" },
+            NAMES_TARGET: { "type": "string", "enum": ["yes", "no"] },
             ONLY: { "type": "string", "enum": ["yes", "no"] },
             LISTED: { "type": "array", "items": { "type": "string", "enum": ids } },
         },
-        "required": [EXPLANATION, ONLY, LISTED],
+        "required": [EXPLANATION, NAMES_TARGET, ONLY, LISTED],
         "additionalProperties": false,
     })
 }
@@ -861,7 +909,14 @@ mod tests {
         assert_eq!(ids, rows);
         let schema = answer_schema(&request);
         assert_eq!(schema["properties"]["yes"]["items"]["enum"], json!(rows));
-        assert_eq!(schema["required"], json!(["explanation", "only", "yes"]));
+        assert_eq!(
+            schema["required"],
+            json!(["explanation", "names_target", "only", "yes"])
+        );
+        assert_eq!(
+            schema["properties"]["names_target"],
+            json!({ "type": "string", "enum": ["yes", "no"] })
+        );
         assert_eq!(schema["additionalProperties"], json!(false));
         let system = system_turn(&request);
         assert!(
@@ -964,8 +1019,9 @@ mod tests {
     }
 
     /// Scenario: in both dialects' bodies, as serialized for the wire, the
-    /// explanation comes before `only`, and `only` before the list of actions,
-    /// so the classifier writes them in that order.
+    /// explanation comes before `names_target`, `names_target` before `only`,
+    /// and `only` before the list of actions, so the classifier writes them in
+    /// that order.
     #[test]
     fn meaning_schema_puts_the_explanation_first() {
         let transcript = Transcript::new("select the billing run chip");
@@ -975,9 +1031,12 @@ mod tests {
             openai_body(&request, "model", ceiling(), None).to_string(),
         ] {
             let schema = &body[body.find("\"properties\"").expect("a schema")..];
-            let at = |key: &str| schema.find(key).expect(key);
-            assert!(at("\"explanation\"") < at("\"only\""));
-            assert!(at("\"only\"") < at("\"yes\""));
+            // As a property name, followed by its colon: `"yes"` is also one
+            // of the values `names_target` and `only` may take.
+            let at = |key: &str| schema.find(&format!("\"{key}\":")).expect(key);
+            assert!(at("explanation") < at("names_target"));
+            assert!(at("names_target") < at("only"));
+            assert!(at("only") < at("yes"));
         }
     }
 
@@ -1021,7 +1080,8 @@ mod tests {
     /// found it needing: any number of actions or none, never the closest; every
     /// action a request fits, since the screen decides which runs; close words
     /// read as closing a view, and never a close for words that close nothing;
-    /// an agent is an agent; a start only for a start.
+    /// an agent is an agent; a start only for a start; and whether the
+    /// sentence says where to start, a doubt being a `yes`.
     #[test]
     fn meaning_instructions_say_what_the_live_runs_found_wrong() {
         let instructions = MEANING_INSTRUCTIONS
@@ -1039,6 +1099,16 @@ mod tests {
             "it asks to start or create something only when it asks for a new one or for a \
              start.",
             "`only` is `no` whenever the explanation quotes anything else.",
+            "— and, when it asks to start or run something, any place or name it gives for that \
+             (or saying it gives none). Then `names_target`: `yes` when the sentence says anything \
+             about where something is to start or run",
+            "what matters is that a place is mentioned, not whether you can tell which one — or \
+             when it contains any name at all:",
+            "even first in the sentence as if addressing someone, and whether or not you know it.",
+            "`no` only when the sentence is a bare request to start, launch or go ahead, with at \
+             most words about when or how and words that only point at what is already there \
+             (it, this, that).",
+            "When you cannot tell, answer `yes`.",
         ] {
             assert!(instructions.contains(rule), "{rule}");
         }
@@ -1048,7 +1118,9 @@ mod tests {
     /// to be exactly "yes"; the write row is read as a write; an unlisted
     /// action, an id nobody asked about and a sloppy `only` are all a no; a
     /// reply that is not an object, has no list, lists a non-string or lists
-    /// one action twice is unreadable.
+    /// one action twice is unreadable. The sentence names no target only when
+    /// `names_target` is exactly "no"; missing, "yes" or a sloppy value reads
+    /// as naming one, and leaves the actions readable.
     #[test]
     fn meaning_verdict_counts_only_what_is_listed() {
         let transcript = Transcript::new("send it");
@@ -1069,6 +1141,28 @@ mod tests {
                 MeaningVerdict::read(&request, &reply(only, &["submit_prompt"])).expect("readable");
             assert!(verdict.asks("submit_prompt", Strictness::Asks), "{only}");
             assert!(!verdict.asks("submit_prompt", Strictness::Whole), "{only}");
+        }
+        assert!(!verdict.names_no_target(), "a reply with no names_target");
+        let named = |names_target: Value| {
+            let mut answers = reply("yes", &["submit_prompt"]);
+            answers["names_target"] = names_target;
+            MeaningVerdict::read(&request, &answers).expect("readable")
+        };
+        assert!(named(json!("no")).names_no_target());
+        assert!(named(json!("no")).asks("submit_prompt", Strictness::Whole));
+        for sloppy in [
+            json!("yes"),
+            json!("No"),
+            json!("no "),
+            json!("false"),
+            json!(""),
+            json!(false),
+            json!(null),
+            json!(["no"]),
+        ] {
+            let verdict = named(sloppy.clone());
+            assert!(!verdict.names_no_target(), "{sloppy}");
+            assert!(verdict.asks("submit_prompt", Strictness::Whole), "{sloppy}");
         }
         for unreadable in [
             json!("yes"),
@@ -1162,10 +1256,27 @@ mod tests {
         );
 
         let content = |content: &str| json!({ "choices": [{ "message": { "content": content } }] });
-        for (first, second) in [("[\"stop_agent\"]", "[]"), ("[]", "[\"stop_agent\"]")] {
-            let twice = format!(
+        let names_target_twice = |first: &str, second: &str| {
+            format!(
+                "{{\"explanation\": \"x\", \"names_target\": \"{first}\", \
+                 \"names_target\": \"{second}\", \"only\": \"yes\", \"yes\": []}}"
+            )
+        };
+        let twice_over = [
+            ("[\"stop_agent\"]", "[]"),
+            ("[]", "[\"stop_agent\"]"),
+        ]
+        .map(|(first, second)| {
+            format!(
                 "{{\"explanation\": \"x\", \"only\": \"yes\", \"yes\": {first}, \"yes\": {second}}}"
-            );
+            )
+        })
+        .into_iter()
+        .chain([
+            names_target_twice("no", "yes"),
+            names_target_twice("yes", "no"),
+        ]);
+        for twice in twice_over {
             assert!(!keys_written_once(twice.as_bytes()), "{twice}");
             assert!(
                 parse_openai(&request, &content(&twice), ceiling()).is_err(),

@@ -361,6 +361,15 @@ pub struct StubResolver {
     /// PRD #1733: what an unscripted action is answered when set, in place
     /// of agreeing with the pick alone.
     meaning_default: Option<bool>,
+    /// PRD #1733: each vote's `names_target` for an utterance, in the order
+    /// the votes are asked — `Some(true)` a `yes`, `Some(false)` a `no` and
+    /// `None` a reply without the field. An utterance with none scripted is
+    /// answered without it, which names a target as far as the app reads it
+    /// ([`MeaningVerdict::names_no_target`]).
+    target_votes: BTreeMap<String, [Option<bool>; 2]>,
+    /// How many votes each utterance has been asked, to pick its
+    /// `target_votes` entry.
+    target_asked: std::sync::Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
     /// PRD #1733: a raw reply for an utterance, read by the production reader
     /// ([`MeaningVerdict::read`]) — so a test can drive a malformed one.
     meaning_replies: BTreeMap<String, serde_json::Value>,
@@ -449,6 +458,14 @@ impl StubResolver {
             (normalize(utterance), action.to_string(), Some(strictness)),
             asks,
         );
+        self
+    }
+
+    /// PRD #1733: answer `names_target` for `utterance` with `votes`, the
+    /// first meaning call with the first and every later one with the
+    /// second.
+    pub fn naming_target(mut self, utterance: &str, votes: [Option<bool>; 2]) -> Self {
+        self.target_votes.insert(normalize(utterance), votes);
         self
     }
 
@@ -546,7 +563,14 @@ impl IntentResolver for StubResolver {
             super::meaning::parse_reply(&request, *dialect, reply.as_bytes(), ceiling)
         } else {
             let picked = self.answers.get(&said).map(|answer| answer.action.as_str());
-            Ok(MeaningVerdict::yes_to(
+            let names_target = self.target_votes.get(&said).and_then(|votes| {
+                let mut asked = self.target_asked.lock().expect("target votes");
+                let vote = asked.entry(said.clone()).or_default();
+                let names = votes[(*vote).min(1)];
+                *vote += 1;
+                names
+            });
+            let verdict = MeaningVerdict::yes_to(
                 request
                     .action_ids()
                     .flat_map(|action| {
@@ -561,7 +585,12 @@ impl IntentResolver for StubResolver {
                             .or(self.meaning_default)
                             .unwrap_or(picked == Some(*action))
                     }),
-            ))
+            );
+            Ok(if names_target == Some(false) {
+                verdict.naming_no_target()
+            } else {
+                verdict
+            })
         };
         Box::pin(async move { outcome })
     }

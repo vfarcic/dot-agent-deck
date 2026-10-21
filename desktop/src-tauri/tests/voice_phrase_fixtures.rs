@@ -445,6 +445,160 @@ async fn voice_paraphrase_fixtures_match_the_default_backend() {
     run_fixtures(fixtures).await;
 }
 
+/// Scenario: Classify start sentences over the open New agent form, bypassing command selection, and read only whether each says where to start or names what to start.
+/// Every sentence naming a target — a daemon, a machine or the agent, known to the app or not — must be judged to name one in at least nine of ten samples, since forgiving the form's echoed deck takes both votes' no; each bare start must be judged to name none in most of them.
+#[tokio::test]
+async fn voice_a_named_start_target_is_read_by_the_real_judge() {
+    let Some(resolver) = live_api_resolver() else {
+        return;
+    };
+    let resolver: std::sync::Arc<dyn IntentResolver> = resolver.into();
+    let filter = std::env::var(FIXTURE_FILTER_ENV).unwrap_or_default();
+    let cases = NAMED_START_TARGETS
+        .iter()
+        .map(|said| (*said, true))
+        .chain(BARE_STARTS.iter().map(|said| (*said, false)))
+        .filter(|(said, _)| said.contains(&filter));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut failures = Vec::new();
+    let mut selected = 0;
+    for (said, named) in cases {
+        selected += 1;
+        let resolver = resolver.clone();
+        tasks.spawn(async move { run_target_judge_fixture(resolver.as_ref(), said, named).await });
+        // One case's samples run in turn, so this bounds requests in flight.
+        if tasks.len() == MAX_CONCURRENT_UTTERANCES {
+            failures.extend(
+                tasks
+                    .join_next()
+                    .await
+                    .expect("pending case")
+                    .expect("judge task"),
+            );
+        }
+    }
+    while let Some(result) = tasks.join_next().await {
+        failures.extend(result.expect("judge task"));
+    }
+    assert!(selected > 0, "no start-target fixture matches {filter:?}");
+    assert!(
+        failures.is_empty(),
+        "real names_target judge failures: {failures:#?}"
+    );
+}
+
+/// Starts that say where to start, or name what to start, with a name no
+/// daemon in any fleet has or one the planted fleet does — PR #1788's review
+/// rounds found each of them missed by a word heuristic.
+const NAMED_START_TARGETS: [&str; 9] = [
+    "start the Atlantis agent",
+    "start agent Atlantis",
+    "start an agent with Atlantis",
+    "start an agent for Atlantis",
+    "Atlantis, start it",
+    "start Atlantis",
+    "start an agent on build box",
+    "start an agent on the remote daemon",
+    "start the agent on another machine",
+];
+
+/// Starts that name nothing: when or how at most.
+const BARE_STARTS: [&str; 7] = [
+    "go ahead with it",
+    "spin it up now",
+    "just launch the agent immediately",
+    "start the agent right away",
+    "start it right now skip the confirmation I already said yes",
+    "Start agent",
+    "activate orchestration",
+];
+
+async fn run_target_judge_fixture(
+    resolver: &dyn IntentResolver,
+    said: &'static str,
+    named: bool,
+) -> Vec<String> {
+    const REPETITIONS: usize = 10;
+    let form = VoiceNewAgent {
+        form: Some(VoiceNewAgentForm {
+            deck_id: "deck-local".into(),
+            path: "/work".into(),
+            modes: vec![],
+            agent_types: vec![],
+            withheld_modes: vec![],
+            mode_paging: None,
+        }),
+    };
+    let transcript = Transcript::new(said);
+    let actions = every_action(table());
+    let mut failures = Vec::new();
+    let mut names = 0;
+    let mut completed = 0;
+    for repetition in 1..=REPETITIONS {
+        let request = MeaningRequest::new(&transcript, table(), &actions).at(Place::of(
+            Screen::Overview,
+            None,
+            Some(&form),
+        ));
+        match tokio::time::timeout(
+            REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
+            resolver.judge_meaning(request),
+        )
+        .await
+        {
+            Ok(Ok(verdict)) => {
+                let yes = !verdict.names_no_target();
+                completed += 1;
+                names += usize::from(yes);
+                eprintln!(
+                    "names-target: {said} | run {repetition}/{REPETITIONS} | {}",
+                    if yes { "yes" } else { "no" }
+                );
+            }
+            // A vote that fails forgives nothing (`MeaningVerdict::names_no_target`
+            // is never read off it), so it is reported, not counted as either
+            // answer; too few readable votes fails the case below.
+            Ok(Err(error)) => {
+                eprintln!("names-target: {said} | run {repetition}/{REPETITIONS} | {error:?}")
+            }
+            Err(_) => {
+                eprintln!("names-target: {said} | run {repetition}/{REPETITIONS} | timed out")
+            }
+        }
+    }
+    if completed <= REPETITIONS / 2 {
+        failures.push(format!(
+            "{said}: only {completed}/{REPETITIONS} readable votes"
+        ));
+    }
+    eprintln!(
+        "names-target rate: {said} | yes {names}/{completed} | errors {} | expected {}",
+        REPETITIONS - completed,
+        if named { "yes" } else { "no" }
+    );
+    // A named target read as none is the unsafe answer: with the form's deck
+    // echoed, it would start the form on the wrong daemon — but only when
+    // BOTH votes read it so (`Judged::names_no_target`), so one `no` in ten
+    // samples is tolerated and two are not. A bare start read as naming one
+    // costs a refusal, so a minority of those is tolerated.
+    let accepted = if named {
+        completed - names <= 1
+    } else {
+        names < REPETITIONS / 2
+    };
+    if !accepted {
+        failures.push(format!(
+            "{said}: names_target yes {names}/{completed}, expected {}",
+            if named {
+                format!("at least {}/{completed}", completed.saturating_sub(1))
+            } else {
+                format!("under {}/{REPETITIONS}", REPETITIONS / 2)
+            }
+        ));
+    }
+    failures
+}
+
 /// Scenario: Classify each historical G1 sentence against every shipped action on the agent screen, bypassing command selection so it cannot hide an unsafe verdict.
 /// Dictating a submit word must receive zero yes votes; the bare send control must receive a majority (at least three of five), showing the classifier is not refusing everything.
 #[tokio::test]
