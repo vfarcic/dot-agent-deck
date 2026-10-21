@@ -7964,7 +7964,7 @@ pub(crate) mod gate_fixture {
                                             .expect("a minimal agent record"),
                                         ])
                                     }
-                                    "start-agent" => AttachResponse {
+                                    "start-agent" | "start-prepared-agent" => AttachResponse {
                                         id: Some("7".into()),
                                         ..AttachResponse::ok()
                                     },
@@ -8068,6 +8068,54 @@ mod protocol_gate_tests {
                 "form-start",
                 client.start_form_agent(start()).await.map(drop),
             ),
+            (
+                "client-seeded-form-start",
+                client
+                    .start_client_seeded_form_agent(start(), None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "authoring-start",
+                client
+                    .start_authoring_agent(
+                        start(),
+                        crate::authoring_seeds::AuthoringKind::Dispatcher,
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "authoring-form-start",
+                client
+                    .start_form_authoring_agent(
+                        start(),
+                        crate::authoring_seeds::AuthoringKind::Dispatcher,
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "prepare-orchestration",
+                client
+                    .prepare_orchestration("/project", "team", "task", None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "prepared-start",
+                client
+                    .start_agent_with_prep_token(start(), Some("preparation"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "prepared-role-start",
+                client
+                    .start_prepared_role(start(), "preparation")
+                    .await
+                    .map(drop),
+            ),
             ("subscribe", client.subscribe_events().await.map(drop)),
             (
                 "subscribe-snapshot",
@@ -8083,7 +8131,8 @@ mod protocol_gate_tests {
 
     /// Scenario: a gated client (the TUI's, the desktop terminal's) asks a
     /// daemon that answers `Hello` on the next attach protocol, and serves
-    /// every verb besides, to list, attach, start and subscribe. Each call is
+    /// every verb besides, to list, attach, prepare, start (ordinary and
+    /// prepared roles) and subscribe. Each call is
     /// refused as a protocol mismatch and the daemon receives none of those
     /// requests; the same calls on a matching daemon reach it, as the control.
     #[tokio::test]
@@ -8114,6 +8163,8 @@ mod protocol_gate_tests {
             "list-agents",
             "attach-stream",
             "start-agent",
+            "prepare-orchestration",
+            "start-prepared-agent",
             "subscribe-events",
             "subscribe-events-with-snapshot",
             "subscribe-turn-replies",

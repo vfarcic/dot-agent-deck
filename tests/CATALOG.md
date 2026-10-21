@@ -3157,17 +3157,18 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Platform coverage:** mac+linux.
 
 ##### lifecycle/handshake/011 — Reconnect rechecks the replacement daemon's protocol before reattaching.
-- **Layer:** L2 lane 1 (`tests/e2e_handshake.rs`), real TUI in a PTY and isolated daemon processes replaced at the same socket.
+- **Layer:** L2 lane 1 (`tests/e2e_handshake.rs` and `tests/e2e_tab_close_regressions.rs`), real TUI in a PTY with isolated daemon processes replaced at the same socket, or a synthetic daemon that changes protocol after the startup handshake.
 - **Agent:** none (raw Python stand-ins; no agent executable or credential).
 - **Asserts:** the same-protocol replacement displays a unique terminal-only sentinel, distinct from its display name. An N+1 replacement records zero terminal/event stream requests from startup through the refusal and a two-second stability window; the visible refusal associates the daemon and client version numbers. The skew uses the existing e2e-only protocol override. The desktop Rust regression `terminal_reopen_after_eof_rechecks_protocol_before_cached_trust` independently drives EOF, socket replacement and terminal establishment with watcher invalidation withheld and cached lookup age pinned to zero, including a same-version stream control; expired-cache lookup fails the fixture precondition.
 - **Does not assert:** compatibility with a real previous-release binary, desktop webview rendering, or behavior after the bounded refusal observation window.
 - **Platform coverage:** mac+linux.
 
-##### lifecycle/handshake/012 — A daemon the TUI refuses on reconnect receives no new pane's start, listing or attach.
+##### lifecycle/handshake/012 — A daemon the TUI refuses receives no new pane or hydrated orchestration role.
 - **Layer:** L2 lane 1 (`tests/e2e_handshake.rs`), real TUI in a PTY and isolated daemon processes replaced at the same socket.
 - **Agent:** none (a raw Python stand-in for the pane that was open before the replacement; no agent executable or credential).
 - **Asserts:** after the replacement on the next attach protocol is refused in the footer, the e2e-only observation seam records no `attach-stream`, `subscribe-events*`, `list-agents`, `start-agent` or `run-now` from the TUI — before the user acts, and for three seconds after the New Agent form is submitted, its directory hints included — and no pane named in the form opens. The unit pins `daemon_client::protocol_gate_tests::*` (every gated verb against a mismatched, a refused/garbled/silent/no-follow-on, and a replaced-between-check-and-request daemon) and `embedded_pane::protocol_gate_tests::*` (reattach fail-closed; the gated controller's start, hydration and pane hydration) cover the paths this PTY test does not drive.
-- **Does not assert:** hydration of an orchestration role pane through the PTY (unit-pinned), the one-shot CLI's deliberately ungated policy (unit-pinned by `an_ungated_client_keeps_the_one_shot_policy`), or compatibility with a real previous-release binary.
+- **Asserts (startup hydration):** a matching daemon hydrates an existing orchestration role visibly; when the protocol changes after the startup handshake, the dashboard stays empty with a refusal naming both protocols and the daemon receives no listing or attach. The existing agent remains registered.
+- **Does not assert:** the one-shot CLI's deliberately ungated policy (unit-pinned by `an_ungated_client_keeps_the_one_shot_policy`), or compatibility with a real previous-release binary.
 - **Platform coverage:** mac+linux.
 
 #### lifecycle/login-path

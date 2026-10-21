@@ -2675,9 +2675,9 @@ mod tests {
 
     /// Answer one connection with one reply, after `hold` resolves.
     ///
-    /// One request per connection is not a simplification — the real daemon's
-    /// `handle_connection` reads exactly ONE frame, dispatches it and returns.
-    /// `hold` is what lets a test stand inside the window between a request
+    /// A protocol-gated attach first exchanges a follow-on Hello on this
+    /// connection; `reply` answers the request after that check. Ungated
+    /// requests receive `reply` directly. `hold` lets a test stand between a request
     /// arriving and its answer, which is where both defects live.
     #[cfg(unix)]
     async fn answer_one(

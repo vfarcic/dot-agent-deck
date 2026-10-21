@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::{AgentRecord, TabMembership};
 use dot_agent_deck::daemon_protocol::{
-    AttachRequest, AttachResponse, KIND_REQ, PROTOCOL_VERSION, RunningAgentsSummary, read_frame,
-    write_resp,
+    AttachRequest, AttachResponse, CAP_HELLO_FOLLOW_ON, KIND_REQ, PROTOCOL_VERSION,
+    RunningAgentsSummary, read_frame, write_resp,
 };
 use spec::spec;
 use tempfile::TempDir;
@@ -28,9 +28,15 @@ use tokio::net::{UnixListener, UnixStream};
 
 #[derive(Clone)]
 enum StopScript {
-    FailOnce { agent_id: String },
+    FailOnce {
+        agent_id: String,
+    },
     AlreadyGone,
     DoneUnverified,
+    RefuseHydration {
+        checks: Arc<AtomicUsize>,
+        admitted: Arc<Mutex<Vec<String>>>,
+    },
 }
 
 struct ScriptedDaemon {
@@ -156,12 +162,34 @@ async fn handle_connection(
     let request: AttachRequest =
         serde_json::from_slice(&payload).expect("decode scripted daemon request");
 
+    if let StopScript::RefuseHydration { admitted, .. } = &stop_script
+        && !matches!(request, AttachRequest::Hello { .. })
+    {
+        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        admitted
+            .lock()
+            .unwrap()
+            .push(request["op"].as_str().unwrap().to_string());
+    }
+
     match request {
         AttachRequest::Hello { follow_on, .. } => {
             let summary = RunningAgentsSummary::from_records(&records.lock().unwrap());
-            let response = AttachResponse::hello(PROTOCOL_VERSION)
-                .with_capabilities()
-                .with_running_agents(summary);
+            // Startup sees a matching daemon with live panes. Every check
+            // after that sees an incompatible replacement, before hydration.
+            let version = match &stop_script {
+                StopScript::RefuseHydration { checks, .. }
+                    if checks.fetch_add(1, Ordering::SeqCst) > 0 =>
+                {
+                    PROTOCOL_VERSION + 1
+                }
+                _ => PROTOCOL_VERSION,
+            };
+            let mut response = AttachResponse::hello(version).with_running_agents(summary);
+            // Advertise only the added protocol exchange. Advertising every
+            // real-daemon capability selects snapshot subscription, which this
+            // close fixture does not implement, and hides a background panic.
+            response.capabilities = Some(vec![CAP_HELLO_FOLLOW_ON.to_string()]);
             write_resp(&mut stream, &response)
                 .await
                 .expect("reply to Hello");
@@ -351,6 +379,55 @@ fn confirm_close(deck: &TuiDeck) {
 fn request_close_alpha_tab(deck: &TuiDeck) {
     let (col, row) = deck.wait_for_in_grid("alpha [×]");
     deck.click(col + "alpha [".len() as u16, row);
+}
+
+/// Scenario: Start the TUI with an existing orchestration pane, then make every protocol check after its startup handshake refuse a replacement daemon. The dashboard must stay empty with a visible refusal and the daemon must receive no listing or attach; a matching daemon must hydrate the named role (control).
+#[spec("lifecycle/handshake/012")]
+#[test]
+fn handshake_012_hydration_refuses_panes_after_the_startup_check() {
+    let record = || orchestration_record("tab-close-targets", "alpha", 0, "orch-agent", "100");
+    {
+        let control = ScriptedDaemon::spawn(vec![record()], StopScript::AlreadyGone);
+        let deck = launch_against(&control, "tab-close-targets");
+        deck.wait_for_string("alpha-orchestrator");
+        deck.wait_for_string("alpha [×]");
+    }
+
+    let checks = Arc::new(AtomicUsize::new(0));
+    let admitted = Arc::new(Mutex::new(Vec::new()));
+    let daemon = ScriptedDaemon::spawn(
+        vec![record()],
+        StopScript::RefuseHydration {
+            checks: Arc::clone(&checks),
+            admitted: Arc::clone(&admitted),
+        },
+    );
+    let deck = launch_against(&daemon, "tab-close-targets");
+    deck.wait_for_string("Not attaching");
+    deck.wait_for_string(&format!(
+        "daemon speaks attach protocol v{}",
+        PROTOCOL_VERSION + 1
+    ));
+    assert!(
+        checks.load(Ordering::SeqCst) > 1,
+        "the post-startup gate must be exercised"
+    );
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("alpha-orchestrator") && !grid.contains("alpha [×]"),
+        "an incompatible daemon's orchestration pane was hydrated:\n{grid}"
+    );
+    let admitted = admitted.lock().unwrap().clone();
+    assert!(
+        admitted.is_empty(),
+        "hydration sent protected requests to the refused daemon: {admitted:?}\n{grid}"
+    );
+    deck.wait_for_string("No active agents");
+    assert_eq!(
+        daemon.records().len(),
+        1,
+        "refusal must preserve the existing agent"
+    );
 }
 
 /// Scenario: Hydrate a two-role orchestration whose worker refuses its first stop, then confirm its close. The tab and failed role must remain with a retry status while the successful role disappears; a second close removes the retained tab.
