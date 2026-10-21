@@ -58,6 +58,7 @@ use dot_agent_deck_desktop::voice::{
     VoiceDirectories, VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome,
     dictation::normalise,
     handle_utterance_after_local_intercepts, handle_utterance_with_dictation,
+    meaning::{Place, every_action},
     resolver::{MeaningFuture, ResolveFuture},
     schema::DECK_HIDDEN_HINT,
     table,
@@ -441,12 +442,11 @@ async fn voice_paraphrase_fixtures_match_the_default_backend() {
     run_fixtures(fixtures).await;
 }
 
-/// Scenario: Force a submit-prompt meaning check for each historical G1 sentence
-/// that asks to dictate a submit word, bypassing command selection so it cannot
-/// hide an unsafe judge verdict; a bare send request must still be accepted.
+/// Scenario: Classify each historical G1 sentence against every shipped action on the agent screen, bypassing command selection so it cannot hide an unsafe verdict.
+/// Dictating a submit word must not ask for submission; a bare send request must still be accepted.
 #[tokio::test]
 async fn voice_submit_words_in_passing_are_refused_by_the_real_judge() {
-    run_judge_fixtures(submit_judge_fixtures(), JudgePipeline::Singleton).await;
+    run_judge_fixtures(submit_judge_fixtures(), JudgePipeline::Classifier).await;
 }
 
 fn submit_judge_fixtures() -> Vec<JudgeFixture> {
@@ -465,12 +465,11 @@ fn submit_judge_fixtures() -> Vec<JudgeFixture> {
     .collect()
 }
 
-/// Scenario: Force each original F1 parameterless pick for "open docs" with
-/// the New agent dialog declared, so the real judge must refuse that action
-/// under its shipping strictness rather than rely on command-model no-match.
+/// Scenario: Classify "open docs" against every shipped action over the New agent directory listing.
+/// Each original F1 parameterless action must be refused under its shipping strictness without relying on command-model no-match.
 #[tokio::test]
 async fn voice_parameterless_steering_is_refused_by_the_real_judge() {
-    run_judge_fixtures(parameterless_judge_fixtures(), JudgePipeline::Singleton).await;
+    run_judge_fixtures(parameterless_judge_fixtures(), JudgePipeline::Classifier).await;
 }
 
 fn parameterless_judge_fixtures() -> Vec<JudgeFixture> {
@@ -493,12 +492,11 @@ fn parameterless_judge_fixtures() -> Vec<JudgeFixture> {
     .collect()
 }
 
-/// Scenario: Force contextual close and destructive picks for sentences that
-/// ask for something else, and six whole-sentence picks containing extra
-/// content; the real judge must refuse them and accept the standalone controls.
+/// Scenario: Classify contextual close, destructive and mixed-content requests against every shipped action in each fixture's declared place.
+/// The real classifier must refuse unasked actions and accept the standalone controls.
 #[tokio::test]
 async fn voice_contextual_and_whole_controls_are_refused_by_the_real_judge() {
-    run_judge_fixtures(contextual_judge_fixtures(), JudgePipeline::Singleton).await;
+    run_judge_fixtures(contextual_judge_fixtures(), JudgePipeline::Classifier).await;
 }
 
 fn contextual_judge_fixtures() -> Vec<JudgeFixture> {
@@ -565,7 +563,7 @@ fn contextual_judge_fixtures() -> Vec<JudgeFixture> {
 }
 
 /// Scenario: Force each G1 submit pick through the shipping pipeline after local
-/// intercepts, including its meaning questions; dictating a submit word must
+/// intercepts, including its parallel meaning votes; dictating a submit word must
 /// dispatch nothing, while the standalone send control still submits.
 #[tokio::test]
 async fn voice_submit_words_in_passing_are_refused_by_the_production_pipeline() {
@@ -573,7 +571,7 @@ async fn voice_submit_words_in_passing_are_refused_by_the_production_pipeline() 
 }
 
 /// Scenario: Force every original F1 pick for "open docs" over the New agent
-/// dialog through the shipping pipeline after local intercepts, including redirect questions;
+/// dialog through the shipping pipeline after local intercepts, including parallel meaning votes;
 /// none may dispatch an action the user did not ask for.
 #[tokio::test]
 async fn voice_parameterless_steering_is_refused_by_the_production_pipeline() {
@@ -645,7 +643,7 @@ async fn voice_contextual_and_whole_controls_are_refused_by_the_production_pipel
 
 #[derive(Debug, Clone, Copy)]
 enum JudgePipeline {
-    Singleton,
+    Classifier,
     Production,
 }
 
@@ -689,6 +687,17 @@ impl JudgeFixture {
         self.agent_param = value;
         self
     }
+
+    fn screen(&self) -> Screen {
+        if matches!(
+            self.action,
+            "submit_prompt" | "dictation_on" | "dictation_off"
+        ) {
+            Screen::Agent
+        } else {
+            Screen::Overview
+        }
+    }
 }
 
 /// These are independent meaning checks, with no command-model calls and
@@ -709,7 +718,7 @@ async fn run_judge_fixtures(cases: Vec<JudgeFixture>, pipeline: JudgePipeline) {
         let resolver = resolver.clone();
         tasks.spawn(async move {
             match pipeline {
-                JudgePipeline::Singleton => run_judge_fixture(resolver.as_ref(), case).await,
+                JudgePipeline::Classifier => run_judge_fixture(resolver.as_ref(), case).await,
                 JudgePipeline::Production => {
                     run_production_judge_fixture(resolver.as_ref(), case).await
                 }
@@ -741,15 +750,27 @@ async fn run_judge_fixture(resolver: &dyn IntentResolver, case: JudgeFixture) ->
     const REPETITIONS: usize = 5;
     let row = table().row(case.action).expect("shipped forced-pick row");
     let dialog = VoiceNewAgent { form: None };
+    let directories = VoiceDirectories {
+        deck_id: "deck-local".into(),
+        path: "/work".into(),
+        has_parent: true,
+        entries: vec![],
+        paging: None,
+    };
     let (strictness, _) = row
         .meaning_for(None, case.dialog.then_some(&dialog))
         .expect("forced pick must be judged");
     let transcript = Transcript::new(&case.said);
+    let actions = every_action(table());
     let mut failures = Vec::new();
     let mut yes_count = 0;
     let mut completed = 0;
     for repetition in 1..=REPETITIONS {
-        let request = MeaningRequest::new(&transcript, table(), &[(row, strictness)]);
+        let request = MeaningRequest::new(&transcript, table(), &actions).at(Place::of(
+            case.screen(),
+            case.dialog.then_some(&directories),
+            case.dialog.then_some(&dialog),
+        ));
         match tokio::time::timeout(
             REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
             resolver.judge_meaning(request),
@@ -788,12 +809,12 @@ async fn run_judge_fixture(resolver: &dyn IntentResolver, case: JudgeFixture) ->
 
 /// Fix command selection locally, but pass the handler's meaning request
 /// unchanged to the shipping backend. A failed remote call is not evidence of
-/// a correct refusal, so count completed checks separately from outcomes.
+/// a correct refusal, so count completed readable votes separately from outcomes.
 struct ForcedCommandResolver<'a> {
     answer: IntentAnswer,
     remote: &'a dyn IntentResolver,
     picks: AtomicUsize,
-    completed_checks: AtomicUsize,
+    completed_votes: AtomicUsize,
 }
 
 impl IntentResolver for ForcedCommandResolver<'_> {
@@ -806,7 +827,7 @@ impl IntentResolver for ForcedCommandResolver<'_> {
     fn judge_meaning<'a>(&'a self, request: MeaningRequest<'a>) -> MeaningFuture<'a> {
         Box::pin(async move {
             let verdict = self.remote.judge_meaning(request).await?;
-            self.completed_checks.fetch_add(1, Ordering::Relaxed);
+            self.completed_votes.fetch_add(1, Ordering::Relaxed);
             Ok(verdict)
         })
     }
@@ -863,14 +884,7 @@ async fn run_production_judge_fixture(
         }],
         paging: None,
     };
-    let screen = if matches!(
-        case.action,
-        "submit_prompt" | "dictation_on" | "dictation_off"
-    ) {
-        Screen::Agent
-    } else {
-        Screen::Overview
-    };
+    let screen = case.screen();
     let mut failures = Vec::new();
     let mut dispatches = 0;
     let mut refusals = 0;
@@ -879,7 +893,7 @@ async fn run_production_judge_fixture(
             answer: answer.clone(),
             remote,
             picks: AtomicUsize::new(0),
-            completed_checks: AtomicUsize::new(0),
+            completed_votes: AtomicUsize::new(0),
         };
         let result = tokio::time::timeout(
             REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
@@ -896,13 +910,13 @@ async fn run_production_judge_fixture(
         )
         .await;
         let picks = resolver.picks.load(Ordering::Relaxed);
-        let checks = resolver.completed_checks.load(Ordering::Relaxed);
+        let votes = resolver.completed_votes.load(Ordering::Relaxed);
         match result {
             Ok(result) => {
                 let (action, kind, _) = observed(&result.outcome);
                 dispatches += usize::from(kind == OutcomeKind::Dispatch);
                 refusals += usize::from(kind == OutcomeKind::ActionUngrounded);
-                let completed = picks == 1 && checks == 1;
+                let completed = picks == 1 && (1..=2).contains(&votes);
                 let correct = match &result.outcome {
                     // Check the resulting action, including readings: a
                     // refused stop must not dispatch close, open_new_agent or
@@ -916,14 +930,14 @@ async fn run_production_judge_fixture(
                 };
                 eprintln!(
                     "forced-production: {} | run {repetition}/{REPETITIONS} | \
-                     action={action:?} outcome={kind} picks={picks} remote_checks={checks} | {}",
+                     action={action:?} outcome={kind} picks={picks} votes={votes} | {}",
                     case.name,
                     result.outcome.sentence(),
                 );
                 if !completed || !correct {
                     failures.push(format!(
                         "{} run {repetition}/{REPETITIONS}: expected {} with a completed meaning check, \
-                         got action={action:?} outcome={kind} picks={picks} remote_checks={checks}: {}",
+                         got action={action:?} outcome={kind} picks={picks} votes={votes}: {}",
                         case.name,
                         if case.expected { "dispatch of the forced action" } else { "action_ungrounded" },
                         result.outcome.sentence(),
@@ -932,7 +946,7 @@ async fn run_production_judge_fixture(
             }
             Err(_) => failures.push(format!(
                 "{} run {repetition}/{REPETITIONS}: production handler timed out, \
-                 picks={picks} remote_checks={checks}",
+                 picks={picks} votes={votes}",
                 case.name,
             )),
         }
