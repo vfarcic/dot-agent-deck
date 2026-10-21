@@ -141,6 +141,19 @@ fn serve(op: &str) -> AttachResponse {
         "list-agents" => AttachResponse::agent_records(vec![listed(REUSED_ID)]),
         "start-agent" | "start-prepared-agent" => AttachResponse::with_id("started".into()),
         "post-message" => AttachResponse::with_id("m-posted".into()),
+        "prepare-orchestration" => AttachResponse::prepared(
+            dot_agent_deck::event::PreparedOrchestration {
+                path: "/project".into(),
+                context_path: "/project/.dot-agent-deck/context.md".into(),
+                token: "prep-token".into(),
+                roles: vec![dot_agent_deck::event::ProjectRole {
+                    name: "orchestrator".into(),
+                    start: true,
+                }],
+                prompt: "Read .dot-agent-deck/context.md and carry out your task.".into(),
+            },
+            dot_agent_deck::daemon_protocol::PrepareSpelling::Orchestration,
+        ),
         "inbox-retry" | "inbox-cancel" => {
             let mut reply = AttachResponse::ok();
             reply.inbox_action = Some(InboxActionReply {
@@ -391,7 +404,8 @@ async fn an_inbox_retry_or_cancel_after_a_swap_sends_the_replacement_nothing() {
 /// Scenario: an answer to the question an agent is waiting on is sent after
 /// the daemon was replaced. A refused replacement receives no answer and the
 /// call reports an error rather than `Answered`; the same build is answered on
-/// a checked connection.
+/// a checked connection. If the user withdraws the answer while that connection
+/// is being admitted, no answer is sent and the call reports `Superseded`.
 #[tokio::test]
 async fn an_answer_after_a_swap_sends_the_replacement_nothing() {
     let _guard = AllowanceGuard::acquire();
@@ -424,13 +438,43 @@ async fn an_answer_after_a_swap_sends_the_replacement_nothing() {
             &["answer-question"],
         );
     }
+
+    // The replacement's Hello is a deterministic cancellation barrier: the
+    // answer is wanted before it responds, and withdrawn as it responds.
+    let deck = ReplacedDeck::start("g3-withdraw", SwapAt::FirstConnection, matching_hello());
+    let links = DaemonLinks::default();
+    let daemon = held(&links, &deck.endpoint()).await;
+    let hellos = Arc::clone(&deck.replacement_hellos);
+    let answered = daemon
+        .client
+        .answer_question_while(
+            || hellos.load(Ordering::SeqCst) == 0,
+            REUSED_ID,
+            "q-withdrawn",
+            Some(1),
+            Vec::new(),
+            false,
+        )
+        .await;
+    let outcome = deck.finish();
+    assert!(outcome.hellos > 0, "the replacement must answer the gate");
+    assert!(
+        matches!(answered, Ok(AnswerReport::Superseded)),
+        "an answer withdrawn during admission must be Superseded: {answered:?}"
+    );
+    assert_eq!(
+        outcome.acted,
+        Vec::<String>::new(),
+        "the replacement received an answer withdrawn during admission"
+    );
 }
 
 /// Scenario: the user stops agent 1 from its card after the daemon was
 /// replaced by one that also runs an agent 1, an unrelated one. Against a
 /// refused replacement the stop fails and that agent is not stopped; against
 /// the same build the stop is sent on a checked connection. An orchestration
-/// launch's rollback stop of the same id behaves the same way.
+/// launch's rollback stop of the same id behaves the same way, including when
+/// a card or rollback stop is repeated against the same build.
 #[tokio::test]
 async fn a_stop_after_a_swap_cannot_hit_the_replacements_reused_id() {
     let _selection = crate::dto::SELECTION_LOCK.lock().await;
@@ -442,6 +486,11 @@ async fn a_stop_after_a_swap_cannot_hit_the_replacements_reused_id() {
         let state = crate::terminal::DesktopState::default();
         let wire = crate::dto::deck_wire_id(&deck.endpoint());
         let stopped = crate::stop_agent_action(&state, &wire, REUSED_ID).await;
+        if served {
+            crate::stop_agent_action(&state, &wire, REUSED_ID)
+                .await
+                .expect("a repeated card stop against the same build");
+        }
         let outcome = deck.finish();
         assert_admitted(
             name,
@@ -449,7 +498,7 @@ async fn a_stop_after_a_swap_cannot_hit_the_replacements_reused_id() {
             &outcome,
             served,
             stopped.is_ok(),
-            &["stop-agent"],
+            &["stop-agent", "stop-agent"],
         );
     }
     for (name, replacement, served) in replacements() {
@@ -458,6 +507,11 @@ async fn a_stop_after_a_swap_cannot_hit_the_replacements_reused_id() {
         let daemon = held(&links, &deck.endpoint()).await;
         let stopped =
             OrchestrationDaemon::stop_orchestration_agent(&*daemon.client, REUSED_ID).await;
+        if served {
+            OrchestrationDaemon::stop_orchestration_agent(&*daemon.client, REUSED_ID)
+                .await
+                .expect("a repeated rollback stop against the same build");
+        }
         let outcome = deck.finish();
         assert_admitted(
             name,
@@ -465,7 +519,7 @@ async fn a_stop_after_a_swap_cannot_hit_the_replacements_reused_id() {
             &outcome,
             served,
             stopped.is_ok(),
-            &["stop-agent"],
+            &["stop-agent", "stop-agent"],
         );
     }
 }
@@ -536,8 +590,8 @@ async fn a_turn_reply_subscription_after_a_swap_sends_the_replacement_nothing() 
 
 /// Scenario: an orchestration launch prepares the orchestration after the
 /// daemon was replaced. A refused replacement is sent no preparation; the same
-/// build receives it on a checked connection. (The fixture's answer is not a
-/// preparation, so the control asserts only what was sent.)
+/// build receives it on a checked connection and returns the preparation the
+/// launch needs.
 #[tokio::test]
 async fn a_preparation_after_a_swap_sends_the_replacement_nothing() {
     let _guard = AllowanceGuard::acquire();
@@ -554,26 +608,17 @@ async fn a_preparation_after_a_swap_sends_the_replacement_nothing() {
         )
         .await;
         let outcome = deck.finish();
-        assert_eq!(
-            outcome.unchecked, 0,
-            "{name}: preparation on an unchecked connection"
+        assert_admitted(
+            name,
+            "the preparation",
+            &outcome,
+            served,
+            prepared.is_ok(),
+            &["prepare-orchestration"],
         );
-        assert!(
-            outcome.hellos > 0,
-            "{name}: precondition: the preparation went to the replacement"
-        );
-        if served {
-            assert_eq!(
-                outcome.acted,
-                vec!["prepare-orchestration".to_string()],
-                "{name}"
-            );
-        } else {
-            assert!(
-                prepared.is_err(),
-                "{name}: prepared on a daemon the app would refuse"
-            );
-            assert_eq!(outcome.acted, Vec::<String>::new(), "{name}");
+        if let Ok(prepared) = prepared {
+            assert_eq!(prepared.token, "prep-token", "{name}: preparation token");
+            assert_eq!(prepared.path, "/project", "{name}: preparation project");
         }
     }
 }

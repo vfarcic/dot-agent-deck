@@ -7997,6 +7997,7 @@ start = true
 #[cfg(all(test, unix))]
 pub(crate) mod gate_fixture {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use crate::daemon_protocol::{
@@ -8030,6 +8031,7 @@ pub(crate) mod gate_fixture {
         _dir: tempfile::TempDir,
         pub(crate) path: PathBuf,
         pub(crate) recorded: Arc<Mutex<Vec<String>>>,
+        unchecked: Arc<AtomicUsize>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -8048,6 +8050,8 @@ pub(crate) mod gate_fixture {
             };
             let recorded = Arc::new(Mutex::new(Vec::new()));
             let log = Arc::clone(&recorded);
+            let unchecked = Arc::new(AtomicUsize::new(0));
+            let unchecked_requests = Arc::clone(&unchecked);
             let server = tokio::spawn(async move {
                 let mut index = 0usize;
                 while let Ok(mut stream) = listener.accept().await {
@@ -8055,8 +8059,10 @@ pub(crate) mod gate_fixture {
                     index += 1;
                     let hello = plan(this);
                     let log = Arc::clone(&log);
+                    let unchecked_requests = Arc::clone(&unchecked_requests);
                     tokio::spawn(async move {
                         let mut follow_on = true;
+                        let mut checked = false;
                         while std::mem::take(&mut follow_on) {
                             let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await
                             else {
@@ -8066,6 +8072,9 @@ pub(crate) mod gate_fixture {
                                 serde_json::from_slice(&payload).expect("a JSON request");
                             let op = request["op"].as_str().unwrap_or("?").to_string();
                             if op != "hello" {
+                                if !checked {
+                                    unchecked_requests.fetch_add(1, Ordering::SeqCst);
+                                }
                                 log.lock().unwrap().push(format!("{this}:{op}"));
                                 let reply = match op.as_str() {
                                     "list-agents" | "subscribe-events-with-snapshot" => {
@@ -8090,6 +8099,7 @@ pub(crate) mod gate_fixture {
                                 let _ = read_frame(&mut stream).await;
                                 return;
                             }
+                            checked = true;
                             let mut reply =
                                 AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
                             match hello {
@@ -8128,12 +8138,17 @@ pub(crate) mod gate_fixture {
                 _dir: dir,
                 path,
                 recorded,
+                unchecked,
                 server,
             }
         }
 
         pub(crate) fn recorded(&self) -> Vec<String> {
             self.recorded.lock().unwrap().clone()
+        }
+
+        pub(crate) fn unchecked_requests(&self) -> usize {
+            self.unchecked.load(Ordering::SeqCst)
         }
     }
 
@@ -8431,7 +8446,8 @@ mod protocol_gate_tests {
     /// and records its last command and orchestrator context, against a daemon
     /// that answers `Hello` on the next protocol and serves every verb besides.
     /// Each call is a protocol mismatch and the daemon receives none of them;
-    /// against a matching daemon each reaches it, as the control.
+    /// against a matching daemon each reaches it on a checked connection, as
+    /// the control.
     #[tokio::test]
     async fn a_gated_client_sends_no_agent_mutation_to_a_daemon_on_another_protocol() {
         let newer = GateDaemon::spawn(|_| GateHello::Newer);
@@ -8460,6 +8476,11 @@ mod protocol_gate_tests {
         assert_eq!(
             reached, expected,
             "control: every mutation reaches a matching daemon"
+        );
+        assert_eq!(
+            matching.unchecked_requests(),
+            0,
+            "a matching daemon received an agent mutation on an unchecked connection"
         );
     }
 
