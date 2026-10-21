@@ -1186,7 +1186,7 @@ async fn after_local_intercepts(
     // not need —
     // so nothing ties it to the command reply, and the user waits for the
     // slower of the two rather than for both in turn. Two identical requests
-    // ([`Ballot`]): the first readable one decides an ordinary pick, and both
+    // ([`Ballot`]): one readable `yes` decides an ordinary pick, and both
     // must list a pick whose wrong `yes` costs the most ([`Judged`]).
     // Its own copy of the words, because the ballot borrows them until it is
     // dropped and every early return below moves `transcript` into its
@@ -1273,7 +1273,8 @@ async fn after_local_intercepts(
     };
     let judged = Judged {
         first,
-        second: Second::NotAwaited(Cell::new(false)),
+        second: Second::NotAwaited,
+        open: Cell::new(false),
         transcript: transcript.text().to_string(),
         directories,
         new_agent,
@@ -1285,10 +1286,28 @@ async fn after_local_intercepts(
     // replies; the decision is then made again on both, from the start.
     if judged.needs_second() {
         let judged = Judged {
-            second: Second::Answered(ballot.second().await),
+            second: match ballot.second().await {
+                Ok(second) => Second::Answered(second),
+                Err(error) => Second::Failed(error),
+            },
+            open: Cell::new(false),
             ..judged
         };
         outcome = decide(&picked, &judged);
+        // A refusal the missing vote decided is the app failing to check,
+        // not the user's words failing to ask.
+        if let Some(error) = judged.unchecked() {
+            outcome = match outcome {
+                VoiceOutcome::ActionUngrounded {
+                    action, transcript, ..
+                } => VoiceOutcome::meaning_unchecked(
+                    transcript,
+                    table.row(&action).unwrap_or(row),
+                    error,
+                ),
+                outcome => outcome,
+            };
+        }
     }
     // What the user waited for is both calls.
     result(outcome, Some(millis(started.elapsed())))
@@ -3638,33 +3657,41 @@ const TWO_VOTES_IN_PLACE_OF_THE_PICK: [&str; 2] = [CLOSE_ROW, START_ROW];
 /// The second classification vote, as a [`Judged`] knows it.
 enum Second {
     /// Not waited for: every question is answered by the first vote alone,
-    /// and asking one whose answer the second could change — a `yes` that
-    /// needs two votes, a `no` that one more could turn — is recorded
-    /// ([`Judged::needs_second`]), so the caller waits for the second and
-    /// decides again.
-    NotAwaited(Cell<bool>),
-    /// Waited for: `None` when it failed, timed out or was unreadable, which
-    /// refuses every question that needs two votes and adds no `yes` to one
-    /// that needs one.
-    Answered(Option<MeaningVerdict>),
+    /// and the caller waits for the second and decides again when a question
+    /// it could answer differently was asked ([`Judged::needs_second`]).
+    NotAwaited,
+    /// Waited for, and readable.
+    Answered(MeaningVerdict),
+    /// Waited for, and it failed, timed out or was unreadable: every question
+    /// that needs two votes is refused, and one that needs one keeps the first
+    /// vote's answer. When such a question is what refused the pick, the
+    /// refusal is that the app could not check, not that the words did not
+    /// ask ([`Judged::unchecked`]).
+    Failed(IntentError),
 }
 
 /// The meaning check's answers for one utterance, with the refuse-only guards
 /// that hold beside them.
 ///
 /// **One vote or two.** Both votes are the same request, so either is a fair
-/// answer for a pick whose wrong `yes` is one more utterance to undo: it runs
-/// on the first readable vote's `yes` without waiting for the other, and when
-/// the first does not list it, on the second's — only when the second is
-/// readable too. Two samples of the same reading miss a request less often
-/// than one, and the wait for the second falls only on what the first did not
-/// list. A pick read [`Strictness::Whole`], a [`TWO_VOTE_ROWS`] row, and a
-/// [`TWO_VOTES_IN_PLACE_OF_THE_PICK`] row reached in place of the pick run
-/// only when BOTH votes answer `yes`: a `no`, an error, a timeout or an
-/// unreadable second vote refuses them.
+/// answer for a pick whose wrong `yes` is one more utterance to undo: an
+/// ordinary row runs on one readable `yes`, from either vote. It acts on the
+/// first readable vote's `yes` without waiting for the other — when the first
+/// vote to answer was unreadable, that is the second to answer — and waits
+/// for the other vote only after a first `no`. A pick
+/// read [`Strictness::Whole`], a [`TWO_VOTE_ROWS`] row, and a
+/// [`TWO_VOTES_IN_PLACE_OF_THE_PICK`] row reached in place of the pick need
+/// BOTH votes' `yes`, so after a first `yes` they wait for the second. A row
+/// is refused when the `yes` votes it needs cannot be had: a `no` refuses it
+/// as not asked for, and a vote that failed, timed out or was unreadable where
+/// a `yes` was still needed refuses it as unchecked.
 struct Judged<'d> {
     first: MeaningVerdict,
     second: Second,
+    /// Whether a question was asked whose answer the second vote could have
+    /// changed — a first `yes` that needs two votes, or a first `no` that
+    /// needs one.
+    open: Cell<bool>,
     transcript: String,
     directories: Option<&'d VoiceDirectories>,
     new_agent: Option<&'d VoiceNewAgent>,
@@ -3696,7 +3723,7 @@ impl Judged<'_> {
     }
 
     fn held(&self, row: &CommandRow, two_votes: bool) -> bool {
-        let meant = match row.meaning_for(self.directories, self.new_agent) {
+        let meant = || match row.meaning_for(self.directories, self.new_agent) {
             Some((strictness, _)) => self.answered(
                 &row.id,
                 strictness,
@@ -3704,37 +3731,50 @@ impl Judged<'_> {
             ),
             None => true,
         };
-        meant && self.guards_hold(row)
+        // The guards first: a pick they refuse is refused whatever the votes
+        // say, so its refusal is never put down to a vote that failed.
+        self.guards_hold(row) && meant()
     }
 
     /// The answer for `action` under `strictness`: both votes' `yes` where
     /// `two_votes`, and either readable vote's otherwise.
     fn answered(&self, action: &str, strictness: Strictness, two_votes: bool) -> bool {
         let first = self.first.asks(action, strictness);
-        match &self.second {
-            Second::NotAwaited(needed) => {
+        let second = match &self.second {
+            Second::Answered(second) => second.asks(action, strictness),
+            Second::NotAwaited | Second::Failed(_) => {
                 if first == two_votes {
-                    needed.set(true);
+                    self.open.set(true);
                 }
-                first
-            }
-            Second::Answered(second) => {
-                let second = second
-                    .as_ref()
-                    .is_some_and(|second| second.asks(action, strictness));
-                if two_votes {
-                    first && second
-                } else {
-                    first || second
+                // Not yet waited for, the first vote's answer stands until
+                // the caller decides again.
+                if matches!(self.second, Second::NotAwaited) {
+                    return first;
                 }
+                false
             }
+        };
+        if two_votes {
+            first && second
+        } else {
+            first || second
         }
     }
 
     /// Whether a decision made on the first vote alone asked a question the
     /// second could answer differently ([`Second::NotAwaited`]).
     fn needs_second(&self) -> bool {
-        matches!(&self.second, Second::NotAwaited(needed) if needed.get())
+        matches!(self.second, Second::NotAwaited) && self.open.get()
+    }
+
+    /// The second vote's error, when it failed and a question it could have
+    /// answered differently was asked — so a refusal was decided by the vote
+    /// the app could not get, not by the user's words.
+    fn unchecked(&self) -> Option<&IntentError> {
+        match &self.second {
+            Second::Failed(error) if self.open.get() => Some(error),
+            _ => None,
+        }
     }
 
     /// Whether `row`'s refuse-only guards hold for this transcript, whatever
@@ -17609,7 +17649,8 @@ mod tests {
         let yes = || MeaningVerdict::yes_to([("close_orchestration", Strictness::Asks)]);
         let judged = Judged {
             first: yes(),
-            second: Second::Answered(Some(yes())),
+            second: Second::Answered(yes()),
+            open: Cell::new(false),
             transcript: "Close".to_string(),
             directories: None,
             new_agent: None,
@@ -18734,7 +18775,7 @@ mod tests {
     }
 
     /// One classification vote as [`Voting`] answers it.
-    #[derive(Clone, Copy)]
+    #[derive(Debug, Clone, Copy)]
     enum Vote {
         /// A readable reply listing these actions, under every strictness.
         Lists(&'static [&'static str]),
@@ -18834,7 +18875,9 @@ mod tests {
     /// refused stop — runs only when both votes list it. Yes then no, no then
     /// yes, yes beside a failed vote in either order, and yes beside a vote
     /// that never answers (refused at the bound) all dispatch nothing; yes
-    /// and yes dispatches.
+    /// and yes dispatches. A readable `no` is refused as not asked for, and a
+    /// `yes` whose second vote failed or never answered as unchecked — the
+    /// app could not check, which says nothing about the user's words.
     #[tokio::test(start_paused = true)]
     async fn voice_outcome_a_two_vote_pick_runs_only_when_both_votes_list_it() {
         use Vote::{Fails, Hangs, Lists};
@@ -18886,6 +18929,19 @@ mod tests {
                 );
                 if matches!(votes[1], Hangs) {
                     assert_eq!(waited, crate::voice::meaning::MEANING_TIMEOUT, "{said}");
+                }
+                if votes.iter().any(|vote| matches!(vote, Fails | Hangs)) {
+                    assert!(
+                        matches!(&outcome, VoiceOutcome::ResolutionFailed { sentence, .. }
+                            if sentence.contains("could not check that this asks to")
+                                && sentence.ends_with("so nothing was done.")),
+                        "{said}: {votes:?}: {outcome:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(&outcome, VoiceOutcome::ActionUngrounded { .. }),
+                        "{said}: {votes:?}: {outcome:?}"
+                    );
                 }
             }
             let (outcome, _) = voted(
@@ -18945,7 +19001,20 @@ mod tests {
             matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "open_settings"),
             "{outcome:?}"
         );
-        for second in [Lists(&[]), Fails, Hangs] {
+        let (outcome, _) = voted(
+            "open settings",
+            Screen::Overview,
+            &fleet(),
+            false,
+            open(),
+            [Lists(&[]), Lists(&[])],
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "open_settings"),
+            "{outcome:?}"
+        );
+        for second in [Fails, Hangs] {
             let (outcome, _) = voted(
                 "open settings",
                 Screen::Overview,
@@ -18956,7 +19025,9 @@ mod tests {
             )
             .await;
             assert!(
-                matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "open_settings"),
+                matches!(&outcome, VoiceOutcome::ResolutionFailed { sentence, .. }
+                    if sentence.contains("could not check that this asks to open settings")
+                        && sentence.ends_with("so nothing was done.")),
                 "{outcome:?}"
             );
         }

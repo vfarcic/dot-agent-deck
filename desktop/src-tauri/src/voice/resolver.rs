@@ -225,8 +225,9 @@ pub trait IntentResolver: Send + Sync {
 
     /// PRD #1733: one vote of the meaning check — which of the table's
     /// actions the transcript asks for ([`super::meaning`]). Its request
-    /// holds the transcript and the app's own text about each action, and
-    /// nothing observed. The pipeline sends two of these beside the command
+    /// holds the transcript, the app's own text about each action and the
+    /// closed-enum screen kind and dialog state — never an observed name,
+    /// screen contents or the pick and its params. The pipeline sends two of these beside the command
     /// call ([`super::meaning::Ballot`]).
     ///
     /// **The default refuses**: a backend that cannot ask the question answers

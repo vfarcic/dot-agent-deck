@@ -272,7 +272,9 @@ impl RemoteResolver {
     /// PRD #1733: one vote of the meaning check — the same transport,
     /// credential and failure wording again, with [`super::meaning`]'s body
     /// and reader. Its body is built from the
-    /// [`super::meaning::MeaningRequest`] alone, which holds nothing observed.
+    /// [`super::meaning::MeaningRequest`] alone, which holds the transcript,
+    /// the app's own action text and the closed-enum screen kind and dialog
+    /// state — never an observed name, screen contents or the pick.
     async fn run_meaning(
         &self,
         request: super::meaning::MeaningRequest<'_>,
